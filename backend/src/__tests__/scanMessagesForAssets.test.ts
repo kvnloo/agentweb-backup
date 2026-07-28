@@ -18,8 +18,6 @@ jest.mock('@google-cloud/discoveryengine', () => ({ EngineServiceClient: jest.fn
 jest.mock('@google-cloud/storage', () => ({ Storage: jest.fn() }));
 jest.mock('../controllers/guide', () => ({ getGuide: jest.fn() }));
 jest.mock('../controllers/release', () => ({ getReleases: jest.fn() }));
-jest.mock('../controllers/api', () => ({ getApiDocs: jest.fn() }));
-jest.mock('../controllers/user-guide', () => ({ getUserGuide: jest.fn() }));
 jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn() }));
 jest.mock('../services/db', () => ({ taskDb: {
   getAllTaskExecutionsByUserId: jest.fn(),
@@ -74,6 +72,73 @@ describe('scanMessagesForAssets', () => {
     });
     expect(result.videos).toHaveLength(0);
     expect(result.htmlReports).toHaveLength(0);
+  });
+
+  it('ENG-510: extracts images from the per-image "image-generated" marker (survives a hard-cap kill)', () => {
+    // This marker message is persisted immediately when each image completes — BEFORE the
+    // end-of-turn toolCalls stamp — so it is the only record left if the whole-turn cap
+    // kills the turn mid-flight. It must surface the completed image.
+    const messages = [
+      {
+        role: 'system',
+        content: 'Image generated: variant-1.png',
+        timestamp: '2026-01-01T12:00:00Z',
+        metadata: {
+          kind: 'image-generated',
+          imageFilename: 'variant-1.png',
+          imageUrl: 'https://s3.amazonaws.com/variant-1.png',
+        },
+      },
+    ];
+
+    const result = scanMessagesForAssets(messages, makeSession());
+
+    expect(result.images).toHaveLength(1);
+    expect(result.images[0]).toEqual({
+      url: 'https://s3.amazonaws.com/variant-1.png',
+      filename: 'variant-1.png',
+      generatedAt: '2026-01-01T12:00:00Z',
+    });
+  });
+
+  it('ENG-510: de-duplicates the marker against the end-of-turn toolCalls stamp (normal completion)', () => {
+    const url = 'https://s3.amazonaws.com/variant-1.png';
+    const messages = [
+      { role: 'system', content: 'Image generated: v1.png', timestamp: '2026-01-01T12:00:00Z',
+        metadata: { kind: 'image-generated', imageFilename: 'v1.png', imageUrl: url } },
+      { role: 'assistant', content: 'done', timestamp: '2026-01-01T12:00:05Z',
+        metadata: { toolCalls: [{ name: 'generate_image', result: { success: true, imageUrl: url, filename: 'v1.png' } }] } },
+    ];
+
+    const result = scanMessagesForAssets(messages, makeSession());
+
+    expect(result.images).toHaveLength(1); // listed once, not twice
+    expect(result.images[0].url).toBe(url);
+  });
+
+  it('ENG-510: ignores a legacy marker that has no imageUrl (backward compatible)', () => {
+    const messages = [
+      { role: 'system', content: 'Image generated: old.png', timestamp: '2026-01-01T12:00:00Z',
+        metadata: { kind: 'image-generated', imageFilename: 'old.png' } },
+    ];
+    expect(scanMessagesForAssets(messages, makeSession()).images).toHaveLength(0);
+  });
+
+  it('ENG-510: skips no-metadata messages, dedupes a repeated marker URL, and defaults a missing filename', () => {
+    const url = 'https://s3.amazonaws.com/dup.png';
+    const messages = [
+      // no metadata at all → marker is undefined (guard short-circuits)
+      { role: 'user', content: 'make an image', timestamp: '2026-01-01T12:00:00Z' },
+      // marker WITH url but NO imageFilename → falls back to the default name
+      { role: 'system', content: 'Image generated: dup.png', timestamp: '2026-01-01T12:00:01Z',
+        metadata: { kind: 'image-generated', imageUrl: url } },
+      // second marker, SAME url → already seen, must not be listed twice
+      { role: 'system', content: 'Image generated: dup.png', timestamp: '2026-01-01T12:00:02Z',
+        metadata: { kind: 'image-generated', imageUrl: url, imageFilename: 'again.png' } },
+    ];
+    const result = scanMessagesForAssets(messages, makeSession());
+    expect(result.images).toHaveLength(1);
+    expect(result.images[0].filename).toBe('generated-image.png');
   });
 
   it('should extract videos from generate_video tool calls', () => {

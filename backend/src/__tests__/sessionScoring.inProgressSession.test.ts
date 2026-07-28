@@ -196,6 +196,122 @@ describe('SessionScoring - failed runs (no assistant turn, stale)', () => {
   });
 });
 
+describe('SessionScoring - manual "Test this schedule" runs are excluded (ENG-499)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  // A completed test run with a real assistant turn — normally scorable.
+  const completedTestMessages: ChatMessage[] = [
+    { role: 'system', content: 'You are an automated scheduled run.' } as any,
+    { role: 'user', content: 'Run the weekly researcher.' },
+    { role: 'assistant', content: 'Here is the weekly summary.' } as any,
+  ];
+
+  it('scoreSessionIfNeeded skips a crashed (stale, turn-less) test run without scoring or surfacing it', async () => {
+    const session = {
+      sessionId: 'test-run-crashed',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      title: 'Test: Weekly Lexy posts researcher',
+      pageIdentifier: 'Test: Weekly Lexy posts researcher|scheduleId:53bdc62f',
+      messages: turnlessMessages,
+      messageCount: turnlessMessages.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).toBeNull();
+    // Excluded from the cohort: no score, no judge call, and no failed-run
+    // surfacing (the user already saw the crash live in the test UI).
+    expect(mockUpdateScore).not.toHaveBeenCalled();
+    expect(mockUpdateError).not.toHaveBeenCalled();
+    expect(mockAddMessage).not.toHaveBeenCalled();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('scoreSessionIfNeeded skips a completed test run rather than scoring it', async () => {
+    const session = {
+      sessionId: 'test-run-completed',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      pageIdentifier: 'Test: Weekly Lexy posts researcher|scheduleId:53bdc62f',
+      messages: completedTestMessages,
+      messageCount: completedTestMessages.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).toBeNull();
+    expect(mockUpdateScore).not.toHaveBeenCalled();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('scoreSessionWithJudgeIfNeeded skips a test run for named judges too', async () => {
+    const session = {
+      sessionId: 'test-run-judge',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      pageIdentifier: 'Test: Weekly Lexy posts researcher|scheduleId:53bdc62f',
+      messages: turnlessMessages,
+      messageCount: turnlessMessages.length,
+      judgeScores: {},
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionWithJudgeIfNeeded(session, testJudge);
+
+    expect(result).toBeNull();
+    expect(mockUpdateJudgeScore).not.toHaveBeenCalled();
+    expect(mockCallLLM).not.toHaveBeenCalled();
+  });
+
+  it('still scores a real "Scheduled:" run of a schedule whose name starts with "Test:"', async () => {
+    // A user-named schedule "Test: X" produces a REAL run titled "Scheduled: Test: X"
+    // — that must NOT be treated as a manual test run.
+    const session = {
+      sessionId: 'real-run-testnamed-schedule',
+      userId: 'u1',
+      sessionType: 'scheduled',
+      pageIdentifier: 'Scheduled: Test: X|scheduleId:abc',
+      messages: turnlessMessages,
+      messageCount: turnlessMessages.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    expect(result).not.toBeNull();
+    expect(result?.score).toBe(1);
+    expect(mockUpdateScore).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not exclude a non-scheduled session that happens to be titled "Test:"', async () => {
+    const session = {
+      sessionId: 'regular-test-titled',
+      userId: 'u1',
+      sessionType: 'regular',
+      pageIdentifier: 'Test: something',
+      messages: turnlessMessages,
+      messageCount: turnlessMessages.length,
+      createdAt: STALE(),
+      updatedAt: STALE(),
+    } as any;
+
+    const result = await scoreSessionIfNeeded(session);
+
+    // Regular sessions are unaffected by the scheduled-test exclusion.
+    expect(result).not.toBeNull();
+    expect(result?.score).toBe(1);
+  });
+});
+
 describe('SessionScoring - sessions with an assistant turn score normally', () => {
   beforeEach(() => {
     jest.clearAllMocks();

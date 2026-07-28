@@ -450,6 +450,9 @@ describe("PUT /api/tasks/:id — update permissions", () => {
 describe("DELETE /api/tasks/:id — delete (archive) permissions", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // clearAllMocks preserves queued/default implementations from the PUT
+    // cases above; reset this shared mock so DELETE cases cannot inherit them.
+    mockGetTaskById.mockReset();
     mockUpdateTask.mockResolvedValue(undefined);
     mockGetTaskSchedules.mockResolvedValue([]);
   });

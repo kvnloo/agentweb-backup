@@ -3,7 +3,7 @@ import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import * as notionService from '../services/notionService';
+import * as intakeService from '../services/intakeService';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 
 // Mock dependencies
@@ -20,8 +20,13 @@ jest.mock('../services/chatbotService', () => ({
   updateTaskExecutionStatus: jest.fn(),
 }));
 
-jest.mock('../services/notionService', () => ({
-  createOncallItem: jest.fn().mockResolvedValue({ pageId: 'page-123', notionUrl: 'https://notion.so/page-123' }),
+jest.mock('../services/intakeService', () => ({
+  fileAutoIssue: jest.fn().mockResolvedValue({
+    pageId: 'ENG-123',
+    url: 'https://linear.app/issue/ENG-123',
+    deduped: false,
+    tracker: 'Linear',
+  }),
 }));
 
 jest.mock('../services/emailService', () => ({
@@ -69,7 +74,7 @@ jest.mock('../utils/sseProgress', () => ({
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockEmailService = emailService as jest.Mocked<typeof emailService>;
 const mockGenerateMarketingResponseWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
-const mockCreateOncallItem = notionService.createOncallItem as jest.MockedFunction<typeof notionService.createOncallItem>;
+const mockFileAutoIssue = intakeService.fileAutoIssue as jest.MockedFunction<typeof intakeService.fileAutoIssue>;
 
 describe('AgentModeController - Error Handling', () => {
   const mockUserId = 'test-user-123';
@@ -966,7 +971,7 @@ describe('AgentModeController - Error Handling', () => {
     });
   });
 
-  describe('generateResponse - context limit auto-report to Notion', () => {
+  describe('generateResponse - context limit auto-report to Linear', () => {
     const contextError = new Error('The request exceeded the maximum context length');
 
     const makeReq = (sessionId = mockSessionId) => ({
@@ -985,7 +990,7 @@ describe('AgentModeController - Error Handling', () => {
       mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(contextError);
     });
 
-    it('should call createOncallItem when session has no contextLimitReported flag', async () => {
+    it('should call canonical Linear intake when session has no contextLimitReported flag', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, contextLimitReported: undefined } as any);
 
       await agentModeController.generateResponse(makeReq(), makeRes());
@@ -993,22 +998,23 @@ describe('AgentModeController - Error Handling', () => {
       // Allow fire-and-forget to settle
       await new Promise(r => setImmediate(r));
 
-      expect(mockCreateOncallItem).toHaveBeenCalledWith(
+      expect(mockFileAutoIssue).toHaveBeenCalledWith(
         expect.objectContaining({
-          additionalTags: expect.arrayContaining(['Customer Reported', 'Context Limit']),
+          executionRoute: 'human-triage',
+          extraLabels: expect.arrayContaining(['Customer Reported', 'Context Limit']),
         })
       );
       expect(mockChatbotDb.updateSessionContextLimitReported).toHaveBeenCalledWith(mockSessionId);
     });
 
-    it('should NOT call createOncallItem when session already has contextLimitReported = true', async () => {
+    it('should NOT call Linear intake when session already has contextLimitReported = true', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession, contextLimitReported: true } as any);
 
       await agentModeController.generateResponse(makeReq(), makeRes());
 
       await new Promise(r => setImmediate(r));
 
-      expect(mockCreateOncallItem).not.toHaveBeenCalled();
+      expect(mockFileAutoIssue).not.toHaveBeenCalled();
       expect(mockChatbotDb.updateSessionContextLimitReported).not.toHaveBeenCalled();
     });
 
@@ -1020,11 +1026,11 @@ describe('AgentModeController - Error Handling', () => {
 
       await new Promise(r => setImmediate(r));
 
-      expect(mockCreateOncallItem).not.toHaveBeenCalled();
+      expect(mockFileAutoIssue).not.toHaveBeenCalled();
     });
 
     it('should return 413 CONTEXT_LIMIT_EXCEEDED regardless of Notion call success', async () => {
-      mockCreateOncallItem.mockRejectedValueOnce(new Error('Notion unavailable'));
+      mockFileAutoIssue.mockRejectedValueOnce(new Error('Linear unavailable'));
       mockChatbotDb.getChatSession.mockResolvedValue({ ...mockSession } as any);
 
       const mockRes = makeRes();

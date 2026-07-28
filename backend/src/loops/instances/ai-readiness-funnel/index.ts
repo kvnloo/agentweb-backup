@@ -11,7 +11,6 @@
  *              landerPath=/ai-readiness (drops site-wide `landed`)
  *   policy   = LlmAnalystRuleSet (binding-constraint lens via flowDescription)
  *   tools    = SpecOutputTool (records the proposal spec; the DM is the value)
- *   gate     = CaptureGate (Slack DM + reactions)
  *   learning = DynamoLearningStore + CooldownRuleSet read-back
  *
  * Registration is ALWAYS performed (so /api/loop-events accepts + stores the
@@ -19,7 +18,6 @@
  * server.ts and must be explicitly enabled via AI_READINESS_LOOP_ENABLED=true.
  */
 
-import { CaptureGate } from '../../core/gates/captureGate';
 import {
   analystFindingsBody,
   buildLoopDigestLines,
@@ -58,7 +56,6 @@ const runner = createInstanceRunner({
     sensor: 'aiReadinessSensor',
     ruleSet: 'aiReadinessAnalyst',
     tools: 'aiReadinessSpecTool',
-    gate: 'aiReadinessGate',
     learning: 'aiReadinessLearning',
   },
   buildLayers: (ports) => {
@@ -76,7 +73,6 @@ const runner = createInstanceRunner({
       }),
       ruleSet: new CooldownRuleSet(analyst, learning, AI_READINESS_LOOP_ID),
       tools: new SpecOutputTool(AI_READINESS_LOOP_ID),
-      gate: new CaptureGate(),
       learning,
     };
   },
@@ -317,8 +313,6 @@ async function postDigest(
   await postLoopDigest(result, slack, slackUserId, aiReadinessDigestTemplate, shape);
 }
 
-/** Test seam. */
-export const _internal = { get aiReadinessGate() { return runner.gate; } };
 export const _testing = {
   summarizeFunnel,
   buildDigestLines,

@@ -1,14 +1,13 @@
 /**
  * Tests for the LOOP_REGISTRY at backend/src/loops/index.ts.
  *
- * Covers the lifecycle of registering + retrieving the 5 layer implementations
+ * Covers the lifecycle of registering + retrieving the 4 layer implementations
  * and loop manifests, including duplicate-registration and missing-impl error
  * paths. The registry is the only runtime logic shipped in Phase 1a — the
  * rest of `loops/` is type definitions + injected ports.
  */
 
 import {
-  ApprovalGate,
   EventSource,
   LearningStore,
   LoopManifest,
@@ -19,7 +18,6 @@ import {
 } from '../loops/core/types';
 import {
   _resetRegistryForTesting,
-  getGate,
   getLearningStore,
   getLoopManifest,
   getRegisteredLoopManifests,
@@ -27,13 +25,11 @@ import {
   getRuleSet,
   getSensor,
   getTools,
-  registerOrReplaceGate,
   registerOrReplaceLearningStore,
   registerOrReplaceLoop,
   registerOrReplaceRuleSet,
   registerOrReplaceSensor,
   registerOrReplaceTools,
-  registerGate,
   registerLearningStore,
   registerLoop,
   registerRuleSet,
@@ -58,13 +54,9 @@ const stubTools: MutationTools<unknown> = {
   apply: jest.fn(),
 };
 
-const stubGate: ApprovalGate = {
-  requestApproval: jest.fn(),
-  pollDecision: jest.fn(),
-};
-
 const stubLearning: LearningStore = {
   record: jest.fn().mockResolvedValue(undefined),
+  recordDecisionIfAbsent: jest.fn().mockResolvedValue(true),
   queryHistory: jest.fn().mockResolvedValue([]),
   lastOutcomeForRule: jest.fn().mockResolvedValue(null),
 };
@@ -84,7 +76,6 @@ const stubManifest: LoopManifest = {
   sensorImpl: 'stubSensor',
   rulesetImpl: 'stubRuleSet',
   toolsImpl: 'stubTools',
-  gateImpl: 'stubGate',
   learningImpl: 'stubLearning',
   thresholds: {
     promoteLiftPct: 15,
@@ -132,11 +123,6 @@ describe('loops registry — failure paths (TDD fail cases)', () => {
     expect(() => registerTools('t', stubTools)).toThrow(/tools impl already registered/);
   });
 
-  it('throws when registering the same gate name twice', () => {
-    registerGate('g', stubGate);
-    expect(() => registerGate('g', stubGate)).toThrow(/gate impl already registered/);
-  });
-
   it('throws when registering the same learning store name twice', () => {
     registerLearningStore('l', stubLearning);
     expect(() => registerLearningStore('l', stubLearning)).toThrow(/learning impl already registered/);
@@ -159,10 +145,6 @@ describe('loops registry — failure paths (TDD fail cases)', () => {
     expect(() => getTools('missing')).toThrow(/tools impl not registered/);
   });
 
-  it('throws when getting an unregistered gate', () => {
-    expect(() => getGate('missing')).toThrow(/gate impl not registered/);
-  });
-
   it('throws when getting an unregistered learning store', () => {
     expect(() => getLearningStore('missing')).toThrow(/learning impl not registered/);
   });
@@ -177,13 +159,11 @@ describe('loops registry — happy paths', () => {
     registerSensor('s', stubSensor);
     registerRuleSet('r', stubRuleSet);
     registerTools('t', stubTools);
-    registerGate('g', stubGate);
     registerLearningStore('l', stubLearning);
 
     expect(getSensor('s')).toBe(stubSensor);
     expect(getRuleSet('r')).toBe(stubRuleSet);
     expect(getTools('t')).toBe(stubTools);
-    expect(getGate('g')).toBe(stubGate);
     expect(getLearningStore('l')).toBe(stubLearning);
   });
 
@@ -230,9 +210,9 @@ describe('loops registry — happy paths', () => {
     const replacementSensor: EventSource<NormalizedEvent> = { fetchEvents: jest.fn().mockResolvedValue([]) };
     const replacementRuleSet: RuleSet<NormalizedEvent, unknown> = { evaluate: jest.fn().mockResolvedValue([]) };
     const replacementTools: MutationTools<unknown> = { apply: jest.fn() };
-    const replacementGate: ApprovalGate = { requestApproval: jest.fn(), pollDecision: jest.fn() };
     const replacementLearning: LearningStore = {
       record: jest.fn().mockResolvedValue(undefined),
+      recordDecisionIfAbsent: jest.fn().mockResolvedValue(true),
       queryHistory: jest.fn().mockResolvedValue([]),
       lastOutcomeForRule: jest.fn().mockResolvedValue(null),
     };
@@ -242,14 +222,12 @@ describe('loops registry — happy paths', () => {
     registerSensor('unrelated', unrelatedSensor);
     registerRuleSet('shared', stubRuleSet);
     registerTools('shared', stubTools);
-    registerGate('shared', stubGate);
     registerLearningStore('shared', stubLearning);
     registerLoop(stubManifest);
 
     registerOrReplaceSensor('shared', replacementSensor);
     registerOrReplaceRuleSet('shared', replacementRuleSet);
     registerOrReplaceTools('shared', replacementTools);
-    registerOrReplaceGate('shared', replacementGate);
     registerOrReplaceLearningStore('shared', replacementLearning);
     registerOrReplaceLoop({ ...stubManifest, displayName: 'Updated Test Loop' });
 
@@ -257,7 +235,6 @@ describe('loops registry — happy paths', () => {
     expect(getSensor('unrelated')).toBe(unrelatedSensor);
     expect(getRuleSet('shared')).toBe(replacementRuleSet);
     expect(getTools('shared')).toBe(replacementTools);
-    expect(getGate('shared')).toBe(replacementGate);
     expect(getLearningStore('shared')).toBe(replacementLearning);
     expect(getLoopManifest(asLoopId('test-loop')).displayName).toBe('Updated Test Loop');
   });
@@ -266,7 +243,6 @@ describe('loops registry — happy paths', () => {
     registerSensor('s', stubSensor);
     registerRuleSet('r', stubRuleSet);
     registerTools('t', stubTools);
-    registerGate('g', stubGate);
     registerLearningStore('l', stubLearning);
     registerLoop(stubManifest);
 
@@ -275,7 +251,6 @@ describe('loops registry — happy paths', () => {
     expect(() => getSensor('s')).toThrow();
     expect(() => getRuleSet('r')).toThrow();
     expect(() => getTools('t')).toThrow();
-    expect(() => getGate('g')).toThrow();
     expect(() => getLearningStore('l')).toThrow();
     expect(() => getLoopManifest(asLoopId('test-loop'))).toThrow();
     expect(getRegisteredLoopIds()).toEqual([]);

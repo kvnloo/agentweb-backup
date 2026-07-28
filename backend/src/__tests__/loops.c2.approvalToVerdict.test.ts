@@ -15,11 +15,9 @@
  * It uses the in-memory learning store + a fake sensor (no network), so the whole
  * approval→attribution→health path is asserted hermetically.
  *
- * Dependency note: this builds against C1's documented gate contract. C1 (the
- * Slack-reaction `ApprovalGate` that calls `recordLoopApproval` on a ✅) is not
- * yet landed on `harsha/swarm`; the persistence primitive it must call
- * (`recordLoopApproval`, which produces `decision=approved` + `shippedAt`) is
- * present and is what this test drives directly.
+ * Historical compatibility note: this drives the legacy Slack-dispatch
+ * persistence primitive directly. New loop runs do not create in-process gate
+ * records; execution and review state live in Linear.
  */
 
 import { recordLoopApproval } from '../loops/core/learning/approvalPersistence';
@@ -58,7 +56,6 @@ function manifest(): LoopManifest {
     sensorImpl: 'c2:sensor',
     rulesetImpl: 'c2:rules',
     toolsImpl: 'c2:tools',
-    gateImpl: 'c2:gate',
     learningImpl: 'c2:learning',
     thresholds: {
       promoteLiftPct: 10,

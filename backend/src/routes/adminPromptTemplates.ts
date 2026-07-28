@@ -21,6 +21,10 @@ import {
   saveGlobalImageDirectives,
 } from "../services/promptTemplatesService";
 import {
+  getOutreachInvitePrompt,
+  saveOutreachInvitePrompt,
+} from "../services/outreachInvitePromptService";
+import {
   computeLikeRate,
   getPromptSignalSummary,
 } from "../services/promptSignalsService";
@@ -109,6 +113,77 @@ router.get("/image-quality", async (req: Request, res: Response) => {
   } catch (err) {
     console.error("[admin/prompt-templates] image-quality failed", err);
     return res.status(500).json({ message: "Failed to analyze image prompt quality" });
+  }
+});
+
+// Onboarding outreach invite prompt (AC #3). Registered BEFORE /:id so
+// "outreach" isn't matched as an archetype id. Edits the variant pool +
+// system prompt the onboarding "review your drafts" step pre-fills from.
+router.get("/outreach/invite", async (_req: Request, res: Response) => {
+  try {
+    const row = await getOutreachInvitePrompt();
+    return res.json({ template: row });
+  } catch (err) {
+    console.error("[admin/prompt-templates] outreach invite get failed", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to get outreach invite prompt" });
+  }
+});
+
+router.put("/outreach/invite", async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  const updatedBy =
+    (req as any).user?.userId || (req as any).user?.email || "unknown-admin";
+
+  // Validate variant lists: when provided, must be an array with at least
+  // one non-empty string so we never persist an empty pool.
+  const validateList = (v: unknown, field: string): string | null => {
+    if (v === undefined) return null;
+    if (
+      !Array.isArray(v) ||
+      v.filter((s) => typeof s === "string" && s.trim().length > 0).length === 0
+    ) {
+      return `${field} must be a non-empty array of strings`;
+    }
+    return null;
+  };
+  const err1 = validateList(body.withCompanyVariants, "withCompanyVariants");
+  const err2 = validateList(
+    body.withoutCompanyVariants,
+    "withoutCompanyVariants",
+  );
+  if (err1 || err2) {
+    return res.status(400).json({ message: err1 || err2 });
+  }
+  if (
+    body.systemPrompt !== undefined &&
+    (typeof body.systemPrompt !== "string" ||
+      body.systemPrompt.trim().length === 0)
+  ) {
+    return res
+      .status(400)
+      .json({ message: "systemPrompt must be a non-empty string" });
+  }
+
+  try {
+    const row = await saveOutreachInvitePrompt({
+      systemPrompt:
+        typeof body.systemPrompt === "string" ? body.systemPrompt : undefined,
+      withCompanyVariants: Array.isArray(body.withCompanyVariants)
+        ? (body.withCompanyVariants as string[])
+        : undefined,
+      withoutCompanyVariants: Array.isArray(body.withoutCompanyVariants)
+        ? (body.withoutCompanyVariants as string[])
+        : undefined,
+      updatedBy,
+    });
+    return res.json({ template: row });
+  } catch (err) {
+    console.error("[admin/prompt-templates] outreach invite save failed", err);
+    return res
+      .status(500)
+      .json({ message: "Failed to save outreach invite prompt" });
   }
 });
 

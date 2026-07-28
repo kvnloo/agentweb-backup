@@ -6,6 +6,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **IMPORTANT:** This project follows the global development rules defined in `~/.claude/CLAUDE.md`. When conflicts arise, these project-specific rules take precedence.
 
+### Autonomous execution and merge
+
+- AI agents own qualifying engineering work through merge. Merge only from a
+  branch current with `main`, after the full relevant local suite, regression
+  coverage, staging/API/browser smoke where applicable, every relevant GitHub
+  check, latest-head Greptile 5/5 with no unresolved actionable P1/P2,
+  attribution, rollback evidence, and acceptance-contract completeness all pass.
+- Database/data-plane work requires Harsha before merge: migrations or persistent
+  schema/table/index/key/model changes; backfills, bulk mutations, deletes, or
+  production data repair; persistence provisioning/retention/backup/access
+  changes, including encryption and access-policy changes; and changes that can
+  reinterpret, orphan, expose, or make stored data unrecoverable.
+- Auth, billing, security, and production-infrastructure code are executable
+  without routine human merge approval when fully bounded, strongly tested,
+  reversible, and outside the database/data-plane gate.
+- Material customer, sales, marketing, social, or press copy that Harsha has not
+  reviewed stops before publish/merge. Already-approved copy can be applied
+  mechanically without a second review gate.
+- Repair failed or missing tests, evaluators, CI, staging, deploy, attribution,
+  and monitoring as pipeline defects. Do not make Harsha the fallback gate.
+- For OPS, GROW, Sales, Marketing, and CS, invoke Emma directly wherever she has
+  the capability. Emma prepares and verifies the work; Harsha reviews external
+  copy before send/publish and handles new/unbounded spend, legal commitments,
+  private credentials, and database/data-plane approvals.
+
 ### Rule 1: Design Before Code
 
 Before writing implementation code:
@@ -432,12 +457,13 @@ Uses browser-use library with Playwright:
 - `.github/workflows/tests.yml` - Runs on PRs, builds and verifies compilation
   - Automatically deploys backend to staging after tests pass on PRs
   - Deploys are triggered by file changes in `backend/` or `partner-portal/`
-- `.github/workflows/deploy.yml` - Deploys to production at safe times only
+- `.github/workflows/deploy.yml` - Deploys path-filtered changes to production
+  on every push to `main`
   - **Manual trigger:** Use GitHub Actions UI to manually trigger deployment (Actions tab → Deploy → Run workflow)
-  - **Scheduled trigger:** Automatically runs daily at 2:00 AM UTC (6:00 PM PST) to deploy any merged changes
+  - **Automatic trigger:** Every merge/push to `main`
   - Detects changes via path filters and only deploys components with actual changes
   - Separate jobs for backend and partner-portal (agentweb repo) and customer portal (separate repo)
-  - Version labels: `<component>-<YYYYMMDD>-scheduled` or `<component>-<YYYYMMDD>-manual`
+  - Version labels: `<component>-<YYYYMMDD>-pr<PR-or-SHA>` or `<component>-<YYYYMMDD>-prmanual-<SHA>`
 
 ### Deployment Targets
 
@@ -452,7 +478,8 @@ Uses browser-use library with Playwright:
 
 ### Triggering Production Deployments
 
-**IMPORTANT:** Production deployments no longer trigger automatically on merge to main. This prevents disruptions during active usage times.
+**IMPORTANT:** A merge to `main` triggers the production workflow immediately. Treat merge as ship,
+watch the path-filtered deployment through completion, then run the PR's post-deploy smoke.
 
 **Option 1: Manual Deployment (via GitHub UI)**
 1. Go to the Actions tab in GitHub
@@ -462,8 +489,8 @@ Uses browser-use library with Playwright:
 5. Click "Run workflow" button
 6. The workflow will detect changes and deploy only components with actual changes
 
-**Option 2: Scheduled Deployment (automatic)**
-- Deployments automatically run daily at 2:00 AM UTC (6:00 PM PST)
+**Option 2: Merge Deployment (automatic)**
+- Deployments run automatically on every push/merge to `main`
 - Only deploys components with changes merged since the last deployment
 - Check the Actions tab to monitor deployment status
 
@@ -694,7 +721,10 @@ For example, a PR that fixes a bug and adds a feature should have at minimum: on
 
 ## Merging Pull Requests
 
-**NEVER use `--delete-branch` when merging PRs.** Always keep remote branches after merge. Use `gh pr merge <number> --merge` without the `--delete-branch` flag.
+Qualifying PRs merge automatically after the complete gate in "Autonomous execution and merge."
+Prefer configured GitHub auto-merge; if it cannot be used, `gh pr merge <number> --merge` is allowed
+after the same evidence is visible. **NEVER use `--delete-branch` when merging PRs.** Always keep
+remote branches after merge.
 
 ## Testing Strategy
 
@@ -705,7 +735,8 @@ Located in `backend/src/__tests__/`:
 - Integration tests for API endpoints
 - Mocking AWS services with Jest
 
-**Note:** Tests are NOT run in CI to reduce complexity. Run tests locally before submitting PRs.
+**Note:** Ready PRs that change `backend/**` run the split backend suites in CI. Local tests remain
+required because CI is a confirmation gate, not a substitute for pre-push validation.
 
 ```bash
 cd backend
@@ -849,4 +880,3 @@ When the user says **"prep for deploy \<date\>"** (default: today's date if omit
    - **This repo** (backend + partner-portal) — commit, push, and create a PR via `gh pr create`
    - **Customer portal** (separate repo at `customer-portal/`) — if there are changes, commit using `git -C customer-portal` commands, push, and create a PR
 4. Return both PR URLs to the user
-

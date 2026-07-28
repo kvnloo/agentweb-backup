@@ -25,7 +25,7 @@ export const LOOP_DIGEST_FOOTER =
 
 /**
  * Per-loop digest template. `TExtra` carries whatever loop-specific context
- * the sections need (drained mutation count, funnel shape, mutations, …).
+ * the sections need (mutation count, funnel shape, mutations, …).
  */
 export interface LoopDigestTemplate<TExtra = void> {
   /** Console-log prefix, e.g. '[agent-mode-loop]'. */
@@ -112,7 +112,9 @@ export function analystFindingsBody(result: LoopRunResult): string[] {
     const p = result.proposals[i];
     const directive = (p.payload as { directive?: string } | undefined)?.directive ?? '';
     lines.push(`${i + 1}. ${p.hypothesis}`);
-    lines.push(`   Kind: \`${p.kind}\`${directive ? `  |  Fix: ${directive}` : ''}`);
+    lines.push(
+      `   Proposal ID: \`${p.proposalId}\`  |  Kind: \`${p.kind}\`${directive ? `  |  Fix: ${directive}` : ''}`,
+    );
   }
   return lines;
 }

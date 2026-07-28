@@ -8,7 +8,6 @@
 
 import {
   _resetRegistryForTesting,
-  registerGate,
   registerLearningStore,
   registerLoop,
   registerRuleSet,
@@ -16,7 +15,6 @@ import {
   registerTools,
 } from '../loops';
 import type {
-  ApprovalGate,
   EventSource,
   LearningRecord,
   LearningStore,
@@ -35,8 +33,6 @@ const clock: ClockPort = { now: () => NOW };
 const sensor: EventSource<NormalizedEvent> = { fetchEvents: jest.fn().mockResolvedValue([]) };
 const rules: RuleSet<NormalizedEvent, unknown> = { evaluate: jest.fn().mockResolvedValue([]) };
 const tools: MutationTools<unknown> = { apply: jest.fn() };
-const gate: ApprovalGate = { requestApproval: jest.fn(), pollDecision: jest.fn() };
-
 function manifest(id: string, paused = false): LoopManifest {
   return {
     loopId: asLoopId(id),
@@ -48,7 +44,6 @@ function manifest(id: string, paused = false): LoopManifest {
     sensorImpl: `${id}:sensor`,
     rulesetImpl: `${id}:rules`,
     toolsImpl: `${id}:tools`,
-    gateImpl: `${id}:gate`,
     learningImpl: `${id}:learning`,
     thresholds: {
       promoteLiftPct: 10,
@@ -70,6 +65,7 @@ function manifest(id: string, paused = false): LoopManifest {
 function learningStore(records: LearningRecord[] = [], throws = false): LearningStore {
   return {
     record: jest.fn().mockResolvedValue(undefined),
+    recordDecisionIfAbsent: jest.fn().mockResolvedValue(true),
     queryHistory: throws
       ? jest.fn().mockRejectedValue(new Error('dynamo unavailable'))
       : jest.fn().mockResolvedValue(records),
@@ -81,7 +77,6 @@ function registerWith(m: LoopManifest, learning: LearningStore) {
   registerSensor(m.sensorImpl, sensor);
   registerRuleSet(m.rulesetImpl, rules);
   registerTools(m.toolsImpl, tools);
-  registerGate(m.gateImpl, gate);
   registerLearningStore(m.learningImpl, learning);
   registerLoop(m);
 }

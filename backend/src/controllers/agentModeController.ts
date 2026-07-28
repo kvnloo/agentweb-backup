@@ -13,6 +13,7 @@ import { settingsService } from '../services/settingsService';
 import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
@@ -34,6 +35,7 @@ import {
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
@@ -210,10 +212,10 @@ function getInteractiveShareExpiresAt(share: { expiresAt?: string; sharedAt?: st
 }
 
 /**
- * Auto-files a Notion "Customer Reported" issue for context-limit errors.
+ * Auto-files a Linear "Customer Reported" issue for context-limit errors.
  * Skips if the session already has contextLimitReported set (dedup).
  */
-async function autoReportContextLimitToNotion(
+async function autoReportContextLimitToLinear(
   sessionId: string | undefined,
   userEmail: string | undefined,
   userId: string | undefined,
@@ -226,7 +228,8 @@ async function autoReportContextLimitToNotion(
       title: `Context limit reached - session ${sessionId}`,
       description: `User hit the context window limit in agent mode.\n\nUser: ${userEmail || 'Unknown'}\nModel: ${llmModel || 'Not specified'}\nSession messages: ${session?.messages?.length ?? 'N/A'}\nSession title: ${session?.title || 'N/A'}`,
       source: 'Context limit',
-      notionTags: ['Customer Reported', 'Context Limit'],
+      executionRoute: 'human-triage',
+      extraLabels: ['Customer Reported', 'Context Limit'],
       notionContext: {
         'User ID': userId || 'N/A',
         'User Email': userEmail || 'N/A',
@@ -240,7 +243,7 @@ async function autoReportContextLimitToNotion(
       console.error('Failed to set contextLimitReported flag:', err)
     );
   } catch (err) {
-    console.error('Failed to create context-limit Notion item:', err);
+    console.error('Failed to create context-limit Linear issue:', err);
   }
 }
 
@@ -726,6 +729,85 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
   return INCOMPLETE_WORK_PATTERNS.some((re) => re.test(content));
 }
 
+// Deterministic, TOOL-CALL-based completion detector for scheduled runs (ENG-518).
+//
+// Some workflows split a mutation into a dry-run PREVIEW tool and a write-back
+// EXECUTE tool (the preview samples the result and its description tells the
+// model to confirm with the user before committing). In a scheduled, unattended
+// run the model can present the preview samples as if they were the deliverable
+// and end the turn — the enrichment is previewed but never committed. The
+// text/flag-based classifier above cannot see this: the closing text need not
+// admit anything or ask to confirm, so the gate lets the run finish mid-pipeline.
+//
+// This maps each preview tool to the execute tool that commits its result. If a
+// scheduled run previewed a list but never ran the execute counterpart FOR THAT
+// SAME LIST, the run stopped before write-back and needs one more continuation.
+const PREVIEW_EXECUTE_TOOL_PAIRS: Record<string, string> = {
+  enrich_leads_preview: 'enrich_leads_execute',
+};
+
+// The tool call arg identifying which CRM list a preview/execute call targeted.
+// list_id is a required arg on both tools; `arguments` is normally the parsed
+// object, but a preflight-failure path can carry the raw JSON string, so handle
+// both shapes.
+function previewExecuteListId(toolCall: any): string | null {
+  const args = toolCall?.arguments;
+  if (!args) return null;
+  if (typeof args === 'string') {
+    try {
+      const parsed = JSON.parse(args);
+      return typeof parsed?.list_id === 'string' ? parsed.list_id : null;
+    } catch {
+      return null;
+    }
+  }
+  return typeof args.list_id === 'string' ? args.list_id : null;
+}
+
+// Deterministic, PER-LIST, RESULT-AWARE detector for the preview→write-back gap.
+//
+// Takes the whole run's accumulated tool-call objects ({ name, arguments, result }).
+// For each preview/execute pair it fires only when a list was previewed AND the
+// engine confirmed that preview is enrichable (processedCount > 0) AND no execute
+// ran for that same list_id. This deliberately does NOT fire for:
+//   - a list whose preview resolved nobody (processedCount 0): forcing a write there
+//     would loop on an unenrichable list and commit nothing useful; and
+//   - a list already committed by its execute call (per-list, so a partial
+//     multi-list run still fires for the lists that were NOT executed).
+// Both narrowings keep the gate from commanding CRM writes a preview never warranted.
+export function scheduledRunPreviewedWithoutExecute(toolCalls: any[]): boolean {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return false;
+  return Object.entries(PREVIEW_EXECUTE_TOOL_PAIRS).some(([previewTool, executeTool]) => {
+    const enrichablePreviewedLists = new Set<string>();
+    const executedLists = new Set<string>();
+    for (const tc of toolCalls) {
+      const listId = previewExecuteListId(tc);
+      if (!listId) continue;
+      if (tc?.name === previewTool) {
+        if (Number(tc?.result?.processedCount) > 0) enrichablePreviewedLists.add(listId);
+      } else if (tc?.name === executeTool) {
+        // Only a SUCCESSFUL write-back closes the gap. An execute closes a list
+        // when it (a) did not throw, (b) persisted at least one record
+        // (processedCount > 0), and (c) had NO write-back failure
+        // (failureBreakdown.updateFailed === 0). A thrown/zero-write execute, or one
+        // that produced values but failed to PERSIST some of them (updateFailed > 0
+        // — a genuine uncommitted write, distinct from a lead the engine simply
+        // could not resolve or find data for), leaves the enrichment uncommitted, so
+        // the gate keeps chasing (bounded by completionGateMaxContinuations) to
+        // retry the write instead of silently accepting a partially-persisted list.
+        const r = tc?.result;
+        const persistedSomething = Number(r?.processedCount) > 0;
+        const hadWriteFailure = Number(r?.failureBreakdown?.updateFailed) > 0;
+        if (!tc?.error && persistedSomething && !hadWriteFailure) executedLists.add(listId);
+      }
+    }
+    for (const listId of enrichablePreviewedLists) {
+      if (!executedLists.has(listId)) return true;
+    }
+    return false;
+  });
+}
+
 // Deterministic detector for the ENG-369 failure mode: a scheduled/unattended
 // run that halted to ask a HUMAN to confirm/approve before proceeding, when no
 // human is present to answer — so the task dead-ends with no deliverable.
@@ -784,6 +866,20 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   /\bwhich\s+(?:option|one|approach|route|path|of\s+(?:these|the))\b[^\n?!]*\byou\b/i,
   // "would you prefer / would you rather …"
   /\bwould\s+you\s+(?:prefer|rather)\b/i,
+  // Deterministic backstop for ENG-480: the run reframes an impossible per-item
+  // pattern correctly but STILL dead-ends by asking the human to supply a scope
+  // parameter (a date range / time window) before it will deliver — a novel
+  // phrasing the LLM judge is the only other line of defense against, and that
+  // judge fails safe when its provider is unavailable. Two scoped catches:
+  //   "Reply 'last 24h' (or give me an exact date range) and I'll generate…" —
+  //   the turn tells the user to REPLY WITH A VALUE and dangles the deliverable
+  //   behind it. Anchored on reply + a quoted value + a following "(", "," or
+  //   "or" so a report that merely quotes text ("reply to my email") can't match.
+  /\breply\s+["'“”][^"'“”\n]{1,40}["'“”]\s*(?:\(|,|\bor\b)/i,
+  //   "what time window / date range / period … do you want?" — asks the human to
+  //   specify the scope before proceeding. Scoped to scope-nouns so a delivered
+  //   report asking a rhetorical "what does this mean" cannot trip it.
+  /\bwhat\s+(?:time\s*window|date\s*range|range|time\s*frame|period|scope|window|day|month|week)\b[^\n?]{0,50}\bdo\s+you\b/i,
 ];
 
 // Markdown emphasis and inline code fences (**bold**, _italic_, `code`) split
@@ -803,7 +899,7 @@ export function scheduledRunAwaitsConfirmation(content: string): boolean {
 // The distinct reasons a scheduled run's latest turn needs one more
 // continuation before it can be considered finished. null = no continuation
 // needed. Ordered by precedence when more than one signal is present.
-export type ScheduledContinuationReason = 'budget' | 'confirmation' | 'unfinished';
+export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmation' | 'unfinished';
 
 // Classify why (if at all) a scheduled run's latest turn needs a continuation:
 //   (a) 'budget' — the run was truncated because it exhausted its step budget
@@ -817,13 +913,19 @@ export type ScheduledContinuationReason = 'budget' | 'confirmation' | 'unfinishe
 //       before proceeding, with no human present to answer (ENG-369); or
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
 //       (scheduledRunSignalsIncompleteWork).
-// Budget truncation takes precedence (it is a hard state signal); a
+// A 'preview-only' write-back gap (ENG-518) takes precedence over everything: it
+// is a hard, tool-call-based fact (a list was previewed as enrichable but its
+// execute counterpart never committed it) that stays true whatever the closing
+// text said, and its continuation message is the most specific ("commit the
+// write-back now"). Budget truncation comes next (also a hard state signal); a
 // confirmation halt takes precedence over a plain unfinished-work admission so
 // the continuation message can be tailored to "proceed best-effort".
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  toolCalls?: any[];
 }): ScheduledContinuationReason | null {
+  if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
@@ -836,6 +938,7 @@ export function classifyScheduledContinuation(response: {
 export function scheduledRunSignalsIncompleteResponse(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  toolCalls?: any[];
 }): boolean {
   return classifyScheduledContinuation(response) !== null;
 }
@@ -898,13 +1001,50 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
 export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  toolCalls?: any[];
 }): Promise<ScheduledContinuationReason | null> {
+  if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (await scheduledTurnDefersToUser(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
+
+// Result shape of a verified/scheduled chat run. Named so the ENG-396
+// park/auto-take helper can return the same type the function returns.
+type RunVerifiedChatResult = {
+  success: boolean;
+  content: string;
+  toolCalls: any[];
+  keywordMatches: string[];
+  keywordMisses: string[];
+  functionCallMatches: string[];
+  functionCallMisses: string[];
+  functionStatus: Array<{
+    functionName: string;
+    requiredCount: number;
+    actualCount: number;
+    met: boolean;
+  }>;
+  attempts: number;
+  workPlanCompleted: boolean;
+  // ENG-396: set when a headless turn left an unanswered blocking AskUserQuestion.
+  // The run stopped without proceeding on a guess; a human must answer it. The
+  // scheduled caller maps this to a `pending_user_input` outcome and notifies.
+  parked?: boolean;
+  pendingUserQuestion?: PendingUserQuestion;
+  // ENG-636: set when a run had to stop on a blocking question but the caller has
+  // NO channel to reach a human (headless, fire-and-forget). The run failed
+  // explicitly instead of parking into a void; there is no pendingUserQuestion to
+  // answer. Distinct from `parked` so monitoring/callers can tell the two apart.
+  parkedUnnotifiable?: boolean;
+  // ENG-635: the run met its tool/keyword requirements but its final turn still
+  // deferred to an absent human (completion gate exhausted while still asking to
+  // confirm). `success` stays true (a deliverable existed for HTTP callers), but the
+  // SCHEDULED path treats this as a failed run (records failure + oncall).
+  deferredUnresolved?: boolean;
+};
 
 // Common function to run verified chat with work plan, keywords, and function call verification
 // Used by both scheduled chat and verified-generate
@@ -924,24 +1064,23 @@ export async function runVerifiedChat(
     // before returning success. Default off so other callers are unaffected.
     completionGate?: boolean;
     completionGateMaxContinuations?: number;
+    // ENG-396: opt-in "full autonomy" (from the schedule). When true, a headless
+    // turn that hits a blocking AskUserQuestion AUTO-TAKES Emma's recommended
+    // option (logged as delegation) and continues, instead of parking — including
+    // for IMMUTABLE questions. This is a deliberate, default-off WAIVER of the
+    // human protection on irreversible decisions (owner opted in per-schedule).
+    fullAutonomy?: boolean;
+    // ENG-636: does a PARK on this run actually reach a human? Only true for
+    // callers with a notification/answer channel: runScheduledChat (owner email)
+    // and the interactive verifiedGenerate endpoint (the live session renders the
+    // pendingUserQuestion card). Default FALSE so any headless, fire-and-forget
+    // caller (resultEndpoint, imageReports, slack/humanEval/revision) is fail-safe:
+    // an unanswerable park is surfaced as an explicit `parkedUnnotifiable` failure
+    // rather than dropped into a void no one will ever action. Fail-safe default
+    // means a NEW headless caller is covered automatically (no drift).
+    parkNotifiable?: boolean;
   }
-): Promise<{
-  success: boolean;
-  content: string;
-  toolCalls: any[];
-  keywordMatches: string[];
-  keywordMisses: string[];
-  functionCallMatches: string[];
-  functionCallMisses: string[];
-  functionStatus: Array<{
-    functionName: string;
-    requiredCount: number;
-    actualCount: number;
-    met: boolean;
-  }>;
-  attempts: number;
-  workPlanCompleted: boolean;
-}> {
+): Promise<RunVerifiedChatResult> {
   const {
     sessionId,
     userId,
@@ -951,8 +1090,16 @@ export async function runVerifiedChat(
     maxAttempts = 20,
     attachments = [],
     completionGate = false,
-    completionGateMaxContinuations = 2
+    completionGateMaxContinuations = 2,
+    fullAutonomy = false,
+    parkNotifiable = false
   } = params;
+
+  // ENG-396: bound how many times a single full-autonomy run may auto-take a
+  // question, so a model that keeps re-asking cannot loop until maxAttempts. Once
+  // exhausted, the run parks (falls back to the safe default).
+  let autoTakesUsed = 0;
+  const MAX_AUTO_TAKES = 3;
 
   // Tracks how many completion-gate continuation turns we've already spent, so a
   // model that keeps admitting "not finished" can't loop indefinitely.
@@ -1071,6 +1218,121 @@ export async function runVerifiedChat(
   // or 'unfinished' (admitted it left per-entity work undone).
   let completionGateReason: ScheduledContinuationReason = 'unfinished';
 
+  // ENG-396: A turn — the MAIN turn OR a completion-gate continuation turn — may
+  // have left an unanswered blocking AskUserQuestion (the tool handler persisted
+  // it via updateSessionAskUserQuestion). Handle it identically at BOTH LLM call
+  // sites so the park guarantee can never be bypassed: re-read from the DB (never
+  // trust a stale in-memory blank), then decide between AUTO-TAKE and PARK.
+  //
+  // ENG-517: a headless/scheduled run must NOT block on a REVERSIBLE question —
+  // a data shortfall, report-scope choice, etc. has an obvious safe default
+  // (Emma's recommended option), so auto-take it and keep going rather than
+  // parking and never delivering. IMMUTABLE questions (e.g. the Meta campaign
+  // objective) still PARK unless the schedule opted into full autonomy — those
+  // are the irreversible decisions a human must own (auto-taking one is the
+  // deliberate per-schedule WAIVER that `fullAutonomy` represents).
+  //
+  // Either way the auto-take is bounded (MAX_AUTO_TAKES) and logged as a
+  // delegation. Returns 'autoTake' (caller retries), a 'park' result to return,
+  // or null when no question is awaiting.
+  const resolveAwaitingUserQuestion = async (): Promise<
+    { action: 'autoTake' } | { action: 'park'; result: RunVerifiedChatResult } | null
+  > => {
+    const postTurnSession = await chatbotDb.getChatSession(sessionId);
+    if (postTurnSession?.pendingUserQuestion?.status !== 'awaiting') return null;
+    const pending = postTurnSession.pendingUserQuestion;
+
+    // Reversible questions auto-proceed in any headless run; immutable ones only
+    // when the schedule explicitly waived the human protection (full autonomy).
+    const canAutoTake = fullAutonomy || pending.immutable !== true;
+    if (canAutoTake && autoTakesUsed < MAX_AUTO_TAKES) {
+      autoTakesUsed++;
+      const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
+      await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
+        requireStillAwaiting: pending.questionId,
+      });
+      const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
+      const takeKind = fullAutonomy && pending.immutable === true ? 'full-autonomy' : 'reversible-default';
+      console.log(
+        `AgentMode runVerifiedChat: ${takeKind} auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
+      );
+      // Breadcrumb in history so Emma sees the decision and resumes without
+      // re-asking (best-effort; the persisted answer is the source of truth).
+      // Label the breadcrumb by the actual session, not the trigger: runVerifiedChat
+      // is also invoked from non-scheduled callers (verifiedGenerate, slack revision,
+      // revisionService, humanEvalActionService, imageReports), so hardcoding
+      // '[Scheduled run]' would write a false label into those sessions' history.
+      const breadcrumbPrefix =
+        fullAutonomy && pending.immutable === true
+          ? '[Full autonomy]'
+          : postTurnSession.sessionType === 'scheduled'
+            ? '[Scheduled run]'
+            : '[Auto-proceed]';
+      try {
+        await chatbotDb.addMessageToSession(sessionId, {
+          role: 'user',
+          content: `${breadcrumbPrefix} Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
+          timestamp: new Date().toISOString(),
+          metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
+        });
+      } catch (breadcrumbError) {
+        console.error('Failed to persist auto-take breadcrumb:', breadcrumbError);
+      }
+      return { action: 'autoTake' };
+    }
+
+    // Shared failure body for both park variants below.
+    const stopResultBase = {
+      success: false as const,
+      content: allContent,
+      toolCalls: allToolCalls,
+      keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+      keywordMisses: remainingKeywords,
+      functionCallMatches: [] as string[],
+      functionCallMisses: requiredFunctions.map(f => f.functionName),
+      functionStatus: requiredFunctions.map(reqFunc => ({
+        functionName: reqFunc.functionName,
+        requiredCount: reqFunc.minCount,
+        actualCount: countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting),
+        met: false,
+      })),
+      attempts: attempt,
+      workPlanCompleted: false,
+    };
+
+    // ENG-636: a PARK only makes sense when a human will actually see and answer
+    // the question. Callers with a notification/answer channel (scheduled →
+    // owner email; interactive verifiedGenerate → live session card) set
+    // parkNotifiable. Headless, fire-and-forget callers do NOT — for them a park
+    // is a dead end: no one is told, no one can answer, and the run silently
+    // delivers nothing. In that case FAIL EXPLICITLY (parkedUnnotifiable) instead
+    // of returning a pendingUserQuestion nobody will ever action. This is the
+    // correct terminal behavior for an IMMUTABLE question too: we must never
+    // auto-decide an irreversible choice, and the write gate still blocks the
+    // action — so an honest, monitorable failure is the safe outcome.
+    if (!parkNotifiable) {
+      console.error(
+        `AgentMode runVerifiedChat: session ${sessionId} hit a blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) after ${autoTakesUsed} auto-take(s), but this run has NO channel to reach a human (parkNotifiable=false). Failing explicitly rather than parking into a void — no deliverable, no one to answer (ENG-636).`
+      );
+      return {
+        action: 'park',
+        result: { ...stopResultBase, parkedUnnotifiable: true },
+      };
+    }
+
+    console.warn(
+      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) awaiting a human selection after ${autoTakesUsed} auto-take(s); run will not proceed on a guess. A human will be notified (scheduled owner email / interactive card).`
+    );
+    return {
+      action: 'park',
+      result: {
+        ...stopResultBase,
+        parked: true,
+        pendingUserQuestion: postTurnSession.pendingUserQuestion,
+      },
+    };
+  };
+
   while (attempt < maxAttempts) {
     attempt++;
 
@@ -1085,7 +1347,24 @@ export async function runVerifiedChat(
         // to proceed best-effort rather than to "finish remaining entities" (ENG-369).
         completionGateContinue = false;
         userMessage =
-          completionGateReason === 'budget'
+          completionGateReason === 'preview-only'
+            ? 'Your previous run produced enrichment PREVIEWS (a dry-run sample) but ' +
+              'never committed them with the write-back step (enrich_leads_execute), and ' +
+              'a preview does not change any data. This is an automated run with no human ' +
+              'present — do NOT wait for confirmation or approval. Act on what THIS ' +
+              "scheduled task actually asked for:\n" +
+              '• If the task asked you to ENRICH, update, populate, refresh, or fill in ' +
+              'the leads (the usual case), you MUST now call enrich_leads_execute for ' +
+              'every list whose preview was enrichable (processedCount > 0), using the ' +
+              'same output_fields you previewed — do not merely describe what would ' +
+              'happen; actually run the write-back. Skip only a list whose preview ' +
+              'failed (processedCount === 0 with identityResolutionFailed > 0).\n' +
+              '• If, and only if, the task EXPLICITLY asked to preview / sample / show ' +
+              'what enrichment WOULD do WITHOUT changing the data, do NOT call ' +
+              'enrich_leads_execute — deliver that preview report instead.\n' +
+              'Then complete the rest of the requested workflow (e.g. recommendations, ' +
+              'drafts) and produce the final report.'
+          : completionGateReason === 'budget'
             ? 'The previous run was cut short because it exhausted its processing-step ' +
               'budget before it could produce the final deliverable. Using the data ' +
               'already gathered, produce the final consolidated report now. Surface any ' +
@@ -1119,8 +1398,26 @@ export async function runVerifiedChat(
         allActualFunctionCallsForReporting.push(
           ...continuationToolCalls.map((call: any) => call.name).filter(Boolean)
         );
-        // Re-evaluate the gate against the continuation's own output.
-        const continuationReason = await classifyScheduledContinuationAsync(continuationResponse);
+        // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
+        // AskUserQuestion. Route it through the same park/auto-take handler as the
+        // main turn instead of falling through and returning success on an
+        // unanswered question (the second LLM call site the original park missed).
+        const continuationQuestion = await resolveAwaitingUserQuestion();
+        if (continuationQuestion?.action === 'autoTake') {
+          await waitForVerifiedChatRetry(attempt);
+          continue;
+        }
+        if (continuationQuestion?.action === 'park') {
+          return continuationQuestion.result;
+        }
+        // Re-evaluate the gate against the continuation's own output. Pass the
+        // whole run's accumulated tool-call objects (name + arguments + result) so a
+        // still-uncommitted per-list preview→execute gap (ENG-518) keeps the gate
+        // firing until the write-back actually runs for every enrichable list.
+        const continuationReason = await classifyScheduledContinuationAsync({
+          ...continuationResponse,
+          toolCalls: allToolCalls,
+        });
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -1132,9 +1429,27 @@ export async function runVerifiedChat(
           await waitForVerifiedChatRetry(attempt);
           continue;
         }
-        // Continuation produced no further "unfinished" admission → done.
+        // ENG-635: the continuation budget (or attempt budget) is exhausted. If this
+        // final continuation STILL defers the task to an absent human (a 'confirmation'
+        // halt) rather than delivering, the run produced no real deliverable. Flag it
+        // via `deferredUnresolved` (rather than flipping `success`) so the SCHEDULED
+        // path records a failure + oncall, WITHOUT changing the success/HTTP contract
+        // for non-scheduled callers (imageReports/revision/etc.) — those met their
+        // required tool calls, so a deliverable DID exist and they must not 500.
+        // Scoped to 'confirmation' only: an 'unfinished'/'budget' turn that still
+        // surfaces a partial report with actionable next-steps is a valid terminal state.
+        const haltedUnresolved = continuationReason === 'confirmation';
+        if (haltedUnresolved) {
+          console.warn(
+            `AgentMode runVerifiedChat: session ${sessionId} exhausted the completion gate ` +
+            `(${completionGateContinuationsUsed}/${completionGateMaxContinuations}) but the final turn still ` +
+            `defers to the user — flagging deferredUnresolved (scheduled runs record a failure).`
+          );
+        }
+        // Continuation produced no further blocking signal (or an accepted partial) → done.
         return {
           success: true,
+          deferredUnresolved: haltedUnresolved,
           content: allContent,
           toolCalls: allToolCalls,
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
@@ -1221,6 +1536,18 @@ export async function runVerifiedChat(
 
       allActualFunctionCallsForReporting.push(...actualFunctionCalls);
 
+      // ENG-396: this MAIN turn may have left an unanswered blocking
+      // AskUserQuestion — auto-take (full autonomy) or park before doing anything
+      // else. Same handler covers the completion-gate continuation turn below.
+      const mainTurnQuestion = await resolveAwaitingUserQuestion();
+      if (mainTurnQuestion?.action === 'autoTake') {
+        await waitForVerifiedChatRetry(attempt);
+        continue;
+      }
+      if (mainTurnQuestion?.action === 'park') {
+        return mainTurnQuestion.result;
+      }
+
       // Check work plan status
       const workPlan = response.workPlan;
       const workPlanCompleted = workPlan && workPlan.steps.every((step: any) => step.status === 'completed' || step.status === 'skipped');
@@ -1277,7 +1604,13 @@ export async function runVerifiedChat(
         completionGateContinuationsUsed < completionGateMaxContinuations &&
         attempt < maxAttempts;
       const responseContinuationReason = gateEligible
-        ? await classifyScheduledContinuationAsync(response)
+        ? await classifyScheduledContinuationAsync({
+            ...response,
+            // Preview→execute detection needs the whole run's tool-call objects
+            // (name + arguments + result), not just this turn's — an earlier attempt
+            // may hold the unmatched, still-uncommitted preview.
+            toolCalls: allToolCalls,
+          })
         : null;
       if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
@@ -1436,7 +1769,8 @@ export async function runScheduledChat(
 ): Promise<{
   scheduleId: string;
   runId: string;
-  status: 'success' | 'failure';
+  // ENG-396: 'pending_user_input' when the run parked on a blocking AskUserQuestion.
+  status: 'success' | 'failure' | 'pending_user_input';
   passed: boolean;
   actualResponse: string;
   actualFunctionCalls: string[];
@@ -1449,6 +1783,8 @@ export async function runScheduledChat(
   attempt: number;
   createdAt: string;
   summary?: string;
+  // Present only on a parked run — links the pending question for the UI.
+  pendingQuestionId?: string;
 }> {
   const now = new Date();
   let sessionId: string = '';
@@ -1756,8 +2092,70 @@ export async function runScheduledChat(
       llmModel: schedule.llmModel || defaultModel,
       // Deterministic backstop for multi-entity scheduled runs (PR #1941 follow-up):
       // if the run admits it left work unfinished, auto-continue before finishing.
-      completionGate: true
+      completionGate: true,
+      // ENG-396: opt-in per-schedule full autonomy — auto-take Emma's recommended
+      // option on a blocking question instead of parking (waives the human gate on
+      // irreversible decisions; default off).
+      fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-636: a scheduled park IS notifiable — the block below emails the owner
+      // and records a `pending_user_input` outcome, so a park reaches a human.
+      parkNotifiable: true
     });
+
+    // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
+    // It did NOT proceed on a guess. Record a `pending_user_input` outcome and
+    // notify the owner so they can make the choice; this is NOT a failure, so we
+    // early-return BEFORE the oncall/auto-issue path. `sessionId: ''` reuses the
+    // established convention (see error/token paths) so the orchestrator/callers
+    // skip their normal result email — the paused email below carries the link.
+    if (result.parked && result.pendingUserQuestion) {
+      const scheduleUser = await userDb.getUserById(userId);
+      const notifyEmails = (schedule.emailNotifications && schedule.emailNotifications.length > 0)
+        ? schedule.emailNotifications
+        : (scheduleUser?.email ? [scheduleUser.email] : []);
+      if (notifyEmails.length > 0) {
+        await emailService.sendScheduledChatPausedForInputEmail(
+          notifyEmails,
+          schedule.scheduleName,
+          schedule.scheduleId,
+          result.pendingUserQuestion.question,
+          sessionId
+        );
+      } else {
+        // Parked but no recipient (no emailNotifications and no account email) — the
+        // owner won't be notified. Surface it loudly rather than parking silently.
+        console.warn(
+          `AgentMode runScheduledChat: schedule ${schedule.scheduleId} parked on a user question but has NO notification recipient — owner will not be told. Session ${sessionId}, question ${result.pendingUserQuestion.questionId}`
+        );
+      }
+
+      const parkedResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'pending_user_input' as const,
+        passed: false,
+        actualResponse: result.content,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: [],
+        functionCallMatches: [],
+        functionCallMisses: [],
+        functionCallDetails: {},
+        executionTime: Date.now() - now.getTime(),
+        // Empty on purpose — suppresses the callers' result email (the paused
+        // email already notified). The pending question id links back for the UI.
+        sessionId: '',
+        pendingQuestionId: result.pendingUserQuestion.questionId,
+        attempt: result.attempts,
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await scheduleDb.addRunResult(schedule.scheduleId, parkedResult);
+      } catch (error) {
+        console.error('Error saving parked run result:', error);
+      }
+      return parkedResult;
+    }
 
     if (!isTest && process.env.NODE_ENV !== 'test') {
       const hasAssistantMessage = await sessionHasAssistantMessage(sessionId);
@@ -1799,11 +2197,16 @@ export async function runScheduledChat(
       };
     });
 
+    // ENG-635: a run that met its requirements but still deferred to an absent human
+    // (deferredUnresolved) produced no real deliverable — record it as a failure so it
+    // is surfaced (auto-issue + oncall) instead of scored as a clean run.
+    const runDelivered = result.success && !result.deferredUnresolved;
+
     const finalResult = {
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
-      status: (result.success ? 'success' : 'failure') as 'success' | 'failure',
-      passed: result.success,
+      status: (runDelivered ? 'success' : 'failure') as 'success' | 'failure',
+      passed: runDelivered,
       actualResponse: result.content,
       actualFunctionCalls: actualFunctionCalls,
       keywordMatches: result.keywordMatches,
@@ -2416,7 +2819,14 @@ export async function generateSessionResponse(
   isInteractiveShare?: boolean,
   pageContext?: { currentUrl?: string; structuredContext?: string; screenshot?: string },
   isDelegatedAccess?: boolean,
-  ishareSenderInfo?: { ip?: string; userAgent?: string }
+  ishareSenderInfo?: { ip?: string; userAgent?: string },
+  // ENG-396: a model-visible directive (from buildAnswerAcknowledgement) appended to
+  // THIS turn's LLM content so Emma opens her reply by naming the chosen option.
+  // Never stored on the displayed user bubble.
+  answerAck?: string,
+  // ENG-396: the structured selection stamped on this reply's metadata, so a card can
+  // show which option was CLICKED (never inferred from the message text).
+  answeredQuestionMeta?: { questionId: string; optionId: string; delegated: boolean }
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -2463,6 +2873,12 @@ export async function generateSessionResponse(
     messageContent += `\n\n[Current page: ${pageContext.currentUrl}]`;
   }
 
+  // ENG-396: when this turn answers an AskUserQuestion, append a directive (LLM-only)
+  // so Emma explicitly names the chosen option in her reply — not just the card footer.
+  if (answerAck) {
+    messageContent += `\n\n${answerAck}`;
+  }
+
   // Create user message object - store processed content with attachments
   const userMessageObj = {
     role: 'user' as const,
@@ -2479,7 +2895,10 @@ export async function generateSessionResponse(
           ...(ishareSenderInfo?.ip ? { ip: ishareSenderInfo.ip } : {}),
           ...(ishareSenderInfo?.userAgent ? { userAgent: ishareSenderInfo.userAgent } : {}),
         }
-      } : {})
+      } : {}),
+      // ENG-396: structured record of the card selection this reply answered (from a
+      // click, not the text). The card reads this to show which option was chosen.
+      ...(answeredQuestionMeta ? { askUserQuestionAnswer: answeredQuestionMeta } : {})
     }
   };
 
@@ -3026,7 +3445,7 @@ export const agentModeController = {
     let idemKeyHeld: string | undefined;
     try {
       const user = req.user as User;
-      const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput } = req.body;
+      const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
       let { userMessage } = req.body;
 
       // If the request contains audio, transcribe it to text first
@@ -3063,6 +3482,97 @@ export const agentModeController = {
       }
       if (session.userId !== user.userId && !user.isAdmin) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
+      }
+
+      // ENG-396: structured AskUserQuestion answer channel. When the chat card
+      // posts a selection, resolve it against the session's pending question and
+      // persist the ANSWERED state BEFORE the run starts, so the consumer gate
+      // (checkQuestionGate — e.g. the Meta objective write, ENG-400) reads a
+      // human-attributed answer from the DB rather than parsing it from prose.
+      // Placed before the idempotency/session locks so a bad selection returns
+      // cleanly with no lock to release. answeredBy is derived server-side inside
+      // resolveInboundAnswer — the client cannot forge who answered.
+      let answerAck: string | undefined;
+      let answeredQuestionMeta: { questionId: string; optionId: string; delegated: boolean } | undefined;
+      if (questionAnswer) {
+        try {
+          const answered = resolveInboundAnswer(
+            session.pendingUserQuestion,
+            {
+              questionId: questionAnswer.questionId,
+              optionId: questionAnswer.optionId,
+              delegated: questionAnswer.delegated === true,
+            },
+            new Date().toISOString(),
+          );
+          // Optimistic-locked: only persists if the question is STILL exactly
+          // this one and STILL 'awaiting' at write time. Without this, two
+          // concurrent submissions (e.g. a double-click) could both validate
+          // against the same in-memory snapshot and the later write would
+          // silently clobber the earlier answer.
+          const persisted = await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
+            requireStillAwaiting: session.pendingUserQuestion!.questionId,
+          });
+          if (!persisted) {
+            // Lost the race to a concurrent submission that already answered
+            // this same question — refresh and re-render rather than silently
+            // overwriting whichever answer actually won.
+            return res.status(409).json({
+              error: 'This question was already answered by a concurrent request.',
+              code: 'ASK_USER_QUESTION_INVALID',
+            });
+          }
+          // ENG-396: make Emma name the chosen option in her reply (esp. for delegation,
+          // where the user's "Let Emma decide" bubble doesn't say which option won).
+          answerAck = buildAnswerAcknowledgement(answered) ?? undefined;
+          // ENG-396: stamp the STRUCTURED selection on this reply so the card reads which
+          // option was chosen from the click record — never inferred from prose. Superseded
+          // cards read this instead of matching chat text.
+          if (answered.answer) {
+            answeredQuestionMeta = {
+              questionId: answered.questionId,
+              optionId: answered.answer.optionId,
+              delegated: answered.answer.delegated === true,
+            };
+          }
+        } catch (err) {
+          if (err instanceof AskUserQuestionError) {
+            // Stale/duplicate/invalid selection (e.g. the card was already
+            // answered, or the questionId no longer matches). 409 so the client
+            // can refresh the session and re-render the current question state.
+            return res.status(409).json({ error: err.message, code: 'ASK_USER_QUESTION_INVALID' });
+          }
+          throw err;
+        }
+      } else if (session.pendingUserQuestion?.status === 'awaiting') {
+        // ENG-396: the user typed a message instead of clicking the open card. Per the
+        // primitive's model, a selection is ONLY an explicit click — never inferred from
+        // prose. So the open question is abandoned: clear it (the old card freezes as
+        // "not answered" history) so the one-live-question guard lets Emma re-ask with a
+        // FRESH card. The irreversible-write gate still blocks until a real structured
+        // answer lands, so this can't rubber-stamp. Inject a directive so Emma re-asks
+        // THAT SAME question instead of inferring a choice from the prose and advancing.
+        // Optimistic-locked (Greptile P1, "Typed messages bypass answer lock"):
+        // a card-answer submission racing this typed message could already have
+        // persisted a real answer between our read and this write. An
+        // unconditional clear would then erase that just-landed answer (or,
+        // the other way round, this clear could land first and make the valid
+        // answer submission fail with a false "already answered"). Guard the
+        // clear on the question still being exactly this one, still awaiting.
+        const abandoned = session.pendingUserQuestion;
+        const cleared = await chatbotDb.updateSessionAskUserQuestion(sessionId, null, {
+          requireStillAwaiting: abandoned.questionId,
+        });
+        if (cleared) {
+          session.pendingUserQuestion = undefined;
+          answerAck = buildReaskDirective(abandoned);
+        } else {
+          // Lost the race — a concurrent structured answer already resolved
+          // this question. Re-read the fresh state so the run proceeds against
+          // the REAL answer rather than silently discarding it.
+          const fresh = await chatbotDb.getChatSession(sessionId);
+          session.pendingUserQuestion = fresh?.pendingUserQuestion;
+        }
       }
 
       // Cross-restart duplicate-submit lock (ENG-147: one question spawned ~30
@@ -3184,6 +3694,10 @@ export const agentModeController = {
         }
       }
 
+      // ENG-510: stamp when this turn's generation began so that, if the whole-turn cap
+      // kills it mid-flight, we count only the media THIS turn saved (not prior turns').
+      const turnStartMs = Date.now();
+
       // Capture the generation promise so the durable path can reattach to it if the
       // run times out while the work is still going (it keeps running detached).
       const genPromise = generateSessionResponse(
@@ -3194,7 +3708,10 @@ export const agentModeController = {
         attachments,
         undefined, // isInteractiveShare
         pageContext,
-        isDelegatedAccessForMessage
+        isDelegatedAccessForMessage,
+        undefined, // ishareSenderInfo
+        answerAck, // ENG-396: make Emma name the chosen option in her reply
+        answeredQuestionMeta // ENG-396: structured click record stamped on the reply
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -3255,6 +3772,40 @@ export const agentModeController = {
           console.log(`AgentMode: generation timed out for session ${sessionId} — cancelling orphaned worker run`);
           requestCancel(sessionId);
           generateMarketingResponseWorkerService.cancelSession(sessionId);
+
+          // ENG-510: the cap can fire AFTER one or more image variants already finished
+          // and were saved (synchronous image-generated markers). A bare 504 there hides
+          // that finished work and leaves the user with no idea that "continue" will
+          // complete the rest. If this turn delivered >= 1 image, persist a clear
+          // partial-delivery message and return it (200) instead — Emma then resumes ONLY
+          // the still-missing assets on "continue" (it sees the saved markers in history).
+          // Non-media timeouts fall through to the existing 504 unchanged.
+          try {
+            // ENG-510: strongly consistent read — a marker written moments before the cap
+            // fired must not be missed by an eventually-consistent read (which would drop
+            // to a bare 504 despite a completed, saved image).
+            const timedOutSession = await chatbotDb.getChatSession(sessionId, true);
+            const timeoutImages = collectMediaGeneratedSince(timedOutSession?.messages, turnStartMs);
+            const continuationMsg = buildTimeoutContinuationMessage(timeoutImages);
+            if (continuationMsg) {
+              markProgressComplete(sessionId);
+              await chatbotDb.addMessageToSession(sessionId, {
+                role: 'assistant',
+                content: continuationMsg,
+                timestamp: new Date().toISOString(),
+                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+              }).catch((persistErr) =>
+                console.error('AgentMode: failed to persist timeout continuation message:', persistErr),
+              );
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_media' });
+              }
+              res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+              return;
+            }
+          } catch (continuationErr) {
+            console.error('AgentMode: partial-media timeout continuation failed (falling through to 504):', continuationErr);
+          }
         }
         throw genErr; // preserve existing error handling (returns 504 GENERATION_TIMEOUT)
       }
@@ -3474,8 +4025,8 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
-          autoReportContextLimitToNotion(sessionId, user?.email, user?.userId, llmModel, session)
-            .catch(err => console.error('autoReportContextLimitToNotion failed:', err));
+          autoReportContextLimitToLinear(sessionId, user?.email, user?.userId, llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToLinear failed:', err));
 
           res.status(413).json({
             error: 'Context limit exceeded',
@@ -3913,7 +4464,12 @@ export const agentModeController = {
           hasActiveProgress: hasActiveProgress(session.sessionId),
           supportNote: supportNote,
           skills: sharedSkills,
-          slackThread: session.slackThread
+          slackThread: session.slackThread,
+          // ENG-396: expose the AskUserQuestion state so a shared/read-only card can
+          // reflect the real answered option (highlight + "Answered") instead of a bare
+          // "View only". Everything here is already visible in the transcript's card, so
+          // it leaks nothing new; the share stays read-only via the card's readOnly path.
+          pendingUserQuestion: session.pendingUserQuestion
         }
       });
 
@@ -3952,6 +4508,8 @@ export const agentModeController = {
 
   // Generate response for shared conversation (with conversable token)
   async generateSharedResponse(req: Request, res: Response) {
+    // ENG-510: declared before the try so the catch's partial-timeout branch can read it.
+    let sharedTurnStartMs = Date.now();
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
@@ -4014,6 +4572,9 @@ export const agentModeController = {
         ip: req.ip || (req.headers?.['x-forwarded-for'] as string | undefined)?.split(',')[0].trim(),
         userAgent: req.headers?.['user-agent'] as string | undefined,
       };
+      // ENG-510: stamp when this turn began so a whole-turn-cap kill can count only the
+      // media THIS turn saved (see the partial-delivery branch in the catch below).
+      sharedTurnStartMs = Date.now();
       const response = await withGenerationTimeout(
         generateSessionResponse(
           session.sessionId,
@@ -4060,11 +4621,45 @@ export const agentModeController = {
         markProgressComplete(shareId);
       }
 
+      // ENG-510: a timeout that already saved >=1 image is a PARTIAL SUCCESS, not an
+      // error. Persist the finished images inline (markdown → rendered in-thread) plus a
+      // "continue" prompt instead of a generic error, so the user actually receives the
+      // completed work on reload even if a retry keeps timing out. Additive: only replaces
+      // the error message on a media-bearing timeout; every other failure is unchanged.
+      let handledPartialTimeout = false;
+      if (shareId && (error as any)?.isGenerationTimeout) {
+        try {
+          // ENG-510: strongly consistent read so a marker written just before the cap is
+          // not missed (see the regular /generate path above).
+          const timedOutSession = await chatbotDb.getChatSession(shareId, true);
+          const timeoutImages = collectMediaGeneratedSince(timedOutSession?.messages, sharedTurnStartMs);
+          const continuationMsg = buildTimeoutContinuationMessage(timeoutImages);
+          if (continuationMsg) {
+            await chatbotDb.addMessageToSession(shareId, {
+              role: 'assistant',
+              content: continuationMsg,
+              timestamp: new Date().toISOString(),
+              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+            });
+            handledPartialTimeout = true;
+            // ENG-510: return the partial delivery as a normal 200 (mirrors the regular
+            // /generate path) instead of falling through to the 504 GENERATION_TIMEOUT
+            // below — a partial SUCCESS must not reach the live caller as a bare timeout.
+            // Progress was already completed above; the session lock is released in the
+            // inner finally, so this early return is safe.
+            res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+            return;
+          }
+        } catch (persistErr) {
+          console.error('AgentMode: shared partial-media timeout continuation failed (falling back to error message):', persistErr);
+        }
+      }
+
       // Persist an error message to the session so the user sees feedback on reload.
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
-      if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
+      if (!handledPartialTimeout && shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
@@ -4153,8 +4748,8 @@ export const agentModeController = {
             }
           }).catch(err => console.error('Failed to send oncall alert:', err));
 
-          autoReportContextLimitToNotion(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
-            .catch(err => console.error('autoReportContextLimitToNotion failed (shared):', err));
+          autoReportContextLimitToLinear(shareId, session?.userId, session?.userId, llmModel || session?.llmModel, session)
+            .catch(err => console.error('autoReportContextLimitToLinear failed (shared):', err));
 
           res.status(413).json({
             error: 'Context limit exceeded',
@@ -4502,6 +5097,7 @@ export const agentModeController = {
           `Message preview: ${String(message.content || '').slice(0, 300)}`,
         ].filter(Boolean).join('\n'),
         source: `Feedback (${type})`,
+        executionRoute: 'human-triage',
         notionTags: [type === 'like' ? 'Feedback-Like' : 'Feedback-Dislike'],
         notionContext: {
           sessionId,
@@ -5039,7 +5635,8 @@ export const agentModeController = {
         variables,
         variableValues,
         frequencyIntervalDays,
-        selfImprove
+        selfImprove,
+        fullAutonomy
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -5107,6 +5704,10 @@ export const agentModeController = {
         emailNotifications: [] as string[],
         dailyDigest: scheduleFrequency === 'hourly' ? (req.body.dailyDigest || false) : false, // Only allow daily digest for hourly schedules
         selfImprove: selfImprove === true, // When on, a reflection turn after each run may improve the prompt
+        // ENG-396: when on, a headless run auto-takes Emma's recommended option on a
+        // blocking question (incl. immutable) instead of parking — an opt-in waiver
+        // of the human gate on irreversible decisions. Default off.
+        fullAutonomy: fullAutonomy === true,
         status: 'active',
         nextRunTime: scheduledNextRunTime,
         createdAt: now.toISOString(),
@@ -5222,7 +5823,8 @@ export const agentModeController = {
         variables,
         variableValues,
         frequencyIntervalDays,
-        selfImprove
+        selfImprove,
+        fullAutonomy
       } = req.body;
 
       // Verify schedule exists and belongs to user (before validation so we can merge)
@@ -5287,6 +5889,8 @@ export const agentModeController = {
         emailNotifications: normalizeEmailList(emailNotifications !== undefined ? emailNotifications : (existingSchedule.emailNotifications || [])),
         dailyDigest: effectiveScheduleFrequency === 'hourly' ? (dailyDigest !== undefined ? dailyDigest : (existingSchedule.dailyDigest || false)) : false,
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
+        // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
+        fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
@@ -7064,7 +7668,10 @@ export const agentModeController = {
         keywords: keywords || [],
         requiredFunctions: requiredFunctionsArray,
         maxAttempts: maxAttemptsParam || 5,
-        attachments: attachmentsArray
+        attachments: attachmentsArray,
+        // ENG-636: interactive endpoint — the user's live session renders the
+        // pendingUserQuestion card, so a park reaches a human who can answer.
+        parkNotifiable: true
       });
 
       // If client disconnected, don't try to send response

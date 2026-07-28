@@ -74,3 +74,42 @@ describe('scheduledTurnDefersToUser — LLM-judge fallback', () => {
     expect(callLLM).not.toHaveBeenCalled();
   });
 });
+
+// ENG-480: a live scheduled run reframed the impossible per-item pattern correctly
+// but STILL dead-ended by asking the human to supply a scope parameter (time
+// window) before delivering. That phrasing slipped the regex, so it depended
+// entirely on the Gemini judge — which fails safe (false) when the provider is
+// unavailable, letting the run finish blocked. These patterns catch the halt
+// class DETERMINISTICALLY so the completion gate fires without a second LLM.
+describe('scheduledRunAwaitsConfirmation — ENG-480 scope-clarification halt (deterministic)', () => {
+  const eng480Halt =
+    'One question so I scope it right: what time window do you want? "Daily" = last ' +
+    '24 hours (ending now), or a specific calendar day? 👉 Next Step: Reply "last 24h" ' +
+    "(or give me an exact date range) and I'll generate the report.";
+
+  it('catches the exact ENG-480 halt via regex — no LLM judge needed', () => {
+    expect(scheduledRunAwaitsConfirmation(eng480Halt)).toBe(true);
+  });
+
+  it('catches "Reply \'<value>\' (or …)" that dangles the deliverable behind a reply', () => {
+    expect(scheduledRunAwaitsConfirmation('Reply "last 24h" (or a date range) and I will generate it.')).toBe(true);
+    expect(scheduledRunAwaitsConfirmation("Reply 'all users' or name one account.")).toBe(true);
+  });
+
+  it('catches "what <scope> do you want?" scope-clarification questions', () => {
+    expect(scheduledRunAwaitsConfirmation('what date range do you want me to use?')).toBe(true);
+    expect(scheduledRunAwaitsConfirmation('what time window do you want?')).toBe(true);
+  });
+
+  it('does NOT fire on a delivered report with an optional follow-up next-step', () => {
+    const delivered =
+      'Daily User Activity Report — window: last 24h, avg 4.7/5. 👉 Next Step: the two ' +
+      'score-3 sessions stemmed from card-emission failures — want me to pull those two ' +
+      'transcripts and file a bug?';
+    expect(scheduledRunAwaitsConfirmation(delivered)).toBe(false);
+  });
+
+  it('does NOT fire on a report that merely quotes the word reply', () => {
+    expect(scheduledRunAwaitsConfirmation('The user said "reply to my thread"; report delivered below.')).toBe(false);
+  });
+});

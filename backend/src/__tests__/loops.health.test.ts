@@ -37,7 +37,6 @@ function manifest(over: Partial<LoopManifest> = {}): LoopManifest {
     sensorImpl: 'test:sensor',
     rulesetImpl: 'test:rules',
     toolsImpl: 'test:tools',
-    gateImpl: 'test:gate',
     learningImpl: 'test:learning',
     thresholds: {
       promoteLiftPct: 10,
@@ -117,6 +116,19 @@ describe('computeLoopHealth', () => {
     ], NOW);
     expect(h.state).toBe('pending_approval');
     expect(h.counts.pendingApproval).toBe(1);
+  });
+
+  it('does not report a denied proposal as pending approval', () => {
+    const h = computeLoopHealth(manifest(), [
+      record({ proposal: proposal(), mutation: mutation(), decision: decision('pending') }),
+      record({
+        decision: decision('denied'),
+        decisionClaim: 'denied',
+        decisionProposalIds: ['prop-rule-a'],
+      }),
+    ], NOW);
+    expect(h.state).toBe('idle');
+    expect(h.counts.pendingApproval).toBe(0);
   });
 
   it('reports in_flight when a fix shipped but attribution has not graded it yet', () => {

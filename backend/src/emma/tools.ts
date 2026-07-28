@@ -16,6 +16,13 @@ import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from '../utils/userFunnelStatus';
 import { humanEvalService, HumanEvalReviewType } from '../services/humanEvalService';
 import { enqueueAutoHumanEval } from '../services/autoHumanEvalService';
+import { v4 as uuidv4 } from 'uuid';
+import {
+  buildPendingUserQuestion,
+  renderQuestionPrompt,
+  AskUserQuestionError,
+  type AskUserQuestionOption,
+} from '../services/agentMode/core/askUserQuestion';
 
 // Register browser cookie persistence tools
 import './browserCookieTools';
@@ -86,6 +93,148 @@ emmaToolRegistry.register({
       slackMessageTs: candidate.slackMessageTs,
     };
   }
+});
+
+// ENG-396: AskUserQuestion — a structured, BLOCKING option-select prompt. Emma
+// emits it to force a human choice on an immutable/irreversible parameter
+// before building. It returns awaitingUserConfirmation:true so the agent loop
+// HALTS (see collectConfirmationPrompt); the answer is persisted structurally
+// on the session and only an inbound USER selection resolves it — the model
+// cannot self-answer.
+//
+// META-SCOPED, NOT OBJECTIVE-SCOPED (2026-07-25): originally restricted to
+// "Meta campaign objective only." That was narrower than intended — the
+// restriction is meant to bound the DOMAIN (Meta Ads), not the specific field
+// within it. Widened to any high-stakes/irreversible Meta Ads decision (e.g.
+// objective, special ad category), still explicitly NOT general-purpose across
+// other domains/platforms. Every part of the underlying mechanism (persistence,
+// the real UI card, the answer channel, headless park, full-autonomy
+// auto-take, delegation, archive, MCP wiring) is fully generic with zero
+// Meta-specific logic and was proven working end-to-end live before this was
+// widened — only the description below is what keeps this Meta-bounded, and
+// that's a prompt-level restriction, not code-enforced.
+//
+// The Meta objective write gate (agentModeService.ts,
+// resolveCampaignObjectiveGate) is UNCHANGED and independent of this — it
+// still enforces the objective deterministically at CAMPAIGN CREATE
+// regardless of whether Emma calls this tool voluntarily for anything else
+// within Meta. This only widens Emma's OWN judgment-based use of the card
+// within Meta; it does not add a new hard-enforced gate for other Meta
+// entities — that requires its own dedicated gate, built the same way
+// ENG-400 was, per irreversible action.
+emmaToolRegistry.register({
+  name: 'ask_user_question',
+  definition: {
+    name: 'ask_user_question',
+    description: `Ask the user a structured, blocking multiple-choice question and STOP until they pick. SCOPE: Meta Ads only — do NOT use this for Google Ads, LinkedIn, or any other platform/domain decision, no matter how high-stakes. Within Meta Ads, use this ONLY for a decision that is high-stakes or IRREVERSIBLE and that the user (not you) must own — e.g. the immutable campaign objective, a special ad category with legal/compliance implications, or a similarly consequential Meta-specific choice. Do NOT use it for routine confirmations or reversible Meta choices — those are yours to make with your own best judgment (the existing target-confirmation flow on writes still applies where it already does).
+
+Provide 2–4 options, each with a one-line \`consequence\`. EXACTLY ONE option must be marked recommended:true with a one-line \`why\` grounded in real signal from this session (e.g. "162 LEAD events fired on your pixel in the last 30d") — the recommendation is the point. Optionally set allow_emma_decide:true to offer a "Let Emma decide" delegation button (proceeds with the recommended option, logged).
+
+After you call this the run BLOCKS: you will NOT be able to answer it yourself and no further action executes until the user selects. Do not restate the options as prose asking for a "yes/confirm" — emit this tool instead.
+
+Ask only ONE question per turn. If several decisions are needed, ask the single most blocking/irreversible one now; the rest come up one at a time in later turns after each is answered. A second question emitted while one is still awaiting is rejected — never batch them.
+
+If the user replies with a TYPED message instead of clicking an option, that open card is abandoned (it freezes as unanswered) — do NOT infer their choice from the prose, even if it looks like they named an option. If you still need the answer, simply emit a FRESH card to ask again. Only an explicit click counts as the answer.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        question: { type: 'string', description: 'The question to ask, e.g. "Which Meta campaign objective? It cannot be changed after launch."' },
+        intro: { type: 'string', description: 'Optional one- or two-sentence lead-in shown ABOVE the question on the card (e.g. context you just gathered). A card may come with text — use this instead of separate prose. Do NOT restate the options here.' },
+        options: {
+          type: 'array',
+          minItems: 2,
+          maxItems: 4,
+          description: '2–4 options; exactly one with recommended:true and a one-line why.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Optional stable id; auto-generated from position if omitted.' },
+              label: { type: 'string', description: 'Short button label, e.g. "Leads".' },
+              consequence: { type: 'string', description: 'One-line consequence of choosing this option.' },
+              recommended: { type: 'boolean', description: 'Set true on EXACTLY ONE option.' },
+              why: { type: 'string', description: 'One-line justification. REQUIRED on the recommended option.' },
+              payload: { type: 'object', description: 'The concrete machine parameters this option implies (applied verbatim by the consumer — no re-inference).' },
+            },
+            required: ['label', 'consequence'],
+          },
+        },
+        immutable: { type: 'boolean', description: 'True if the parameter is irreversible (e.g. Meta objective). Immutable questions never auto-resolve in headless runs.' },
+        allow_emma_decide: { type: 'boolean', description: 'Offer a "Let Emma decide" delegation button that takes the recommended option.' },
+        kind: { type: 'string', description: 'Optional consumer tag (e.g. "meta_objective") identifying which class of decision this is, for a write gate to correlate against without inspecting question text.' },
+      },
+      required: ['question', 'options'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const sessionId = context?.sessionId;
+    if (!sessionId) {
+      return { success: false, message: 'ask_user_question requires an active session.' };
+    }
+    // Normalize incoming options: assign a stable id when the model omitted one.
+    const options: AskUserQuestionOption[] = Array.isArray(args.options)
+      ? args.options.map((o: any, i: number) => ({
+          id: typeof o?.id === 'string' && o.id.trim() !== '' ? o.id : `option-${i + 1}`,
+          label: o?.label,
+          consequence: o?.consequence,
+          recommended: o?.recommended === true,
+          why: o?.why,
+          payload: o?.payload,
+        }))
+      : [];
+
+    let question;
+    try {
+      question = buildPendingUserQuestion({
+        questionId: uuidv4(),
+        question: args.question,
+        intro: typeof args.intro === 'string' ? args.intro : undefined,
+        options,
+        immutable: args.immutable === true,
+        allowEmmaDecide: args.allow_emma_decide === true,
+        kind: typeof args.kind === 'string' ? args.kind : undefined,
+        createdAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      if (err instanceof AskUserQuestionError) {
+        // Surface the validation problem so the model can fix and re-emit.
+        return { success: false, message: `Invalid ask_user_question: ${err.message}` };
+      }
+      throw err;
+    }
+
+    // Persist as the single active question. The guard enforces one live question
+    // at a time: if a question is already awaiting, the write is refused (null) and
+    // we tell the model to ask this one later — questions are asked ONE AT A TIME,
+    // never batched, so a second call can't overwrite the pending one's slot.
+    const posted = await chatbotDb.updateSessionAskUserQuestion(sessionId, question, {
+      failIfAwaitingExists: true,
+    });
+    if (!posted) {
+      return {
+        success: false,
+        message:
+          'A question is already waiting for the user to answer. Only ONE question can be open at a time — do not ask another now. Wait until the current question is answered, then ask this one in a later turn (one question per turn).',
+      };
+    }
+
+    const prompt = renderQuestionPrompt(question);
+    // awaitingUserConfirmation halts the loop; type + options let the chat card
+    // render and the frontend post back a structured selection. No field tells
+    // the model how to answer — only a user selection can resolve it.
+    return {
+      success: true,
+      awaitingUserConfirmation: true,
+      type: 'ask_user_question',
+      questionId: question.questionId,
+      question: question.question,
+      ...(question.intro ? { intro: question.intro } : {}),
+      options: question.options,
+      recommendedOptionId: question.recommendedOptionId,
+      allowEmmaDecide: question.allowEmmaDecide,
+      confirmationPrompt: prompt,
+      summary: prompt,
+    };
+  },
 });
 
 function outputFieldNames(outputFields: unknown): string[] {
@@ -690,12 +839,19 @@ emmaToolRegistry.register({
     description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Works even without a Meta connected account (falls back to legacy adAccount config). Use this first to get campaign IDs, then call get_meta_ads_metrics.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available.'
+        }
+      },
       required: []
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.listMetaAdsCampaignsNew(context?.userId);
+    return args.account_id
+      ? await agentModeService.listMetaAdsCampaignsNew(context?.userId, args.account_id)
+      : await agentModeService.listMetaAdsCampaignsNew(context?.userId);
   }
 });
 
@@ -719,6 +875,21 @@ emmaToolRegistry.register({
   candidates and ask the user to disambiguate BEFORE calling. Never publish an ad into a campaign/ad set the
   user did not explicitly name, and never regenerate/edit an asset set without confirming which assets.
   (LIST/SEARCH/UPLOAD_IMAGE/UPLOAD_VIDEO are read/upload-only and need no confirmation.)
+
+⚠️ CAMPAIGN OBJECTIVE IS IMMUTABLE — cannot be changed after creation. There is NO "start with Traffic/LPV
+  and switch to conversions later" on Meta; that is not a valid plan. Because of this, a CAMPAIGN CREATE
+  with no objective the user explicitly chose is BLOCKED SERVER-SIDE before it reaches Meta: if you omit
+  objective_quote (see below) and the objective hasn't already been confirmed by the user in this session,
+  the call returns a blocking question instead of creating the campaign — do not try to work around this
+  by guessing an objective or retrying.
+
+  If the user asks you to confirm the objective (or any other setting) via a structured card BEFORE you
+  build anything: you have NO way to render an interactive card yourself — do not fabricate one out of HTML,
+  markdown tables, or styled text in your reply; a hand-written "card" you write is not real and answering
+  it does nothing. Just attempt the CAMPAIGN CREATE call directly (with your real name/budget/targeting
+  params, omitting objective if it isn't explicitly confirmed) — if the objective truly isn't settled, the
+  call itself returns the real blocking question, which the platform renders as an actual clickable card.
+  Do not stall in prose waiting to "ask first"; attempting the call is how the real card appears.
 
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
@@ -893,6 +1064,11 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
 
             // --- Campaign ---
             objective: { type: "string", description: "Campaign objective (e.g., OUTCOME_TRAFFIC, OUTCOME_SALES)." },
+            objective_quote: {
+              type: "string",
+              description:
+                "CAMPAIGN CREATE ONLY: the exact, literal substring from the user's own message that names this objective (e.g. the user typed \"set up a leads campaign\" → objective_quote: \"leads campaign\"). Provide this ONLY when the user explicitly named the objective themselves — it is checked against their actual message, and a quote that doesn't genuinely appear there is rejected. Do NOT invent or paraphrase a quote, and do NOT provide this if the user did not actually name an objective — just omit it and the objective will be confirmed automatically before the campaign is created.",
+            },
             special_ad_categories: { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
             advantage_campaign_budget: { type: "boolean", description: "Enable Advantage Campaign Budget." },
             budget_amount: { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
@@ -986,6 +1162,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
       args.ad_set_id,
       args.ad_id,
       args.params,
+      context?.sessionId,
     );
   }
 });
@@ -1135,6 +1312,10 @@ emmaToolRegistry.register({
           // Legacy single-id alias. execute() normalizes this into campaign_ids.
           type: 'string',
           description: 'Legacy alias for a single campaign id. Prefer campaign_ids. Provide at least one of campaign_ids or campaign_id.'
+        },
+        account_id: {
+          type: 'string',
+          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available.'
         }
       }
     }
@@ -1149,7 +1330,12 @@ emmaToolRegistry.register({
           ? [args.campaign_id.trim()]
           : [];
 
-    return await agentModeService.getMetaAdsMetrics(args.timeframe || '7d', context?.userId, normalizedCampaignIds);
+    return await agentModeService.getMetaAdsMetrics(
+      args.timeframe || '7d',
+      context?.userId,
+      normalizedCampaignIds,
+      args.account_id,
+    );
   }
 });
 
@@ -4503,7 +4689,7 @@ emmaToolRegistry.register({
   name: 'generate_image',
   definition: {
     name: 'generate_image',
-    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.\n\nTRANSPARENT BACKGROUNDS — DO NOT use generate_image to "redraw the logo on a transparent background". This model redraws the mark and can drift its icon/letters/colors, and it CANNOT guarantee a true alpha channel. To make an existing logo\'s background transparent, use the remove_image_background tool (it operates on the original pixels and outputs genuine alpha). If the user already has a transparent PNG of the logo, use that directly. Only fall back to generation if no source logo exists at all.',
+    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nMULTIPLE VARIANTS: When the user asks for several INDEPENDENT variants of the same brief (e.g. "generate 3 variants"), emit ALL the generate_image calls together in a SINGLE turn — one tool call per variant. They run in parallel (bounded), so N variants finish in roughly the time of one instead of N× and stay within the turn\'s time limit; generating them one-by-one across separate turns is slow and can time out. Only chain image calls sequentially when a later image genuinely DEPENDS on an earlier one (e.g. editing a just-generated image).\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.\n\nTRANSPARENT BACKGROUNDS — DO NOT use generate_image to "redraw the logo on a transparent background". This model redraws the mark and can drift its icon/letters/colors, and it CANNOT guarantee a true alpha channel. To make an existing logo\'s background transparent, use the remove_image_background tool (it operates on the original pixels and outputs genuine alpha). If the user already has a transparent PNG of the logo, use that directly. Only fall back to generation if no source logo exists at all.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4551,8 +4737,12 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    // If the LLM didn't specify a model, fall back to the admin-configured image API default
-    const imageModel = args.imageModel || await agentModeService.getImageApiDefaultModel();
+    // ENG-510: pass the LLM's model choice through AS-IS (undefined when it didn't
+    // pick one). Resolving the admin-configured default here made every request look
+    // like an explicit model choice, which disabled the transient-timeout fallback in
+    // generateImage — so a provider timeout produced zero deliverables. generateImage
+    // now resolves the admin default itself and only suppresses the fallback for a
+    // genuinely LLM-specified model.
     return await agentModeService.generateImage(
       args.prompt,
       args.filename,
@@ -4561,7 +4751,7 @@ emmaToolRegistry.register({
       args.inputImages || [],
       context?.userId,
       context?.sessionId,
-      imageModel,
+      args.imageModel,
       args.logo_image,
       args.confirm
     );
@@ -6645,6 +6835,85 @@ import { mcpToolRegistry } from '../mcp/server/registry';
 // for mcpToolRegistry to be available).
 mcpToolRegistry.register(visualContextTool);
 
+mcpToolRegistry.register({
+  name: 'manage_linear_governance_label',
+  definition: {
+    name: 'manage_linear_governance_label',
+    description:
+      'Admin-only: read, dry-run, or update an existing allowlisted Linear routing/intake label. ' +
+      'Returns verified before/after readback evidence. It cannot create, delete, or move labels and never exposes Linear credentials.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        label_name: {
+          type: 'string',
+          description: 'Existing allowlisted governance label, such as Route: Emma or Needs PM.',
+        },
+        name: {
+          type: 'string',
+          description: 'Optional replacement name. It must also be an allowlisted governance label and must not already exist.',
+        },
+        description: {
+          type: 'string',
+          maxLength: 1000,
+          description: 'Optional replacement description.',
+        },
+        color: {
+          type: 'string',
+          pattern: '^#[0-9A-Fa-f]{6}$',
+          description: 'Optional six-digit hex color.',
+        },
+        reason: {
+          type: 'string',
+          description: 'Required audit reason for the read, dry-run, or update.',
+        },
+        dry_run: {
+          type: 'boolean',
+          description: 'When true, return the exact proposed definition without mutating Linear.',
+        },
+      },
+      required: ['label_name', 'reason'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+    const user = await userDb.getUserById(userId);
+    const delegated = context?.isDelegatedAccess === true || context?.isDelegatedAdmin === true;
+    if (user?.isAdmin !== true && !delegated) {
+      throw new Error('Admin access required to manage Linear governance labels');
+    }
+    let actor: string | undefined;
+    if (delegated) {
+      actor = context?.adminEmail;
+      if (!actor && context?.sessionId) {
+        const session = await chatbotDb.getChatSession(context.sessionId);
+        if (session?.delegateInfo?.isDelegated) {
+          actor = session.delegateInfo.adminEmail;
+        }
+      }
+      if (!actor) {
+        throw new Error('Delegated administrator identity unavailable');
+      }
+    } else {
+      actor = user?.email || userId;
+    }
+    if (!actor) {
+      throw new Error('Administrator identity unavailable');
+    }
+    const { manageLinearGovernanceLabel } = await import('../services/linearGovernanceLabelService');
+    return manageLinearGovernanceLabel({
+      labelName: args.label_name,
+      name: args.name,
+      description: args.description,
+      color: args.color,
+      reason: args.reason,
+      actor,
+      dryRun: args.dry_run === true,
+    });
+  },
+});
+
 const bridgedToolNames = [
   // Scheduled Chat tools
   'list_scheduled_chats',
@@ -6681,6 +6950,7 @@ const bridgedToolNames = [
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
 const adminToolNames = [
+  'manage_linear_governance_label',
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
   'list_skills',
@@ -6688,7 +6958,6 @@ const adminToolNames = [
   'get_chat_history',
   'list_all_clients',
   'assess_client_health',
-  'manage_user_guide',
   'get_pr_digest',
   'freeze_user_account',
   'manage_scoring_judges',
@@ -8136,6 +8405,8 @@ ACTION MATRIX:
               ADD_PROXIMITY (campaign_resource_name, radius, address{street_address?, city_name?, postal_code?, province_code?, province_name?, country_code?}; radius_units defaults MILES) — mile/km-radius targeting centered on a real address (Google geocodes it server-side). This is native API support for "within N miles of our store/showroom" requests — do NOT tell the user proximity/radius targeting requires the UI; it does not. Additive to any existing LOCATION (city) criteria — REMOVE_PROXIMITY the old one first if only the radius should apply.
               REMOVE_PROXIMITY (criterion_resource_name) — removes a campaign-level LOCATION or PROXIMITY criterion. Obtain resource names via a raw GAQL query on campaign_criterion (call_google_ads_reporting_api mode="raw").
               TRANSPARENCY GUARDRAIL: if any Google Ads request cannot be fully satisfied via this API — including cases where you genuinely must fall back to a UI-only step (e.g. linking Google Business Profile) — you MUST say so explicitly to the user at deployment: name the gap, what you did instead, and the exact manual step left for them. Never silently substitute a workaround or imply a request is fully done when a manual step remains outstanding.
+  CAMPAIGN_CRITERION → ADD (campaign_resource_name, placement_urls? and/or mobile_app_category_resource_names?)
+              Adds campaign-scoped negative placement and mobile-app-category criteria atomically. placement_urls accepts domains or HTTP(S) URLs. mobile_app_category_resource_names must use canonical mobileAppCategoryConstants/<id> resource names. This is not a keyword/ad-group fallback.
   BIDDING_STRATEGY → LIST (portfolio/shared bidding strategies; returns resource_name for use as bidding_strategy_resource_name)
   AD_GROUP    → LIST (campaign_resource_name)
                CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
@@ -8167,7 +8438,7 @@ ACTION MATRIX:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field from the result (NOT the "id" field).' },
-        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY'] },
+        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'CAMPAIGN_CRITERION', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY'] },
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
@@ -8201,6 +8472,8 @@ ACTION MATRIX:
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
         brand_logo_asset_resource_name: { type: 'string', description: 'Logo image asset resource name for PMax brand guidelines. Upload via ASSET UPLOAD first.' },
         criterion_resource_name: { type: 'string', description: 'Criterion resource name. Required for KEYWORD REMOVE (ad group criterion, from KEYWORD LIST) and CAMPAIGN REMOVE_PROXIMITY (campaign criterion, from a raw GAQL query on campaign_criterion).' },
+        placement_urls: { type: 'array', items: { type: 'string' }, description: 'Placement domains or HTTP(S) URLs to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
+        mobile_app_category_resource_names: { type: 'array', items: { type: 'string' }, description: 'Canonical mobileAppCategoryConstants/<id> resource names to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
         assets: { type: 'array', items: { type: 'object', properties: { fieldType: { type: 'string', enum: ['BUSINESS_NAME', 'LOGO', 'SQUARE_MARKETING_IMAGE', 'MARKETING_IMAGE', 'HEADLINE', 'DESCRIPTION'] }, assetResourceName: { type: 'string' }, text: { type: 'string' } }, required: ['fieldType'] }, description: 'Assets to attach for CAMPAIGN_ASSET ATTACH. Use text for BUSINESS_NAME, assetResourceName for image/logo types.' },
         keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] }, description: 'Keywords for ADD or ADD_NEGATIVE action.' },
         query: { type: 'string', description: 'Location search query.' },

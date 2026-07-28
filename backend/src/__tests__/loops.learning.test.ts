@@ -148,7 +148,7 @@ describe('runAttribution', () => {
   const shippedAt = new Date(30 * DAY);
 
   /** Seed the store with one shipped (auto_shipped) mutation for capture-broken. */
-  async function seedShipped(store: InMemoryLearningStore) {
+  async function seedShipped(store: InMemoryLearningStore, linearIssueId?: string) {
     await store.record({
       loopId,
       runId: asRunId('run-1'),
@@ -161,7 +161,12 @@ describe('runAttribution', () => {
         payload: {},
         triggeringStats: {},
       },
-      mutation: { mutationId: asMutationId('m1'), proposalId: asMutationId('m1'), kind: 'copy', artifact: {} },
+      mutation: {
+        mutationId: asMutationId('m1'),
+        proposalId: asMutationId('m1'),
+        kind: 'copy',
+        artifact: linearIssueId ? { linearIssueId } : {},
+      },
       decision: { status: 'auto_shipped', decidedAt: shippedAt },
       shippedAt,
     });
@@ -175,6 +180,24 @@ describe('runAttribution', () => {
       ...manyEvents('signed_up', 1, shippedAt.getTime() - 2 * DAY),
       ...manyEvents('form_submitted', 10, shippedAt.getTime() + 1 * DAY),
       ...manyEvents('signed_up', 4, shippedAt.getTime() + 2 * DAY),
+    ]);
+  }
+
+  function regressedSensor(): StubSensor {
+    return new StubSensor([
+      ...manyEvents('form_submitted', 10, shippedAt.getTime() - 3 * DAY),
+      ...manyEvents('signed_up', 4, shippedAt.getTime() - 2 * DAY),
+      ...manyEvents('form_submitted', 10, shippedAt.getTime() + 1 * DAY),
+      ...manyEvents('signed_up', 1, shippedAt.getTime() + 2 * DAY),
+    ]);
+  }
+
+  function noChangeSensor(): StubSensor {
+    return new StubSensor([
+      ...manyEvents('form_submitted', 10, shippedAt.getTime() - 3 * DAY),
+      ...manyEvents('signed_up', 2, shippedAt.getTime() - 2 * DAY),
+      ...manyEvents('form_submitted', 10, shippedAt.getTime() + 1 * DAY),
+      ...manyEvents('signed_up', 2, shippedAt.getTime() + 2 * DAY),
     ]);
   }
 
@@ -216,5 +239,118 @@ describe('runAttribution', () => {
     const second = await runAttribution({ manifest, sensor: improvedSensor(), learning: store, clock });
     expect(second.evaluated).toBe(0);
     expect(second.attributed).toBe(0);
+  });
+
+  it('moves an improved linked issue to Verifying with metric evidence and a verifier', async () => {
+    const store = new InMemoryLearningStore();
+    await seedShipped(store, 'ENG-600');
+    const issueLifecycle = { recordOutcome: jest.fn().mockResolvedValue({ status: 'applied' }) };
+
+    const summary = await runAttribution({
+      manifest,
+      sensor: improvedSensor(),
+      learning: store,
+      clock: { now: () => new Date(shippedAt.getTime() + 8 * DAY) },
+      issueLifecycle,
+      verifierId: 'linear-harsha',
+    } as any);
+
+    expect(issueLifecycle.recordOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      issueId: 'ENG-600',
+      transition: 'verifying',
+      metricName: METRIC.name,
+      metricBefore: 0.1,
+      metricAfter: 0.4,
+      verifierId: expect.any(String),
+    }));
+    expect(summary.outcomes[0]).toMatchObject({ issueId: 'ENG-600', issueSync: 'applied' });
+  });
+
+  it('reopens a regressed linked issue with before/after evidence', async () => {
+    const store = new InMemoryLearningStore();
+    await seedShipped(store, 'ENG-601');
+    const issueLifecycle = { recordOutcome: jest.fn().mockResolvedValue({ status: 'applied' }) };
+
+    await runAttribution({
+      manifest,
+      sensor: regressedSensor(),
+      learning: store,
+      clock: { now: () => new Date(shippedAt.getTime() + 8 * DAY) },
+      issueLifecycle,
+      verifierId: 'linear-harsha',
+    } as any);
+
+    expect(issueLifecycle.recordOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      issueId: 'ENG-601',
+      verdict: 'regressed',
+      transition: 'reopen',
+      metricBefore: 0.4,
+      metricAfter: 0.1,
+    }));
+  });
+
+  it('records no-change evidence without moving the linked issue', async () => {
+    const store = new InMemoryLearningStore();
+    await seedShipped(store, 'ENG-602');
+    const issueLifecycle = { recordOutcome: jest.fn().mockResolvedValue({ status: 'applied' }) };
+
+    await runAttribution({
+      manifest,
+      sensor: noChangeSensor(),
+      learning: store,
+      clock: { now: () => new Date(shippedAt.getTime() + 8 * DAY) },
+      issueLifecycle,
+      verifierId: 'linear-harsha',
+    } as any);
+
+    expect(issueLifecycle.recordOutcome).toHaveBeenCalledWith(expect.objectContaining({
+      issueId: 'ENG-602',
+      verdict: 'no_change',
+      transition: 'evidence_only',
+    }));
+  });
+
+  it('attributes a record with no linked issue without attempting a Linear write', async () => {
+    const store = new InMemoryLearningStore();
+    await seedShipped(store);
+    const issueLifecycle = { recordOutcome: jest.fn() };
+
+    const summary = await runAttribution({
+      manifest,
+      sensor: improvedSensor(),
+      learning: store,
+      clock: { now: () => new Date(shippedAt.getTime() + 8 * DAY) },
+      issueLifecycle,
+      verifierId: 'linear-harsha',
+    } as any);
+
+    expect(issueLifecycle.recordOutcome).not.toHaveBeenCalled();
+    expect(summary.outcomes[0]).toMatchObject({ issueSync: 'missing_issue' });
+  });
+
+  it('retries Linear writeback after a transient failure without duplicating attribution', async () => {
+    const store = new InMemoryLearningStore();
+    await seedShipped(store, 'ENG-603');
+    const issueLifecycle = {
+      recordOutcome: jest
+        .fn()
+        .mockRejectedValueOnce(new Error('Linear unavailable'))
+        .mockResolvedValueOnce({ status: 'applied' }),
+    };
+    const input = {
+      manifest,
+      sensor: improvedSensor(),
+      learning: store,
+      clock: { now: () => new Date(shippedAt.getTime() + 8 * DAY) },
+      issueLifecycle,
+      verifierId: 'linear-harsha',
+    } as any;
+
+    await expect(runAttribution(input)).rejects.toThrow('Linear unavailable');
+    expect(await store.lastOutcomeForRule(loopId, 'capture-broken')).toBeNull();
+
+    const retried = await runAttribution(input);
+    expect(retried.attributed).toBe(1);
+    expect(issueLifecycle.recordOutcome).toHaveBeenCalledTimes(2);
   });
 });

@@ -36,10 +36,16 @@ const mockService = {
   listTaskTemplates: jest.fn(),
   searchLeads: jest.fn(),
   repairBlogArticle: jest.fn(),
+  callMetaMarketingApi: jest.fn(),
 };
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: mockService,
+}));
+
+const mockChatbotDb = { getChatSession: jest.fn() };
+jest.mock('../services/chatbotService', () => ({
+  chatbotDb: mockChatbotDb,
 }));
 
 import emmaApiRoutes from '../routes/emmaApi';
@@ -232,6 +238,62 @@ describe('Emma API Routes', () => {
 
       expect(res.status).toBe(200);
       expect(mockService.listTaskTemplates).toHaveBeenCalled();
+    });
+  });
+
+  // Greptile P1/security ("Session does not bind authorization"): session_id
+  // feeds the Meta objective gate's confirmation check, so an authenticated
+  // caller supplying a DIFFERENT user's session_id must be rejected, never
+  // silently forwarded as if it were the caller's own confirmation.
+  describe('POST /api/emma/meta-ads/marketing-api — session ownership', () => {
+    it('proceeds when no session_id is provided (gate handles the no-session case itself)', async () => {
+      mockService.callMetaMarketingApi.mockResolvedValue({ success: true });
+
+      const res = await request(app)
+        .post('/api/emma/meta-ads/marketing-api')
+        .send({ entity_type: 'CAMPAIGN', action: 'LIST', account_id: 'acct-1' });
+
+      expect(res.status).toBe(200);
+      expect(mockChatbotDb.getChatSession).not.toHaveBeenCalled();
+      expect(mockService.callMetaMarketingApi).toHaveBeenCalledWith(
+        'user-123', 'CAMPAIGN', 'LIST', 'acct-1', undefined, undefined, undefined, undefined, undefined,
+      );
+    });
+
+    it('proceeds when session_id belongs to the authenticated user', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'user-123' });
+      mockService.callMetaMarketingApi.mockResolvedValue({ success: true });
+
+      const res = await request(app)
+        .post('/api/emma/meta-ads/marketing-api')
+        .send({ entity_type: 'CAMPAIGN', action: 'CREATE', account_id: 'acct-1', session_id: 'sess-1' });
+
+      expect(res.status).toBe(200);
+      expect(mockService.callMetaMarketingApi).toHaveBeenCalledWith(
+        'user-123', 'CAMPAIGN', 'CREATE', 'acct-1', undefined, undefined, undefined, undefined, 'sess-1',
+      );
+    });
+
+    it('REJECTS (403) when session_id belongs to a DIFFERENT user — never forwarded to the gate', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({ sessionId: 'sess-1', userId: 'someone-else' });
+
+      const res = await request(app)
+        .post('/api/emma/meta-ads/marketing-api')
+        .send({ entity_type: 'CAMPAIGN', action: 'CREATE', account_id: 'acct-1', session_id: 'sess-1' });
+
+      expect(res.status).toBe(403);
+      expect(mockService.callMetaMarketingApi).not.toHaveBeenCalled();
+    });
+
+    it('REJECTS (403) when session_id does not exist at all', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue(null);
+
+      const res = await request(app)
+        .post('/api/emma/meta-ads/marketing-api')
+        .send({ entity_type: 'CAMPAIGN', action: 'CREATE', account_id: 'acct-1', session_id: 'nonexistent' });
+
+      expect(res.status).toBe(403);
+      expect(mockService.callMetaMarketingApi).not.toHaveBeenCalled();
     });
   });
 });

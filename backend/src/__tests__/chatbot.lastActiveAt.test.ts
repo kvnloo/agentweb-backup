@@ -20,7 +20,6 @@ jest.mock("@google-cloud/storage", () => ({ Storage: jest.fn() }));
 jest.mock("openai", () => jest.fn());
 jest.mock("../controllers/release", () => ({ getReleases: jest.fn() }));
 jest.mock("../services/notionService", () => ({ getUserGuideContent: jest.fn() }));
-jest.mock("../controllers/api", () => ({ getApiDocs: jest.fn() }));
 jest.mock("../controllers/docsController", () => ({ getUserReleaseNotes: jest.fn() }));
 
 import { chatbotDb } from "../services/chatbotService";

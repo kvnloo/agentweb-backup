@@ -10,6 +10,7 @@ jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     listMetaAdsCampaignsNew: jest.fn(),
     listMetaAdsCampaigns: jest.fn(),
+    getMetaAdsMetrics: jest.fn(),
   },
 }));
 
@@ -90,5 +91,55 @@ describe('Meta Ads Emma Tools - list_meta_ads_campaigns', () => {
     await tool.execute({}, { userId: 'specific-user-id' });
 
     expect(agentModeService.listMetaAdsCampaignsNew).toHaveBeenCalledWith('specific-user-id');
+  });
+
+  it('should pass an explicit account ID when multiple Meta accounts are available', async () => {
+    const tool = emmaToolRegistry.getTool(toolName);
+    if (!tool) throw new Error(`Tool ${toolName} not found`);
+
+    (agentModeService.listMetaAdsCampaignsNew as jest.Mock).mockResolvedValue({
+      success: true,
+      campaigns: [],
+      totalCount: 0,
+    });
+
+    await tool.execute({ account_id: 'act_111222333444555' }, { userId: 'user-123' });
+
+    expect(agentModeService.listMetaAdsCampaignsNew).toHaveBeenCalledWith(
+      'user-123',
+      'act_111222333444555',
+    );
+  });
+});
+
+describe('Meta Ads Emma Tools - get_meta_ads_metrics', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  it('exposes and forwards an explicit account ID for multi-account selection', async () => {
+    const tool = emmaToolRegistry.getTool('get_meta_ads_metrics');
+    if (!tool) throw new Error('Tool get_meta_ads_metrics not found');
+    (agentModeService.getMetaAdsMetrics as jest.Mock).mockResolvedValue({ success: true });
+
+    expect(tool.definition.inputSchema.properties.account_id).toEqual(
+      expect.objectContaining({ type: 'string' }),
+    );
+
+    await tool.execute(
+      {
+        timeframe: '7d',
+        campaign_ids: ['campaign-1'],
+        account_id: '111222333444555',
+      },
+      { userId: 'user-123' },
+    );
+
+    expect(agentModeService.getMetaAdsMetrics).toHaveBeenCalledWith(
+      '7d',
+      'user-123',
+      ['campaign-1'],
+      '111222333444555',
+    );
   });
 });

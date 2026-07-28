@@ -476,11 +476,118 @@ describe('intakeService.fileAutoIssue', () => {
   const realFlag = process.env.FEATUREBASE_INTAKE;
   afterEach(() => { process.env.FEATUREBASE_INTAKE = realFlag; jest.clearAllMocks(); });
 
-  it('flag OFF -> Notion', async () => {
+  it('auto issues always use Linear even when the customer-intake migration flag is off', async () => {
     process.env.FEATUREBASE_INTAKE = 'false';
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-6', url: 'u' });
     const r = await fileAutoIssue({ title: 't', description: 'd', source: 'Context limit' });
-    expect(notion.createOncallItem).toHaveBeenCalled();
-    expect(r.tracker).toBe('Notion');
+    expect(notion.createOncallItem).not.toHaveBeenCalled();
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        labelNames: ['Auto', 'Bug', 'Needs PM'],
+        stateName: 'Todo',
+        assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6',
+      }),
+    );
+    expect(r.tracker).toBe('Linear');
+  });
+
+  it('maps the autofix execution route to an executable Todo owned by Manan', async () => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-8', url: 'u' });
+
+    await fileAutoIssue({
+      title: 'tool schema regression',
+      description: 'd',
+      source: 'AgentMode loop',
+      executionRoute: 'autofix',
+    } as any);
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        labelNames: ['Auto', 'Bug', 'autofix'],
+        stateName: 'Todo',
+        assigneeId: 'cabadf7c-b95d-4455-b9ec-df11d5d83f5f',
+      }),
+    );
+  });
+
+  it('maps the human-triage route to Needs PM and Harsha without autofix', async () => {
+    process.env.FEATUREBASE_INTAKE = 'true';
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-9', url: 'u' });
+
+    await fileAutoIssue({
+      title: 'unknown product behavior',
+      description: 'd',
+      source: 'Onboarding loop',
+      executionRoute: 'human-triage',
+    } as any);
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        labelNames: ['Auto', 'Bug', 'Needs PM'],
+        stateName: 'Todo',
+        assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6',
+      }),
+    );
+    expect(linear.createInternalLinearIssue.mock.calls[0][0].labelNames).not.toContain('autofix');
+  });
+
+  it('fails closed to human triage when a caller omits executionRoute', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([]);
+    linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-10', url: 'u' });
+
+    await fileAutoIssue({
+      title: 'legacy system alert',
+      description: 'd',
+      source: 'Scheduled chat',
+    });
+
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({
+        labelNames: ['Auto', 'Bug', 'Needs PM'],
+        stateName: 'Todo',
+        assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6',
+      }),
+    );
+  });
+
+  it('replaces a conflicting route and owner when enriching a deduped canonical', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-11', issueId: 'uuid-11', title: 'same alert', description: 'd' },
+    ]);
+
+    await fileAutoIssue({
+      title: 'same alert',
+      description: 'd',
+      source: 'AI eval',
+      executionRoute: 'autofix',
+    });
+
+    expect(linear.raiseIssueTriage).toHaveBeenCalledWith('uuid-11', {
+      addLabelNames: ['Bug', 'autofix'],
+      removeLabelNames: ['Needs PM'],
+      assigneeId: 'cabadf7c-b95d-4455-b9ec-df11d5d83f5f',
+      settleStateName: 'Todo',
+    });
+  });
+
+  it('fails deduped intake visibly when required route enrichment fails', async () => {
+    linear.listOpenIssuesByLabel.mockResolvedValue([
+      { identifier: 'ENG-11', issueId: 'uuid-11', title: 'same alert', description: 'd' },
+    ]);
+    linear.raiseIssueTriage.mockRejectedValueOnce(new Error('Linear route update rejected'));
+
+    await expect(
+      fileAutoIssue({
+        title: 'same alert',
+        description: 'd',
+        source: 'AI eval',
+        executionRoute: 'autofix',
+      }),
+    ).rejects.toThrow('Linear route update rejected');
   });
 
   it('flag ON + open Auto issue with same title -> groups (comment), no new issue', async () => {
@@ -497,7 +604,9 @@ describe('intakeService.fileAutoIssue', () => {
     linear.listOpenIssuesByLabel.mockResolvedValue([]);
     linear.createInternalLinearIssue.mockResolvedValue({ identifier: 'ENG-8', url: 'u' });
     const r = await fileAutoIssue({ title: 'new auto', description: 'd', source: 'Scheduled chat', extraLabels: ['Scheduled Chat'] });
-    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({ labelNames: ['Auto', 'Scheduled Chat'] }));
+    expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(
+      expect.objectContaining({ labelNames: ['Auto', 'Bug', 'Needs PM', 'Scheduled Chat'] }),
+    );
     expect(r).toMatchObject({ deduped: false, tracker: 'Linear' });
   });
 });
@@ -886,7 +995,9 @@ describe('intakeService.fileAutoIssue — alert-class clustering (ENG-358)', () 
     });
     expect(linear.createInternalLinearIssue).toHaveBeenCalledTimes(1);
     expect(linear.createInternalLinearIssue).toHaveBeenCalledWith(expect.objectContaining({
-      labelNames: ['Auto', 'Oncall'],
+      labelNames: ['Auto', 'Bug', 'Needs PM', 'Oncall'],
+      stateName: 'Todo',
+      assigneeId: '142fef82-4d45-4070-99be-c5debe565ac6',
       priority: 2, // 'high'
       description: expect.stringContaining('Alert Class: v0-credits'),
     }));

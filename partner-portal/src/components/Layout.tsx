@@ -14,15 +14,23 @@ import {
   Alert
 } from '@mui/material';
 import AccountCircle from '@mui/icons-material/AccountCircle';
-import { useAuth, UserRole } from '../contexts/AuthContext';
+import { useAuth } from '../contexts/AuthContext';
 import logo from '../assets/logo.svg';
 import ChatSupport from './ChatSupport';
+import { getHeaderNavigation, getPortalRoute } from '../navigation/catalog';
 
 export default function Layout() {
   const { user, logout, hasRole } = useAuth();
   const [anchorEl, setAnchorEl] = React.useState<null | HTMLElement>(null);
   const location = useLocation();
   const isHomePage = location.pathname === '/';
+  const headerNavigation = getHeaderNavigation({
+    authenticated: Boolean(user),
+    isAdmin: Boolean(user?.isAdmin),
+    isContractor: Boolean(user && hasRole('contractor')),
+  });
+  const loginRoute = getPortalRoute('login');
+  const profileRoute = getPortalRoute('profile');
 
   const handleMenu = (event: React.MouseEvent<HTMLElement>) => {
     setAnchorEl(event.currentTarget);
@@ -108,152 +116,17 @@ export default function Layout() {
               />
             </Box>
             <Box sx={{ flexGrow: 1, ml: 3 }}>
-              <Button 
-                color="primary" 
-                component={RouterLink} 
-                to="/"
-                variant={isActivePath('/') ? 'contained' : 'text'}
-                sx={{ 
-                  '&.Mui-disabled': { 
-                    color: 'white',
-                    bgcolor: 'primary.main' 
-                  }
-                }}
-              >
-                Home
-              </Button>
-              <Button
-                color="primary"
-                component={RouterLink}
-                to="/release"
-                variant={isActivePath('/release') ? 'contained' : 'text'}
-              >
-                Release
-              </Button>
-              {user && (
-                <>
-                  <Button 
-                    color="primary" 
-                    component={RouterLink} 
-                    to="/tasks"
-                    variant={isActivePath('/tasks') ? 'contained' : 'text'}
-                  >
-                    Tasks
-                  </Button>
-                  {user.isAdmin && (
-                    <>
-                      <Button 
-                        color="primary" 
-                        component={RouterLink} 
-                        to="/templates"
-                        variant={isActivePath('/templates') ? 'contained' : 'text'}
-                      >
-                        Templates
-                      </Button>
-                      <Button
-                        color="primary"
-                        component={RouterLink}
-                        to="/html-templates"
-                        variant={isActivePath('/html-templates') ? 'contained' : 'text'}
-                      >
-                        HTML Templates
-                      </Button>
-                      <Button
-                        color="primary"
-                        component={RouterLink}
-                        to="/skills"
-                        variant={isActivePath('/skills') ? 'contained' : 'text'}
-                      >
-                        Skills
-                      </Button>
-                      <Button
-                        color="primary"
-                        component={RouterLink}
-                        to="/work-plans"
-                        variant={isActivePath('/work-plans') ? 'contained' : 'text'}
-                      >
-                        Work Plans
-                      </Button>
-                      <Button
-                        color="primary"
-                        component={RouterLink}
-                        to="/schedule-templates"
-                        variant={isActivePath('/schedule-templates') ? 'contained' : 'text'}
-                      >
-                        Schedule Templates
-                      </Button>
-                      <Button
-                        color="primary"
-                        component={RouterLink}
-                        to="/gtm-ops"
-                        variant={isActivePath('/gtm-ops') ? 'contained' : 'text'}
-                      >
-                        GTM Tracker
-                      </Button>
-                      <Button
-                        color="primary"
-                        component={RouterLink}
-                        to="/client-health"
-                        variant={isActivePath('/client-health') ? 'contained' : 'text'}
-                      >
-                        Client Health
-                      </Button>
-                      <Button
-                        color="primary"
-                        component={RouterLink}
-                        to="/agent-runs"
-                        variant={isActivePath('/agent-runs') ? 'contained' : 'text'}
-                      >
-                        Agent Runs
-                      </Button>
-                      <Button
-                        color="primary"
-                        component={RouterLink}
-                        to="/prompt-templates"
-                        variant={isActivePath('/prompt-templates') ? 'contained' : 'text'}
-                      >
-                        Prompt Templates
-                      </Button>
-                    </>
-                  )}
-                  <Button 
-                    color="primary" 
-                    component={RouterLink} 
-                    to="/workflows"
-                    variant={isActivePath('/workflows') ? 'contained' : 'text'}
-                  >
-                    Workflows
-                  </Button>
-                  <Button 
-                    color="primary" 
-                    component={RouterLink} 
-                    to="/config"
-                    variant={isActivePath('/config') ? 'contained' : 'text'}
-                  >
-                    Config
-                  </Button>
-                  {hasRole('contractor') && (
-                    <Button
-                      color="primary"
-                      component={RouterLink}
-                      to="/contractor-accesses"
-                      variant={isActivePath('/contractor-accesses') ? 'contained' : 'text'}
-                    >
-                      Contractor Accesses
-                    </Button>
-                  )}
-                  {user.isAdmin && (
-                    <Button
-                      color="primary"
-                      component={RouterLink}
-                      to="/admin"
-                      variant={isActivePath('/admin') ? 'contained' : 'text'}
-                    >
-                      Admin
-                    </Button>
-                  )}
-                </>
-              )}
+              {headerNavigation.map((entry) => (
+                <Button
+                  key={entry.id}
+                  color="primary"
+                  component={RouterLink}
+                  to={entry.destination}
+                  variant={isActivePath(entry.destination) ? 'contained' : 'text'}
+                >
+                  {entry.label}
+                </Button>
+              ))}
             </Box>
             {user ? (
               <div>
@@ -284,11 +157,11 @@ export default function Layout() {
                 >
                   <MenuItem 
                     component={RouterLink} 
-                    to="/profile" 
+                    to={profileRoute.destination}
                     onClick={handleClose}
-                    selected={isActivePath('/profile')}
+                    selected={isActivePath(profileRoute.destination)}
                   >
-                    Profile
+                    {profileRoute.label}
                   </MenuItem>
                   <MenuItem onClick={handleLogout}>Logout</MenuItem>
                 </Menu>
@@ -297,10 +170,10 @@ export default function Layout() {
               <Button 
                 color="primary" 
                 component={RouterLink} 
-                to="/login"
-                variant={isActivePath('/login') ? 'contained' : 'text'}
+                to={loginRoute.destination}
+                variant={isActivePath(loginRoute.destination) ? 'contained' : 'text'}
               >
-                Login
+                {loginRoute.label}
               </Button>
             )}
           </Toolbar>

@@ -102,6 +102,37 @@ export interface AttributionInput {
   /** When provided, post a one-line outcome summary per attributed fix. */
   slack?: SlackPort;
   slackChannelOrUserId?: string;
+  /** Optional issue-state writeback. Production supplies the Linear adapter;
+   * tests use a fake. The write completes before the verdict is persisted so a
+   * transient issue-system failure remains retryable on the next cron tick. */
+  issueLifecycle?: AttributionIssueLifecycle;
+  /** Accountable human assigned to verify improved/regressed outcomes. */
+  verifierId?: string;
+}
+
+export type AttributionIssueTransition = 'verifying' | 'reopen' | 'evidence_only';
+export type AttributionIssueSyncStatus = 'applied' | 'already_applied' | 'missing_issue' | 'not_configured';
+
+export interface AttributionIssueOutcome {
+  issueId: string;
+  loopId: LoopId;
+  runId: string;
+  mutationId: string;
+  ruleId: string;
+  verdict: OutcomeVerdict;
+  transition: AttributionIssueTransition;
+  metricName: string;
+  metricBefore: number | null;
+  metricAfter: number | null;
+  observedLiftPct: number | null;
+  sampleN: number;
+  verifierId: string;
+}
+
+export interface AttributionIssueLifecycle {
+  recordOutcome(
+    outcome: AttributionIssueOutcome,
+  ): Promise<{ status: Exclude<AttributionIssueSyncStatus, 'missing_issue' | 'not_configured'> | 'missing_issue' }>;
 }
 
 export interface AttributionOutcome {
@@ -109,6 +140,8 @@ export interface AttributionOutcome {
   mutationId: string;
   verdict: OutcomeVerdict;
   observedLiftPct: number | null;
+  issueId?: string;
+  issueSync: AttributionIssueSyncStatus;
 }
 
 export interface AttributionSummary {
@@ -124,6 +157,17 @@ function recordKey(r: LearningRecord): string | null {
   const m = r.mutation?.mutationId as string | undefined;
   const p = r.proposal?.proposalId as string | undefined;
   return m ?? p ?? null;
+}
+
+function linkedIssueId(r: LearningRecord): string | null {
+  const candidate = r.mutation?.artifact?.linearIssueId;
+  return typeof candidate === 'string' && candidate.trim() !== '' ? candidate.trim() : null;
+}
+
+function transitionFor(verdict: OutcomeVerdict): AttributionIssueTransition {
+  if (verdict === 'improved') return 'verifying';
+  if (verdict === 'regressed') return 'reopen';
+  return 'evidence_only';
 }
 
 /**
@@ -180,6 +224,39 @@ export async function runAttribution(input: AttributionInput): Promise<Attributi
       minSampleN: manifest.thresholds.promoteMinNPerArm,
     });
 
+    const ruleId = rec.proposal?.sourceRuleId ?? 'unknown';
+    const issueId = linkedIssueId(rec);
+    let issueSync: AttributionIssueSyncStatus;
+    if (!issueId) {
+      issueSync = 'missing_issue';
+      input.logger?.log('warn', '[attribution] shipped mutation has no linked Linear issue', {
+        loopId: manifest.loopId,
+        mutationId: id,
+      });
+    } else if (!input.issueLifecycle) {
+      issueSync = 'not_configured';
+    } else {
+      if (!input.verifierId) {
+        throw new Error('Attribution issue lifecycle requires verifierId');
+      }
+      const sync = await input.issueLifecycle.recordOutcome({
+        issueId,
+        loopId: rec.loopId,
+        runId: rec.runId as unknown as string,
+        mutationId: id,
+        ruleId,
+        verdict,
+        transition: transitionFor(verdict),
+        metricName: manifest.targetMetric.name,
+        metricBefore: before.ratio,
+        metricAfter: after.ratio,
+        observedLiftPct,
+        sampleN,
+        verifierId: input.verifierId,
+      });
+      issueSync = sync.status;
+    }
+
     await learning.record({
       loopId: rec.loopId,
       runId: rec.runId,
@@ -196,8 +273,14 @@ export async function runAttribution(input: AttributionInput): Promise<Attributi
     });
     attributed.add(id);
 
-    const ruleId = rec.proposal?.sourceRuleId ?? 'unknown';
-    outcomes.push({ ruleId, mutationId: id, verdict, observedLiftPct });
+    outcomes.push({
+      ruleId,
+      mutationId: id,
+      verdict,
+      observedLiftPct,
+      ...(issueId ? { issueId } : {}),
+      issueSync,
+    });
     input.logger?.log('info', `[attribution] ${manifest.loopId} ${ruleId}: ${verdict}`, {
       observedLiftPct,
       sampleN,

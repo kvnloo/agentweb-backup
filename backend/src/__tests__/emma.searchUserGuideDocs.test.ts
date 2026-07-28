@@ -9,12 +9,6 @@
 
 jest.mock('../services/notionService', () => ({
   getUserGuideContent: jest.fn(),
-  getUserGuideBlocks: jest.fn(),
-  updateBlock: jest.fn(),
-  appendBlocks: jest.fn(),
-  deleteBlock: jest.fn(),
-  getBlock: jest.fn(),
-  getNotionCredentials: jest.fn(),
 }));
 
 import { getUserGuideContent } from '../services/notionService';
@@ -127,5 +121,15 @@ describe('search_user_guide tool', () => {
     expect(tool?.definition.inputSchema.properties.query).toEqual(
       expect.objectContaining({ type: 'string' })
     );
+  });
+});
+
+describe('manage_user_guide removal (ENG-163)', () => {
+  it('does not register the legacy manage_user_guide Notion write tool', () => {
+    expect(emmaToolRegistry.getTool('manage_user_guide')).toBeUndefined();
+  });
+
+  it('still registers the read-only search_user_guide tool', () => {
+    expect(emmaToolRegistry.getTool('search_user_guide')).toBeDefined();
   });
 });

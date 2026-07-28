@@ -39,8 +39,6 @@ jest.mock('@google-cloud/discoveryengine', () => ({
 jest.mock('@google-cloud/storage', () => ({ Storage: jest.fn() }));
 jest.mock('../controllers/guide', () => ({ getGuide: jest.fn() }));
 jest.mock('../controllers/release', () => ({ getReleases: jest.fn() }));
-jest.mock('../controllers/api', () => ({ getApiDocs: jest.fn() }));
-jest.mock('../controllers/user-guide', () => ({ getUserGuide: jest.fn() }));
 jest.mock('../controllers/docsController', () => ({ getUserReleaseNotes: jest.fn() }));
 jest.mock('../services/db', () => ({ taskDb: {} }));
 jest.mock('../utils/secretsManager', () => ({
@@ -205,6 +203,75 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   // ── (4) Surface gaps as actionable items ────────────────────────────────────
   it('requires surfacing skipped/blocked work as actionable items', () => {
     expect(directive.toLowerCase()).toContain('actionable');
+  });
+
+  // ── (5) ENG-396/ENG-369 reconciliation: irreversible-parameter carve-out ─────
+  // ENG-369's best-effort mandate says a scheduled run should self-pick rather
+  // than ever present a blocking menu. That must NOT extend to an irreversible /
+  // immutable parameter no human specified (e.g. the Meta campaign objective) —
+  // guessing one is the RankAI incident ENG-396 exists to prevent. The directive
+  // must carve that class out of "pick it yourself".
+  it('carves irreversible/immutable parameters out of the best-effort self-pick rule', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('irreversible');
+    expect(lower).toContain('never fabricate');
+    // The named exemplar keeps the boundary concrete.
+    expect(directive).toContain('Meta campaign objective');
+  });
+
+  it('routes an irreversible unspecified decision to park (or logged auto-take), not a guess', () => {
+    const lower = directive.toLowerCase();
+    // parks for the owner by default...
+    expect(lower).toContain('park');
+    // ...and only auto-proceeds on an explicitly autonomous schedule, logged.
+    expect(lower).toContain('autonomous');
+    expect(lower).toMatch(/log(s|ged)? the delegation/);
+  });
+
+  it('still lets reversible choices proceed best-effort (the carve-out is narrow)', () => {
+    // The exception must not swallow ENG-369: reversible work still runs.
+    expect(directive.toLowerCase()).toContain('reversible');
+    expect(directive).toContain('best-effort');
+  });
+
+  // ── (6) Prescribed per-item call patterns are intent, not literal law ────────
+  // Regression coverage for ENG-480 (sessions 54325528 / fa552592, "Daily User
+  // Activity Report"): the scheduled prompt prescribed impossible per-session and
+  // per-userId tool calls. One run proceeded via the efficient supported path
+  // (get_chat_history already returns per-session data) but was scored as having
+  // "refused/bypassed explicit constraints"; the other stopped to explain instead
+  // of delivering. The directive must reframe using the supported path as CORRECT
+  // and compliant — not a refusal — and still require producing the deliverable.
+  it('treats a prescribed per-item call pattern as intent, not a literal tool requirement', () => {
+    expect(directive.toLowerCase()).toContain('not a literal requirement');
+    expect(directive.toLowerCase()).toContain('one call per item');
+  });
+
+  it('names the efficient supported path (get_chat_history) as the correct, complete execution', () => {
+    expect(directive).toContain('get_chat_history');
+  });
+
+  it('states that using the supported path is NOT skipping/refusing/violating the instruction', () => {
+    expect(directive.toLowerCase()).toContain('not skipping, refusing');
+  });
+
+  it('still requires producing the deliverable in full rather than stopping', () => {
+    expect(directive.toLowerCase()).toContain('always produce the requested deliverable');
+  });
+
+  // The reframing must NOT bleed into per-entity ACTIONS (send/post/draft). It is
+  // scoped to fetching per-item DATA for a report; a batched call must never be
+  // treated as satisfying a per-entity side effect (guards the tension with the
+  // PER-ENTITY COMPLETION LOOP directive that immediately follows it).
+  it('scopes the reframing to reading/gathering data, not per-entity actions', () => {
+    expect(directive.toLowerCase()).toContain('reading/gathering data');
+  });
+
+  it('carves out per-entity actions so a batched call never collapses per-item side effects', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('carve-out');
+    expect(lower).toContain('does not loosen per-entity actions');
+    expect(lower).toContain('per-entity completion loop');
   });
 });
 

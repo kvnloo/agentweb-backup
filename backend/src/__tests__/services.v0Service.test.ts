@@ -113,7 +113,11 @@ jest.mock("../services/settingsService", () => ({
 }));
 jest.mock("../services/autoHumanEvalService", () => ({
   enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
-}), { virtual: true });
+}));
+const mockRunGenerationSmokeTest = jest.fn().mockResolvedValue(undefined);
+jest.mock("../services/landingPageSmokeTest", () => ({
+  runGenerationSmokeTest: (...args: any[]) => mockRunGenerationSmokeTest(...args),
+}));
 
 // Mock fs for filesystem fallback tests
 const mockFsExistsSync = jest.fn().mockReturnValue(false);
@@ -176,9 +180,11 @@ import {
   triggerVercelDeployment,
   injectLeadCaptureAttribution,
   assertNoDuplicateInjectedRoutes,
+  buildTrackingHelper,
 } from "../services/v0Service";
 
 import { setV0PollIntervals, setVercelPollConfig, deleteLandingPageByRecord, getVercelBuildErrors, isNonErrorBuildLine } from "../services/v0Service";
+import { metaService } from "../services/metaService";
 import { _resetV0UsageGuardForTest, guardedV0ChatCreate, hashV0Prompt } from "../services/v0UsageGuard";
 const { enqueueAutoHumanEval } = jest.requireMock("../services/autoHumanEvalService");
 
@@ -447,6 +453,12 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
     expect(routeSrc).toContain("/api/webhooks/forward-lead");
     expect(routeSrc).toContain('from "next/headers"');
     expect(routeSrc).toContain("aw_first_touch");
+
+    // ENG-449 match-quality gap: _fbp/_fbc are Meta's own first-party click-id cookies (set
+    // by the already-platform-injected base Pixel snippet) — read server-side here and
+    // forwarded to /forward-lead, fully deterministic, no v0-authored client code involved.
+    expect(routeSrc).toContain('"_fbp"');
+    expect(routeSrc).toContain('"_fbc"');
   });
 
   it("FAIL: v0-generated app/api/capture/route.ts is replaced, not duplicated", () => {
@@ -540,6 +552,126 @@ describe("v0Service - injectLeadCaptureAttribution", () => {
   it("SUCCESS: injectLeadCaptureAttribution never trips the duplicate guard on the normal path", () => {
     const files = [file("app/page.tsx"), file("app/api/capture/route.ts", "// v0's own"), file("middleware.ts", "// v0's own")];
     expect(() => injectLeadCaptureAttribution(files, { "/": "list_xyz" })).not.toThrow();
+  });
+
+  // ---------------------------------------------------------------------------
+  // pixelId/metaAccountId threaded through to the generated capture route,
+  // forwarded to the backend's forward-lead webhook alongside the client's own eventId.
+  // ---------------------------------------------------------------------------
+  it("SUCCESS: pixelId + metaAccountId are baked into the capture route and forwarded", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" }, "1430870751246428", "acc1");
+
+    const route = result.find((f) => f.path === "app/api/capture/route.ts")!;
+    const routeSrc = route.content.toString();
+    expect(routeSrc).toContain('const PIXEL_ID = "1430870751246428"');
+    expect(routeSrc).toContain('const META_ACCOUNT_ID = "acc1"');
+    expect(routeSrc).toContain("pixelId: PIXEL_ID");
+    expect(routeSrc).toContain("metaAccountId: META_ACCOUNT_ID");
+    // The client's own eventId already passes through via the existing `...body` spread —
+    // no separate handling needed, but pin that the spread still comes first.
+    expect(routeSrc.indexOf("...body")).toBeLessThan(routeSrc.indexOf("pixelId: PIXEL_ID"));
+  });
+
+  it("SUCCESS: no pixelId => no PIXEL_ID/META_ACCOUNT_ID fields forwarded at all", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" });
+
+    const route = result.find((f) => f.path === "app/api/capture/route.ts")!;
+    const routeSrc = route.content.toString();
+    // PIXEL_ID/META_ACCOUNT_ID are declared undefined, so the runtime `PIXEL_ID ? {...} : {}`
+    // ternary in the forwarded body naturally omits pixelId/metaAccountId — no separate
+    // conditional needed in the generated source itself.
+    expect(routeSrc).toContain("const PIXEL_ID = undefined");
+    expect(routeSrc).toContain("const META_ACCOUNT_ID = undefined");
+  });
+});
+
+// =============================================================================
+// buildTrackingHelper + its injection (ENG-449 follow-up: deterministic tracking,
+// shrinks the v0-compliance surface for fbq()/bridge-out — see plan
+// "ENG-449 follow-up: close CAPI/Pixel reliability gaps")
+// =============================================================================
+describe("v0Service - buildTrackingHelper", () => {
+  it("SUCCESS: generated module exports fireLeadTracking with fbq + 800ms flush + bridge-out redirect logic", () => {
+    const src = buildTrackingHelper();
+    expect(src).toContain("export async function fireLeadTracking");
+    expect(src).toContain("window.fbq");
+    expect(src).toContain("'track'");
+    expect(src).toContain("'Lead'");
+    expect(src).toContain("800");
+    expect(src).toContain("window.location.href");
+    // Query building uses the URL API now (searchParams.set), not manual
+    // encodeURIComponent string concatenation — see the dedicated UTM test below
+    // for why (respecting an explicit override already on the destination URL).
+    expect(src).toContain("URLSearchParams");
+    // pixelId/bridgeOutUrl are CALL-TIME arguments (per-page data), not baked into this
+    // repo-level shared file — a page's own values are literal args v0 is instructed to pass.
+    expect(src).toContain("pixelId");
+    expect(src).toContain("bridgeOutUrl");
+    // eventId must be a caller-supplied argument, NOT generated inside this helper — the
+    // SAME id has to also reach the server (in the /api/capture POST body) for Meta's CAPI
+    // dedup to work. Generating it here would desync the client fbq call from the
+    // server-side CAPI event_id, silently breaking dedup.
+    expect(src).toContain("eventId");
+    expect(src).not.toContain("crypto.randomUUID");
+  });
+
+  it("SUCCESS (ENG-449): bridge-out forwards UTMs alongside email, read from the current page's own URL", () => {
+    const src = buildTrackingHelper();
+    expect(src).toContain("window.location.search");
+    expect(src).toContain("URLSearchParams");
+    for (const key of ["utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term"]) {
+      expect(src).toContain(key);
+    }
+  });
+
+  it("SUCCESS (ENG-449): an explicit utm_* param already on the bridge-out URL is never overridden — source asserts the override-respecting guard", () => {
+    const src = buildTrackingHelper();
+    // A same-named-key match alone wouldn't prove the guard is real (a same-looking
+    // string could still omit the check). Assert the specific defensive line directly:
+    // the destination URL's OWN params are checked first, before ever copying one over.
+    expect(src).toContain("url.searchParams.has(key)");
+    expect(src).toContain("continue");
+  });
+
+  it("SUCCESS (gap follow-up): a malformed bridgeOutUrl degrades gracefully instead of throwing", () => {
+    const src = buildTrackingHelper();
+    // new URL(opts.bridgeOutUrl) throws on a malformed value — a persisted-record edge
+    // case that shouldn't crash the whole submit flow (the lead is already captured via
+    // /api/capture by the time this runs). Assert the guard exists around it.
+    expect(src).toContain("try {");
+    expect(src).toContain("catch (err)");
+    expect(src).toMatch(/catch \(err\) \{[\s\S]*console\.error/);
+  });
+});
+
+describe("v0Service - injectLeadCaptureAttribution also injects lib/agentweb-track.ts", () => {
+  const file = (path: string, content = "// v0 generated") => ({ path, content: Buffer.from(content) });
+
+  it("SUCCESS: injects lib/agentweb-track.ts alongside the existing capture files", () => {
+    const result = injectLeadCaptureAttribution([file("app/page.tsx")], { "/": "list_xyz" });
+    const helper = result.find((f) => f.path === "lib/agentweb-track.ts");
+    expect(helper).toBeDefined();
+    expect(helper!.content.toString()).toContain("fireLeadTracking");
+  });
+
+  it("FAIL: v0-generated lib/agentweb-track.ts is replaced, not duplicated", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("lib/agentweb-track.ts", "// v0's own fake tracking helper"), file("app/page.tsx")],
+      { "/": "list_xyz" }
+    );
+    const helpers = result.filter((f) => f.path === "lib/agentweb-track.ts");
+    expect(helpers).toHaveLength(1);
+    expect(helpers[0].content.toString()).not.toContain("v0's own fake tracking helper");
+  });
+
+  it("FAIL: route-group/src-prefixed variant of v0's tracking helper is also dropped", () => {
+    const result = injectLeadCaptureAttribution(
+      [file("src/lib/agentweb-track.ts", "// v0 variant"), file("app/page.tsx")],
+      { "/": "list_xyz" }
+    );
+    const helpers = result.filter((f) => f.path === "lib/agentweb-track.ts");
+    expect(helpers).toHaveLength(1);
+    expect(helpers[0].content.toString()).not.toContain("v0 variant");
   });
 });
 
@@ -889,6 +1021,24 @@ describe("v0Service - commitFilesToRepoMain (retry + rebase)", () => {
     const res = await commitFilesToRepoMain("o/r", {}, files, "msg");
     expect(res.pushedCommitSha).toBe("new-sha");
     expect(mockAxiosGet).toHaveBeenCalledTimes(1); // no rebase needed
+  });
+
+  it("ENG-497: commits to a non-default branch when one is passed, never touching heads/main", async () => {
+    mockAxiosGet.mockResolvedValue(ref);
+    mockAxiosPost.mockResolvedValue(post);
+    mockAxiosPatch.mockResolvedValue({ data: {} });
+
+    const res = await commitFilesToRepoMain("o/r", {}, files, "msg", 4, "draft/agentweb-preview");
+    expect(res.pushedCommitSha).toBe("new-sha");
+    expect(mockAxiosGet).toHaveBeenCalledWith(
+      "https://api.github.com/repos/o/r/git/ref/heads/draft/agentweb-preview",
+      expect.anything()
+    );
+    expect(mockAxiosPatch).toHaveBeenCalledWith(
+      "https://api.github.com/repos/o/r/git/refs/heads/draft/agentweb-preview",
+      expect.anything(),
+      expect.anything()
+    );
   });
 
   it("rebases and retries on a non-fast-forward 422 (concurrent commit landed)", async () => {
@@ -1696,6 +1846,15 @@ describe("v0Service - deployLandingPage", () => {
         userId: "user-1",
       },
     }));
+
+    // ENG-449 gap #3: dispatched via a dynamic import (avoids a circular import with
+    // landingPageSmokeTest.ts, which imports FROM this module) — flush microtasks so
+    // that import()'s .then() chain has a chance to run before asserting.
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mockRunGenerationSmokeTest).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "page-1", status: "deployed" })
+    );
   });
 
   it("FAIL: chats.downloadVersion throws → throws deployment error", async () => {
@@ -1885,6 +2044,131 @@ describe("v0Service - deployLandingPage", () => {
       .some((c) => Buffer.from(c[1].content, "base64").toString("utf8").includes("googletagmanager.com"));
     expect(anyTagPushed).toBe(false);
     expect(pushedTrackingSignal()).toBe(false);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Meta Pixel auto-injection wiring — the resolved metaPixelId flows through
+  // the push path into the files array pushed to GitHub, and metaTrackingInstalled is
+  // persisted. Mirrors the GTM wiring section above. resolveMetaPixelForUser
+  // itself is unit-tested elsewhere (metaService.pixelResolution.test.ts) — these pin
+  // the WIRING between resolution and injection.
+  // ---------------------------------------------------------------------------
+
+  function pushedMetaTrackingSignal(): boolean | undefined {
+    const call = mockUpdate.mock.calls.find(
+      (c) => c[0]?.ExpressionAttributeValues && ":metaTrackingInstalled" in c[0].ExpressionAttributeValues,
+    );
+    return call?.[0].ExpressionAttributeValues[":metaTrackingInstalled"];
+  }
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it("SUCCESS (criterion 1): a resolvable pixel pushes an app/layout.tsx carrying the Meta Pixel snippet and records metaTrackingInstalled=true", async () => {
+    jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValue({
+      pixelId: "1430870751246428",
+      accountId: "acc1",
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Compare Landing Page",
+            prompt: "Build a compare landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    expect(layout).toContain("fbq('init', '1430870751246428')");
+    expect(layout).toContain('rel="icon"'); // v0's original layout content preserved
+    expect(pushedMetaTrackingSignal()).toBe(true);
+  });
+
+  it("SUCCESS (criterion 3): an unresolvable pixel (0 connected accounts) still deploys, pushes NO pixel tag, and records metaTrackingInstalled=false", async () => {
+    jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValue({
+      unresolved: true,
+      reason: "No Meta ad account connected",
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Untracked Landing Page",
+            prompt: "Build an untracked landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            // metaPixelId intentionally absent
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    expect(layout).not.toContain("fbq(");
+    expect(layout).not.toContain("facebook.com");
+    expect(pushedMetaTrackingSignal()).toBe(false);
+  });
+
+  it("SUCCESS (criterion 4): both GTM and Meta Pixel configured — both snippets present in the same pushed layout, neither corrupts the other", async () => {
+    jest.spyOn(metaService, "resolveMetaPixelForUser").mockResolvedValue({
+      pixelId: "1430870751246428",
+      accountId: "acc1",
+    });
+    mockGet.mockReturnValueOnce({
+      promise: () =>
+        Promise.resolve({
+          Item: {
+            id: "page-1",
+            userId: "user-1",
+            name: "Fully Tracked Landing Page",
+            prompt: "Build a fully tracked landing page",
+            status: "draft",
+            v0ChatId: "chat_1",
+            iterations: 0,
+            gtmContainerId: "GTM-TEST99",
+          },
+        }),
+    });
+    mockChatsGetById.mockResolvedValueOnce({ id: "chat_1", latestVersion: { id: "ver_1" } });
+    mockChatsDownloadVersion.mockResolvedValueOnce(await createV0ZipWithLayout());
+    wireHappyPathDeploy();
+
+    const result = await deployLandingPage("page-1", "user-1");
+
+    expect(result.status).toBe("deployed");
+    const layout = pushedLayoutBlob();
+    expect(layout).toBeDefined();
+    // Both present
+    expect(layout).toContain("'GTM-TEST99'");
+    expect(layout).toContain("fbq('init', '1430870751246428')");
+    // Neither duplicated / corrupted by the other's injection running second
+    expect(layout!.match(/gtm\.js\?id=/g)).toHaveLength(1);
+    expect(layout!.match(/fbq\('init',/g)).toHaveLength(1);
+    expect(pushedTrackingSignal()).toBe(true);
+    expect(pushedMetaTrackingSignal()).toBe(true);
   });
 });
 
@@ -3887,6 +4171,20 @@ describe("v0Service - remapFilesForSubPage", () => {
     expect(result[0].path).toBe("app/test/page.tsx");
   });
 
+  // ENG-449 follow-up: if v0 ever authors its own copy of the platform-owned tracking
+  // helper for a sub-page (rather than just importing it, per the updated prompt
+  // instruction), it must be dropped here — same defense as lib/utils.ts above — so the
+  // platform's own version (injected/synced separately) stays authoritative.
+  it("skips a v0-authored lib/agentweb-track.ts", () => {
+    const files = [
+      { path: "lib/agentweb-track.ts", content: buf('// v0-authored fake tracking helper') },
+      { path: "app/page.tsx", content: buf('export default function Page() { return <div/>; }') },
+    ];
+    const result = remapFilesForSubPage(files, "test");
+    expect(result).toHaveLength(1);
+    expect(result[0].path).toBe("app/test/page.tsx");
+  });
+
   it("moves custom components to app/<slug>/_components/ and rewrites imports", () => {
     const pageContent = `import { Hero } from "@/components/hero";\nimport { Footer } from "@/components/footer";\nexport default function Page() { return <><Hero/><Footer/></>; }`;
     const files = [
@@ -4185,7 +4483,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
   };
 
   // Setup: mock GitHub API (repair scan, ref, blob, tree, commit, patch)
-  const setupGitHubMocks = () => {
+  // `extraBlobs`: mockAxiosPost is a plain sequential mockResolvedValueOnce queue (not
+  // URL-matched), so every POST call — blob, tree, or commit — consumes the next queued
+  // entry regardless of which one it "means" to be. When lib/agentweb-track.ts also rides in
+  // the page's own commit (ENG-449 follow-up: only when leadListId && (metaPixelId ||
+  // bridgeOutUrl)), that's a 2nd blob upload that MUST be queued between the page's own blob
+  // and the tree/commit mocks, or the tree call would wrongly consume a blob-shaped response.
+  const setupGitHubMocks = (extraBlobs: number = 0) => {
     // GET git/trees/main?recursive=1 — the poisoned-import repair scan runs first.
     // An empty tree means a healthy repo: nothing to scan, nothing to repair, no extra reads.
     mockAxiosGet.mockResolvedValueOnce({ data: { tree: [] } });
@@ -4197,6 +4501,9 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     mockAxiosPost.mockResolvedValueOnce({
       data: { sha: "blob_sha" },
     });
+    for (let i = 0; i < extraBlobs; i++) {
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: `blob_sha_extra_${i}` } });
+    }
     // POST tree
     mockAxiosPost.mockResolvedValueOnce({
       data: { sha: "tree_sha" },
@@ -4519,11 +4826,12 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
     // 1 repair-scan tree listing + 1 GitHub ref + 2 Vercel polls.
     // The tree listing is the whole cost of the poisoned-import scan on a healthy repo:
     // an empty/clean tree yields no candidates, so no file contents are ever read.
-    // Plus 3 more (ENG-483): the post-deploy capture-route sync reads middleware.ts,
-    // app/api/capture/route.ts, and domainMap.ts to decide whether LIST_BY_PATH needs
-    // updating. No mock is queued for them here, so all 3 reject and the sync gives up
-    // silently (never blocking the deploy) — still 3 real GET attempts.
-    expect(mockAxiosGet).toHaveBeenCalledTimes(7);
+    // Plus 4 more (ENG-483 + ENG-449 follow-up): the post-deploy capture-route sync reads
+    // middleware.ts, app/api/capture/route.ts, domainMap.ts, and lib/agentweb-track.ts to
+    // decide whether anything needs updating/backfilling. No mock is queued for them here,
+    // so all 4 reject and the sync gives up silently (never blocking the deploy) — still 4
+    // real GET attempts.
+    expect(mockAxiosGet).toHaveBeenCalledTimes(8);
   });
 
   it("SUCCESS: sub-page deployedUrl uses customDomainUrl as base when existingPage has one", async () => {
@@ -4559,8 +4867,8 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
   // lead form 422'd forever until an unrelated GTM/Pixel override happened to resync it.
   describe("ENG-483: sub-page registered in shared capture route", () => {
     // Sync's own GitHub calls, run AFTER the page's own commit + Vercel poll succeed:
-    // Promise.all([middleware.ts, capture route, domainMap.ts]) reads, then (if different)
-    // a ref read, a blob per changed file, a tree, a commit, and a ref patch.
+    // Promise.all([middleware.ts, capture route, domainMap.ts, lib/agentweb-track.ts]) reads,
+    // then (if different) a ref read, a blob per changed file, a tree, a commit, and a ref patch.
     const setupCaptureRouteSyncMocks = (existingCaptureRouteContent: string) => {
       mockAxiosGet.mockResolvedValueOnce({
         data: { content: Buffer.from("stale middleware").toString("base64") },
@@ -4571,9 +4879,13 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       mockAxiosGet.mockResolvedValueOnce({
         data: { content: Buffer.from("{}").toString("base64") },
       }); // domainMap.ts (already exists)
+      mockAxiosGet.mockResolvedValueOnce({
+        data: { content: Buffer.from(buildTrackingHelper()).toString("base64") },
+      }); // lib/agentweb-track.ts (already up to date — only the capture-route staleness above forces the commit)
       mockAxiosGet.mockResolvedValueOnce({ data: { object: { sha: "sync_base_sha" } } }); // ref/heads/main
       mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_middleware" } });
       mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_capture_route" } });
+      mockAxiosPost.mockResolvedValueOnce({ data: { sha: "blob_tracking_helper" } });
       mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_tree_sha" } });
       mockAxiosPost.mockResolvedValueOnce({ data: { sha: "sync_commit_sha" } });
       mockAxiosPatch.mockResolvedValueOnce({ data: {} }); // ref update
@@ -4805,6 +5117,216 @@ describe("v0Service - addPageToExistingRepo (Vercel deployment polling)", () => 
       );
       expect(loggedBuildFailure).toBe(true);
       errorSpy.mockRestore();
+    });
+  });
+
+  // ENG-482: validatePixelLeadEvent used to run on `previewFiles` — v0's raw,
+  // unfiltered zip — while the files actually committed are `filesToCommit`, produced
+  // by a LATER, separate remapFilesForSubPage() call with its own skip-list (drops
+  // app/layout.tsx, lib/utils.ts, etc.). A file that satisfies the fbq('track','Lead')
+  // regex in the raw zip but gets dropped by that skip-list made pixelLeadEventVerified
+  // a false positive: the platform believed Lead tracking worked on a page whose
+  // deployed code could never fire it. Live-repro'd against a real generated sub-page
+  // whose only "hit" was v0's own scaffold app/layout.tsx, which remapFilesForSubPage
+  // always drops (the real, already-injected layout already lives in the target repo).
+  describe("ENG-482: pixel Lead-event validation must check the file set that actually ships", () => {
+    const existingSiteWithPixel = {
+      ...existingSiteRecord,
+      metaPixelId: "1012387921717047",
+    };
+
+    const setupSiteRecordWithPixelMock = () => {
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteWithPixel] }),
+      });
+      mockGet.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: existingSiteWithPixel }),
+      });
+    };
+
+    /** v0's raw zip: the real form component has NO fbq call, but v0's own scaffold
+     *  app/layout.tsx (always dropped by remapFilesForSubPage) happens to contain one —
+     *  exactly the false-positive mechanism the live repro found. */
+    const createZipWithFbqOnlyInLayout = async () => {
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from('export default function Page() { return <div>No form here</div>; }')
+      );
+      zip.addFile(
+        "app/layout.tsx",
+        Buffer.from(
+          `export default function RootLayout({ children }: { children: React.ReactNode }) {
+             return <html><body>{children}<script>fbq('track', 'Lead');</script></body></html>;
+           }`
+        )
+      );
+      return zip.toBuffer();
+    };
+
+    it("SUCCESS: exhausts retries and correctly reports pixelLeadEventVerified:false when the only fbq match is in a file remapFilesForSubPage drops", async () => {
+      setupSiteRecordWithPixelMock();
+
+      const buggyZip = await createZipWithFbqOnlyInLayout();
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      // Initial version + 2 correction-round versions — all download the SAME
+      // buggy zip, so validation fails identically on every attempt.
+      mockChatsGetById
+        .mockResolvedValueOnce({ latestVersion: { id: "v1" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v2" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v3" } });
+      mockChatsDownloadVersion
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip);
+      mockChatsSendMessage.mockResolvedValue({});
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a signup page",
+        "Signup Page",
+        {},
+        "list_signup"
+      );
+
+      // Never fails generation over a missing client-side event (AC3) — the page
+      // itself is fine, this is purely a tracking-completeness signal.
+      expect(result.status).toBe("deployed");
+      // 2 correction messages sent (both retry attempts exhausted, not just detected once).
+      expect(mockChatsSendMessage).toHaveBeenCalledTimes(2);
+      expect(result.pixelLeadEventVerified).toBe(false);
+    });
+
+    it("SUCCESS: reports pixelLeadEventVerified:true when the fbq call is in the file that actually ships (app/page.tsx)", async () => {
+      setupSiteRecordWithPixelMock();
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          `export default function Page() { return <button onClick={() => window.fbq && window.fbq('track', 'Lead')}>Submit</button>; }`
+        )
+      );
+      const goodZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(goodZip);
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a signup page",
+        "Signup Page 2",
+        {},
+        "list_signup2"
+      );
+
+      expect(result.status).toBe("deployed");
+      expect(mockChatsSendMessage).not.toHaveBeenCalled();
+      expect(result.pixelLeadEventVerified).toBe(true);
+    });
+  });
+
+  // ENG-449 (Harsha's bridge-out requirement): validateBridgeOutRedirect mirrors
+  // validatePixelLeadEvent's "verify not guarantee" contract — exhausted retries never
+  // fail generation, they just record bridgeOutVerified:false on the record.
+  describe("bridge-out redirect validation (ENG-449, mirrors ENG-482's pixel Lead-event checks)", () => {
+    const BRIDGE_URL = "https://rankai.ai/book-a-call";
+
+    const existingSiteWithBridgeOut = {
+      ...existingSiteRecord,
+      bridgeOutUrl: BRIDGE_URL,
+    };
+
+    const setupSiteRecordWithBridgeOutMock = () => {
+      mockQuery.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Items: [existingSiteWithBridgeOut] }),
+      });
+      mockGet.mockReturnValueOnce({
+        promise: () => Promise.resolve({ Item: existingSiteWithBridgeOut }),
+      });
+    };
+
+    it("SUCCESS: exhausts retries and correctly reports bridgeOutVerified:false when the redirect is missing", async () => {
+      setupSiteRecordWithBridgeOutMock();
+
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from('export default function Page() { return <div>No redirect here</div>; }')
+      );
+      const buggyZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById
+        .mockResolvedValueOnce({ latestVersion: { id: "v1" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v2" } })
+        .mockResolvedValueOnce({ latestVersion: { id: "v3" } });
+      mockChatsDownloadVersion
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip)
+        .mockResolvedValueOnce(buggyZip);
+      mockChatsSendMessage.mockResolvedValue({});
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a booking page",
+        "Booking Page",
+        {},
+        "list_booking",
+        undefined,
+        { bridgeOutUrl: BRIDGE_URL }
+      );
+
+      // Never fails generation over a missing client-side redirect (same AC3 contract).
+      expect(result.status).toBe("deployed");
+      expect(mockChatsSendMessage).toHaveBeenCalledTimes(2);
+      expect(result.bridgeOutVerified).toBe(false);
+    });
+
+    it("SUCCESS: reports bridgeOutVerified:true when the redirect + email= param are in the file that actually ships", async () => {
+      setupSiteRecordWithBridgeOutMock();
+      const AdmZip = (await import("adm-zip")).default;
+      const zip = new AdmZip();
+      zip.addFile(
+        "app/page.tsx",
+        Buffer.from(
+          `export default function Page() { return <button onClick={() => { window.location.href = \`${BRIDGE_URL}?email=\${encodeURIComponent(email)}\`; }}>Submit</button>; }`
+        )
+      );
+      const goodZip = zip.toBuffer();
+
+      mockChatsCreate.mockResolvedValueOnce({ id: "chat_new_page" });
+      mockChatsGetById.mockResolvedValueOnce({ latestVersion: { id: "v1" } });
+      mockChatsDownloadVersion.mockResolvedValueOnce(goodZip);
+
+      setupGitHubMocks(1);
+      setupVercelDeploySuccessMock();
+
+      const result = await generateLandingPage(
+        "user-1",
+        "Create a booking page",
+        "Booking Page 2",
+        {},
+        "list_booking2",
+        undefined,
+        { bridgeOutUrl: BRIDGE_URL }
+      );
+
+      expect(result.status).toBe("deployed");
+      expect(mockChatsSendMessage).not.toHaveBeenCalled();
+      expect(result.bridgeOutVerified).toBe(true);
     });
   });
 });

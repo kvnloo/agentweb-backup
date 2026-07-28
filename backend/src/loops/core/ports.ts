@@ -102,8 +102,7 @@ export interface BedrockPort {
 }
 
 // ---------------------------------------------------------------------------
-// Slack port — only the operations the framework's gates need. Each
-// ApprovalGate impl that uses Slack pulls this port through its config.
+// Slack port — digest/notification operations used by loop instances.
 // ---------------------------------------------------------------------------
 
 export interface SlackMessageHandle {
@@ -111,24 +110,9 @@ export interface SlackMessageHandle {
   ts: string;
 }
 
-export interface SlackReaction {
-  name: string;
-  users: readonly string[];
-}
-
-export interface SlackReply {
-  user: string;
-  text: string;
-  ts: string;
-}
-
 export interface SlackPort {
-  /** Send a DM or channel message; returns a handle for later polling. */
+  /** Send a DM or channel message. */
   postMessage(channelOrUserId: string, markdown: string): Promise<SlackMessageHandle>;
-  /** Get reactions on a previously-posted message. */
-  getReactions(handle: SlackMessageHandle): Promise<readonly SlackReaction[]>;
-  /** Get thread replies to a previously-posted message. */
-  getReplies(handle: SlackMessageHandle): Promise<readonly SlackReply[]>;
 }
 
 // ---------------------------------------------------------------------------

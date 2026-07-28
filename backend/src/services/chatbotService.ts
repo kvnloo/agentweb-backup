@@ -5,8 +5,7 @@ import AWS from "aws-sdk";
 import dotenv from "dotenv";
 import path from "path";
 import { getReleases } from "../controllers/release";
-import { getUserGuideContent } from "../services/notionService";
-import { getApiDocs } from "../controllers/api";
+import { fetchMintlifyDocsContent, chunkDocsContent } from "./docsKnowledgeSource";
 import { getUserReleaseNotes } from "../controllers/docsController";
 import { Request, Response } from "express";
 import { EngineServiceClient } from '@google-cloud/discoveryengine';
@@ -21,9 +20,11 @@ import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBl
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
+import { withKeyedMutex } from '../utils/keyedMutex';
 import { incrementUserTokenUsage } from './tokenUsageService';
 import { computeCostMicroUsd } from './usageRecorderService';
 import { approvalDb } from './approvalDb';
+import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 
@@ -138,6 +139,7 @@ export interface ChatMessage {
     };
     kind?: string;                      // Stable marker for system messages (e.g. 'image-generated')
     imageFilename?: string;             // Filename when kind === 'image-generated'
+    imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
   };
 }
@@ -195,6 +197,16 @@ export interface ChatSession {
     autocomplete?: boolean; // When true, Emma MUST complete each step before responding to the user
   };
   contextLimitReported?: boolean; // True once a context-limit issue report has been auto-filed
+  // ENG-396: the single structured question Emma is currently blocked on (if any).
+  // Persisted so the answer is read STRUCTURALLY by the next tool call (never
+  // re-parsed from prose) and so an unanswered gate survives run boundaries as a
+  // parked pending_user_input state. Mirrors the workPlan persistence pattern.
+  pendingUserQuestion?: PendingUserQuestion;
+  // ENG-400: answered questions archived by questionId when they roll off the
+  // live pendingUserQuestion slot (a later question replaced them). Lets a
+  // write gate (checkQuestionGate) still find an earlier human answer even
+  // after Emma has moved on to asking something else in the same session.
+  answeredQuestions?: Record<string, PendingUserQuestion>;
   calledFunctions?: Record<string, number>; // Track count of each function call made in this session
   failedFunctions?: Record<string, number>; // Track count of each failed function call in this session
   favorites?: Record<string, boolean>; // Track favorited assets by URL (key: assetUrl, value: true if favorited)
@@ -880,41 +892,48 @@ export class ChatbotDB {
     sessionId: string,
     message: ChatMessage
   ): Promise<ChatSession> {
-    // Check if session exists
-    const currentSession = await this.getChatSession(sessionId);
-    if (!currentSession) {
-      throw new Error('Session not found');
-    }
+    // ENG-510: the count-then-write below is a read-modify-write. Serialize it per session
+    // so concurrent appends (e.g. parallel image-variant markers in one turn) can't read
+    // the same count and Put to the same messageIndex, overwriting each other. Keyed by
+    // session; different sessions still run concurrently. Shares the key with
+    // addMessagesToSession so a mid-turn marker and the end-of-turn batch can't collide.
+    return withKeyedMutex(`chat-append:${sessionId}`, async () => {
+      // Check if session exists
+      const currentSession = await this.getChatSession(sessionId);
+      if (!currentSession) {
+        throw new Error('Session not found');
+      }
 
-    // Get current message count from AW-ChatMessages
-    const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
-    const currentMessageCount = currentMessages.length;
+      // Get current message count from AW-ChatMessages
+      const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
+      const currentMessageCount = currentMessages.length;
 
-    const messageIndex = currentMessageCount;
+      const messageIndex = currentMessageCount;
 
-    // Add message to AW-ChatMessages table
-    await this.addMessagesToMessagesTable(sessionId, [message], messageIndex);
+      // Add message to AW-ChatMessages table
+      await this.addMessagesToMessagesTable(sessionId, [message], messageIndex);
 
-    // Atomically increment messageCount on the session record for asset cache tracking
-    await this.incrementMessageCount(sessionId, 1);
+      // Atomically increment messageCount on the session record for asset cache tracking
+      await this.incrementMessageCount(sessionId, 1);
 
-    // Incrementally update token usage on the session
-    await this.incrementTokenUsage(sessionId, [message]);
+      // Incrementally update token usage on the session
+      await this.incrementTokenUsage(sessionId, [message]);
 
-    // Increment user-level token usage for allowance tracking
-    if (currentSession.userId && message.usage) {
-      await incrementUserTokenUsage(
-        currentSession.userId,
-        message.usage.total_tokens || 0,
-        message.usage.estimated_cost || 0
-      );
-    }
+      // Increment user-level token usage for allowance tracking
+      if (currentSession.userId && message.usage) {
+        await incrementUserTokenUsage(
+          currentSession.userId,
+          message.usage.total_tokens || 0,
+          message.usage.estimated_cost || 0
+        );
+      }
 
-    // Return session with updated messages (no need to update session table)
-    return {
-      ...currentSession,
-      messages: [...currentMessages, message],
-    };
+      // Return session with updated messages (no need to update session table)
+      return {
+        ...currentSession,
+        messages: [...currentMessages, message],
+      };
+    });
   }
 
   async addMessagesToSession(
@@ -925,47 +944,52 @@ export class ChatbotDB {
       return (await this.getChatSession(sessionId))!;
     }
 
-    // Check if session exists
-    const currentSession = await this.getChatSession(sessionId);
-    if (!currentSession) {
-      throw new Error('Session not found');
-    }
+    // ENG-510: serialize the read-modify-write per session (same key as
+    // addMessageToSession) so a batched append can't race a concurrent marker append and
+    // collide on messageIndex. See withKeyedMutex for the full rationale.
+    return withKeyedMutex(`chat-append:${sessionId}`, async () => {
+      // Check if session exists
+      const currentSession = await this.getChatSession(sessionId);
+      if (!currentSession) {
+        throw new Error('Session not found');
+      }
 
-    // Get current message count from AW-ChatMessages
-    const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
-    const currentMessageCount = currentMessages.length;
+      // Get current message count from AW-ChatMessages
+      const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
+      const currentMessageCount = currentMessages.length;
 
-    const messageIndex = currentMessageCount;
+      const messageIndex = currentMessageCount;
 
-    // Add messages to AW-ChatMessages table
-    await this.addMessagesToMessagesTable(sessionId, messages, messageIndex);
+      // Add messages to AW-ChatMessages table
+      await this.addMessagesToMessagesTable(sessionId, messages, messageIndex);
 
-    // Atomically increment messageCount on the session record for asset cache tracking
-    await this.incrementMessageCount(sessionId, messages.length);
+      // Atomically increment messageCount on the session record for asset cache tracking
+      await this.incrementMessageCount(sessionId, messages.length);
 
-    // Incrementally update token usage on the session
-    await this.incrementTokenUsage(sessionId, messages);
+      // Incrementally update token usage on the session
+      await this.incrementTokenUsage(sessionId, messages);
 
-    // Increment user-level token usage for allowance tracking
-    if (currentSession.userId) {
-      let batchTokens = 0;
-      let batchCost = 0;
-      for (const msg of messages) {
-        if (msg.usage) {
-          batchTokens += msg.usage.total_tokens || 0;
-          batchCost += msg.usage.estimated_cost || 0;
+      // Increment user-level token usage for allowance tracking
+      if (currentSession.userId) {
+        let batchTokens = 0;
+        let batchCost = 0;
+        for (const msg of messages) {
+          if (msg.usage) {
+            batchTokens += msg.usage.total_tokens || 0;
+            batchCost += msg.usage.estimated_cost || 0;
+          }
+        }
+        if (batchTokens > 0 || batchCost > 0) {
+          await incrementUserTokenUsage(currentSession.userId, batchTokens, batchCost);
         }
       }
-      if (batchTokens > 0 || batchCost > 0) {
-        await incrementUserTokenUsage(currentSession.userId, batchTokens, batchCost);
-      }
-    }
 
-    // Return session with updated messages (no need to update session table)
-    return {
-      ...currentSession,
-      messages: [...currentMessages, ...messages],
-    };
+      // Return session with updated messages (no need to update session table)
+      return {
+        ...currentSession,
+        messages: [...currentMessages, ...messages],
+      };
+    });
   }
 
   // Update message feedback in AW-ChatMessages table
@@ -1079,7 +1103,7 @@ export class ChatbotDB {
   }
 
   // Get messages from AW-ChatMessages table
-  async getMessagesFromMessagesTable(sessionId: string): Promise<ChatMessage[]> {
+  async getMessagesFromMessagesTable(sessionId: string, consistentRead = false): Promise<ChatMessage[]> {
     const params = {
       TableName: this.messagesTableName,
       KeyConditionExpression: "sessionId = :sessionId",
@@ -1087,6 +1111,11 @@ export class ChatbotDB {
         ":sessionId": sessionId,
       },
       ScanIndexForward: true, // Sort by messageIndex ascending
+      // ENG-510: default reads are eventually consistent — a caller that must see a marker
+      // written moments earlier (e.g. the whole-turn-timeout recovery collecting the images
+      // that just completed) can opt into a strongly consistent read so a fresh append is
+      // never missed.
+      ...(consistentRead ? { ConsistentRead: true } : {}),
     };
 
     try {
@@ -1560,7 +1589,20 @@ export class ChatbotDB {
     });
   }
 
-  async getChatSession(sessionId: string): Promise<ChatSession | null> {
+  /**
+   * Load the raw chat session record — ownership and metadata only — without
+   * hydrating the message history or running the legacy message migration that
+   * `getChatSession` performs.
+   *
+   * Use this for authorization checks (ENG-521): resolving the owner of a
+   * caller-supplied sessionId must not cause that session's message table to be
+   * read or migrated before the caller has been proven to own it.
+   *
+   * NOTE: `messages` on the returned record is the raw stored value (usually
+   * absent for non-legacy sessions). Callers that need the real conversation
+   * must use `getChatSession`.
+   */
+  async getChatSessionRecord(sessionId: string): Promise<ChatSession | null> {
     const params = {
       TableName: this.tableName,
       Key: {
@@ -1570,14 +1612,23 @@ export class ChatbotDB {
 
     try {
       const result = await dynamodb.get(params).promise();
-      const session = (result.Item as ChatSession) || null;
-      
-      if (!session) {
-        return null;
-      }
+      return (result.Item as ChatSession) || null;
+    } catch (error) {
+      console.error("Error getting chat session record:", error);
+      throw error;
+    }
+  }
 
+  async getChatSession(sessionId: string, consistentRead = false): Promise<ChatSession | null> {
+    const session = await this.getChatSessionRecord(sessionId);
+
+    if (!session) {
+      return null;
+    }
+
+    try {
       // Check if messages exist in AW-ChatMessages
-      let messages = await this.getMessagesFromMessagesTable(sessionId);
+      let messages = await this.getMessagesFromMessagesTable(sessionId, consistentRead);
 
       // If no messages in AW-ChatMessages but messages exist in session record, migrate them
       if (messages.length === 0 && session.messages && session.messages.length > 0) {
@@ -2655,6 +2706,121 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * ENG-396/400: persist (or clear) the session's blocking AskUserQuestion.
+   * Pass a PendingUserQuestion to set it (status 'awaiting' when posed,
+   * 'answered' once the user selects); pass null to clear it after the
+   * consumer has read the answer. Mirrors updateSessionWorkPlan — a targeted
+   * SET/REMOVE so subsequent tool calls read session.pendingUserQuestion
+   * directly rather than parsing prose.
+   *
+   * ENG-400: when posting a NEW question, if the CURRENT live slot is already
+   * 'answered' (a different, earlier question), it is archived into
+   * session.answeredQuestions[questionId] before being overwritten — so
+   * checkQuestionGate can still find that earlier human answer by id even
+   * after Emma has moved on to asking something else in the same session.
+   */
+  async updateSessionAskUserQuestion(
+    sessionId: string,
+    pendingUserQuestion: PendingUserQuestion | null,
+    opts?: { failIfAwaitingExists?: boolean; requireStillAwaiting?: string },
+  ): Promise<ChatSession | null> {
+    // ENG-396: the one-live-question invariant. When posing a NEW awaiting question,
+    // `failIfAwaitingExists` gates the write on there being no question already
+    // awaiting — a settled 'answered' slot may be replaced (that's the normal
+    // turn-by-turn next question). Enforced atomically so two ask_user_question
+    // calls in the same turn can never both take the single slot; the loser is
+    // refused (returns null) and the model asks it in a later turn.
+    const guard = opts?.failIfAwaitingExists === true && pendingUserQuestion !== null;
+
+    // Greptile P1 ("Concurrent answers overwrite selections" / "Typed messages
+    // bypass answer lock"): persisting an ANSWER, or clearing an abandoned
+    // question (the typed-past-a-card path), previously had no guard at all —
+    // two concurrent requests (a card answer racing a typed message, or two
+    // answer submissions) could both read the same 'awaiting' snapshot and the
+    // later unconditional write would silently clobber or erase the earlier
+    // one's result. `requireStillAwaiting` makes EITHER write (SET an answer,
+    // or REMOVE/clear) optimistic-locked: it only succeeds if the question is
+    // STILL exactly this one, STILL 'awaiting', at the moment of write — the
+    // loser of the race gets null (refused) instead of corrupting the winner.
+    const requireStillAwaiting =
+      typeof opts?.requireStillAwaiting === 'string' ? opts.requireStillAwaiting : undefined;
+
+    let updatedArchive: Record<string, PendingUserQuestion> | undefined;
+    if (pendingUserQuestion !== null) {
+      // A lightweight, PROJECTED read (not getChatSession — that also loads/migrates
+      // messages, which this write doesn't need) of just the two fields this
+      // archiving decision depends on.
+      const existing = await dynamodb
+        .get({
+          TableName: this.tableName,
+          Key: { sessionId },
+          ProjectionExpression: "pendingUserQuestion, answeredQuestions",
+        })
+        .promise();
+      const current: PendingUserQuestion | undefined = existing?.Item?.pendingUserQuestion;
+      if (current && current.status === 'answered' && current.questionId !== pendingUserQuestion.questionId) {
+        updatedArchive = { ...(existing?.Item?.answeredQuestions || {}), [current.questionId]: current };
+      }
+    }
+
+    const params: any = pendingUserQuestion
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: updatedArchive
+            ? "SET pendingUserQuestion = :pendingUserQuestion, adminListPartition = :adminListPartition, answeredQuestions = :answeredQuestions"
+            : "SET pendingUserQuestion = :pendingUserQuestion, adminListPartition = :adminListPartition",
+          ExpressionAttributeValues: {
+            ":pendingUserQuestion": pendingUserQuestion,
+            ":adminListPartition": "all",
+            ...(updatedArchive ? { ":answeredQuestions": updatedArchive } : {}),
+          },
+          ReturnValues: "ALL_NEW",
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: "REMOVE pendingUserQuestion",
+          ReturnValues: "ALL_NEW",
+        };
+
+    if (guard) {
+      params.ConditionExpression =
+        "attribute_not_exists(pendingUserQuestion) OR pendingUserQuestion.#pStatus <> :awaitingStatus";
+      params.ExpressionAttributeNames = { "#pStatus": "status" };
+      params.ExpressionAttributeValues[":awaitingStatus"] = "awaiting";
+    } else if (requireStillAwaiting) {
+      params.ConditionExpression =
+        "pendingUserQuestion.questionId = :requireQuestionId AND pendingUserQuestion.#pStatus = :awaitingStatus";
+      params.ExpressionAttributeNames = { "#pStatus": "status" };
+      // The REMOVE branch's params literal has no ExpressionAttributeValues at
+      // all (nothing to reference) until a guard needs one — create it here
+      // rather than assuming it exists, so a plain unconditional REMOVE keeps
+      // its existing (undefined) shape when no guard applies.
+      params.ExpressionAttributeValues = {
+        ...(params.ExpressionAttributeValues || {}),
+        ":requireQuestionId": requireStillAwaiting,
+        ":awaitingStatus": "awaiting",
+      };
+    }
+
+    try {
+      const result = await dynamodb.update(params).promise();
+      return result.Attributes as ChatSession;
+    } catch (error) {
+      // A guarded write that fails the condition means either a question is
+      // already awaiting (posting a new one) or this answer lost a race to a
+      // concurrent one (persisting an answer) — an expected outcome, not an
+      // error. Signal it with null either way.
+      if ((guard || requireStillAwaiting) && (error as any)?.code === "ConditionalCheckFailedException") {
+        return null;
+      }
+      console.error("Error updating session AskUserQuestion:", error);
+      throw error;
+    }
+  }
+
   async updateSessionWorkPlan(
     sessionId: string,
     workPlan: {
@@ -3327,46 +3493,22 @@ function printKnowledgeBase(): void {
 }
 
 // Load and cache content from backend API controllers directly
-async function loadKnowledgeBase(): Promise<void> {
+export async function loadKnowledgeBase(): Promise<void> {
   const endpoints = [
     { controller: getReleases, source: "release" },
-    { controller: getApiDocs, source: "api" },
     { controller: getUserReleaseNotes, source: "user-release" },
   ];
 
   const chunks: ContextChunk[] = [];
   let chunkId = 0;
 
-  // Load Notion-based user guide content
+  // Load product docs from Mintlify (docs.agentweb.pro) — the canonical docs
+  // source. Replaces the retired Notion user-guide shadow copy (ENG-163).
   try {
-    const guideContent = await getUserGuideContent();
-    if (guideContent) {
-      const guideChunks = guideContent.match(/[^\.!\?]+[\.!\?]+/g) || [guideContent];
-      let currentChunk = "";
-      for (const sentence of guideChunks) {
-        if ((currentChunk + sentence).length > 2000) {
-          if (currentChunk) {
-            chunks.push({
-              id: `chunk-guide-${chunkId++}`,
-              content: currentChunk.trim(),
-              metadata: { source: "guide" },
-            });
-          }
-          currentChunk = sentence;
-        } else {
-          currentChunk += " " + sentence;
-        }
-      }
-      if (currentChunk.trim()) {
-        chunks.push({
-          id: `chunk-guide-${chunkId++}`,
-          content: currentChunk.trim(),
-          metadata: { source: "guide" },
-        });
-      }
-    }
+    const docsContent = await fetchMintlifyDocsContent();
+    chunks.push(...chunkDocsContent(docsContent, "guide"));
   } catch (error) {
-    console.error("Error loading Notion user guide for knowledge base:", error);
+    console.error("Error loading Mintlify docs for knowledge base:", error);
   }
 
   for (const endpoint of endpoints) {
@@ -3405,23 +3547,7 @@ async function loadKnowledgeBase(): Promise<void> {
       ) {
         let content = "";
 
-        if (endpoint.source === "api") {
-          for (const section of mockResponse.data.data) {
-            content += `${section.title}\n`;
-            for (const paragraph of section.content) {
-              content += `${paragraph}\n`;
-            }
-            if (section.subsections) {
-              for (const subsection of section.subsections) {
-                content += `${subsection.title}\n`;
-                for (const paragraph of subsection.content) {
-                  content += `${paragraph}\n`;
-                }
-              }
-            }
-            content += "\n";
-          }
-        } else if (endpoint.source === "user-release") {
+        if (endpoint.source === "user-release") {
           for (const release of mockResponse.data.data) {
             content += `Release Date: ${release.date}\n`;
             for (const change of release.changes) {

@@ -1,13 +1,12 @@
 /**
  * Tests for the ai-eval-funnel ✅ reaction handler in /api/slack/events.
  *
- * Behavioral contract — from Notion task 36d09247c95181a9bf6fe75a7cb7c6af:
+ * Behavioral contract — legacy Slack approvals during the Linear migration:
  *   1. POST /api/slack/events handles reaction_added events.
  *   2. Guard: white_check_mark + Harsha (U08TM4QFQ1L) + Emma-bot DM containing
  *      "AI Eval Funnel — daily run" + not already dispatched.
- *   3. Parse Notion page IDs from message text and call launchEnvironment(...)
- *      with the Sprint Tasks data-source ID.
- *   4. Post thread reply: "Dispatching N..." then completion summary.
+ *   3. Parse actionable digest items and file them through canonical Linear intake.
+ *   4. Legacy items fail closed to Needs PM unless the digest explicitly admits a code change.
  *   5. Idempotency via loopDispatchTracker (in-memory Map).
  *   6. missing_scope from Slack: clear console.error, still 200, no launches.
  *   7. (cron template change tested separately.)
@@ -30,26 +29,18 @@ jest.mock('@slack/web-api', () => ({
   })),
 }));
 
-const mockLaunchEnvironment = jest.fn();
-const mockGetNotionPage = jest.fn();
-const mockGetNotionPageContent = jest.fn();
-const mockGetNotionCredentials = jest.fn();
-const mockGetSprintTasksDatabaseId = jest.fn();
-
-jest.mock('../services/devEnvService', () => ({
-  launchEnvironment: (...args: unknown[]) => mockLaunchEnvironment(...args),
-  getNotionPage: (...args: unknown[]) => mockGetNotionPage(...args),
-  getNotionPageContent: (...args: unknown[]) => mockGetNotionPageContent(...args),
-}));
-
-jest.mock('../services/notionService', () => ({
-  getNotionCredentials: (...args: unknown[]) => mockGetNotionCredentials(...args),
-  getSprintTasksDatabaseId: (...args: unknown[]) => mockGetSprintTasksDatabaseId(...args),
+const mockFileAutoIssue = jest.fn();
+jest.mock('../services/intakeService', () => ({
+  fileAutoIssue: (...args: unknown[]) => mockFileAutoIssue(...args),
 }));
 
 const mockRecordLoopApproval = jest.fn();
+const mockRecordLoopDenial = jest.fn();
+const mockClaimLoopDecision = jest.fn();
 jest.mock('../loops/core/learning/approvalPersistence', () => ({
+  claimLoopDecision: (...args: unknown[]) => mockClaimLoopDecision(...args),
   recordLoopApproval: (...args: unknown[]) => mockRecordLoopApproval(...args),
+  recordLoopDenial: (...args: unknown[]) => mockRecordLoopDenial(...args),
 }));
 
 // Generic mocks so unrelated handlers in the same file don't blow up.
@@ -128,16 +119,12 @@ const DM_CHANNEL = 'D12345';
 const MESSAGE_TS = '1700000000.000100';
 const AI_READINESS_MESSAGE_TS = '1700000000.000200';
 const FUTURE_LOOP_MESSAGE_TS = '1700000000.000300';
-const SPRINT_TASKS_DATA_SOURCE = '2bf09247-c951-812a-bd0a-000bd4c05bbf';
-
 // One real Notion task URL from the daily DM (32-hex page id at end of slug).
 const PAGE_URL_1 =
   '<https://www.notion.so/fix-ai-eval-funnel-capture-broken-Lots-of-landings-36d09247c9518127bc6fffd03dd0e887|fix(ai-eval-funnel): capture-broken — Lots of landings>';
-const PAGE_ID_1 = '36d09247c9518127bc6fffd03dd0e887';
 
 const PAGE_URL_2 =
   '<https://www.notion.so/fix-ai-eval-funnel-wait-too-long-Funnel-stalls-abc12345678901234567890123456789|fix(ai-eval-funnel): wait-too-long — Funnel stalls>';
-const PAGE_ID_2 = 'abc12345678901234567890123456789';
 
 function buildLoopDmMessage(urls: string[] = [PAGE_URL_1]) {
   return [
@@ -215,37 +202,27 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     mockAuthTest.mockResolvedValue({ ok: true, user_id: EMMA_BOT });
     mockChatPostMessage.mockResolvedValue({ ok: true, ts: 'reply-ts' });
+    mockClaimLoopDecision.mockResolvedValue({
+      loopId: 'test-loop',
+      decision: 'approved',
+      accepted: true,
+      created: true,
+      proposalIds: ['proposal-1'],
+    });
     mockRecordLoopApproval.mockResolvedValue({ loopId: null, approved: 0, shipped: 0, dispatchFailures: 0 });
-    mockGetNotionCredentials.mockResolvedValue({ apiToken: 'notion-token', userGuidePageId: 'guide' });
-    mockGetSprintTasksDatabaseId.mockResolvedValue(SPRINT_TASKS_DATA_SOURCE);
-    jest.spyOn(global, 'fetch').mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        id: 'notion-ai-readiness-page-id',
-        url: 'https://notion.so/notionaireadinesspageid',
-      }),
-    } as Response);
-    mockGetNotionPage.mockResolvedValue({
-      title: 'fix(ai-eval-funnel): capture-broken',
-      status: 'To-do',
-      instanceId: '',
-      sgId: '',
-      publicIp: '',
-      databaseId: '2bf09247-c951-8122-a327-ee39ef7a6ec7',
-      launchedBy: '',
+    mockRecordLoopDenial.mockResolvedValue({ loopId: 'test-loop', denied: 1 });
+    mockFileAutoIssue.mockResolvedValue({
+      id: 'ENG-999',
+      url: 'https://linear.app/agentweb/issue/ENG-999/test',
+      tracker: 'Linear',
     });
-    mockGetNotionPageContent.mockResolvedValue({
-      text: 'task content here',
-      attachments: [],
-    });
-    mockLaunchEnvironment.mockResolvedValue(undefined);
   });
 
   afterEach(() => {
     jest.restoreAllMocks();
   });
 
-  it('dispatches cloud-dev runs when Harsha reacts ✅ on the daily Emma DM', async () => {
+  it('fails closed for the retired AI Eval Notion-link digest', async () => {
     mockConversationsHistory.mockResolvedValue({
       ok: true,
       messages: [
@@ -273,34 +250,15 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(res.status).toBe(200);
     await wait();
 
-    // Verified BOTH page IDs were extracted and dispatched.
-    expect(mockLaunchEnvironment).toHaveBeenCalledTimes(2);
-    expect(mockLaunchEnvironment).toHaveBeenCalledWith(
-      PAGE_ID_1,
-      expect.any(String),
-      expect.any(String),
-      '2bf09247-c951-812a-bd0a-000bd4c05bbf',
-    );
-    expect(mockLaunchEnvironment).toHaveBeenCalledWith(
-      PAGE_ID_2,
-      expect.any(String),
-      expect.any(String),
-      '2bf09247-c951-812a-bd0a-000bd4c05bbf',
-    );
-
-    // Two thread replies posted: "Dispatching N" then summary.
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
     const replies = mockChatPostMessage.mock.calls.filter(
       ([arg]) => arg.thread_ts === MESSAGE_TS,
     );
-    expect(replies.length).toBeGreaterThanOrEqual(2);
-    expect(replies[0][0].text).toMatch(/Dispatching 2 cloud-dev/i);
-    expect(replies[replies.length - 1][0].text).toMatch(/Launched 2\/2/i);
-
-    // Idempotency: marked dispatched.
-    expect(await isDispatched(MESSAGE_TS)).toBe(true);
+    expect(replies[0][0].text).toMatch(/could not parse any dispatchable tasks/i);
+    expect(await isDispatched(MESSAGE_TS)).toBe(false);
   });
 
-  it('creates and launches cloud-dev task when Harsha reacts ✅ on AI Readiness low-data digest', async () => {
+  it('queues an approved AI Readiness item for human triage', async () => {
     mockConversationsHistory.mockResolvedValue({
       ok: true,
       messages: [
@@ -328,26 +286,22 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(res.status).toBe(200);
     await wait();
 
-    expect(global.fetch).toHaveBeenCalledWith(
-      'https://api.notion.com/v1/pages',
-      expect.objectContaining({
-        method: 'POST',
-        body: expect.stringContaining('low-data-quiz-start-leak'),
+    expect(mockFileAutoIssue).toHaveBeenCalledWith(expect.objectContaining({
+      title: 'fix(ai-readiness-funnel): low-data-quiz-start-leak',
+      description: expect.stringContaining('3/42 visitors started the quiz'),
+      executionRoute: 'human-triage',
+      notionContext: expect.objectContaining({
+        'Alert Class': expect.stringContaining('slack-approved-loop:'),
       }),
-    );
-    expect(mockLaunchEnvironment).toHaveBeenCalledWith(
-      'notion-ai-readiness-page-id',
-      'fix(ai-readiness-funnel): low-data-quiz-start-leak',
-      expect.stringContaining('3/42 visitors started the quiz'),
-      SPRINT_TASKS_DATA_SOURCE,
-    );
+    }));
 
     const replies = mockChatPostMessage.mock.calls.filter(
       ([arg]) => arg.thread_ts === AI_READINESS_MESSAGE_TS,
     );
     expect(replies.length).toBeGreaterThanOrEqual(2);
-    expect(replies[0][0].text).toMatch(/Creating 1 cloud-dev task for AI Readiness/i);
-    expect(replies[replies.length - 1][0].text).toMatch(/Launched 1\/1 cloud-dev run for AI Readiness/i);
+    expect(replies[0][0].text).toMatch(/Queuing 1 approved Linear task/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/Queued 1\/1 Linear task/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/Needs PM/i);
     expect(await isDispatched(AI_READINESS_MESSAGE_TS)).toBe(true);
   });
 
@@ -400,13 +354,6 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
   });
 
   it('lets a new loop use the shared ✅ footer without adding a bespoke Slack handler', async () => {
-    (global.fetch as jest.Mock).mockResolvedValueOnce({
-      ok: true,
-      json: async () => ({
-        id: 'future-loop-page-id',
-      }),
-    } as Response);
-
     mockConversationsHistory.mockResolvedValue({
       ok: true,
       messages: [
@@ -434,32 +381,19 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(res.status).toBe(200);
     await wait();
 
-    expect(global.fetch).toHaveBeenCalledWith(
-      'https://api.notion.com/v1/pages',
-      expect.objectContaining({
-        method: 'POST',
-        body: expect.stringContaining('Trial signup drop-off spiked after pricing click'),
-      }),
-    );
-    expect(global.fetch).toHaveBeenCalledWith(
-      'https://api.notion.com/v1/pages',
-      expect.objectContaining({
-        body: expect.stringContaining('startup-sized decision'),
-      }),
-    );
-    expect(mockLaunchEnvironment).toHaveBeenCalledWith(
-      'future-loop-page-id',
-      expect.stringContaining('fix(revenue-loop)'),
-      expect.stringContaining('tighten the pricing CTA'),
-      SPRINT_TASKS_DATA_SOURCE,
-    );
+    expect(mockFileAutoIssue).toHaveBeenCalledWith(expect.objectContaining({
+      title: expect.stringContaining('fix(revenue-loop)'),
+      description: expect.stringContaining('tighten the pricing CTA'),
+      executionRoute: 'human-triage',
+    }));
 
     const replies = mockChatPostMessage.mock.calls.filter(
       ([arg]) => arg.thread_ts === FUTURE_LOOP_MESSAGE_TS,
     );
-    expect(replies[0][0].text).toMatch(/Creating 1 cloud-dev task for Revenue Loop/i);
-    expect(replies[replies.length - 1][0].text).toMatch(/Launched 1\/1 cloud-dev run for Revenue Loop/i);
-    expect(replies[replies.length - 1][0].text).toMatch(/futurelooppageid/i);
+    expect(replies[0][0].text).toMatch(/Queuing 1 approved Linear task/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/Queued 1\/1 Linear task/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/Needs PM/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/ENG-999/i);
     expect(await isDispatched(FUTURE_LOOP_MESSAGE_TS)).toBe(true);
   });
 
@@ -491,7 +425,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(res.status).toBe(200);
     await wait();
 
-    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
     const replies = mockChatPostMessage.mock.calls.filter(
       ([arg]) => arg.thread_ts === FUTURE_LOOP_MESSAGE_TS,
     );
@@ -499,13 +433,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
   });
 
   it('reports failed generated-task dispatch without hiding the rest of the reaction handler', async () => {
-    (global.fetch as jest.Mock).mockResolvedValueOnce({
-      ok: false,
-      json: async () => ({
-        object: 'error',
-        message: 'Notion write denied',
-      }),
-    } as Response);
+    mockFileAutoIssue.mockRejectedValueOnce(new Error('Linear write denied'));
     mockConversationsHistory.mockResolvedValue({
       ok: true,
       messages: [
@@ -533,12 +461,12 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(res.status).toBe(200);
     await wait();
 
-    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
     const replies = mockChatPostMessage.mock.calls.filter(
       ([arg]) => arg.thread_ts === FUTURE_LOOP_MESSAGE_TS,
     );
-    expect(replies[replies.length - 1][0].text).toMatch(/Launched 0\/1 cloud-dev run/i);
-    expect(replies[replies.length - 1][0].text).toMatch(/Notion write denied/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/Queued 0\/1 Linear task/i);
+    expect(replies[replies.length - 1][0].text).toMatch(/Linear write denied/i);
     expect(await isDispatched(FUTURE_LOOP_MESSAGE_TS)).toBe(true);
   });
 
@@ -569,7 +497,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     expect(res.status).toBe(200);
     await wait();
-    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
   });
 
   it('ignores reactions on messages without the daily-run marker', async () => {
@@ -599,7 +527,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     expect(res.status).toBe(200);
     await wait();
-    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
   });
 
   it('ignores reactions other than white_check_mark', async () => {
@@ -629,7 +557,41 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     expect(res.status).toBe(200);
     await wait();
-    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
+  });
+
+  it('persists an authorized x reaction as a rejection without filing work', async () => {
+    mockConversationsHistory.mockResolvedValue({
+      ok: true,
+      messages: [
+        {
+          ts: MESSAGE_TS,
+          user: EMMA_BOT,
+          bot_id: 'B_EMMA',
+          text: buildLoopDmMessage(),
+        },
+      ],
+    });
+
+    const res = await request(buildApp())
+      .post('/api/slack/events')
+      .send({
+        type: 'event_callback',
+        event: {
+          type: 'reaction_added',
+          reaction: 'x',
+          user: HARSHA,
+          item: { type: 'message', channel: DM_CHANNEL, ts: MESSAGE_TS },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    await wait();
+    expect(mockRecordLoopDenial).toHaveBeenCalledWith(expect.objectContaining({
+      runId: 'abc-123',
+      denier: `slack:${HARSHA}`,
+    }));
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
   });
 
   it('skips dispatch on duplicate ✅ for the same messageTs', async () => {
@@ -640,7 +602,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
           ts: MESSAGE_TS,
           user: EMMA_BOT,
           bot_id: 'B_EMMA',
-          text: buildLoopDmMessage([PAGE_URL_1]),
+          text: buildAiReadinessDmMessage(),
         },
       ],
     });
@@ -657,16 +619,16 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     await request(buildApp()).post('/api/slack/events').send(payload);
     await wait();
-    expect(mockLaunchEnvironment).toHaveBeenCalledTimes(1);
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
 
-    // Second reaction on same ts → no new launches
+    // Second reaction on same ts → no duplicate Linear intake.
     await request(buildApp()).post('/api/slack/events').send(payload);
     await wait();
-    expect(mockLaunchEnvironment).toHaveBeenCalledTimes(1);
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
   });
 
   // AC #2 (HUMAN-WRITTEN): reacting ✅ twice on the same DM ACROSS a simulated
-  // backend redeploy launches the cloud-dev EC2 exactly ONCE. This is the case
+  // backend redeploy files the approved Linear task exactly ONCE. This is the case
   // the in-memory v1 tracker FAILED — the Map reset on restart, so the second
   // ✅ re-dispatched. With DynamoDB persistence the dedupe survives.
   it('does not double-dispatch across a simulated redeploy (DynamoDB persistence)', async () => {
@@ -680,7 +642,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
           ts: MESSAGE_TS,
           user: EMMA_BOT,
           bot_id: 'B_EMMA',
-          text: buildLoopDmMessage([PAGE_URL_1]),
+          text: buildAiReadinessDmMessage(),
         },
       ],
     });
@@ -695,18 +657,18 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
       },
     };
 
-    // First ✅ → dispatches once.
+    // First ✅ → files once.
     await request(buildApp()).post('/api/slack/events').send(payload);
     await wait();
-    expect(mockLaunchEnvironment).toHaveBeenCalledTimes(1);
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
 
     // Simulate a redeploy: a BRAND-NEW tracker instance over the SAME table.
     resetTracker(new DynamoLoopDispatchTracker(port));
 
-    // Re-✅ the same (pre-deploy) DM → must NOT launch again.
+    // Re-✅ the same (pre-deploy) DM → must NOT file again.
     await request(buildApp()).post('/api/slack/events').send(payload);
     await wait();
-    expect(mockLaunchEnvironment).toHaveBeenCalledTimes(1);
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(1);
   });
 
   it('logs a clear error and returns 200 when Slack returns missing_scope', async () => {
@@ -731,7 +693,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(res.status).toBe(200);
     await wait();
 
-    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
     // Must mention the scope name AND a Slack-config-style hint so a human can act on it.
     const calls = consoleSpy.mock.calls.flat().join(' ');
     expect(calls).toMatch(/reactions:read/);
@@ -758,12 +720,12 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(res.status).toBe(200);
     await wait();
 
-    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
     expect(consoleSpy.mock.calls.flat().join(' ')).toMatch(/conversations\.history failed/);
     consoleSpy.mockRestore();
   });
 
-  it('reports partial-success when one launchEnvironment throws', async () => {
+  it('reports partial success when one Linear intake write fails', async () => {
     mockConversationsHistory.mockResolvedValue({
       ok: true,
       messages: [
@@ -771,14 +733,21 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
           ts: MESSAGE_TS,
           user: EMMA_BOT,
           bot_id: 'B_EMMA',
-          text: buildLoopDmMessage([PAGE_URL_1, PAGE_URL_2]),
+          text: buildFutureLoopDmMessage().replace(
+            'React ✅ to dispatch',
+            '2. Activation email delivery regressed\n   Kind: `code_change`  |  Fix: restore the existing delivery invariant.\n\nReact ✅ to dispatch',
+          ),
         },
       ],
     });
 
-    mockLaunchEnvironment
-      .mockResolvedValueOnce(undefined) // first succeeds
-      .mockRejectedValueOnce(new Error('EC2 quota exceeded')); // second fails
+    mockFileAutoIssue
+      .mockResolvedValueOnce({
+        id: 'ENG-999',
+        url: 'https://linear.app/agentweb/issue/ENG-999/test',
+        tracker: 'Linear',
+      })
+      .mockRejectedValueOnce(new Error('Linear rate limit exceeded'));
 
     const res = await request(buildApp())
       .post('/api/slack/events')
@@ -795,14 +764,14 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(res.status).toBe(200);
     await wait();
 
-    expect(mockLaunchEnvironment).toHaveBeenCalledTimes(2);
+    expect(mockFileAutoIssue).toHaveBeenCalledTimes(2);
     const replies = mockChatPostMessage.mock.calls.filter(
       ([arg]) => arg.thread_ts === MESSAGE_TS,
     );
     const finalReply = replies[replies.length - 1][0].text as string;
     // Summary mentions partial success: 1 of 2.
-    expect(finalReply).toMatch(/Launched 1\/2/);
-    expect(finalReply).toMatch(/EC2 quota exceeded/);
+    expect(finalReply).toMatch(/Queued 1\/2 Linear tasks/);
+    expect(finalReply).toMatch(/Linear rate limit exceeded/);
   });
 
   it('ignores reactions on non-DM channels (channel id does not start with D)', async () => {
@@ -832,7 +801,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     expect(res.status).toBe(200);
     await wait();
-    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
   });
 
   it('ignores reactions on messages NOT posted by Emma (no bot_id)', async () => {
@@ -861,7 +830,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
 
     expect(res.status).toBe(200);
     await wait();
-    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
   });
 
   it('ignores no-bot_id messages when Emma bot identity lookup fails', async () => {
@@ -893,7 +862,7 @@ describe('POST /api/slack/events — reaction_added handler (ai-eval-funnel)', (
     expect(res.status).toBe(200);
     await wait();
 
-    expect(mockLaunchEnvironment).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
     expect(consoleSpy.mock.calls.flat().join(' ')).toMatch(/Could not fetch Emma bot user ID/);
     consoleSpy.mockRestore();
   });
