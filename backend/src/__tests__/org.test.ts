@@ -38,6 +38,34 @@ jest.mock('../services/db', () => ({
       }
       return Promise.resolve(mockUsers[userId]);
     }),
+    // Mirrors the real atomic transaction: check-and-set with no await in
+    // between, so it can't be raced within a single test's synchronous mock
+    // body — matching what the real DynamoDB transaction guarantees.
+    joinOrgWithCapacityCheck: jest.fn((userId: string, orgId: string, orgRole: string, maxMembers: number) => {
+      const user = mockUsers[userId];
+      if (!user) return Promise.resolve('already_in_org');
+      if (user.orgId) return Promise.resolve('already_in_org');
+      const org = mockOrgs[orgId];
+      const currentCount = org?.memberCount ?? 0;
+      if (currentCount >= maxMembers) return Promise.resolve('org_full');
+      user.orgId = orgId;
+      user.orgRole = orgRole;
+      user.pendingOrgInvite = null;
+      if (org) org.memberCount = currentCount + 1;
+      return Promise.resolve('joined');
+    }),
+    clearOrgMembership: jest.fn((userId: string) => {
+      const user = mockUsers[userId];
+      if (user) {
+        const orgId = user.orgId;
+        delete user.orgId;
+        delete user.orgRole;
+        if (orgId && mockOrgs[orgId]) {
+          mockOrgs[orgId].memberCount = Math.max(0, (mockOrgs[orgId].memberCount ?? 1) - 1);
+        }
+      }
+      return Promise.resolve();
+    }),
   },
   orgDb: {
     createOrg: jest.fn((org: any) => {
@@ -132,6 +160,8 @@ describe('Organization routes', () => {
       expect(res.body.data.name).toBe('My Org');
       expect(res.body.data.ownerUserId).toBe('user-1');
       expect(res.body.data.maxMembers).toBe(5);
+      // Owner is the first member — seeded directly, no transaction needed.
+      expect(res.body.data.memberCount).toBe(1);
 
       // User should be updated with orgId and owner role
       expect(mockUsers['user-1'].orgId).toBe(res.body.data.orgId);
@@ -451,6 +481,20 @@ describe('Organization routes', () => {
       expect(mockUsers['user-2'].orgRole).toBe('member');
     });
 
+    it('fails loudly (no silent drop) when the org is already at maxMembers — atomic capacity check', async () => {
+      mockOrgs['org-1'].maxMembers = 1;
+      mockOrgs['org-1'].memberCount = 1;
+      const res = await request(app).post('/api/org/accept-invite').send({
+        orgId: 'org-1',
+        inviteToken: 'valid-token',
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/full/i);
+      // The invite must not be silently consumed on failure.
+      expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
+      expect(mockUsers['user-2'].orgId).toBeUndefined();
+    });
+
     it('should NOT snapshot the owner tier onto the member on accept (ENG-288)', async () => {
       const res = await request(app).post('/api/org/accept-invite').send({
         orgId: 'org-1',
@@ -475,6 +519,7 @@ describe('Organization routes', () => {
         name: 'Test Org',
         ownerUserId: 'user-1',
         maxMembers: 5,
+        memberCount: 2,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -493,10 +538,12 @@ describe('Organization routes', () => {
       expect(res.status).toBe(400);
     });
 
-    it('should succeed and remove member', async () => {
+    it('should succeed and remove member, decrementing memberCount', async () => {
       const res = await request(app).delete('/api/org/org-1/members/user-2');
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
+      expect(mockUsers['user-2'].orgId).toBeUndefined();
+      expect(mockOrgs['org-1'].memberCount).toBe(1);
     });
   });
 
@@ -507,6 +554,7 @@ describe('Organization routes', () => {
         name: 'Test Org',
         ownerUserId: 'user-1',
         maxMembers: 5,
+        memberCount: 2,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -520,11 +568,13 @@ describe('Organization routes', () => {
       expect(res.body.error).toMatch(/owner cannot leave/i);
     });
 
-    it('should succeed for a member', async () => {
+    it('should succeed for a member, decrementing memberCount', async () => {
       mockUser = mockUsers['user-2'];
       const res = await request(app).post('/api/org/org-1/leave');
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
+      expect(mockUsers['user-2'].orgId).toBeUndefined();
+      expect(mockOrgs['org-1'].memberCount).toBe(1);
     });
   });
 

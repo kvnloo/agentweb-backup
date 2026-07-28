@@ -47,17 +47,33 @@ jest.mock('../services/db', () => ({
       if (mockUsers[userId]) Object.assign(mockUsers[userId], updates);
       return Promise.resolve(mockUsers[userId]);
     }),
-    // Mirrors the real atomic ConditionExpression: check-and-set with no
-    // await in between, so two "concurrent" calls in a test (via
-    // Promise.all) can't both observe orgId as unset — matching what the
-    // real DynamoDB ConditionExpression guarantees in production.
-    joinOrgIfUnassigned: jest.fn((userId: string, orgId: string, orgRole: string) => {
-      if (mockUsers[userId]?.orgId) return Promise.resolve(false);
-      if (mockUsers[userId]) {
-        mockUsers[userId].orgId = orgId;
-        mockUsers[userId].orgRole = orgRole;
+    // Mirrors the real atomic transaction: check-and-set with no await in
+    // between, so two "concurrent" calls in a test (via Promise.all) can't
+    // both observe orgId as unset, or both squeeze under maxMembers —
+    // matching what the real DynamoDB transaction guarantees in production.
+    joinOrgWithCapacityCheck: jest.fn((userId: string, orgId: string, orgRole: string, maxMembers: number) => {
+      const user = mockUsers[userId];
+      if (!user) return Promise.resolve('already_in_org');
+      if (user.orgId) return Promise.resolve('already_in_org');
+      const org = mockOrgs[orgId];
+      const currentCount = org?.memberCount ?? 0;
+      if (currentCount >= maxMembers) return Promise.resolve('org_full');
+      user.orgId = orgId;
+      user.orgRole = orgRole;
+      if (org) org.memberCount = currentCount + 1;
+      return Promise.resolve('joined');
+    }),
+    clearOrgMembership: jest.fn((userId: string) => {
+      const user = mockUsers[userId];
+      if (user) {
+        const orgId = user.orgId;
+        delete user.orgId;
+        delete user.orgRole;
+        if (orgId && mockOrgs[orgId]) {
+          mockOrgs[orgId].memberCount = Math.max(0, (mockOrgs[orgId].memberCount ?? 1) - 1);
+        }
       }
-      return Promise.resolve(true);
+      return Promise.resolve();
     }),
   },
   orgDb: {
@@ -210,8 +226,9 @@ describe('Domain-based org auto-join', () => {
 
     it('fails loudly (no silent drop) when the org is already full', async () => {
       mockUsers['user-1'].orgId = 'org-1';
-      // Fill the org to maxMembers with other members.
+      // Fill the org to maxMembers (owner already counts as 1).
       mockOrgs['org-1'].maxMembers = 1;
+      mockOrgs['org-1'].memberCount = 1;
 
       const res = await request(app).post('/api/org/org-1/domain-requests/valid-token/approve');
       expect(res.status).toBe(400);
@@ -282,6 +299,44 @@ describe('Domain-based org auto-join', () => {
       // loser's request should survive for a retry/manual follow-up.
       const loserOrgId = successes[0] === resA ? 'org-2' : 'org-1';
       expect(mockOrgs[loserOrgId].pendingDomainJoinRequests.length).toBeGreaterThan(0);
+    });
+
+    it('under true concurrency, exactly one of two different users approved into the same org (one slot left) succeeds — capacity never overshoots (Greptile review)', async () => {
+      // Regression test for the capacity-side race: two DIFFERENT users
+      // approved into the SAME org at the same instant used to both read
+      // the same member count before either write landed, letting both
+      // succeed and the org exceed maxMembers. joinOrgWithCapacityCheck ties
+      // the memberCount increment and the membership write into one atomic
+      // transaction, so only one can win when a single slot remains.
+      mockOrgs['org-1'].maxMembers = 3;
+      mockOrgs['org-1'].memberCount = 2; // one slot left
+      mockUsers['user-1'].orgId = 'org-1'; // owner
+      mockUsers['user-3'] = { userId: 'user-3', email: 'other@example.com', displayName: 'Other', orgId: undefined, orgRole: undefined };
+      mockOrgs['org-1'].pendingDomainJoinRequests = [
+        { userId: 'user-2', email: 'member@example.com', requestedAt: '2026-01-01T00:00:00Z', requestToken: 'valid-token' },
+        { userId: 'user-3', email: 'other@example.com', requestedAt: '2026-01-01T00:00:00Z', requestToken: 'valid-token-user3' },
+      ];
+
+      const approveUser2 = request(app)
+        .post('/api/org/org-1/domain-requests/valid-token/approve')
+        .set('x-test-user-id', 'user-1');
+      const approveUser3 = request(app)
+        .post('/api/org/org-1/domain-requests/valid-token-user3/approve')
+        .set('x-test-user-id', 'user-1');
+
+      const [resA, resB] = await Promise.all([approveUser2, approveUser3]);
+      const results = [resA, resB];
+      const successes = results.filter((r) => r.status === 200);
+      const failures = results.filter((r) => r.status === 400);
+
+      expect(successes).toHaveLength(1);
+      expect(failures).toHaveLength(1);
+      expect(failures[0].body.error).toMatch(/full|maximum/i);
+
+      // Capacity must never be exceeded — exactly one of the two joined.
+      expect(mockOrgs['org-1'].memberCount).toBe(3);
+      const joinedCount = [mockUsers['user-2'].orgId, mockUsers['user-3'].orgId].filter((id) => id === 'org-1').length;
+      expect(joinedCount).toBe(1);
     });
 
     // === SUCCESS case ===
