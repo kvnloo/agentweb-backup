@@ -1509,9 +1509,11 @@ export class UserDB {
    *
    * memberCount is denormalized purely for this atomic check — it is never
    * used for display (see the field's doc comment on Organization). Orgs
-   * created before this field existed are treated as count 0 via
-   * if_not_exists until the backfill migration runs; see
-   * scripts/backfill-org-member-count.ts.
+   * created before this field existed are backfilled by
+   * scripts/backfill-org-member-count.ts, but if a join lands on one before
+   * that runs, this function computes the org's real current count as the
+   * seed value (never a bare 0 default — see below) so the counter starts
+   * accurate on first use instead of silently discarding real membership.
    */
   async joinOrgWithCapacityCheck(
     userId: string,
@@ -1524,6 +1526,22 @@ export class UserDB {
       throw new Error(`User with ID '${userId}' not found or has no email.`);
     }
 
+    // If memberCount hasn't been backfilled on this org yet, seed it from
+    // the real GSI-backed count rather than defaulting to 0 — defaulting to
+    // 0 would silently discard the org's actual existing membership, and
+    // every subsequent join would then be checked against a counter
+    // starting far below reality, letting the org balloon past maxMembers
+    // before the backfill migration runs. This doesn't reintroduce the
+    // original race: DynamoDB re-evaluates the transaction's condition
+    // against the item's real current state at commit time, not this
+    // pre-read, so a concurrent join that already initialized the counter
+    // is still correctly serialized against.
+    const orgSnapshot = await this.docClient.get({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
+    const seedCount =
+      orgSnapshot.Item?.memberCount !== undefined
+        ? orgSnapshot.Item.memberCount
+        : await this.getRealMemberCountForOrg(orgId);
+
     try {
       await this.docClient
         .transactWrite({
@@ -1532,9 +1550,9 @@ export class UserDB {
               Update: {
                 TableName: ORGS_TABLE,
                 Key: { orgId },
-                UpdateExpression: "SET memberCount = if_not_exists(memberCount, :zero) + :one",
+                UpdateExpression: "SET memberCount = if_not_exists(memberCount, :seed) + :one",
                 ConditionExpression: "attribute_not_exists(memberCount) OR memberCount < :maxMembers",
-                ExpressionAttributeValues: { ":zero": 0, ":one": 1, ":maxMembers": maxMembers },
+                ExpressionAttributeValues: { ":seed": seedCount, ":one": 1, ":maxMembers": maxMembers },
               },
             },
             {
@@ -1562,6 +1580,31 @@ export class UserDB {
       handleDynamoDbError(error, "joinOrgWithCapacityCheck");
       throw error;
     }
+  }
+
+  // Live count of an org's real members via OrgIdIndex — same logic as
+  // scripts/backfill-org-member-count.ts. Only used as a one-time seed
+  // value inside joinOrgWithCapacityCheck when memberCount hasn't been
+  // backfilled on this org yet; not for display or repeated capacity checks.
+  private async getRealMemberCountForOrg(orgId: string): Promise<number> {
+    let total = 0;
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await this.docClient
+        .query({
+          TableName: this.tableName,
+          IndexName: "OrgIdIndex",
+          KeyConditionExpression: "orgId = :orgId",
+          FilterExpression: "NOT begins_with(userId, :tombstone)",
+          ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
+          Select: "COUNT",
+          ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+        })
+        .promise();
+      total += result.Count || 0;
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return total;
   }
 
   /**
@@ -1832,6 +1875,14 @@ export class UserDB {
    * decrements the org's denormalized memberCount (see Organization.memberCount)
    * so it stays accurate for the atomic capacity check at join time.
    *
+   * The user-clear is conditioned on orgId still matching what was just
+   * read — this is what prevents a double-decrement when two concurrent
+   * calls target the same membership (e.g. an owner-initiated remove racing
+   * a self-initiated leave): only whichever call's conditioned REMOVE
+   * actually wins decrements the counter; the loser's condition fails
+   * (orgId is already gone) and it correctly skips decrementing, since the
+   * winner already accounted for the one real departure.
+   *
    * The decrement is intentionally NOT in the same transaction as the
    * membership clear, and intentionally non-fatal: leaving an org must never
    * fail because of a counter-bookkeeping issue (missing/stale memberCount
@@ -1845,26 +1896,40 @@ export class UserDB {
       throw new Error(`User with ID '${userId}' not found or has no email.`);
     }
     const orgId = user.orgId;
-    await this.docClient.update({
-      TableName: this.tableName,
-      Key: { email: user.email },
-      UpdateExpression: "REMOVE orgId, orgRole",
-    }).promise();
+    if (!orgId) return; // Already cleared, e.g. by a concurrent call — nothing to do.
 
-    if (orgId) {
-      try {
-        await this.docClient
-          .update({
-            TableName: ORGS_TABLE,
-            Key: { orgId },
-            UpdateExpression: "SET memberCount = if_not_exists(memberCount, :one) - :one",
-            ConditionExpression: "attribute_not_exists(memberCount) OR memberCount > :zero",
-            ExpressionAttributeValues: { ":one": 1, ":zero": 0 },
-          })
-          .promise();
-      } catch (error) {
-        console.error(`Failed to decrement memberCount for org ${orgId} (non-fatal):`, error);
+    try {
+      await this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "REMOVE orgId, orgRole",
+          ConditionExpression: "orgId = :orgId",
+          ExpressionAttributeValues: { ":orgId": orgId },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error.code === "ConditionalCheckFailedException") {
+        // A concurrent call already cleared (or changed) this membership —
+        // it already performed the decrement, so skip ours to avoid double-
+        // counting one real departure as two.
+        return;
       }
+      throw error;
+    }
+
+    try {
+      await this.docClient
+        .update({
+          TableName: ORGS_TABLE,
+          Key: { orgId },
+          UpdateExpression: "SET memberCount = if_not_exists(memberCount, :one) - :one",
+          ConditionExpression: "attribute_not_exists(memberCount) OR memberCount > :zero",
+          ExpressionAttributeValues: { ":one": 1, ":zero": 0 },
+        })
+        .promise();
+    } catch (error) {
+      console.error(`Failed to decrement memberCount for org ${orgId} (non-fatal):`, error);
     }
   }
 }
