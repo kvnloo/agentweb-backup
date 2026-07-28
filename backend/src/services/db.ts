@@ -1904,6 +1904,23 @@ export class UserDB {
     const orgId = user.orgId;
     if (!orgId) return; // Already cleared, e.g. by a concurrent call — nothing to do.
 
+    // If memberCount hasn't been backfilled on this org yet, compute the seed
+    // from the real live count BEFORE clearing this user's membership, not
+    // after. OrgIdIndex is a GSI — eventually consistent relative to the base
+    // table write — so querying it immediately after our own REMOVE could
+    // still include the departing user, seeding the counter one too high and
+    // wrongly blocking a later legitimate join. Querying before the removal
+    // sidesteps that: the count here still (correctly) includes this user,
+    // so subtracting 1 below lands on the true post-departure value without
+    // depending on the GSI having caught up to a write we just made.
+    const orgSnapshot = await this.docClient
+      .get({ TableName: ORGS_TABLE, Key: { orgId }, ProjectionExpression: "memberCount" })
+      .promise();
+    const seed =
+      orgSnapshot.Item?.memberCount !== undefined
+        ? 1 // Ignored by if_not_exists when memberCount is already present.
+        : (await this.getRealMemberCountForOrg(orgId)) + 1;
+
     try {
       await this.docClient
         .update({
@@ -1925,23 +1942,6 @@ export class UserDB {
     }
 
     try {
-      // If memberCount hasn't been backfilled on this org yet, seed it from
-      // the real live count rather than defaulting the missing-attribute
-      // base to 1 — with a bare 1, if_not_exists(memberCount, 1) - 1 always
-      // lands on 0, silently zeroing the counter even if the org still has
-      // other real members. The live count already reflects this departure
-      // (the user's orgId was just cleared above), so add 1 back before the
-      // subtraction lands the result on the correct post-departure value;
-      // if memberCount already exists, if_not_exists ignores this fallback
-      // entirely and the ordinary decrement applies.
-      const orgSnapshot = await this.docClient
-        .get({ TableName: ORGS_TABLE, Key: { orgId }, ProjectionExpression: "memberCount" })
-        .promise();
-      const seed =
-        orgSnapshot.Item?.memberCount !== undefined
-          ? 1 // Ignored by if_not_exists when memberCount is already present.
-          : (await this.getRealMemberCountForOrg(orgId)) + 1;
-
       await this.docClient
         .update({
           TableName: ORGS_TABLE,
