@@ -785,7 +785,12 @@ export function scheduledRunPreviewedWithoutExecute(toolCalls: any[]): boolean {
       if (tc?.name === previewTool) {
         if (Number(tc?.result?.processedCount) > 0) enrichablePreviewedLists.add(listId);
       } else if (tc?.name === executeTool) {
-        executedLists.add(listId);
+        // Only a SUCCESSFUL write-back closes the gap. An execute that threw
+        // (tc.error set → no result) or persisted nothing (processedCount 0) left
+        // the enrichment uncommitted, so it must NOT count as executed — the gate
+        // keeps chasing (bounded by completionGateMaxContinuations) until a real
+        // commit lands, instead of the failed call silently closing the run.
+        if (!tc?.error && Number(tc?.result?.processedCount) > 0) executedLists.add(listId);
       }
     }
     for (const listId of enrichablePreviewedLists) {

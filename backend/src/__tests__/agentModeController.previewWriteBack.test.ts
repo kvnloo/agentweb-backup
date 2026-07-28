@@ -64,6 +64,22 @@ describe('scheduledRunPreviewedWithoutExecute — per-list preview→execute det
     expect(scheduledRunPreviewedWithoutExecute(toolCalls)).toBe(true);
   });
 
+  it('fires when the execute THREW — a failed write-back does not close the gap (Greptile P1)', () => {
+    const toolCalls = [
+      preview('list-1', 2),
+      { name: 'enrich_leads_execute', arguments: { list_id: 'list-1' }, error: 'engine timeout' },
+    ];
+    expect(scheduledRunPreviewedWithoutExecute(toolCalls)).toBe(true);
+  });
+
+  it('fires when the execute persisted ZERO records (processedCount 0) (Greptile P1)', () => {
+    const toolCalls = [
+      preview('list-1', 2),
+      { name: 'enrich_leads_execute', arguments: { list_id: 'list-1' }, result: { processedCount: 0 } },
+    ];
+    expect(scheduledRunPreviewedWithoutExecute(toolCalls)).toBe(true);
+  });
+
   // ── PASS cases: every enrichable list committed, or nothing to commit ─────────
   it('does NOT fire when every previewed enrichable list was executed', () => {
     const toolCalls = [

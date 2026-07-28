@@ -309,6 +309,29 @@ describe('runScheduledChat — deterministic completion gate', () => {
     expect(result).toEqual(expect.objectContaining({ status: 'success' }));
   });
 
+  it('ENG-518: a failed execute (error) does NOT close the gate — it retries until write-back lands', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => {
+      call++;
+      // Turn 1: previewed enrichable list-1 and attempted execute, but it threw →
+      // the write-back never landed. The gate must NOT treat the errored execute as
+      // done. Turn 2 (continuation): execute succeeds and the run finishes.
+      return Promise.resolve(
+        call === 1
+          ? workerResultWithTools('Previewed list-1; the execute call errored out.', [
+              previewCall('list-1', 2),
+              { name: 'enrich_leads_execute', arguments: { list_id: 'list-1' }, error: 'engine timeout' },
+            ])
+          : workerResultWithTools('Execute succeeded on retry. Final report below.', [executeCall('list-1')])
+      );
+    });
+
+    const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    expect(mockWorker.runInWorker.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(result).toEqual(expect.objectContaining({ status: 'success' }));
+  });
+
   it('ENG-518: a run that previewed AND executed the same list does NOT fire the gate', async () => {
     mockWorker.runInWorker.mockResolvedValue(
       workerResultWithTools('Enrichment previewed and committed. Recommendations and drafts below.', [
