@@ -680,7 +680,31 @@ export interface Organization {
     invitedAt: string;
     invitedBy: string;
   }>;
+  /**
+   * Owner opt-in: when true, new signups whose email domain matches
+   * autoJoinDomain create a pendingDomainJoinRequest and email the owner for
+   * approval, instead of requiring an explicit invite. autoJoinDomain is
+   * always derived server-side from the owner's own email domain — never
+   * client-supplied — so an owner can't claim a domain they don't belong to.
+   */
+  autoJoinEnabled?: boolean;
+  autoJoinDomain?: string;
+  pendingDomainJoinRequests?: Array<{
+    userId: string;
+    email: string;
+    requestedAt: string;
+    requestToken: string;
+  }>;
   maxMembers: number;
+  /**
+   * Denormalized, atomically-maintained member count — used ONLY as a fast
+   * capacity gate at join time (via a DynamoDB transaction pairing the
+   * increment with the joining user's write), never for display. Display
+   * always uses the live GSI-backed member list (getOrgMembers), which can
+   * never drift. Absent on orgs created before this field existed; treated
+   * as 0 via if_not_exists until the backfill migration runs.
+   */
+  memberCount?: number;
   createdAt: string;
   updatedAt: string;
   shareSettings?: OrgShareSettings;
@@ -1472,6 +1496,125 @@ export class UserDB {
   }
 
   /**
+   * Atomically assigns a user to an org AND enforces the member cap in a
+   * single DynamoDB transaction — a plain read-then-write (check orgId /
+   * check member count, then separately write) has two distinct TOCTOU
+   * races: (1) two concurrent approvals for the SAME user from different
+   * orgs can both pass the "not already in an org" read-check before either
+   * write lands, and (2) two concurrent approvals for DIFFERENT users on
+   * the SAME org can both pass the "under capacity" read-check when only
+   * one slot remains, overshooting maxMembers. TransactWriteItems ties the
+   * org's memberCount increment (conditioned on staying under maxMembers)
+   * and the user's orgId write (conditioned on not already having one) into
+   * one all-or-nothing operation, closing both races at once.
+   *
+   * memberCount is denormalized purely for this atomic check — it is never
+   * used for display (see the field's doc comment on Organization). Orgs
+   * created before this field existed are backfilled by
+   * scripts/backfill-org-member-count.ts, but if a join lands on one before
+   * that runs, this function computes the org's real current count as the
+   * seed value (never a bare 0 default — see below) so the counter starts
+   * accurate on first use instead of silently discarding real membership.
+   */
+  async joinOrgWithCapacityCheck(
+    userId: string,
+    orgId: string,
+    orgRole: "member" | "owner",
+    maxMembers: number
+  ): Promise<"joined" | "org_full" | "already_in_org"> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    // If memberCount hasn't been backfilled on this org yet, seed it from
+    // the real GSI-backed count rather than defaulting to 0 — defaulting to
+    // 0 would silently discard the org's actual existing membership, and
+    // every subsequent join would then be checked against a counter
+    // starting far below reality, letting the org balloon past maxMembers
+    // before the backfill migration runs. This doesn't reintroduce the
+    // original race: DynamoDB re-evaluates the transaction's condition
+    // against the item's real current state at commit time, not this
+    // pre-read, so a concurrent join that already initialized the counter
+    // is still correctly serialized against.
+    const orgSnapshot = await this.docClient.get({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
+    const seedCount =
+      orgSnapshot.Item?.memberCount !== undefined
+        ? orgSnapshot.Item.memberCount
+        : await this.getRealMemberCountForOrg(orgId);
+
+    try {
+      await this.docClient
+        .transactWrite({
+          TransactItems: [
+            {
+              Update: {
+                TableName: ORGS_TABLE,
+                Key: { orgId },
+                UpdateExpression: "SET memberCount = if_not_exists(memberCount, :seed) + :one",
+                // Must check capacity against the seed value too when
+                // memberCount is still absent — attribute_not_exists(...)
+                // alone would pass unconditionally regardless of how full
+                // the org's real (seeded) membership already is, letting an
+                // already-full unmigrated org overshoot maxMembers.
+                ConditionExpression:
+                  "(attribute_exists(memberCount) AND memberCount < :maxMembers) OR (attribute_not_exists(memberCount) AND :seed < :maxMembers)",
+                ExpressionAttributeValues: { ":seed": seedCount, ":one": 1, ":maxMembers": maxMembers },
+              },
+            },
+            {
+              Update: {
+                TableName: this.tableName,
+                Key: { email: user.email },
+                UpdateExpression: "SET orgId = :orgId, orgRole = :orgRole REMOVE pendingOrgInvite",
+                ConditionExpression: "attribute_not_exists(orgId)",
+                ExpressionAttributeValues: { ":orgId": orgId, ":orgRole": orgRole },
+              },
+            },
+          ],
+        })
+        .promise();
+      return "joined";
+    } catch (error: any) {
+      if (error.code === "TransactionCanceledException") {
+        const reasons: Array<{ Code?: string }> = error.CancellationReasons || [];
+        if (reasons[0]?.Code === "ConditionalCheckFailed") return "org_full";
+        if (reasons[1]?.Code === "ConditionalCheckFailed") return "already_in_org";
+        // Unrecognized cancellation shape — treat conservatively as a
+        // capacity/assignment conflict rather than surfacing a 500.
+        return "already_in_org";
+      }
+      handleDynamoDbError(error, "joinOrgWithCapacityCheck");
+      throw error;
+    }
+  }
+
+  // Live count of an org's real members via OrgIdIndex — same logic as
+  // scripts/backfill-org-member-count.ts. Only used as a one-time seed
+  // value inside joinOrgWithCapacityCheck when memberCount hasn't been
+  // backfilled on this org yet; not for display or repeated capacity checks.
+  private async getRealMemberCountForOrg(orgId: string): Promise<number> {
+    let total = 0;
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await this.docClient
+        .query({
+          TableName: this.tableName,
+          IndexName: "OrgIdIndex",
+          KeyConditionExpression: "orgId = :orgId",
+          FilterExpression: "NOT begins_with(userId, :tombstone)",
+          ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
+          Select: "COUNT",
+          ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+        })
+        .promise();
+      total += result.Count || 0;
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return total;
+  }
+
+  /**
    * Atomically increment a user's sessionVersion, invalidating all tokens issued
    * with the prior value. Used after a password change so that every other active
    * session (other devices) is logged out. Returns the new sessionVersion.
@@ -1734,18 +1877,84 @@ export class UserDB {
   }
 
   /**
-   * Remove orgId and orgRole from a user record (used when removing a member from an org).
+   * Remove orgId and orgRole from a user record (used when removing a member
+   * from an org, or a member leaving on their own). Also best-effort
+   * decrements the org's denormalized memberCount (see Organization.memberCount)
+   * so it stays accurate for the atomic capacity check at join time.
+   *
+   * The user-clear is conditioned on orgId still matching what was just
+   * read — this is what prevents a double-decrement when two concurrent
+   * calls target the same membership (e.g. an owner-initiated remove racing
+   * a self-initiated leave): only whichever call's conditioned REMOVE
+   * actually wins decrements the counter; the loser's condition fails
+   * (orgId is already gone) and it correctly skips decrementing, since the
+   * winner already accounted for the one real departure.
+   *
+   * The decrement is intentionally NOT in the same transaction as the
+   * membership clear, and intentionally non-fatal: leaving an org must never
+   * fail because of a counter-bookkeeping issue (missing/stale memberCount
+   * on an org predating this field, a rare inconsistency, etc.) — that
+   * failure mode would be worse than a temporarily-stale count, which only
+   * risks blocking one future join until reconciled, never overflow.
    */
   async clearOrgMembership(userId: string): Promise<void> {
     const user = await this.getUserById(userId);
     if (!user || !user.email) {
       throw new Error(`User with ID '${userId}' not found or has no email.`);
     }
-    await this.docClient.update({
-      TableName: this.tableName,
-      Key: { email: user.email },
-      UpdateExpression: "REMOVE orgId, orgRole",
-    }).promise();
+    const orgId = user.orgId;
+    if (!orgId) return; // Already cleared, e.g. by a concurrent call — nothing to do.
+
+    // If memberCount hasn't been backfilled on this org yet, compute the seed
+    // from the real live count BEFORE clearing this user's membership, not
+    // after. OrgIdIndex is a GSI — eventually consistent relative to the base
+    // table write — so querying it immediately after our own REMOVE could
+    // still include the departing user, seeding the counter one too high and
+    // wrongly blocking a later legitimate join. Querying before the removal
+    // sidesteps that: the count here still (correctly) includes this user,
+    // so subtracting 1 below lands on the true post-departure value without
+    // depending on the GSI having caught up to a write we just made.
+    const orgSnapshot = await this.docClient
+      .get({ TableName: ORGS_TABLE, Key: { orgId }, ProjectionExpression: "memberCount" })
+      .promise();
+    const seed =
+      orgSnapshot.Item?.memberCount !== undefined
+        ? 1 // Ignored by if_not_exists when memberCount is already present.
+        : (await this.getRealMemberCountForOrg(orgId)) + 1;
+
+    try {
+      await this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "REMOVE orgId, orgRole",
+          ConditionExpression: "orgId = :orgId",
+          ExpressionAttributeValues: { ":orgId": orgId },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error.code === "ConditionalCheckFailedException") {
+        // A concurrent call already cleared (or changed) this membership —
+        // it already performed the decrement, so skip ours to avoid double-
+        // counting one real departure as two.
+        return;
+      }
+      throw error;
+    }
+
+    try {
+      await this.docClient
+        .update({
+          TableName: ORGS_TABLE,
+          Key: { orgId },
+          UpdateExpression: "SET memberCount = if_not_exists(memberCount, :seed) - :one",
+          ConditionExpression: "attribute_not_exists(memberCount) OR memberCount > :zero",
+          ExpressionAttributeValues: { ":seed": seed, ":one": 1, ":zero": 0 },
+        })
+        .promise();
+    } catch (error) {
+      console.error(`Failed to decrement memberCount for org ${orgId} (non-fatal):`, error);
+    }
   }
 }
 
@@ -8467,33 +8676,44 @@ export const orgDb = {
       return org;
     }
 
-    const updateExpressions: string[] = [];
+    const setExpressions: string[] = [];
+    const removeExpressions: string[] = [];
     const expressionAttributeNames: Record<string, string> = {};
     const expressionAttributeValues: Record<string, any> = {};
 
     Object.entries(updatableFields).forEach(([key, value]) => {
-      if (value !== undefined) {
-        updateExpressions.push(`#${key} = :${key}`);
-        expressionAttributeNames[`#${key}`] = key;
+      if (value === undefined) return;
+      expressionAttributeNames[`#${key}`] = key;
+      if (value === null) {
+        // Same REMOVE-on-null convention as userDb.updateUser — needed to
+        // actually clear a GSI-keyed attribute like autoJoinDomain, since
+        // DynamoDB rejects SET-ing a GSI key to NULL.
+        removeExpressions.push(`#${key}`);
+      } else {
+        setExpressions.push(`#${key} = :${key}`);
         expressionAttributeValues[`:${key}`] = value;
       }
     });
 
-    if (updateExpressions.length === 0) {
+    if (setExpressions.length === 0 && removeExpressions.length === 0) {
       const org = await this.getOrgById(orgId);
       if (!org) throw new Error(`Organization ${orgId} not found`);
       return org;
     }
 
     // Always update updatedAt
-    updateExpressions.push("#updatedAt = :updatedAt");
+    setExpressions.push("#updatedAt = :updatedAt");
     expressionAttributeNames["#updatedAt"] = "updatedAt";
     expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    const updateExpressionParts: string[] = [];
+    updateExpressionParts.push(`SET ${setExpressions.join(", ")}`);
+    if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
 
     const params = {
       TableName: ORGS_TABLE,
       Key: { orgId },
-      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      UpdateExpression: updateExpressionParts.join(" "),
       ExpressionAttributeNames: expressionAttributeNames,
       ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW" as const,
@@ -8565,6 +8785,99 @@ export const orgDb = {
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey);
     return null;
+  },
+
+  // Find all orgs with auto-join enabled for the given email domain (indexed
+  // query via AutoJoinDomainIndex, not a scan — this runs on every signup).
+  // Used at registration time to create pending domain-join requests.
+  async getOrgsWithAutoJoinDomain(domain: string): Promise<Organization[]> {
+    const allItems: Organization[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.query({
+        TableName: ORGS_TABLE,
+        IndexName: "AutoJoinDomainIndex",
+        KeyConditionExpression: "autoJoinDomain = :domain",
+        FilterExpression: "autoJoinEnabled = :enabled",
+        ExpressionAttributeValues: { ":domain": domain, ":enabled": true },
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      allItems.push(...((result.Items as Organization[]) || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return allItems;
+  },
+
+  // Atomically appends a domain-join request via DynamoDB's list_append,
+  // rather than reading pendingDomainJoinRequests then SET-ing the whole
+  // array back (a read-modify-write that loses concurrent appends/removals
+  // to the same org — flagged in review). Two signups matching the same org
+  // at the same instant now both land correctly instead of one clobbering
+  // the other's read-modify-write.
+  async addPendingDomainJoinRequest(
+    orgId: string,
+    request: { userId: string; email: string; requestedAt: string; requestToken: string }
+  ): Promise<void> {
+    await dynamodb
+      .update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression:
+          "SET pendingDomainJoinRequests = list_append(if_not_exists(pendingDomainJoinRequests, :empty), :new), updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":empty": [],
+          ":new": [request],
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+  },
+
+  // Atomically removes a domain-join request by token (approve/reject),
+  // via optimistic-concurrency retry rather than the read-filter-then-SET-
+  // whole-array pattern this replaced — that pattern silently dropped a
+  // concurrently-appended request (a new signup landing via
+  // addPendingDomainJoinRequest while an owner was mid-approve on this same
+  // org) or let two concurrent owner actions overwrite each other and
+  // resurrect an already-processed request (flagged in review). Each retry
+  // re-reads the org fresh and re-filters, conditioned on updatedAt not
+  // having changed since that read; on a conflict it just retries against
+  // the new state. Returns false if the token isn't found (already removed,
+  // or never existed) — never throws for that case.
+  async removeDomainJoinRequest(orgId: string, requestToken: string): Promise<boolean> {
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const result = await dynamodb.get({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
+      const org = result.Item as Organization | undefined;
+      if (!org) return false;
+
+      const pending = org.pendingDomainJoinRequests || [];
+      const updated = pending.filter((r) => r.requestToken !== requestToken);
+      if (updated.length === pending.length) return false; // Not found.
+
+      try {
+        await dynamodb
+          .update({
+            TableName: ORGS_TABLE,
+            Key: { orgId },
+            UpdateExpression: "SET pendingDomainJoinRequests = :updated, updatedAt = :now",
+            ConditionExpression: "updatedAt = :expectedUpdatedAt",
+            ExpressionAttributeValues: {
+              ":updated": updated,
+              ":now": new Date().toISOString(),
+              ":expectedUpdatedAt": org.updatedAt,
+            },
+          })
+          .promise();
+        return true;
+      } catch (error: any) {
+        if (error.code === "ConditionalCheckFailedException") {
+          continue; // Org changed concurrently — re-read and retry.
+        }
+        throw error;
+      }
+    }
+    throw new Error(`removeDomainJoinRequest: exceeded ${MAX_ATTEMPTS} retry attempts for org ${orgId}`);
   },
 
   async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
