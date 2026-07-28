@@ -6,6 +6,7 @@ import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
+import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
@@ -7647,6 +7648,171 @@ export const browserCookieDb = {
     } catch (error) {
       handleDynamoDbError(error, 'deleteAllBrowserCookies');
       throw error;
+    }
+  },
+
+  /**
+   * Save a manually-imported (e.g. pasted from DevTools) cookie set for a specific
+   * domain, distinct from the auto-persisted '__all__' blob. Caller is responsible
+   * for normalizing `domain` (lowercase) before calling. Encrypted at rest — unlike
+   * the auto-persisted blob, this is a user-supplied, already-authenticated bearer
+   * credential.
+   */
+  async saveDomainCookies(userId: string, domain: string, cookies: any[]): Promise<void> {
+    const now = new Date().toISOString();
+    // Cookies from one parseCookieHeader() call all share the same synthetic expiry,
+    // but take the earliest present (defensive, e.g. if callers ever mix sources) as
+    // the honest floor: once ANY cookie in the set is past this, injection is a no-op
+    // anyway, so surface/exclude the whole entry rather than silently keep using it.
+    const expirySeconds = cookies
+      .map((c) => c.expires)
+      .filter((e): e is number => typeof e === 'number');
+    const expiresAt = expirySeconds.length > 0
+      ? new Date(Math.min(...expirySeconds) * 1000).toISOString()
+      : undefined;
+
+    try {
+      await dynamodb.put({
+        TableName: BROWSER_COOKIES_TABLE,
+        Item: {
+          userId,
+          domain,
+          encryptedCookies: encryptPassword(JSON.stringify(cookies), userId),
+          cookieCount: cookies.length,
+          ...(expiresAt ? { expiresAt } : {}),
+          updatedAt: now,
+          createdAt: now,
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'saveDomainBrowserCookies');
+      throw error;
+    }
+  },
+
+  /** List manually-imported cookie domains for a user — metadata only, never the encrypted values. */
+  async listDomainCookies(userId: string): Promise<Array<{ domain: string; cookieCount: number; createdAt: string; expiresAt?: string; lastFailedAt?: string }>> {
+    try {
+      const items = await paginatedQuery(dynamodb, {
+        TableName: BROWSER_COOKIES_TABLE,
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+      });
+
+      return items
+        .filter((item) => item.domain !== '__all__')
+        .map((item) => ({
+          domain: item.domain,
+          cookieCount: item.cookieCount ?? 0,
+          createdAt: item.createdAt,
+          ...(item.expiresAt ? { expiresAt: item.expiresAt } : {}),
+          ...(item.lastFailedAt ? { lastFailedAt: item.lastFailedAt } : {}),
+        }));
+    } catch (error) {
+      handleDynamoDbError(error, 'listDomainBrowserCookies');
+      throw error;
+    }
+  },
+
+  /**
+   * Records that a manually-imported session for a domain failed to authenticate
+   * mid-task (e.g. the site still showed a signin page after load_browser_cookies
+   * injected it — the session died server-side before its synthetic expiresAt
+   * floor was reached). Called by Emma's mark_browser_session_failed tool so the
+   * failure is visible in Settings on the user's next visit instead of silently
+   * recurring on every future run. A fresh re-import (saveDomainCookies) fully
+   * overwrites the item, clearing this automatically.
+   *
+   * Best-effort: this is an observability signal, not a critical write. If the
+   * domain was deleted out from under it (condition fails) or the update
+   * otherwise errors, it's logged and swallowed rather than thrown — a failed
+   * "mark as failed" call must never break the automation task that reported it.
+   */
+  async markDomainCookiesFailed(userId: string, domain: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: BROWSER_COOKIES_TABLE,
+        Key: { userId, domain },
+        ConditionExpression: 'attribute_exists(userId)',
+        UpdateExpression: 'SET lastFailedAt = :now',
+        ExpressionAttributeValues: { ':now': new Date().toISOString() },
+      }).promise();
+    } catch (error) {
+      console.warn(`Failed to mark browser cookies as failed for domain "${domain}" (userId: ${userId}):`, error);
+    }
+  },
+
+  async deleteDomainCookies(userId: string, domain: string): Promise<void> {
+    try {
+      await dynamodb.delete({
+        TableName: BROWSER_COOKIES_TABLE,
+        Key: { userId, domain },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteDomainBrowserCookies');
+      throw error;
+    }
+  },
+
+  /**
+   * Combined cookie set for browser-automation injection: the auto-persisted
+   * '__all__' blob followed by every manually-imported per-domain entry. Order
+   * matters — per-domain (deliberately human-provided) cookies are appended AFTER
+   * '__all__' so they take precedence for the same site when Playwright's
+   * addCookies dedups by name/domain/path (empirically verified: last entry in
+   * the array wins). A per-domain entry past its `expiresAt` floor is skipped —
+   * injecting it would be a guaranteed no-op, so don't waste the attempt. A
+   * corrupted/undecryptable entry is likewise logged and skipped rather than
+   * failing the whole load.
+   *
+   * Defense in depth: the read path changed from a single get() to a query()
+   * to support per-domain entries, but the overwhelming majority of users
+   * have never touched that feature. If the query itself fails outright
+   * (throttling, a bug in this new path, etc.), fall back to the old,
+   * narrower get()-based read for '__all__' — the one nearly every user's
+   * automation actually depends on — rather than failing their whole task
+   * because of a code path they never opted into. If THAT also fails, the
+   * error is a real, visible infra problem and is allowed to propagate
+   * rather than being swallowed as a silent "no cookies saved".
+   */
+  async getAllCookiesForUser(userId: string): Promise<any[]> {
+    try {
+      const items = await paginatedQuery(dynamodb, {
+        TableName: BROWSER_COOKIES_TABLE,
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+      });
+
+      const allItem = items.find((item) => item.domain === '__all__');
+      const combined: any[] = [...(allItem?.cookies || [])];
+      const now = Date.now();
+
+      for (const item of items) {
+        if (item.domain === '__all__') continue;
+
+        if (item.expiresAt && new Date(item.expiresAt).getTime() <= now) {
+          console.warn(`Skipping expired manually-imported browser cookies for domain "${item.domain}" (userId: ${userId}, expiresAt: ${item.expiresAt})`);
+          continue;
+        }
+
+        try {
+          const { password: cookiesJson } = decryptPassword(item.encryptedCookies);
+          combined.push(...JSON.parse(cookiesJson));
+        } catch (error) {
+          console.error(`Failed to decrypt/parse browser cookies for domain "${item.domain}" (userId: ${userId}):`, error);
+        }
+      }
+
+      return combined;
+    } catch (queryError) {
+      console.warn(`getAllCookiesForUser query failed for userId ${userId}, falling back to get()-based getCookies:`, queryError);
+      try {
+        const fallbackCookies = await browserCookieDb.getCookies(userId);
+        return fallbackCookies || [];
+      } catch (fallbackError) {
+        handleDynamoDbError(fallbackError, 'getAllBrowserCookiesForUser');
+        throw fallbackError;
+      }
     }
   },
 };
