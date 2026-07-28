@@ -695,6 +695,15 @@ export interface Organization {
     requestToken: string;
   }>;
   maxMembers: number;
+  /**
+   * Denormalized, atomically-maintained member count — used ONLY as a fast
+   * capacity gate at join time (via a DynamoDB transaction pairing the
+   * increment with the joining user's write), never for display. Display
+   * always uses the live GSI-backed member list (getOrgMembers), which can
+   * never drift. Absent on orgs created before this field existed; treated
+   * as 0 via if_not_exists until the backfill migration runs.
+   */
+  memberCount?: number;
   createdAt: string;
   updatedAt: string;
   shareSettings?: OrgShareSettings;
@@ -1486,20 +1495,30 @@ export class UserDB {
   }
 
   /**
-   * Atomically assign a user to an org, but only if they don't already have
-   * one — a plain read-then-write (check user.orgId, then updateUser) has a
-   * TOCTOU race: two concurrent approvals (e.g. domain-join requests from two
-   * different orgs) can both pass the read-check before either write lands,
-   * double-joining or silently overwriting one org's membership. The
-   * ConditionExpression makes the check-and-set atomic. Returns false (no
-   * throw) if the user already had an orgId — the caller decides how to
-   * surface that as "already in an organization".
+   * Atomically assigns a user to an org AND enforces the member cap in a
+   * single DynamoDB transaction — a plain read-then-write (check orgId /
+   * check member count, then separately write) has two distinct TOCTOU
+   * races: (1) two concurrent approvals for the SAME user from different
+   * orgs can both pass the "not already in an org" read-check before either
+   * write lands, and (2) two concurrent approvals for DIFFERENT users on
+   * the SAME org can both pass the "under capacity" read-check when only
+   * one slot remains, overshooting maxMembers. TransactWriteItems ties the
+   * org's memberCount increment (conditioned on staying under maxMembers)
+   * and the user's orgId write (conditioned on not already having one) into
+   * one all-or-nothing operation, closing both races at once.
+   *
+   * memberCount is denormalized purely for this atomic check — it is never
+   * used for display (see the field's doc comment on Organization). Orgs
+   * created before this field existed are treated as count 0 via
+   * if_not_exists until the backfill migration runs; see
+   * scripts/backfill-org-member-count.ts.
    */
-  async joinOrgIfUnassigned(
+  async joinOrgWithCapacityCheck(
     userId: string,
     orgId: string,
-    orgRole: "member" | "owner"
-  ): Promise<boolean> {
+    orgRole: "member" | "owner",
+    maxMembers: number
+  ): Promise<"joined" | "org_full" | "already_in_org"> {
     const user = await this.getUserById(userId);
     if (!user || !user.email) {
       throw new Error(`User with ID '${userId}' not found or has no email.`);
@@ -1507,20 +1526,40 @@ export class UserDB {
 
     try {
       await this.docClient
-        .update({
-          TableName: this.tableName,
-          Key: { email: user.email },
-          UpdateExpression: "SET orgId = :orgId, orgRole = :orgRole REMOVE pendingOrgInvite",
-          ConditionExpression: "attribute_not_exists(orgId)",
-          ExpressionAttributeValues: { ":orgId": orgId, ":orgRole": orgRole },
+        .transactWrite({
+          TransactItems: [
+            {
+              Update: {
+                TableName: ORGS_TABLE,
+                Key: { orgId },
+                UpdateExpression: "SET memberCount = if_not_exists(memberCount, :zero) + :one",
+                ConditionExpression: "attribute_not_exists(memberCount) OR memberCount < :maxMembers",
+                ExpressionAttributeValues: { ":zero": 0, ":one": 1, ":maxMembers": maxMembers },
+              },
+            },
+            {
+              Update: {
+                TableName: this.tableName,
+                Key: { email: user.email },
+                UpdateExpression: "SET orgId = :orgId, orgRole = :orgRole REMOVE pendingOrgInvite",
+                ConditionExpression: "attribute_not_exists(orgId)",
+                ExpressionAttributeValues: { ":orgId": orgId, ":orgRole": orgRole },
+              },
+            },
+          ],
         })
         .promise();
-      return true;
+      return "joined";
     } catch (error: any) {
-      if (error.code === "ConditionalCheckFailedException") {
-        return false;
+      if (error.code === "TransactionCanceledException") {
+        const reasons: Array<{ Code?: string }> = error.CancellationReasons || [];
+        if (reasons[0]?.Code === "ConditionalCheckFailed") return "org_full";
+        if (reasons[1]?.Code === "ConditionalCheckFailed") return "already_in_org";
+        // Unrecognized cancellation shape — treat conservatively as a
+        // capacity/assignment conflict rather than surfacing a 500.
+        return "already_in_org";
       }
-      handleDynamoDbError(error, "joinOrgIfUnassigned");
+      handleDynamoDbError(error, "joinOrgWithCapacityCheck");
       throw error;
     }
   }
@@ -1788,18 +1827,45 @@ export class UserDB {
   }
 
   /**
-   * Remove orgId and orgRole from a user record (used when removing a member from an org).
+   * Remove orgId and orgRole from a user record (used when removing a member
+   * from an org, or a member leaving on their own). Also best-effort
+   * decrements the org's denormalized memberCount (see Organization.memberCount)
+   * so it stays accurate for the atomic capacity check at join time.
+   *
+   * The decrement is intentionally NOT in the same transaction as the
+   * membership clear, and intentionally non-fatal: leaving an org must never
+   * fail because of a counter-bookkeeping issue (missing/stale memberCount
+   * on an org predating this field, a rare inconsistency, etc.) — that
+   * failure mode would be worse than a temporarily-stale count, which only
+   * risks blocking one future join until reconciled, never overflow.
    */
   async clearOrgMembership(userId: string): Promise<void> {
     const user = await this.getUserById(userId);
     if (!user || !user.email) {
       throw new Error(`User with ID '${userId}' not found or has no email.`);
     }
+    const orgId = user.orgId;
     await this.docClient.update({
       TableName: this.tableName,
       Key: { email: user.email },
       UpdateExpression: "REMOVE orgId, orgRole",
     }).promise();
+
+    if (orgId) {
+      try {
+        await this.docClient
+          .update({
+            TableName: ORGS_TABLE,
+            Key: { orgId },
+            UpdateExpression: "SET memberCount = if_not_exists(memberCount, :one) - :one",
+            ConditionExpression: "attribute_not_exists(memberCount) OR memberCount > :zero",
+            ExpressionAttributeValues: { ":one": 1, ":zero": 0 },
+          })
+          .promise();
+      } catch (error) {
+        console.error(`Failed to decrement memberCount for org ${orgId} (non-fatal):`, error);
+      }
+    }
   }
 }
 
