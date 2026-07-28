@@ -1,6 +1,19 @@
 import { emmaToolRegistry } from './registry';
 import { get2CaptchaApiKey } from '../utils/secretsManager';
 
+// MCP tool calls deliberately have no transport-level timeout (needed for
+// legitimate long-running browser tasks — see mcpClientService.ts). The site-key
+// probe is a tiny synchronous DOM read that should never legitimately take long;
+// bound it explicitly so a hung MCP call can't block the whole captcha solve.
+const SITE_KEY_PROBE_TIMEOUT_MS = 8000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
 function findPlaywrightTool(service: any, suffix: string): string | null {
   const allTools = service.toolRegistry?.getAllTools?.() || [];
   for (const tool of allTools) {
@@ -155,6 +168,94 @@ function buildInjectCode(captchaType: string, token: string): string {
   return `async (page) => { return 'no-inject-needed'; }`;
 }
 
+const IFRAME_SELECTOR_BY_CAPTCHA_TYPE: Record<string, string> = {
+  recaptcha_v2: 'iframe[src*="recaptcha"]',
+  recaptcha_v3: 'iframe[src*="recaptcha"]',
+  hcaptcha: 'iframe[src*="hcaptcha"]',
+  turnstile: 'iframe[src*="challenges.cloudflare.com"]',
+  funcaptcha: 'iframe[src*="arkoselabs"], iframe[src*="funcaptcha"]'
+};
+
+/**
+ * Probes the live page for the site key actually bound to the rendered CAPTCHA widget,
+ * checking both static data-* attributes and the widget iframe's src query params (the
+ * only place the key lives for CAPTCHAs rendered without a static attribute, e.g. some
+ * invisible reCAPTCHA implementations).
+ */
+function buildSiteKeyProbeCode(captchaType: string): string {
+  const iframeSelector = JSON.stringify(IFRAME_SELECTOR_BY_CAPTCHA_TYPE[captchaType] || '');
+  return `async (page) => {
+  return await page.evaluate((sel) => {
+    const dataKey = document.querySelector('[data-sitekey]')?.getAttribute('data-sitekey')
+      || document.querySelector('[data-pkey]')?.getAttribute('data-pkey')
+      || document.querySelector('[data-enforcementkey]')?.getAttribute('data-enforcementkey')
+      || null;
+    let iframeKey = null;
+    if (sel) {
+      const iframe = document.querySelector(sel);
+      if (iframe && iframe.src) {
+        try {
+          const url = new URL(iframe.src);
+          iframeKey = url.searchParams.get('k') || url.searchParams.get('sitekey') || url.searchParams.get('pk') || null;
+        } catch (e) {}
+      }
+    }
+    return JSON.stringify({ dataKey, iframeKey });
+  }, ${iframeSelector});
+}`;
+}
+
+/**
+ * Resolves the site key to actually use for solving: the caller (LLM) supplies a site_key,
+ * but that value can be stale — e.g. copied from a scheduled task's static prompt text rather
+ * than freshly read off the page. A stale/mismatched key produces a token that is valid for a
+ * DIFFERENT widget, which the target site's backend then rejects (see ENG-494: RankAI's
+ * /api/auth/magic-link returned 400 for every attempt because the invisible reCAPTCHA on
+ * their signin page renders without a static [data-sitekey] attribute, so the agent fell back
+ * to a hardcoded key from the task prompt instead of the page's actual key).
+ *
+ * When the live page exposes a key (via a data attribute or the widget iframe's src) that
+ * differs from the caller-provided one, the live key wins — it is the one the target site's
+ * backend will actually validate against. If the page can't be probed (no active browser
+ * session, no key found, or the probe errors), the caller-provided key is used unchanged.
+ */
+async function resolveLiveSiteKey(
+  context: any,
+  userId: string,
+  captchaType: string,
+  providedSiteKey: string
+): Promise<string> {
+  const runCodeTool = findPlaywrightTool(context.service, 'browser_run_code');
+  if (!runCodeTool) return providedSiteKey;
+
+  try {
+    const probeResult = await withTimeout(
+      context.service.executeTool(
+        context.llmModel,
+        runCodeTool,
+        { code: buildSiteKeyProbeCode(captchaType) },
+        userId,
+        context.sessionId
+      ),
+      SITE_KEY_PROBE_TIMEOUT_MS,
+      'Site key probe'
+    );
+    const probeText = extractMcpText(probeResult);
+    const parsed = JSON.parse(probeText) as { dataKey: string | null; iframeKey: string | null };
+    const liveKey = parsed.dataKey || parsed.iframeKey || null;
+    if (liveKey && liveKey !== providedSiteKey) {
+      console.warn(
+        `[solveCaptcha] Caller-provided site_key "${providedSiteKey}" does not match the live key ` +
+        `"${liveKey}" found on the page — using the live key.`
+      );
+      return liveKey;
+    }
+  } catch (e) {
+    console.warn(`[solveCaptcha] Site key verification failed, falling back to caller-provided site_key: ${(e as Error).message}`);
+  }
+  return providedSiteKey;
+}
+
 // ---------------------------------------------------------------------------
 // solve_captcha — unified tool for all token-based CAPTCHAs
 // ---------------------------------------------------------------------------
@@ -238,6 +339,7 @@ emmaToolRegistry.register({
     }
 
     const apiKey = await get2CaptchaApiKey();
+    const resolvedSiteKey = await resolveLiveSiteKey(context, userId, captcha_type, site_key);
     console.log(`[solveCaptcha] Solving ${captcha_type} for ${page_url}`);
 
     let token: string;
@@ -246,7 +348,7 @@ emmaToolRegistry.register({
       case 'recaptcha_v2':
         token = await submit2CaptchaTask(apiKey, {
           method: 'userrecaptcha',
-          googlekey: site_key,
+          googlekey: resolvedSiteKey,
           pageurl: page_url,
           ...(invisible ? { invisible: '1' } : {})
         }, 15000);
@@ -256,7 +358,7 @@ emmaToolRegistry.register({
         token = await submit2CaptchaTask(apiKey, {
           method: 'userrecaptcha',
           version: 'v3',
-          googlekey: site_key,
+          googlekey: resolvedSiteKey,
           pageurl: page_url,
           action,
           min_score: String(min_score)
@@ -272,7 +374,7 @@ emmaToolRegistry.register({
       case 'hcaptcha':
         token = await submit2CaptchaTask(apiKey, {
           method: 'hcaptcha',
-          sitekey: site_key,
+          sitekey: resolvedSiteKey,
           pageurl: page_url
         }, 15000);
         break;
@@ -280,7 +382,7 @@ emmaToolRegistry.register({
       case 'turnstile':
         token = await submit2CaptchaTask(apiKey, {
           method: 'turnstile',
-          sitekey: site_key,
+          sitekey: resolvedSiteKey,
           pageurl: page_url
         }, 10000);
         break;
@@ -288,7 +390,7 @@ emmaToolRegistry.register({
       case 'funcaptcha':
         token = await submit2CaptchaTask(apiKey, {
           method: 'funcaptcha',
-          publickey: site_key,
+          publickey: resolvedSiteKey,
           pageurl: page_url
         }, 30000);
         break;
