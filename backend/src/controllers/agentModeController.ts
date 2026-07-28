@@ -1272,9 +1272,25 @@ export async function runVerifiedChat(
           await waitForVerifiedChatRetry(attempt);
           continue;
         }
-        // Continuation produced no further "unfinished" admission → done.
+        // ENG-635: the continuation budget (or attempt budget) is exhausted. If this
+        // final continuation STILL defers the task to an absent human (a 'confirmation'
+        // halt) rather than delivering, do NOT report a clean success — a headless run
+        // that punts to a human who will never reply produced no deliverable. Reporting
+        // success:false lets the scheduled path record a failure (auto-issue + oncall)
+        // instead of scoring a non-deliverable as a good run. Scoped to 'confirmation'
+        // only: an 'unfinished'/'budget' turn that still surfaces a partial report with
+        // actionable next-steps is a valid terminal state and stays success:true.
+        const haltedUnresolved = continuationReason === 'confirmation';
+        if (haltedUnresolved) {
+          console.warn(
+            `AgentMode runVerifiedChat: session ${sessionId} exhausted the completion gate ` +
+            `(${completionGateContinuationsUsed}/${completionGateMaxContinuations}) but the final turn still ` +
+            `defers to the user — reporting as unsuccessful (no deliverable produced).`
+          );
+        }
+        // Continuation produced no further blocking signal (or an accepted partial) → done.
         return {
-          success: true,
+          success: !haltedUnresolved,
           content: allContent,
           toolCalls: allToolCalls,
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
@@ -1290,7 +1306,7 @@ export async function runVerifiedChat(
             return { functionName: reqFunc.functionName, requiredCount: reqFunc.minCount, actualCount, met: actualCount >= reqFunc.minCount };
           }),
           attempts: attempt,
-          workPlanCompleted: true
+          workPlanCompleted: !haltedUnresolved
         };
       }
 
