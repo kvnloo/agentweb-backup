@@ -22,6 +22,22 @@ describe('parseCookieHeader', () => {
       const huge = 'a=' + 'x'.repeat(21 * 1024);
       expect(() => parseCookieHeader(huge, 'rankai.ai')).toThrow(/too large|size/i);
     });
+
+    it('gives a guided error (not a generic "malformed" one) when the whole input has no "=" at all — the bare-value mistake', () => {
+      // Real-world case: a user pastes just a cookie's VALUE (copied from DevTools
+      // Application/Storage tab's Value column) instead of "name=value" (from the
+      // Network tab's cookie request header). e.g. a raw LinkedIn li_at token.
+      const bareValue = 'AQEDASb4dPAEWdFlAAABn2pU7G8AAAGfw5KF600AtLpf70SRax7BtNC53yM0XiICAKBLPguFfDttjepnLv0JCHwsyil7DTcaFyM_ASn0FnUuDTNlknKH5kxjqekfmYPSStirUmWe5SEz29STmDENYver';
+      expect(() => parseCookieHeader(bareValue, 'linkedin.com')).toThrow(/looks like you pasted just the cookie's value/i);
+      expect(() => parseCookieHeader(bareValue, 'linkedin.com')).toThrow(/name=value/);
+    });
+
+    it('still gives the plain malformed-segment error when SOME segments are valid but one is broken', () => {
+      // Distinguishes "entirely bare value" (guided message) from "one bad segment
+      // among otherwise-valid ones" (a real typo, not the bare-value mistake).
+      expect(() => parseCookieHeader('session=abc; garbage', 'rankai.ai')).toThrow(/malformed cookie segment/i);
+      expect(() => parseCookieHeader('session=abc; garbage', 'rankai.ai')).not.toThrow(/looks like you pasted/i);
+    });
   });
 
   describe('success cases', () => {

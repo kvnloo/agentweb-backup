@@ -76,9 +76,16 @@ describe('Browser Cookies Routes', () => {
     });
 
     it('rejects a malformed cookie header, surfacing the parser error', async () => {
-      const res = await request(app).post('/api/browser-cookies').send({ domain: 'rankai.ai', cookieHeader: 'garbage' });
+      const res = await request(app).post('/api/browser-cookies').send({ domain: 'rankai.ai', cookieHeader: 'session=abc; garbage' });
       expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/malformed|invalid/i);
+      expect(res.body.error).toMatch(/malformed/i);
+      expect(mockDb.saveDomainCookies).not.toHaveBeenCalled();
+    });
+
+    it('gives the guided bare-value error when the whole cookieHeader has no "=" (e.g. pasted a raw li_at value)', async () => {
+      const res = await request(app).post('/api/browser-cookies').send({ domain: 'linkedin.com', cookieHeader: 'garbage' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/looks like you pasted just the cookie's value/i);
       expect(mockDb.saveDomainCookies).not.toHaveBeenCalled();
     });
 

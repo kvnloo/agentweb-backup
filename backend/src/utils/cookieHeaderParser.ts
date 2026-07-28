@@ -25,6 +25,18 @@ export function parseCookieHeader(headerString: string, domain: string): ParsedC
     throw new Error('Cookie value is empty');
   }
 
+  // A pasted value with no "=" anywhere is almost always the bare-value mistake:
+  // copying a single cookie's Value column from DevTools' Application/Storage tab,
+  // rather than the full "name=value; ..." string from the Network tab's cookie
+  // request header. Give a guided fix instead of a generic parse error.
+  if (!trimmedHeader.includes('=') && !trimmedHeader.includes(';')) {
+    throw new Error(
+      "This looks like you pasted just the cookie's value, not its name=value pair. " +
+      'Prefix it with the cookie\'s name, e.g. "sessionid=' + trimmedHeader.slice(0, 20) + '...", ' +
+      'or copy the full "cookie" request header from the Network tab instead (see the instructions above).'
+    );
+  }
+
   const normalizedDomain = '.' + domain.toLowerCase().replace(/^\.+/, '');
   const expires = Math.floor(Date.now() / 1000) + COOKIE_LIFETIME_SECONDS;
 
