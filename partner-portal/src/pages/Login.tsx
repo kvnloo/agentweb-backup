@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate, Link as RouterLink } from 'react-router-dom';
+import { useLocation, useNavigate, Link as RouterLink } from 'react-router-dom';
 import {
   Container,
   Box,
@@ -17,7 +17,9 @@ export default function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const { login, loginError, clearLoginError } = useAuth();
+  const location = useLocation();
   const navigate = useNavigate();
+  const returnTo = location.state?.from ?? '/tasks';
 
   useEffect(() => {
     clearLoginError();
@@ -28,9 +30,9 @@ export default function Login() {
     clearLoginError();
     try {
       await login(email, password, 'partner');
-      navigate('/tasks');
-    } catch (err: any) {
-      console.error("Login page catch:", err.message);
+      navigate(returnTo, { replace: true });
+    } catch {
+      // AuthContext exposes the user-facing login error.
     }
   };
 
@@ -98,4 +100,4 @@ export default function Login() {
       </Box>
     </Container>
   );
-} 
+}
