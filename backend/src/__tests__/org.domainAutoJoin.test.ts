@@ -124,6 +124,18 @@ describe('Domain-based org auto-join', () => {
       expect(res.body.data.autoJoinDomain).toBe('example.com');
     });
 
+    it('rejects enabling when the owner\'s own email is a personal domain (ENG-512 review)', async () => {
+      mockUsers['user-1'].email = 'owner@gmail.com';
+      const res = await request(app)
+        .put('/api/org/org-1')
+        .send({ autoJoinEnabled: true });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/personal email domain/i);
+      expect(mockOrgs['org-1'].autoJoinEnabled).toBeUndefined();
+      expect(mockOrgs['org-1'].autoJoinDomain).toBeUndefined();
+    });
+
     it('clears autoJoinDomain when disabling', async () => {
       mockOrgs['org-1'].autoJoinEnabled = true;
       mockOrgs['org-1'].autoJoinDomain = 'example.com';
