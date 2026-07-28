@@ -1,5 +1,5 @@
-import { useState, useEffect } from 'react';
-import { useNavigate, Link as RouterLink } from 'react-router-dom';
+import { useEffect } from 'react';
+import { useLocation, useNavigate, Link as RouterLink } from 'react-router-dom';
 import {
   Container,
   Box,
@@ -14,24 +14,45 @@ import { useAuth } from '../contexts/AuthContext';
 import GoogleSignInButton from '../components/GoogleSignInButton';
 
 export default function Login() {
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const { login, loginError, clearLoginError } = useAuth();
+  const location = useLocation();
   const navigate = useNavigate();
+  const returnTo = location.state?.from ?? '/tasks';
 
   useEffect(() => {
     clearLoginError();
   }, [clearLoginError]);
 
-  const handleSubmit = async (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     clearLoginError();
+    const submittedForm = new FormData(e.currentTarget);
+    const submittedEmail = String(submittedForm.get('email') ?? '');
+    const submittedPassword = String(submittedForm.get('password') ?? '');
+
     try {
-      await login(email, password, 'partner');
-      navigate('/tasks');
-    } catch (err: any) {
-      console.error("Login page catch:", err.message);
+      await login(submittedEmail, submittedPassword, 'partner');
+      navigate(returnTo, { replace: true });
+    } catch {
+      // AuthContext exposes the user-facing login error.
     }
+  };
+
+  const handleFormKeyDown = (e: React.KeyboardEvent<HTMLFormElement>) => {
+    const target = e.target;
+    const isTextInput = target instanceof HTMLInputElement;
+    const isSubmitButton =
+      target instanceof HTMLButtonElement && target.type === 'submit';
+    const isKeyboardSubmit =
+      (e.key === 'Enter' && (isTextInput || isSubmitButton)) ||
+      (e.key === ' ' && isSubmitButton);
+
+    if (!isKeyboardSubmit) return;
+
+    e.preventDefault();
+    if (e.repeat || e.nativeEvent.isComposing) return;
+
+    e.currentTarget.requestSubmit(isSubmitButton ? target : undefined);
   };
 
   return (
@@ -50,7 +71,11 @@ export default function Login() {
         <Box sx={{ mt: 1, width: '100%' }}>
           <GoogleSignInButton />
           <Divider sx={{ my: 2 }}>OR</Divider>
-          <Box component="form" onSubmit={handleSubmit}>
+          <Box
+            component="form"
+            onSubmit={handleSubmit}
+            onKeyDown={handleFormKeyDown}
+          >
             {loginError && (
               <Alert severity="error" sx={{ mb: 2 }}>
                 {loginError}
@@ -65,8 +90,6 @@ export default function Login() {
               name="email"
               autoComplete="email"
               autoFocus
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
             />
             <TextField
               margin="normal"
@@ -77,8 +100,6 @@ export default function Login() {
               type="password"
               id="password"
               autoComplete="current-password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
             />
             <Button
               type="submit"
@@ -98,4 +119,4 @@ export default function Login() {
       </Box>
     </Container>
   );
-} 
+}
