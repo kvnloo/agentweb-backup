@@ -1149,7 +1149,16 @@ export async function runVerifiedChat(
       );
       // Breadcrumb in history so Emma sees the decision and resumes without
       // re-asking (best-effort; the persisted answer is the source of truth).
-      const breadcrumbPrefix = fullAutonomy && pending.immutable === true ? '[Full autonomy]' : '[Scheduled run]';
+      // Label the breadcrumb by the actual session, not the trigger: runVerifiedChat
+      // is also invoked from non-scheduled callers (verifiedGenerate, slack revision,
+      // revisionService, humanEvalActionService, imageReports), so hardcoding
+      // '[Scheduled run]' would write a false label into those sessions' history.
+      const breadcrumbPrefix =
+        fullAutonomy && pending.immutable === true
+          ? '[Full autonomy]'
+          : postTurnSession.sessionType === 'scheduled'
+            ? '[Scheduled run]'
+            : '[Auto-proceed]';
       try {
         await chatbotDb.addMessageToSession(sessionId, {
           role: 'user',
