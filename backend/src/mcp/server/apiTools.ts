@@ -2534,7 +2534,7 @@ mcpToolRegistry.register({
   name: 'get_registration_status',
   definition: {
     name: 'get_registration_status',
-    description: `Join a batch of emails against AgentWeb user accounts to learn which ones registered (signed up) and which became premium (paying/trialing) users. Use this to attribute CRM leads — e.g. audit-page leads — to real signups and conversions in a funnel report. Read-only.
+    description: `Join a batch of emails against AgentWeb user accounts to learn which ones registered (signed up) and which became premium (paying/trialing) users. When computing a funnel Registered or Premium stage, you MUST call this on the lead emails to get real signup/payment status — do not infer it from list_all_clients or search. Admin-only (non-admin callers get a 403) and read-only.
 
 For each input email the response reports:
 - \`registered\`: true if a (non-deleted) AgentWeb account exists for that email.
@@ -2542,6 +2542,8 @@ For each input email the response reports:
 - \`subscriptionStatus\` / \`subscriptionType\` / \`userId\` / \`createdAt\`: present when registered.
 
 Emails with no matching account come back as \`{ registered: false, isPremium: false }\`. The response also includes a \`summary\` with \`total\`, \`registered\`, and \`premium\` counts.
+
+Set \`include_chat_session_count: true\` to also get \`chatSessionCount\` (a live count of each registered user's chat sessions) — use it for a funnel Usage/Active stage instead of scraping the admin page. It costs one extra query per registered user, so only request it when you need usage.
 
 Example:
   action inputs: { emails: ["lead1@acme.com", "lead2@acme.com"] }
@@ -2553,6 +2555,10 @@ Example:
           type: 'array',
           items: { type: 'string' },
           description: 'Emails to look up (1-1000). Case/whitespace-insensitive; duplicates are collapsed.',
+        },
+        include_chat_session_count: {
+          type: 'boolean',
+          description: 'When true, also return a live chatSessionCount for each registered user (for a funnel Usage/Active stage). Costs one extra query per registered user. Default false.',
         },
       },
       required: ['emails'],
@@ -2571,7 +2577,7 @@ Example:
       method: 'POST',
       path: '/api/crm/registration-status',
       context: ctx(context),
-      body: { emails },
+      body: { emails, includeChatSessionCount: args?.include_chat_session_count === true },
     });
     return jsonResult(data);
   },
