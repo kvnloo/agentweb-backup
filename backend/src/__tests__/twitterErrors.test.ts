@@ -82,4 +82,37 @@ describe('describeXApiError', () => {
     expect(msg).toContain('Bad Request');
     expect(msg).not.toContain('HTTP');
   });
+
+  // ENG-604: HTTP 402 = the workspace's X API plan is out of credits. Reads and
+  // posts are blocked until it is topped up / upgraded. The surfaced error must
+  // point the user to where they resolve it, not just echo "credits depleted".
+  it('appends an actionable top-up hint on a 402 credits-depleted error', () => {
+    const err = makeApiResponseError(402, {
+      title: 'Payment Required',
+      detail: 'credits depleted',
+    });
+    const msg = describeXApiError(err);
+    expect(msg).toContain('Payment Required');
+    expect(msg).toContain('credits depleted');
+    expect(msg).toContain('402');
+    // Actionable: names the credit/top-up path and where to resolve it.
+    expect(msg).toMatch(/credits/i);
+    expect(msg).toMatch(/top up|upgrade/i);
+    expect(msg).toMatch(/developer\.x\.com|Developer Portal/i);
+  });
+
+  it('surfaces the top-up hint on a 402 even when the X payload is empty', () => {
+    const err = makeApiResponseError(402, {});
+    const msg = describeXApiError(err);
+    expect(msg).toMatch(/top up|upgrade/i);
+    expect(msg).toContain('402');
+    expect(msg).not.toBe('Request failed with code 402');
+  });
+
+  it('does NOT add the credit hint to non-402 errors', () => {
+    const err = makeApiResponseError(403, { title: 'Forbidden', detail: 'no permission' });
+    const msg = describeXApiError(err);
+    expect(msg).not.toMatch(/top up|upgrade/i);
+    expect(msg).not.toMatch(/developer\.x\.com/i);
+  });
 });
