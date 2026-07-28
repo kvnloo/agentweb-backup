@@ -1551,7 +1551,13 @@ export class UserDB {
                 TableName: ORGS_TABLE,
                 Key: { orgId },
                 UpdateExpression: "SET memberCount = if_not_exists(memberCount, :seed) + :one",
-                ConditionExpression: "attribute_not_exists(memberCount) OR memberCount < :maxMembers",
+                // Must check capacity against the seed value too when
+                // memberCount is still absent — attribute_not_exists(...)
+                // alone would pass unconditionally regardless of how full
+                // the org's real (seeded) membership already is, letting an
+                // already-full unmigrated org overshoot maxMembers.
+                ConditionExpression:
+                  "(attribute_exists(memberCount) AND memberCount < :maxMembers) OR (attribute_not_exists(memberCount) AND :seed < :maxMembers)",
                 ExpressionAttributeValues: { ":seed": seedCount, ":one": 1, ":maxMembers": maxMembers },
               },
             },
