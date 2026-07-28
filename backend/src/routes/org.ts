@@ -83,6 +83,12 @@ function isOrgOwner(user: any, org: Organization): boolean {
   return org.ownerUserId === user.userId || user.orgRole === "owner";
 }
 
+// Domain always derived server-side from the acting user's own email — never
+// client-supplied — so nobody can claim a domain they don't belong to.
+function deriveDomainFromEmail(email: string): string | undefined {
+  return email.split("@")[1]?.toLowerCase() || undefined;
+}
+
 function sanitizeConnectedAccountForOrgResponse(account: any): any {
   const safeConfig: Record<string, any> = {};
   for (const [key, value] of Object.entries(account.config || {})) {
@@ -136,6 +142,11 @@ router.post("/", async (req: Request, res: Response) => {
       // default). Without this, new orgs had no shareSettings and default-on
       // features silently fell through to "off" for plain members.
       shareSettings: defaultShareSettings(),
+      // Auto-join is on by default (owners can turn it off) — domain-matched
+      // signups still always require owner approval per request, so this
+      // doesn't weaken the safety model, just removes an extra opt-in step.
+      autoJoinEnabled: true,
+      autoJoinDomain: deriveDomainFromEmail(user.email),
       createdAt: now,
       updatedAt: now,
     };
@@ -225,7 +236,7 @@ router.put("/:orgId", async (req: Request, res: Response) => {
     if (updates.autoJoinEnabled !== undefined) {
       if (updates.autoJoinEnabled) {
         const ownerEmail = (req as AuthenticatedRequest).user?.email || "";
-        const domain = ownerEmail.split("@")[1]?.toLowerCase();
+        const domain = deriveDomainFromEmail(ownerEmail);
         if (!domain) {
           return res.status(400).json({ error: "Could not determine your email domain" });
         }
