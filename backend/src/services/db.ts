@@ -800,6 +800,14 @@ export interface RegistrationStatus {
   createdAt?: string;
   subscriptionType?: string | null;
   subscriptionStatus?: string;
+  /**
+   * Live count of the user's (non-archived) chat sessions. Only populated when
+   * the caller passes { includeChatSessionCount: true } — it costs one COUNT
+   * query per registered user, so it's opt-in. Lets the funnel report compute
+   * the "Usage/Active" stage from this single join instead of scraping the admin
+   * page or reading a customFields copy. Absent for unregistered emails.
+   */
+  chatSessionCount?: number;
 }
 
 export class UserDB {
@@ -1821,7 +1829,10 @@ export class UserDB {
    * come back as { registered: false, isPremium: false }. Premium = the user's
    * subscription_status is "active" or "trialing".
    */
-  async getRegistrationStatusByEmails(emails: string[]): Promise<RegistrationStatus[]> {
+  async getRegistrationStatusByEmails(
+    emails: string[],
+    options?: { includeChatSessionCount?: boolean },
+  ): Promise<RegistrationStatus[]> {
     // Normalize, drop blanks, de-duplicate (preserve first-seen order).
     const seen = new Set<string>();
     const normalized: string[] = [];
@@ -1854,7 +1865,7 @@ export class UserDB {
       }
     }
 
-    return normalized.map((email) => {
+    const results: RegistrationStatus[] = normalized.map((email) => {
       const user = foundByEmail.get(email);
       // A tombstoned account (userId begins with "deleted_") is treated as
       // unregistered — it's a former user, not an active signup.
@@ -1874,6 +1885,34 @@ export class UserDB {
         isPremium,
       };
     });
+
+    // Opt-in: attach a live chat-session count for each registered user so the
+    // funnel report can compute its Usage/Active stage from this one join. One
+    // COUNT query per registered user, so it's gated behind the flag and run in
+    // small concurrent chunks to avoid a burst on large cohorts.
+    if (options?.includeChatSessionCount) {
+      const registered = results.filter((r) => r.registered && r.userId);
+      const CHUNK = 10;
+      for (let i = 0; i < registered.length; i += CHUNK) {
+        const chunk = registered.slice(i, i + CHUNK);
+        await Promise.all(
+          chunk.map(async (r) => {
+            try {
+              r.chatSessionCount = await this.getChatSessionCount(r.userId as string);
+            } catch (err: any) {
+              // A single user's COUNT query failing must not sink the whole
+              // batch — leave this user's chatSessionCount undefined (unknown)
+              // and let every other lead's status through.
+              console.error(
+                `getRegistrationStatusByEmails: chatSessionCount failed for ${r.userId}: ${err?.message}`,
+              );
+            }
+          }),
+        );
+      }
+    }
+
+    return results;
   }
 
   /**
