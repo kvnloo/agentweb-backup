@@ -883,10 +883,101 @@ describe('AgentModeService - generate_image function', () => {
       expect(fb(undefined, [], undefined)).toBe('gpt-image-2');
       // The legacy preview id must never be the fallback (regression guard for the 2249 swap).
       expect(fb(undefined, [], undefined)).not.toBe('gemini-3.1-flash-image-preview');
-      // No fallback when the caller picked a model, or when editing / compositing a logo.
-      expect(fb('gemini-3.1-flash-image', [], undefined)).toBeUndefined();
+      // No fallback when the LLM explicitly picked a model, or when editing / compositing a logo.
+      expect(fb('gemini-3.1-flash-image', [], undefined, true)).toBeUndefined();
       expect(fb(undefined, ['https://x/a.png'], undefined)).toBeUndefined();
       expect(fb(undefined, [], 'https://x/logo.png')).toBeUndefined();
+    });
+  });
+
+  describe('Admin-default model fallback (ENG-510)', () => {
+    it('getImageGenerationFallbackModel gates on the explicit-choice flag, not mere model presence', () => {
+      const fb = (agentModeService as any).getImageGenerationFallbackModel.bind(agentModeService);
+      // A concrete model that came from the admin default (implicit) must still fall back.
+      expect(fb('gemini-3.1-flash-image-preview', [], undefined, false)).toBe('gpt-image-2');
+      // The same concrete model, when the LLM explicitly chose it, is respected (no fallback).
+      expect(fb('gemini-3.1-flash-image-preview', [], undefined, true)).toBeUndefined();
+    });
+
+    it('never falls back to the same model it just failed on', () => {
+      const fb = (agentModeService as any).getImageGenerationFallbackModel.bind(agentModeService);
+      // If the resolved default IS the first-choice fallback, pick a different alternate.
+      const chosen = fb('gpt-image-2', [], undefined, false);
+      expect(chosen).toBeDefined();
+      expect(chosen).not.toBe('gpt-image-2');
+    });
+
+    it('falls back on a timeout when the model came from the admin default, not an explicit choice', async () => {
+      const defaultSpy = jest
+        .spyOn(agentModeService as any, 'getImageApiDefaultModel')
+        .mockResolvedValue('gemini-3.1-flash-image-preview');
+
+      mockImageService.generateImage
+        .mockResolvedValueOnce({
+          success: false,
+          error: 'Failed to generate image: Image generation with gemini-3.1-flash-image timed out after 600 seconds'
+        })
+        .mockResolvedValueOnce({
+          success: true,
+          imageUrl: 'https://example.com/fallback-image.png',
+          filename: 'ad.png'
+        });
+
+      const result = await (agentModeService as any).generateImage(
+        'Three flat vector ad illustrations of a woman at the beach',
+        'ad.png',
+        '1024x1024',
+        'high',
+        [],
+        'user123',
+        'session123'
+        // no explicit imageModel → the admin default is resolved internally
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.imageUrl).toBe('https://example.com/fallback-image.png');
+      expect(result.fallbackUsed).toBe(true);
+      expect(result.imageModel).toBe('gpt-image-2');
+      expect(mockImageService.generateImage).toHaveBeenCalledTimes(2);
+      // Primary attempt uses the resolved admin default...
+      expect(mockImageService.generateImage).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        imageModel: 'gemini-3.1-flash-image-preview'
+      }));
+      // ...and the fallback fails over to a different provider.
+      expect(mockImageService.generateImage).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        imageModel: 'gpt-image-2'
+      }));
+
+      defaultSpy.mockRestore();
+    });
+
+    it('does not resolve the admin default or fall back when the LLM explicitly picked a model', async () => {
+      const defaultSpy = jest
+        .spyOn(agentModeService as any, 'getImageApiDefaultModel')
+        .mockResolvedValue('gemini-3.1-flash-image-preview');
+
+      mockImageService.generateImage.mockResolvedValueOnce({
+        success: false,
+        error: 'Failed to generate image: Image generation with gemini-3-pro-image-preview timed out after 600 seconds'
+      });
+
+      const result = await (agentModeService as any).generateImage(
+        'A clean product launch graphic',
+        'launch.png',
+        '1024x1024',
+        'high',
+        [],
+        'user123',
+        'session123',
+        'gemini-3-pro-image-preview' // explicit choice
+      );
+
+      expect(result.success).toBe(false);
+      expect(mockImageService.generateImage).toHaveBeenCalledTimes(1);
+      // An explicit model short-circuits the admin-default lookup entirely.
+      expect(defaultSpy).not.toHaveBeenCalled();
+
+      defaultSpy.mockRestore();
     });
   });
 });

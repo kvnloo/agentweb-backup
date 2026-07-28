@@ -54,6 +54,7 @@ jest.mock('../utils/secretsManager', () => ({ getMetaAccessToken: jest.fn().mock
 import { emmaToolRegistry } from '../emma/registry';
 import '../emma/tools'; // side-effect: registers call_meta_marketing_api + generate_image
 import { metaService } from '../services/metaService';
+import { agentModeService } from '../services/agentModeService';
 
 const ctx = { userId: 'user123', sessionId: 'sess1' } as any;
 
@@ -99,6 +100,30 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
 
     expect(result.awaitingUserConfirmation).toBe(true);
     expect(result.confirmationPrompt).toContain('![source image 1](https://cdn.example.com/a.png)');
+  });
+
+  it('generate_image: does NOT pre-resolve the admin default into an explicit-looking model (ENG-510)', async () => {
+    // The admin default is configured, but the LLM did not pick a model.
+    const defaultSpy = jest
+      .spyOn(agentModeService, 'getImageApiDefaultModel')
+      .mockResolvedValue('gemini-3.1-flash-image-preview');
+    const genSpy = jest
+      .spyOn(agentModeService, 'generateImage')
+      .mockResolvedValue({ success: true } as any);
+
+    await emmaToolRegistry.execute('generate_image', {
+      prompt: 'flat vector ad illustration',
+      filename: 'ad.png'
+      // no imageModel → the tool must pass undefined through, NOT the admin default,
+      // so generateImage can tell this was a system default and fail over on a timeout.
+    }, ctx);
+
+    expect(genSpy).toHaveBeenCalledTimes(1);
+    // 8th positional arg (index 7) is imageModel — must be undefined here.
+    expect(genSpy.mock.calls[0][7]).toBeUndefined();
+
+    genSpy.mockRestore();
+    defaultSpy.mockRestore();
   });
 
   it('generate_image: image_model enum offers the GA id and no longer offers the preview id', () => {
