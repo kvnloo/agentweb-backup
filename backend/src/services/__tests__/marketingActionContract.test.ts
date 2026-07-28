@@ -358,6 +358,40 @@ describe('A6 — serialization: stable ID plus the full named field set', () => 
     expect(() => parseMarketingActions(tampered)).toThrow(MarketingActionContractError);
   });
 
+  it('parse rejects a transported ID that does not match canonical action identity', () => {
+    // A foreign-but-plausible ID must not masquerade as this action's identity:
+    // assertion 6 requires ONE STABLE id per (actionType, scopeId), so parse
+    // re-derives and rejects any drifted/transplanted id.
+    const [action] = selectTopMarketingActions([
+      candidate({ actionType: 'pause_ad', scopeId: 'campaign-real' }),
+    ]);
+    const tampered = JSON.parse(serializeMarketingActions([action]));
+    tampered[0].id = marketingActionId('scale_budget', 'campaign-other');
+    expect(() => parseMarketingActions(JSON.stringify(tampered))).toThrow(
+      MarketingActionContractError
+    );
+    try {
+      parseMarketingActions(JSON.stringify(tampered));
+      throw new Error('expected parse to throw');
+    } catch (err) {
+      expect((err as Error).message).toContain('id');
+      expect((err as Error).message).toContain('canonical');
+    }
+  });
+
+  it('parse rejects an ID whose identity fields were renamed after serialization', () => {
+    // Renaming actionType/scopeId in transit without re-deriving the id is the
+    // same masquerade in the other direction — also rejected.
+    const [action] = selectTopMarketingActions([
+      candidate({ actionType: 'pause_ad', scopeId: 'campaign-real' }),
+    ]);
+    const tampered = JSON.parse(serializeMarketingActions([action]));
+    tampered[0].actionType = 'launch_campaign';
+    expect(() => parseMarketingActions(JSON.stringify(tampered))).toThrow(
+      MarketingActionContractError
+    );
+  });
+
   it('parse rejects an action missing its stable ID loudly', () => {
     const [action] = selectTopMarketingActions([candidate()]);
     const stripped = JSON.parse(serializeMarketingActions([action]));

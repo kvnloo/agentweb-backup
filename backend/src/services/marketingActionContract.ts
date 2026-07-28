@@ -346,9 +346,13 @@ export function serializeMarketingActions(actions: MarketingAction[]): string {
 }
 
 /**
- * Parse + validate a serialized action list. The stored id and status are
- * preserved verbatim (round-trip stability); every field is re-validated so a
- * tampered or truncated payload fails loudly instead of flowing downstream.
+ * Parse + validate a serialized action list. Every field is re-validated, and
+ * the transported id must equal the canonical `marketingActionId(actionType,
+ * scopeId)` derivation — a foreign or drifted id cannot masquerade as this
+ * action's identity (assertion 6: ONE stable id per action). Round-trip
+ * stability is unaffected: serialization always emits canonical ids. Status is
+ * preserved verbatim. Tampered or truncated payloads fail loudly instead of
+ * flowing downstream.
  */
 export function parseMarketingActions(json: string): MarketingAction[] {
   let parsed: unknown;
@@ -370,6 +374,14 @@ export function parseMarketingActions(json: string): MarketingAction[] {
     if (!isNonEmptyString(record.id)) {
       throw new MarketingActionContractError(
         `Invalid marketing action at index ${index}: "id" must be a non-empty string`
+      );
+    }
+    // assertCandidate above guarantees actionType/scopeId are non-empty strings.
+    const expectedId = marketingActionId(entry.actionType, entry.scopeId);
+    if (record.id !== expectedId) {
+      throw new MarketingActionContractError(
+        `Invalid marketing action at index ${index}: "id" does not match the canonical identity ` +
+          `derived from (actionType, scopeId) — expected "${expectedId}", got "${record.id}"`
       );
     }
     if (!STATUSES.includes(record.status as MarketingActionStatus)) {
