@@ -4432,6 +4432,13 @@ export const agentModeController = {
               metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
             });
             handledPartialTimeout = true;
+            // ENG-510: return the partial delivery as a normal 200 (mirrors the regular
+            // /generate path) instead of falling through to the 504 GENERATION_TIMEOUT
+            // below — a partial SUCCESS must not reach the live caller as a bare timeout.
+            // Progress was already completed above; the session lock is released in the
+            // inner finally, so this early return is safe.
+            res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+            return;
           }
         } catch (persistErr) {
           console.error('AgentMode: shared partial-media timeout continuation failed (falling back to error message):', persistErr);
