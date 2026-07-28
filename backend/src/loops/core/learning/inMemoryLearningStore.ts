@@ -15,6 +15,15 @@ export class InMemoryLearningStore implements LearningStore {
     this.events.push({ ...event, sortKey: `${event.ts.toISOString()}#${counter}` });
   }
 
+  async recordDecisionIfAbsent(event: LearningEvent, decisionKey: string): Promise<boolean> {
+    const sortKey = `decision#${decisionKey}`;
+    if (this.events.some((record) => record.loopId === event.loopId && record.sortKey === sortKey)) {
+      return false;
+    }
+    this.events.push({ ...event, sortKey });
+    return true;
+  }
+
   async queryHistory(filter: HistoryFilter): Promise<LearningRecord[]> {
     return this.events.filter((e) => {
       if (e.loopId !== filter.loopId) return false;

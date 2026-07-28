@@ -397,7 +397,12 @@ router.post('/meta-ads/insights', async (req: Request, res: Response) => {
 router.post('/meta-ads/metrics', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.getMetaAdsMetrics(req.body.timeframe || '7d', userId(req), req.body.campaign_ids);
+    const result = await svc.getMetaAdsMetrics(
+      req.body.timeframe || '7d',
+      userId(req),
+      req.body.campaign_ids,
+      req.body.account_id,
+    );
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });

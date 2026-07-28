@@ -20,6 +20,7 @@ import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBl
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
+import { withKeyedMutex } from '../utils/keyedMutex';
 import { incrementUserTokenUsage } from './tokenUsageService';
 import { computeCostMicroUsd } from './usageRecorderService';
 import { approvalDb } from './approvalDb';
@@ -138,6 +139,7 @@ export interface ChatMessage {
     };
     kind?: string;                      // Stable marker for system messages (e.g. 'image-generated')
     imageFilename?: string;             // Filename when kind === 'image-generated'
+    imageUrl?: string;                  // ENG-510: image URL on the immediate marker so a completed image survives a whole-turn-cap kill
     citations?: Citation[];             // ENG-351: de-duplicated web sources this message consulted (ChatGPT-style Sources UI)
   };
 }
@@ -890,41 +892,48 @@ export class ChatbotDB {
     sessionId: string,
     message: ChatMessage
   ): Promise<ChatSession> {
-    // Check if session exists
-    const currentSession = await this.getChatSession(sessionId);
-    if (!currentSession) {
-      throw new Error('Session not found');
-    }
+    // ENG-510: the count-then-write below is a read-modify-write. Serialize it per session
+    // so concurrent appends (e.g. parallel image-variant markers in one turn) can't read
+    // the same count and Put to the same messageIndex, overwriting each other. Keyed by
+    // session; different sessions still run concurrently. Shares the key with
+    // addMessagesToSession so a mid-turn marker and the end-of-turn batch can't collide.
+    return withKeyedMutex(`chat-append:${sessionId}`, async () => {
+      // Check if session exists
+      const currentSession = await this.getChatSession(sessionId);
+      if (!currentSession) {
+        throw new Error('Session not found');
+      }
 
-    // Get current message count from AW-ChatMessages
-    const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
-    const currentMessageCount = currentMessages.length;
+      // Get current message count from AW-ChatMessages
+      const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
+      const currentMessageCount = currentMessages.length;
 
-    const messageIndex = currentMessageCount;
+      const messageIndex = currentMessageCount;
 
-    // Add message to AW-ChatMessages table
-    await this.addMessagesToMessagesTable(sessionId, [message], messageIndex);
+      // Add message to AW-ChatMessages table
+      await this.addMessagesToMessagesTable(sessionId, [message], messageIndex);
 
-    // Atomically increment messageCount on the session record for asset cache tracking
-    await this.incrementMessageCount(sessionId, 1);
+      // Atomically increment messageCount on the session record for asset cache tracking
+      await this.incrementMessageCount(sessionId, 1);
 
-    // Incrementally update token usage on the session
-    await this.incrementTokenUsage(sessionId, [message]);
+      // Incrementally update token usage on the session
+      await this.incrementTokenUsage(sessionId, [message]);
 
-    // Increment user-level token usage for allowance tracking
-    if (currentSession.userId && message.usage) {
-      await incrementUserTokenUsage(
-        currentSession.userId,
-        message.usage.total_tokens || 0,
-        message.usage.estimated_cost || 0
-      );
-    }
+      // Increment user-level token usage for allowance tracking
+      if (currentSession.userId && message.usage) {
+        await incrementUserTokenUsage(
+          currentSession.userId,
+          message.usage.total_tokens || 0,
+          message.usage.estimated_cost || 0
+        );
+      }
 
-    // Return session with updated messages (no need to update session table)
-    return {
-      ...currentSession,
-      messages: [...currentMessages, message],
-    };
+      // Return session with updated messages (no need to update session table)
+      return {
+        ...currentSession,
+        messages: [...currentMessages, message],
+      };
+    });
   }
 
   async addMessagesToSession(
@@ -935,47 +944,52 @@ export class ChatbotDB {
       return (await this.getChatSession(sessionId))!;
     }
 
-    // Check if session exists
-    const currentSession = await this.getChatSession(sessionId);
-    if (!currentSession) {
-      throw new Error('Session not found');
-    }
+    // ENG-510: serialize the read-modify-write per session (same key as
+    // addMessageToSession) so a batched append can't race a concurrent marker append and
+    // collide on messageIndex. See withKeyedMutex for the full rationale.
+    return withKeyedMutex(`chat-append:${sessionId}`, async () => {
+      // Check if session exists
+      const currentSession = await this.getChatSession(sessionId);
+      if (!currentSession) {
+        throw new Error('Session not found');
+      }
 
-    // Get current message count from AW-ChatMessages
-    const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
-    const currentMessageCount = currentMessages.length;
+      // Get current message count from AW-ChatMessages
+      const currentMessages = await this.getMessagesFromMessagesTable(sessionId);
+      const currentMessageCount = currentMessages.length;
 
-    const messageIndex = currentMessageCount;
+      const messageIndex = currentMessageCount;
 
-    // Add messages to AW-ChatMessages table
-    await this.addMessagesToMessagesTable(sessionId, messages, messageIndex);
+      // Add messages to AW-ChatMessages table
+      await this.addMessagesToMessagesTable(sessionId, messages, messageIndex);
 
-    // Atomically increment messageCount on the session record for asset cache tracking
-    await this.incrementMessageCount(sessionId, messages.length);
+      // Atomically increment messageCount on the session record for asset cache tracking
+      await this.incrementMessageCount(sessionId, messages.length);
 
-    // Incrementally update token usage on the session
-    await this.incrementTokenUsage(sessionId, messages);
+      // Incrementally update token usage on the session
+      await this.incrementTokenUsage(sessionId, messages);
 
-    // Increment user-level token usage for allowance tracking
-    if (currentSession.userId) {
-      let batchTokens = 0;
-      let batchCost = 0;
-      for (const msg of messages) {
-        if (msg.usage) {
-          batchTokens += msg.usage.total_tokens || 0;
-          batchCost += msg.usage.estimated_cost || 0;
+      // Increment user-level token usage for allowance tracking
+      if (currentSession.userId) {
+        let batchTokens = 0;
+        let batchCost = 0;
+        for (const msg of messages) {
+          if (msg.usage) {
+            batchTokens += msg.usage.total_tokens || 0;
+            batchCost += msg.usage.estimated_cost || 0;
+          }
+        }
+        if (batchTokens > 0 || batchCost > 0) {
+          await incrementUserTokenUsage(currentSession.userId, batchTokens, batchCost);
         }
       }
-      if (batchTokens > 0 || batchCost > 0) {
-        await incrementUserTokenUsage(currentSession.userId, batchTokens, batchCost);
-      }
-    }
 
-    // Return session with updated messages (no need to update session table)
-    return {
-      ...currentSession,
-      messages: [...currentMessages, ...messages],
-    };
+      // Return session with updated messages (no need to update session table)
+      return {
+        ...currentSession,
+        messages: [...currentMessages, ...messages],
+      };
+    });
   }
 
   // Update message feedback in AW-ChatMessages table
@@ -1089,7 +1103,7 @@ export class ChatbotDB {
   }
 
   // Get messages from AW-ChatMessages table
-  async getMessagesFromMessagesTable(sessionId: string): Promise<ChatMessage[]> {
+  async getMessagesFromMessagesTable(sessionId: string, consistentRead = false): Promise<ChatMessage[]> {
     const params = {
       TableName: this.messagesTableName,
       KeyConditionExpression: "sessionId = :sessionId",
@@ -1097,6 +1111,11 @@ export class ChatbotDB {
         ":sessionId": sessionId,
       },
       ScanIndexForward: true, // Sort by messageIndex ascending
+      // ENG-510: default reads are eventually consistent — a caller that must see a marker
+      // written moments earlier (e.g. the whole-turn-timeout recovery collecting the images
+      // that just completed) can opt into a strongly consistent read so a fresh append is
+      // never missed.
+      ...(consistentRead ? { ConsistentRead: true } : {}),
     };
 
     try {
@@ -1600,7 +1619,7 @@ export class ChatbotDB {
     }
   }
 
-  async getChatSession(sessionId: string): Promise<ChatSession | null> {
+  async getChatSession(sessionId: string, consistentRead = false): Promise<ChatSession | null> {
     const session = await this.getChatSessionRecord(sessionId);
 
     if (!session) {
@@ -1609,7 +1628,7 @@ export class ChatbotDB {
 
     try {
       // Check if messages exist in AW-ChatMessages
-      let messages = await this.getMessagesFromMessagesTable(sessionId);
+      let messages = await this.getMessagesFromMessagesTable(sessionId, consistentRead);
 
       // If no messages in AW-ChatMessages but messages exist in session record, migrate them
       if (messages.length === 0 && session.messages && session.messages.length > 0) {

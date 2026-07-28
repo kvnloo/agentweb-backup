@@ -56,6 +56,19 @@ export const MEDIA_GEN_TOOLS = new Set<string>([
 ]);
 
 /**
+ * ENG-510: how many media-gen calls batched in ONE assistant turn may run at once.
+ * Multi-variant requests were previously forced strictly serial (concurrency 1) to
+ * respect provider rate limits, but that makes N independent variants take N× a single
+ * image's wall-clock and blow the whole-turn cap. Run them with BOUNDED concurrency
+ * instead — big enough to finish a batch in ~one image's time, small enough to stay
+ * under provider rate limits. Override with AGENT_MODE_MEDIA_GEN_CONCURRENCY (min 1).
+ */
+export const MEDIA_GEN_MAX_CONCURRENCY = Math.max(
+  1,
+  parseInt(process.env.AGENT_MODE_MEDIA_GEN_CONCURRENCY || '3', 10) || 3,
+);
+
+/**
  * Tools exempt from same-turn dedupe (ENG-108) — they have legitimate repeat
  * semantics within a single assistant turn, so two identical calls are NOT a
  * double-execution bug. `wait_seconds` is the canonical case (sleeping twice is
@@ -262,6 +275,36 @@ export interface ExecutePreparedToolsInput {
    * image before stopping — guaranteeing forward progress every turn.
    */
   mediaAssetsProducedThisRun?: number;
+  /**
+   * ENG-510: wall-clock deadline (epoch ms) of the controller's whole-turn hard cap
+   * (GENERATION_TIMEOUT_MS, default 10 min). The fixed soft budget above leaves only a
+   * fixed headroom below this cap and assumes fast images; a single slow high-quality
+   * image can take ~6–7 min and nearly consume the budget, so the NEXT media call slips
+   * past the soft-deadline check and then runs past the hard cap — losing every already-
+   * generated image. When supplied, the dispatcher also defers a media call once the time
+   * left before this cap is less than the longest media call observed this run (see
+   * `longestMediaCallMsThisRun`), so the turn ends gracefully with its finished images
+   * persisted. Undefined disables the adaptive check (mirrors the soft-budget disable).
+   */
+  generationHardCapMs?: number;
+  /**
+   * Longest media-call wall-clock duration (ms) observed so far this run, across prior
+   * iterations. Seeds the adaptive hard-cap reserve so the decision uses real observed
+   * latency rather than a guess. The dispatcher returns an updated value each iteration.
+   */
+  longestMediaCallMsThisRun?: number;
+  /**
+   * ENG-510: dedupe keys (`name:stableStringify(args)` -> first tool_call_id) of media-gen
+   * calls that ALREADY produced an asset in EARLIER iterations of this turn. The ENG-108
+   * dedupe is per-iteration, so a model that re-emits an identical generate_image in a
+   * later iteration (e.g. re-requesting an image it already made when resuming after a
+   * timeout) would regenerate it. When a media-gen call's key is already here, the
+   * dispatcher suppresses it — scoped to media tools ONLY, so legitimately-repeated
+   * mutating calls (send_email, create_lead) across iterations still run. The dispatcher
+   * returns the keys produced THIS iteration via `producedMediaCallKeys` for the loop to
+   * accumulate. Only SUCCESSFUL generations are recorded, so a failed call stays retryable.
+   */
+  priorMediaCallKeys?: Map<string, string>;
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -278,6 +321,19 @@ export interface ExecutePreparedToolsResult {
   mediaAssetsProduced: number;
   /** true if one or more media-gen calls were deferred this iteration due to the time budget */
   mediaBudgetDeferred: boolean;
+  /**
+   * ENG-510: longest media-call wall-clock duration (ms) observed this run, including
+   * this iteration's calls. The loop threads it back in as `longestMediaCallMsThisRun`
+   * so the adaptive hard-cap reserve tracks the run's actual media latency.
+   */
+  longestMediaCallMs: number;
+  /**
+   * ENG-510: dedupe keys of media-gen calls that produced an asset THIS iteration
+   * (`name:stableStringify(args)` -> tool_call_id). The loop merges these into the set it
+   * passes back as `priorMediaCallKeys` next iteration, so an identical re-request later in
+   * the same turn is suppressed instead of regenerating the image.
+   */
+  producedMediaCallKeys: Map<string, string>;
 }
 
 /**
@@ -314,8 +370,14 @@ export async function executePreparedTools(
     maxToolContentSize,
     mediaGenerationDeadlineMs,
     mediaAssetsProducedThisRun = 0,
+    generationHardCapMs,
+    longestMediaCallMsThisRun = 0,
+    priorMediaCallKeys,
     ports,
   } = input;
+  // ENG-510: keys of media-gen assets successfully produced this iteration, returned to the
+  // loop to accumulate across iterations for cross-iteration media dedupe (see below).
+  const producedMediaCallKeys = new Map<string, string>();
 
   const pendingCounterUpdates: Record<string, number> = {};
   const failedCounterUpdates: Record<string, number> = {};
@@ -324,7 +386,7 @@ export async function executePreparedTools(
   let mediaBudgetDeferred = false;
 
   // Phase 1: Validate and prepare tool calls (synchronous)
-  const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
+  const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision; dedupeKey: string }> = [];
   const preflightToolResults: PreflightToolResult[] = [];
 
   // Same-turn dedupe (ENG-108): collapse identical (name + args) calls emitted in
@@ -490,9 +552,23 @@ export async function executePreparedTools(
         suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
         continue;
       }
+      // ENG-510: cross-iteration dedupe for MEDIA-GEN tools only. The per-iteration check
+      // above misses an identical generate_image re-emitted in a LATER iteration of the
+      // same turn (e.g. resuming after a timeout, the model re-requests an image it already
+      // made). Suppress it if that exact call already produced an asset earlier this turn.
+      // Media-only so a legitimately-repeated mutating call (send_email) is never blocked;
+      // only successful generations are recorded, so a failed call can still be retried.
+      if (
+        MEDIA_GEN_TOOLS.has(toolCall.function.name)
+        && priorMediaCallKeys?.has(dedupeKey)
+      ) {
+        const duplicateOfId = priorMediaCallKeys.get(dedupeKey) as string;
+        suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
+        continue;
+      }
       seenToolCallKeys.set(dedupeKey, toolCall.id);
 
-      preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
+      preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision, dedupeKey });
     } catch (error) {
       console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
@@ -581,12 +657,25 @@ export async function executePreparedTools(
   // is supplied (AGENT_MODE_MEDIA_BUDGET_MS=0, and the unit tests), which preserves
   // prior behavior. It is NOT opt-in — an unset env var still applies the 7-min default.
   let assetsThisBatch = 0;
+  // ENG-510: run-wide longest media-call duration, seeded from prior iterations and
+  // updated as calls settle below, so the adaptive reserve reflects real latency.
+  let longestMediaCallMs = longestMediaCallMsThisRun;
   const isMediaGenTool = (toolCall: any) => MEDIA_GEN_TOOLS.has(toolCall.function.name);
+  // Fixed soft-budget deadline passed (the original, fast-image assumption).
+  const softBudgetExceeded = (): boolean =>
+    mediaGenerationDeadlineMs != null && Date.now() > mediaGenerationDeadlineMs;
+  // ENG-510: not enough time before the whole-turn hard cap to finish another media
+  // call the size of the longest one seen this run. Catches the slow-single-image case
+  // the fixed soft headroom can't: after one ~6.5-min image there is < one image of
+  // time left, so the next call would run past the cap and lose the finished image(s).
+  const withinOneMediaCallOfHardCap = (): boolean =>
+    generationHardCapMs != null
+    && longestMediaCallMs > 0
+    && (generationHardCapMs - Date.now()) < longestMediaCallMs;
   const shouldDeferMedia = (toolCall: any): boolean =>
-    mediaGenerationDeadlineMs != null
-    && isMediaGenTool(toolCall)
-    && Date.now() > mediaGenerationDeadlineMs
-    && (mediaAssetsProducedThisRun + assetsThisBatch) >= 1;
+    isMediaGenTool(toolCall)
+    && (mediaAssetsProducedThisRun + assetsThisBatch) >= 1
+    && (softBudgetExceeded() || withinOneMediaCallOfHardCap());
   const makeDeferred = (toolCall: any, functionArgs: any, policyDecision: AgentToolPolicyDecision): DispatchToolResult => {
     mediaBudgetDeferred = true;
     return { status: 'deferred', toolCall, functionArgs, duration: 0, policyDecision };
@@ -600,8 +689,18 @@ export async function executePreparedTools(
     && isMediaGenTool(dr.toolCall)
     && !ports.toolResultError(dr.result)
     && mediaGenProducedAsset(dr.toolCall.function.name, dr.result);
+  // ENG-510: track how long a media call actually took so the adaptive reserve (and the
+  // value returned to the loop) reflects real latency. Updated as each call settles so a
+  // later call in the SAME batch already sees the earlier call's duration.
+  const recordMediaDuration = (dr: DispatchToolResult): void => {
+    if (isMediaGenTool(dr.toolCall) && dr.status !== 'deferred') {
+      longestMediaCallMs = Math.max(longestMediaCallMs, dr.duration || 0);
+    }
+  };
 
-  if (hasWaitTool || hasMultipleMediaGenTools) {
+  if (hasWaitTool) {
+    // Strict sequential: wait_seconds must take effect in emission order, so nothing
+    // batched with it may overlap it.
     toolResults = [];
     for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
       if (shouldDeferMedia(toolCall)) {
@@ -611,7 +710,33 @@ export async function executePreparedTools(
       const outcome = await runOne(toolCall, functionArgs, policyDecision);
       const dr = toDispatchResult(outcome, toolCall, functionArgs);
       if (countsAsAsset(dr)) assetsThisBatch++;
+      recordMediaDuration(dr);
       toolResults.push(dr);
+    }
+  } else if (hasMultipleMediaGenTools) {
+    // ENG-510: run batched media-gen with BOUNDED concurrency (MEDIA_GEN_MAX_CONCURRENCY
+    // at a time) instead of strictly serial, so N independent variants finish in ~one
+    // image's wall-clock and fit under the whole-turn cap — while staying under provider
+    // rate limits. Budget/duration state settles BETWEEN batches, so the deferral decision
+    // (and the >=1-asset forward-progress gate) is made per batch, race-free. Results are
+    // written by index so emission order is preserved regardless of completion order.
+    toolResults = new Array(preparedCalls.length);
+    for (let start = 0; start < preparedCalls.length; start += MEDIA_GEN_MAX_CONCURRENCY) {
+      const batch = preparedCalls.slice(start, start + MEDIA_GEN_MAX_CONCURRENCY);
+      const batchResults = await Promise.all(
+        batch.map(async ({ toolCall, functionArgs, policyDecision }) => {
+          if (shouldDeferMedia(toolCall)) {
+            return makeDeferred(toolCall, functionArgs, policyDecision);
+          }
+          const outcome = await runOne(toolCall, functionArgs, policyDecision);
+          return toDispatchResult(outcome, toolCall, functionArgs);
+        }),
+      );
+      batchResults.forEach((dr, i) => {
+        if (countsAsAsset(dr)) assetsThisBatch++;
+        recordMediaDuration(dr);
+        toolResults[start + i] = dr;
+      });
     }
   } else {
     // Parallel path carries at most one media-gen call (a solo call; any media call
@@ -624,6 +749,7 @@ export async function executePreparedTools(
       const outcome = await runOne(toolCall, functionArgs, policyDecision);
       const dr = toDispatchResult(outcome, toolCall, functionArgs);
       if (countsAsAsset(dr)) assetsThisBatch++;
+      recordMediaDuration(dr);
       return dr;
     });
     toolResults = await Promise.all(toolPromises);
@@ -651,6 +777,18 @@ export async function executePreparedTools(
       policyDecision: toolResult.policyDecision,
     };
   });
+  // ENG-510: record media-gen calls that SUCCEEDED this iteration (post-downgrade), keyed
+  // by their dedupe signature, so the loop can suppress an identical re-request in a later
+  // iteration of this turn. Only genuine successes are recorded — a failed or downgraded
+  // generation is NOT, so it stays retryable. toolResults is index-aligned with
+  // preparedCalls in every execution path.
+  toolResults.forEach((dr, i) => {
+    const pc = preparedCalls[i];
+    if (pc && dr.status === 'success' && countsAsAsset(dr)) {
+      producedMediaCallKeys.set(pc.dedupeKey, pc.toolCall.id);
+    }
+  });
+
   // Deferred calls never executed, but they ARE forwarded to telemetry as their
   // own class (ENG-103): the telemetry layer records them via toolDeferred (not
   // toolInvoked/succeeded/failed), so deferred/skipped is accounted separately
@@ -866,5 +1004,5 @@ export async function executePreparedTools(
     appendSuppressedDuplicate(suppressed);
   }
 
-  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred };
+  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred, longestMediaCallMs, producedMediaCallKeys };
 }

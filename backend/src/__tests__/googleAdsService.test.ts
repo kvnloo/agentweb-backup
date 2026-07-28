@@ -70,7 +70,6 @@ beforeEach(() => {
   mockAssertPublicHostname.mockResolvedValue(undefined);
   service = new GoogleAdsService();
 });
-
 describe('API version', () => {
   it('uses Google Ads API v24 base URL', async () => {
     mockAxiosGet.mockResolvedValueOnce({ data: { resourceNames: [] } });
@@ -835,6 +834,173 @@ describe('addNegativeKeywords', () => {
   });
 });
 
+describe('addNegativeCampaignCriteria', () => {
+  it('builds one atomic campaignCriteria mutation for placements and mobile-app categories', async () => {
+    mockAxiosPost.mockResolvedValueOnce({ data: { results: [{}, {}, {}] } });
+
+    await service.addNegativeCampaignCriteria(
+      'user-123',
+      '1234567890',
+      'customers/1234567890/campaigns/24056663695',
+      {
+        placementUrls: ['coeurdazur.com', 'https://viraltemy.com/games'],
+        mobileAppCategoryResourceNames: ['mobileAppCategoryConstants/60000'],
+      },
+    );
+
+    const body = mockAxiosPost.mock.calls[0][1];
+    expect(body.operations).toEqual([
+      {
+        create: {
+          campaign: 'customers/1234567890/campaigns/24056663695',
+          negative: true,
+          placement: { url: 'coeurdazur.com' },
+        },
+      },
+      {
+        create: {
+          campaign: 'customers/1234567890/campaigns/24056663695',
+          negative: true,
+          placement: { url: 'https://viraltemy.com/games' },
+        },
+      },
+      {
+        create: {
+          campaign: 'customers/1234567890/campaigns/24056663695',
+          negative: true,
+          mobileAppCategory: {
+            mobileAppCategoryConstant: 'mobileAppCategoryConstants/60000',
+          },
+        },
+      },
+    ]);
+  });
+
+  it('rejects a campaign from another customer before credentials or mutation', async () => {
+    await expect(service.addNegativeCampaignCriteria(
+      'user-123',
+      '1234567890',
+      'customers/9999999999/campaigns/24056663695',
+      {
+        placementUrls: ['coeurdazur.com'],
+        mobileAppCategoryResourceNames: [],
+      },
+    )).rejects.toMatchObject({
+      errorType: 'VALIDATION_ERROR',
+      errorCode: 'CAMPAIGN_CUSTOMER_MISMATCH',
+    });
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it('surfaces an API permission failure after one atomic mutation request', async () => {
+    const permissionError = {
+      response: {
+        data: {
+          error: {
+            details: [{
+              errors: [{
+                errorCode: { authorizationError: 'USER_PERMISSION_DENIED' },
+                message: 'User does not have permission to access customer.',
+              }],
+            }],
+          },
+        },
+      },
+    };
+    mockAxiosPost.mockRejectedValueOnce(permissionError);
+
+    await expect(service.addNegativeCampaignCriteria(
+      'user-123',
+      '1234567890',
+      'customers/1234567890/campaigns/24056663695',
+      {
+        placementUrls: ['coeurdazur.com'],
+        mobileAppCategoryResourceNames: ['mobileAppCategoryConstants/60000'],
+      },
+    )).rejects.toBe(permissionError);
+
+    expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    expect(mockAxiosPost.mock.calls[0][1].operations).toHaveLength(2);
+  });
+
+  it.each([
+    {
+      name: 'a placement URL with an unsupported port',
+      placementUrl: 'https://example.com:8080/games',
+      errorCode: 'INVALID_PLACEMENT_URL',
+    },
+    {
+      name: 'a placement URL deeper than two path levels',
+      placementUrl: 'example.com/one/two/three',
+      errorCode: 'INVALID_PLACEMENT_URL',
+    },
+    {
+      name: 'a YouTube video URL that requires the dedicated criterion type',
+      placementUrl: 'https://www.youtube.com/watch?v=abc123',
+      errorCode: 'UNSUPPORTED_PLACEMENT_CRITERION_TYPE',
+    },
+    {
+      name: 'the retired mobile-app blanket placement',
+      placementUrl: 'adsenseformobileapps.com',
+      errorCode: 'UNSUPPORTED_PLACEMENT_CRITERION_TYPE',
+    },
+    {
+      name: 'a placement URL longer than the Google Ads limit',
+      placementUrl: `https://example.com/${'a'.repeat(240)}`,
+      errorCode: 'INVALID_PLACEMENT_URL',
+    },
+  ])('rejects $name before credentials or mutation', async ({ placementUrl, errorCode }) => {
+    await expect(service.addNegativeCampaignCriteria(
+      'user-123',
+      '1234567890',
+      'customers/1234567890/campaigns/24056663695',
+      {
+        placementUrls: [placementUrl],
+        mobileAppCategoryResourceNames: [],
+      },
+    )).rejects.toMatchObject({
+      errorType: 'VALIDATION_ERROR',
+      errorCode,
+    });
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      name: 'invalid placement URL',
+      params: {
+        placementUrls: ['not a placement'],
+        mobileAppCategoryResourceNames: [],
+      },
+      error: /invalid placement url/i,
+    },
+    {
+      name: 'malformed mobile app category resource name',
+      params: {
+        placementUrls: [],
+        mobileAppCategoryResourceNames: ['mobileAppCategoryConstants/not-a-number'],
+      },
+      error: /invalid mobile app category/i,
+    },
+    {
+      name: 'missing criteria',
+      params: {
+        placementUrls: [],
+        mobileAppCategoryResourceNames: [],
+      },
+      error: /at least one/i,
+    },
+  ])('rejects $name without issuing a mutation', async ({ params, error }) => {
+    await expect(service.addNegativeCampaignCriteria(
+      'user-123',
+      '1234567890',
+      'customers/1234567890/campaigns/24056663695',
+      params,
+    )).rejects.toThrow(error);
+    expect(mockAxiosPost).not.toHaveBeenCalled();
+  });
+});
+
 /**
  * ENG-239: createAd now issues a GAQL read for the campaign's inherited
  * final_url_suffix before mutating (an ad-level suffix REPLACES the campaign's, so
@@ -1501,5 +1667,3 @@ describe('createCampaign — PMax with brand guidelines', () => {
     expect(body.mutateOperations[3].campaignAssetOperation.create.asset).toBe('customers/123/assets/logo-1');
   });
 });
-
-

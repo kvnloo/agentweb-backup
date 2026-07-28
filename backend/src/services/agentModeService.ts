@@ -56,6 +56,7 @@ import {
   imageGenerationCostUsd,
   videoGenerationCostUsd,
 } from '../utils/llmPricing';
+import { normalizeImageModel } from './imageGeneration';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import {
@@ -174,6 +175,10 @@ import { twitterService } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
+import {
+  NegativeCampaignCriteriaValidationError,
+  validateNegativeCampaignCriteria,
+} from './googleAdsCampaignCriteria';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
@@ -2689,15 +2694,21 @@ export class AgentModeService {
   }
 
   private getImageGenerationFallbackModel(
-    primaryModel: string | undefined,
+    currentModel: string | undefined,
     inputImages: string[] | undefined,
-    logoImage: string | undefined
+    logoImage: string | undefined,
+    modelExplicitlyChosen: boolean = false
   ): string | undefined {
     // Keep generation fallback narrow. Telemetry showed the painful cases were
     // product-fidelity workflows and explicit model choices; silently switching
     // providers there changes output semantics. Only recover when the caller left
     // model selection to us and the request is fresh text-to-image.
-    if (primaryModel) {
+    //
+    // ENG-510: gate on whether the model was an explicit per-request choice — NOT
+    // merely on a model string being present. The admin-configured default is
+    // resolved to a concrete id before generation, but that is a system default,
+    // not a user choice, so a transient timeout on it must still fail over.
+    if (modelExplicitlyChosen) {
       return undefined;
     }
 
@@ -2706,8 +2717,13 @@ export class AgentModeService {
       return undefined;
     }
 
+    // Pick the first alternate that isn't the model we just failed on (compare on
+    // the normalized id so e.g. the legacy "...-preview" alias matches its GA id).
+    const normalizedCurrent = normalizeImageModel(currentModel);
     const fallbackOrder = ['gpt-image-2', 'gemini-3.1-flash-image', 'gemini-2.5-flash-image'];
-    return fallbackOrder[0];
+    return fallbackOrder.find(
+      (model) => model !== currentModel && model !== normalizedCurrent
+    );
   }
 
   private getVisionFallbackModel(primaryModel: string): string | undefined {
@@ -3044,6 +3060,20 @@ export class AgentModeService {
       const mediaBudgetMs = parseInt(process.env.AGENT_MODE_MEDIA_BUDGET_MS || '420000', 10);
       const mediaGenerationDeadlineMs = mediaBudgetMs > 0 ? Date.now() + mediaBudgetMs : undefined;
       let mediaAssetsProducedThisRun = 0;
+      // ENG-510: the fixed soft budget above assumed fast images and leaves only ~3 min
+      // of headroom below the controller's 10-min whole-turn hard cap. A single slow
+      // high-quality image can take ~6–7 min, so the next variant slips past the fixed
+      // deadline and runs past the cap — losing the already-generated variants. Give the
+      // dispatcher the hard-cap deadline + the longest media latency seen this run so it
+      // can also defer when there isn't time left for one more call. Mirror the soft
+      // budget's disable switch (off when AGENT_MODE_MEDIA_BUDGET_MS=0).
+      const generationTimeoutMs = parseInt(process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000', 10);
+      const generationHardCapMs = mediaBudgetMs > 0 ? Date.now() + generationTimeoutMs : undefined;
+      let longestMediaCallMsThisRun = 0;
+      // ENG-510: accumulate dedupe keys of media-gen calls that produced an asset, across
+      // iterations of this turn, so the dispatcher can suppress an identical re-request in a
+      // later iteration (e.g. resuming after a timeout) instead of regenerating the image.
+      const mediaCallKeysThisRun = new Map<string, string>();
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
@@ -3481,6 +3511,9 @@ export class AgentModeService {
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
           mediaGenerationDeadlineMs,
           mediaAssetsProducedThisRun,
+          generationHardCapMs,
+          longestMediaCallMsThisRun,
+          priorMediaCallKeys: mediaCallKeysThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -3520,6 +3553,16 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-510: carry the run-wide longest media-call latency forward so the next
+        // iteration's adaptive hard-cap reserve uses real observed durations.
+        longestMediaCallMsThisRun = Math.max(longestMediaCallMsThisRun, dispatchResult.longestMediaCallMs ?? 0);
+        // ENG-510: fold this iteration's produced media keys into the run-wide set so the
+        // next iteration suppresses an identical regenerate-the-same-image re-request.
+        if (dispatchResult.producedMediaCallKeys) {
+          for (const [key, id] of dispatchResult.producedMediaCallKeys) {
+            if (!mediaCallKeysThisRun.has(key)) mediaCallKeysThisRun.set(key, id);
+          }
+        }
 
         // Send progress update after all tools complete.
         // Only send tool calls added in this iteration — the frontend accumulates
@@ -4146,12 +4189,8 @@ export class AgentModeService {
     // not the cause — the user was nudging a flow that kept looping. The real driver was
     // this regenerate-from-scratch-after-timeout loop; surfacing already-made assets is
     // what actually breaks it.
-    if (includeResumeGuidance && Array.isArray(generatedImageFilenames) && generatedImageFilenames.length > 0) {
-      workPlanContent += `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them UNLESS the user explicitly asks to regenerate, restart, redo, or change them. Otherwise only generate the images that are still missing.\n`;
-      for (const filename of generatedImageFilenames) {
-        workPlanContent += `   - ${filename}\n`;
-      }
-      workPlanContent += `\n`;
+    if (includeResumeGuidance) {
+      workPlanContent += AgentModeService.buildGeneratedAssetsAwarenessText(generatedImageFilenames);
     }
 
     workPlan.steps.forEach((step: any) => {
@@ -4217,6 +4256,25 @@ export class AgentModeService {
       filenames.push(filename);
     }
     return filenames;
+  }
+
+  /**
+   * ENG-510: the shared "already-generated assets" awareness block. Lists images already
+   * saved this session so the model regenerates ONLY what is still missing after a
+   * mid-batch timeout — INCLUDING an image that completed in the orphaned worker AFTER the
+   * whole-turn cap fired (that image's marker lands in history but was never in any
+   * assistant toolCalls stamp). Returns '' when there is nothing to surface. Used both
+   * inside a work plan and standalone for plain multi-image requests, which have no work
+   * plan (the reported ENG-510 scenario — multiple ad-illustration variants).
+   */
+  public static buildGeneratedAssetsAwarenessText(generatedImageFilenames?: string[]): string {
+    if (!Array.isArray(generatedImageFilenames) || generatedImageFilenames.length === 0) return '';
+    let text = `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them UNLESS the user explicitly asks to regenerate, restart, redo, or change them. Otherwise only generate the images that are still missing.\n`;
+    for (const filename of generatedImageFilenames) {
+      text += `   - ${filename}\n`;
+    }
+    text += `\n`;
+    return text;
   }
 
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
@@ -4378,6 +4436,18 @@ export class AgentModeService {
     if (workPlan) {
       const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
       messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames));
+    } else {
+      // ENG-510: even WITHOUT a work plan (plain multi-image requests — the reported
+      // scenario), a run that timed out mid-batch leaves already-generated images in
+      // history. On the "continue" turn the model must be told which images already
+      // exist so it regenerates ONLY the missing ones — otherwise an image that
+      // completed in the orphaned worker AFTER the cap (its marker present, but no
+      // toolCalls stamp and not named in the continuation message) gets redone.
+      const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
+      const assetAwarenessText = AgentModeService.buildGeneratedAssetsAwarenessText(generatedImageFilenames);
+      if (assetAwarenessText) {
+        messages.push({ role: 'assistant', content: assetAwarenessText });
+      }
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
@@ -5108,6 +5178,21 @@ export class AgentModeService {
         };
       }
       return base;
+    }
+
+    // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
+    // completion gate can (a) tell an enrichable preview (processedCount > 0) from an
+    // unenrichable one and (b) pair previews to executes per list. The large `samples`
+    // array is dropped — the model already saw it in the tool message; only the small
+    // counts matter for the gate and reporting.
+    if (toolName === 'enrich_leads_preview' || toolName === 'enrich_leads_execute') {
+      return {
+        runId: result?.runId,
+        mode: result?.mode,
+        processedCount: result?.processedCount,
+        failedCount: result?.failedCount,
+        failureBreakdown: result?.failureBreakdown,
+      };
     }
 
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
@@ -13847,7 +13932,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw this.makeMetaAuthError(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
       }
 
-      await this.ensureUsableMetaToken(selected, userId);
+      await this.ensureUsableMetaToken(selected, selected.userId || userId);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
@@ -13869,7 +13954,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // 4. Default to the single available account
     const selected = fbAccounts[0];
 
-    await this.ensureUsableMetaToken(selected, userId);
+    await this.ensureUsableMetaToken(selected, selected.userId || userId);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 
@@ -15693,43 +15778,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_ids: string[] | string): Promise<any> {
+  public async getMetaAdsMetrics(
+    timeframe: string,
+    userId: string,
+    campaign_ids: string[] | string,
+    requestedAccountId?: string,
+  ): Promise<any> {
     try {
+      const rawCampaignIds = Array.isArray(campaign_ids)
+        ? campaign_ids
+        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
+      const campaignFilterIds = [
+        ...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))
+      ];
+      console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
+      if (campaignFilterIds.length === 0) {
+        return {
+          success: false,
+          message: 'campaign_ids is required and must contain at least one campaign ID.',
+          error: 'Invalid campaign_ids'
+        };
+      }
 
-      // Import the Meta API functions directly to reuse the same logic
-      const { getMetaAccessToken } = await import('../utils/secretsManager');
-      const { userDb } = await import('./db');
       const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
 
-      // Get user from database
-      const user = await userDb.getUserById(userId);
-      if (!user) {
-        return {
-          success: false,
-          message: 'User not found',
-          error: 'User not found'
-        };
-      }
-
-      // Check if user has ad account configured
-      if (!user.adAccount || user.adAccount.trim() === "") {
-        return {
-          success: false,
-          message: 'Ad account not configured. Please configure your Meta ad account first.',
-          error: 'Ad account not configured'
-        };
-      }
-
-      // Get Meta API access token from Secrets Manager
+      // Use the same account resolver as the raw Insights tool. This keeps
+      // connected-account, org-shared, and legacy account selection consistent.
+      let accountId: string;
       let accessToken: string;
       try {
-        accessToken = await getMetaAccessToken();
+        ({ accountId, accessToken } = await this.getMetaCredentials(userId, requestedAccountId));
       } catch (error: any) {
-        console.error('AgentMode: Error fetching Meta access token:', error);
+        const credentialFailure =
+          error?.isMetaAuthError ||
+          /meta.*(?:access token|secret)|(?:access token|secret).*meta/i.test(error?.message || '');
+        if (!credentialFailure) throw error;
         return {
           success: false,
-          message: 'Meta access token not configured. Please contact your administrator.',
-          error: error.message || 'Failed to fetch access token from Secrets Manager'
+          message: error.message,
+          error: error.message,
+          errorType: 'connection'
         };
       }
 
@@ -15753,21 +15841,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const untilStr = endDate.toISOString().split('T')[0];
       const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))) + 1; // +1 to include both start and end dates
 
-      // Build filtering parameter for API calls from campaign_ids
-      let campaignFilterIds: string[] = [];
-      const rawCampaignIds = Array.isArray(campaign_ids)
-        ? campaign_ids
-        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
-      campaignFilterIds = [...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))];
-      console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
-      if (campaignFilterIds.length === 0) {
-        return {
-          success: false,
-          message: 'campaign_ids is required and must contain at least one campaign ID.',
-          error: 'Invalid campaign_ids'
-        };
-      }
-
       // Build filtering parameter for API calls
       const filteringParam = campaignFilterIds.length > 0
         ? `&filtering=[{"field":"campaign.id","operator":"IN","value":["${campaignFilterIds.join('","')}"]}]`
@@ -15777,48 +15850,49 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
       // Using fetchWithRetryAndPaging to automatically handle pagination if there are multiple pages
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
         // Campaign-level insights for campaigns processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Demographics breakdown (age/gender)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Placement breakdown (publisher platform and position)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Device breakdown (mobile/desktop, etc.)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
       ]);
 
 
-      // Check for errors in any of the responses
-      if (campaignsData.error) {
-        console.error('AgentMode: Campaigns API Error:', campaignsData.error);
-        throw new Error(`Campaigns API Error: ${campaignsData.error.message}`);
-      }
-      if (adSetsData.error) {
-        console.error('AgentMode: Ad Sets API Error:', adSetsData.error);
-        throw new Error(`Ad Sets API Error: ${adSetsData.error.message}`);
-      }
-      if (adsData.error) {
-        console.error('AgentMode: Ads API Error:', adsData.error);
-        throw new Error(`Ads API Error: ${adsData.error.message}`);
-      }
-      if (adInsightsData.error) {
-        console.error('AgentMode: Ad-level Insights API Error:', adInsightsData.error);
-        throw new Error(`Ad-level Insights API Error: ${adInsightsData.error.message}`);
-      }
-      if (adSetInsightsData.error) {
-        console.error('AgentMode: Adset-level Insights API Error:', adSetInsightsData.error);
-        throw new Error(`Adset-level Insights API Error: ${adSetInsightsData.error.message}`);
-      }
-      if (campaignInsightsData.error) {
-        console.error('AgentMode: Campaign-level Insights API Error:', campaignInsightsData.error);
-        throw new Error(`Campaign-level Insights API Error: ${campaignInsightsData.error.message}`);
+      // Keep connection lookup, permission, and query failures distinct so Emma
+      // can prompt for the right remedy instead of always asking for reconnect.
+      for (const [section, response] of [
+        ['Campaigns', campaignsData],
+        ['Ad Sets', adSetsData],
+        ['Ads', adsData],
+        ['Ad-level Insights', adInsightsData],
+        ['Adset-level Insights', adSetInsightsData],
+        ['Campaign-level Insights', campaignInsightsData],
+      ] as const) {
+        if (!response?.error) continue;
+        console.error(`AgentMode: ${section} API Error:`, response.error);
+        const message = response.error.message || 'Unknown Meta API error';
+        const code = Number(response.error.code);
+        const connectionFailure =
+          code === 190 ||
+          /access token|oauth|token.*(?:expired|invalid|revoked)/i.test(message);
+        const permissionFailure =
+          [10, 200].includes(code) ||
+          /permission|not authorized/i.test(message);
+        const typedError = new Error(`${section} API Error: ${message}`) as any;
+        typedError.metaMetricsErrorType = connectionFailure
+          ? 'connection'
+          : (permissionFailure ? 'permission' : 'api');
+        throw typedError;
       }
       // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
       // a missing/errored breakdown must be distinguishable from an empty-but-OK
@@ -15895,13 +15969,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
 
       return result;
-    } catch (error) {
+    } catch (error: any) {
       console.error('AgentMode: Error fetching Meta ads metrics:', error);
       console.error('AgentMode: Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+      const errorType = error?.isMetaAuthError
+        ? 'connection'
+        : (error?.metaMetricsErrorType || 'api');
+      const message = error instanceof Error ? error.message : 'Unknown error';
       return {
         success: false,
-        message: 'Failed to fetch Meta ads metrics. Please ensure your Meta ad account is properly configured.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        message,
+        error: message,
+        errorType
       };
     }
   }
@@ -21501,6 +21580,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // ENG-510: distinguish an LLM-specified model from a system-resolved default.
+      // Only a genuine per-request choice should suppress the transient-timeout
+      // fallback; the admin-configured default is a system preference, not a
+      // semantic lock, so a timeout on it must still fail over to another provider
+      // instead of delivering zero images. Resolving the default here (rather than
+      // in the tool handler) preserves that distinction end-to-end.
+      const modelExplicitlyChosen = typeof imageModel === 'string' && imageModel.trim().length > 0;
+      const resolvedImageModel = modelExplicitlyChosen
+        ? imageModel
+        : await this.getImageApiDefaultModel();
+
       const inputImagesForRequest = inputImages || [];
       const primaryRequest = {
         prompt,
@@ -21510,11 +21600,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         inputImages: inputImagesForRequest,
         logoImage,
         userId,
-        imageModel
+        imageModel: resolvedImageModel
       };
 
       let result: any;
-      let imageModelUsed = imageModel || 'gemini-3-pro-image-preview';
+      let imageModelUsed = resolvedImageModel || 'gemini-3-pro-image-preview';
       let fallbackUsed = false;
       let primaryError: string | undefined;
 
@@ -21522,7 +21612,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         result = await imageService.generateImage(primaryRequest);
       } catch (primaryFailure: any) {
         primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
-        const fallbackModel = this.getImageGenerationFallbackModel(imageModel, inputImagesForRequest, logoImage);
+        const fallbackModel = this.getImageGenerationFallbackModel(resolvedImageModel, inputImagesForRequest, logoImage, modelExplicitlyChosen);
         if (!fallbackModel || !this.isRetryableMediaToolError(primaryError)) {
           throw primaryFailure;
         }
@@ -21557,7 +21647,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       if (!(result.success && result.imageUrl) && !fallbackUsed) {
         primaryError = result.error || 'Failed to generate image';
-        const fallbackModel = this.getImageGenerationFallbackModel(imageModel, inputImagesForRequest, logoImage);
+        const fallbackModel = this.getImageGenerationFallbackModel(resolvedImageModel, inputImagesForRequest, logoImage, modelExplicitlyChosen);
         if (fallbackModel && this.isRetryableMediaToolError(primaryError)) {
           console.warn(
             `AgentMode: Image generation with "${imageModelUsed}" failed with a retryable error; trying fallback "${fallbackModel}":`,
@@ -21617,7 +21707,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Stable marker so extractGeneratedImageFilenames can detect generated
               // images without relying solely on the content-string format.
               kind: 'image-generated',
-              imageFilename: result.filename
+              imageFilename: result.filename,
+              // ENG-510: carry the URL on this immediately-persisted marker so a completed
+              // image is discoverable (scanMessagesForAssets) even if the whole-turn cap
+              // kills the turn before the end-of-turn toolCalls stamp runs — graceful
+              // partial delivery instead of losing finished work. De-duped by URL.
+              imageUrl: result.imageUrl
             }
           });
         } catch (error) {
@@ -29167,7 +29262,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
@@ -29178,6 +29273,25 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
         return { success: true, biddingStrategies };
+      }
+
+      if (entity_type === 'CAMPAIGN_CRITERION' && action === 'ADD') {
+        const { placementUrls, mobileAppCategoryResourceNames } = validateNegativeCampaignCriteria(
+          customer_id,
+          args.campaign_resource_name,
+          args.placement_urls,
+          args.mobile_app_category_resource_names,
+        );
+        await googleAdsService.addNegativeCampaignCriteria(
+          userId,
+          customer_id,
+          args.campaign_resource_name,
+          { placementUrls, mobileAppCategoryResourceNames },
+        );
+        return {
+          success: true,
+          message: `Added ${placementUrls.length + mobileAppCategoryResourceNames.length} negative campaign criteria`,
+        };
       }
 
       if (entity_type === 'CAMPAIGN') {
@@ -29509,15 +29623,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
     } catch (error: any) {
+      if (error instanceof NegativeCampaignCriteriaValidationError) {
+        return {
+          success: false,
+          errorType: error.errorType,
+          errorCode: error.errorCode,
+          error: error.message,
+        };
+      }
       if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
       console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
+      const gadsErrorCodes = gadsErrors
+        .map((e: any) => Object.values(e.errorCode || {})[0])
+        .filter(Boolean);
       const gadsError = gadsErrors.length
         ? gadsErrors.map((e: any) => {
             const code = Object.values(e.errorCode || {})[0];
             return code ? `${code}: ${e.message}` : e.message;
           }).join('; ')
         : undefined;
+      if (args.entity_type === 'CAMPAIGN_CRITERION') {
+        return {
+          success: false,
+          errorType: gadsError ? 'GOOGLE_ADS_API_ERROR' : 'INTERNAL_ERROR',
+          errorCode: gadsErrorCodes[0] || 'UNKNOWN_GOOGLE_ADS_ERROR',
+          error: gadsError || error.message || 'Unknown error',
+        };
+      }
       return { success: false, error: gadsError || error.message || 'Unknown error' };
     }
   }

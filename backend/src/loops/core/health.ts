@@ -75,15 +75,14 @@ function proposalKey(r: LearningRecord): string | null {
   return p ?? m ?? null;
 }
 
-/** A record "resolves" its proposal once a human ✅ lands (approved /
- * auto_shipped), the mutation ships (`shippedAt`), or attribution grades it
- * (`verdict`). The learning store is append-only, so the original `pending`
- * row for a proposal lives forever alongside its later approved/shipped/graded
- * rows — without de-duping, a loop would report `pending_approval` even after
- * the ✅ and even after a verdict landed, which is exactly the C2 stall. */
+/** A record "resolves" its proposal once a human decision lands (approved /
+ * denied / auto_shipped), the mutation ships (`shippedAt`), or attribution
+ * grades it (`verdict`). The learning store is append-only, so the original
+ * `pending` row lives forever alongside its terminal row. */
 function resolvesProposal(r: LearningRecord): boolean {
   return (
     r.decision?.status === 'approved'
+    || r.decision?.status === 'denied'
     || r.decision?.status === 'auto_shipped'
     || !!r.shippedAt
     || r.verdict != null
@@ -135,6 +134,7 @@ export function computeLoopHealth(
   const resolvedProposals = new Set<string>(); // approved/shipped/graded exists
   const gradedProposals = new Set<string>(); // a verdict exists
   for (const r of history) {
+    for (const key of r.decisionProposalIds ?? []) resolvedProposals.add(key);
     const key = proposalKey(r);
     if (!key) continue;
     if (resolvesProposal(r)) resolvedProposals.add(key);

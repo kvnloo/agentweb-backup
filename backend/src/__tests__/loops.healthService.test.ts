@@ -65,6 +65,7 @@ function manifest(id: string, paused = false): LoopManifest {
 function learningStore(records: LearningRecord[] = [], throws = false): LearningStore {
   return {
     record: jest.fn().mockResolvedValue(undefined),
+    recordDecisionIfAbsent: jest.fn().mockResolvedValue(true),
     queryHistory: throws
       ? jest.fn().mockRejectedValue(new Error('dynamo unavailable'))
       : jest.fn().mockResolvedValue(records),

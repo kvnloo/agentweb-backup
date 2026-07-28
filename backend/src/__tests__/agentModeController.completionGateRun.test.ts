@@ -91,7 +91,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { runScheduledChat } from '../controllers/agentModeController';
+import { runScheduledChat, runVerifiedChat } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -219,6 +219,49 @@ describe('runScheduledChat — deterministic completion gate', () => {
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
   });
 
+  it('ENG-635: reports failure when the run still defers to the user after exhausting the completion gate', async () => {
+    // Every turn punts the decision back to an absent human instead of delivering.
+    // The gate issues its forceful "proceed best-effort, no human present" continuations,
+    // but the model keeps deferring — so after the budget is exhausted the run must NOT
+    // be reported as a clean success (it produced no deliverable).
+    mockWorker.runInWorker.mockResolvedValue(
+      workerResult("I found only 30 of the 100 requested ads. Should I proceed with cataloging the 30? Reply 'go' to proceed.")
+    );
+
+    const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // Bounded: 1 initial + up to 2 continuations = 3, well under maxAttempts(20).
+    const calls = mockWorker.runInWorker.mock.calls.length;
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(calls).toBeLessThanOrEqual(3);
+    // Punted to an absent human and never delivered → recorded as a failure, not success.
+    expect(result).toEqual(expect.objectContaining({ status: 'failure' }));
+  });
+
+  it('ENG-635: a persistent defer keeps runVerifiedChat success:true + flags deferredUnresolved (non-scheduled HTTP callers must not 500)', async () => {
+    // Same persistent-defer scenario, but observed at the runVerifiedChat layer that
+    // the HTTP callers (imageReports/revision/resultEndpoint) consume directly. They
+    // key on `result.success`; a deliverable existed (requirements met), so success
+    // MUST stay true — the defer is surfaced only via the `deferredUnresolved` flag,
+    // which only the scheduled path turns into a failure.
+    mockWorker.runInWorker.mockResolvedValue(
+      workerResult("I found only 30 of the 100 requested ads. Should I proceed with cataloging the 30? Reply 'go' to proceed.")
+    );
+
+    const result = await runVerifiedChat({
+      sessionId: 'test-session-123',
+      userId: 'test-user-123',
+      startingMessage: 'catalog ads',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 20,
+      completionGate: true,
+    });
+
+    expect(result.success).toBe(true);
+    expect((result as any).deferredUnresolved).toBe(true);
+  });
+
   it('is bounded: stops after the max continuations even if it keeps admitting incompleteness', async () => {
     // Every turn admits incompleteness → gate must cap continuations, not loop to maxAttempts (20).
     mockWorker.runInWorker.mockResolvedValue(
@@ -228,6 +271,150 @@ describe('runScheduledChat — deterministic completion gate', () => {
     await runScheduledChat(leadEngSchedule, 'test-user-123', true);
 
     // 1 initial + up to 2 continuations = 3. Must be well under maxAttempts(20).
+    const calls = mockWorker.runInWorker.mock.calls.length;
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(calls).toBeLessThanOrEqual(3);
+  });
+
+  // ENG-518: the PER-LIST, result-aware preview→execute write-back gate, driven
+  // end-to-end through the real runScheduledChat → runVerifiedChat loop (not just
+  // the classifier). These prove the wiring: the loop accumulates the worker's
+  // tool-call objects (name + arguments.list_id + result.processedCount) into
+  // allToolCalls, feeds them to the gate, and the gate drives a continuation that
+  // commits the write-back for every enrichable list that was not yet executed.
+  const previewCall = (listId: string, processedCount: number) => ({
+    name: 'enrich_leads_preview',
+    arguments: { list_id: listId },
+    result: { processedCount },
+  });
+  const executeCall = (listId: string) => ({
+    name: 'enrich_leads_execute',
+    arguments: { list_id: listId },
+    result: { processedCount: 5 },
+  });
+  const workerResultWithTools = (content: string, toolCalls: any[]) => ({
+    ...workerResult(content),
+    toolCalls,
+  });
+
+  it('ENG-518: a run that previewed but never executed is driven to commit the write-back', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => {
+      call++;
+      // Turn 1: previewed an enrichable list (processedCount > 0) and presented the
+      // dry-run samples as if delivered — NO admission phrasing, NO confirmation
+      // question, not truncated. The old text/flag-based gate saw nothing to
+      // continue on. Turn 2 (continuation): the model calls the execute write-back.
+      return Promise.resolve(
+        call === 1
+          ? workerResultWithTools(
+              'Here are the enriched leads from the preview. Top prospects look strong.',
+              [previewCall('list-1', 2)]
+            )
+          : workerResultWithTools(
+              'Enrichment committed. Top 10 leads recommended and connection drafts below.',
+              [executeCall('list-1')]
+            )
+      );
+    });
+
+    const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // Gate fired on the tool-call fact (enrichable preview without execute) → 2nd turn.
+    expect(mockWorker.runInWorker.mock.calls.length).toBeGreaterThanOrEqual(2);
+    const secondMsg = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
+    expect(secondMsg).toMatch(/enrich_leads_execute/);
+    expect(secondMsg).toMatch(/never committed|write-back/i);
+    // The continuation CONSULTS the task's intent (Greptile #2): commit if the task
+    // asked to enrich, but do NOT write if it explicitly asked for a preview only.
+    expect(secondMsg).toMatch(/if the task asked you to ENRICH/i);
+    expect(secondMsg).toMatch(/EXPLICITLY asked to preview/i);
+    // Once execute ran for the list, the gap is closed and the run succeeds.
+    expect(result).toEqual(expect.objectContaining({ status: 'success' }));
+  });
+
+  it('ENG-518: a partial multi-list run keeps firing until every enrichable list is committed', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => {
+      call++;
+      // Turn 1: previewed 2 enrichable lists but executed only list-1 → list-2 still
+      // uncommitted (the Greptile partial-write-back gap). Turn 2: commits list-2.
+      return Promise.resolve(
+        call === 1
+          ? workerResultWithTools('Enriched list-1; list-2 samples below.', [
+              previewCall('list-1', 2), previewCall('list-2', 2), executeCall('list-1'),
+            ])
+          : workerResultWithTools('list-2 committed. Final report below.', [executeCall('list-2')])
+      );
+    });
+
+    const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // A subset-execute must NOT close the gate — it fires again for list-2.
+    expect(mockWorker.runInWorker.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(result).toEqual(expect.objectContaining({ status: 'success' }));
+  });
+
+  it('ENG-518: a failed execute (error) does NOT close the gate — it retries until write-back lands', async () => {
+    let call = 0;
+    mockWorker.runInWorker.mockImplementation(() => {
+      call++;
+      // Turn 1: previewed enrichable list-1 and attempted execute, but it threw →
+      // the write-back never landed. The gate must NOT treat the errored execute as
+      // done. Turn 2 (continuation): execute succeeds and the run finishes.
+      return Promise.resolve(
+        call === 1
+          ? workerResultWithTools('Previewed list-1; the execute call errored out.', [
+              previewCall('list-1', 2),
+              { name: 'enrich_leads_execute', arguments: { list_id: 'list-1' }, error: 'engine timeout' },
+            ])
+          : workerResultWithTools('Execute succeeded on retry. Final report below.', [executeCall('list-1')])
+      );
+    });
+
+    const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    expect(mockWorker.runInWorker.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(result).toEqual(expect.objectContaining({ status: 'success' }));
+  });
+
+  it('ENG-518: a run that previewed AND executed the same list does NOT fire the gate', async () => {
+    mockWorker.runInWorker.mockResolvedValue(
+      workerResultWithTools('Enrichment previewed and committed. Recommendations and drafts below.', [
+        previewCall('list-1', 2), executeCall('list-1'),
+      ])
+    );
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // The list's execute counterpart already ran → no continuation.
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('ENG-518: an UNENRICHABLE preview (processedCount 0) is not forced to execute', async () => {
+    // The engine resolved nobody for this list; the model correctly skipped execute.
+    // The gate must NOT chase it (no unauthorized CRM write, no loop) → single turn.
+    mockWorker.runInWorker.mockResolvedValue(
+      workerResultWithTools('This list is unenrichable — surfaced as an actionable gap.', [
+        previewCall('list-1', 0),
+      ])
+    );
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('ENG-518: keeps chasing the write-back but stays bounded if execute never runs', async () => {
+    // Every turn previews an enrichable list without executing → the gate must keep
+    // firing (the gap is still open) yet remain capped by completionGateMaxContinuations.
+    mockWorker.runInWorker.mockResolvedValue(
+      workerResultWithTools('Preview samples shown above.', [previewCall('list-1', 2)])
+    );
+
+    await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // 1 initial + up to 2 continuations = 3. Bounded well under maxAttempts(20).
     const calls = mockWorker.runInWorker.mock.calls.length;
     expect(calls).toBeGreaterThanOrEqual(2);
     expect(calls).toBeLessThanOrEqual(3);
