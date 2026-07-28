@@ -1034,6 +1034,16 @@ type RunVerifiedChatResult = {
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
   parked?: boolean;
   pendingUserQuestion?: PendingUserQuestion;
+  // ENG-636: set when a run had to stop on a blocking question but the caller has
+  // NO channel to reach a human (headless, fire-and-forget). The run failed
+  // explicitly instead of parking into a void; there is no pendingUserQuestion to
+  // answer. Distinct from `parked` so monitoring/callers can tell the two apart.
+  parkedUnnotifiable?: boolean;
+  // ENG-635: the run met its tool/keyword requirements but its final turn still
+  // deferred to an absent human (completion gate exhausted while still asking to
+  // confirm). `success` stays true (a deliverable existed for HTTP callers), but the
+  // SCHEDULED path treats this as a failed run (records failure + oncall).
+  deferredUnresolved?: boolean;
 };
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -1060,6 +1070,15 @@ export async function runVerifiedChat(
     // for IMMUTABLE questions. This is a deliberate, default-off WAIVER of the
     // human protection on irreversible decisions (owner opted in per-schedule).
     fullAutonomy?: boolean;
+    // ENG-636: does a PARK on this run actually reach a human? Only true for
+    // callers with a notification/answer channel: runScheduledChat (owner email)
+    // and the interactive verifiedGenerate endpoint (the live session renders the
+    // pendingUserQuestion card). Default FALSE so any headless, fire-and-forget
+    // caller (resultEndpoint, imageReports, slack/humanEval/revision) is fail-safe:
+    // an unanswerable park is surfaced as an explicit `parkedUnnotifiable` failure
+    // rather than dropped into a void no one will ever action. Fail-safe default
+    // means a NEW headless caller is covered automatically (no drift).
+    parkNotifiable?: boolean;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -1072,7 +1091,8 @@ export async function runVerifiedChat(
     attachments = [],
     completionGate = false,
     completionGateMaxContinuations = 2,
-    fullAutonomy = false
+    fullAutonomy = false,
+    parkNotifiable = false
   } = params;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
@@ -1202,11 +1222,19 @@ export async function runVerifiedChat(
   // have left an unanswered blocking AskUserQuestion (the tool handler persisted
   // it via updateSessionAskUserQuestion). Handle it identically at BOTH LLM call
   // sites so the park guarantee can never be bypassed: re-read from the DB (never
-  // trust a stale in-memory blank), then AUTO-TAKE Emma's recommended option under
-  // full autonomy (bounded, logged as a delegation — a deliberate per-schedule
-  // WAIVER of the human protection on irreversible decisions), otherwise PARK and
-  // stop rather than proceed on a guess. Returns 'autoTake' (caller retries), a
-  // 'park' result to return, or null when no question is awaiting.
+  // trust a stale in-memory blank), then decide between AUTO-TAKE and PARK.
+  //
+  // ENG-517: a headless/scheduled run must NOT block on a REVERSIBLE question —
+  // a data shortfall, report-scope choice, etc. has an obvious safe default
+  // (Emma's recommended option), so auto-take it and keep going rather than
+  // parking and never delivering. IMMUTABLE questions (e.g. the Meta campaign
+  // objective) still PARK unless the schedule opted into full autonomy — those
+  // are the irreversible decisions a human must own (auto-taking one is the
+  // deliberate per-schedule WAIVER that `fullAutonomy` represents).
+  //
+  // Either way the auto-take is bounded (MAX_AUTO_TAKES) and logged as a
+  // delegation. Returns 'autoTake' (caller retries), a 'park' result to return,
+  // or null when no question is awaiting.
   const resolveAwaitingUserQuestion = async (): Promise<
     { action: 'autoTake' } | { action: 'park'; result: RunVerifiedChatResult } | null
   > => {
@@ -1214,54 +1242,93 @@ export async function runVerifiedChat(
     if (postTurnSession?.pendingUserQuestion?.status !== 'awaiting') return null;
     const pending = postTurnSession.pendingUserQuestion;
 
-    if (fullAutonomy && autoTakesUsed < MAX_AUTO_TAKES) {
+    // Reversible questions auto-proceed in any headless run; immutable ones only
+    // when the schedule explicitly waived the human protection (full autonomy).
+    const canAutoTake = fullAutonomy || pending.immutable !== true;
+    if (canAutoTake && autoTakesUsed < MAX_AUTO_TAKES) {
       autoTakesUsed++;
       const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
       await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
         requireStillAwaiting: pending.questionId,
       });
       const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
+      const takeKind = fullAutonomy && pending.immutable === true ? 'full-autonomy' : 'reversible-default';
       console.log(
-        `AgentMode runVerifiedChat: full-autonomy auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
+        `AgentMode runVerifiedChat: ${takeKind} auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
       );
       // Breadcrumb in history so Emma sees the decision and resumes without
       // re-asking (best-effort; the persisted answer is the source of truth).
+      // Label the breadcrumb by the actual session, not the trigger: runVerifiedChat
+      // is also invoked from non-scheduled callers (verifiedGenerate, slack revision,
+      // revisionService, humanEvalActionService, imageReports), so hardcoding
+      // '[Scheduled run]' would write a false label into those sessions' history.
+      const breadcrumbPrefix =
+        fullAutonomy && pending.immutable === true
+          ? '[Full autonomy]'
+          : postTurnSession.sessionType === 'scheduled'
+            ? '[Scheduled run]'
+            : '[Auto-proceed]';
       try {
         await chatbotDb.addMessageToSession(sessionId, {
           role: 'user',
-          content: `[Full autonomy] Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
+          content: `${breadcrumbPrefix} Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
           timestamp: new Date().toISOString(),
           metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
         });
       } catch (breadcrumbError) {
-        console.error('Failed to persist full-autonomy auto-take breadcrumb:', breadcrumbError);
+        console.error('Failed to persist auto-take breadcrumb:', breadcrumbError);
       }
       return { action: 'autoTake' };
     }
 
-    console.log(
-      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}) awaiting a selection; run will not proceed on a guess`
+    // Shared failure body for both park variants below.
+    const stopResultBase = {
+      success: false as const,
+      content: allContent,
+      toolCalls: allToolCalls,
+      keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+      keywordMisses: remainingKeywords,
+      functionCallMatches: [] as string[],
+      functionCallMisses: requiredFunctions.map(f => f.functionName),
+      functionStatus: requiredFunctions.map(reqFunc => ({
+        functionName: reqFunc.functionName,
+        requiredCount: reqFunc.minCount,
+        actualCount: countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting),
+        met: false,
+      })),
+      attempts: attempt,
+      workPlanCompleted: false,
+    };
+
+    // ENG-636: a PARK only makes sense when a human will actually see and answer
+    // the question. Callers with a notification/answer channel (scheduled →
+    // owner email; interactive verifiedGenerate → live session card) set
+    // parkNotifiable. Headless, fire-and-forget callers do NOT — for them a park
+    // is a dead end: no one is told, no one can answer, and the run silently
+    // delivers nothing. In that case FAIL EXPLICITLY (parkedUnnotifiable) instead
+    // of returning a pendingUserQuestion nobody will ever action. This is the
+    // correct terminal behavior for an IMMUTABLE question too: we must never
+    // auto-decide an irreversible choice, and the write gate still blocks the
+    // action — so an honest, monitorable failure is the safe outcome.
+    if (!parkNotifiable) {
+      console.error(
+        `AgentMode runVerifiedChat: session ${sessionId} hit a blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) after ${autoTakesUsed} auto-take(s), but this run has NO channel to reach a human (parkNotifiable=false). Failing explicitly rather than parking into a void — no deliverable, no one to answer (ENG-636).`
+      );
+      return {
+        action: 'park',
+        result: { ...stopResultBase, parkedUnnotifiable: true },
+      };
+    }
+
+    console.warn(
+      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) awaiting a human selection after ${autoTakesUsed} auto-take(s); run will not proceed on a guess. A human will be notified (scheduled owner email / interactive card).`
     );
     return {
       action: 'park',
       result: {
-        success: false,
+        ...stopResultBase,
         parked: true,
         pendingUserQuestion: postTurnSession.pendingUserQuestion,
-        content: allContent,
-        toolCalls: allToolCalls,
-        keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
-        keywordMisses: remainingKeywords,
-        functionCallMatches: [],
-        functionCallMisses: requiredFunctions.map(f => f.functionName),
-        functionStatus: requiredFunctions.map(reqFunc => ({
-          functionName: reqFunc.functionName,
-          requiredCount: reqFunc.minCount,
-          actualCount: countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting),
-          met: false,
-        })),
-        attempts: attempt,
-        workPlanCompleted: false,
       },
     };
   };
@@ -1362,9 +1429,27 @@ export async function runVerifiedChat(
           await waitForVerifiedChatRetry(attempt);
           continue;
         }
-        // Continuation produced no further "unfinished" admission → done.
+        // ENG-635: the continuation budget (or attempt budget) is exhausted. If this
+        // final continuation STILL defers the task to an absent human (a 'confirmation'
+        // halt) rather than delivering, the run produced no real deliverable. Flag it
+        // via `deferredUnresolved` (rather than flipping `success`) so the SCHEDULED
+        // path records a failure + oncall, WITHOUT changing the success/HTTP contract
+        // for non-scheduled callers (imageReports/revision/etc.) — those met their
+        // required tool calls, so a deliverable DID exist and they must not 500.
+        // Scoped to 'confirmation' only: an 'unfinished'/'budget' turn that still
+        // surfaces a partial report with actionable next-steps is a valid terminal state.
+        const haltedUnresolved = continuationReason === 'confirmation';
+        if (haltedUnresolved) {
+          console.warn(
+            `AgentMode runVerifiedChat: session ${sessionId} exhausted the completion gate ` +
+            `(${completionGateContinuationsUsed}/${completionGateMaxContinuations}) but the final turn still ` +
+            `defers to the user — flagging deferredUnresolved (scheduled runs record a failure).`
+          );
+        }
+        // Continuation produced no further blocking signal (or an accepted partial) → done.
         return {
           success: true,
+          deferredUnresolved: haltedUnresolved,
           content: allContent,
           toolCalls: allToolCalls,
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
@@ -2011,7 +2096,10 @@ export async function runScheduledChat(
       // ENG-396: opt-in per-schedule full autonomy — auto-take Emma's recommended
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
-      fullAutonomy: schedule.fullAutonomy === true
+      fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-636: a scheduled park IS notifiable — the block below emails the owner
+      // and records a `pending_user_input` outcome, so a park reaches a human.
+      parkNotifiable: true
     });
 
     // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
@@ -2109,11 +2197,16 @@ export async function runScheduledChat(
       };
     });
 
+    // ENG-635: a run that met its requirements but still deferred to an absent human
+    // (deferredUnresolved) produced no real deliverable — record it as a failure so it
+    // is surfaced (auto-issue + oncall) instead of scored as a clean run.
+    const runDelivered = result.success && !result.deferredUnresolved;
+
     const finalResult = {
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
-      status: (result.success ? 'success' : 'failure') as 'success' | 'failure',
-      passed: result.success,
+      status: (runDelivered ? 'success' : 'failure') as 'success' | 'failure',
+      passed: runDelivered,
       actualResponse: result.content,
       actualFunctionCalls: actualFunctionCalls,
       keywordMatches: result.keywordMatches,
@@ -7575,7 +7668,10 @@ export const agentModeController = {
         keywords: keywords || [],
         requiredFunctions: requiredFunctionsArray,
         maxAttempts: maxAttemptsParam || 5,
-        attachments: attachmentsArray
+        attachments: attachmentsArray,
+        // ENG-636: interactive endpoint — the user's live session renders the
+        // pendingUserQuestion card, so a park reaches a human who can answer.
+        parkNotifiable: true
       });
 
       // If client disconnected, don't try to send response

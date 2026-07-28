@@ -190,6 +190,8 @@ describe('Result Endpoints', () => {
           sessionId: 'test-session-123',
           startingMessage: expect.stringContaining('Acme Corp'),
           requiredFunctions: [{ functionName: 'send_for_review', minCount: 1 }],
+          // ENG-634: headless fire-and-forget run must enable completion-gate halt protection.
+          completionGate: true,
         })
       );
     });
