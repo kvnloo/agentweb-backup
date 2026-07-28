@@ -1942,6 +1942,17 @@ export class UserDB {
     // exactly what produced the earlier staleness bug. Skipping is safe:
     // once the org is backfilled, decrements apply normally; until then,
     // there's nothing to decrement from.
+    //
+    // Known narrow residual race (accepted, Greptile review): the orgId
+    // clear above and this decrement are two separate writes. If the
+    // backfill runs in that gap, it queries the live member list (which
+    // already excludes this departure, since orgId is already cleared) and
+    // seeds memberCount at the post-departure count — then this decrement
+    // still fires and subtracts again, leaving the counter one too low.
+    // Only possible during the brief backfill-run window, only ever
+    // under-counts (never lets capacity overshoot from this bug alone), and
+    // self-heals on the next join/leave. Mitigated operationally by running
+    // the backfill during low-traffic hours rather than a code-level fix.
     try {
       await this.docClient
         .update({
