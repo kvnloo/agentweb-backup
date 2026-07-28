@@ -279,10 +279,13 @@ describe('runScheduledChat — deterministic completion gate', () => {
 
     // Gate fired on the tool-call fact (enrichable preview without execute) → 2nd turn.
     expect(mockWorker.runInWorker.mock.calls.length).toBeGreaterThanOrEqual(2);
-    // The continuation message specifically instructs committing the write-back.
     const secondMsg = mockWorker.runInWorker.mock.calls[1][0].messageContent as string;
     expect(secondMsg).toMatch(/enrich_leads_execute/);
     expect(secondMsg).toMatch(/never committed|write-back/i);
+    // The continuation CONSULTS the task's intent (Greptile #2): commit if the task
+    // asked to enrich, but do NOT write if it explicitly asked for a preview only.
+    expect(secondMsg).toMatch(/if the task asked you to ENRICH/i);
+    expect(secondMsg).toMatch(/EXPLICITLY asked to preview/i);
     // Once execute ran for the list, the gap is closed and the run succeeds.
     expect(result).toEqual(expect.objectContaining({ status: 'success' }));
   });

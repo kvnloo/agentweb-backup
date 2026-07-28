@@ -1274,14 +1274,21 @@ export async function runVerifiedChat(
         userMessage =
           completionGateReason === 'preview-only'
             ? 'Your previous run produced enrichment PREVIEWS (a dry-run sample) but ' +
-              'never committed them with the write-back step (enrich_leads_execute). ' +
-              'A preview is NOT the deliverable. This is an automated run with no human ' +
-              'present — do NOT wait for confirmation. Call enrich_leads_execute now for ' +
-              'every list whose preview succeeded (processedCount > 0), using the same ' +
-              'output_fields you previewed. Skip only a list whose preview explicitly ' +
-              'failed (processedCount === 0 with identityResolutionFailed > 0). Then ' +
-              'complete the rest of the requested workflow (recommendations, drafts) and ' +
-              'produce the final report.'
+              'never committed them with the write-back step (enrich_leads_execute), and ' +
+              'a preview does not change any data. This is an automated run with no human ' +
+              'present — do NOT wait for confirmation or approval. Act on what THIS ' +
+              "scheduled task actually asked for:\n" +
+              '• If the task asked you to ENRICH, update, populate, refresh, or fill in ' +
+              'the leads (the usual case), you MUST now call enrich_leads_execute for ' +
+              'every list whose preview was enrichable (processedCount > 0), using the ' +
+              'same output_fields you previewed — do not merely describe what would ' +
+              'happen; actually run the write-back. Skip only a list whose preview ' +
+              'failed (processedCount === 0 with identityResolutionFailed > 0).\n' +
+              '• If, and only if, the task EXPLICITLY asked to preview / sample / show ' +
+              'what enrichment WOULD do WITHOUT changing the data, do NOT call ' +
+              'enrich_leads_execute — deliver that preview report instead.\n' +
+              'Then complete the rest of the requested workflow (e.g. recommendations, ' +
+              'drafts) and produce the final report.'
           : completionGateReason === 'budget'
             ? 'The previous run was cut short because it exhausted its processing-step ' +
               'budget before it could produce the final deliverable. Using the data ' +
