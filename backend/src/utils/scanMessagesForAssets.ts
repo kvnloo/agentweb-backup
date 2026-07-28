@@ -33,7 +33,7 @@ export function scanMessagesForAssets(
     // kills the turn mid-flight, so completed images are still delivered. De-duped by URL
     // against the toolCalls stamp below, so a normally-completed image is listed once.
     const marker = message.metadata;
-    if (marker?.kind === 'image-generated' && marker?.imageUrl && !seenUrls.has(marker.imageUrl)) {
+    if (marker?.kind === 'image-generated' && marker.imageUrl && !seenUrls.has(marker.imageUrl)) {
       seenUrls.add(marker.imageUrl);
       images.push({ url: marker.imageUrl, filename: marker.imageFilename || 'generated-image.png', generatedAt: timestamp });
     }

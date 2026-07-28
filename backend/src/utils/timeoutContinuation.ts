@@ -39,8 +39,9 @@ export function collectMediaGeneratedSince(
   const seen = new Set<string>();
   for (const message of messages) {
     const marker = message?.metadata;
-    if (marker?.kind !== 'image-generated' || !marker?.imageUrl) continue;
-    const rawTs = message?.timestamp || marker?.timestamp;
+    if (!marker || marker.kind !== 'image-generated' || !marker.imageUrl) continue;
+    // `message` is non-null here (a nullish entry yields no marker and already continued).
+    const rawTs = message.timestamp || marker.timestamp;
     const ts = rawTs ? Date.parse(rawTs) : NaN;
     if (!Number.isFinite(ts) || ts < sinceMs) continue;
     if (seen.has(marker.imageUrl)) continue;
