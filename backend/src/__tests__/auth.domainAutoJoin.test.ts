@@ -179,7 +179,7 @@ describe('register controller — domain auto-join requests', () => {
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
   });
 
-  it('fails loud (no requests, no emails) when multiple orgs share the domain — tie-break undecided (ENG-512 review)', async () => {
+  it('creates a request for every matching org when multiple orgs share the domain (tie-break: notify all, first-approve-wins)', async () => {
     mockGetOrgsWithAutoJoinDomain.mockResolvedValue([
       { orgId: 'org-a', ownerUserId: 'owner-a', name: 'Org A', autoJoinEnabled: true, autoJoinDomain: 'acmecorp.com', pendingDomainJoinRequests: [] },
       { orgId: 'org-b', ownerUserId: 'owner-b', name: 'Org B', autoJoinEnabled: true, autoJoinDomain: 'acmecorp.com', pendingDomainJoinRequests: [] },
@@ -194,8 +194,8 @@ describe('register controller — domain auto-join requests', () => {
       .send({ email: 'alice@acmecorp.com', password: 'ValidPass123!' });
 
     expect(res.status).toBe(201);
-    expect(mockUpdateOrg).not.toHaveBeenCalled();
-    expect(mockSendEmail).not.toHaveBeenCalled();
+    expect(mockUpdateOrg).toHaveBeenCalledTimes(2);
+    expect(mockSendEmail).toHaveBeenCalledTimes(2);
   });
 
   it('does not fail registration if the domain-match lookup throws (non-fatal, matches invite-check behavior)', async () => {

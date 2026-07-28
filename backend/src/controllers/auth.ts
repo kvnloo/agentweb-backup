@@ -30,17 +30,11 @@ async function createDomainJoinRequestsForNewUser(userId: string, email: string)
   try {
     const matchingOrgs = await orgDb.getOrgsWithAutoJoinDomain(domain);
 
-    // Multiple-orgs-per-domain tie-break is an explicitly undecided call
-    // (ENG-512). Fail loud rather than guessing a fan-out policy — don't
-    // notify any owner until that decision is made.
-    if (matchingOrgs.length > 1) {
-      console.error(
-        `Domain auto-join: ${matchingOrgs.length} orgs matched domain "${domain}" for new user ${email} — ` +
-        `tie-break policy undecided, skipping all domain-join requests for this signup.`
-      );
-      return;
-    }
-
+    // Multiple-orgs-per-domain tie-break (ENG-512): notify every matching
+    // owner; whichever approves first wins. Safe because approve is
+    // atomic (userDb.joinOrgIfUnassigned) — a second owner approving the
+    // same user after the first one wins gets a clean "already in an
+    // organization" rather than a phantom double-join.
     for (const org of matchingOrgs) {
       const requestToken = crypto.randomBytes(32).toString("hex");
       const pendingRequests = org.pendingDomainJoinRequests || [];
