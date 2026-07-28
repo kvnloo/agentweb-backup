@@ -37,6 +37,7 @@ class MockLinearPort implements LinearPort {
   searchCalls = 0;
   findKeyCalls: string[] = [];
   throwOnCreate = false;
+  throwOnRelate = false;
   private nextId = 1;
 
   async findByFathomKey(key: string): Promise<LinearCandidateIssue | null> {
@@ -75,6 +76,7 @@ class MockLinearPort implements LinearPort {
   }
 
   async relateIssues(params: { issueId: string; relatedIssueId: string }): Promise<void> {
+    if (this.throwOnRelate) throw new Error('Linear relation failed');
     this.relations.push(params);
   }
 }
@@ -231,13 +233,30 @@ describe('fathomLinearRouter — idempotency (retry safety)', () => {
     expect(second.duplicatesAvoided[0].identifier).toBe('ENG-101');
   });
 
-  it('does not search or write when the idempotency key already exists', async () => {
+  it('never writes new work when the idempotency key already exists', async () => {
     const port = new MockLinearPort();
     const m = meeting();
     const it = item();
     port.byKey[fathomKey(m.recordingId, it.id)] = grow6();
 
     const report = await routeMeetingToLinear(m, [it], port);
+
+    // A live-mode redelivery MAY search once (relation-repair check — see the
+    // relation-durability block), but it must never create, comment, or relate
+    // for a non-follow-on item: the outcome is a pure idempotent no-op.
+    expect(port.created).toHaveLength(0);
+    expect(port.comments).toHaveLength(0);
+    expect(port.relations).toHaveLength(0);
+    expect(report.duplicatesAvoided).toHaveLength(1);
+  });
+
+  it('does not even search on a shadow-mode idempotent hit', async () => {
+    const port = new MockLinearPort();
+    const m = meeting();
+    const it = item();
+    port.byKey[fathomKey(m.recordingId, it.id)] = grow6();
+
+    const report = await routeMeetingToLinear(m, [it], port, { dryRun: true });
 
     expect(port.searchCalls).toBe(0);
     expect(port.created).toHaveLength(0);
@@ -412,5 +431,101 @@ describe('fathomKey / buildSearchQuery helpers', () => {
     expect(q).toContain('onboarding');
     expect(q).toContain('GROW-6');
     expect(q).toContain('do the thing');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Relation durability — the create+relate two-phase must converge (Greptile P1)
+// ---------------------------------------------------------------------------
+
+describe('fathomLinearRouter — relation durability (create + relate two-phase)', () => {
+  const distinctFollowOn = () =>
+    item({
+      team: 'CS',
+      customer: 'Baldwin',
+      action: 'Schedule Baldwin live account review',
+      workflowNouns: ['onboarding'],
+      owner: 'Fangfang',
+      nextAction: 'Book a live account-review call with Baldwin',
+      doneCriteria: 'Review call completed and notes filed',
+    });
+
+  it('reconciles a failed relation as an error carrying the created issue (never double-counted)', async () => {
+    const port = new MockLinearPort();
+    port.candidates = [grow6()];
+    port.throwOnRelate = true;
+
+    const report = await routeMeetingToLinear(meeting(), [distinctFollowOn()], port);
+
+    expect(port.created).toHaveLength(1); // the issue WAS created…
+    expect(report.related).toHaveLength(0); // …but is not reported as successfully related
+    expect(report.created).toHaveLength(0);
+    expect(report.errors).toHaveLength(1);
+    expect(report.errors[0].identifier).toBe('CS-101');
+    expect(report.errors[0].canonicalIdentifier).toBe('GROW-6');
+    expect(report.errors[0].reason).toMatch(/relat/i);
+    expect(allEntries(report)).toHaveLength(1); // exactly one outcome bucket
+  });
+
+  it('re-asserts the missing relation on redelivery (created issue excluded from canonical search)', async () => {
+    const port = new MockLinearPort();
+    port.candidates = [grow6()];
+    port.throwOnRelate = true;
+    const first = await routeMeetingToLinear(meeting(), [distinctFollowOn()], port);
+    expect(first.errors).toHaveLength(1);
+    expect(port.relations).toHaveLength(0);
+
+    // Redelivery: the marker now resolves, the relation write works again, and the
+    // search returns BOTH the created issue itself and the canonical.
+    port.throwOnRelate = false;
+    const createdIssue = Object.values(port.byKey)[0];
+    port.candidates = [createdIssue, grow6()];
+
+    const second = await routeMeetingToLinear(meeting(), [distinctFollowOn()], port);
+
+    expect(port.relations).toHaveLength(1);
+    expect(port.relations[0]).toEqual({ issueId: createdIssue.id, relatedIssueId: 'uuid-grow6' });
+    expect(second.duplicatesAvoided).toHaveLength(1);
+    expect(second.duplicatesAvoided[0].reason).toMatch(/re-assert/i);
+    expect(second.created).toHaveLength(0);
+    expect(second.related).toHaveLength(0);
+  });
+
+  it('never writes the repair relation in shadow mode', async () => {
+    const port = new MockLinearPort();
+    const existing = grow6();
+    port.byKey[fathomKey('rec-747768521', 'ai-1')] = existing;
+    port.candidates = [grow6()];
+
+    const report = await routeMeetingToLinear(meeting(), [distinctFollowOn()], port, { dryRun: true });
+
+    expect(port.relations).toHaveLength(0);
+    expect(report.duplicatesAvoided).toHaveLength(1);
+  });
+
+  it('stays a plain idempotent no-op when redelivery finds no canonical', async () => {
+    const port = new MockLinearPort();
+    port.byKey[fathomKey('rec-747768521', 'ai-1')] = grow6();
+    port.candidates = [];
+
+    const report = await routeMeetingToLinear(meeting(), [distinctFollowOn()], port);
+
+    expect(port.relations).toHaveLength(0);
+    expect(report.duplicatesAvoided).toHaveLength(1);
+    expect(report.duplicatesAvoided[0].reason).toBe('already processed (idempotent)');
+  });
+
+  it('reports a failed re-assert as an error so a later redelivery can retry it', async () => {
+    const port = new MockLinearPort();
+    const created = { ...grow6(), id: 'uuid-created', identifier: 'CS-200' };
+    port.byKey[fathomKey('rec-747768521', 'ai-1')] = created;
+    port.candidates = [grow6()];
+    port.throwOnRelate = true;
+
+    const report = await routeMeetingToLinear(meeting(), [distinctFollowOn()], port);
+
+    expect(report.duplicatesAvoided).toHaveLength(0);
+    expect(report.errors).toHaveLength(1);
+    expect(report.errors[0].reason).toMatch(/re-assert/i);
   });
 });
