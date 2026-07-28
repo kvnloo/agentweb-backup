@@ -190,4 +190,31 @@ describe('userDb.getRegistrationStatusByEmails', () => {
     // The COUNT query runs only for the one registered user.
     expect(mockQuerySpy).toHaveBeenCalledTimes(1);
   });
+
+  it('degrades gracefully when one chatSessionCount query fails (no whole-batch failure)', async () => {
+    batchGetPromiseMock.mockResolvedValueOnce({
+      Responses: {
+        [USERS_TABLE]: [
+          { email: 'a@x.com', userId: 'u-a' },
+          { email: 'b@x.com', userId: 'u-b' },
+        ],
+      },
+    });
+    // First user's COUNT query blips; the second succeeds.
+    mockQueryPromise
+      .mockRejectedValueOnce(new Error('ddb blip'))
+      .mockResolvedValue({ Items: [], Count: 4 });
+
+    const result = await userDb.getRegistrationStatusByEmails(
+      ['a@x.com', 'b@x.com'],
+      { includeChatSessionCount: true },
+    );
+
+    const byEmail = Object.fromEntries(result.map((r) => [r.email, r]));
+    // Both remain registered; the failed one is left undefined (unknown), the
+    // other still gets its live count — the batch does not reject.
+    expect(byEmail['a@x.com'].registered).toBe(true);
+    expect(byEmail['a@x.com'].chatSessionCount).toBeUndefined();
+    expect(byEmail['b@x.com'].chatSessionCount).toBe(4);
+  });
 });
