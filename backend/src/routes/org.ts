@@ -455,11 +455,23 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
       });
     }
 
-    // Remove the request and add the user to the org. Same non-snapshotting
-    // join mechanics as accept-invite (see ENG-288) — no tier fields copied.
+    // Add the user to the org first — joinOrgIfUnassigned is the
+    // authoritative, atomic check (the plain targetUser.orgId check above is
+    // just a cheap early exit; without the ConditionExpression inside it, two
+    // concurrent approvals for the same user from different orgs can both
+    // pass that early check before either write lands). Only remove the
+    // request from this org's pending list once the join actually succeeds —
+    // removing it first would silently drop the request if the atomic join
+    // loses the race, with no way to retry.
+    const joined = await userDb.joinOrgIfUnassigned(requestEntry.userId, orgId, "member");
+    if (!joined) {
+      return res.status(400).json({ error: "This user is already in an organization" });
+    }
+
+    // Same non-snapshotting join mechanics as accept-invite (see ENG-288) —
+    // no tier fields copied.
     const updatedRequests = pendingRequests.filter((r) => r.requestToken !== requestToken);
     await orgDb.updateOrg(orgId, { pendingDomainJoinRequests: updatedRequests });
-    await userDb.updateUser(requestEntry.userId, { orgId, orgRole: "member" });
 
     return res.json({ success: true, message: "Domain-join request approved" });
   } catch (error) {

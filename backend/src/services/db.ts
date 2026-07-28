@@ -1486,6 +1486,46 @@ export class UserDB {
   }
 
   /**
+   * Atomically assign a user to an org, but only if they don't already have
+   * one — a plain read-then-write (check user.orgId, then updateUser) has a
+   * TOCTOU race: two concurrent approvals (e.g. domain-join requests from two
+   * different orgs) can both pass the read-check before either write lands,
+   * double-joining or silently overwriting one org's membership. The
+   * ConditionExpression makes the check-and-set atomic. Returns false (no
+   * throw) if the user already had an orgId — the caller decides how to
+   * surface that as "already in an organization".
+   */
+  async joinOrgIfUnassigned(
+    userId: string,
+    orgId: string,
+    orgRole: "member" | "owner"
+  ): Promise<boolean> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    try {
+      await this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "SET orgId = :orgId, orgRole = :orgRole REMOVE pendingOrgInvite",
+          ConditionExpression: "attribute_not_exists(orgId)",
+          ExpressionAttributeValues: { ":orgId": orgId, ":orgRole": orgRole },
+        })
+        .promise();
+      return true;
+    } catch (error: any) {
+      if (error.code === "ConditionalCheckFailedException") {
+        return false;
+      }
+      handleDynamoDbError(error, "joinOrgIfUnassigned");
+      throw error;
+    }
+  }
+
+  /**
    * Atomically increment a user's sessionVersion, invalidating all tokens issued
    * with the prior value. Used after a password change so that every other active
    * session (other devices) is logged out. Returns the new sessionVersion.
