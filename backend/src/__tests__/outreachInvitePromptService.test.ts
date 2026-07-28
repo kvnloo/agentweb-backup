@@ -296,7 +296,11 @@ describe("saveOutreachInvitePrompt", () => {
     });
     await saveOutreachInvitePrompt({ systemPrompt: "NEW", updatedBy: "admin-9" });
     const put = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
-    expect(put.ConditionExpression).toBe("version = :expected");
+    // `version` is a DynamoDB reserved word, so it MUST be referenced via an
+    // ExpressionAttributeNames alias, never bare (a bare name throws a
+    // ValidationException at write time -> HTTP 500). See ENG-603.
+    expect(put.ConditionExpression).toBe("#version = :expected");
+    expect(put.ExpressionAttributeNames).toEqual({ "#version": "version" });
     expect(put.ExpressionAttributeValues).toEqual({
       ":expected": "v7-2026-07-13",
     });
@@ -443,7 +447,9 @@ describe("saveOutreachInvitePrompt", () => {
     const put = mockPut.mock.calls[mockPut.mock.calls.length - 1][0];
     // Not a toothless attribute_exists — the version's ABSENCE is the token, so
     // the first writer stamps a version and a concurrent versionless save loses.
-    expect(put.ConditionExpression).toBe("attribute_not_exists(version)");
+    // `version` is reserved, so the guard aliases it via ExpressionAttributeNames.
+    expect(put.ConditionExpression).toBe("attribute_not_exists(#version)");
+    expect(put.ExpressionAttributeNames).toEqual({ "#version": "version" });
     expect(put.ExpressionAttributeValues).toBeUndefined();
   });
 
@@ -481,7 +487,8 @@ describe("saveOutreachInvitePrompt", () => {
     expect(row.systemPrompt).toBe("MINE");
     expect(row.withCompanyVariants).toEqual(["CONCURRENT A"]); // winner preserved
     const put2 = mockPut.mock.calls[1][0];
-    expect(put2.ConditionExpression).toBe("version = :expected");
+    expect(put2.ConditionExpression).toBe("#version = :expected");
+    expect(put2.ExpressionAttributeNames).toEqual({ "#version": "version" });
     expect(put2.ExpressionAttributeValues).toEqual({ ":expected": "v5-2026-07-13" });
   });
 });
