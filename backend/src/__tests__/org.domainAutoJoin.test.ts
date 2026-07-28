@@ -24,8 +24,14 @@ let mockUsers: Record<string, any> = {};
 let mockOrgs: Record<string, any> = {};
 
 jest.mock('../middleware/auth', () => ({
+  // Supports an explicit x-test-user-id header so concurrency tests can pin
+  // each in-flight request to a fixed identity — the shared `mockUser`
+  // variable is otherwise a race hazard when two requests are genuinely
+  // in-flight at once against the same app (both mutating/reading it).
   authenticateToken: (req: any, _res: any, next: any) => {
-    req.user = { userId: mockUser.userId, email: mockUser.email, isAdmin: false };
+    const headerUserId = req.headers['x-test-user-id'];
+    const user = headerUserId ? mockUsers[headerUserId as string] : mockUser;
+    req.user = { userId: user.userId, email: user.email, isAdmin: false };
     next();
   },
   AuthenticatedRequest: {},
@@ -40,6 +46,18 @@ jest.mock('../services/db', () => ({
     updateUser: jest.fn((userId: string, updates: any) => {
       if (mockUsers[userId]) Object.assign(mockUsers[userId], updates);
       return Promise.resolve(mockUsers[userId]);
+    }),
+    // Mirrors the real atomic ConditionExpression: check-and-set with no
+    // await in between, so two "concurrent" calls in a test (via
+    // Promise.all) can't both observe orgId as unset — matching what the
+    // real DynamoDB ConditionExpression guarantees in production.
+    joinOrgIfUnassigned: jest.fn((userId: string, orgId: string, orgRole: string) => {
+      if (mockUsers[userId]?.orgId) return Promise.resolve(false);
+      if (mockUsers[userId]) {
+        mockUsers[userId].orgId = orgId;
+        mockUsers[userId].orgRole = orgRole;
+      }
+      return Promise.resolve(true);
     }),
   },
   orgDb: {
@@ -209,6 +227,61 @@ describe('Domain-based org auto-join', () => {
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/already in an organization/i);
       expect(mockUsers['user-2'].orgId).toBe('some-other-org');
+    });
+
+    it('under true concurrency, exactly one of two simultaneous approvals (different orgs, same user) wins — no phantom approval', async () => {
+      // Regression test for a live-reproduced bug: two orgs approving the
+      // same pending user at the same instant used to both return success,
+      // because the orgId-check and the orgId-write were separate DB round
+      // trips with no atomic guard between them. One org's "approved" was a
+      // phantom — the request got cleared and the owner saw success, but the
+      // membership write was silently overwritten by the other org's write.
+      mockOrgs['org-2'] = {
+        orgId: 'org-2',
+        name: 'Second Org',
+        ownerUserId: 'user-3',
+        maxMembers: 5,
+        autoJoinEnabled: true,
+        autoJoinDomain: 'example.com',
+        pendingDomainJoinRequests: [
+          {
+            userId: 'user-2',
+            email: 'member@example.com',
+            requestedAt: '2026-01-01T00:00:00Z',
+            requestToken: 'valid-token-org2',
+          },
+        ],
+      };
+
+      // x-test-user-id pins each request's identity explicitly, so the two
+      // in-flight requests can't race on the shared `mockUser` variable —
+      // isolating the race to exactly the thing under test (the DB layer).
+      const requestAsOrg1Owner = request(app)
+        .post('/api/org/org-1/domain-requests/valid-token/approve')
+        .set('x-test-user-id', 'user-1');
+      const requestAsOrg2Owner = request(app)
+        .post('/api/org/org-2/domain-requests/valid-token-org2/approve')
+        .set('x-test-user-id', 'user-3');
+
+      const [resA, resB] = await Promise.all([requestAsOrg1Owner, requestAsOrg2Owner]);
+      const results = [resA, resB];
+      const successes = results.filter((r) => r.status === 200);
+      const failures = results.filter((r) => r.status === 400);
+
+      expect(successes).toHaveLength(1);
+      expect(failures).toHaveLength(1);
+      expect(failures[0].body.error).toMatch(/already in an organization/i);
+
+      // The user must end up in exactly one org, matching whichever call
+      // actually won — never both, and never neither.
+      expect(mockUsers['user-2'].orgId).toBe(successes[0] === resA ? 'org-1' : 'org-2');
+
+      // Whichever org lost the race must NOT have silently dropped the
+      // request (it should still be there, or explicitly handled) — since
+      // this fix removes the request only after a successful join, the
+      // loser's request should survive for a retry/manual follow-up.
+      const loserOrgId = successes[0] === resA ? 'org-2' : 'org-1';
+      expect(mockOrgs[loserOrgId].pendingDomainJoinRequests.length).toBeGreaterThan(0);
     });
 
     // === SUCCESS case ===
