@@ -14,6 +14,10 @@ describe('parseCookieHeader', () => {
       expect(() => parseCookieHeader('session=abc; garbage', 'rankai.ai')).toThrow(/malformed|invalid/i);
     });
 
+    it('throws when a segment has an empty name before "=" (e.g. "=value")', () => {
+      expect(() => parseCookieHeader('session=abc; =bareval', 'rankai.ai')).toThrow(/malformed cookie segment \(missing name\)/i);
+    });
+
     it('throws when the header parses to zero valid pairs (semicolons only)', () => {
       expect(() => parseCookieHeader(';;;', 'rankai.ai')).toThrow(/empty|no valid/i);
     });
