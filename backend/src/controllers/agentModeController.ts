@@ -1172,8 +1172,14 @@ export async function runVerifiedChat(
       return { action: 'autoTake' };
     }
 
-    console.log(
-      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}) awaiting a selection; run will not proceed on a guess`
+    // ENG-636: warn (not log) so a park is never silent. Only runScheduledChat
+    // notifies the owner + records a `pending_user_input` outcome on a park; other
+    // headless callers (resultEndpoint, imageReports, slack/humanEval/revisionService)
+    // have no notification path and would otherwise drop this parked question with no
+    // deliverable. The question itself stays durable on the session's
+    // pendingUserQuestion; this makes the drop observable in monitoring.
+    console.warn(
+      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) awaiting a human selection after ${autoTakesUsed} auto-take(s); run will not proceed on a guess. Non-scheduled headless callers surface no deliverable on a park (ENG-636).`
     );
     return {
       action: 'park',
