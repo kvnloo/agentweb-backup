@@ -78,6 +78,8 @@ describe('runHumanEvalFeedbackAction', () => {
       userId: 'user-1',
       startingMessage: expect.stringContaining('https://example.com/image.png'),
       requiredFunctions: [{ functionName: 'generate_image', minCount: 1 }],
+      // ENG-634: headless run must enable completion-gate halt protection.
+      completionGate: true,
     }));
   });
 
