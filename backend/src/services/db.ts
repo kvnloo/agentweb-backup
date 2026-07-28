@@ -1919,13 +1919,30 @@ export class UserDB {
     }
 
     try {
+      // If memberCount hasn't been backfilled on this org yet, seed it from
+      // the real live count rather than defaulting the missing-attribute
+      // base to 1 — with a bare 1, if_not_exists(memberCount, 1) - 1 always
+      // lands on 0, silently zeroing the counter even if the org still has
+      // other real members. The live count already reflects this departure
+      // (the user's orgId was just cleared above), so add 1 back before the
+      // subtraction lands the result on the correct post-departure value;
+      // if memberCount already exists, if_not_exists ignores this fallback
+      // entirely and the ordinary decrement applies.
+      const orgSnapshot = await this.docClient
+        .get({ TableName: ORGS_TABLE, Key: { orgId }, ProjectionExpression: "memberCount" })
+        .promise();
+      const seed =
+        orgSnapshot.Item?.memberCount !== undefined
+          ? 1 // Ignored by if_not_exists when memberCount is already present.
+          : (await this.getRealMemberCountForOrg(orgId)) + 1;
+
       await this.docClient
         .update({
           TableName: ORGS_TABLE,
           Key: { orgId },
-          UpdateExpression: "SET memberCount = if_not_exists(memberCount, :one) - :one",
+          UpdateExpression: "SET memberCount = if_not_exists(memberCount, :seed) - :one",
           ConditionExpression: "attribute_not_exists(memberCount) OR memberCount > :zero",
-          ExpressionAttributeValues: { ":one": 1, ":zero": 0 },
+          ExpressionAttributeValues: { ":seed": seed, ":one": 1, ":zero": 0 },
         })
         .promise();
     } catch (error) {

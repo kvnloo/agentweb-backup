@@ -47,15 +47,29 @@ export async function runBackfill(): Promise<void> {
       if (org.memberCount !== undefined) continue;
 
       const realCount = await getRealMemberCount(ddb, org.orgId);
-      await ddb
-        .update({
-          TableName: ORGS_TABLE,
-          Key: { orgId: org.orgId },
-          UpdateExpression: "SET memberCount = :count, updatedAt = :now",
-          ExpressionAttributeValues: { ":count": realCount, ":now": new Date().toISOString() },
-        })
-        .promise();
-      console.log(`Backfilled org ${org.orgId}: memberCount = ${realCount}`);
+      try {
+        await ddb
+          .update({
+            TableName: ORGS_TABLE,
+            Key: { orgId: org.orgId },
+            // Conditioned on memberCount still being absent — if a live join
+            // or leave (userDb.joinOrgWithCapacityCheck / clearOrgMembership)
+            // set it in the gap between the read above and this write, an
+            // unconditional SET would silently clobber that fresh, correct
+            // value with this stale snapshot.
+            UpdateExpression: "SET memberCount = :count, updatedAt = :now",
+            ConditionExpression: "attribute_not_exists(memberCount)",
+            ExpressionAttributeValues: { ":count": realCount, ":now": new Date().toISOString() },
+          })
+          .promise();
+        console.log(`Backfilled org ${org.orgId}: memberCount = ${realCount}`);
+      } catch (error: any) {
+        if (error.code === "ConditionalCheckFailedException") {
+          console.log(`Skipped org ${org.orgId}: memberCount was set concurrently, leaving it as-is.`);
+          continue;
+        }
+        throw error;
+      }
     }
     lek = page.LastEvaluatedKey;
   } while (lek);
