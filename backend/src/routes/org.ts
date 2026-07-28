@@ -409,6 +409,9 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
     if (joinResult === "already_in_org") {
       return res.status(400).json({ error: "You are already in an organization. Leave your current org first." });
     }
+    if (joinResult === "not_migrated") {
+      return res.status(409).json({ error: "This organization is not yet ready to accept members. Please try again shortly." });
+    }
 
     // Only remove the invite once the join actually succeeded — removing it
     // first would silently drop the invite if the atomic join lost the race.
@@ -472,6 +475,9 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
     }
     if (joinResult === "already_in_org") {
       return res.status(400).json({ error: "This user is already in an organization" });
+    }
+    if (joinResult === "not_migrated") {
+      return res.status(409).json({ error: "This organization is not yet ready to accept members. Please try again shortly." });
     }
 
     // Same non-snapshotting join mechanics as accept-invite (see ENG-288) —
