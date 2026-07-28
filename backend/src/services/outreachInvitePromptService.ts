@@ -261,24 +261,16 @@ export async function saveOutreachInvitePrompt(
     // then fails the condition, retries, and re-reads the real token. Guarding
     // on mere `attribute_exists(templateId)` would give the versionless case no
     // protection at all, letting concurrent saves silently clobber each other.
-    // `version` is a DynamoDB reserved word, so it can never appear bare in a
-    // ConditionExpression — doing so throws a ValidationException at write time
-    // (surfaced to the admin as HTTP 500). Reference it through an
-    // ExpressionAttributeNames alias (`#version`) instead. See ENG-603.
     const hasVersionToken =
       raw && raw.version !== undefined && raw.version !== null;
     const guard = !raw
       ? { ConditionExpression: "attribute_not_exists(templateId)" }
       : hasVersionToken
         ? {
-            ConditionExpression: "#version = :expected",
-            ExpressionAttributeNames: { "#version": "version" },
+            ConditionExpression: "version = :expected",
             ExpressionAttributeValues: { ":expected": raw.version },
           }
-        : {
-            ConditionExpression: "attribute_not_exists(#version)",
-            ExpressionAttributeNames: { "#version": "version" },
-          };
+        : { ConditionExpression: "attribute_not_exists(version)" };
 
     try {
       await docClient
