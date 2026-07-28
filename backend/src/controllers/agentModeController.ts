@@ -739,18 +739,60 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
 // admit anything or ask to confirm, so the gate lets the run finish mid-pipeline.
 //
 // This maps each preview tool to the execute tool that commits its result. If a
-// scheduled run called a preview tool but never its execute counterpart, the run
-// stopped before write-back and needs one more continuation to finish.
+// scheduled run previewed a list but never ran the execute counterpart FOR THAT
+// SAME LIST, the run stopped before write-back and needs one more continuation.
 const PREVIEW_EXECUTE_TOOL_PAIRS: Record<string, string> = {
   enrich_leads_preview: 'enrich_leads_execute',
 };
 
-export function scheduledRunPreviewedWithoutExecute(toolCallNames: string[]): boolean {
-  if (!Array.isArray(toolCallNames) || toolCallNames.length === 0) return false;
-  const called = new Set(toolCallNames);
-  return Object.entries(PREVIEW_EXECUTE_TOOL_PAIRS).some(
-    ([previewTool, executeTool]) => called.has(previewTool) && !called.has(executeTool)
-  );
+// The tool call arg identifying which CRM list a preview/execute call targeted.
+// list_id is a required arg on both tools; `arguments` is normally the parsed
+// object, but a preflight-failure path can carry the raw JSON string, so handle
+// both shapes.
+function previewExecuteListId(toolCall: any): string | null {
+  const args = toolCall?.arguments;
+  if (!args) return null;
+  if (typeof args === 'string') {
+    try {
+      const parsed = JSON.parse(args);
+      return typeof parsed?.list_id === 'string' ? parsed.list_id : null;
+    } catch {
+      return null;
+    }
+  }
+  return typeof args.list_id === 'string' ? args.list_id : null;
+}
+
+// Deterministic, PER-LIST, RESULT-AWARE detector for the preview→write-back gap.
+//
+// Takes the whole run's accumulated tool-call objects ({ name, arguments, result }).
+// For each preview/execute pair it fires only when a list was previewed AND the
+// engine confirmed that preview is enrichable (processedCount > 0) AND no execute
+// ran for that same list_id. This deliberately does NOT fire for:
+//   - a list whose preview resolved nobody (processedCount 0): forcing a write there
+//     would loop on an unenrichable list and commit nothing useful; and
+//   - a list already committed by its execute call (per-list, so a partial
+//     multi-list run still fires for the lists that were NOT executed).
+// Both narrowings keep the gate from commanding CRM writes a preview never warranted.
+export function scheduledRunPreviewedWithoutExecute(toolCalls: any[]): boolean {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return false;
+  return Object.entries(PREVIEW_EXECUTE_TOOL_PAIRS).some(([previewTool, executeTool]) => {
+    const enrichablePreviewedLists = new Set<string>();
+    const executedLists = new Set<string>();
+    for (const tc of toolCalls) {
+      const listId = previewExecuteListId(tc);
+      if (!listId) continue;
+      if (tc?.name === previewTool) {
+        if (Number(tc?.result?.processedCount) > 0) enrichablePreviewedLists.add(listId);
+      } else if (tc?.name === executeTool) {
+        executedLists.add(listId);
+      }
+    }
+    for (const listId of enrichablePreviewedLists) {
+      if (!executedLists.has(listId)) return true;
+    }
+    return false;
+  });
 }
 
 // Deterministic detector for the ENG-369 failure mode: a scheduled/unattended
@@ -859,18 +901,18 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
 //       (scheduledRunSignalsIncompleteWork).
 // A 'preview-only' write-back gap (ENG-518) takes precedence over everything: it
-// is a hard, tool-call-based fact (a preview tool ran, its execute counterpart
-// did not) that stays true whatever the closing text said, and its continuation
-// message is the most specific ("commit the write-back now"). Budget truncation
-// comes next (also a hard state signal); a confirmation halt takes precedence
-// over a plain unfinished-work admission so the continuation message can be
-// tailored to "proceed best-effort".
+// is a hard, tool-call-based fact (a list was previewed as enrichable but its
+// execute counterpart never committed it) that stays true whatever the closing
+// text said, and its continuation message is the most specific ("commit the
+// write-back now"). Budget truncation comes next (also a hard state signal); a
+// confirmation halt takes precedence over a plain unfinished-work admission so
+// the continuation message can be tailored to "proceed best-effort".
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
-  toolCallNames?: string[];
+  toolCalls?: any[];
 }): ScheduledContinuationReason | null {
-  if (scheduledRunPreviewedWithoutExecute(response?.toolCallNames || [])) return 'preview-only';
+  if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
@@ -883,7 +925,7 @@ export function classifyScheduledContinuation(response: {
 export function scheduledRunSignalsIncompleteResponse(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
-  toolCallNames?: string[];
+  toolCalls?: any[];
 }): boolean {
   return classifyScheduledContinuation(response) !== null;
 }
@@ -946,9 +988,9 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
 export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
-  toolCallNames?: string[];
+  toolCalls?: any[];
 }): Promise<ScheduledContinuationReason | null> {
-  if (scheduledRunPreviewedWithoutExecute(response?.toolCallNames || [])) return 'preview-only';
+  if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (await scheduledTurnDefersToUser(content)) return 'confirmation';
@@ -1282,11 +1324,12 @@ export async function runVerifiedChat(
           return continuationQuestion.result;
         }
         // Re-evaluate the gate against the continuation's own output. Pass the
-        // accumulated tool calls so a still-uncommitted preview→execute gap
-        // (ENG-518) keeps the gate firing until the write-back actually runs.
+        // whole run's accumulated tool-call objects (name + arguments + result) so a
+        // still-uncommitted per-list preview→execute gap (ENG-518) keeps the gate
+        // firing until the write-back actually runs for every enrichable list.
         const continuationReason = await classifyScheduledContinuationAsync({
           ...continuationResponse,
-          toolCallNames: allActualFunctionCallsForReporting,
+          toolCalls: allToolCalls,
         });
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
@@ -1458,9 +1501,10 @@ export async function runVerifiedChat(
       const responseContinuationReason = gateEligible
         ? await classifyScheduledContinuationAsync({
             ...response,
-            // Preview→execute detection needs the whole run's tool calls, not just
-            // this turn's — an earlier attempt may hold the unmatched preview.
-            toolCallNames: allActualFunctionCallsForReporting,
+            // Preview→execute detection needs the whole run's tool-call objects
+            // (name + arguments + result), not just this turn's — an earlier attempt
+            // may hold the unmatched, still-uncommitted preview.
+            toolCalls: allToolCalls,
           })
         : null;
       if (gateEligible && responseContinuationReason !== null) {

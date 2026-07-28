@@ -5114,6 +5114,21 @@ export class AgentModeService {
       return base;
     }
 
+    // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
+    // completion gate can (a) tell an enrichable preview (processedCount > 0) from an
+    // unenrichable one and (b) pair previews to executes per list. The large `samples`
+    // array is dropped — the model already saw it in the tool message; only the small
+    // counts matter for the gate and reporting.
+    if (toolName === 'enrich_leads_preview' || toolName === 'enrich_leads_execute') {
+      return {
+        runId: result?.runId,
+        mode: result?.mode,
+        processedCount: result?.processedCount,
+        failedCount: result?.failedCount,
+        failureBreakdown: result?.failureBreakdown,
+      };
+    }
+
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
