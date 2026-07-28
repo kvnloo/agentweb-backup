@@ -293,6 +293,18 @@ export interface ExecutePreparedToolsInput {
    * latency rather than a guess. The dispatcher returns an updated value each iteration.
    */
   longestMediaCallMsThisRun?: number;
+  /**
+   * ENG-510: dedupe keys (`name:stableStringify(args)` -> first tool_call_id) of media-gen
+   * calls that ALREADY produced an asset in EARLIER iterations of this turn. The ENG-108
+   * dedupe is per-iteration, so a model that re-emits an identical generate_image in a
+   * later iteration (e.g. re-requesting an image it already made when resuming after a
+   * timeout) would regenerate it. When a media-gen call's key is already here, the
+   * dispatcher suppresses it — scoped to media tools ONLY, so legitimately-repeated
+   * mutating calls (send_email, create_lead) across iterations still run. The dispatcher
+   * returns the keys produced THIS iteration via `producedMediaCallKeys` for the loop to
+   * accumulate. Only SUCCESSFUL generations are recorded, so a failed call stays retryable.
+   */
+  priorMediaCallKeys?: Map<string, string>;
   // ---- ports ----
   ports: ToolDispatchPorts;
 }
@@ -315,6 +327,13 @@ export interface ExecutePreparedToolsResult {
    * so the adaptive hard-cap reserve tracks the run's actual media latency.
    */
   longestMediaCallMs: number;
+  /**
+   * ENG-510: dedupe keys of media-gen calls that produced an asset THIS iteration
+   * (`name:stableStringify(args)` -> tool_call_id). The loop merges these into the set it
+   * passes back as `priorMediaCallKeys` next iteration, so an identical re-request later in
+   * the same turn is suppressed instead of regenerating the image.
+   */
+  producedMediaCallKeys: Map<string, string>;
 }
 
 /**
@@ -353,8 +372,12 @@ export async function executePreparedTools(
     mediaAssetsProducedThisRun = 0,
     generationHardCapMs,
     longestMediaCallMsThisRun = 0,
+    priorMediaCallKeys,
     ports,
   } = input;
+  // ENG-510: keys of media-gen assets successfully produced this iteration, returned to the
+  // loop to accumulate across iterations for cross-iteration media dedupe (see below).
+  const producedMediaCallKeys = new Map<string, string>();
 
   const pendingCounterUpdates: Record<string, number> = {};
   const failedCounterUpdates: Record<string, number> = {};
@@ -363,7 +386,7 @@ export async function executePreparedTools(
   let mediaBudgetDeferred = false;
 
   // Phase 1: Validate and prepare tool calls (synchronous)
-  const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision }> = [];
+  const preparedCalls: Array<{ toolCall: any; functionArgs: any; policyDecision: AgentToolPolicyDecision; dedupeKey: string }> = [];
   const preflightToolResults: PreflightToolResult[] = [];
 
   // Same-turn dedupe (ENG-108): collapse identical (name + args) calls emitted in
@@ -529,9 +552,23 @@ export async function executePreparedTools(
         suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
         continue;
       }
+      // ENG-510: cross-iteration dedupe for MEDIA-GEN tools only. The per-iteration check
+      // above misses an identical generate_image re-emitted in a LATER iteration of the
+      // same turn (e.g. resuming after a timeout, the model re-requests an image it already
+      // made). Suppress it if that exact call already produced an asset earlier this turn.
+      // Media-only so a legitimately-repeated mutating call (send_email) is never blocked;
+      // only successful generations are recorded, so a failed call can still be retried.
+      if (
+        MEDIA_GEN_TOOLS.has(toolCall.function.name)
+        && priorMediaCallKeys?.has(dedupeKey)
+      ) {
+        const duplicateOfId = priorMediaCallKeys.get(dedupeKey) as string;
+        suppressedDuplicates.push({ toolCall, functionArgs: preparedFunctionArgs, duplicateOfId });
+        continue;
+      }
       seenToolCallKeys.set(dedupeKey, toolCall.id);
 
-      preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision });
+      preparedCalls.push({ toolCall, functionArgs: preparedFunctionArgs, policyDecision, dedupeKey });
     } catch (error) {
       console.error(`AgentMode: Tool argument parse error for ${toolCall.function.name}:`, error);
       const errMsg = error instanceof Error ? error.message : String(error);
@@ -740,6 +777,18 @@ export async function executePreparedTools(
       policyDecision: toolResult.policyDecision,
     };
   });
+  // ENG-510: record media-gen calls that SUCCEEDED this iteration (post-downgrade), keyed
+  // by their dedupe signature, so the loop can suppress an identical re-request in a later
+  // iteration of this turn. Only genuine successes are recorded — a failed or downgraded
+  // generation is NOT, so it stays retryable. toolResults is index-aligned with
+  // preparedCalls in every execution path.
+  toolResults.forEach((dr, i) => {
+    const pc = preparedCalls[i];
+    if (pc && dr.status === 'success' && countsAsAsset(dr)) {
+      producedMediaCallKeys.set(pc.dedupeKey, pc.toolCall.id);
+    }
+  });
+
   // Deferred calls never executed, but they ARE forwarded to telemetry as their
   // own class (ENG-103): the telemetry layer records them via toolDeferred (not
   // toolInvoked/succeeded/failed), so deferred/skipped is accounted separately
@@ -955,5 +1004,5 @@ export async function executePreparedTools(
     appendSuppressedDuplicate(suppressed);
   }
 
-  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred, longestMediaCallMs };
+  return { pendingCounterUpdates, failedCounterUpdates, skillsUpdated, mediaAssetsProduced, mediaBudgetDeferred, longestMediaCallMs, producedMediaCallKeys };
 }

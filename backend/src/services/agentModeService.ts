@@ -3065,6 +3065,10 @@ export class AgentModeService {
       const generationTimeoutMs = parseInt(process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000', 10);
       const generationHardCapMs = mediaBudgetMs > 0 ? Date.now() + generationTimeoutMs : undefined;
       let longestMediaCallMsThisRun = 0;
+      // ENG-510: accumulate dedupe keys of media-gen calls that produced an asset, across
+      // iterations of this turn, so the dispatcher can suppress an identical re-request in a
+      // later iteration (e.g. resuming after a timeout) instead of regenerating the image.
+      const mediaCallKeysThisRun = new Map<string, string>();
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
@@ -3504,6 +3508,7 @@ export class AgentModeService {
           mediaAssetsProducedThisRun,
           generationHardCapMs,
           longestMediaCallMsThisRun,
+          priorMediaCallKeys: mediaCallKeysThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -3546,6 +3551,13 @@ export class AgentModeService {
         // ENG-510: carry the run-wide longest media-call latency forward so the next
         // iteration's adaptive hard-cap reserve uses real observed durations.
         longestMediaCallMsThisRun = Math.max(longestMediaCallMsThisRun, dispatchResult.longestMediaCallMs ?? 0);
+        // ENG-510: fold this iteration's produced media keys into the run-wide set so the
+        // next iteration suppresses an identical regenerate-the-same-image re-request.
+        if (dispatchResult.producedMediaCallKeys) {
+          for (const [key, id] of dispatchResult.producedMediaCallKeys) {
+            if (!mediaCallKeysThisRun.has(key)) mediaCallKeysThisRun.set(key, id);
+          }
+        }
 
         // Send progress update after all tools complete.
         // Only send tool calls added in this iteration — the frontend accumulates
