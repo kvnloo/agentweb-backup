@@ -9,12 +9,16 @@
 
 const batchGetPromiseMock = jest.fn();
 const batchGetSpy: jest.Mock = jest.fn(() => ({ promise: batchGetPromiseMock }));
+// getChatSessionCount (used when includeChatSessionCount is set) issues a COUNT
+// query against AW-ChatSessions; make that controllable per-test.
+const mockQueryPromise = jest.fn().mockResolvedValue({ Items: [], Count: 0 });
+const mockQuerySpy = jest.fn(() => ({ promise: mockQueryPromise }));
 
 jest.mock('aws-sdk', () => ({
   config: { update: jest.fn() },
   DynamoDB: {
     DocumentClient: jest.fn(() => ({
-      query: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({ Items: [] }) })),
+      query: mockQuerySpy,
       get: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
       put: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
       update: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
@@ -153,5 +157,37 @@ describe('userDb.getRegistrationStatusByEmails', () => {
     const result = await userDb.getRegistrationStatusByEmails(['', '   ', 'real@x.com']);
     expect(result).toHaveLength(1);
     expect(result[0].email).toBe('real@x.com');
+  });
+
+  it('does NOT compute chatSessionCount by default (no extra COUNT queries)', async () => {
+    batchGetPromiseMock.mockResolvedValueOnce({
+      Responses: { [USERS_TABLE]: [{ email: 'reg@x.com', userId: 'u-1' }] },
+    });
+
+    const result = await userDb.getRegistrationStatusByEmails(['reg@x.com']);
+
+    expect(result[0].chatSessionCount).toBeUndefined();
+    expect(mockQuerySpy).not.toHaveBeenCalled();
+  });
+
+  it('includes a live chatSessionCount for registered users when includeChatSessionCount is true', async () => {
+    batchGetPromiseMock.mockResolvedValueOnce({
+      Responses: {
+        [USERS_TABLE]: [{ email: 'reg@x.com', userId: 'u-1', subscription_status: 'active' }],
+      },
+    });
+    mockQueryPromise.mockResolvedValue({ Items: [], Count: 7 });
+
+    const result = await userDb.getRegistrationStatusByEmails(
+      ['reg@x.com', 'ghost@x.com'],
+      { includeChatSessionCount: true },
+    );
+
+    const byEmail = Object.fromEntries(result.map((r) => [r.email, r]));
+    expect(byEmail['reg@x.com'].chatSessionCount).toBe(7);
+    // Unregistered emails have no userId → no count computed.
+    expect(byEmail['ghost@x.com'].chatSessionCount).toBeUndefined();
+    // The COUNT query runs only for the one registered user.
+    expect(mockQuerySpy).toHaveBeenCalledTimes(1);
   });
 });
