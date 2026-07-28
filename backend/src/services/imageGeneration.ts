@@ -66,9 +66,17 @@ interface ImageGenerationParams {
 }
 
 export class ImageService {
-  // Default timeout for a single image generation API call (10 minutes).
-  // Prevents sessions from hanging indefinitely when a provider is unresponsive.
-  private readonly IMAGE_GENERATION_TIMEOUT_MS = 10 * 60 * 1000;
+  // Timeout for a SINGLE image generation API call. ENG-510 (mode 2 — provider hang):
+  // this MUST stay below the whole-turn generation cap (agentModeController
+  // GENERATION_TIMEOUT_MS, 10 min) — when they were equal, a single hung/silent provider
+  // call consumed the ENTIRE turn, leaving no headroom to fail over to another provider,
+  // deliver the other (parallel) variants, or surface a graceful message, so the turn
+  // died with a bare timeout. 8 min still clears observed legitimate slow generations
+  // (~6.5 min for high-quality Pro) so it does not regress successful-but-slow renders,
+  // while leaving ~2 min under the cap for a fast cross-provider failover / wrap-up.
+  // Env-overridable for per-environment tuning; invalid/empty falls back to the default.
+  private readonly IMAGE_GENERATION_TIMEOUT_MS =
+    parseInt(process.env.IMAGE_GENERATION_TIMEOUT_MS || '', 10) || 8 * 60 * 1000;
 
   constructor() {
     // No initialization needed - clients will be created as needed

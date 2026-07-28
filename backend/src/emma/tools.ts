@@ -4689,7 +4689,7 @@ emmaToolRegistry.register({
   name: 'generate_image',
   definition: {
     name: 'generate_image',
-    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.\n\nTRANSPARENT BACKGROUNDS — DO NOT use generate_image to "redraw the logo on a transparent background". This model redraws the mark and can drift its icon/letters/colors, and it CANNOT guarantee a true alpha channel. To make an existing logo\'s background transparent, use the remove_image_background tool (it operates on the original pixels and outputs genuine alpha). If the user already has a transparent PNG of the logo, use that directly. Only fall back to generation if no source logo exists at all.',
+    description: 'Generate or edit images using AI image generation models. Supports both text-to-image generation and image editing with input images.\n\nMULTIPLE VARIANTS: When the user asks for several INDEPENDENT variants of the same brief (e.g. "generate 3 variants"), emit ALL the generate_image calls together in a SINGLE turn — one tool call per variant. They run in parallel (bounded), so N variants finish in roughly the time of one instead of N× and stay within the turn\'s time limit; generating them one-by-one across separate turns is slow and can time out. Only chain image calls sequentially when a later image genuinely DEPENDS on an earlier one (e.g. editing a just-generated image).\n\nLOGO COMPOSITING BEST PRACTICES (tested and confirmed):\n- When the user wants an image with their logo, ALWAYS use the logo_image parameter with the logo URL from their brand guidelines (read_brand_guidelines tool). Do NOT describe the logo in the prompt — pass the actual PNG URL.\n- For logo compositing, prefer gemini-3.1-flash-image or gemini-3-pro-image-preview. Both successfully composite PNG logos with high fidelity. gemini-3.1-flash-image renders the logo largest and most prominently. These models also produce 4096×4096 output.\n- gpt-image-2 also supports logo compositing via logo_image and works correctly, preserving the logo faithfully at 1024×1024 (may add unrequested design elements around it).\n- gpt-image-1 is NOT reliable for logo compositing — it rewrites the logo (e.g. replaces the actual text in the logo with the company name from the prompt). Avoid gpt-image-1 when logo fidelity matters.\n- NEVER tell the user that AI image generation cannot composite a real logo — gemini-3-pro-image-preview, gemini-3.1-flash-image, and gpt-image-2 all handle it correctly when logo_image is provided.\n- NEVER switch the output format from image to HTML without explicit user approval.\n- Brand guideline PNG logos from the attachments array composite cleanly — use them directly.\n\nTRANSPARENT BACKGROUNDS — DO NOT use generate_image to "redraw the logo on a transparent background". This model redraws the mark and can drift its icon/letters/colors, and it CANNOT guarantee a true alpha channel. To make an existing logo\'s background transparent, use the remove_image_background tool (it operates on the original pixels and outputs genuine alpha). If the user already has a transparent PNG of the logo, use that directly. Only fall back to generation if no source logo exists at all.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -4737,8 +4737,12 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    // If the LLM didn't specify a model, fall back to the admin-configured image API default
-    const imageModel = args.imageModel || await agentModeService.getImageApiDefaultModel();
+    // ENG-510: pass the LLM's model choice through AS-IS (undefined when it didn't
+    // pick one). Resolving the admin-configured default here made every request look
+    // like an explicit model choice, which disabled the transient-timeout fallback in
+    // generateImage — so a provider timeout produced zero deliverables. generateImage
+    // now resolves the admin default itself and only suppresses the fallback for a
+    // genuinely LLM-specified model.
     return await agentModeService.generateImage(
       args.prompt,
       args.filename,
@@ -4747,7 +4751,7 @@ emmaToolRegistry.register({
       args.inputImages || [],
       context?.userId,
       context?.sessionId,
-      imageModel,
+      args.imageModel,
       args.logo_image,
       args.confirm
     );

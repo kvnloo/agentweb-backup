@@ -9,6 +9,16 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-07-27',
+    changes: [
+      'Fixed: Multi-Variant Image Requests No Longer Come Back Empty After a Long Run',
+      '- When you asked Emma for several image variants at once (for example, three ad illustrations), a slow batch could hit the per-response time limit and return nothing — even when some of the images had already finished, they were thrown away and you saw only a timeout',
+      '- Emma now generates the variants together instead of strictly one-at-a-time, so a batch finishes in roughly the time of a single image and comfortably fits within the limit',
+      '- If a request still runs over the limit, the images that finished are delivered to you right in the chat, and Emma tells you how many are done and invites you to reply "continue" to make the rest — so completed work is never lost, even if a later image keeps failing',
+      '- On "continue", Emma generates only the images that are still missing and does not redo the ones you already have',
+    ],
+  },
+  {
     date: '2026-07-23',
     changes: [
       'Improved: Emma Now Remembers a Website Login Between Runs',
