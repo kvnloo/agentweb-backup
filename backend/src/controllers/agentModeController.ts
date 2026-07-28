@@ -950,6 +950,11 @@ type RunVerifiedChatResult = {
   // explicitly instead of parking into a void; there is no pendingUserQuestion to
   // answer. Distinct from `parked` so monitoring/callers can tell the two apart.
   parkedUnnotifiable?: boolean;
+  // ENG-635: the run met its tool/keyword requirements but its final turn still
+  // deferred to an absent human (completion gate exhausted while still asking to
+  // confirm). `success` stays true (a deliverable existed for HTTP callers), but the
+  // SCHEDULED path treats this as a failed run (records failure + oncall).
+  deferredUnresolved?: boolean;
 };
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -1314,23 +1319,25 @@ export async function runVerifiedChat(
         }
         // ENG-635: the continuation budget (or attempt budget) is exhausted. If this
         // final continuation STILL defers the task to an absent human (a 'confirmation'
-        // halt) rather than delivering, do NOT report a clean success — a headless run
-        // that punts to a human who will never reply produced no deliverable. Reporting
-        // success:false lets the scheduled path record a failure (auto-issue + oncall)
-        // instead of scoring a non-deliverable as a good run. Scoped to 'confirmation'
-        // only: an 'unfinished'/'budget' turn that still surfaces a partial report with
-        // actionable next-steps is a valid terminal state and stays success:true.
+        // halt) rather than delivering, the run produced no real deliverable. Flag it
+        // via `deferredUnresolved` (rather than flipping `success`) so the SCHEDULED
+        // path records a failure + oncall, WITHOUT changing the success/HTTP contract
+        // for non-scheduled callers (imageReports/revision/etc.) — those met their
+        // required tool calls, so a deliverable DID exist and they must not 500.
+        // Scoped to 'confirmation' only: an 'unfinished'/'budget' turn that still
+        // surfaces a partial report with actionable next-steps is a valid terminal state.
         const haltedUnresolved = continuationReason === 'confirmation';
         if (haltedUnresolved) {
           console.warn(
             `AgentMode runVerifiedChat: session ${sessionId} exhausted the completion gate ` +
             `(${completionGateContinuationsUsed}/${completionGateMaxContinuations}) but the final turn still ` +
-            `defers to the user — reporting as unsuccessful (no deliverable produced).`
+            `defers to the user — flagging deferredUnresolved (scheduled runs record a failure).`
           );
         }
         // Continuation produced no further blocking signal (or an accepted partial) → done.
         return {
-          success: !haltedUnresolved,
+          success: true,
+          deferredUnresolved: haltedUnresolved,
           content: allContent,
           toolCalls: allToolCalls,
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
@@ -1346,7 +1353,7 @@ export async function runVerifiedChat(
             return { functionName: reqFunc.functionName, requiredCount: reqFunc.minCount, actualCount, met: actualCount >= reqFunc.minCount };
           }),
           attempts: attempt,
-          workPlanCompleted: !haltedUnresolved
+          workPlanCompleted: true
         };
       }
 
@@ -2072,11 +2079,16 @@ export async function runScheduledChat(
       };
     });
 
+    // ENG-635: a run that met its requirements but still deferred to an absent human
+    // (deferredUnresolved) produced no real deliverable — record it as a failure so it
+    // is surfaced (auto-issue + oncall) instead of scored as a clean run.
+    const runDelivered = result.success && !result.deferredUnresolved;
+
     const finalResult = {
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
-      status: (result.success ? 'success' : 'failure') as 'success' | 'failure',
-      passed: result.success,
+      status: (runDelivered ? 'success' : 'failure') as 'success' | 'failure',
+      passed: runDelivered,
       actualResponse: result.content,
       actualFunctionCalls: actualFunctionCalls,
       keywordMatches: result.keywordMatches,
