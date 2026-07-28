@@ -307,3 +307,128 @@ describe('runVerifiedChat — full-autonomy auto-take (ENG-396 Version B)', () =
     expect(mockWorkerService.runInWorker.mock.calls.length).toBeLessThan(20);
   });
 });
+
+/**
+ * ENG-517: reversible-question auto-proceed in headless runs.
+ *
+ * A scheduled/headless run that hits a REVERSIBLE blocking question (e.g. a data
+ * shortfall — "only 30 of the requested 100 ads exist, how should I handle it?")
+ * has an obvious safe default (Emma's recommended option), so it must AUTO-TAKE
+ * that option and keep going rather than parking and never delivering — even when
+ * the schedule did not opt into full autonomy. IMMUTABLE questions (e.g. the Meta
+ * campaign objective) still park unless full autonomy is on — those are the
+ * irreversible decisions a human must own.
+ */
+function reversibleQuestion(): PendingUserQuestion {
+  return buildPendingUserQuestion({
+    questionId: 'q-shortfall-1',
+    question: 'Only 30 of the requested 100 B2B ads were found. How should I proceed?',
+    options: [
+      {
+        id: 'catalog-30',
+        label: 'Catalog the 30 real ads',
+        consequence: 'Saves the 30 genuine ads and notes the shortfall vs 100.',
+        recommended: true,
+        why: 'Preserves data integrity — never pad with off-target ads.',
+      },
+      { id: 'pad-b2c', label: 'Pad with B2C ads', consequence: 'Reaches 100 but pollutes the set.' },
+    ],
+    immutable: false,
+    allowEmmaDecide: true,
+    createdAt: '2026-07-25T16:11:00.000Z',
+  });
+}
+
+describe('runVerifiedChat — reversible auto-proceed in headless runs (ENG-517)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+    (mockChatbotDb as any).updateSessionAskUserQuestion = jest.fn().mockResolvedValue(undefined as any);
+    mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
+    mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
+    mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
+    mockAgentModeService.getDefaultModel.mockResolvedValue('default-model');
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('system prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
+    mockWorkerService.runInWorker.mockResolvedValue({
+      content: 'Only 30 ads were found — how should I handle the shortfall?',
+      toolCalls: [{ name: 'ask_user_question', result: { awaitingUserConfirmation: true } }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    } as any);
+  });
+
+  it('without fullAutonomy, AUTO-TAKES the recommended option on a REVERSIBLE question and continues (does not park)', async () => {
+    let persisted = reversibleQuestion();
+    (mockChatbotDb as any).updateSessionAskUserQuestion = jest.fn(async (_sid: string, q: any) => { persisted = q; });
+    mockChatbotDb.getChatSession.mockImplementation(async () => ({ ...baseSession, pendingUserQuestion: persisted } as any));
+
+    const result = await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Refresh the B2B Meta ads intelligence.',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 5,
+      attachments: [],
+      fullAutonomy: false,
+    });
+
+    // It did NOT park — the reversible shortfall was auto-resolved with the
+    // recommended (integrity-preserving) option and the run carried on.
+    expect((result as any).parked).toBeFalsy();
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion).toHaveBeenCalled();
+    expect(persisted.status).toBe('answered');
+    expect(persisted.answer).toMatchObject({ optionId: 'catalog-30', delegated: true, answeredBy: 'delegation' });
+    // A breadcrumb was written so Emma resumes without re-asking.
+    expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledWith(
+      'session-1',
+      expect.objectContaining({ metadata: expect.objectContaining({ autoDelegatedAnswer: true }) }),
+    );
+    // Continued past the auto-take (more than one turn).
+    expect(mockWorkerService.runInWorker.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it('still PARKS an IMMUTABLE question without fullAutonomy (irreversible decisions stay human-owned)', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue({ ...baseSession, pendingUserQuestion: awaitingQuestion() } as any);
+
+    const result = await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Build and launch my Meta campaigns.',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 5,
+      attachments: [],
+      fullAutonomy: false,
+    });
+
+    expect((result as any).parked).toBe(true);
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion).not.toHaveBeenCalled();
+  });
+
+  it('bounds reversible auto-takes: a model that keeps re-asking eventually parks', async () => {
+    let n = 0;
+    (mockChatbotDb as any).updateSessionAskUserQuestion = jest.fn().mockResolvedValue(undefined);
+    mockChatbotDb.getChatSession.mockImplementation(async () => {
+      n++;
+      return { ...baseSession, pendingUserQuestion: { ...reversibleQuestion(), questionId: `q-${n}` } } as any;
+    });
+
+    const result = await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Refresh the B2B Meta ads intelligence.',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 20,
+      attachments: [],
+      fullAutonomy: false,
+    });
+
+    expect((result as any).parked).toBe(true);
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion.mock.calls.length).toBe(3); // MAX_AUTO_TAKES
+    expect(mockWorkerService.runInWorker.mock.calls.length).toBeLessThan(20);
+  });
+});
