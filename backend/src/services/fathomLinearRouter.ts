@@ -209,13 +209,36 @@ export function fathomKeyMarker(key: string): string {
   return `[[fathom-key:${key}]]`;
 }
 
+/**
+ * The canonical-target marker embedded in a created follow-on issue. Durably records
+ * WHICH canonical the follow-on belongs to, so redelivery repair is deterministic —
+ * it re-asserts against the recorded target instead of depending on a fresh search
+ * reproducing the original match.
+ */
+export function fathomCanonicalMarker(canonicalId: string, canonicalIdentifier: string): string {
+  return `[[fathom-canonical:${canonicalId}|${canonicalIdentifier}]]`;
+}
+
+const CANONICAL_MARKER_RE = /\[\[fathom-canonical:([^|\]]+)\|([^\]]+)\]\]/;
+
+/** Parse the recorded canonical target from an issue description, if present. */
+export function parseCanonicalMarker(description: string): { id: string; identifier: string } | null {
+  const m = (description || '').match(CANONICAL_MARKER_RE);
+  return m ? { id: m[1], identifier: m[2] } : null;
+}
+
 function meetingGrounding(meeting: FathomMeetingRef, item: ExtractedActionItem): string {
   const link = item.groundingUrl || meeting.url;
   const conf = typeof item.confidence === 'number' ? ` · confidence ${(item.confidence * 100).toFixed(0)}%` : '';
   return `Source: [${meeting.title}](${link}) (${meeting.date})${conf}`;
 }
 
-function buildIssueDescription(meeting: FathomMeetingRef, item: ExtractedActionItem, key: string): string {
+function buildIssueDescription(
+  meeting: FathomMeetingRef,
+  item: ExtractedActionItem,
+  key: string,
+  canonical?: { id: string; identifier: string },
+): string {
   const lines = [
     item.action,
     '',
@@ -227,6 +250,7 @@ function buildIssueDescription(meeting: FathomMeetingRef, item: ExtractedActionI
   if (item.nextAction) lines.push(`Next action: ${item.nextAction}`);
   if (item.doneCriteria) lines.push(`Done when: ${item.doneCriteria}`);
   lines.push('', fathomKeyMarker(key));
+  if (canonical) lines.push(fathomCanonicalMarker(canonical.id, canonical.identifier));
   return lines.join('\n');
 }
 
@@ -375,6 +399,36 @@ async function routeItem(
       // its canonical. Re-assert the relation (relateIssues is contractually
       // idempotent) so the two-phase create+relate converges instead of leaving
       // the follow-on permanently detached. Shadow mode never writes.
+      //
+      // The created issue durably records its canonical target (canonical marker),
+      // so the repair is DETERMINISTIC — it targets the recorded canonical and
+      // does not depend on a fresh search reproducing the original match.
+      if (!opts.dryRun) {
+        const recorded = parseCanonicalMarker(already.description);
+        if (recorded) {
+          try {
+            await port.relateIssues({ issueId: already.id, relatedIssueId: recorded.id });
+            report.duplicatesAvoided.push({
+              ...base,
+              identifier: already.identifier,
+              url: already.url,
+              canonicalIdentifier: recorded.identifier,
+              reason: 'already processed (idempotent); canonical relation re-asserted',
+            });
+          } catch (e) {
+            report.errors.push({
+              ...base,
+              identifier: already.identifier,
+              canonicalIdentifier: recorded.identifier,
+              reason: `idempotent hit but canonical relation re-assert failed (next redelivery retries): ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+            });
+          }
+          return;
+        }
+      }
+      // Legacy fallback (no recorded canonical marker): best-effort search-based repair.
       if (!opts.dryRun) {
         let repairCanonical: LinearCandidateIssue | null = null;
         try {
@@ -450,7 +504,10 @@ async function routeItem(
       const created = await port.createIssue({
         team: item.team,
         title: item.action,
-        description: buildIssueDescription(meeting, item, key),
+        description: buildIssueDescription(meeting, item, key, {
+          id: canonical.id,
+          identifier: canonical.identifier,
+        }),
       });
       try {
         await port.relateIssues({ issueId: created.id, relatedIssueId: canonical.id });
