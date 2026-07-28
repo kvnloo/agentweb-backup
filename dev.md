@@ -1,3 +1,27 @@
+## ENG-445: shared marketing-action contract + deterministic top-3 selector (2026-07-28)
+
+New pure module `backend/src/services/marketingActionContract.ts` — ONE typed contract for "a
+recommended marketing action" and ONE deterministic selector (`selectTopMarketingActions`, cap 3)
+for the ENG-444 "3 moves today" surfaces. Investigation findings that shaped it:
+
+- **ENG-87 campaign-health signal code does not exist in this repo** (no `campaignHealth`/
+  `healthSignal`/`struggling` module) — the contract therefore does not import a signal engine; it
+  is fed candidates by producers (ENG-446 wires existing report/run data into it).
+- **There is no `reportId` primitive anywhere in the backend.** "Source report/run ID" is an
+  opaque `sourceKind: 'report'|'run'` + `sourceId` pair, so `AW-AgentRuns` runIds, loop `RunId`s,
+  and report artifact ids all fit without a new table.
+- Shape reuse: tiers mirror `RcaRankedFix` (ai-eval-funnel), provenance mirrors loops/core
+  `MutationProposal`, stable-id + "recommendation is the product" mirrors
+  `agentMode/core/askUserQuestion.ts`; pure-module style mirrors `healthScoreService.ts`
+  (the existing top-3 tie-break precedent is `onboardingLoopApproval.ts:181`).
+- Determinism: identity = normalized sha256 of (actionType, scopeId) → duplicates collapse onto
+  one id and status changes never move it; ranking is a total order (critical/campaign tier →
+  weighted 5-factor score → per-factor tiers → id → canonical JSON), so output is invariant under
+  input permutation. Weights (5/4/3/2/1) encode the contract's stated factor order; campaign
+  priority is a hard tier that only `critical: true` overrides.
+- No consumers changed in this PR by design — ENG-446 (blocked by ENG-445) exposes canonical
+  payloads through existing report/run data.
+
 ## ENG-114: durable MCP session store so sessions resolve across instances (2026-07-21)
 
 MCP Streamable-HTTP sessions lived only in a per-process `Map` in `mcp/server/mcpServer.ts`. On a
