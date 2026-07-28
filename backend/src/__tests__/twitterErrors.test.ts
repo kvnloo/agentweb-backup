@@ -83,10 +83,12 @@ describe('describeXApiError', () => {
     expect(msg).not.toContain('HTTP');
   });
 
-  // ENG-604: HTTP 402 = the workspace's X API plan is out of credits. Reads and
-  // posts are blocked until it is topped up / upgraded. The surfaced error must
-  // point the user to where they resolve it, not just echo "credits depleted".
-  it('appends an actionable top-up hint on a 402 credits-depleted error', () => {
+  // ENG-604: HTTP 402 = AgentWeb's shared X Developer App is out of X API credits.
+  // The plan/credit balance belongs to AgentWeb (every user connects against the
+  // one shared app), NOT the end user — so the surfaced error must explain it is a
+  // platform-side limit and route them to AgentWeb support, NOT tell them to top up
+  // "their" plan or visit a Developer Portal they have no access to.
+  it('explains an AgentWeb-side credit limit on a 402 credits-depleted error', () => {
     const err = makeApiResponseError(402, {
       title: 'Payment Required',
       detail: 'credits depleted',
@@ -95,16 +97,20 @@ describe('describeXApiError', () => {
     expect(msg).toContain('Payment Required');
     expect(msg).toContain('credits depleted');
     expect(msg).toContain('402');
-    // Actionable: names the credit/top-up path and where to resolve it.
+    // Actionable AND correctly attributed: AgentWeb-side credit limit, contact support.
     expect(msg).toMatch(/credits/i);
-    expect(msg).toMatch(/top up|upgrade/i);
-    expect(msg).toMatch(/developer\.x\.com|Developer Portal/i);
+    expect(msg).toMatch(/AgentWeb/);
+    expect(msg).toMatch(/support/i);
+    // Must NOT blame the user's own X account/plan or send them to the Developer Portal.
+    expect(msg).not.toMatch(/your X \(Twitter\) API plan|your X app/i);
+    expect(msg).not.toMatch(/developer\.x\.com|Developer Portal/i);
   });
 
-  it('surfaces the top-up hint on a 402 even when the X payload is empty', () => {
+  it('surfaces the credit-limit explanation on a 402 even when the X payload is empty', () => {
     const err = makeApiResponseError(402, {});
     const msg = describeXApiError(err);
-    expect(msg).toMatch(/top up|upgrade/i);
+    expect(msg).toMatch(/AgentWeb/);
+    expect(msg).toMatch(/support/i);
     expect(msg).toContain('402');
     expect(msg).not.toBe('Request failed with code 402');
   });
@@ -112,7 +118,7 @@ describe('describeXApiError', () => {
   it('does NOT add the credit hint to non-402 errors', () => {
     const err = makeApiResponseError(403, { title: 'Forbidden', detail: 'no permission' });
     const msg = describeXApiError(err);
-    expect(msg).not.toMatch(/top up|upgrade/i);
-    expect(msg).not.toMatch(/developer\.x\.com/i);
+    expect(msg).not.toMatch(/AgentWeb's X \(Twitter\) API plan/);
+    expect(msg).not.toMatch(/contact AgentWeb support/i);
   });
 });

@@ -30,16 +30,22 @@ interface XApiErrorLike {
  * surfaced (with the HTTP status). Otherwise falls back to the error's own
  * message so nothing is ever swallowed.
  */
-// HTTP 402 (Payment Required) from the X API means the workspace's X API plan is
-// out of credits — every read (search/profile enrichment) and write (post/reply)
-// is blocked until the plan is topped up or upgraded. This is a billing limit on
-// the user's own X app, not an AgentWeb connection problem and not something a
-// retry can clear, so the surfaced error must say WHERE to resolve it. (ENG-604)
+// HTTP 402 (Payment Required) from the X API means AgentWeb's shared X Developer
+// App has run out of X API credits/usage for the current period, so every read
+// (search/profile enrichment) and write (post/reply) is blocked until AgentWeb
+// tops up or upgrades that plan. Every user connects their X *account* against
+// AgentWeb's single app (one clientId/clientSecret from the Twitter secret — see
+// getTwitterCredentials/getAppClient), so the credit balance is AgentWeb's, NOT
+// the end user's: the user has no X Developer Portal access to it and cannot
+// resolve it themselves. The surfaced error must therefore point them to AgentWeb
+// support rather than blame their own connection or send them to a portal they
+// can't act in. This is not something a retry can clear. (ENG-604)
 const X_CREDITS_HINT =
-  '. Your X (Twitter) API plan is out of credits — reads and posts are blocked ' +
-  'until you top up or upgrade your X API plan in the X Developer Portal ' +
-  '(developer.x.com → Products / Billing). This is a billing limit on your X app, ' +
-  'not an AgentWeb connection problem.';
+  ". AgentWeb's X (Twitter) API plan has run out of credits for the current " +
+  'billing period, so X reads and posts are temporarily paused until AgentWeb ' +
+  'tops up or upgrades that plan. This is a platform-side limit on AgentWeb, not ' +
+  'a problem with your connected X account — please contact AgentWeb support to ' +
+  'get X access restored.';
 
 export function describeXApiError(error: unknown): string {
   const e = error as XApiErrorLike;
@@ -72,8 +78,9 @@ export function describeXApiError(error: unknown): string {
   const base =
     error instanceof Error ? error.message : typeof error === 'string' ? error : 'Unknown error';
 
-  // A 402 with no structured payload (e.g. an empty body) must still tell the user
-  // where to resolve it rather than collapsing to a bare "Request failed with code 402".
+  // A 402 with no structured payload (e.g. an empty body) must still explain that
+  // this is an AgentWeb-side credit limit rather than collapsing to a bare
+  // "Request failed with code 402".
   if (creditsHint) return `X API error (HTTP 402): ${base}${creditsHint}`;
   return base;
 }
