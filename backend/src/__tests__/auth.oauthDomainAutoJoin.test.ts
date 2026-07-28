@@ -82,6 +82,7 @@ beforeEach(() => {
   mockOrgDb.getOrgWithPendingInviteForEmail.mockResolvedValue(null);
   mockOrgDb.getOrgsWithAutoJoinDomain.mockResolvedValue([]);
   (mockOrgDb as any).updateOrg.mockResolvedValue(undefined);
+  (mockOrgDb as any).addPendingDomainJoinRequest.mockResolvedValue(undefined);
   mockEmailService.sendTeamIntroductionEmail.mockResolvedValue(undefined as any);
 });
 
@@ -103,6 +104,41 @@ describe('googleCallback — domain auto-join requests (customer portal, new use
     expect(mockOrgDb.getOrgsWithAutoJoinDomain).not.toHaveBeenCalled();
   });
 
+  it('does not re-run the domain-match hook when an existing standalone user logs in again (Greptile review — was creating a duplicate request + email on every login)', async () => {
+    const email = 'existingstandalone@acmecorp.com';
+    const existingUser = {
+      userId: 'user-existing-oauth',
+      email,
+      displayName: 'Existing Standalone',
+      roles: ['customer'],
+      isOAuthUser: true,
+      isAdmin: false,
+      password: 'placeholder',
+      isActive: true,
+      orgId: undefined,
+      pendingOrgInvite: undefined,
+      createdAt: new Date().toISOString(),
+    };
+    // The user already exists — getUserByEmail returns it, so googleCallback
+    // takes the existing-user path and never calls createUser.
+    mockUserDb.getUserByEmail.mockResolvedValue(existingUser as any);
+    mockOrgDb.getOrgsWithAutoJoinDomain.mockResolvedValue([
+      { orgId: 'org-domain', autoJoinEnabled: true, autoJoinDomain: 'acmecorp.com', pendingDomainJoinRequests: [] } as any,
+    ]);
+
+    const profile = createMockProfile(email, 'Existing Standalone');
+    const req = createMockRequest('customer');
+    const done = createMockDone();
+
+    await googleCallback(req as Request, 'access-token', 'refresh-token', profile, done);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(mockUserDb.createUser).not.toHaveBeenCalled();
+    expect(mockOrgDb.getOrgsWithAutoJoinDomain).not.toHaveBeenCalled();
+    expect(mockOrgDb.addPendingDomainJoinRequest).not.toHaveBeenCalled();
+    expect(mockEmailService.sendEmail).not.toHaveBeenCalled();
+  });
+
   it('does not create a domain-join request when no org has auto-join enabled for the domain', async () => {
     const email = 'newcustomer@acmecorp.com';
     const userId = 'user-oauth-1';
@@ -118,7 +154,7 @@ describe('googleCallback — domain auto-join requests (customer portal, new use
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(mockOrgDb.getOrgsWithAutoJoinDomain).toHaveBeenCalledWith('acmecorp.com');
-    expect(mockOrgDb.updateOrg).not.toHaveBeenCalled();
+    expect(mockOrgDb.addPendingDomainJoinRequest).not.toHaveBeenCalled();
     expect(mockEmailService.sendEmail).not.toHaveBeenCalled();
   });
 
@@ -144,7 +180,7 @@ describe('googleCallback — domain auto-join requests (customer portal, new use
 
     // Explicit invite wins — the domain-match lookup should never even run.
     expect(mockOrgDb.getOrgsWithAutoJoinDomain).not.toHaveBeenCalled();
-    expect(mockOrgDb.updateOrg).not.toHaveBeenCalled();
+    expect(mockOrgDb.addPendingDomainJoinRequest).not.toHaveBeenCalled();
   });
 
   it('creates a pending domain-join request and emails the org owner on a matching domain', async () => {
@@ -179,13 +215,9 @@ describe('googleCallback — domain auto-join requests (customer portal, new use
     await googleCallback(req as Request, 'access-token', 'refresh-token', profile, done);
     await new Promise((resolve) => setImmediate(resolve));
 
-    expect(mockOrgDb.updateOrg).toHaveBeenCalledWith(
+    expect(mockOrgDb.addPendingDomainJoinRequest).toHaveBeenCalledWith(
       'org-domain',
-      expect.objectContaining({
-        pendingDomainJoinRequests: expect.arrayContaining([
-          expect.objectContaining({ userId, email }),
-        ]),
-      })
+      expect.objectContaining({ userId, email })
     );
     expect(mockEmailService.sendEmail).toHaveBeenCalledTimes(1);
   });
@@ -223,13 +255,9 @@ describe('googleCallback — domain auto-join requests (customer portal, new use
     await googleCallback(req as Request, 'access-token', 'refresh-token', profile, done);
     await new Promise((resolve) => setImmediate(resolve));
 
-    expect(mockOrgDb.updateOrg).toHaveBeenCalledWith(
+    expect(mockOrgDb.addPendingDomainJoinRequest).toHaveBeenCalledWith(
       'org-genius',
-      expect.objectContaining({
-        pendingDomainJoinRequests: expect.arrayContaining([
-          expect.objectContaining({ userId, email }),
-        ]),
-      })
+      expect.objectContaining({ userId, email })
     );
   });
 });

@@ -37,12 +37,11 @@ async function createDomainJoinRequestsForNewUser(userId: string, email: string)
     // organization" rather than a phantom double-join.
     for (const org of matchingOrgs) {
       const requestToken = crypto.randomBytes(32).toString("hex");
-      const pendingRequests = org.pendingDomainJoinRequests || [];
-      await orgDb.updateOrg(org.orgId, {
-        pendingDomainJoinRequests: [
-          ...pendingRequests,
-          { userId, email: email.toLowerCase(), requestedAt: new Date().toISOString(), requestToken },
-        ],
+      await orgDb.addPendingDomainJoinRequest(org.orgId, {
+        userId,
+        email: email.toLowerCase(),
+        requestedAt: new Date().toISOString(),
+        requestToken,
       });
 
       const ownerUser = await userDb.getUserById(org.ownerUserId);
@@ -360,6 +359,12 @@ export const googleCallback = async (
     email = email.toLowerCase();
 
     let user = await userDb.getUserByEmail(email);
+    // Captured before either creation branch below reassigns `user` — this is
+    // the one reliable signal that this account didn't exist before this
+    // call. Without it, the domain-join hook further down would re-fire on
+    // every future login by an existing standalone user, spamming duplicate
+    // requests/emails to the org owner each time they log in.
+    const isNewUser = !user;
 
     const portalOrigin = (req.query.state as string) || "partner";
 
@@ -505,7 +510,7 @@ export const googleCallback = async (
     // For newly created users: check if a pending org invite exists for this email
     // and stamp it so ProtectedRoute redirects them to accept-invite instead of onboarding.
     // An explicit invite always wins over a domain match.
-    if (user && !user.orgId && !user.pendingOrgInvite) {
+    if (user && isNewUser && !user.orgId && !user.pendingOrgInvite) {
       let hasPendingInvite = false;
       try {
         const pendingOrg = await orgDb.getOrgWithPendingInviteForEmail(email);
