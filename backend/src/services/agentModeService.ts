@@ -27294,6 +27294,26 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
+      // ENG-660: a personal LinkedIn profile's existing post/comment history is
+      // NOT readable through the connection — the LinkedIn API does not expose it
+      // to connected apps, so only posts AgentWeb itself published (stored
+      // locally) are ever returned here. When there are none, a bare
+      // "Successfully loaded 0 posts" led the model to claim the fetch of the
+      // user's posts succeeded (a tool-success hallucination). Report zero posts
+      // on a personal account as an unsupported read, not an empty-but-successful
+      // fetch, so the model states the truth instead of implying it read the
+      // user's LinkedIn.
+      const accountType = (matchingAccount.config as any)?.account_type;
+      if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
+        return {
+          success: true,
+          organicReadUnsupported: true,
+          posts: [],
+          message:
+            'No posts are readable for this personal LinkedIn account. LinkedIn does not expose a personal profile\'s existing post/comment history to connected apps — only posts published through AgentWeb are stored and returned here, and there are none yet. This is a platform limitation, not a transient failure, so do NOT retry. Do NOT claim you have read or analyzed the user\'s LinkedIn posts. To work from their real content, ask them to paste/upload their posts, or connect a LinkedIn company page (which does support reading posts).',
+        };
+      }
+
       return {
         success: true,
         message: `Successfully loaded ${result.posts.length} posts`,
