@@ -158,6 +158,34 @@ function pruneAllExpired(now: number): void {
   earliestSettledExpiry = nextSettledExpiry;
 }
 
+/**
+ * At aggregate capacity, admitting a new report evicts the oldest SETTLED replay entry rather
+ * than rejecting an unrelated user's filing — other tenants' replay state must never consume a
+ * user's right to file. Evicting a settled entry only weakens replay suppression for that one
+ * already-completed report (its later retry re-files); it never loses an in-flight filing.
+ * Pending entries are never evicted — they are the authoritative in-flight filings — so an
+ * all-pending registry still fails closed as genuine overload. Runs only on the rare
+ * blocked-admission path; ordinary requests still touch only their own scope.
+ */
+function evictOldestSettled(): boolean {
+  let oldestScope: string | undefined;
+  let oldestReports: Map<string, TrackedReport> | undefined;
+  let oldestFingerprint: string | undefined;
+  let oldestEntry: TrackedReport | undefined;
+  for (const [scope, trackedByFingerprint] of trackedByScope) {
+    for (const [fingerprint, entry] of trackedByFingerprint) {
+      if (entry.settled && (!oldestEntry || entry.at < oldestEntry.at)) {
+        oldestScope = scope;
+        oldestReports = trackedByFingerprint;
+        oldestFingerprint = fingerprint;
+        oldestEntry = entry;
+      }
+    }
+  }
+  if (!oldestScope || !oldestReports || !oldestFingerprint || !oldestEntry) return false;
+  return deleteTrackedReport(oldestScope, oldestReports, oldestFingerprint, oldestEntry);
+}
+
 function reportsForScope(scope: string): Map<string, TrackedReport> {
   let reports = trackedByScope.get(scope);
   if (!reports) {
@@ -256,7 +284,9 @@ export async function fileReportOnce<T>(
   ) {
     pruneAllExpired(now);
   }
-  if (trackedReportCount >= MAX_TRACKED_REPORTS_TOTAL) {
+  if (trackedReportCount >= MAX_TRACKED_REPORTS_TOTAL && !evictOldestSettled()) {
+    // Every tracked entry is an in-flight filing: this is genuine overload, not
+    // replay bookkeeping, so the caller gets the explicit retryable response.
     throw new ReportReplayCapacityError();
   }
 
