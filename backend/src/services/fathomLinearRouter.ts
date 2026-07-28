@@ -370,6 +370,45 @@ async function routeItem(
     // Idempotency rail: already processed this exact item → no-op, never a duplicate.
     const already = await port.findByFathomKey(key);
     if (already) {
+      // Relation durability: a redelivery may be retrying a run that created the
+      // follow-on issue (marker embedded) but crashed/failed before relating it to
+      // its canonical. Re-assert the relation (relateIssues is contractually
+      // idempotent) so the two-phase create+relate converges instead of leaving
+      // the follow-on permanently detached. Shadow mode never writes.
+      if (!opts.dryRun) {
+        let repairCanonical: LinearCandidateIssue | null = null;
+        try {
+          const candidates = (
+            await port.searchIssues({
+              teams: ALL_TEAMS,
+              query: buildSearchQuery(meeting, item),
+              limit: opts.searchLimit,
+            })
+          ).filter((c) => c.id !== already.id); // never match the created issue itself
+          repairCanonical = matchCanonical(meeting, item, candidates);
+          if (repairCanonical && isDistinctFollowOn(item, repairCanonical)) {
+            await port.relateIssues({ issueId: already.id, relatedIssueId: repairCanonical.id });
+            report.duplicatesAvoided.push({
+              ...base,
+              identifier: already.identifier,
+              url: already.url,
+              canonicalIdentifier: repairCanonical.identifier,
+              reason: 'already processed (idempotent); canonical relation re-asserted',
+            });
+            return;
+          }
+        } catch (e) {
+          report.errors.push({
+            ...base,
+            identifier: already.identifier,
+            canonicalIdentifier: repairCanonical?.identifier,
+            reason: `idempotent hit but canonical relation re-assert failed (next redelivery retries): ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          });
+          return;
+        }
+      }
       report.duplicatesAvoided.push({
         ...base,
         identifier: already.identifier,
@@ -413,7 +452,23 @@ async function routeItem(
         title: item.action,
         description: buildIssueDescription(meeting, item, key),
       });
-      await port.relateIssues({ issueId: created.id, relatedIssueId: canonical.id });
+      try {
+        await port.relateIssues({ issueId: created.id, relatedIssueId: canonical.id });
+      } catch (e) {
+        // The issue WAS created (marker embedded) but relating failed. Reconcile
+        // honestly — created identifier + intended canonical — and let the next
+        // redelivery re-assert the relation via the idempotency-hit repair path.
+        report.errors.push({
+          ...base,
+          identifier: created.identifier,
+          url: created.url,
+          canonicalIdentifier: canonical.identifier,
+          reason: `issue created but relating to canonical failed (redelivery re-asserts): ${
+            e instanceof Error ? e.message : String(e)
+          }`,
+        });
+        return;
+      }
       report.related.push({ ...base, identifier: created.identifier, url: created.url, canonicalIdentifier: canonical.identifier });
       return;
     }
