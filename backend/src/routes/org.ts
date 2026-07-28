@@ -4,6 +4,7 @@ import { userDb, orgDb, Organization } from "../services/db";
 import { defaultShareSettings } from "../services/orgShareService";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
+import { isCompanyEmail } from "../utils/validation";
 
 const router = Router();
 
@@ -142,11 +143,6 @@ router.post("/", async (req: Request, res: Response) => {
       // default). Without this, new orgs had no shareSettings and default-on
       // features silently fell through to "off" for plain members.
       shareSettings: defaultShareSettings(),
-      // Auto-join is on by default (owners can turn it off) — domain-matched
-      // signups still always require owner approval per request, so this
-      // doesn't weaken the safety model, just removes an extra opt-in step.
-      autoJoinEnabled: true,
-      autoJoinDomain: deriveDomainFromEmail(user.email),
       createdAt: now,
       updatedAt: now,
     };
@@ -236,6 +232,11 @@ router.put("/:orgId", async (req: Request, res: Response) => {
     if (updates.autoJoinEnabled !== undefined) {
       if (updates.autoJoinEnabled) {
         const ownerEmail = (req as AuthenticatedRequest).user?.email || "";
+        if (!isCompanyEmail(ownerEmail)) {
+          return res.status(400).json({
+            error: "Auto-join can't be enabled for a personal email domain.",
+          });
+        }
         const domain = deriveDomainFromEmail(ownerEmail);
         if (!domain) {
           return res.status(400).json({ error: "Could not determine your email domain" });
