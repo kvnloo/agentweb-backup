@@ -30,9 +30,22 @@ interface XApiErrorLike {
  * surfaced (with the HTTP status). Otherwise falls back to the error's own
  * message so nothing is ever swallowed.
  */
+// HTTP 402 (Payment Required) from the X API means the workspace's X API plan is
+// out of credits — every read (search/profile enrichment) and write (post/reply)
+// is blocked until the plan is topped up or upgraded. This is a billing limit on
+// the user's own X app, not an AgentWeb connection problem and not something a
+// retry can clear, so the surfaced error must say WHERE to resolve it. (ENG-604)
+const X_CREDITS_HINT =
+  '. Your X (Twitter) API plan is out of credits — reads and posts are blocked ' +
+  'until you top up or upgrade your X API plan in the X Developer Portal ' +
+  '(developer.x.com → Products / Billing). This is a billing limit on your X app, ' +
+  'not an AgentWeb connection problem.';
+
 export function describeXApiError(error: unknown): string {
   const e = error as XApiErrorLike;
   const data = e?.data;
+  const code = typeof e?.code === 'number' ? e.code : undefined;
+  const creditsHint = code === 402 ? X_CREDITS_HINT : '';
 
   if (data && typeof data === 'object') {
     const parts: string[] = [];
@@ -51,12 +64,16 @@ export function describeXApiError(error: unknown): string {
 
     const detail = parts.filter(Boolean).join(' — ');
     if (detail) {
-      const code = typeof e.code === 'number' ? ` (HTTP ${e.code})` : '';
-      return `X API error${code}: ${detail}`;
+      const codeStr = code !== undefined ? ` (HTTP ${code})` : '';
+      return `X API error${codeStr}${': '}${detail}${creditsHint}`;
     }
   }
 
-  if (error instanceof Error) return error.message;
-  if (typeof error === 'string') return error;
-  return 'Unknown error';
+  const base =
+    error instanceof Error ? error.message : typeof error === 'string' ? error : 'Unknown error';
+
+  // A 402 with no structured payload (e.g. an empty body) must still tell the user
+  // where to resolve it rather than collapsing to a bare "Request failed with code 402".
+  if (creditsHint) return `X API error (HTTP 402): ${base}${creditsHint}`;
+  return base;
 }
