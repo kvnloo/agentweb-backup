@@ -137,6 +137,10 @@ router.post("/", async (req: Request, res: Response) => {
       name: name.trim(),
       ownerUserId: userId,
       maxMembers: orgDb.ORG_MAX_MEMBERS,
+      // The owner is the org's first member. Seeded directly (no transaction
+      // needed — this org doesn't exist in the table until this exact call,
+      // so there's no concurrent joiner to race against).
+      memberCount: 1,
       pendingInvites: [],
       // Seed sharing defaults at creation so the toggle UI and member-fanout
       // gating agree from day one (skills + work plans shared org-wide by
@@ -390,23 +394,29 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Invalid or expired invitation" });
     }
 
-    // Check member count (race condition guard)
-    const memberCount = await orgDb.getOrgMemberCount(orgId);
-    if (memberCount >= org.maxMembers) {
+    // Add user to org first — atomic (memberCount increment + orgId write in
+    // one transaction, see joinOrgWithCapacityCheck) so two concurrent
+    // accepts/approvals can never both squeeze into the last slot. We
+    // intentionally do NOT snapshot the owner's subscription tier onto the
+    // member here — the org's effective tier is resolved dynamically from
+    // the owner at read time (getUserSubscriptionType), which keeps members
+    // in sync with owner up/downgrades and auto-revokes entitlements when
+    // they leave. See ENG-288.
+    const joinResult = await userDb.joinOrgWithCapacityCheck(userId, orgId, "member", org.maxMembers);
+    if (joinResult === "org_full") {
       return res.status(400).json({ error: "Organization is full" });
     }
+    if (joinResult === "already_in_org") {
+      return res.status(400).json({ error: "You are already in an organization. Leave your current org first." });
+    }
 
-    // Remove the invite and update org
+    // Only remove the invite once the join actually succeeded — removing it
+    // first would silently drop the invite if the atomic join lost the race.
+    // (joinOrgWithCapacityCheck's transaction already cleared pendingOrgInvite
+    // on the user as part of the atomic write.)
     const updatedInvites = [...pendingInvites];
     updatedInvites.splice(inviteIndex, 1);
     await orgDb.updateOrg(orgId, { pendingInvites: updatedInvites });
-
-    // Add user to org and clear the pending invite stamp. We intentionally do
-    // NOT snapshot the owner's subscription tier onto the member here — the org's
-    // effective tier is resolved dynamically from the owner at read time
-    // (getUserSubscriptionType), which keeps members in sync with owner up/
-    // downgrades and auto-revokes entitlements when they leave. See ENG-288.
-    await userDb.updateUser(userId, { orgId, orgRole: "member", pendingOrgInvite: null });
 
     return res.json({ success: true, message: "Successfully joined the organization" });
   } catch (error) {
@@ -436,9 +446,13 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
       return res.status(400).json({ error: "Invalid or unknown domain-join request" });
     }
 
-    // Re-check the requester hasn't already joined a different org in the
-    // meantime (can happen if the domain matched multiple orgs and another
-    // owner approved first — one-org-per-user is enforced here).
+    // Cheap early exit — the authoritative check is the atomic transaction
+    // below (joinOrgWithCapacityCheck), which closes both: (1) the same user
+    // joining twice if the domain matched multiple orgs and another owner
+    // approved first, and (2) two different users both squeezing into the
+    // last slot when the org is nearly full. Neither race is closeable by a
+    // separate read-then-write, however early — see the function's doc
+    // comment.
     const targetUser = await userDb.getUserById(requestEntry.userId);
     if (!targetUser) {
       return res.status(404).json({ error: "The requesting user no longer exists" });
@@ -447,24 +461,16 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
       return res.status(400).json({ error: "This user is already in an organization" });
     }
 
-    // Check member count (race condition guard) — fail loud, never a silent drop.
-    const memberCount = await orgDb.getOrgMemberCount(orgId);
-    if (memberCount >= org.maxMembers) {
+    // Only remove the request from this org's pending list once the join
+    // actually succeeds — removing it first would silently drop the request
+    // if the atomic join loses the race, with no way to retry.
+    const joinResult = await userDb.joinOrgWithCapacityCheck(requestEntry.userId, orgId, "member", org.maxMembers);
+    if (joinResult === "org_full") {
       return res.status(400).json({
         error: `Organization has reached the maximum of ${org.maxMembers} members. Upgrade to add more.`,
       });
     }
-
-    // Add the user to the org first — joinOrgIfUnassigned is the
-    // authoritative, atomic check (the plain targetUser.orgId check above is
-    // just a cheap early exit; without the ConditionExpression inside it, two
-    // concurrent approvals for the same user from different orgs can both
-    // pass that early check before either write lands). Only remove the
-    // request from this org's pending list once the join actually succeeds —
-    // removing it first would silently drop the request if the atomic join
-    // loses the race, with no way to retry.
-    const joined = await userDb.joinOrgIfUnassigned(requestEntry.userId, orgId, "member");
-    if (!joined) {
+    if (joinResult === "already_in_org") {
       return res.status(400).json({ error: "This user is already in an organization" });
     }
 
@@ -572,7 +578,7 @@ router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) =
       return res.status(404).json({ error: "Member not found in this organization" });
     }
 
-    await userDb.updateUser(memberId, { orgId: null as any, orgRole: null as any });
+    await userDb.clearOrgMembership(memberId);
     return res.json({ success: true, message: "Member removed" });
   } catch (error) {
     console.error("Error removing member:", error);
@@ -600,7 +606,7 @@ router.post("/:orgId/leave", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "You are not a member of this organization" });
     }
 
-    await userDb.updateUser(userId, { orgId: null as any, orgRole: null as any });
+    await userDb.clearOrgMembership(userId);
     return res.json({ success: true, message: "Left the organization" });
   } catch (error) {
     console.error("Error leaving organization:", error);
