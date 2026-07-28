@@ -35,6 +35,7 @@ import {
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
@@ -3483,6 +3484,10 @@ export const agentModeController = {
         }
       }
 
+      // ENG-510: stamp when this turn's generation began so that, if the whole-turn cap
+      // kills it mid-flight, we count only the media THIS turn saved (not prior turns').
+      const turnStartMs = Date.now();
+
       // Capture the generation promise so the durable path can reattach to it if the
       // run times out while the work is still going (it keeps running detached).
       const genPromise = generateSessionResponse(
@@ -3557,6 +3562,40 @@ export const agentModeController = {
           console.log(`AgentMode: generation timed out for session ${sessionId} — cancelling orphaned worker run`);
           requestCancel(sessionId);
           generateMarketingResponseWorkerService.cancelSession(sessionId);
+
+          // ENG-510: the cap can fire AFTER one or more image variants already finished
+          // and were saved (synchronous image-generated markers). A bare 504 there hides
+          // that finished work and leaves the user with no idea that "continue" will
+          // complete the rest. If this turn delivered >= 1 image, persist a clear
+          // partial-delivery message and return it (200) instead — Emma then resumes ONLY
+          // the still-missing assets on "continue" (it sees the saved markers in history).
+          // Non-media timeouts fall through to the existing 504 unchanged.
+          try {
+            // ENG-510: strongly consistent read — a marker written moments before the cap
+            // fired must not be missed by an eventually-consistent read (which would drop
+            // to a bare 504 despite a completed, saved image).
+            const timedOutSession = await chatbotDb.getChatSession(sessionId, true);
+            const timeoutImages = collectMediaGeneratedSince(timedOutSession?.messages, turnStartMs);
+            const continuationMsg = buildTimeoutContinuationMessage(timeoutImages);
+            if (continuationMsg) {
+              markProgressComplete(sessionId);
+              await chatbotDb.addMessageToSession(sessionId, {
+                role: 'assistant',
+                content: continuationMsg,
+                timestamp: new Date().toISOString(),
+                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+              }).catch((persistErr) =>
+                console.error('AgentMode: failed to persist timeout continuation message:', persistErr),
+              );
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_media' });
+              }
+              res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+              return;
+            }
+          } catch (continuationErr) {
+            console.error('AgentMode: partial-media timeout continuation failed (falling through to 504):', continuationErr);
+          }
         }
         throw genErr; // preserve existing error handling (returns 504 GENERATION_TIMEOUT)
       }
@@ -4259,6 +4298,8 @@ export const agentModeController = {
 
   // Generate response for shared conversation (with conversable token)
   async generateSharedResponse(req: Request, res: Response) {
+    // ENG-510: declared before the try so the catch's partial-timeout branch can read it.
+    let sharedTurnStartMs = Date.now();
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
@@ -4321,6 +4362,9 @@ export const agentModeController = {
         ip: req.ip || (req.headers?.['x-forwarded-for'] as string | undefined)?.split(',')[0].trim(),
         userAgent: req.headers?.['user-agent'] as string | undefined,
       };
+      // ENG-510: stamp when this turn began so a whole-turn-cap kill can count only the
+      // media THIS turn saved (see the partial-delivery branch in the catch below).
+      sharedTurnStartMs = Date.now();
       const response = await withGenerationTimeout(
         generateSessionResponse(
           session.sessionId,
@@ -4367,11 +4411,45 @@ export const agentModeController = {
         markProgressComplete(shareId);
       }
 
+      // ENG-510: a timeout that already saved >=1 image is a PARTIAL SUCCESS, not an
+      // error. Persist the finished images inline (markdown → rendered in-thread) plus a
+      // "continue" prompt instead of a generic error, so the user actually receives the
+      // completed work on reload even if a retry keeps timing out. Additive: only replaces
+      // the error message on a media-bearing timeout; every other failure is unchanged.
+      let handledPartialTimeout = false;
+      if (shareId && (error as any)?.isGenerationTimeout) {
+        try {
+          // ENG-510: strongly consistent read so a marker written just before the cap is
+          // not missed (see the regular /generate path above).
+          const timedOutSession = await chatbotDb.getChatSession(shareId, true);
+          const timeoutImages = collectMediaGeneratedSince(timedOutSession?.messages, sharedTurnStartMs);
+          const continuationMsg = buildTimeoutContinuationMessage(timeoutImages);
+          if (continuationMsg) {
+            await chatbotDb.addMessageToSession(shareId, {
+              role: 'assistant',
+              content: continuationMsg,
+              timestamp: new Date().toISOString(),
+              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+            });
+            handledPartialTimeout = true;
+            // ENG-510: return the partial delivery as a normal 200 (mirrors the regular
+            // /generate path) instead of falling through to the 504 GENERATION_TIMEOUT
+            // below — a partial SUCCESS must not reach the live caller as a bare timeout.
+            // Progress was already completed above; the session lock is released in the
+            // inner finally, so this early return is safe.
+            res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+            return;
+          }
+        } catch (persistErr) {
+          console.error('AgentMode: shared partial-media timeout continuation failed (falling back to error message):', persistErr);
+        }
+      }
+
       // Persist an error message to the session so the user sees feedback on reload.
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
-      if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
+      if (!handledPartialTimeout && shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {

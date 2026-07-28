@@ -56,6 +56,7 @@ import {
   imageGenerationCostUsd,
   videoGenerationCostUsd,
 } from '../utils/llmPricing';
+import { normalizeImageModel } from './imageGeneration';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import {
@@ -2693,15 +2694,21 @@ export class AgentModeService {
   }
 
   private getImageGenerationFallbackModel(
-    primaryModel: string | undefined,
+    currentModel: string | undefined,
     inputImages: string[] | undefined,
-    logoImage: string | undefined
+    logoImage: string | undefined,
+    modelExplicitlyChosen: boolean = false
   ): string | undefined {
     // Keep generation fallback narrow. Telemetry showed the painful cases were
     // product-fidelity workflows and explicit model choices; silently switching
     // providers there changes output semantics. Only recover when the caller left
     // model selection to us and the request is fresh text-to-image.
-    if (primaryModel) {
+    //
+    // ENG-510: gate on whether the model was an explicit per-request choice — NOT
+    // merely on a model string being present. The admin-configured default is
+    // resolved to a concrete id before generation, but that is a system default,
+    // not a user choice, so a transient timeout on it must still fail over.
+    if (modelExplicitlyChosen) {
       return undefined;
     }
 
@@ -2710,8 +2717,13 @@ export class AgentModeService {
       return undefined;
     }
 
+    // Pick the first alternate that isn't the model we just failed on (compare on
+    // the normalized id so e.g. the legacy "...-preview" alias matches its GA id).
+    const normalizedCurrent = normalizeImageModel(currentModel);
     const fallbackOrder = ['gpt-image-2', 'gemini-3.1-flash-image', 'gemini-2.5-flash-image'];
-    return fallbackOrder[0];
+    return fallbackOrder.find(
+      (model) => model !== currentModel && model !== normalizedCurrent
+    );
   }
 
   private getVisionFallbackModel(primaryModel: string): string | undefined {
@@ -3048,6 +3060,20 @@ export class AgentModeService {
       const mediaBudgetMs = parseInt(process.env.AGENT_MODE_MEDIA_BUDGET_MS || '420000', 10);
       const mediaGenerationDeadlineMs = mediaBudgetMs > 0 ? Date.now() + mediaBudgetMs : undefined;
       let mediaAssetsProducedThisRun = 0;
+      // ENG-510: the fixed soft budget above assumed fast images and leaves only ~3 min
+      // of headroom below the controller's 10-min whole-turn hard cap. A single slow
+      // high-quality image can take ~6–7 min, so the next variant slips past the fixed
+      // deadline and runs past the cap — losing the already-generated variants. Give the
+      // dispatcher the hard-cap deadline + the longest media latency seen this run so it
+      // can also defer when there isn't time left for one more call. Mirror the soft
+      // budget's disable switch (off when AGENT_MODE_MEDIA_BUDGET_MS=0).
+      const generationTimeoutMs = parseInt(process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000', 10);
+      const generationHardCapMs = mediaBudgetMs > 0 ? Date.now() + generationTimeoutMs : undefined;
+      let longestMediaCallMsThisRun = 0;
+      // ENG-510: accumulate dedupe keys of media-gen calls that produced an asset, across
+      // iterations of this turn, so the dispatcher can suppress an identical re-request in a
+      // later iteration (e.g. resuming after a timeout) instead of regenerating the image.
+      const mediaCallKeysThisRun = new Map<string, string>();
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
@@ -3485,6 +3511,9 @@ export class AgentModeService {
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
           mediaGenerationDeadlineMs,
           mediaAssetsProducedThisRun,
+          generationHardCapMs,
+          longestMediaCallMsThisRun,
+          priorMediaCallKeys: mediaCallKeysThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -3524,6 +3553,16 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-510: carry the run-wide longest media-call latency forward so the next
+        // iteration's adaptive hard-cap reserve uses real observed durations.
+        longestMediaCallMsThisRun = Math.max(longestMediaCallMsThisRun, dispatchResult.longestMediaCallMs ?? 0);
+        // ENG-510: fold this iteration's produced media keys into the run-wide set so the
+        // next iteration suppresses an identical regenerate-the-same-image re-request.
+        if (dispatchResult.producedMediaCallKeys) {
+          for (const [key, id] of dispatchResult.producedMediaCallKeys) {
+            if (!mediaCallKeysThisRun.has(key)) mediaCallKeysThisRun.set(key, id);
+          }
+        }
 
         // Send progress update after all tools complete.
         // Only send tool calls added in this iteration — the frontend accumulates
@@ -4150,12 +4189,8 @@ export class AgentModeService {
     // not the cause — the user was nudging a flow that kept looping. The real driver was
     // this regenerate-from-scratch-after-timeout loop; surfacing already-made assets is
     // what actually breaks it.
-    if (includeResumeGuidance && Array.isArray(generatedImageFilenames) && generatedImageFilenames.length > 0) {
-      workPlanContent += `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them UNLESS the user explicitly asks to regenerate, restart, redo, or change them. Otherwise only generate the images that are still missing.\n`;
-      for (const filename of generatedImageFilenames) {
-        workPlanContent += `   - ${filename}\n`;
-      }
-      workPlanContent += `\n`;
+    if (includeResumeGuidance) {
+      workPlanContent += AgentModeService.buildGeneratedAssetsAwarenessText(generatedImageFilenames);
     }
 
     workPlan.steps.forEach((step: any) => {
@@ -4221,6 +4256,25 @@ export class AgentModeService {
       filenames.push(filename);
     }
     return filenames;
+  }
+
+  /**
+   * ENG-510: the shared "already-generated assets" awareness block. Lists images already
+   * saved this session so the model regenerates ONLY what is still missing after a
+   * mid-batch timeout — INCLUDING an image that completed in the orphaned worker AFTER the
+   * whole-turn cap fired (that image's marker lands in history but was never in any
+   * assistant toolCalls stamp). Returns '' when there is nothing to surface. Used both
+   * inside a work plan and standalone for plain multi-image requests, which have no work
+   * plan (the reported ENG-510 scenario — multiple ad-illustration variants).
+   */
+  public static buildGeneratedAssetsAwarenessText(generatedImageFilenames?: string[]): string {
+    if (!Array.isArray(generatedImageFilenames) || generatedImageFilenames.length === 0) return '';
+    let text = `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them UNLESS the user explicitly asks to regenerate, restart, redo, or change them. Otherwise only generate the images that are still missing.\n`;
+    for (const filename of generatedImageFilenames) {
+      text += `   - ${filename}\n`;
+    }
+    text += `\n`;
+    return text;
   }
 
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
@@ -4382,6 +4436,18 @@ export class AgentModeService {
     if (workPlan) {
       const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
       messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames));
+    } else {
+      // ENG-510: even WITHOUT a work plan (plain multi-image requests — the reported
+      // scenario), a run that timed out mid-batch leaves already-generated images in
+      // history. On the "continue" turn the model must be told which images already
+      // exist so it regenerates ONLY the missing ones — otherwise an image that
+      // completed in the orphaned worker AFTER the cap (its marker present, but no
+      // toolCalls stamp and not named in the continuation message) gets redone.
+      const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
+      const assetAwarenessText = AgentModeService.buildGeneratedAssetsAwarenessText(generatedImageFilenames);
+      if (assetAwarenessText) {
+        messages.push({ role: 'assistant', content: assetAwarenessText });
+      }
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
@@ -21499,6 +21565,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // ENG-510: distinguish an LLM-specified model from a system-resolved default.
+      // Only a genuine per-request choice should suppress the transient-timeout
+      // fallback; the admin-configured default is a system preference, not a
+      // semantic lock, so a timeout on it must still fail over to another provider
+      // instead of delivering zero images. Resolving the default here (rather than
+      // in the tool handler) preserves that distinction end-to-end.
+      const modelExplicitlyChosen = typeof imageModel === 'string' && imageModel.trim().length > 0;
+      const resolvedImageModel = modelExplicitlyChosen
+        ? imageModel
+        : await this.getImageApiDefaultModel();
+
       const inputImagesForRequest = inputImages || [];
       const primaryRequest = {
         prompt,
@@ -21508,11 +21585,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         inputImages: inputImagesForRequest,
         logoImage,
         userId,
-        imageModel
+        imageModel: resolvedImageModel
       };
 
       let result: any;
-      let imageModelUsed = imageModel || 'gemini-3-pro-image-preview';
+      let imageModelUsed = resolvedImageModel || 'gemini-3-pro-image-preview';
       let fallbackUsed = false;
       let primaryError: string | undefined;
 
@@ -21520,7 +21597,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         result = await imageService.generateImage(primaryRequest);
       } catch (primaryFailure: any) {
         primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
-        const fallbackModel = this.getImageGenerationFallbackModel(imageModel, inputImagesForRequest, logoImage);
+        const fallbackModel = this.getImageGenerationFallbackModel(resolvedImageModel, inputImagesForRequest, logoImage, modelExplicitlyChosen);
         if (!fallbackModel || !this.isRetryableMediaToolError(primaryError)) {
           throw primaryFailure;
         }
@@ -21555,7 +21632,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       if (!(result.success && result.imageUrl) && !fallbackUsed) {
         primaryError = result.error || 'Failed to generate image';
-        const fallbackModel = this.getImageGenerationFallbackModel(imageModel, inputImagesForRequest, logoImage);
+        const fallbackModel = this.getImageGenerationFallbackModel(resolvedImageModel, inputImagesForRequest, logoImage, modelExplicitlyChosen);
         if (fallbackModel && this.isRetryableMediaToolError(primaryError)) {
           console.warn(
             `AgentMode: Image generation with "${imageModelUsed}" failed with a retryable error; trying fallback "${fallbackModel}":`,
@@ -21615,7 +21692,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Stable marker so extractGeneratedImageFilenames can detect generated
               // images without relying solely on the content-string format.
               kind: 'image-generated',
-              imageFilename: result.filename
+              imageFilename: result.filename,
+              // ENG-510: carry the URL on this immediately-persisted marker so a completed
+              // image is discoverable (scanMessagesForAssets) even if the whole-turn cap
+              // kills the turn before the end-of-turn toolCalls stamp runs — graceful
+              // partial delivery instead of losing finished work. De-duped by URL.
+              imageUrl: result.imageUrl
             }
           });
         } catch (error) {
