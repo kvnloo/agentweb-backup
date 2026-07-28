@@ -72,6 +72,16 @@ describe('scheduledRunPreviewedWithoutExecute — per-list preview→execute det
     expect(scheduledRunPreviewedWithoutExecute(toolCalls)).toBe(true);
   });
 
+  it('fires when the execute ERRORED even though it reports a processedCount (error wins)', () => {
+    // Defensive: a call flagged as errored must not close the gap even if a partial
+    // result count leaked through — the write-back cannot be trusted as committed.
+    const toolCalls = [
+      preview('list-1', 2),
+      { name: 'enrich_leads_execute', arguments: { list_id: 'list-1' }, error: 'partial failure', result: { processedCount: 3 } },
+    ];
+    expect(scheduledRunPreviewedWithoutExecute(toolCalls)).toBe(true);
+  });
+
   it('fires when the execute persisted ZERO records (processedCount 0) (Greptile P1)', () => {
     const toolCalls = [
       preview('list-1', 2),
