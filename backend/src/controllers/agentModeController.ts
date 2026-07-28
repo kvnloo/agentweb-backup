@@ -1113,11 +1113,19 @@ export async function runVerifiedChat(
   // have left an unanswered blocking AskUserQuestion (the tool handler persisted
   // it via updateSessionAskUserQuestion). Handle it identically at BOTH LLM call
   // sites so the park guarantee can never be bypassed: re-read from the DB (never
-  // trust a stale in-memory blank), then AUTO-TAKE Emma's recommended option under
-  // full autonomy (bounded, logged as a delegation — a deliberate per-schedule
-  // WAIVER of the human protection on irreversible decisions), otherwise PARK and
-  // stop rather than proceed on a guess. Returns 'autoTake' (caller retries), a
-  // 'park' result to return, or null when no question is awaiting.
+  // trust a stale in-memory blank), then decide between AUTO-TAKE and PARK.
+  //
+  // ENG-517: a headless/scheduled run must NOT block on a REVERSIBLE question —
+  // a data shortfall, report-scope choice, etc. has an obvious safe default
+  // (Emma's recommended option), so auto-take it and keep going rather than
+  // parking and never delivering. IMMUTABLE questions (e.g. the Meta campaign
+  // objective) still PARK unless the schedule opted into full autonomy — those
+  // are the irreversible decisions a human must own (auto-taking one is the
+  // deliberate per-schedule WAIVER that `fullAutonomy` represents).
+  //
+  // Either way the auto-take is bounded (MAX_AUTO_TAKES) and logged as a
+  // delegation. Returns 'autoTake' (caller retries), a 'park' result to return,
+  // or null when no question is awaiting.
   const resolveAwaitingUserQuestion = async (): Promise<
     { action: 'autoTake' } | { action: 'park'; result: RunVerifiedChatResult } | null
   > => {
@@ -1125,27 +1133,32 @@ export async function runVerifiedChat(
     if (postTurnSession?.pendingUserQuestion?.status !== 'awaiting') return null;
     const pending = postTurnSession.pendingUserQuestion;
 
-    if (fullAutonomy && autoTakesUsed < MAX_AUTO_TAKES) {
+    // Reversible questions auto-proceed in any headless run; immutable ones only
+    // when the schedule explicitly waived the human protection (full autonomy).
+    const canAutoTake = fullAutonomy || pending.immutable !== true;
+    if (canAutoTake && autoTakesUsed < MAX_AUTO_TAKES) {
       autoTakesUsed++;
       const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
       await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
         requireStillAwaiting: pending.questionId,
       });
       const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
+      const takeKind = fullAutonomy && pending.immutable === true ? 'full-autonomy' : 'reversible-default';
       console.log(
-        `AgentMode runVerifiedChat: full-autonomy auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
+        `AgentMode runVerifiedChat: ${takeKind} auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
       );
       // Breadcrumb in history so Emma sees the decision and resumes without
       // re-asking (best-effort; the persisted answer is the source of truth).
+      const breadcrumbPrefix = fullAutonomy && pending.immutable === true ? '[Full autonomy]' : '[Scheduled run]';
       try {
         await chatbotDb.addMessageToSession(sessionId, {
           role: 'user',
-          content: `[Full autonomy] Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
+          content: `${breadcrumbPrefix} Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
           timestamp: new Date().toISOString(),
           metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
         });
       } catch (breadcrumbError) {
-        console.error('Failed to persist full-autonomy auto-take breadcrumb:', breadcrumbError);
+        console.error('Failed to persist auto-take breadcrumb:', breadcrumbError);
       }
       return { action: 'autoTake' };
     }
