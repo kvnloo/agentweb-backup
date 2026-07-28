@@ -80,6 +80,9 @@ async function runAgentModeRevision(
       keywords: [],
       attachments: [],
       maxAttempts: 5,
+      // ENG-634: headless run (no human present) — enable completion-gate halt
+      // protection so a free-text confirmation halt auto-continues best-effort.
+      completionGate: true,
     });
 
     console.log(`Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);

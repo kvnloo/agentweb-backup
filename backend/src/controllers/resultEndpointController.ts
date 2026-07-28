@@ -217,6 +217,10 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
       requiredFunctions,
       maxAttempts: 20,
       llmModel,
+      // ENG-634: headless fire-and-forget run (no human present to reply) — enable
+      // completion-gate halt protection so a free-text "shall I proceed?" auto-continues
+      // best-effort instead of dead-ending with a non-deliverable.
+      completionGate: true,
     }).then(result => {
       console.log(`Result endpoint "${resultName}" session ${session.sessionId} completed: success=${result.success}, attempts=${result.attempts}`);
     }).catch(error => {
