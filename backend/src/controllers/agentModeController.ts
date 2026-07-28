@@ -3571,7 +3571,10 @@ export const agentModeController = {
           // the still-missing assets on "continue" (it sees the saved markers in history).
           // Non-media timeouts fall through to the existing 504 unchanged.
           try {
-            const timedOutSession = await chatbotDb.getChatSession(sessionId);
+            // ENG-510: strongly consistent read — a marker written moments before the cap
+            // fired must not be missed by an eventually-consistent read (which would drop
+            // to a bare 504 despite a completed, saved image).
+            const timedOutSession = await chatbotDb.getChatSession(sessionId, true);
             const timeoutImages = collectMediaGeneratedSince(timedOutSession?.messages, turnStartMs);
             const continuationMsg = buildTimeoutContinuationMessage(timeoutImages);
             if (continuationMsg) {
@@ -4416,7 +4419,9 @@ export const agentModeController = {
       let handledPartialTimeout = false;
       if (shareId && (error as any)?.isGenerationTimeout) {
         try {
-          const timedOutSession = await chatbotDb.getChatSession(shareId);
+          // ENG-510: strongly consistent read so a marker written just before the cap is
+          // not missed (see the regular /generate path above).
+          const timedOutSession = await chatbotDb.getChatSession(shareId, true);
           const timeoutImages = collectMediaGeneratedSince(timedOutSession?.messages, sharedTurnStartMs);
           const continuationMsg = buildTimeoutContinuationMessage(timeoutImages);
           if (continuationMsg) {

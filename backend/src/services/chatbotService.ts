@@ -1103,7 +1103,7 @@ export class ChatbotDB {
   }
 
   // Get messages from AW-ChatMessages table
-  async getMessagesFromMessagesTable(sessionId: string): Promise<ChatMessage[]> {
+  async getMessagesFromMessagesTable(sessionId: string, consistentRead = false): Promise<ChatMessage[]> {
     const params = {
       TableName: this.messagesTableName,
       KeyConditionExpression: "sessionId = :sessionId",
@@ -1111,6 +1111,11 @@ export class ChatbotDB {
         ":sessionId": sessionId,
       },
       ScanIndexForward: true, // Sort by messageIndex ascending
+      // ENG-510: default reads are eventually consistent — a caller that must see a marker
+      // written moments earlier (e.g. the whole-turn-timeout recovery collecting the images
+      // that just completed) can opt into a strongly consistent read so a fresh append is
+      // never missed.
+      ...(consistentRead ? { ConsistentRead: true } : {}),
     };
 
     try {
@@ -1614,7 +1619,7 @@ export class ChatbotDB {
     }
   }
 
-  async getChatSession(sessionId: string): Promise<ChatSession | null> {
+  async getChatSession(sessionId: string, consistentRead = false): Promise<ChatSession | null> {
     const session = await this.getChatSessionRecord(sessionId);
 
     if (!session) {
@@ -1623,7 +1628,7 @@ export class ChatbotDB {
 
     try {
       // Check if messages exist in AW-ChatMessages
-      let messages = await this.getMessagesFromMessagesTable(sessionId);
+      let messages = await this.getMessagesFromMessagesTable(sessionId, consistentRead);
 
       // If no messages in AW-ChatMessages but messages exist in session record, migrate them
       if (messages.length === 0 && session.messages && session.messages.length > 0) {
