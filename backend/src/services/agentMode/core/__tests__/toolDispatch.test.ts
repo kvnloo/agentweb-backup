@@ -15,6 +15,7 @@ import {
 } from '../../../agentToolGatewayService';
 import {
   executePreparedTools,
+  stableStringify,
   type ExecutePreparedToolsInput,
   type ToolDispatchPorts,
 } from '../toolDispatch';
@@ -1000,5 +1001,80 @@ describe('executePreparedTools', () => {
       const entry = telemetered.find((r: any) => r.toolCall?.id === 'a');
       expect(entry.status).toBe('success');
     });
+  });
+});
+
+// ENG-510: cross-iteration media-gen dedupe. The ENG-108 dedupe is per-iteration, so a
+// model that re-emits an identical generate_image in a LATER iteration of the same turn
+// (e.g. resuming after a timeout) would regenerate the image. The dispatcher suppresses a
+// media-gen call whose successful result is already recorded from an earlier iteration —
+// scoped to media tools so repeated mutations still run, and only for successes so a failed
+// call stays retryable.
+describe('executePreparedTools — cross-iteration media dedupe (ENG-510)', () => {
+  const imageGatewayPorts = () =>
+    makePorts({
+      executePreparedAgentTool: async (_i: any) => ({ success: true, imageUrl: 'https://s3/img.png' }),
+    });
+
+  it('records a produced media key, then suppresses the same generate_image next iteration', async () => {
+    // Iteration 1: fresh run, one image call → executes and is recorded.
+    const ports1 = imageGatewayPorts();
+    const in1 = makeInput([toolCall('a', 'generate_image', '{"prompt":"sun"}')], ports1, {
+      priorMediaCallKeys: new Map<string, string>(),
+    });
+    const r1 = await executePreparedTools(in1);
+    expect((ports1 as any).__execOrder).toEqual(['generate_image']);
+    expect(r1.producedMediaCallKeys.size).toBe(1);
+    expect(r1.mediaAssetsProduced).toBe(1);
+
+    // Iteration 2: the SAME call, with iteration 1's keys threaded in → suppressed.
+    const ports2 = imageGatewayPorts();
+    const in2 = makeInput([toolCall('b', 'generate_image', '{"prompt":"sun"}')], ports2, {
+      priorMediaCallKeys: r1.producedMediaCallKeys,
+    });
+    const r2 = await executePreparedTools(in2);
+    expect((ports2 as any).__execOrder).toEqual([]); // did NOT regenerate
+    expect(r2.mediaAssetsProduced).toBe(0);
+    expect(r2.pendingCounterUpdates.generate_image).toBeUndefined();
+    // Still answers the tool_call_id so the next LLM turn has no orphan.
+    const msg = in2.messages.find((m: any) => m.tool_call_id === 'b');
+    expect(msg).toBeDefined();
+    expect(msg.role).toBe('tool');
+  });
+
+  it('does NOT suppress a distinct variant (different args) from a prior iteration', async () => {
+    const prior = new Map<string, string>([[`generate_image:${stableStringify({ prompt: 'sun' })}`, 'a']]);
+    const ports = imageGatewayPorts();
+    const input = makeInput([toolCall('b', 'generate_image', '{"prompt":"moon"}')], ports, {
+      priorMediaCallKeys: prior,
+    });
+    const result = await executePreparedTools(input);
+    expect((ports as any).__execOrder).toEqual(['generate_image']); // moon still generated
+    expect(result.mediaAssetsProduced).toBe(1);
+  });
+
+  it('does NOT suppress a repeated non-media (mutating) call across iterations', async () => {
+    // Even if a non-media key were present, the media-only guard leaves it alone, so a
+    // legitimately-repeated send_email still runs.
+    const prior = new Map<string, string>([[`send_email:${stableStringify({ to: 'x' })}`, 'a']]);
+    const ports = makePorts();
+    const input = makeInput([toolCall('b', 'send_email', '{"to":"x"}')], ports, {
+      priorMediaCallKeys: prior,
+    });
+    await executePreparedTools(input);
+    expect((ports as any).__execOrder).toEqual(['send_email']); // repeated mutation runs
+  });
+
+  it('does NOT record a FAILED generation, so it stays retryable next iteration', async () => {
+    const ports = makePorts({
+      executePreparedAgentTool: async (_i: any) => {
+        throw new Error('provider timeout');
+      },
+    });
+    const input = makeInput([toolCall('a', 'generate_image', '{"prompt":"sun"}')], ports, {
+      priorMediaCallKeys: new Map<string, string>(),
+    });
+    const result = await executePreparedTools(input);
+    expect(result.producedMediaCallKeys.size).toBe(0); // failure not recorded → retryable
   });
 });
