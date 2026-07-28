@@ -114,6 +114,37 @@ describe('solve_captcha live site-key verification', () => {
     jest.clearAllMocks();
   });
 
+  it('falls back to the caller-provided site_key if the live probe hangs, instead of blocking the whole captcha solve forever', async () => {
+    // MCP tool calls deliberately have NO transport-level timeout (needed for
+    // legitimate long-running browser tasks) — so a probe that never resolves
+    // must be bounded here specifically, or it hangs the entire solve_captcha
+    // call (and the agent turn) indefinitely.
+    const fetchMock = mockTwoCaptchaFetch();
+    global.fetch = fetchMock as any;
+    const executeTool = jest.fn().mockImplementation((_model: string, _toolName: string, args: { code: string }) => {
+      if (args.code.includes('iframeKey')) {
+        return new Promise(() => {}); // never resolves — simulates a hung MCP call
+      }
+      return Promise.resolve({ raw: { content: [{ type: 'text', text: '### Ran Playwright code\n```js\n// inject\n```' }] } });
+    });
+    const ctx = {
+      userId: 'user-123',
+      sessionId: 'session-abc',
+      llmModel: 'test-model',
+      service: { toolRegistry: { getAllTools: () => [{ name: 'playwright_browser_run_code' }] }, executeTool }
+    };
+
+    const result = await tool.execute(
+      { captcha_type: 'recaptcha_v2', site_key: 'FALLBACK_KEY', page_url: 'https://rankai.ai/signin', invisible: true },
+      ctx
+    );
+
+    expect(result.success).toBe(true);
+    const submitCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes('/in.php'));
+    const submittedUrl = new URL(submitCall![0]);
+    expect(submittedUrl.searchParams.get('googlekey')).toBe('FALLBACK_KEY');
+  }, 30000);
+
   it('falls back to the caller-provided site_key when the live page cannot be probed for any key (no dataKey/iframeKey found)', async () => {
     const fetchMock = mockTwoCaptchaFetch();
     global.fetch = fetchMock as any;

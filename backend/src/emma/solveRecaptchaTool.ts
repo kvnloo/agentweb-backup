@@ -1,6 +1,19 @@
 import { emmaToolRegistry } from './registry';
 import { get2CaptchaApiKey } from '../utils/secretsManager';
 
+// MCP tool calls deliberately have no transport-level timeout (needed for
+// legitimate long-running browser tasks — see mcpClientService.ts). The site-key
+// probe is a tiny synchronous DOM read that should never legitimately take long;
+// bound it explicitly so a hung MCP call can't block the whole captcha solve.
+const SITE_KEY_PROBE_TIMEOUT_MS = 8000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
 function findPlaywrightTool(service: any, suffix: string): string | null {
   const allTools = service.toolRegistry?.getAllTools?.() || [];
   for (const tool of allTools) {
@@ -216,12 +229,16 @@ async function resolveLiveSiteKey(
   if (!runCodeTool) return providedSiteKey;
 
   try {
-    const probeResult = await context.service.executeTool(
-      context.llmModel,
-      runCodeTool,
-      { code: buildSiteKeyProbeCode(captchaType) },
-      userId,
-      context.sessionId
+    const probeResult = await withTimeout(
+      context.service.executeTool(
+        context.llmModel,
+        runCodeTool,
+        { code: buildSiteKeyProbeCode(captchaType) },
+        userId,
+        context.sessionId
+      ),
+      SITE_KEY_PROBE_TIMEOUT_MS,
+      'Site key probe'
     );
     const probeText = extractMcpText(probeResult);
     const parsed = JSON.parse(probeText) as { dataKey: string | null; iframeKey: string | null };
