@@ -219,6 +219,25 @@ describe('runScheduledChat — deterministic completion gate', () => {
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
   });
 
+  it('ENG-635: reports failure when the run still defers to the user after exhausting the completion gate', async () => {
+    // Every turn punts the decision back to an absent human instead of delivering.
+    // The gate issues its forceful "proceed best-effort, no human present" continuations,
+    // but the model keeps deferring — so after the budget is exhausted the run must NOT
+    // be reported as a clean success (it produced no deliverable).
+    mockWorker.runInWorker.mockResolvedValue(
+      workerResult("I found only 30 of the 100 requested ads. Should I proceed with cataloging the 30? Reply 'go' to proceed.")
+    );
+
+    const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // Bounded: 1 initial + up to 2 continuations = 3, well under maxAttempts(20).
+    const calls = mockWorker.runInWorker.mock.calls.length;
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(calls).toBeLessThanOrEqual(3);
+    // Punted to an absent human and never delivered → recorded as a failure, not success.
+    expect(result).toEqual(expect.objectContaining({ status: 'failure' }));
+  });
+
   it('is bounded: stops after the max continuations even if it keeps admitting incompleteness', async () => {
     // Every turn admits incompleteness → gate must cap continuations, not loop to maxAttempts (20).
     mockWorker.runInWorker.mockResolvedValue(
