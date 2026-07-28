@@ -138,6 +138,24 @@ describe('Organization routes', () => {
       expect(mockUsers['user-1'].orgRole).toBe('owner');
     });
 
+    it('seeds autoJoinEnabled on by default, with the domain derived from the owner\'s email (ENG-512)', async () => {
+      // Auto-join is opt-out, not opt-in — owners can turn it off, but every new
+      // org starts with domain-matched signups able to request to join. The
+      // per-request owner-approval gate is unaffected either way.
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+      expect(res.status).toBe(201);
+      expect(res.body.data.autoJoinEnabled).toBe(true);
+      expect(res.body.data.autoJoinDomain).toBe('example.com');
+    });
+
+    it('does not throw if the creating user email has no domain to derive (defensive, should not happen in practice)', async () => {
+      mockUsers['user-1'].email = 'not-an-email';
+      const res = await request(app).post('/api/org').send({ name: 'My Org' });
+      expect(res.status).toBe(201);
+      expect(res.body.data.autoJoinEnabled).toBe(true);
+      expect(res.body.data.autoJoinDomain).toBeUndefined();
+    });
+
     it('should seed shareSettings with everything shared by default', async () => {
       // A new org is a team that has just arrived. Seeding these to private meant they
       // saw an empty product until someone found the org settings page.
