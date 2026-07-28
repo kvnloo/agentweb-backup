@@ -166,6 +166,18 @@ describe('POST /api/webhooks/fathom', () => {
     expect(res.body.routed).toBe(true);
   });
 
+  it('accepts deliveries at the exact destination URL the connect flow registers', async () => {
+    armRouter(mockPort());
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { buildFathomWebhookDestinationUrl } = require('../routes/fathomAuth');
+    const registered: string = buildFathomWebhookDestinationUrl('https://api.agentweb.pro');
+    const pathWithQuery = registered.replace('https://api.agentweb.pro', '');
+    expect(pathWithQuery).toContain('?token='); // registration carries the credential
+
+    const res = await request(app).post(pathWithQuery).send(validPayload).expect(200);
+    expect(res.body.routed).toBe(true); // the registered URL authenticates end-to-end
+  });
+
   it('refuses to run the router (500) when a LinearPort is registered without a secret', async () => {
     registerFathomLinearPort(mockPort()); // secret deliberately NOT set
     const res = await post(validPayload, null).expect(500);

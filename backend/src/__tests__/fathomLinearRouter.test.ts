@@ -12,6 +12,7 @@ import {
   isDistinctFollowOn,
   fathomKey,
   fathomKeyMarker,
+  fathomCanonicalMarker,
   buildSearchQuery,
   ALL_TEAMS,
   FathomMeetingRef,
@@ -527,5 +528,69 @@ describe('fathomLinearRouter — relation durability (create + relate two-phase)
     expect(report.duplicatesAvoided).toHaveLength(0);
     expect(report.errors).toHaveLength(1);
     expect(report.errors[0].reason).toMatch(/re-assert/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deterministic convergence — repair targets the RECORDED canonical, not a re-search
+// ---------------------------------------------------------------------------
+
+describe('fathomLinearRouter — recorded-canonical repair (deterministic convergence)', () => {
+  const distinctFollowOn2 = () =>
+    item({
+      team: 'CS',
+      customer: 'Baldwin',
+      action: 'Schedule Baldwin live account review',
+      workflowNouns: ['onboarding'],
+      owner: 'Fangfang',
+      nextAction: 'Book a live account-review call with Baldwin',
+      doneCriteria: 'Review call completed and notes filed',
+    });
+
+  it('embeds the selected canonical in the created issue so the target is durably recorded', async () => {
+    const port = new MockLinearPort();
+    port.candidates = [grow6()];
+    port.throwOnRelate = true;
+
+    await routeMeetingToLinear(meeting(), [distinctFollowOn2()], port);
+
+    expect(port.created).toHaveLength(1);
+    expect(port.created[0].description).toContain(fathomCanonicalMarker('uuid-grow6', 'GROW-6'));
+  });
+
+  it('repairs the recorded canonical on redelivery even when a fresh search misses it', async () => {
+    const port = new MockLinearPort();
+    port.candidates = [grow6()];
+    port.throwOnRelate = true;
+    const first = await routeMeetingToLinear(meeting(), [distinctFollowOn2()], port);
+    expect(first.errors).toHaveLength(1);
+
+    // Redelivery under CHANGED search results: the canonical no longer surfaces.
+    port.throwOnRelate = false;
+    port.candidates = [];
+    const createdIssue = Object.values(port.byKey)[0];
+
+    const second = await routeMeetingToLinear(meeting(), [distinctFollowOn2()], port);
+
+    expect(port.relations).toHaveLength(1);
+    expect(port.relations[0]).toEqual({ issueId: createdIssue.id, relatedIssueId: 'uuid-grow6' });
+    expect(second.duplicatesAvoided).toHaveLength(1);
+    expect(second.duplicatesAvoided[0].reason).toMatch(/re-assert/i);
+    expect(second.duplicatesAvoided[0].canonicalIdentifier).toBe('GROW-6');
+  });
+
+  it('reports a failed recorded-canonical repair loudly so redelivery retries', async () => {
+    const port = new MockLinearPort();
+    port.candidates = [grow6()];
+    port.throwOnRelate = true;
+    await routeMeetingToLinear(meeting(), [distinctFollowOn2()], port);
+
+    // Still failing on redelivery → loud error, not a silent no-op.
+    port.candidates = [];
+    const second = await routeMeetingToLinear(meeting(), [distinctFollowOn2()], port);
+
+    expect(second.duplicatesAvoided).toHaveLength(0);
+    expect(second.errors).toHaveLength(1);
+    expect(second.errors[0].reason).toMatch(/re-assert/i);
   });
 });
