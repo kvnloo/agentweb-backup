@@ -80,6 +80,33 @@ describe('scheduledRunPreviewedWithoutExecute — per-list preview→execute det
     expect(scheduledRunPreviewedWithoutExecute(toolCalls)).toBe(true);
   });
 
+  it('fires when the execute PARTIALLY persisted — some rows had updateFailed write errors (Greptile P1)', () => {
+    // 3 persisted but 2 CRM writes failed → uncommitted write-back, keep chasing.
+    const toolCalls = [
+      preview('list-1', 2),
+      {
+        name: 'enrich_leads_execute',
+        arguments: { list_id: 'list-1' },
+        result: { processedCount: 3, failureBreakdown: { updateFailed: 2 } },
+      },
+    ];
+    expect(scheduledRunPreviewedWithoutExecute(toolCalls)).toBe(true);
+  });
+
+  it('does NOT fire when the only failures are no-data (identityResolutionFailed), not write failures', () => {
+    // Leads the engine could not resolve are not uncommitted writes — re-executing
+    // would loop pointlessly. updateFailed === 0 → the write-back is complete.
+    const toolCalls = [
+      preview('list-1', 2),
+      {
+        name: 'enrich_leads_execute',
+        arguments: { list_id: 'list-1' },
+        result: { processedCount: 3, failureBreakdown: { identityResolutionFailed: 2, updateFailed: 0 } },
+      },
+    ];
+    expect(scheduledRunPreviewedWithoutExecute(toolCalls)).toBe(false);
+  });
+
   // ── PASS cases: every enrichable list committed, or nothing to commit ─────────
   it('does NOT fire when every previewed enrichable list was executed', () => {
     const toolCalls = [
