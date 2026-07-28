@@ -105,6 +105,29 @@ describe('browserCookieDb — manual per-domain cookie import', () => {
       expect(result[0]).not.toHaveProperty('encryptedCookies');
     });
 
+    it('paginates past DynamoDB\'s per-response page limit instead of silently dropping later domains (Greptile P1, PR #2201)', async () => {
+      mockDynamoDB.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ userId: 'user-1', domain: 'page1.com', cookieCount: 1, createdAt: '2026-01-01T00:00:00.000Z' }],
+            LastEvaluatedKey: { userId: 'user-1', domain: 'page1.com' },
+          }),
+        })
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ userId: 'user-1', domain: 'page2.com', cookieCount: 1, createdAt: '2026-01-02T00:00:00.000Z' }],
+          }),
+        });
+
+      const result = await browserCookieDb.listDomainCookies('user-1');
+
+      expect(result.map((r) => r.domain)).toEqual(['page1.com', 'page2.com']);
+      expect(mockDynamoDB.query).toHaveBeenCalledTimes(2);
+      expect(mockDynamoDB.query.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ ExclusiveStartKey: { userId: 'user-1', domain: 'page1.com' } })
+      );
+    });
+
     it('returns an empty array when only "__all__" exists', async () => {
       mockDynamoDB.query.mockReturnValue({
         promise: jest.fn().mockResolvedValue({
@@ -185,6 +208,28 @@ describe('browserCookieDb — manual per-domain cookie import', () => {
   });
 
   describe('getAllCookiesForUser', () => {
+    it('paginates past DynamoDB\'s per-response page limit instead of silently dropping later domains\' cookies from injection (Greptile P1, PR #2201)', async () => {
+      const page1Cookies = [{ name: 'session', value: 'page1-val' }];
+      const page2Cookies = [{ name: 'session', value: 'page2-val' }];
+      mockDynamoDB.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ userId: 'user-1', domain: 'page1.com', encryptedCookies: `ENC(user-1:${JSON.stringify(page1Cookies)})` }],
+            LastEvaluatedKey: { userId: 'user-1', domain: 'page1.com' },
+          }),
+        })
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ userId: 'user-1', domain: 'page2.com', encryptedCookies: `ENC(user-1:${JSON.stringify(page2Cookies)})` }],
+          }),
+        });
+
+      const result = await browserCookieDb.getAllCookiesForUser('user-1');
+
+      expect(result).toEqual([...page1Cookies, ...page2Cookies]);
+      expect(mockDynamoDB.query).toHaveBeenCalledTimes(2);
+    });
+
     it('falls back to the simple get()-based getCookies path if the query itself throws entirely (e.g. throttling), instead of failing the whole load', async () => {
       // Defense in depth: users who never touch the manual-import feature (the
       // overwhelming majority, day one) should not regress just because the read

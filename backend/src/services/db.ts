@@ -7689,13 +7689,13 @@ export const browserCookieDb = {
   /** List manually-imported cookie domains for a user — metadata only, never the encrypted values. */
   async listDomainCookies(userId: string): Promise<Array<{ domain: string; cookieCount: number; createdAt: string; expiresAt?: string; lastFailedAt?: string }>> {
     try {
-      const result = await dynamodb.query({
+      const items = await paginatedQuery(dynamodb, {
         TableName: BROWSER_COOKIES_TABLE,
         KeyConditionExpression: 'userId = :userId',
         ExpressionAttributeValues: { ':userId': userId },
-      }).promise();
+      });
 
-      return (result.Items || [])
+      return items
         .filter((item) => item.domain !== '__all__')
         .map((item) => ({
           domain: item.domain,
@@ -7773,13 +7773,12 @@ export const browserCookieDb = {
    */
   async getAllCookiesForUser(userId: string): Promise<any[]> {
     try {
-      const result = await dynamodb.query({
+      const items = await paginatedQuery(dynamodb, {
         TableName: BROWSER_COOKIES_TABLE,
         KeyConditionExpression: 'userId = :userId',
         ExpressionAttributeValues: { ':userId': userId },
-      }).promise();
+      });
 
-      const items = result.Items || [];
       const allItem = items.find((item) => item.domain === '__all__');
       const combined: any[] = [...(allItem?.cookies || [])];
       const now = Date.now();
