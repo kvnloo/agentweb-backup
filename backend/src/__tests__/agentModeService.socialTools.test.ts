@@ -53,6 +53,20 @@ describe('AgentModeService - Social Media Tools', () => {
     updated_at: new Date().toISOString(),
   };
 
+  const mockPersonalLinkedInAccount = {
+    account_id: 'urn:li:person:ilhAte8iXG',
+    account_name: 'Kevin Rajan',
+    platform: 'linkedin',
+    config: {
+      account_type: 'personal',
+      access_token: 'personal-access-token',
+      token_expires_at: Date.now() + 3600000,
+      scopes: ['w_member_social'],
+    },
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
   const mockTwitterAccount = {
     account_id: 'twitter-user-123',
     account_name: '@testuser',
@@ -483,6 +497,50 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.success).toBe(true);
       expect(result.posts).toEqual([]);
       expect(result.message).toContain('Successfully loaded 0 posts');
+    });
+
+    // ENG-660: a personal LinkedIn profile's post/comment history is NOT
+    // readable through the connection (only AgentWeb-published posts are stored
+    // and returned). Reporting a bare "Successfully loaded 0 posts" here led the
+    // model to claim the fetch succeeded / that it had read the user's LinkedIn,
+    // which reads as a tool-success hallucination. Zero posts on a personal
+    // account must be reported as an unsupported read, not an empty success.
+    it('reports an unsupported read (not a bare empty success) when a personal LinkedIn account has 0 posts', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([mockPersonalLinkedInAccount as any]);
+      mockAdapter.listPosts.mockResolvedValue([]);
+
+      const result = await service.loadConnectedAccountPosts(
+        'user-123',
+        'urn:li:person:ilhAte8iXG'
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.posts).toEqual([]);
+      expect(result.organicReadUnsupported).toBe(true);
+      // Must NOT frame it as a successful read of the user's posts.
+      expect(result.message).not.toContain('Successfully loaded');
+      expect(result.message.toLowerCase()).toContain('personal linkedin');
+      expect(result.message.toLowerCase()).toContain('do not claim');
+    });
+
+    // Regression guard: a personal LinkedIn account that DOES have stored
+    // AgentWeb-published posts still reports a normal successful load.
+    it('still reports a normal load when a personal LinkedIn account has stored posts', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([mockPersonalLinkedInAccount as any]);
+      mockAdapter.listPosts.mockResolvedValue([
+        { id: 'urn:li:share:p1', commentary: 'A post AgentWeb published', author: 'urn:li:person:ilhAte8iXG' },
+      ]);
+
+      const result = await service.loadConnectedAccountPosts(
+        'user-123',
+        'urn:li:person:ilhAte8iXG',
+        { include_metrics: false }
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.posts).toHaveLength(1);
+      expect(result.organicReadUnsupported).toBeUndefined();
+      expect(result.message).toContain('Successfully loaded 1 posts');
     });
   });
 
