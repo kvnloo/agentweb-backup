@@ -68,6 +68,7 @@ import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
 import ContractorsTab from "../components/admin/ContractorsTab";
+import CostDashboardTab from "../components/admin/CostDashboardTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -783,6 +784,7 @@ export default function AdminDashboard() {
     'connected-accounts': 21,
     'contractors': 22,
     'emma-mcp': 23,
+    'costs': 24,
   };
   
   // Get initial tab value from URL or default to Users
@@ -3362,6 +3364,7 @@ export default function AdminDashboard() {
             <Tab label="Connected Accounts" {...a11yProps(21)} />
             <Tab label="Contractors" {...a11yProps(22)} />
             <Tab label="Emma MCP" {...a11yProps(23)} />
+            <Tab label="LLM Costs" {...a11yProps(24)} />
           </Tabs>
         </Box>
 
@@ -6556,6 +6559,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={23}>
           <EmmaMcpUsageTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={24}>
+          <CostDashboardTab />
         </TabPanel>
 
       </Paper>
