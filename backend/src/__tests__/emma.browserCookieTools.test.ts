@@ -9,6 +9,8 @@ jest.mock('../services/db', () => ({
     saveCookies: jest.fn().mockResolvedValue(undefined),
     getCookies: jest.fn().mockResolvedValue(null),
     deleteAllCookies: jest.fn().mockResolvedValue(undefined),
+    getAllCookiesForUser: jest.fn().mockResolvedValue([]),
+    markDomainCookiesFailed: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -57,10 +59,11 @@ const sampleCookies = [
 ];
 
 describe('browser cookie tools registration', () => {
-  it('should register all three tools in emmaToolRegistry', () => {
+  it('should register all four tools in emmaToolRegistry', () => {
     expect(emmaToolRegistry.getTool('save_browser_cookies')).toBeDefined();
     expect(emmaToolRegistry.getTool('load_browser_cookies')).toBeDefined();
     expect(emmaToolRegistry.getTool('clear_browser_cookies')).toBeDefined();
+    expect(emmaToolRegistry.getTool('mark_browser_session_failed')).toBeDefined();
   });
 
   it('should not register list_saved_domains (removed)', () => {
@@ -140,8 +143,8 @@ describe('load_browser_cookies', () => {
       .rejects.toThrow('Authentication required');
   });
 
-  it('should return failure when no saved cookies exist', async () => {
-    mockedDb.getCookies.mockResolvedValue(null);
+  it('should return failure when no saved cookies exist (both "__all__" and per-domain empty)', async () => {
+    mockedDb.getAllCookiesForUser.mockResolvedValue([]);
     const ctx = createMockContext();
     const result = await executeTool('load_browser_cookies', {}, ctx);
 
@@ -150,14 +153,15 @@ describe('load_browser_cookies', () => {
     expect(ctx.service.executeTool).not.toHaveBeenCalled();
   });
 
-  it('should load all cookies from DB and inject into browser', async () => {
-    mockedDb.getCookies.mockResolvedValue(sampleCookies);
+  it('should load all cookies (via getAllCookiesForUser) and inject into browser', async () => {
+    mockedDb.getAllCookiesForUser.mockResolvedValue(sampleCookies);
     const ctx = createMockContext({ content: 'Loaded 3 cookies', raw: {} });
 
     const result = await executeTool('load_browser_cookies', {}, ctx);
 
     expect(result.success).toBe(true);
     expect(result.cookieCount).toBe(3);
+    expect(mockedDb.getAllCookiesForUser).toHaveBeenCalledWith('test-user-123');
 
     // Should have called browser_run_code to inject cookies
     expect(ctx.service.executeTool).toHaveBeenCalledWith(
@@ -169,8 +173,19 @@ describe('load_browser_cookies', () => {
     );
   });
 
+  it('should succeed when only manually-imported per-domain cookies exist (no "__all__" ever saved)', async () => {
+    const manualOnly = [sampleCookies[2]];
+    mockedDb.getAllCookiesForUser.mockResolvedValue(manualOnly);
+    const ctx = createMockContext({ content: 'Loaded 1 cookies', raw: {} });
+
+    const result = await executeTool('load_browser_cookies', {}, ctx);
+
+    expect(result.success).toBe(true);
+    expect(result.cookieCount).toBe(1);
+  });
+
   it('should reject when Playwright tools are not available', async () => {
-    mockedDb.getCookies.mockResolvedValue(sampleCookies);
+    mockedDb.getAllCookiesForUser.mockResolvedValue(sampleCookies);
     const ctx = createMockContext();
     ctx.service.toolRegistry.getAllTools = () => [];
     await expect(executeTool('load_browser_cookies', {}, ctx))
@@ -192,5 +207,32 @@ describe('clear_browser_cookies', () => {
     expect(result.success).toBe(true);
     expect(result.message).toContain('all saved cookies');
     expect(mockedDb.deleteAllCookies).toHaveBeenCalledWith('test-user');
+  });
+});
+
+describe('mark_browser_session_failed', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('is registered in emmaToolRegistry', () => {
+    expect(emmaToolRegistry.getTool('mark_browser_session_failed')).toBeDefined();
+  });
+
+  it('should reject when no userId', async () => {
+    await expect(executeTool('mark_browser_session_failed', { domain: 'rankai.ai' }, {}))
+      .rejects.toThrow('Authentication required');
+  });
+
+  it('should reject when domain is missing', async () => {
+    const result = await executeTool('mark_browser_session_failed', {}, { userId: 'test-user' });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/domain/i);
+    expect(mockedDb.markDomainCookiesFailed).not.toHaveBeenCalled();
+  });
+
+  it('marks the domain as failed and lowercases it', async () => {
+    const result = await executeTool('mark_browser_session_failed', { domain: 'RankAI.AI' }, { userId: 'test-user' });
+
+    expect(result.success).toBe(true);
+    expect(mockedDb.markDomainCookiesFailed).toHaveBeenCalledWith('test-user', 'rankai.ai');
   });
 });
