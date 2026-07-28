@@ -1753,7 +1753,16 @@ export class UserDB {
         const chunk = registered.slice(i, i + CHUNK);
         await Promise.all(
           chunk.map(async (r) => {
-            r.chatSessionCount = await this.getChatSessionCount(r.userId as string);
+            try {
+              r.chatSessionCount = await this.getChatSessionCount(r.userId as string);
+            } catch (err: any) {
+              // A single user's COUNT query failing must not sink the whole
+              // batch — leave this user's chatSessionCount undefined (unknown)
+              // and let every other lead's status through.
+              console.error(
+                `getRegistrationStatusByEmails: chatSessionCount failed for ${r.userId}: ${err?.message}`,
+              );
+            }
           }),
         );
       }
