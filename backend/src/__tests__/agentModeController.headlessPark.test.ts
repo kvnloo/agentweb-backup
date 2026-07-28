@@ -109,6 +109,10 @@ describe('runVerifiedChat — headless park on a blocking question (ENG-396)', (
     const result = await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
+      // ENG-636: these cases model a NOTIFIABLE run (scheduled/interactive) where a
+      // park reaches a human — so the park machinery applies. Headless callers with
+      // no channel are covered separately by the parkedUnnotifiable tests.
+      parkNotifiable: true,
       startingMessage: 'Build and launch my Meta campaigns.',
       keywords: [],
       requiredFunctions: [],
@@ -131,6 +135,10 @@ describe('runVerifiedChat — headless park on a blocking question (ENG-396)', (
     const result = await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
+      // ENG-636: these cases model a NOTIFIABLE run (scheduled/interactive) where a
+      // park reaches a human — so the park machinery applies. Headless callers with
+      // no channel are covered separately by the parkedUnnotifiable tests.
+      parkNotifiable: true,
       startingMessage: 'Continue.',
       keywords: [],
       requiredFunctions: [],
@@ -148,6 +156,10 @@ describe('runVerifiedChat — headless park on a blocking question (ENG-396)', (
     const result = await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
+      // ENG-636: these cases model a NOTIFIABLE run (scheduled/interactive) where a
+      // park reaches a human — so the park machinery applies. Headless callers with
+      // no channel are covered separately by the parkedUnnotifiable tests.
+      parkNotifiable: true,
       startingMessage: 'Just summarize my week.',
       keywords: [],
       requiredFunctions: [],
@@ -190,6 +202,10 @@ describe('runVerifiedChat — headless park on a blocking question (ENG-396)', (
     const result = await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
+      // ENG-636: these cases model a NOTIFIABLE run (scheduled/interactive) where a
+      // park reaches a human — so the park machinery applies. Headless callers with
+      // no channel are covered separately by the parkedUnnotifiable tests.
+      parkNotifiable: true,
       startingMessage: 'For each of the 3 events, research and report on every guest.',
       keywords: [],
       requiredFunctions: [],
@@ -238,6 +254,10 @@ describe('runVerifiedChat — full-autonomy auto-take (ENG-396 Version B)', () =
     const result = await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
+      // ENG-636: these cases model a NOTIFIABLE run (scheduled/interactive) where a
+      // park reaches a human — so the park machinery applies. Headless callers with
+      // no channel are covered separately by the parkedUnnotifiable tests.
+      parkNotifiable: true,
       startingMessage: 'Build and launch my Meta campaigns.',
       keywords: [],
       requiredFunctions: [],
@@ -268,6 +288,10 @@ describe('runVerifiedChat — full-autonomy auto-take (ENG-396 Version B)', () =
     const result = await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
+      // ENG-636: these cases model a NOTIFIABLE run (scheduled/interactive) where a
+      // park reaches a human — so the park machinery applies. Headless callers with
+      // no channel are covered separately by the parkedUnnotifiable tests.
+      parkNotifiable: true,
       startingMessage: 'Build and launch my Meta campaigns.',
       keywords: [],
       requiredFunctions: [],
@@ -293,6 +317,10 @@ describe('runVerifiedChat — full-autonomy auto-take (ENG-396 Version B)', () =
     const result = await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
+      // ENG-636: these cases model a NOTIFIABLE run (scheduled/interactive) where a
+      // park reaches a human — so the park machinery applies. Headless callers with
+      // no channel are covered separately by the parkedUnnotifiable tests.
+      parkNotifiable: true,
       startingMessage: 'Build and launch my Meta campaigns.',
       keywords: [],
       requiredFunctions: [],
@@ -367,6 +395,10 @@ describe('runVerifiedChat — reversible auto-proceed in headless runs (ENG-517)
     const result = await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
+      // ENG-636: these cases model a NOTIFIABLE run (scheduled/interactive) where a
+      // park reaches a human — so the park machinery applies. Headless callers with
+      // no channel are covered separately by the parkedUnnotifiable tests.
+      parkNotifiable: true,
       startingMessage: 'Refresh the B2B Meta ads intelligence.',
       keywords: [],
       requiredFunctions: [],
@@ -396,6 +428,10 @@ describe('runVerifiedChat — reversible auto-proceed in headless runs (ENG-517)
     const result = await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
+      // ENG-636: these cases model a NOTIFIABLE run (scheduled/interactive) where a
+      // park reaches a human — so the park machinery applies. Headless callers with
+      // no channel are covered separately by the parkedUnnotifiable tests.
+      parkNotifiable: true,
       startingMessage: 'Build and launch my Meta campaigns.',
       keywords: [],
       requiredFunctions: [],
@@ -419,6 +455,10 @@ describe('runVerifiedChat — reversible auto-proceed in headless runs (ENG-517)
     const result = await runVerifiedChat({
       sessionId: 'session-1',
       userId: 'user-1',
+      // ENG-636: these cases model a NOTIFIABLE run (scheduled/interactive) where a
+      // park reaches a human — so the park machinery applies. Headless callers with
+      // no channel are covered separately by the parkedUnnotifiable tests.
+      parkNotifiable: true,
       startingMessage: 'Refresh the B2B Meta ads intelligence.',
       keywords: [],
       requiredFunctions: [],
@@ -429,6 +469,90 @@ describe('runVerifiedChat — reversible auto-proceed in headless runs (ENG-517)
 
     expect((result as any).parked).toBe(true);
     expect((mockChatbotDb as any).updateSessionAskUserQuestion.mock.calls.length).toBe(3); // MAX_AUTO_TAKES
+    expect(mockWorkerService.runInWorker.mock.calls.length).toBeLessThan(20);
+  });
+});
+
+/**
+ * ENG-636: headless, fire-and-forget callers have NO channel to reach a human, so
+ * a PARK there is a dead end — nobody is told, nobody can answer, and the run
+ * silently delivers nothing. runVerifiedChat defaults `parkNotifiable: false`, and
+ * for such callers it must FAIL EXPLICITLY (`parkedUnnotifiable: true`) instead of
+ * returning a `parked` result with a pendingUserQuestion no one will ever action.
+ * Only the notifiable callers (scheduled owner email / interactive card) opt into
+ * `parkNotifiable: true` and keep the park behavior.
+ */
+describe('runVerifiedChat — unnotifiable park in headless callers (ENG-636)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
+    (mockChatbotDb as any).updateSessionAskUserQuestion = jest.fn().mockResolvedValue(undefined as any);
+    mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
+    mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
+    mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
+    mockAgentModeService.getDefaultModel.mockResolvedValue('default-model');
+    mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('system prompt');
+    mockAgentModeService.generateSessionTitle.mockResolvedValue('Title');
+    mockWorkerService.runInWorker.mockResolvedValue({
+      content: 'Which objective should I optimize for?',
+      toolCalls: [{ name: 'ask_user_question', result: { awaitingUserConfirmation: true } }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    } as any);
+  });
+
+  it('default (no parkNotifiable): an IMMUTABLE question FAILS explicitly, not a park into a void', async () => {
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      ...baseSession,
+      pendingUserQuestion: awaitingQuestion(),
+    } as any);
+
+    // A headless caller (imageReports/revision/resultEndpoint) — parkNotifiable omitted.
+    const result = await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Build and launch my Meta campaigns.',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 5,
+      attachments: [],
+    });
+
+    expect(result.success).toBe(false);
+    // Explicit unnotifiable failure — NOT a park, and no dangling question to answer.
+    expect((result as any).parkedUnnotifiable).toBe(true);
+    expect((result as any).parked).toBeFalsy();
+    expect((result as any).pendingUserQuestion).toBeUndefined();
+    // Never auto-decided the irreversible objective, and did not loop.
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion).not.toHaveBeenCalled();
+    expect(result.attempts).toBe(1);
+  });
+
+  it('default (no parkNotifiable): a REVERSIBLE tail (auto-takes exhausted) also FAILS explicitly, never a void park', async () => {
+    let n = 0;
+    mockChatbotDb.getChatSession.mockImplementation(async () => {
+      n++;
+      // Every turn re-emits a fresh reversible question, so auto-takes are exhausted.
+      return { ...baseSession, pendingUserQuestion: { ...reversibleQuestion(), questionId: `q-${n}` } } as any;
+    });
+
+    const result = await runVerifiedChat({
+      sessionId: 'session-1',
+      userId: 'user-1',
+      startingMessage: 'Refresh the B2B Meta ads intelligence.',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 20,
+      attachments: [],
+    });
+
+    expect(result.success).toBe(false);
+    expect((result as any).parkedUnnotifiable).toBe(true);
+    expect((result as any).parked).toBeFalsy();
+    // Bounded: it auto-took the reversible default up to MAX_AUTO_TAKES, then failed
+    // explicitly instead of parking into a void or looping to maxAttempts.
+    expect((mockChatbotDb as any).updateSessionAskUserQuestion.mock.calls.length).toBe(3);
     expect(mockWorkerService.runInWorker.mock.calls.length).toBeLessThan(20);
   });
 });
