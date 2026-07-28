@@ -124,6 +124,23 @@ describe('scanMessagesForAssets', () => {
     expect(scanMessagesForAssets(messages, makeSession()).images).toHaveLength(0);
   });
 
+  it('ENG-510: skips no-metadata messages, dedupes a repeated marker URL, and defaults a missing filename', () => {
+    const url = 'https://s3.amazonaws.com/dup.png';
+    const messages = [
+      // no metadata at all → marker is undefined (guard short-circuits)
+      { role: 'user', content: 'make an image', timestamp: '2026-01-01T12:00:00Z' },
+      // marker WITH url but NO imageFilename → falls back to the default name
+      { role: 'system', content: 'Image generated: dup.png', timestamp: '2026-01-01T12:00:01Z',
+        metadata: { kind: 'image-generated', imageUrl: url } },
+      // second marker, SAME url → already seen, must not be listed twice
+      { role: 'system', content: 'Image generated: dup.png', timestamp: '2026-01-01T12:00:02Z',
+        metadata: { kind: 'image-generated', imageUrl: url, imageFilename: 'again.png' } },
+    ];
+    const result = scanMessagesForAssets(messages, makeSession());
+    expect(result.images).toHaveLength(1);
+    expect(result.images[0].filename).toBe('generated-image.png');
+  });
+
   it('should extract videos from generate_video tool calls', () => {
     const messages = [
       {

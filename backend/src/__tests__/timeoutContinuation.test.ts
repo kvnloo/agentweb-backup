@@ -46,6 +46,17 @@ describe('collectMediaGeneratedSince', () => {
     ]);
   });
 
+  it('skips null/undefined message entries and markers with no timestamp at all', () => {
+    const msgs = [
+      null,
+      undefined,
+      // valid image-generated marker but NO timestamp anywhere → Date.parse gets nothing
+      // (rawTs falsy → NaN → not finite) so it is excluded rather than counted.
+      { metadata: { kind: 'image-generated', imageUrl: 'https://s3/no-ts.png', imageFilename: 'x.png' } },
+    ];
+    expect(collectMediaGeneratedSince(msgs as any, turnStart)).toEqual([]);
+  });
+
   it('falls back to a default filename when the marker omits one', () => {
     const msgs = [{ metadata: { kind: 'image-generated', imageUrl: 'https://s3/x.png', timestamp: '2026-07-24T06:54:00Z' } }];
     expect(collectMediaGeneratedSince(msgs, turnStart)).toEqual([
