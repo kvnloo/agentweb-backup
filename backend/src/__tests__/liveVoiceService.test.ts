@@ -46,11 +46,16 @@ jest.mock('../services/onboardingTelemetry', () => ({
 
 const mockAddMessageToSession = jest.fn();
 const mockAddMessagesToSession = jest.fn();
+// ENG-521: startLiveSession now resolves the session owner before starting.
+// These tests all drive sessions owned by 'test-user-id'. Cross-user rejection
+// is covered separately in liveVoiceService.sessionOwnership.test.ts.
+const mockGetChatSessionRecord = jest.fn();
 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     addMessageToSession: mockAddMessageToSession,
     addMessagesToSession: mockAddMessagesToSession,
+    getChatSessionRecord: mockGetChatSessionRecord,
   },
 }));
 
@@ -125,6 +130,10 @@ afterAll(() => {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  mockGetChatSessionRecord.mockImplementation(async (sessionId: string) => ({
+    sessionId,
+    userId: 'test-user-id',
+  }));
 });
 
 afterEach(() => {

@@ -3,7 +3,9 @@ import { getDispatched, markDispatched } from './loopDispatchTracker';
 import { fileAutoIssue } from './intakeService';
 import { getLearningStore, getLoopManifest, getRegisteredLoopIds } from '../loops/index';
 import {
+  claimLoopDecision,
   recordLoopApproval,
+  recordLoopDenial,
   type LoopApprovalStores,
 } from '../loops/core/learning/approvalPersistence';
 
@@ -12,6 +14,14 @@ const LOOP_APPROVAL_USER_ID = process.env.LOOP_APPROVAL_SLACK_USER_ID || 'U08TM4
 
 /** All digest DMs that advertise this footer opt into the shared approval path. */
 const LOOP_DISPATCH_FOOTER = 'React ✅ to dispatch all to cloud-dev';
+
+/**
+ * Rollback for the expanded decision gate. Disabled restores the pre-ENG-593
+ * behavior: ✅ dispatches, while ❌ remains a no-op.
+ */
+function rejectionGateEnabled(): boolean {
+  return process.env.LOOP_SLACK_DECISION_GATE_ENABLED !== 'false';
+}
 
 /** Back-compat marker for the AI Readiness parser while loop digests are text-only. */
 const AI_READINESS_DM_MARKER = 'AI Readiness Funnel — daily run';
@@ -346,6 +356,86 @@ async function persistApproval(
   }
 }
 
+async function persistDenial(
+  channel: string,
+  threadTs: string,
+  messageText: string,
+  denier: string,
+): Promise<void> {
+  const runId = extractRunId(messageText);
+  try {
+    const outcome = await recordLoopDenial({
+      runId,
+      denier: `slack:${denier}`,
+      stores: loopLearningStores(),
+    });
+    if (outcome.loopId == null) {
+      console.warn(`⚠️ loop rejection: no pending learning records for run ${runId} — rejection not persisted`);
+      return;
+    }
+    if (outcome.denied === 0) {
+      console.log(`🔁 loop rejection: run ${runId} was already resolved — skipping`);
+      return;
+    }
+    await postThread(
+      channel,
+      threadTs,
+      `❌ Rejected ${outcome.denied} pending proposal${outcome.denied === 1 ? '' : 's'} (${outcome.loopId}). No work was dispatched.`,
+    );
+  } catch (err) {
+    console.error(`❌ loop rejection: failed to persist rejection for run ${runId}:`, err);
+    await postThread(
+      channel,
+      threadTs,
+      `⚠️ Rejection was not persisted to the learning store; this run remains pending.`,
+    ).catch(() => undefined);
+  }
+}
+
+async function claimApprovalDecision(
+  channel: string,
+  threadTs: string,
+  messageText: string,
+  approver: string,
+): Promise<boolean> {
+  const runId = extractRunId(messageText);
+  try {
+    const outcome = await claimLoopDecision({
+      runId,
+      decision: 'approved',
+      decidedBy: `slack:${approver}`,
+      stores: loopLearningStores(),
+    });
+    if (outcome.loopId == null) {
+      console.warn(`⚠️ loop approval: no pending learning records for run ${runId} — dispatch blocked`);
+      await postThread(
+        channel,
+        threadTs,
+        `⚠️ Approval could not be claimed in the learning store, so no work was dispatched.`,
+      );
+      return false;
+    }
+    if (!outcome.accepted) {
+      console.log(`🔁 loop approval: run ${runId} already has a terminal decision — skipping`);
+      await postThread(
+        channel,
+        threadTs,
+        `↩️ This run was already resolved${outcome.decision ? ` as ${outcome.decision}` : ''}; no work was dispatched.`,
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error(`❌ loop approval: failed to claim decision for run ${runId}:`, err);
+    await postThread(
+      channel,
+      threadTs,
+      `⚠️ Approval could not be persisted atomically, so no work was dispatched.`,
+    ).catch(() => undefined);
+    return false;
+  }
+}
+
 function formatSummary(loopTitle: string, results: DispatchResult[]): string {
   const successCount = results.filter((r) => r.ok).length;
   const lines = [
@@ -363,7 +453,9 @@ function formatSummary(loopTitle: string, results: DispatchResult[]): string {
 }
 
 export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Promise<void> {
-  if (event.reaction !== 'white_check_mark') return;
+  const isApproval = event.reaction === 'white_check_mark';
+  const isRejection = event.reaction === 'x' && rejectionGateEnabled();
+  if (!isApproval && !isRejection) return;
   if (event.user !== LOOP_APPROVAL_USER_ID) return;
 
   const item = event.item;
@@ -380,6 +472,20 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
 
   if (!message.text.includes(LOOP_DISPATCH_FOOTER)) return;
 
+  if (isRejection) {
+    if (inFlightDispatches.has(item.ts)) {
+      console.log(`🔁 loop rejection reaction: ${item.ts} is already in flight — skipping`);
+      return;
+    }
+    inFlightDispatches.add(item.ts);
+    try {
+      await persistDenial(item.channel, item.ts, message.text, event.user);
+    } finally {
+      inFlightDispatches.delete(item.ts);
+    }
+    return;
+  }
+
   const loopTitle = extractDigestTitle(message.text);
   const tasks = parseDispatchableTasks(message.text);
   if (tasks.length === 0) {
@@ -390,6 +496,8 @@ export async function handleLoopApprovalReaction(event: ReactionAddedEvent): Pro
     );
     return;
   }
+
+  if (!await claimApprovalDecision(item.channel, item.ts, message.text, event.user)) return;
 
   const priorDispatch = await getDispatched(item.ts);
   const completedTaskIds = new Set(priorDispatch?.pageIds ?? []);

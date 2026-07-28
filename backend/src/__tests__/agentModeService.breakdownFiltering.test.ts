@@ -11,6 +11,10 @@ jest.mock('../services/db', () => ({
   }
 }));
 
+jest.mock('../services/connectedAccountsDb', () => ({
+  getAccountsWithOwnerIncludingOrgShared: jest.fn().mockResolvedValue([])
+}));
+
 jest.mock('../utils/s3Utils', () => ({
   uploadFileToS3: jest.fn().mockResolvedValue({
     success: true,

@@ -15,13 +15,17 @@ import { checkTokenUsage } from './services/tokenUsageService';
 import { userDb } from './services/db';
 import { registerIo } from './services/sessionSockets';
 import {
-  startLiveSession,
   sendAudioChunk,
   sendAudioStreamEnd,
   sendTextTurn,
   closeLiveSession,
   hasLiveSession,
 } from './services/liveVoiceService';
+import {
+  getEffectiveLiveUserId,
+  registerLiveCloseHandler,
+  registerLiveStartHandler,
+} from './services/liveVoiceSocket';
 import {
   ONBOARDING_TELEMETRY_EVENTS,
   recordOnboardingEvent,
@@ -173,49 +177,8 @@ io.on('connection', (socket: Socket) => {
   // Gemini Live Voice handlers
   // ---------------------------------------------------------------------------
 
-  // Emit helper that sends events to this specific socket
-  const liveEmit = (event: string, data: unknown) => socket.emit(event, data);
-
-  // Verify the socket user owns the sessionId before allowing live operations
-  function getLiveUserId(): string {
-    // Conversable (iShare) socket — userId resolved at auth time
-    if (socket.data.conversableUserId) {
-      return socket.data.conversableUserId;
-    }
-    const token = socket.handshake.auth.token;
-    if (!token) throw new Error('No auth token');
-    const decoded = jwt.verify(token, getJwtSecret()) as {
-      userId: string;
-      delegateAccess?: { targetUserId: string };
-    };
-    return decoded.delegateAccess?.targetUserId || decoded.userId;
-  }
-
-  socket.on('live:start', async ({
-    sessionId,
-    toolProfile = 'default',
-  }: {
-    sessionId: string;
-    toolProfile?: 'default' | 'onboarding';
-  }) => {
-    try {
-      // For conversable sockets, enforce that the sessionId matches what was auth'd
-      if (socket.data.conversableSessionId && socket.data.conversableSessionId !== sessionId) {
-        throw new Error('Session ID mismatch for conversable socket');
-      }
-      const userId = getLiveUserId(); // auth check — throws if invalid
-      console.log(`[liveVoice] live:start received for session ${sessionId} on socket ${socket.id}`);
-      // Track which live sessions this socket owns (for disconnect cleanup)
-      if (!socket.data.liveSessions) socket.data.liveSessions = new Set<string>();
-      socket.data.liveSessions.add(sessionId);
-      await startLiveSession(sessionId, socket.id, liveEmit, userId, toolProfile);
-      console.log(`[liveVoice] live:start completed for session ${sessionId}`);
-    } catch (err: any) {
-      socket.data.liveSessions?.delete(sessionId);
-      console.error(`[liveVoice] live:start error for session ${sessionId}:`, err?.message);
-      socket.emit('live:error', { sessionId, error: err?.message ?? 'Failed to start live session' });
-    }
-  });
+  registerLiveStartHandler(socket);
+  registerLiveCloseHandler(socket);
 
   socket.on('live:audio', ({ sessionId, chunk }: { sessionId: string; chunk: string }) => {
     console.log(`[liveVoice] live:audio received for session ${sessionId}, hasSession=${hasLiveSession(sessionId)}`);
@@ -245,11 +208,6 @@ io.on('connection', (socket: Socket) => {
     }
   });
 
-  socket.on('live:close', ({ sessionId }: { sessionId: string }) => {
-    closeLiveSession(sessionId, socket.id);
-    socket.data.liveSessions?.delete(sessionId);
-  });
-
   socket.on('live:report-issue', async ({
     sessionId,
     phase,
@@ -263,7 +221,7 @@ io.on('connection', (socket: Socket) => {
       if (!sessionId || !socket.data.liveSessions?.has(sessionId)) {
         throw new Error('No active voice session for this report');
       }
-      const userId = getLiveUserId();
+      const userId = getEffectiveLiveUserId(socket);
       const safePhase = typeof phase === 'string' ? phase.slice(0, 40) : 'unknown';
       const safeBreadcrumbs = Array.isArray(breadcrumbs)
         ? JSON.stringify(breadcrumbs.slice(-25)).slice(0, 2_500)

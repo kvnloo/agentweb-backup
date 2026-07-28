@@ -63,6 +63,7 @@ jest.mock('../services/emailEventsDb', () => ({
 
 import request from 'supertest';
 import express from 'express';
+import { createServer, Server } from 'http';
 import webhookRouter from '../routes/webhooks';
 import { crmDb, userDb } from '../services/db';
 import { metaService } from '../services/metaService';
@@ -74,6 +75,24 @@ import { leadListAlertService } from '../services/leadListAlertService';
 const app = express();
 app.use(express.json());
 app.use('/api/webhooks', webhookRouter);
+let rateLimitTestServer: Server;
+
+beforeAll(async () => {
+  rateLimitTestServer = createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    rateLimitTestServer.once('error', reject);
+    rateLimitTestServer.listen(0, '127.0.0.1', () => {
+      rateLimitTestServer.off('error', reject);
+      resolve();
+    });
+  });
+});
+
+afterAll(async () => {
+  await new Promise<void>((resolve, reject) => {
+    rateLimitTestServer.close((error) => (error ? reject(error) : resolve()));
+  });
+});
 
 const flushAsyncWork = async () => {
   await new Promise((resolve) => setImmediate(resolve));
@@ -94,7 +113,7 @@ describe('forward-lead: lead save is never rate-limited (ENG-492)', () => {
 
   it('SUCCESS: more than 100 submissions to the same list in one window all still save and get a 201 — none are ever rejected', async () => {
     for (let i = 0; i < 105; i++) {
-      const res = await request(app)
+      const res = await request(rateLimitTestServer)
         .post('/api/webhooks/forward-lead')
         .send({ listId: 'list_high_volume_real_customer', email: `real-lead-${i}@example.com` });
       expect(res.status).toBe(201);
@@ -118,13 +137,35 @@ describe('forward-lead: CAPI send is budgeted per listId, independent of the lea
   });
 
   const sendWithCapiFields = (listId: string, email: string) =>
-    request(app).post('/api/webhooks/forward-lead').send({
+    request(rateLimitTestServer).post('/api/webhooks/forward-lead').send({
       listId,
       email,
       pixelId: '1430870751246428',
       metaAccountId: 'acc1',
       eventId: `evt_${email}`,
     });
+
+  describe('persistent suite transport', () => {
+    it('owns one server for the suite instead of constructing a listener per request', () => {
+      expect(rateLimitTestServer).toBeDefined();
+    });
+
+    it('keeps the shared listener open while budget assertions run', () => {
+      expect(rateLimitTestServer.listening).toBe(true);
+    });
+
+    it('does not bind new listeners for repeated submissions', async () => {
+      const listenSpy = jest.spyOn(Server.prototype, 'listen');
+
+      try {
+        await sendWithCapiFields('list_transport_stability', 'one@example.com');
+        await sendWithCapiFields('list_transport_stability', 'two@example.com');
+        expect(listenSpy).not.toHaveBeenCalled();
+      } finally {
+        listenSpy.mockRestore();
+      }
+    });
+  });
 
   it('FAIL: the 101st CAPI-eligible submission to the same list in one window still saves (201), does NOT attempt the CAPI send, and logs the overflow for visibility', async () => {
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
@@ -180,7 +221,7 @@ describe('forward-lead: CAPI paused per Meta ad account on its real Business Use
   });
 
   const sendFor = (listId: string, accountId: string, email: string) =>
-    request(app).post('/api/webhooks/forward-lead').send({
+    request(rateLimitTestServer).post('/api/webhooks/forward-lead').send({
       listId,
       email,
       pixelId: '1430870751246428',
@@ -262,7 +303,7 @@ describe('forward-lead: CAPI client IP prefers x-forwarded-for over req.ip (scop
   // riskier change), this scopes the fix to just this CAPI call site, reusing the pattern
   // already established in loopEvents.ts/assetController.ts.
   it('SUCCESS: uses the first x-forwarded-for IP when present, not req.ip', async () => {
-    await request(app)
+    await request(rateLimitTestServer)
       .post('/api/webhooks/forward-lead')
       .set('X-Forwarded-For', '203.0.113.7, 10.0.0.1')
       .send({
@@ -282,7 +323,7 @@ describe('forward-lead: CAPI client IP prefers x-forwarded-for over req.ip (scop
   });
 
   it('SUCCESS: falls back to req.ip when x-forwarded-for is absent', async () => {
-    await request(app)
+    await request(rateLimitTestServer)
       .post('/api/webhooks/forward-lead')
       .send({
         listId: 'list_ip_test_2',
@@ -315,7 +356,7 @@ describe('forward-lead: fbp/fbc forwarded to CAPI when the client sent them (ENG
   });
 
   it('SUCCESS: fbp/fbc in the request body are passed through to sendCapiLeadEvent', async () => {
-    await request(app).post('/api/webhooks/forward-lead').send({
+    await request(rateLimitTestServer).post('/api/webhooks/forward-lead').send({
       listId: 'list_fbp_test',
       email: 'fbp-test@example.com',
       pixelId: '1430870751246428',
@@ -334,7 +375,7 @@ describe('forward-lead: fbp/fbc forwarded to CAPI when the client sent them (ENG
   });
 
   it('SUCCESS: omits fbp/fbc when absent from the request body (does not send undefined fields)', async () => {
-    await request(app).post('/api/webhooks/forward-lead').send({
+    await request(rateLimitTestServer).post('/api/webhooks/forward-lead').send({
       listId: 'list_fbp_test_2',
       email: 'fbp-test-2@example.com',
       pixelId: '1430870751246428',
@@ -365,7 +406,7 @@ describe('forward-lead: synthetic smoke-test leads skip all side effects (ENG-44
   });
 
   it('SUCCESS: a smoke-test lead (smoke-test+<ts>@agentweb.pro) still saves and gets a 201, but skips CAPI/CRM-sync/sequence-enrollment/owner-notify', async () => {
-    const res = await request(app).post('/api/webhooks/forward-lead').send({
+    const res = await request(rateLimitTestServer).post('/api/webhooks/forward-lead').send({
       listId: 'list_smoke_test',
       email: 'smoke-test+1721000000000@agentweb.pro',
       pixelId: '1430870751246428',
@@ -382,7 +423,7 @@ describe('forward-lead: synthetic smoke-test leads skip all side effects (ENG-44
   });
 
   it('FAIL (regression guard): a real lead with a similar-looking but non-matching email still gets the full side-effect cascade', async () => {
-    await request(app).post('/api/webhooks/forward-lead').send({
+    await request(rateLimitTestServer).post('/api/webhooks/forward-lead').send({
       listId: 'list_real_lead',
       email: 'smoke-test-but-not-really@agentweb.pro', // doesn't match the strict pattern
       pixelId: '1430870751246428',
