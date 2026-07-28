@@ -25,12 +25,14 @@ const V0_REQUEST_TIMEOUT_MS = 10_000;
 export const V0_CREDITS_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // ── Warn thresholds ───────────────────────────────────────────────────────────
-/** Total spendable (monthly remaining + on-demand remaining) below this → "low". */
-export const LOW_TOTAL_SPENDABLE_USD = 25;
+// Total spendable (monthly remaining + on-demand remaining) is the ONLY trigger.
+// The monthly bucket must never alert on its own (ENG-585): the $30/mo allowance
+// is chronically exhausted mid-cycle while on-demand credit keeps generation
+// working, so monthly-based triggers produced a daily alert at $50+ spendable.
+/** Total spendable below this → "low". */
+export const LOW_TOTAL_SPENDABLE_USD = 10;
 /** Total spendable below this → "critical". */
-export const CRITICAL_TOTAL_SPENDABLE_USD = 10;
-/** Monthly allowance remaining below this fraction of its total → "low". */
-export const LOW_MONTHLY_REMAINING_FRACTION = 0.2;
+export const CRITICAL_TOTAL_SPENDABLE_USD = 5;
 
 export type V0WarnLevel = "ok" | "low" | "critical";
 
@@ -100,18 +102,11 @@ export interface V0CreditsDto {
   fetchedAt: string; // ISO timestamp of the underlying v0 fetch
 }
 
-export function computeWarnLevel(
-  totalSpendableUsd: number,
-  monthly: V0Balance
-): V0WarnLevel {
-  const monthlyExhausted = monthly.total > 0 && monthly.remaining <= 0;
-  if (totalSpendableUsd < CRITICAL_TOTAL_SPENDABLE_USD || monthlyExhausted) {
+export function computeWarnLevel(totalSpendableUsd: number): V0WarnLevel {
+  if (totalSpendableUsd < CRITICAL_TOTAL_SPENDABLE_USD) {
     return "critical";
   }
-  const monthlyLow =
-    monthly.total > 0 &&
-    monthly.remaining / monthly.total < LOW_MONTHLY_REMAINING_FRACTION;
-  if (totalSpendableUsd < LOW_TOTAL_SPENDABLE_USD || monthlyLow) {
+  if (totalSpendableUsd < LOW_TOTAL_SPENDABLE_USD) {
     return "low";
   }
   return "ok";
@@ -190,7 +185,7 @@ async function fetchAndNormalize(): Promise<V0CreditsDto> {
               : null,
           }
         : null,
-    warnLevel: computeWarnLevel(totalSpendableUsd, monthly),
+    warnLevel: computeWarnLevel(totalSpendableUsd),
     fetchedAt: new Date().toISOString(),
   };
 }

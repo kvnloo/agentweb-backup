@@ -21,7 +21,6 @@ import {
   __resetV0CreditsCacheForTests,
   LOW_TOTAL_SPENDABLE_USD,
   CRITICAL_TOTAL_SPENDABLE_USD,
-  LOW_MONTHLY_REMAINING_FRACTION,
   V0_CREDITS_CACHE_TTL_MS,
   V0_ALERT_REALERT_WINDOW_MS,
 } from '../v0BillingService';
@@ -133,8 +132,8 @@ describe('v0BillingService', () => {
         daily: { limit: 7, remaining: 7, reset: 1783814400000 },
       });
       expect(dto.fetchedAt).toBe('2026-07-11T00:00:00.000Z');
-      // $12.76 spendable is below the $25 low-water mark
-      expect(dto.warnLevel).toBe('low');
+      // $12.76 spendable is above the $10 low-water mark (ENG-585)
+      expect(dto.warnLevel).toBe('ok');
     });
 
     it('sends the API key as a Bearer token and never as a query param', async () => {
@@ -168,35 +167,30 @@ describe('v0BillingService', () => {
     });
   });
 
-  describe('warnLevel thresholds', () => {
+  describe('warnLevel thresholds (ENG-585: total spendable is the ONLY trigger)', () => {
     it('exports the documented threshold constants', () => {
-      expect(LOW_TOTAL_SPENDABLE_USD).toBe(25);
-      expect(CRITICAL_TOTAL_SPENDABLE_USD).toBe(10);
-      expect(LOW_MONTHLY_REMAINING_FRACTION).toBe(0.2);
+      expect(LOW_TOTAL_SPENDABLE_USD).toBe(10);
+      expect(CRITICAL_TOTAL_SPENDABLE_USD).toBe(5);
     });
 
     it('returns ok when balances are healthy', () => {
-      expect(computeWarnLevel(80, { remaining: 30, total: 30 })).toBe('ok');
+      expect(computeWarnLevel(80)).toBe('ok');
     });
 
-    it('returns low when total spendable is under $25', () => {
-      expect(computeWarnLevel(24.99, { remaining: 30, total: 30 })).toBe('low');
+    it('returns low when total spendable is under $10', () => {
+      expect(computeWarnLevel(9.99)).toBe('low');
     });
 
-    it('returns low when monthly remaining is under 20%', () => {
-      expect(computeWarnLevel(105, { remaining: 5, total: 30 })).toBe('low');
+    it('returns critical when total spendable is under $5', () => {
+      expect(computeWarnLevel(4.99)).toBe('critical');
     });
 
-    it('returns critical when total spendable is under $10', () => {
-      expect(computeWarnLevel(9.99, { remaining: 30, total: 30 })).toBe('critical');
+    it('boundary: exactly $10 total is still ok', () => {
+      expect(computeWarnLevel(10)).toBe('ok');
     });
 
-    it('returns critical when the monthly allowance is exhausted', () => {
-      expect(computeWarnLevel(100, { remaining: 0, total: 30 })).toBe('critical');
-    });
-
-    it('boundary: exactly $25 total and exactly 20% monthly is still ok', () => {
-      expect(computeWarnLevel(25, { remaining: 6, total: 30 })).toBe('ok');
+    it('boundary: exactly $5 total is low, not critical', () => {
+      expect(computeWarnLevel(5)).toBe('low');
     });
 
     it('end-to-end: healthy fixture balances produce warnLevel ok', async () => {
@@ -209,10 +203,35 @@ describe('v0BillingService', () => {
       expect(dto.warnLevel).toBe('ok');
     });
 
-    it('end-to-end: exhausted monthly allowance produces warnLevel critical', async () => {
+    // AC #1 (ENG-585): the exact state behind the daily 2026-07-27 alert —
+    // monthly $2.00/$30.00, on-demand $51.81 → $53.81 spendable — must be ok.
+    it('end-to-end: $53.81 spendable with a nearly-exhausted monthly bucket is ok', async () => {
+      const billing = JSON.parse(JSON.stringify(BILLING_FIXTURE));
+      billing.data.balance = { remaining: 2, total: 30 };
+      billing.data.onDemand.balance = 51.81;
+      mockV0Api({ billing });
+
+      const dto = await getV0Credits();
+      expect(dto.totalSpendableUsd).toBe(53.81);
+      expect(dto.warnLevel).toBe('ok');
+    });
+
+    // AC #3 (ENG-585): a fully exhausted monthly allowance alone never alerts —
+    // on-demand credit covers generation, so this state was pure daily noise.
+    it('end-to-end: exhausted monthly allowance with on-demand credit left is ok', async () => {
       const billing = JSON.parse(JSON.stringify(BILLING_FIXTURE));
       billing.data.balance = { remaining: 0, total: 30 };
       billing.data.onDemand.balance = 100;
+      mockV0Api({ billing });
+
+      const dto = await getV0Credits();
+      expect(dto.warnLevel).toBe('ok');
+    });
+
+    it('end-to-end: exhausted monthly AND near-empty on-demand is critical', async () => {
+      const billing = JSON.parse(JSON.stringify(BILLING_FIXTURE));
+      billing.data.balance = { remaining: 0, total: 30 };
+      billing.data.onDemand.balance = 3.5;
       mockV0Api({ billing });
 
       const dto = await getV0Credits();
@@ -363,11 +382,11 @@ describe('v0BillingService', () => {
         billing.data.balance = { remaining: 30, total: 30 };
         billing.data.onDemand.balance = 50; // $80 spendable
       } else if (level === 'low') {
-        billing.data.balance = { remaining: 10, total: 30 };
-        billing.data.onDemand.balance = 5; // $15 spendable → low
+        billing.data.balance = { remaining: 2, total: 30 };
+        billing.data.onDemand.balance = 6; // $8 spendable → low
       } else {
-        billing.data.balance = { remaining: 1, total: 30 };
-        billing.data.onDemand.balance = 4; // $5 spendable → critical
+        billing.data.balance = { remaining: 0, total: 30 };
+        billing.data.onDemand.balance = 3; // $3 spendable → critical
       }
       return billing;
     }
@@ -392,11 +411,25 @@ describe('v0BillingService', () => {
       expect(transport).toHaveBeenCalledTimes(1);
       const [subject, message] = transport.mock.calls[0];
       expect(subject).toContain('LOW');
-      expect(subject).toContain('$15.00');
+      expect(subject).toContain('$8.00');
       expect(message).toContain('Plan: v0-team');
-      expect(message).toContain('Total spendable: $15.00');
-      expect(message).toContain('Monthly allowance: $10.00 of $30.00');
+      expect(message).toContain('Total spendable: $8.00');
+      expect(message).toContain('Monthly allowance: $2.00 of $30.00');
       expect(message).toContain('top up v0 credits');
+    });
+
+    // AC #1 (ENG-585): the daily-noise state — $53.81 spendable, monthly bucket
+    // nearly exhausted — must send NOTHING through the oncall transport.
+    it('sends no alert at $53.81 spendable even with the monthly bucket at $2.00/$30.00', async () => {
+      const billing = JSON.parse(JSON.stringify(BILLING_FIXTURE));
+      billing.data.balance = { remaining: 2, total: 30 };
+      billing.data.onDemand.balance = 51.81;
+      mockV0Api({ billing });
+
+      const result = await checkAndAlert({ transport });
+
+      expect(result).toEqual({ warnLevel: 'ok', alerted: false, recovered: false });
+      expect(transport).not.toHaveBeenCalled();
     });
 
     // ENG-358: the alert context must carry the intake gate's clustering keys so every occurrence

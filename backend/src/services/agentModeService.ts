@@ -175,6 +175,10 @@ import { twitterService } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
+import {
+  NegativeCampaignCriteriaValidationError,
+  validateNegativeCampaignCriteria,
+} from './googleAdsCampaignCriteria';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
@@ -224,6 +228,7 @@ import {
   ALLOWED_NODE_TYPES,
   AllowedNodeType,
   ALLOWED_INSIGHTS_FIELDS,
+  suggestInsightsFields,
   ALLOWED_INSIGHTS_BREAKDOWNS,
   ALLOWED_ACTION_BREAKDOWNS,
   ALLOWED_DATE_PRESETS,
@@ -13912,7 +13917,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw this.makeMetaAuthError(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
       }
 
-      await this.ensureUsableMetaToken(selected, userId);
+      await this.ensureUsableMetaToken(selected, selected.userId || userId);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
@@ -13934,7 +13939,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // 4. Default to the single available account
     const selected = fbAccounts[0];
 
-    await this.ensureUsableMetaToken(selected, userId);
+    await this.ensureUsableMetaToken(selected, selected.userId || userId);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 
@@ -13984,13 +13989,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw new Error("fields array is required");
       }
 
-      const invalidFields = fields.filter(
+      // ENG-511: Do NOT hard-reject the whole call when some requested fields are
+      // unknown. Meta Insights has a large, evolving field vocabulary and the model
+      // occasionally requests a valid-but-unwhitelisted field (e.g.
+      // cost_per_inline_link_click) or a plausible-but-unsupported one. Previously
+      // any unknown field threw, the model re-issued the identical call, and the
+      // anti-loop/retry guard hard-blocked the entire insights channel before any
+      // metrics came back. Instead: drop the unknown fields, keep the valid subset,
+      // and proceed. Only fail when NOTHING valid remains — and even then, name the
+      // dropped fields so the model corrects rather than blindly retries.
+      const droppedFields = fields.filter(
         (f) => !ALLOWED_INSIGHTS_FIELDS.includes(f)
       );
+      let validFields = fields.filter((f) =>
+        ALLOWED_INSIGHTS_FIELDS.includes(f)
+      );
 
-      if (invalidFields.length) {
+      if (!validFields.length) {
+        // ENG-511: point the model at the closest valid field for each bad one so
+        // it can correct a typo/loose phrasing rather than guess.
+        const suggestions = suggestInsightsFields(droppedFields);
+        const suggestionHint = Object.keys(suggestions).length
+          ? ` Did you mean: ${Object.entries(suggestions)
+              .map(([bad, good]) => `${bad} -> ${good}`)
+              .join(", ")}?`
+          : "";
         throw new Error(
-          `Invalid insights fields requested: ${invalidFields.join(", ")}`
+          `Invalid insights fields requested: ${droppedFields.join(", ")}. None are supported, so no data could be fetched — do not retry with the same fields.${suggestionHint} Choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`
         );
       }
 
@@ -14069,7 +14094,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const submitUrl = `${baseUrl}/${actualNodeId}/insights`;
 
       const filteredParams = {
-        fields: fields.join(","),
+        fields: validFields.join(","),
         limit: 5000,
 
         ...(date_preset && { date_preset }),
@@ -14084,57 +14109,138 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(filtering?.length && { filtering }),
       };
 
-      const submitRes = await axios.post(submitUrl, {
-        ...filteredParams,
-        access_token: accessToken,
-      });
-
-      const reportRunId = (submitRes.data as any)?.report_run_id;
-
-      if (!reportRunId) {
-        throw new Error("Failed to get report_run_id from Meta");
-      }
-
-      // Polling Engine
-      let attempts = 0;
-      const maxAttempts = 60;
-
-      while (attempts < maxAttempts) {
-        attempts++;
-
-        await new Promise((resolve) => setTimeout(resolve, 10000));
-
-        const statusRes = await axios.get(`${baseUrl}/${reportRunId}`, {
-          params: { access_token: accessToken },
+      // ENG-511: Run the full report (submit → poll → fetch) as one unit. Meta
+      // rejects some whitelisted fields at SUBMIT time (HTTP 400 on the POST) but
+      // others only LAZILY at result-read time (e.g. onsite_conversion_lead_grouped
+      // returns "(#100) Tried accessing nonexisting summary field ..." on the GET,
+      // after a report_run_id was already issued). Wrapping the whole run lets us
+      // self-heal a bad field regardless of which stage surfaces it.
+      const runReport = async (
+        fieldsToSend: string[]
+      ): Promise<{ reportRunId: string; data: any[] }> => {
+        const submitRes = await axios.post(submitUrl, {
+          ...filteredParams,
+          fields: fieldsToSend.join(","),
+          access_token: accessToken,
         });
-
-        const status = (statusRes.data as any)?.async_status;
-
-        if (status === "Job Completed") break;
-
-        if (status === "Job Failed" || status === "Job Skipped") {
-          throw new Error(`Meta Insights Job failed: ${status}`);
+        const rid = (submitRes.data as any)?.report_run_id;
+        if (!rid) {
+          throw new Error("Failed to get report_run_id from Meta");
         }
 
-        if (attempts === maxAttempts) {
-          throw new Error("Meta Insights Job timed out.");
+        // Polling Engine
+        let attempts = 0;
+        const maxAttempts = 60;
+        while (attempts < maxAttempts) {
+          attempts++;
+          await new Promise((resolve) => setTimeout(resolve, 10000));
+          const statusRes = await axios.get(`${baseUrl}/${rid}`, {
+            params: { access_token: accessToken },
+          });
+          const status = (statusRes.data as any)?.async_status;
+          if (status === "Job Completed") break;
+          if (status === "Job Failed" || status === "Job Skipped") {
+            throw new Error(`Meta Insights Job failed: ${status}`);
+          }
+          if (attempts === maxAttempts) {
+            throw new Error("Meta Insights Job timed out.");
+          }
         }
-      }
 
-      // Fetch Paginated Results
-      const resultsUrl = `${baseUrl}/${reportRunId}/insights`;
+        // Fetch Paginated Results
+        const resultsUrl = `${baseUrl}/${rid}/insights`;
+        const collected: any[] = [];
+        let nextUrl: string | null = resultsUrl;
+        let isFirstRequest = true;
+        while (nextUrl) {
+          const res: any = isFirstRequest
+            ? await axios.get(nextUrl, { params: { access_token: accessToken } })
+            : await axios.get(nextUrl); // paging.next already includes token
+          collected.push(...(res.data?.data || []));
+          nextUrl = res.data?.paging?.next || null;
+          isFirstRequest = false;
+        }
+        return { reportRunId: rid, data: collected };
+      };
 
-      let allData: any[] = [];
-      let nextUrl: string | null = resultsUrl;
-      let isFirstRequest = true;
+      // ENG-511: If Meta rejects a whitelisted field (400 at submit OR at read),
+      // don't surface a bare error the model will blindly re-issue until the
+      // anti-loop guard hard-blocks the whole insights channel. Parse the offending
+      // field(s) out of Meta's error, drop them, and retry the whole report exactly
+      // ONCE with the valid remainder. If we cannot isolate the offender (or nothing
+      // valid would remain), return a structured no-retry error so the model
+      // corrects rather than loops.
+      let reportRunId: string;
+      let allData: any[];
+      // Meta names incompatible fields ONE AT A TIME, so a single retry only clears
+      // one bad field. Loop: drop the field(s) Meta names, retry with the remainder,
+      // and repeat until the report succeeds or nothing valid is left. Each pass
+      // removes >=1 field, so validFields strictly shrinks — the loop is bounded by
+      // the field count (maxHealAttempts is a belt-and-suspenders cap).
+      const maxHealAttempts = validFields.length + 1;
+      let healAttempts = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        try {
+          const run = await runReport(validFields);
+          reportRunId = run.reportRunId;
+          allData = run.data;
+          break;
+        } catch (reportErr: any) {
+          const metaError = reportErr?.response?.data?.error;
+          const status = reportErr?.response?.status;
+          const haystack = `${metaError?.message || ""} ${metaError?.error_user_msg || ""} ${metaError?.error_user_title || ""}`;
+          const isFieldError = status === 400 && /field/i.test(haystack);
 
-      while (nextUrl) {
-        const res: any = isFirstRequest
-          ? await axios.get(nextUrl, { params: { access_token: accessToken } })
-          : await axios.get(nextUrl); // paging.next already includes token
-        allData.push(...(res.data?.data || []));
-        nextUrl = res.data?.paging?.next || null;
-        isFirstRequest = false;
+          // Word-boundary match so a rejected field is not confused with a longer
+          // sibling that contains it (e.g. `ctr` inside `inline_link_click_ctr`).
+          const metaRejectedFields = isFieldError
+            ? validFields.filter((f) => new RegExp(`\\b${f}\\b`).test(haystack))
+            : [];
+          const retryFields = validFields.filter(
+            (f) => !metaRejectedFields.includes(f)
+          );
+
+          if (
+            isFieldError &&
+            metaRejectedFields.length &&
+            retryFields.length &&
+            healAttempts < maxHealAttempts
+          ) {
+            // Drop the Meta-rejected field(s) and retry with the valid subset.
+            healAttempts++;
+            droppedFields.push(...metaRejectedFields);
+            validFields = retryFields;
+            filteredParams.fields = validFields.join(",");
+            continue;
+          }
+
+          if (!isFieldError) {
+            throw reportErr;
+          }
+
+          // Field error we cannot recover from (offender unisolable, nothing valid
+          // remains, or cap hit): return a structured no-retry error so the model
+          // corrects rather than loops.
+          const suggestions = suggestInsightsFields(metaRejectedFields);
+          const suggestionHint = Object.keys(suggestions).length
+            ? ` Did you mean: ${Object.entries(suggestions)
+                .map(([bad, good]) => `${bad} -> ${good}`)
+                .join(", ")}?`
+            : "";
+          return {
+            success: false,
+            error: `Meta rejected the requested insights field(s)${metaRejectedFields.length ? `: ${metaRejectedFields.join(", ")}` : ""}. Do not retry the same request — remove or replace the offending field(s).${suggestionHint} Choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`,
+            metadata: {
+              tool: "call_meta_ads_insights_api",
+              account_id,
+              meta_error: metaError?.message || reportErr?.message,
+              ...(Object.keys(suggestions).length && {
+                field_suggestions: suggestions,
+              }),
+            },
+          };
+        }
       }
 
       const envelope = {
@@ -14147,6 +14253,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           query: filteredParams,
           report_run_id: reportRunId,
           api_version: version,
+          // ENG-511: surface any unsupported fields we dropped so the model knows
+          // why they are absent and does not re-request them on the next turn, plus
+          // a closest-valid-field suggestion for each so a typo/loose phrasing is
+          // actionable (e.g. `impression` -> `impressions`) rather than silently gone.
+          ...(droppedFields.length && { dropped_fields: droppedFields }),
+          ...(droppedFields.length &&
+            Object.keys(suggestInsightsFields(droppedFields)).length && {
+              dropped_field_suggestions: suggestInsightsFields(droppedFields),
+            }),
         },
         data: allData,
       };
@@ -15648,43 +15763,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_ids: string[] | string): Promise<any> {
+  public async getMetaAdsMetrics(
+    timeframe: string,
+    userId: string,
+    campaign_ids: string[] | string,
+    requestedAccountId?: string,
+  ): Promise<any> {
     try {
+      const rawCampaignIds = Array.isArray(campaign_ids)
+        ? campaign_ids
+        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
+      const campaignFilterIds = [
+        ...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))
+      ];
+      console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
+      if (campaignFilterIds.length === 0) {
+        return {
+          success: false,
+          message: 'campaign_ids is required and must contain at least one campaign ID.',
+          error: 'Invalid campaign_ids'
+        };
+      }
 
-      // Import the Meta API functions directly to reuse the same logic
-      const { getMetaAccessToken } = await import('../utils/secretsManager');
-      const { userDb } = await import('./db');
       const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
 
-      // Get user from database
-      const user = await userDb.getUserById(userId);
-      if (!user) {
-        return {
-          success: false,
-          message: 'User not found',
-          error: 'User not found'
-        };
-      }
-
-      // Check if user has ad account configured
-      if (!user.adAccount || user.adAccount.trim() === "") {
-        return {
-          success: false,
-          message: 'Ad account not configured. Please configure your Meta ad account first.',
-          error: 'Ad account not configured'
-        };
-      }
-
-      // Get Meta API access token from Secrets Manager
+      // Use the same account resolver as the raw Insights tool. This keeps
+      // connected-account, org-shared, and legacy account selection consistent.
+      let accountId: string;
       let accessToken: string;
       try {
-        accessToken = await getMetaAccessToken();
+        ({ accountId, accessToken } = await this.getMetaCredentials(userId, requestedAccountId));
       } catch (error: any) {
-        console.error('AgentMode: Error fetching Meta access token:', error);
+        const credentialFailure =
+          error?.isMetaAuthError ||
+          /meta.*(?:access token|secret)|(?:access token|secret).*meta/i.test(error?.message || '');
+        if (!credentialFailure) throw error;
         return {
           success: false,
-          message: 'Meta access token not configured. Please contact your administrator.',
-          error: error.message || 'Failed to fetch access token from Secrets Manager'
+          message: error.message,
+          error: error.message,
+          errorType: 'connection'
         };
       }
 
@@ -15708,21 +15826,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const untilStr = endDate.toISOString().split('T')[0];
       const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))) + 1; // +1 to include both start and end dates
 
-      // Build filtering parameter for API calls from campaign_ids
-      let campaignFilterIds: string[] = [];
-      const rawCampaignIds = Array.isArray(campaign_ids)
-        ? campaign_ids
-        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
-      campaignFilterIds = [...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))];
-      console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
-      if (campaignFilterIds.length === 0) {
-        return {
-          success: false,
-          message: 'campaign_ids is required and must contain at least one campaign ID.',
-          error: 'Invalid campaign_ids'
-        };
-      }
-
       // Build filtering parameter for API calls
       const filteringParam = campaignFilterIds.length > 0
         ? `&filtering=[{"field":"campaign.id","operator":"IN","value":["${campaignFilterIds.join('","')}"]}]`
@@ -15732,48 +15835,49 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
       // Using fetchWithRetryAndPaging to automatically handle pagination if there are multiple pages
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
         // Campaign-level insights for campaigns processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Demographics breakdown (age/gender)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Placement breakdown (publisher platform and position)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Device breakdown (mobile/desktop, etc.)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
       ]);
 
 
-      // Check for errors in any of the responses
-      if (campaignsData.error) {
-        console.error('AgentMode: Campaigns API Error:', campaignsData.error);
-        throw new Error(`Campaigns API Error: ${campaignsData.error.message}`);
-      }
-      if (adSetsData.error) {
-        console.error('AgentMode: Ad Sets API Error:', adSetsData.error);
-        throw new Error(`Ad Sets API Error: ${adSetsData.error.message}`);
-      }
-      if (adsData.error) {
-        console.error('AgentMode: Ads API Error:', adsData.error);
-        throw new Error(`Ads API Error: ${adsData.error.message}`);
-      }
-      if (adInsightsData.error) {
-        console.error('AgentMode: Ad-level Insights API Error:', adInsightsData.error);
-        throw new Error(`Ad-level Insights API Error: ${adInsightsData.error.message}`);
-      }
-      if (adSetInsightsData.error) {
-        console.error('AgentMode: Adset-level Insights API Error:', adSetInsightsData.error);
-        throw new Error(`Adset-level Insights API Error: ${adSetInsightsData.error.message}`);
-      }
-      if (campaignInsightsData.error) {
-        console.error('AgentMode: Campaign-level Insights API Error:', campaignInsightsData.error);
-        throw new Error(`Campaign-level Insights API Error: ${campaignInsightsData.error.message}`);
+      // Keep connection lookup, permission, and query failures distinct so Emma
+      // can prompt for the right remedy instead of always asking for reconnect.
+      for (const [section, response] of [
+        ['Campaigns', campaignsData],
+        ['Ad Sets', adSetsData],
+        ['Ads', adsData],
+        ['Ad-level Insights', adInsightsData],
+        ['Adset-level Insights', adSetInsightsData],
+        ['Campaign-level Insights', campaignInsightsData],
+      ] as const) {
+        if (!response?.error) continue;
+        console.error(`AgentMode: ${section} API Error:`, response.error);
+        const message = response.error.message || 'Unknown Meta API error';
+        const code = Number(response.error.code);
+        const connectionFailure =
+          code === 190 ||
+          /access token|oauth|token.*(?:expired|invalid|revoked)/i.test(message);
+        const permissionFailure =
+          [10, 200].includes(code) ||
+          /permission|not authorized/i.test(message);
+        const typedError = new Error(`${section} API Error: ${message}`) as any;
+        typedError.metaMetricsErrorType = connectionFailure
+          ? 'connection'
+          : (permissionFailure ? 'permission' : 'api');
+        throw typedError;
       }
       // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
       // a missing/errored breakdown must be distinguishable from an empty-but-OK
@@ -15850,13 +15954,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
 
       return result;
-    } catch (error) {
+    } catch (error: any) {
       console.error('AgentMode: Error fetching Meta ads metrics:', error);
       console.error('AgentMode: Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+      const errorType = error?.isMetaAuthError
+        ? 'connection'
+        : (error?.metaMetricsErrorType || 'api');
+      const message = error instanceof Error ? error.message : 'Unknown error';
       return {
         success: false,
-        message: 'Failed to fetch Meta ads metrics. Please ensure your Meta ad account is properly configured.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        message,
+        error: message,
+        errorType
       };
     }
   }
@@ -29138,7 +29247,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
@@ -29149,6 +29258,25 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
         return { success: true, biddingStrategies };
+      }
+
+      if (entity_type === 'CAMPAIGN_CRITERION' && action === 'ADD') {
+        const { placementUrls, mobileAppCategoryResourceNames } = validateNegativeCampaignCriteria(
+          customer_id,
+          args.campaign_resource_name,
+          args.placement_urls,
+          args.mobile_app_category_resource_names,
+        );
+        await googleAdsService.addNegativeCampaignCriteria(
+          userId,
+          customer_id,
+          args.campaign_resource_name,
+          { placementUrls, mobileAppCategoryResourceNames },
+        );
+        return {
+          success: true,
+          message: `Added ${placementUrls.length + mobileAppCategoryResourceNames.length} negative campaign criteria`,
+        };
       }
 
       if (entity_type === 'CAMPAIGN') {
@@ -29480,15 +29608,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
     } catch (error: any) {
+      if (error instanceof NegativeCampaignCriteriaValidationError) {
+        return {
+          success: false,
+          errorType: error.errorType,
+          errorCode: error.errorCode,
+          error: error.message,
+        };
+      }
       if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
       console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
+      const gadsErrorCodes = gadsErrors
+        .map((e: any) => Object.values(e.errorCode || {})[0])
+        .filter(Boolean);
       const gadsError = gadsErrors.length
         ? gadsErrors.map((e: any) => {
             const code = Object.values(e.errorCode || {})[0];
             return code ? `${code}: ${e.message}` : e.message;
           }).join('; ')
         : undefined;
+      if (args.entity_type === 'CAMPAIGN_CRITERION') {
+        return {
+          success: false,
+          errorType: gadsError ? 'GOOGLE_ADS_API_ERROR' : 'INTERNAL_ERROR',
+          errorCode: gadsErrorCodes[0] || 'UNKNOWN_GOOGLE_ADS_ERROR',
+          error: gadsError || error.message || 'Unknown error',
+        };
+      }
       return { success: false, error: gadsError || error.message || 'Unknown error' };
     }
   }

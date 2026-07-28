@@ -1584,7 +1584,20 @@ export class ChatbotDB {
     });
   }
 
-  async getChatSession(sessionId: string): Promise<ChatSession | null> {
+  /**
+   * Load the raw chat session record — ownership and metadata only — without
+   * hydrating the message history or running the legacy message migration that
+   * `getChatSession` performs.
+   *
+   * Use this for authorization checks (ENG-521): resolving the owner of a
+   * caller-supplied sessionId must not cause that session's message table to be
+   * read or migrated before the caller has been proven to own it.
+   *
+   * NOTE: `messages` on the returned record is the raw stored value (usually
+   * absent for non-legacy sessions). Callers that need the real conversation
+   * must use `getChatSession`.
+   */
+  async getChatSessionRecord(sessionId: string): Promise<ChatSession | null> {
     const params = {
       TableName: this.tableName,
       Key: {
@@ -1594,12 +1607,21 @@ export class ChatbotDB {
 
     try {
       const result = await dynamodb.get(params).promise();
-      const session = (result.Item as ChatSession) || null;
-      
-      if (!session) {
-        return null;
-      }
+      return (result.Item as ChatSession) || null;
+    } catch (error) {
+      console.error("Error getting chat session record:", error);
+      throw error;
+    }
+  }
 
+  async getChatSession(sessionId: string): Promise<ChatSession | null> {
+    const session = await this.getChatSessionRecord(sessionId);
+
+    if (!session) {
+      return null;
+    }
+
+    try {
       // Check if messages exist in AW-ChatMessages
       let messages = await this.getMessagesFromMessagesTable(sessionId);
 

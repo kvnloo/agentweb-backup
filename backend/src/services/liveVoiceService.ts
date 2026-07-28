@@ -361,6 +361,7 @@ async function openGeminiSession(
         console.log(`[liveVoiceService] Gemini session OPEN for ${sessionId}${resumptionHandle ? ' (resumed)' : ''}`);
       },
       onmessage: (message: LiveServerMessage) => {
+        if (activeSessions.get(sessionId) !== entry) return;
         console.log(`[liveVoiceService] Gemini message for ${sessionId}:`, JSON.stringify(message).slice(0, 200));
         handleIncomingMessage(sessionId, message).catch((err) => {
           console.error(`[liveVoiceService] handleIncomingMessage error for ${sessionId}:`, err?.message, err?.stack?.split('\n').slice(0, 5).join(' | '));
@@ -369,7 +370,7 @@ async function openGeminiSession(
       onerror: (e: ErrorEvent) => {
         console.error(`[liveVoiceService] Gemini ERROR on session ${sessionId}:`, e.message, e);
         const currentEntry = activeSessions.get(sessionId);
-        if (currentEntry) {
+        if (currentEntry === entry) {
           void recordOnboardingFailure(
             currentEntry.userId,
             ONBOARDING_TELEMETRY_EVENTS.voiceSessionFailed,
@@ -382,18 +383,28 @@ async function openGeminiSession(
       onclose: (e: CloseEvent) => {
         console.log(`[liveVoiceService] Gemini CLOSED session ${sessionId}, code=${e.code}, reason=${e.reason}`);
         const currentEntry = activeSessions.get(sessionId);
-        if (!currentEntry) return;
+        if (currentEntry !== entry) return;
 
         // Code 1000 = normal closure by Gemini after a turn. Reconnect transparently
         // using the latest resumption handle so the conversation continues.
         if (e.code === 1000 && currentEntry.resumptionHandle) {
           console.log(`[liveVoiceService] Auto-reconnecting session ${sessionId} with handle ${currentEntry.resumptionHandle.slice(0, 8)}...`);
           openGeminiSession(sessionId, currentEntry, currentEntry.resumptionHandle)
-            .then(() => { currentEntry.session = activeSessions.get(sessionId)!.session; })
+            .then(() => {
+              if (activeSessions.get(sessionId) !== currentEntry) {
+                try {
+                  currentEntry.session.close();
+                } catch {
+                  // Ignore close errors for a reconnect superseded in flight.
+                }
+              }
+            })
             .catch((err) => {
               console.error(`[liveVoiceService] Reconnect failed for ${sessionId}:`, err?.message);
-              activeSessions.delete(sessionId);
-              currentEntry.emitFn('live:closed', { sessionId });
+              if (activeSessions.get(sessionId) === currentEntry) {
+                activeSessions.delete(sessionId);
+                currentEntry.emitFn('live:closed', { sessionId });
+              }
             });
           return;
         }
@@ -472,8 +483,91 @@ async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
 }
 
 /**
+ * Uniform rejection for an unauthorized live-session request. Deliberately does
+ * NOT distinguish "session does not exist" from "session belongs to someone
+ * else" — the message is relayed straight to the client over `live:error`, so a
+ * distinguishable message would turn `live:start` into a session-ID enumeration
+ * oracle.
+ */
+const LIVE_SESSION_FORBIDDEN = 'Not authorized for this chat session';
+
+export class LiveSessionAuthorizationError extends Error {
+  readonly code = 'LIVE_SESSION_FORBIDDEN';
+
+  constructor() {
+    super(LIVE_SESSION_FORBIDDEN);
+    this.name = 'LiveSessionAuthorizationError';
+  }
+}
+
+export class LiveSessionStartCancelledError extends Error {
+  readonly code = 'LIVE_SESSION_START_CANCELLED';
+
+  constructor() {
+    super('Live session start cancelled');
+    this.name = 'LiveSessionStartCancelledError';
+  }
+}
+
+function throwIfLiveStartCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new LiveSessionStartCancelledError();
+}
+
+/**
+ * ENG-521 — verify the caller owns the chat session before any live-session
+ * work happens.
+ *
+ * `live:start` takes a client-supplied `sessionId`. Without this check any
+ * authenticated user who learned another tenant's session ID got that tenant's
+ * message history injected into the Gemini Live system prompt (disclosure),
+ * had their own voice turns persisted onto that session (write), and closed
+ * and took over the victim's in-flight live session (hijack).
+ *
+ * `effectiveUserId` is already the resolved principal: the delegated
+ * `targetUserId` for a delegate token, and the share owner's `userId` for an
+ * iShare (conversable) socket — so those boundaries keep working unchanged.
+ *
+ * Uses `getChatSessionRecord` rather than `getChatSession` so an unauthorized
+ * caller never triggers a read (or legacy migration write) of the victim's
+ * message table.
+ */
+export async function assertLiveSessionOwnership(
+  sessionId: string,
+  effectiveUserId: string,
+): Promise<void> {
+  const session = await chatbotDb.getChatSessionRecord(sessionId);
+
+  if (!session) {
+    console.warn(
+      `[liveVoiceService] live session denied — session ${sessionId} not found (requested by ${effectiveUserId})`,
+    );
+    throw new LiveSessionAuthorizationError();
+  }
+
+  if (!session.userId || !effectiveUserId || session.userId !== effectiveUserId) {
+    console.warn(
+      `[liveVoiceService] live session denied — session ${sessionId} is owned by ${session.userId ?? '<none>'}, requested by ${effectiveUserId}`,
+    );
+    throw new LiveSessionAuthorizationError();
+  }
+}
+
+/**
+ * In-flight start guard. `startLiveSession` awaits ownership (and later, tool/
+ * history loads and the Gemini connect), so two overlapping starts for the
+ * same sessionId could otherwise both pass the `activeSessions` duplicate
+ * check, both open Gemini connections, and the later map write would orphan
+ * the first (its `live:ready` caller left with an entry belonging to another
+ * socket, its Gemini WebSocket never closed). Serializing per sessionId makes
+ * overlap deterministic: the later start waits for the earlier to settle, then
+ * supersedes it through the normal existing-session close.
+ */
+const pendingStarts = new Map<string, Promise<void>>();
+
+/**
  * Start a Gemini Live session for the given Agent Mode sessionId.
  * If a session already exists for this sessionId, it is closed first.
+ * Overlapping calls for the same sessionId are serialized (last caller wins).
  *
  * @param sessionId  Agent Mode chat session ID
  * @param socketId   Socket.IO socket ID of the connected browser
@@ -485,23 +579,51 @@ export async function startLiveSession(
   emitFn: EmitFn,
   userId: string,
   toolProfile: LiveToolProfile = 'default',
+  signal?: AbortSignal,
 ): Promise<void> {
+  // Read + write of pendingStarts happen in the same synchronous block, so two
+  // overlapping calls can never both observe "no start in flight".
+  const prior = pendingStarts.get(sessionId);
+  const start = (prior ?? Promise.resolve())
+    // A failed prior start only orders this one — it must not fail it.
+    .catch(() => {})
+    .then(() => {
+      throwIfLiveStartCancelled(signal);
+      return doStartLiveSession(sessionId, socketId, emitFn, userId, toolProfile, signal);
+    });
+  pendingStarts.set(sessionId, start);
+  try {
+    await start;
+  } finally {
+    if (pendingStarts.get(sessionId) === start) pendingStarts.delete(sessionId);
+  }
+}
+
+async function doStartLiveSession(
+  sessionId: string,
+  socketId: string,
+  emitFn: EmitFn,
+  userId: string,
+  toolProfile: LiveToolProfile,
+  signal?: AbortSignal,
+): Promise<void> {
+  // Ownership gate FIRST — before any telemetry, before the existing-session
+  // close below, and before any history is loaded or registered.
+  await assertLiveSessionOwnership(sessionId, userId);
+  throwIfLiveStartCancelled(signal);
+
   const startedAt = Date.now();
   void recordOnboardingEvent(
     userId,
     ONBOARDING_TELEMETRY_EVENTS.voiceSessionStarted,
     { sessionId },
   );
-  // Close any existing session for this sessionId
-  if (activeSessions.has(sessionId)) {
-    closeLiveSession(sessionId);
-  }
-
   // Load tools and prior history in parallel
   const [functionDeclarations, historyContext] = await Promise.all([
     loadGeminiFunctionDeclarations(userId, toolProfile),
     loadHistoryForSystemPrompt(sessionId),
   ]);
+  throwIfLiveStartCancelled(signal);
 
   if (historyContext) {
     console.log(`[liveVoiceService] Injecting history into system prompt for ${sessionId}`);
@@ -523,11 +645,35 @@ export async function startLiveSession(
     startedAt,
     turnCount: 0,
   };
-  activeSessions.set(sessionId, entry);
 
   // Pass history via system prompt on fresh starts. Code-1000 resumptions already
   // carry Gemini's own in-memory context, so historyContext is not passed there.
+  // The replacement is staged outside the registry: the healthy prior session
+  // remains routable until Gemini accepts the new connection and cancellation
+  // can no longer strand both callers.
   await openGeminiSession(sessionId, entry, undefined, historyContext || undefined);
+  if (signal?.aborted) {
+    try {
+      entry.session.close();
+    } catch {
+      // Ignore close errors while cancelling an abandoned start.
+    }
+    throw new LiveSessionStartCancelledError();
+  }
+
+  // Atomically publish the ready replacement, then retire the prior connection.
+  // Old-session callbacks are identity-guarded above, so a synchronous close
+  // cannot delete or emit against the newly published entry.
+  const previousEntry = activeSessions.get(sessionId);
+  activeSessions.set(sessionId, entry);
+  if (previousEntry) {
+    try {
+      previousEntry.session.close();
+    } catch {
+      // Ignore close errors after the replacement is safely active.
+    }
+  }
+
   entry.readyAt = Date.now();
   void recordOnboardingEvent(
     userId,
