@@ -217,9 +217,14 @@ export async function handleResult(req: Request, res: Response): Promise<void> {
       requiredFunctions,
       maxAttempts: 20,
       llmModel,
-      // ENG-634: headless fire-and-forget run (no human present to reply) — enable
-      // completion-gate halt protection so a free-text "shall I proceed?" auto-continues
-      // best-effort instead of dead-ending with a non-deliverable.
+      // ENG-634: this is the ONE non-scheduled headless caller that runs arbitrary,
+      // user-configured prompts (not a single fixed asset op), so a free-text
+      // "shall I proceed?" halt is genuinely plausible AND no human is present to
+      // reply — enable completion-gate halt protection so it auto-continues
+      // best-effort instead of dead-ending with a non-deliverable. The fixed-purpose
+      // asset callers (imageReports/revision/humanEval/slack) deliberately do NOT set
+      // this: they don't halt in free text, and structured questions are handled by
+      // the park/auto-take path regardless.
       completionGate: true,
     }).then(result => {
       console.log(`Result endpoint "${resultName}" session ${session.sessionId} completed: success=${result.success}, attempts=${result.attempts}`);

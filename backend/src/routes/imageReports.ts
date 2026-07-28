@@ -127,10 +127,6 @@ router.post('/generate', authenticateToken, async (req: Request, res: Response) 
       requiredFunctions: [{ functionName: 'create_html_file', minCount: 1 }],
       keywords: [],
       maxAttempts: 5,
-      // ENG-634: headless run (no human present) — enable completion-gate halt
-      // protection so a free-text confirmation halt auto-continues rather than
-      // returning a non-deliverable.
-      completionGate: true,
     });
 
     // Set title after agent completes — agent auto-titles the session during the run

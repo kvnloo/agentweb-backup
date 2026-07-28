@@ -1404,11 +1404,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   requiredFunctions,
                   keywords: [],
                   attachments: [],
-                  maxAttempts: 5,
-                  // ENG-634: headless Slack-triggered run (no human at a browser) —
-                  // enable completion-gate halt protection so a free-text confirmation
-                  // halt auto-continues best-effort instead of dead-ending.
-                  completionGate: true
+                  maxAttempts: 5
                 }).then(async (result) => {
                   console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
 
@@ -1635,11 +1631,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       requiredFunctions,
                       keywords: [],
                       attachments: [],
-                      maxAttempts: 5,
-                      // ENG-634: headless Slack-triggered run (no human at a browser) —
-                      // enable completion-gate halt protection so a free-text confirmation
-                      // halt auto-continues best-effort instead of dead-ending.
-                      completionGate: true
+                      maxAttempts: 5
                     }).then(async (result) => {
                       console.log(`✅ Agent Mode revision completed. Success: ${result.success}, Tool calls: ${result.toolCalls.length}`);
 

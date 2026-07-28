@@ -42,9 +42,6 @@ async function reviseAgentModeImage(
     keywords: [],
     attachments: [],
     maxAttempts: 5,
-    // ENG-634: headless run (no human present) — enable completion-gate halt
-    // protection so a free-text confirmation halt auto-continues best-effort.
-    completionGate: true,
   });
 }
 
