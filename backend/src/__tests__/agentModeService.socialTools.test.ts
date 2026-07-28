@@ -523,6 +523,29 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.message.toLowerCase()).toContain('do not claim');
     });
 
+    // ENG-660 precedence guard: when a PERSONAL LinkedIn account's adapter
+    // errors (e.g. expired token) and there are 0 cached posts, the pre-existing
+    // error branch must win — the read failed, so it must return success:false
+    // with the real error, NOT be swallowed by the organicReadUnsupported branch
+    // (which shares the posts.length===0 condition and would otherwise mask a
+    // genuine failure as a benign "unsupported read"). Ordering guarantees this;
+    // this test locks it in for the personal path.
+    it('surfaces the real adapter error (not the unsupported-read message) when a personal LinkedIn account errors with 0 posts', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([mockPersonalLinkedInAccount as any]);
+      mockAdapter.listPosts.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
+
+      const result = await service.loadConnectedAccountPosts(
+        'user-123',
+        'urn:li:person:ilhAte8iXG'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('LinkedIn access token expired');
+      // Must NOT be masked as a benign unsupported read.
+      expect(result.organicReadUnsupported).toBeUndefined();
+      expect(result.message).not.toContain('platform limitation');
+    });
+
     // Regression guard: a personal LinkedIn account that DOES have stored
     // AgentWeb-published posts still reports a normal successful load.
     it('still reports a normal load when a personal LinkedIn account has stored posts', async () => {
