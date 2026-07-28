@@ -7760,6 +7760,16 @@ export const browserCookieDb = {
    * injecting it would be a guaranteed no-op, so don't waste the attempt. A
    * corrupted/undecryptable entry is likewise logged and skipped rather than
    * failing the whole load.
+   *
+   * Defense in depth: the read path changed from a single get() to a query()
+   * to support per-domain entries, but the overwhelming majority of users
+   * have never touched that feature. If the query itself fails outright
+   * (throttling, a bug in this new path, etc.), fall back to the old,
+   * narrower get()-based read for '__all__' — the one nearly every user's
+   * automation actually depends on — rather than failing their whole task
+   * because of a code path they never opted into. If THAT also fails, the
+   * error is a real, visible infra problem and is allowed to propagate
+   * rather than being swallowed as a silent "no cookies saved".
    */
   async getAllCookiesForUser(userId: string): Promise<any[]> {
     try {
@@ -7791,9 +7801,15 @@ export const browserCookieDb = {
       }
 
       return combined;
-    } catch (error) {
-      handleDynamoDbError(error, 'getAllBrowserCookiesForUser');
-      throw error;
+    } catch (queryError) {
+      console.warn(`getAllCookiesForUser query failed for userId ${userId}, falling back to get()-based getCookies:`, queryError);
+      try {
+        const fallbackCookies = await browserCookieDb.getCookies(userId);
+        return fallbackCookies || [];
+      } catch (fallbackError) {
+        handleDynamoDbError(fallbackError, 'getAllBrowserCookiesForUser');
+        throw fallbackError;
+      }
     }
   },
 };

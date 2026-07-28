@@ -185,6 +185,29 @@ describe('browserCookieDb — manual per-domain cookie import', () => {
   });
 
   describe('getAllCookiesForUser', () => {
+    it('falls back to the simple get()-based getCookies path if the query itself throws entirely (e.g. throttling), instead of failing the whole load', async () => {
+      // Defense in depth: users who never touch the manual-import feature (the
+      // overwhelming majority, day one) should not regress just because the read
+      // path changed from a single get() to a query() to support it.
+      mockDynamoDB.query.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('ProvisionedThroughputExceededException')) });
+      const allCookies = [{ name: 'auto', value: 'auto-val' }];
+      mockDynamoDB.get.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Item: { userId: 'user-1', domain: '__all__', cookies: allCookies } }) });
+
+      const result = await browserCookieDb.getAllCookiesForUser('user-1');
+
+      expect(result).toEqual(allCookies);
+      expect(mockDynamoDB.get).toHaveBeenCalledWith(
+        expect.objectContaining({ Key: { userId: 'user-1', domain: '__all__' } })
+      );
+    });
+
+    it('still throws (does not silently swallow) if BOTH the query and the get() fallback fail — a real infra outage should stay visible, not masquerade as "no cookies saved"', async () => {
+      mockDynamoDB.query.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('down')) });
+      mockDynamoDB.get.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('also down')) });
+
+      await expect(browserCookieDb.getAllCookiesForUser('user-1')).rejects.toThrow();
+    });
+
     it('returns "__all__" cookies followed by decrypted per-domain cookies (human session wins on dedup)', async () => {
       const allCookies = [{ name: 'auto', value: 'auto-val' }];
       const domainCookies = [{ name: 'session', value: 'human-val' }];
