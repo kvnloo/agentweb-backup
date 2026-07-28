@@ -1,3 +1,33 @@
+## ENG-259: Fathom→Linear router — cloud wiring in shadow mode (2026-07-28)
+
+The canonical reconciliation engine (`services/fathomLinearRouter.ts`, carried forward from the
+preserved `swarm/eng-259-fathom-linear-router` branch) is now WIRED: `/api/webhooks/fathom` runs
+deterministic extraction (`services/fathomExtraction.ts` — no LLM; retries produce byte-identical
+ids so `fathomKey` idempotency holds) and reconciles through the engine via the `LinearPort`
+resolved from `services/fathomLinearPortRegistry.ts`. Mode = `FATHOM_LINEAR_ROUTER_MODE`
+(off | shadow | live, default shadow — real board reads, zero writes, full run report logged as
+one `[FathomLinearRouter]` JSON line). Decision of record: ENG-447 selected Option 1 (managed
+durable workflow in the existing backend, Fathom-first, shadow before writes, no laptop fallback).
+
+Assumptions / boundaries:
+- The production LinearPort adapter is ENG-536 (blocked-by this): until it registers at the
+  composition root, the webhook answers `routed:false, reason: LinearPort not configured (ENG-536)`
+  with extraction counts — deliberate 200 so Fathom does not retry-spiral on a known-inactive path.
+- The legacy `meetingIntakeService` path was REMOVED from the webhook (it wrote to placeholder
+  Notion/ClickUp deps — dead destinations since the Linear migration). The service itself stays:
+  Emma's `fathom_route_action_items` tool still imports it, and changing Emma tool behavior is out
+  of swarm scope.
+- The ENG-246 onboarding leg (`FATHOM_ONBOARDING_AUTOMATION_ENABLED`) is preserved unchanged and
+  self-contained (never throws the webhook).
+- Extraction Harsha-filter: items explicitly assigned to a non-Harsha person become
+  `actionable:false` FYI (reported `notFiled`, never silently dropped) per issue scope #2.
+- Customer ambiguity is CRM-derived only (≥2 distinct crm_matches companies → `needsPm`); a
+  multi-external-domain call yields customer=undefined (absent, not ambiguous) so the engine's
+  anchor rule (customer+workflow required to bind) stays safe without flooding Needs PM.
+- Fathom's exact webhook payload field names for crm_matches/action-item assignees are asserted
+  loosely (string|object accepted, defensive) — verify against a real org-account payload when
+  ENG-447's credentials land; shadow mode makes any mismatch observable without writes.
+
 ## ENG-114: durable MCP session store so sessions resolve across instances (2026-07-21)
 
 MCP Streamable-HTTP sessions lived only in a per-process `Map` in `mcp/server/mcpServer.ts`. On a
