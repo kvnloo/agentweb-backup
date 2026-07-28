@@ -3,6 +3,7 @@ import { getGoogleAdsCredentials } from '../utils/secretsManager';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { updateAccountTokens } from './connectedAccountsDb'; // sibling in services/
 import { buildUtmSpec, mergeUtmIntoQueryString, mergeUtmIntoUrl, readUtmKeys, utmKeysInQueryString, utmQueryString } from '../utils/adUtm';
+import { validateNegativeCampaignCriteria } from './googleAdsCampaignCriteria';
 
 const GOOGLE_ADS_API_BASE = 'https://googleads.googleapis.com/v24';
 const TOKEN_REFRESH_URL = 'https://oauth2.googleapis.com/token';
@@ -837,6 +838,43 @@ export class GoogleAdsService {
         },
       })), loginCustomerId);
     }
+  }
+
+  async addNegativeCampaignCriteria(
+    userId: string,
+    customerId: string,
+    campaignResourceName: string,
+    params: {
+      placementUrls: string[];
+      mobileAppCategoryResourceNames: string[];
+    },
+  ): Promise<void> {
+    const { placementUrls, mobileAppCategoryResourceNames } = validateNegativeCampaignCriteria(
+      customerId,
+      campaignResourceName,
+      params.placementUrls,
+      params.mobileAppCategoryResourceNames,
+    );
+
+    const operations = [
+      ...placementUrls.map((url) => ({
+        create: {
+          campaign: campaignResourceName,
+          negative: true,
+          placement: { url },
+        },
+      })),
+      ...mobileAppCategoryResourceNames.map((mobileAppCategoryConstant) => ({
+        create: {
+          campaign: campaignResourceName,
+          negative: true,
+          mobileAppCategory: { mobileAppCategoryConstant },
+        },
+      })),
+    ];
+
+    const { accessToken, loginCustomerId } = await this.getAccountCredentials(userId, customerId);
+    await this.mutate(customerId, accessToken, 'campaignCriteria', operations, loginCustomerId);
   }
 
   async listKeywords(userId: string, customerId: string, adGroupResourceName: string): Promise<any[]> {

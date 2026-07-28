@@ -1406,6 +1406,23 @@ export class LinkedInOutreachService {
   }
 
   /**
+   * List ALL of the user's own connected Unipile account_ids (no site-wide
+   * shared pool). Where `resolveUserOwnedAccountId` returns just the first,
+   * callers that must reason about ambiguity — e.g. "which account will
+   * actually send?" — need the full set. Returns [] on any failure.
+   */
+  async listUserOwnedUnipileAccountIds(userId: string): Promise<string[]> {
+    try {
+      const { getAccountsByUserId } = await import('./connectedAccountsDb');
+      const accounts = await getAccountsByUserId(userId);
+      return (accounts as any[])
+        .filter((a) => a.platform === 'unipile' && a.account_id)
+        .map((a) => a.account_id as string);
+    } catch { /* ignore */ }
+    return [];
+  }
+
+  /**
    * Enrichment-specific account resolution. Differs from resolveAccountId in three ways:
    * 1. Tries ALL user accounts (not just the first), skipping dead ones with a connectivity check.
    * 2. Site-wide accounts are the last resort, never the first choice.

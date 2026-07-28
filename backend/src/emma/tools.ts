@@ -839,12 +839,19 @@ emmaToolRegistry.register({
     description: 'List all Meta ad campaigns for the current user. Returns campaign names, IDs, statuses, and objectives. Works even without a Meta connected account (falls back to legacy adAccount config). Use this first to get campaign IDs, then call get_meta_ads_metrics.',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        account_id: {
+          type: 'string',
+          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available.'
+        }
+      },
       required: []
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.listMetaAdsCampaignsNew(context?.userId);
+    return args.account_id
+      ? await agentModeService.listMetaAdsCampaignsNew(context?.userId, args.account_id)
+      : await agentModeService.listMetaAdsCampaignsNew(context?.userId);
   }
 });
 
@@ -1305,6 +1312,10 @@ emmaToolRegistry.register({
           // Legacy single-id alias. execute() normalizes this into campaign_ids.
           type: 'string',
           description: 'Legacy alias for a single campaign id. Prefer campaign_ids. Provide at least one of campaign_ids or campaign_id.'
+        },
+        account_id: {
+          type: 'string',
+          description: 'Optional Meta ad account ID from list_connected_accounts. Required only when multiple Meta ad accounts are available.'
         }
       }
     }
@@ -1319,7 +1330,12 @@ emmaToolRegistry.register({
           ? [args.campaign_id.trim()]
           : [];
 
-    return await agentModeService.getMetaAdsMetrics(args.timeframe || '7d', context?.userId, normalizedCampaignIds);
+    return await agentModeService.getMetaAdsMetrics(
+      args.timeframe || '7d',
+      context?.userId,
+      normalizedCampaignIds,
+      args.account_id,
+    );
   }
 });
 
@@ -6815,6 +6831,85 @@ import { mcpToolRegistry } from '../mcp/server/registry';
 // for mcpToolRegistry to be available).
 mcpToolRegistry.register(visualContextTool);
 
+mcpToolRegistry.register({
+  name: 'manage_linear_governance_label',
+  definition: {
+    name: 'manage_linear_governance_label',
+    description:
+      'Admin-only: read, dry-run, or update an existing allowlisted Linear routing/intake label. ' +
+      'Returns verified before/after readback evidence. It cannot create, delete, or move labels and never exposes Linear credentials.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        label_name: {
+          type: 'string',
+          description: 'Existing allowlisted governance label, such as Route: Emma or Needs PM.',
+        },
+        name: {
+          type: 'string',
+          description: 'Optional replacement name. It must also be an allowlisted governance label and must not already exist.',
+        },
+        description: {
+          type: 'string',
+          maxLength: 1000,
+          description: 'Optional replacement description.',
+        },
+        color: {
+          type: 'string',
+          pattern: '^#[0-9A-Fa-f]{6}$',
+          description: 'Optional six-digit hex color.',
+        },
+        reason: {
+          type: 'string',
+          description: 'Required audit reason for the read, dry-run, or update.',
+        },
+        dry_run: {
+          type: 'boolean',
+          description: 'When true, return the exact proposed definition without mutating Linear.',
+        },
+      },
+      required: ['label_name', 'reason'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const userId = context?.userId || context?.agentUserId;
+    if (!userId) throw new Error('Authentication required');
+    const user = await userDb.getUserById(userId);
+    const delegated = context?.isDelegatedAccess === true || context?.isDelegatedAdmin === true;
+    if (user?.isAdmin !== true && !delegated) {
+      throw new Error('Admin access required to manage Linear governance labels');
+    }
+    let actor: string | undefined;
+    if (delegated) {
+      actor = context?.adminEmail;
+      if (!actor && context?.sessionId) {
+        const session = await chatbotDb.getChatSession(context.sessionId);
+        if (session?.delegateInfo?.isDelegated) {
+          actor = session.delegateInfo.adminEmail;
+        }
+      }
+      if (!actor) {
+        throw new Error('Delegated administrator identity unavailable');
+      }
+    } else {
+      actor = user?.email || userId;
+    }
+    if (!actor) {
+      throw new Error('Administrator identity unavailable');
+    }
+    const { manageLinearGovernanceLabel } = await import('../services/linearGovernanceLabelService');
+    return manageLinearGovernanceLabel({
+      labelName: args.label_name,
+      name: args.name,
+      description: args.description,
+      color: args.color,
+      reason: args.reason,
+      actor,
+      dryRun: args.dry_run === true,
+    });
+  },
+});
+
 const bridgedToolNames = [
   // Scheduled Chat tools
   'list_scheduled_chats',
@@ -6851,6 +6946,7 @@ const bridgedToolNames = [
 
 // ─── Admin-only tools (bridged from mcpToolRegistry / apiTools.ts) ───────────
 const adminToolNames = [
+  'manage_linear_governance_label',
   'list_predefined_work_plans',
   'manage_predefined_work_plan',
   'list_skills',
@@ -8305,6 +8401,8 @@ ACTION MATRIX:
               ADD_PROXIMITY (campaign_resource_name, radius, address{street_address?, city_name?, postal_code?, province_code?, province_name?, country_code?}; radius_units defaults MILES) — mile/km-radius targeting centered on a real address (Google geocodes it server-side). This is native API support for "within N miles of our store/showroom" requests — do NOT tell the user proximity/radius targeting requires the UI; it does not. Additive to any existing LOCATION (city) criteria — REMOVE_PROXIMITY the old one first if only the radius should apply.
               REMOVE_PROXIMITY (criterion_resource_name) — removes a campaign-level LOCATION or PROXIMITY criterion. Obtain resource names via a raw GAQL query on campaign_criterion (call_google_ads_reporting_api mode="raw").
               TRANSPARENCY GUARDRAIL: if any Google Ads request cannot be fully satisfied via this API — including cases where you genuinely must fall back to a UI-only step (e.g. linking Google Business Profile) — you MUST say so explicitly to the user at deployment: name the gap, what you did instead, and the exact manual step left for them. Never silently substitute a workaround or imply a request is fully done when a manual step remains outstanding.
+  CAMPAIGN_CRITERION → ADD (campaign_resource_name, placement_urls? and/or mobile_app_category_resource_names?)
+              Adds campaign-scoped negative placement and mobile-app-category criteria atomically. placement_urls accepts domains or HTTP(S) URLs. mobile_app_category_resource_names must use canonical mobileAppCategoryConstants/<id> resource names. This is not a keyword/ad-group fallback.
   BIDDING_STRATEGY → LIST (portfolio/shared bidding strategies; returns resource_name for use as bidding_strategy_resource_name)
   AD_GROUP    → LIST (campaign_resource_name)
                CREATE (name, campaign_resource_name, type [SEARCH_STANDARD|DISPLAY_STANDARD], cpc_bid_micros?)
@@ -8336,7 +8434,7 @@ ACTION MATRIX:
       type: 'object',
       properties: {
         customer_id: { type: 'string', description: 'Google Ads customer ID (numeric, no dashes). Call list_connected_accounts(platform="google_ads") and use the "customer_id" field from the result (NOT the "id" field).' },
-        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY'] },
+        entity_type: { type: 'string', enum: ['BUDGET', 'CAMPAIGN', 'CAMPAIGN_CRITERION', 'AD_GROUP', 'KEYWORD', 'AD', 'ASSET', 'CAMPAIGN_ASSET', 'ASSET_GROUP', 'LOCATION', 'BIDDING_STRATEGY'] },
         action: { type: 'string', description: 'Action to perform. See ACTION MATRIX.' },
         name: { type: 'string' },
         type: { type: 'string', description: 'Campaign type (SEARCH|DISPLAY|PERFORMANCE_MAX), ad group type (SEARCH_STANDARD|DISPLAY_STANDARD), or ad type for AD CREATE (RESPONSIVE_SEARCH_AD|RESPONSIVE_DISPLAY_AD).' },
@@ -8370,6 +8468,8 @@ ACTION MATRIX:
         brand_business_name: { type: 'string', description: 'Business name for PMax brand guidelines. Required for PERFORMANCE_MAX CAMPAIGN CREATE when brand guidelines are enforced.' },
         brand_logo_asset_resource_name: { type: 'string', description: 'Logo image asset resource name for PMax brand guidelines. Upload via ASSET UPLOAD first.' },
         criterion_resource_name: { type: 'string', description: 'Criterion resource name. Required for KEYWORD REMOVE (ad group criterion, from KEYWORD LIST) and CAMPAIGN REMOVE_PROXIMITY (campaign criterion, from a raw GAQL query on campaign_criterion).' },
+        placement_urls: { type: 'array', items: { type: 'string' }, description: 'Placement domains or HTTP(S) URLs to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
+        mobile_app_category_resource_names: { type: 'array', items: { type: 'string' }, description: 'Canonical mobileAppCategoryConstants/<id> resource names to add as negative campaign criteria. For CAMPAIGN_CRITERION ADD.' },
         assets: { type: 'array', items: { type: 'object', properties: { fieldType: { type: 'string', enum: ['BUSINESS_NAME', 'LOGO', 'SQUARE_MARKETING_IMAGE', 'MARKETING_IMAGE', 'HEADLINE', 'DESCRIPTION'] }, assetResourceName: { type: 'string' }, text: { type: 'string' } }, required: ['fieldType'] }, description: 'Assets to attach for CAMPAIGN_ASSET ATTACH. Use text for BUSINESS_NAME, assetResourceName for image/logo types.' },
         keywords: { type: 'array', items: { type: 'object', properties: { text: { type: 'string' }, matchType: { type: 'string', enum: ['BROAD', 'PHRASE', 'EXACT'] } }, required: ['text', 'matchType'] }, description: 'Keywords for ADD or ADD_NEGATIVE action.' },
         query: { type: 'string', description: 'Location search query.' },

@@ -243,6 +243,27 @@ function classifyTurnlessSession(session: ChatSession): "in-flight" | "failed" {
 }
 
 /**
+ * Whether this session is a manual "Test this schedule" run rather than a real
+ * scheduled execution. Test runs are triggered interactively by the user, who
+ * watches the outcome live, and are deliberately excluded from the durable
+ * lease/reconciler recovery path (agentModeController.runScheduledChat) — a test
+ * click must never requeue. They are QA actions, not production runs, so a test
+ * that crashes must not be scored or surfaced as a satisfaction reliability
+ * failure: doing so pollutes the cohort and files recurring product tickets for
+ * what the user already saw fail in the UI (ENG-499).
+ *
+ * runScheduledChat prefixes the pageIdentifier (and title) with "Test: " for a
+ * test run and "Scheduled: " for a real run, so the prefix is a reliable marker
+ * fixed at session creation. A schedule literally named "Test: …" produces a real
+ * run titled "Scheduled: Test: …", which correctly does NOT match.
+ */
+function isTestScheduledSession(session: ChatSession): boolean {
+  if (session.sessionType !== "scheduled") return false;
+  const marker = session.pageIdentifier ?? session.title ?? "";
+  return marker.startsWith("Test: ");
+}
+
+/**
  * Returns true when the transcript ends in a state an agent tool loop cannot
  * terminate on — the run is still mid-flight even though hasAssistantTurn()
  * would return true (a partial tool-call step was persisted).
@@ -545,6 +566,15 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
+  // Manual "Test this schedule" runs are interactive QA actions, not production
+  // scheduled executions — the user triggers them and watches the outcome live,
+  // and they are excluded from durable recovery/requeue by design. A crashed test
+  // must not be scored/reported as a satisfaction reliability failure (ENG-499),
+  // so drop it from the cohort like greeting-only sessions.
+  if (isTestScheduledSession(session)) {
+    return null;
+  }
+
   // No assistant turn yet: skip if still in-flight, flag as failed if stale.
   let result: ScoringResult;
   if (!hasAssistantTurn(session.messages)) {
@@ -613,6 +643,15 @@ export async function scoreSessionIfNeeded(
   // the satisfaction cohort (ENG-168) — same skip-and-return-null treatment as
   // sub-threshold and in-flight sessions.
   if (isGreetingOnlySession(session.messages)) {
+    return null;
+  }
+
+  // Manual "Test this schedule" runs are interactive QA actions, not production
+  // scheduled executions — the user triggers them and watches the outcome live,
+  // and they are excluded from durable recovery/requeue by design. A crashed test
+  // must not be scored/surfaced as a satisfaction reliability failure (ENG-499),
+  // so drop it from the cohort like greeting-only sessions.
+  if (isTestScheduledSession(session)) {
     return null;
   }
 

@@ -811,6 +811,20 @@ const AWAITING_CONFIRMATION_PATTERNS: RegExp[] = [
   /\bwhich\s+(?:option|one|approach|route|path|of\s+(?:these|the))\b[^\n?!]*\byou\b/i,
   // "would you prefer / would you rather …"
   /\bwould\s+you\s+(?:prefer|rather)\b/i,
+  // Deterministic backstop for ENG-480: the run reframes an impossible per-item
+  // pattern correctly but STILL dead-ends by asking the human to supply a scope
+  // parameter (a date range / time window) before it will deliver — a novel
+  // phrasing the LLM judge is the only other line of defense against, and that
+  // judge fails safe when its provider is unavailable. Two scoped catches:
+  //   "Reply 'last 24h' (or give me an exact date range) and I'll generate…" —
+  //   the turn tells the user to REPLY WITH A VALUE and dangles the deliverable
+  //   behind it. Anchored on reply + a quoted value + a following "(", "," or
+  //   "or" so a report that merely quotes text ("reply to my email") can't match.
+  /\breply\s+["'“”][^"'“”\n]{1,40}["'“”]\s*(?:\(|,|\bor\b)/i,
+  //   "what time window / date range / period … do you want?" — asks the human to
+  //   specify the scope before proceeding. Scoped to scope-nouns so a delivered
+  //   report asking a rhetorical "what does this mean" cannot trip it.
+  /\bwhat\s+(?:time\s*window|date\s*range|range|time\s*frame|period|scope|window|day|month|week)\b[^\n?]{0,50}\bdo\s+you\b/i,
 ];
 
 // Markdown emphasis and inline code fences (**bold**, _italic_, `code`) split
