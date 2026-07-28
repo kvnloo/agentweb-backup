@@ -8488,6 +8488,31 @@ export const orgDb = {
     return allItems;
   },
 
+  // Atomically appends a domain-join request via DynamoDB's list_append,
+  // rather than reading pendingDomainJoinRequests then SET-ing the whole
+  // array back (a read-modify-write that loses concurrent appends/removals
+  // to the same org — flagged in review). Two signups matching the same org
+  // at the same instant now both land correctly instead of one clobbering
+  // the other's read-modify-write.
+  async addPendingDomainJoinRequest(
+    orgId: string,
+    request: { userId: string; email: string; requestedAt: string; requestToken: string }
+  ): Promise<void> {
+    await dynamodb
+      .update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression:
+          "SET pendingDomainJoinRequests = list_append(if_not_exists(pendingDomainJoinRequests, :empty), :new), updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":empty": [],
+          ":new": [request],
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+  },
+
   async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
     await dynamodb.update({
       TableName: ORGS_TABLE,

@@ -17,6 +17,7 @@ const mockUpdateUser = jest.fn();
 const mockGetOrgWithPendingInviteForEmail = jest.fn();
 const mockGetOrgsWithAutoJoinDomain = jest.fn();
 const mockUpdateOrg = jest.fn();
+const mockAddPendingDomainJoinRequest = jest.fn();
 const mockSendEmail = jest.fn().mockResolvedValue(undefined);
 
 jest.mock('../services/db', () => ({
@@ -30,6 +31,7 @@ jest.mock('../services/db', () => ({
     getOrgWithPendingInviteForEmail: (...args: any[]) => mockGetOrgWithPendingInviteForEmail(...args),
     getOrgsWithAutoJoinDomain: (...args: any[]) => mockGetOrgsWithAutoJoinDomain(...args),
     updateOrg: (...args: any[]) => mockUpdateOrg(...args),
+    addPendingDomainJoinRequest: (...args: any[]) => mockAddPendingDomainJoinRequest(...args),
   },
   taskDb: {},
   subscriberDb: {},
@@ -95,6 +97,7 @@ beforeEach(() => {
   });
   mockUpdateUser.mockResolvedValue({ userId: 'uuid-u1' });
   mockUpdateOrg.mockResolvedValue(undefined);
+  mockAddPendingDomainJoinRequest.mockResolvedValue(undefined);
 });
 
 describe('register controller — domain auto-join requests', () => {
@@ -119,7 +122,7 @@ describe('register controller — domain auto-join requests', () => {
 
     expect(res.status).toBe(201);
     expect(mockGetOrgsWithAutoJoinDomain).toHaveBeenCalledWith('acmecorp.com');
-    expect(mockUpdateOrg).not.toHaveBeenCalled();
+    expect(mockAddPendingDomainJoinRequest).not.toHaveBeenCalled();
     expect(mockSendEmail).not.toHaveBeenCalled();
   });
 
@@ -140,7 +143,7 @@ describe('register controller — domain auto-join requests', () => {
     expect(res.status).toBe(201);
     // Explicit invite wins — no domain-join request should be created.
     expect(mockGetOrgsWithAutoJoinDomain).not.toHaveBeenCalled();
-    expect(mockUpdateOrg).not.toHaveBeenCalled();
+    expect(mockAddPendingDomainJoinRequest).not.toHaveBeenCalled();
   });
 
   // === SUCCESS cases ===
@@ -168,13 +171,9 @@ describe('register controller — domain auto-join requests', () => {
       .send({ email: 'alice@acmecorp.com', password: 'ValidPass123!' });
 
     expect(res.status).toBe(201);
-    expect(mockUpdateOrg).toHaveBeenCalledWith(
+    expect(mockAddPendingDomainJoinRequest).toHaveBeenCalledWith(
       'org-domain',
-      expect.objectContaining({
-        pendingDomainJoinRequests: expect.arrayContaining([
-          expect.objectContaining({ email: 'alice@acmecorp.com' }),
-        ]),
-      })
+      expect.objectContaining({ email: 'alice@acmecorp.com' })
     );
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
   });
@@ -194,7 +193,7 @@ describe('register controller — domain auto-join requests', () => {
       .send({ email: 'alice@acmecorp.com', password: 'ValidPass123!' });
 
     expect(res.status).toBe(201);
-    expect(mockUpdateOrg).toHaveBeenCalledTimes(2);
+    expect(mockAddPendingDomainJoinRequest).toHaveBeenCalledTimes(2);
     expect(mockSendEmail).toHaveBeenCalledTimes(2);
   });
 
