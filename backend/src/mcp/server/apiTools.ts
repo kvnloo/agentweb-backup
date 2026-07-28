@@ -2534,7 +2534,7 @@ mcpToolRegistry.register({
   name: 'get_registration_status',
   definition: {
     name: 'get_registration_status',
-    description: `Join a batch of emails against AgentWeb user accounts to learn which ones registered (signed up) and which became premium (paying/trialing) users. When computing a funnel Registered or Premium stage, you MUST call this on the lead emails to get real signup/payment status — do not infer it from list_all_clients or search. Read-only.
+    description: `Join a batch of emails against AgentWeb user accounts to learn which ones registered (signed up) and which became premium (paying/trialing) users. When computing a funnel Registered or Premium stage, you MUST call this on the lead emails to get real signup/payment status — do not infer it from list_all_clients or search. Admin-only (non-admin callers get a 403) and read-only.
 
 For each input email the response reports:
 - \`registered\`: true if a (non-deleted) AgentWeb account exists for that email.
