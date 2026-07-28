@@ -46,12 +46,15 @@ jest.mock('../services/db', () => ({
       if (!user) return Promise.resolve('already_in_org');
       if (user.orgId) return Promise.resolve('already_in_org');
       const org = mockOrgs[orgId];
-      const currentCount = org?.memberCount ?? 0;
-      if (currentCount >= maxMembers) return Promise.resolve('org_full');
+      // Fail closed: a missing memberCount is never seeded from a live count
+      // here — only the reviewed backfill migration is allowed to initialize
+      // it. A live path just requires it to already exist and be under cap.
+      if (org?.memberCount === undefined) return Promise.resolve('not_migrated');
+      if (org.memberCount >= maxMembers) return Promise.resolve('org_full');
       user.orgId = orgId;
       user.orgRole = orgRole;
       user.pendingOrgInvite = null;
-      if (org) org.memberCount = currentCount + 1;
+      org.memberCount += 1;
       return Promise.resolve('joined');
     }),
     clearOrgMembership: jest.fn((userId: string) => {
@@ -60,8 +63,10 @@ jest.mock('../services/db', () => ({
         const orgId = user.orgId;
         delete user.orgId;
         delete user.orgRole;
-        if (orgId && mockOrgs[orgId]) {
-          mockOrgs[orgId].memberCount = Math.max(0, (mockOrgs[orgId].memberCount ?? 1) - 1);
+        // Fail closed: skip the decrement entirely if memberCount isn't set
+        // yet, rather than seeding it here (non-fatal, matches real behavior).
+        if (orgId && mockOrgs[orgId] && mockOrgs[orgId].memberCount !== undefined) {
+          mockOrgs[orgId].memberCount = Math.max(0, mockOrgs[orgId].memberCount - 1);
         }
       }
       return Promise.resolve();
@@ -425,6 +430,7 @@ describe('Organization routes', () => {
         name: 'Test Org',
         ownerUserId: 'user-1',
         maxMembers: 5,
+        memberCount: 1,
         pendingInvites: [{
           email: 'member@example.com',
           inviteToken: 'valid-token',
@@ -491,6 +497,18 @@ describe('Organization routes', () => {
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/full/i);
       // The invite must not be silently consumed on failure.
+      expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
+      expect(mockUsers['user-2'].orgId).toBeUndefined();
+    });
+
+    it('fails closed (not silently seeded) when memberCount has not been backfilled yet', async () => {
+      delete mockOrgs['org-1'].memberCount;
+      const res = await request(app).post('/api/org/accept-invite').send({
+        orgId: 'org-1',
+        inviteToken: 'valid-token',
+      });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/not yet ready/i);
       expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
       expect(mockUsers['user-2'].orgId).toBeUndefined();
     });

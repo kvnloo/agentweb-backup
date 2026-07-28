@@ -701,8 +701,10 @@ export interface Organization {
    * capacity gate at join time (via a DynamoDB transaction pairing the
    * increment with the joining user's write), never for display. Display
    * always uses the live GSI-backed member list (getOrgMembers), which can
-   * never drift. Absent on orgs created before this field existed; treated
-   * as 0 via if_not_exists until the backfill migration runs.
+   * never drift. Absent on orgs created before this field existed — every
+   * live path (join/leave) fails closed on a missing value rather than
+   * seeding it, since a live count can race with concurrent writes. Only
+   * scripts/backfill-org-member-count.ts is allowed to initialize this field.
    */
   memberCount?: number;
   createdAt: string;
@@ -1521,28 +1523,20 @@ export class UserDB {
     orgId: string,
     orgRole: "member" | "owner",
     maxMembers: number
-  ): Promise<"joined" | "org_full" | "already_in_org"> {
+  ): Promise<"joined" | "org_full" | "already_in_org" | "not_migrated"> {
     const user = await this.getUserById(userId);
     if (!user || !user.email) {
       throw new Error(`User with ID '${userId}' not found or has no email.`);
     }
 
-    // If memberCount hasn't been backfilled on this org yet, seed it from
-    // the real GSI-backed count rather than defaulting to 0 — defaulting to
-    // 0 would silently discard the org's actual existing membership, and
-    // every subsequent join would then be checked against a counter
-    // starting far below reality, letting the org balloon past maxMembers
-    // before the backfill migration runs. This doesn't reintroduce the
-    // original race: DynamoDB re-evaluates the transaction's condition
-    // against the item's real current state at commit time, not this
-    // pre-read, so a concurrent join that already initialized the counter
-    // is still correctly serialized against.
-    const orgSnapshot = await this.docClient.get({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
-    const seedCount =
-      orgSnapshot.Item?.memberCount !== undefined
-        ? orgSnapshot.Item.memberCount
-        : await this.getRealMemberCountForOrg(orgId);
-
+    // Fail closed if memberCount is missing — never seed it from a live
+    // count here. A live path guessing at the "real" count and initializing
+    // the counter from it is exactly what produced several subtle races
+    // (GSI eventual-consistency staleness, double-accounting against a
+    // concurrent departure/join). The reviewed backfill migration
+    // (scripts/backfill-org-member-count.ts) is the only thing allowed to
+    // initialize memberCount; every live path just requires it to already
+    // exist and be under cap.
     try {
       await this.docClient
         .transactWrite({
@@ -1551,15 +1545,9 @@ export class UserDB {
               Update: {
                 TableName: ORGS_TABLE,
                 Key: { orgId },
-                UpdateExpression: "SET memberCount = if_not_exists(memberCount, :seed) + :one",
-                // Must check capacity against the seed value too when
-                // memberCount is still absent — attribute_not_exists(...)
-                // alone would pass unconditionally regardless of how full
-                // the org's real (seeded) membership already is, letting an
-                // already-full unmigrated org overshoot maxMembers.
-                ConditionExpression:
-                  "(attribute_exists(memberCount) AND memberCount < :maxMembers) OR (attribute_not_exists(memberCount) AND :seed < :maxMembers)",
-                ExpressionAttributeValues: { ":seed": seedCount, ":one": 1, ":maxMembers": maxMembers },
+                UpdateExpression: "SET memberCount = memberCount + :one",
+                ConditionExpression: "attribute_exists(memberCount) AND memberCount < :maxMembers",
+                ExpressionAttributeValues: { ":one": 1, ":maxMembers": maxMembers },
               },
             },
             {
@@ -1578,7 +1566,14 @@ export class UserDB {
     } catch (error: any) {
       if (error.code === "TransactionCanceledException") {
         const reasons: Array<{ Code?: string }> = error.CancellationReasons || [];
-        if (reasons[0]?.Code === "ConditionalCheckFailed") return "org_full";
+        if (reasons[0]?.Code === "ConditionalCheckFailed") {
+          // Ambiguous by design between "org is full" and "org hasn't been
+          // backfilled yet" — both fail the same condition. Distinguish by
+          // checking which one it actually is, since the caller needs a
+          // different message for each.
+          const orgSnapshot = await this.docClient.get({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
+          return orgSnapshot.Item?.memberCount === undefined ? "not_migrated" : "org_full";
+        }
         if (reasons[1]?.Code === "ConditionalCheckFailed") return "already_in_org";
         // Unrecognized cancellation shape — treat conservatively as a
         // capacity/assignment conflict rather than surfacing a 500.
@@ -1587,31 +1582,6 @@ export class UserDB {
       handleDynamoDbError(error, "joinOrgWithCapacityCheck");
       throw error;
     }
-  }
-
-  // Live count of an org's real members via OrgIdIndex — same logic as
-  // scripts/backfill-org-member-count.ts. Only used as a one-time seed
-  // value inside joinOrgWithCapacityCheck when memberCount hasn't been
-  // backfilled on this org yet; not for display or repeated capacity checks.
-  private async getRealMemberCountForOrg(orgId: string): Promise<number> {
-    let total = 0;
-    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
-    do {
-      const result = await this.docClient
-        .query({
-          TableName: this.tableName,
-          IndexName: "OrgIdIndex",
-          KeyConditionExpression: "orgId = :orgId",
-          FilterExpression: "NOT begins_with(userId, :tombstone)",
-          ExpressionAttributeValues: { ":orgId": orgId, ":tombstone": "deleted_" },
-          Select: "COUNT",
-          ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
-        })
-        .promise();
-      total += result.Count || 0;
-      lastEvaluatedKey = result.LastEvaluatedKey;
-    } while (lastEvaluatedKey);
-    return total;
   }
 
   /**
@@ -1905,23 +1875,6 @@ export class UserDB {
     const orgId = user.orgId;
     if (!orgId) return; // Already cleared, e.g. by a concurrent call — nothing to do.
 
-    // If memberCount hasn't been backfilled on this org yet, compute the seed
-    // from the real live count BEFORE clearing this user's membership, not
-    // after. OrgIdIndex is a GSI — eventually consistent relative to the base
-    // table write — so querying it immediately after our own REMOVE could
-    // still include the departing user, seeding the counter one too high and
-    // wrongly blocking a later legitimate join. Querying before the removal
-    // sidesteps that: the count here still (correctly) includes this user,
-    // so subtracting 1 below lands on the true post-departure value without
-    // depending on the GSI having caught up to a write we just made.
-    const orgSnapshot = await this.docClient
-      .get({ TableName: ORGS_TABLE, Key: { orgId }, ProjectionExpression: "memberCount" })
-      .promise();
-    const seed =
-      orgSnapshot.Item?.memberCount !== undefined
-        ? 1 // Ignored by if_not_exists when memberCount is already present.
-        : (await this.getRealMemberCountForOrg(orgId)) + 1;
-
     try {
       await this.docClient
         .update({
@@ -1942,17 +1895,26 @@ export class UserDB {
       throw error;
     }
 
+    // Fail closed: if memberCount isn't set yet, skip the decrement entirely
+    // rather than seeding it here. Only the reviewed backfill migration
+    // (scripts/backfill-org-member-count.ts) is allowed to initialize this
+    // field — a live path guessing at the "real" count via OrgIdIndex (a
+    // GSI, eventually consistent relative to the write we just made) is
+    // exactly what produced the earlier staleness bug. Skipping is safe:
+    // once the org is backfilled, decrements apply normally; until then,
+    // there's nothing to decrement from.
     try {
       await this.docClient
         .update({
           TableName: ORGS_TABLE,
           Key: { orgId },
-          UpdateExpression: "SET memberCount = if_not_exists(memberCount, :seed) - :one",
-          ConditionExpression: "attribute_not_exists(memberCount) OR memberCount > :zero",
-          ExpressionAttributeValues: { ":seed": seed, ":one": 1, ":zero": 0 },
+          UpdateExpression: "SET memberCount = memberCount - :one",
+          ConditionExpression: "attribute_exists(memberCount) AND memberCount > :zero",
+          ExpressionAttributeValues: { ":one": 1, ":zero": 0 },
         })
         .promise();
-    } catch (error) {
+    } catch (error: any) {
+      if (error.code === "ConditionalCheckFailedException") return; // Not backfilled yet, or already 0 — nothing to do.
       console.error(`Failed to decrement memberCount for org ${orgId} (non-fatal):`, error);
     }
   }
