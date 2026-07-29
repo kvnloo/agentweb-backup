@@ -16,6 +16,12 @@ export interface HardeningBlock {
   marker: string;
   /** Verbatim block text appended to a skill's systemPrompt. */
   text: string;
+  /**
+   * Tools this block's text instructs Emma to call. They MUST be in the skill's
+   * toolNames or the block would reference tools the skill lacks (Blindspot 5),
+   * so planSkillChange auto-adds them whenever the block is applied.
+   */
+  requiredTools: string[];
 }
 
 const SAFETY = `## SAFETY & VOLUME LIMITS (apply in ALL modes, including scheduled/unattended runs)
@@ -77,12 +83,12 @@ const ADS_BUDGET = `## BUDGET & FAILURE STOP CONDITIONS
   reasons) / N queued. Never imply a change landed unless the tool confirms.`;
 
 export const BLOCKS: Record<string, HardeningBlock> = {
-  safety: { key: "safety", marker: "## SAFETY & VOLUME LIMITS", text: SAFETY },
-  failure: { key: "failure", marker: "## FAILURE HANDLING", text: FAILURE },
-  context: { key: "context", marker: "## CONTEXT FRESHNESS", text: CONTEXT },
-  learn: { key: "learn", marker: "## LEARN FROM OUTCOMES", text: LEARN },
-  compliance: { key: "compliance", marker: "## COMPLIANCE", text: COMPLIANCE },
-  adsBudget: { key: "adsBudget", marker: "## BUDGET & FAILURE STOP CONDITIONS", text: ADS_BUDGET },
+  safety: { key: "safety", marker: "## SAFETY & VOLUME LIMITS", text: SAFETY, requiredTools: ["list_connected_accounts"] },
+  failure: { key: "failure", marker: "## FAILURE HANDLING", text: FAILURE, requiredTools: [] },
+  context: { key: "context", marker: "## CONTEXT FRESHNESS", text: CONTEXT, requiredTools: ["list_connected_accounts", "read_market_strategy", "read_brand_guidelines", "save_memory"] },
+  learn: { key: "learn", marker: "## LEARN FROM OUTCOMES", text: LEARN, requiredTools: ["add_lead_engagement", "save_memory"] },
+  compliance: { key: "compliance", marker: "## COMPLIANCE", text: COMPLIANCE, requiredTools: [] },
+  adsBudget: { key: "adsBudget", marker: "## BUDGET & FAILURE STOP CONDITIONS", text: ADS_BUDGET, requiredTools: [] },
 };
 
 /**
@@ -201,7 +207,12 @@ export function planSkillChange(
   }
   const afterBlocks = applyHardening(working, target.blocks || []);
   const declared = new Set(afterBlocks.skill.toolNames || []);
-  const addedTools = (target.addTools || []).filter((t) => t && !declared.has(t));
+  // Every applied block's required tools must be present too (whether the block
+  // was just appended or already there), else the block references tools the
+  // skill lacks. Combine with explicit addTools, dedupe, drop already-declared.
+  const blockTools = (target.blocks || []).flatMap((k) => BLOCKS[k]?.requiredTools || []);
+  const want = [...(target.addTools || []), ...blockTools];
+  const addedTools = want.filter((t, i) => t && !declared.has(t) && want.indexOf(t) === i);
   const toolNames = addedTools.length
     ? [...(afterBlocks.skill.toolNames || []), ...addedTools]
     : afterBlocks.skill.toolNames;

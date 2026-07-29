@@ -98,6 +98,23 @@ describe("planSkillChange", () => {
     expect(res.skill.toolNames).toEqual(["a_tool"]);
   });
 
+  it("auto-adds a block's required tools even without explicit addTools", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "" } as any;
+    const res = planSkillChange(skill, { skillId: "s", blocks: ["learn"] });
+    expect([...res.addedTools].sort()).toEqual(["add_lead_engagement", "save_memory"]);
+    expect(res.skill.toolNames).toEqual(
+      expect.arrayContaining(["add_lead_engagement", "save_memory"]),
+    );
+  });
+
+  it("adds a block's required tools even when the block is already present (repair)", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: BLOCKS.learn.text } as any;
+    const res = planSkillChange(skill, { skillId: "s", blocks: ["learn"] });
+    expect(res.appended).toEqual([]); // block text already present
+    expect([...res.addedTools].sort()).toEqual(["add_lead_engagement", "save_memory"]);
+    expect(res.changed).toBe(true);
+  });
+
   it("applies blocks and tools together and reports both", () => {
     const skill = { skillId: "s", toolNames: [], systemPrompt: "base" } as any;
     const res = planSkillChange(skill, {
