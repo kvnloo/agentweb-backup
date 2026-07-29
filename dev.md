@@ -1,3 +1,77 @@
+## ENG-629: fail closed + prompt re-consent when a Meta connection lacks Ads scopes (2026-07-29)
+
+Live signal: OPS-79 fired twice in 24h — the scheduled Meta Ads report on account
+`922903076601160` failed with `(#200) Ad account owner has NOT granted ads_management or ads_read
+permission`, while `list_connected_accounts` reported the account connected + active and the
+unattended run produced a report with no data. Investigation findings that shaped the fix:
+
+- **`BaseOAuthConfig.scopes` is not a capability signal for Meta — it is a copy of our own OAuth
+  request.** `routes/metaAuth.ts` stored `scopes: flowCfg.scopes` after the token exchange, and the
+  token response was only destructured for `{ access_token, expires_in }`. No `debug_token` or
+  `/me/permissions` call existed in the marketing flow. So every Meta marketing connection records
+  `ads_read` + `ads_management` regardless of what the user actually ticked at the consent dialog.
+  **This is the trap**: a pre-flight gate reading `config.scopes` would have passed for exactly the
+  account that is failing in production, and the whole fix would have been a no-op. The gate had to
+  be built on a newly captured `granted_scopes`, mirroring the existing Gmail/YouTube/HubSpot field.
+- **Capability is tri-state, not boolean.** `granted_scopes` present without an ads scope is an
+  authoritative refusal; `granted_scopes` absent (every pre-existing record) is genuinely *unknown*.
+  Treating unknown as "missing" would lock out every working legacy connection; treating it as
+  "granted" reproduces the bug. `getMetaAdsScopeState` returns `granted | missing | unknown`, and
+  only `missing` refuses work before calling Meta.
+- **The soft-result shape was the actual user-visible defect.** `listMetaAdsCampaignsNew` caught the
+  Meta error and returned `{ success: false, ... }` with no `campaigns` key, which reads to the model
+  as "this account has no campaigns" — hence a clean-looking empty report instead of a failure. Meta
+  auth errors already had a rethrow channel (`error.isMetaAuthError`); the scope error joins it, so
+  it throws rather than degrading.
+- **Self-heal closes AC3 for legacy records.** When Meta authoritatively refuses, we now write the
+  learned grant back via the existing `updateAccountConfig` contract, so the *next* read fails at the
+  pre-flight gate without another API call. Best-effort by design — a persistence failure logs and
+  still surfaces the actionable error, never masking it. Re-consent overwrites `granted_scopes` at
+  connect, so the record self-corrects; no cache invalidation logic was needed.
+- **Scoped exclusions, deliberate.** Code 190 (expired token) and code 100 (validation — the
+  `filtering must be an array` defect owned by ENG-630) are explicitly NOT classified as scope
+  problems; misrouting either would hand the user the wrong remedy. Tests pin both.
+- **Non-secret by construction.** Meta echoes access tokens and `fbtrace_id` into error strings, so
+  the upstream error is attached as `cause` for logs and never interpolated into the message. One
+  canonical message for every trigger, so this is "one actionable error", not a family of near-duplicates.
+- **Self-review catch worth keeping.** The first cut of the self-heal wrote back the retained
+  grant, which for a legacy record collapses to `[]` — and `[]` was mapped to `unknown`, not
+  `missing`. So the pre-flight gate would have fallen through to Meta on every subsequent run,
+  defeating AC3 for exactly the records that needed it. The original test ("persisted array has no
+  ads scope") passed anyway, because `[]` trivially satisfies it. The fix is an explicit
+  `ads_scope_revoked_at` marker that makes the refusal unambiguous, plus a behavioral test that
+  feeds the persisted config back in and asserts the second read never calls Meta. Lesson: assert
+  the *downstream consequence* of a write, not the shape of the write.
+- **A permission classification is not evidence of a missing scope** (Greptile P1-2). The first
+  predicate returned true for any code 10 / 200-299, and `metaService.handleError` stamps
+  `PERMISSION_ERROR` on that whole family — missing `business_management`, an inaccessible ad
+  account, a disabled asset. Since the normalization path *narrows the stored grant*, that would
+  have stripped `ads_read` from a connection that genuinely had it and then blocked every later
+  request behind re-consent advice that cannot fix anything: a transient upstream error converted
+  into a bricked customer connection. The costs are asymmetric — a false negative just falls
+  through to the pre-existing soft error path carrying Meta's own message, while a false positive
+  destroys working state — so the bar is asymmetric too: Meta must NAME an Ads scope, and a
+  permission code alone is never sufficient. Renamed to `isMetaAdsScopeRefusal` because "permission
+  error" was the wrong concept and the loose name invited the loose check.
+- **The 95% CI coverage gate only measures `src/utils/**`** (`jest.config.js` `collectCoverageFrom`),
+  and the coverage shard additionally ignores `/__tests__/agentMode*`. Two consequences worth
+  knowing before adding a util: `services/` and `routes/` changes are not measured at all, so the
+  *only* file in this PR the gate could see was `utils/metaAdsScope.ts` — which is why one new
+  pure module could drag the global branch number from >=95% to 94.81% on its own.
+- **Deep `?.`/`??` chains are a coverage tax.** istanbul counts every optional-chaining hop as a
+  branch, so `error?.response?.data?.error?.code` alone contributes four. Meta delivers errors in
+  several shapes, so the first cut spelled out five code paths and seven text paths as inline
+  chains — ~19 branches for what is really two lookups, most unreachable without absurd permutation
+  fixtures. Replaced with declared path lists plus one `pick()` reducer: same behavior, the shapes
+  are now a readable table, and the file went 89.44% -> 100% branch coverage while getting shorter
+  in intent. Prefer a data-driven lookup over a nested optional chain when probing foreign payloads.
+- Gate coverage note: the pre-flight gate sits in `getMetaCredentials`, the single choke point for
+  every connected-account Meta tool, so it covers all ads paths including writes. Post-flight
+  normalization is wired into the campaign read path named in the reporter signal; once the
+  self-heal records the missing grant, every other path fails pre-flight too.
+- AgentMode chat behavior (outputs, tool selection, prompts, model defaults) is untouched. The
+  system prompt already forbade fabricating metrics; it needed no edit.
+
 ## ENG-446: canonical action payloads on existing report/run data (2026-07-29)
 
 New pure module `backend/src/services/marketingActionEnvelope.ts` — the transport/persistence seam
