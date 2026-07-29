@@ -45,6 +45,61 @@ because an agent chose to open the comment and read the score. Investigation fin
   advisory. Neither has a `greptile.json` or a `Require Greptile Review` job, so this mechanism does
   not reach them; porting it is Harsha's call (criterion 6).
 
+## ENG-744: Claude 5 generation added to the model catalog (2026-07-29)
+
+Added `anthropic.claude-opus-5`, `anthropic.claude-sonnet-5` and
+`anthropic.claude-haiku-4-5-20251001-v1:0` to the registry, the ENG-683 profile map, and the
+price book. Investigation findings:
+
+- **A listed ACTIVE inference profile is NOT proof of account access, and the difference is
+  invisible until runtime.** `list-inference-profiles` in us-west-2 reports
+  `us.anthropic.claude-opus-5` and `us.anthropic.claude-sonnet-5` ACTIVE, but invoking either with
+  the app's default credentials (992382574572) returns
+  `AccessDeniedException: ... is not available for this account`. Both are only reachable from the
+  **bearer-token account (231030591963)** — the same cross-account path Opus 4.8 already uses. Adding
+  them on the strength of the profile listing alone would have shipped two picker entries that 403
+  for every user. Always invoke before adding.
+- **Haiku 4.5 is the opposite case and must NOT be given bearer auth.** It IS served on the default
+  account, so it takes a normal `global.*` cross-region ARN and stays out of
+  `BEDROCK_BEARER_TOKEN_MODELS`. The account assignment is per-model, not per-generation — there is
+  no "Claude 5 goes to the bearer account" rule to lean on.
+- **Opus 5 returns a `reasoningContent` block before its text block** (thinking is on by default on
+  Opus 5, unlike 4.8/4.7 where omitting the `thinking` param meant no thinking). The Converse parser
+  in `agentModeService` collects *all* `text` blocks and ignores unknown ones, so this is handled —
+  but a parser that assumed `content[0].text` would silently return empty replies for Opus 5 only.
+  Verified against live Bedrock via ConverseCommand, with and without a tool.
+- **Opus 5 and Sonnet 5 reject `temperature` with HTTP 400 `"temperature is deprecated for this
+  model"`** — hence `supportsTemperature: false`, matching Opus 4.8. Haiku 4.5 still accepts it.
+  Confirmed empirically rather than inferred from the generation number.
+- **Haiku 4.5's price key is a canonicalization trap.** `llmPricing` already had
+  `anthropic.claude-haiku-4-5`, but the registry id is
+  `anthropic.claude-haiku-4-5-20251001-v1:0`, and `canonicalModelId` only strips a trailing bare
+  `-YYYY-MM-DD` — not `-20251001-v1:0`. Without its own key the lookup misses and `getModelPrice`
+  returns null, which the ledger books as $0. The pre-existing key covers a *different* id than it
+  appears to.
+- **`gemini-3-pro-preview` was withdrawn by Google on 2026-03-09 and we kept serving it for ~4.5
+  months.** A live probe returns 404 `"This model models/gemini-3-pro-preview is no longer
+  available."` while it was still listed by `GET /api/agent-mode/public/llm-models`, so every user
+  who picked it hit a hard failure. **Removed from the registry** under explicit authorization
+  (recorded on ENG-744 and in the PR body) — ENG-744 AC #7 forbids *silent* removal, not documented
+  removal. Migration target is `gemini-3.1-pro-preview`. The price entry is intentionally retained.
+  The signal was already in the tree and nobody joined it up: `llmPricing.ts` carried
+  `// DEPRECATED 2026-03-09` and a registry comment noted the id 404s for the *vision* path — but
+  neither was generalized to "this model is gone everywhere".
+- **A model can 404 on a real call while still appearing in Google's `ListModels`.**
+  `gemini-3-pro-preview` did exactly this. Discovery endpoints are therefore not evidence a model
+  works — verify by invoking. The same asymmetry runs the other way: Google enforces published
+  shutdown dates inconsistently (two image previews past their stated date still return 200), so
+  "it still responds" is not evidence of safety either. Trust the published date in both directions.
+- **The Gemini Pro line is not behind — Google has not shipped one.** `gemini-3.1-pro-preview` is
+  the newest Pro in the live catalog; there is no 3.5/3.6 Pro despite 3.5/3.6 Flash existing. The
+  "Pro lags Flash" reading of our catalog is Google's release cadence, not our drift.
+- **Live voice is healthy; the `generateContent` 404 against it is a probe artifact.**
+  `gemini-3.1-flash-live-preview` only advertises `bidiGenerateContent`, the WebSocket method
+  `liveVoiceService` actually uses. It is not withdrawn. It does, however, have **no GA successor**
+  in the catalog — as does `gemini-3.1-pro-preview` — which is the live exposure to watch ahead of
+  the 2026-10-20 Gemini platform migration.
+
 ## ENG-743: the staging deploy gate now has to observe the deploy (2026-07-29)
 
 `backend-staging-deploy` in `.github/workflows/tests.yml` now calls
@@ -468,6 +523,7 @@ pair), so they never hit the fixed path; new Emma ads are already correct. (2) `
 convention (meta vs facebook) stays a Session:Taste call in ENG-327. (3) Backfilling the live RankAI
 ads is a separate real-money action (rebuilding existing-post ads would drop social proof) — not in
 this PR.
+
 ## ENG-413: X posting fails silently — 3 code gaps made a read-only grant undiagnosable (2026-07-20)
 
 The live 403 (Reply Guy scheduled chat, all `twitter_manage_post` replies 403'd while reads worked)
