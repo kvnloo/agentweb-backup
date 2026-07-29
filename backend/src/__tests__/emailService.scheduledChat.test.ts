@@ -420,6 +420,32 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
     expect(recipients).not.toContain('nonadmin@example.com');
   });
 
+  it('does NOT silently drop: notifies the owner when a sensitive report has no authorized recipients', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { list_all_clients: 1 },
+    });
+    // owner is NOT an admin and neither is the configured recipient → nobody authorized
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: false });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(
+      ['nonadmin@example.com'],
+      'Daily User Activity Report',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    // exactly one send: the delivery-blocked STATUS notice to the owner (not the report)
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients, subject, , htmlContent] = spy.mock.calls[0];
+    expect(recipients).toEqual(['owner@example.com']);
+    expect(subject).toContain('not delivered');
+    expect(htmlContent).not.toContain('<html>'); // the report body is NOT included
+  });
+
   it('leaves recipients unchanged and does no lookups for an ordinary (non-sensitive) report', async () => {
     (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
       sessionId: 'session-abc',
