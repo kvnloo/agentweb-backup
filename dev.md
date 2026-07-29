@@ -1,3 +1,46 @@
+## ENG-629: fail closed + prompt re-consent when a Meta connection lacks Ads scopes (2026-07-29)
+
+Live signal: OPS-79 fired twice in 24h — the scheduled Meta Ads report on account
+`922903076601160` failed with `(#200) Ad account owner has NOT granted ads_management or ads_read
+permission`, while `list_connected_accounts` reported the account connected + active and the
+unattended run produced a report with no data. Investigation findings that shaped the fix:
+
+- **`BaseOAuthConfig.scopes` is not a capability signal for Meta — it is a copy of our own OAuth
+  request.** `routes/metaAuth.ts` stored `scopes: flowCfg.scopes` after the token exchange, and the
+  token response was only destructured for `{ access_token, expires_in }`. No `debug_token` or
+  `/me/permissions` call existed in the marketing flow. So every Meta marketing connection records
+  `ads_read` + `ads_management` regardless of what the user actually ticked at the consent dialog.
+  **This is the trap**: a pre-flight gate reading `config.scopes` would have passed for exactly the
+  account that is failing in production, and the whole fix would have been a no-op. The gate had to
+  be built on a newly captured `granted_scopes`, mirroring the existing Gmail/YouTube/HubSpot field.
+- **Capability is tri-state, not boolean.** `granted_scopes` present without an ads scope is an
+  authoritative refusal; `granted_scopes` absent (every pre-existing record) is genuinely *unknown*.
+  Treating unknown as "missing" would lock out every working legacy connection; treating it as
+  "granted" reproduces the bug. `getMetaAdsScopeState` returns `granted | missing | unknown`, and
+  only `missing` refuses work before calling Meta.
+- **The soft-result shape was the actual user-visible defect.** `listMetaAdsCampaignsNew` caught the
+  Meta error and returned `{ success: false, ... }` with no `campaigns` key, which reads to the model
+  as "this account has no campaigns" — hence a clean-looking empty report instead of a failure. Meta
+  auth errors already had a rethrow channel (`error.isMetaAuthError`); the scope error joins it, so
+  it throws rather than degrading.
+- **Self-heal closes AC3 for legacy records.** When Meta authoritatively refuses, we now write the
+  learned grant back via the existing `updateAccountConfig` contract, so the *next* read fails at the
+  pre-flight gate without another API call. Best-effort by design — a persistence failure logs and
+  still surfaces the actionable error, never masking it. Re-consent overwrites `granted_scopes` at
+  connect, so the record self-corrects; no cache invalidation logic was needed.
+- **Scoped exclusions, deliberate.** Code 190 (expired token) and code 100 (validation — the
+  `filtering must be an array` defect owned by ENG-630) are explicitly NOT classified as scope
+  problems; misrouting either would hand the user the wrong remedy. Tests pin both.
+- **Non-secret by construction.** Meta echoes access tokens and `fbtrace_id` into error strings, so
+  the upstream error is attached as `cause` for logs and never interpolated into the message. One
+  canonical message for every trigger, so this is "one actionable error", not a family of near-duplicates.
+- Gate coverage note: the pre-flight gate sits in `getMetaCredentials`, the single choke point for
+  every connected-account Meta tool, so it covers all ads paths including writes. Post-flight
+  normalization is wired into the campaign read path named in the reporter signal; once the
+  self-heal records the missing grant, every other path fails pre-flight too.
+- AgentMode chat behavior (outputs, tool selection, prompts, model defaults) is untouched. The
+  system prompt already forbade fabricating metrics; it needed no edit.
+
 ## ENG-446: canonical action payloads on existing report/run data (2026-07-29)
 
 New pure module `backend/src/services/marketingActionEnvelope.ts` — the transport/persistence seam
