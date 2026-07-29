@@ -366,9 +366,9 @@ describe('ENG-693 vendor dimension — behavioral contract', () => {
       expect(materializeRow(updateParams(1)).onBehalfOf).toBe('client-7');
     });
 
-    it('carries sessionId onto a vendor row when the caller has one', async () => {
+    it('carries the session onto a vendor row as lastSessionId when the caller has one', async () => {
       await recordVendorUsage({ ...v0Ctx, sessionId: 'sess-9' });
-      expect(materializeRow(updateParams()).sessionId).toBe('sess-9');
+      expect(materializeRow(updateParams()).lastSessionId).toBe('sess-9');
     });
 
     it('never writes a negative cost or a fractional quantity', async () => {
@@ -416,18 +416,31 @@ describe('ENG-693 vendor dimension — behavioral contract', () => {
       expect(materializeRow(updateParams()).provider).toBe('bedrock');
     });
 
-    it('threads sessionId through instead of dropping it at the write', async () => {
+    it('threads the session through instead of dropping it at the write', async () => {
       await recordUsage({ ...llmCtx, sessionId: 'sess-42' });
-      expect(materializeRow(updateParams()).sessionId).toBe('sess-42');
+      expect(materializeRow(updateParams()).lastSessionId).toBe('sess-42');
     });
 
-    it('omits provider/sessionId cleanly when the caller has none', async () => {
+    it('never pins one session onto a row fed by many (Greptile P1)', async () => {
+      // The sort key has no session component, so these two calls land on ONE row
+      // whose counters hold both sessions' usage. The stored id must therefore
+      // track the latest writer, not stick to the first — a sticky id would read
+      // as "sess-a owns this usage" while sess-b's tokens accumulate underneath it.
+      await recordUsage({ ...llmCtx, sessionId: 'sess-a' });
+      await recordUsage({ ...llmCtx, sessionId: 'sess-b' });
+
+      expect(updateParams(0).Key).toEqual(updateParams(1).Key);
+      expect(updateParams(1).UpdateExpression).not.toContain('if_not_exists(lastSessionId');
+      expect(materializeRow(updateParams(1)).lastSessionId).toBe('sess-b');
+    });
+
+    it('omits provider/session cleanly when the caller has none', async () => {
       const { provider, ...noProvider } = llmCtx;
       await recordUsage(noProvider as any);
       const params = updateParams();
       expect(params.ExpressionAttributeValues[':provider']).toBeUndefined();
-      expect(params.ExpressionAttributeValues[':sessionId']).toBeUndefined();
-      expect(params.UpdateExpression).not.toContain('sessionId');
+      expect(params.ExpressionAttributeValues[':lastSessionId']).toBeUndefined();
+      expect(params.UpdateExpression).not.toContain('SessionId');
     });
 
     it('writes provider with if_not_exists so an aggregate row never flaps', async () => {
