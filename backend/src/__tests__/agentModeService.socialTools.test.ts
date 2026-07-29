@@ -504,9 +504,11 @@ describe('AgentModeService - Social Media Tools', () => {
     // Reporting a bare "Successfully loaded 0 posts" here led the model to claim
     // the fetch succeeded / that it had read the user's LinkedIn, which reads as
     // a tool-success hallucination. Zero posts on a personal account must be
-    // reported as a non-success, explicitly-unsupported read that owns the
-    // AgentWeb-only behavior (not framed as a LinkedIn/platform limitation).
-    it('reports a non-success unsupported read (not a bare empty success) when a personal LinkedIn account has 0 posts', async () => {
+    // flagged as an explicitly-unsupported read (organicReadUnsupported) that
+    // owns the AgentWeb-only behavior — while keeping success:true, because the
+    // account is connected and nothing failed, so it must NOT render as a tool
+    // "failure" in the UI.
+    it('flags an unsupported read (not a bare empty success) but keeps success:true when a personal LinkedIn account has 0 posts', async () => {
       mockGetAccountsByUserId.mockResolvedValue([mockPersonalLinkedInAccount as any]);
       mockAdapter.listPosts.mockResolvedValue([]);
 
@@ -515,7 +517,9 @@ describe('AgentModeService - Social Media Tools', () => {
         'urn:li:person:ilhAte8iXG'
       );
 
-      expect(result.success).toBe(false);
+      // success stays true: the account is connected and healthy — nothing
+      // failed — so the UI must not badge this by-design empty read as a failure.
+      expect(result.success).toBe(true);
       expect(result.posts).toEqual([]);
       expect(result.organicReadUnsupported).toBe(true);
       // Must NOT frame it as a successful read of the user's posts.
