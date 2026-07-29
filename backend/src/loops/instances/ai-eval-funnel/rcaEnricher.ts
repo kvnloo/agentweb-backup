@@ -22,13 +22,12 @@
 
 import type { MutationProposal } from '../../core/types';
 import type { AiEvalProposalPayload } from './rules';
+import { resolveBedrockModelId } from '../../../utils/bedrockInferenceProfiles';
 
 export const RCA_TIMEOUT_MS = 25_000;
 
-// claude-sonnet-4-6 requires the global cross-region inference profile ARN —
-// matches the mapping in agentModeService.getBedrockClient().
-const SONNET_4_6_INFERENCE_PROFILE =
-  'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6';
+// claude-sonnet-4-6 requires the global cross-region inference profile ARN.
+const SONNET_4_6_INFERENCE_PROFILE = resolveBedrockModelId('anthropic.claude-sonnet-4-6');
 
 export type RcaImpact = 'high' | 'med' | 'low';
 export type RcaConfidence = 'high' | 'med' | 'low';
