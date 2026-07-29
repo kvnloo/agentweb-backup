@@ -45,7 +45,7 @@ function buildOAuthUrl(params: { authorizationUrl: string; clientId: string; red
     return `${params.authorizationUrl}?${searchParams.toString()}`;
 }
 
-async function storeTokenSession(userId: string, tokens: { access_token: string; expires_in?: number; scopes: string[]; flow: MetaFlowType }): Promise<string> {
+async function storeTokenSession(userId: string, tokens: { access_token: string; expires_in?: number; scopes: string[]; granted_scopes?: string[]; flow: MetaFlowType }): Promise<string> {
     const sessionId = crypto.randomBytes(32).toString('hex');
     await oauthSessionDb.save({ sessionId, userId, ...tokens });
     return sessionId;
@@ -228,10 +228,26 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
             }
         }
 
+        // Ask Meta what it ACTUALLY granted. `flowCfg.scopes` is only what we
+        // requested — the user can untick individual permissions at the consent
+        // dialog and still receive a token, so storing the request as if it were
+        // the grant records an unverified claim (ENG-629 / OPS-79). Best-effort:
+        // a failure here must never block connecting the account.
+        let granted_scopes: string[] | undefined;
+        try {
+            granted_scopes = await metaService.getGrantedScopes(access_token);
+            console.log(
+                `[Meta Finalize] granted scopes: ${granted_scopes ? granted_scopes.join(',') : '(undetermined)'}`
+            );
+        } catch (err: any) {
+            console.warn(`[Meta Finalize] Could not determine granted scopes: ${err?.message ?? err}`);
+        }
+
         const tokenSessionId = await storeTokenSession(userId, {
             access_token,
             expires_in,
             scopes: flowCfg.scopes,
+            ...(granted_scopes ? { granted_scopes } : {}),
             flow
         });
 
@@ -324,6 +340,10 @@ router.post('/connect-ad-accounts', authenticateToken, async (req: any, res) => 
                     access_token: session.access_token,
                     token_expires_at: session.expires_in ? Date.now() + (session.expires_in * 1000) : Date.now() + (60 * 24 * 60 * 60 * 1000),
                     scopes: session.scopes,
+                    // Authoritative capability signal, read back by getMetaAdsScopeState.
+                    // Omitted (not []) when undetermined, so "we could not ask" never
+                    // masquerades as "nothing was granted" (ENG-629).
+                    ...(session.granted_scopes ? { granted_scopes: session.granted_scopes } : {}),
                 }
             });
             connectedAccounts.push(account);
