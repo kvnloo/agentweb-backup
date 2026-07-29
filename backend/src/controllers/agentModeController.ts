@@ -6476,8 +6476,13 @@ export const agentModeController = {
       // ENG-446: hand every consumer the canonical marketing-action list the run
       // itself selected — same ids, same order, empty for legacy runs that carry
       // none. Consumers render this; they never re-rank or regenerate it.
+      // Arrays are excluded deliberately: spreading one into an object literal
+      // would silently turn it into {0: …, 1: …}. A malformed entry passes
+      // through untouched rather than being corrupted into a wrong answer.
       const historyWithActions = (testHistory || []).map((run: any) =>
-        run !== null && typeof run === 'object' ? normalizeMarketingActions(run) : run
+        run !== null && typeof run === 'object' && !Array.isArray(run)
+          ? normalizeMarketingActions(run)
+          : run
       );
 
       res.json(historyWithActions);

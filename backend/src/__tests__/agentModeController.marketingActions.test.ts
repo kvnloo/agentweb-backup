@@ -258,6 +258,14 @@ describe('ENG-446 run surface — GET /scheduled-chats/:id/test-history', () => 
 
       expect(body).toEqual([]);
     });
+
+    it('passes a malformed non-object run entry through untouched instead of corrupting it', async () => {
+      mockScheduleDb.getRunResults.mockResolvedValue([null, 'legacy-string', ['a', 'b']] as any);
+
+      const body = await getTestHistory();
+
+      expect(body).toEqual([null, 'legacy-string', ['a', 'b']]);
+    });
   });
 
   describe('A6 — duplicate delivery / retry never mints new action IDs', () => {
