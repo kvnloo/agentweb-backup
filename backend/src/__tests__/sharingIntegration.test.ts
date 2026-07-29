@@ -37,6 +37,15 @@ jest.mock('../services/generateMarketingResponseWorkerService', () => ({
   },
 }));
 
+// ENG-705: generateSharedResponse now gates on the share owner's token
+// allowance before generating. Stub it as "within limits" so these tests keep
+// exercising sharing behavior rather than the usage gate (which has its own
+// suite in agentModeController.ishareUsageGate.test.ts).
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn().mockResolvedValue({ allowed: true, warning: false, percentUsed: 0 }),
+  incrementUserTokenUsage: jest.fn(),
+}));
+
 // Mock the User type
 interface User {
   userId: string;
