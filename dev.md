@@ -35,6 +35,14 @@ New pure module `backend/src/utils/metaInsightsFiltering.ts`, wired into
 - **Verification is mock-only, deliberately.** OPS-79 means our own Meta connection currently lacks
   `ads_read`, so no live Insights call is possible; the issue's AC5 forbids one regardless. Every
   assertion is against the request body we hand axios and the error object we hand back.
+- **The filter `value` was the last unvalidated hop, and review caught it, not the tests.** The
+  first cut validated `field` and `operator` but forwarded `value` verbatim, so a supported
+  operator carrying an object or a nested array still travelled to Meta — the exact class of defect
+  the module was written to stop, surviving inside the fix for it. Values are now asserted scalar
+  (and each element of a list-operator value individually). Non-finite numbers go too: `NaN` and
+  `Infinity` have no JSON representation and serialize to `null`, so they filter on a value nobody
+  asked for. Generalizable: **when you add a boundary, enumerate every field crossing it — a guard
+  that covers two of three fields reads as "validated" and is trusted like it.**
 
 ## ENG-693: vendor dimension on the existing usage ledger (2026-07-29)
 
