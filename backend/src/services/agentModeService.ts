@@ -788,7 +788,15 @@ export class AgentModeService {
   private readonly FILE_CACHE_MAX_SIZE = 1000; // Max 1000 cached files
   private readonly FILE_CACHE_MAX_AGE_MS = 3600000; // 1 hour TTL
   private readonly FILE_CACHE_CLEANUP_INTERVAL_MS = 600000; // Cleanup every 10 minutes
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5.5';
+  // ENG-759: the default chat model. Opus 5 and Opus 4.8 are both $5/$25, so this
+  // is a capability upgrade at no cost change. Opus 5 is AccessDenied on our
+  // default AWS account and reachable ONLY through the bearer-token account, so it
+  // MUST stay in BEDROCK_BEARER_TOKEN_MODELS — see utils/bedrockInferenceProfiles.
+  // This literal is the last-resort fallback; the effective default is the
+  // `agent_mode_default_model` setting when one is configured (getDefaultModel).
+  // It previously read 'gpt-5.5', which meant a missing/invalid setting silently
+  // dropped every chat onto an Azure GPT deployment instead of the intended Claude.
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'anthropic.claude-opus-5';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
