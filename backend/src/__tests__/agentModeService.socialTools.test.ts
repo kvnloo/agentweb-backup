@@ -525,9 +525,11 @@ describe('AgentModeService - Social Media Tools', () => {
       // Must NOT frame it as a successful read of the user's posts.
       expect(result.message).not.toContain('Successfully loaded');
       // Owns it as AgentWeb's own behavior, framed positively (what AgentWeb
-      // DOES) — never as a weakness/"limitation".
+      // DOES) — never as a weakness/"limitation", and steers the model away from
+      // blaming an external platform.
       expect(result.message.toLowerCase()).toContain('agentweb');
       expect(result.message.toLowerCase()).not.toContain('limitation');
+      expect(result.message.toLowerCase()).toContain('do not blame any external platform');
       expect(result.message.toLowerCase()).toContain('do not claim');
     });
 
