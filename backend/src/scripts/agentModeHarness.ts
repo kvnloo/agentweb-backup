@@ -1,70 +1,103 @@
 /**
- * ENG-204 — behavioral Emma harness. Drives a real agent-mode turn against the
- * running backend (default localhost:31101, dev-backed) via REST, and prints the
- * response text + the tool calls Emma made — so we can behaviorally verify
- * hardened skills (caps enforced, completion ledger, tool availability) without
- * the browser/CORS constraints of the preview.
+ * ENG-204 — behavioral Emma harness. Drives real agent-mode turns against the
+ * running backend (default localhost:31101, dev-backed) via REST so we can
+ * behaviorally verify hardened skills (caps enforced, queue-on-overflow,
+ * completion ledger) without the preview browser/CORS constraints.
  *
- *   NODE_ENV=development npx ts-node src/scripts/agentModeHarness.ts "<message>" [--model <id>]
+ *   NODE_ENV=development npx ts-node src/scripts/agentModeHarness.ts \
+ *     --install <skillId[,skillId]> "<msg1>" ["<msg2>" ...] [--model <id>]
  *
- * Env: HARNESS_API (base URL), HARNESS_EMAIL, HARNESS_PASSWORD (default test admin).
+ * With --install, the harness installs the skill(s) directly via
+ * agentModeService.installSkills (the reliable path — requiredFunctions over
+ * REST does NOT install), temporarily granting the test user wildcard skill
+ * access for the run and RESTORING its subscription in a finally block.
+ *
+ * Env: HARNESS_API, HARNESS_EMAIL, HARNESS_PASSWORD (default test admin).
  */
+import AWS from "aws-sdk";
+import { agentModeService } from "../services/agentModeService";
+
 const API = process.env.HARNESS_API || "http://localhost:31101";
 const EMAIL = process.env.HARNESS_EMAIL || "test@example.com";
 const PASSWORD = process.env.HARNESS_PASSWORD || "Test123!";
+const USERS_TABLE = (process.env.NODE_ENV === "development" ? "Dev-" : "") + "AW-Users";
+const ddb = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
 
 async function j(res: Response): Promise<any> {
   const text = await res.text();
   if (!res.ok) throw new Error(`${res.status} ${res.url}: ${text.slice(0, 300)}`);
   return JSON.parse(text);
 }
-
-async function login(): Promise<string> {
-  const d = await j(await fetch(`${API}/api/auth/login`, {
+const post = (path: string, token: string | null, body: any) =>
+  fetch(`${API}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
-  }));
-  return d.token;
-}
-
-async function createSession(token: string, title: string): Promise<string> {
-  const d = await j(await fetch(`${API}/api/agent-mode/sessions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ title }),
-  }));
-  return d.sessionId || d.id;
-}
-
-async function generate(token: string, sessionId: string, userMessage: string, model?: string): Promise<any> {
-  const body: any = { sessionId, userMessage };
-  if (model) body.llmModel = model;
-  return j(await fetch(`${API}/api/agent-mode/generate`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: JSON.stringify(body),
-  }));
+  }).then(j);
+
+async function getSubscription(email: string): Promise<string | undefined> {
+  const r = await ddb.get({ TableName: USERS_TABLE, Key: { email } }).promise();
+  return r.Item?.subscriptionType;
+}
+async function setSubscription(email: string, value: string): Promise<void> {
+  await ddb.update({
+    TableName: USERS_TABLE, Key: { email },
+    UpdateExpression: "SET subscriptionType = :v",
+    ExpressionAttributeValues: { ":v": value },
+  }).promise();
 }
 
 async function main() {
-  const message = process.argv[2];
-  const modelIdx = process.argv.indexOf("--model");
-  const model = modelIdx > -1 ? process.argv[modelIdx + 1] : undefined;
-  if (!message) {
-    console.error('Usage: agentModeHarness.ts "<message>" [--model <id>]');
+  const argv = process.argv.slice(2);
+  const flagVal = (n: string) => { const i = argv.indexOf(n); return i > -1 ? argv[i + 1] : undefined; };
+  const model = flagVal("--model");
+  const installList = flagVal("--install");
+  const skillIds = installList ? installList.split(",").map((s) => s.trim()) : [];
+  const flagKeys = new Set(["--model", "--install"]);
+  const messages = argv.filter((a, i) => !a.startsWith("--") && !flagKeys.has(argv[i - 1]));
+  if (messages.length === 0) {
+    console.error('Usage: agentModeHarness.ts [--install <skillId,...>] "<msg1>" ["<msg2>" ...] [--model <id>]');
     process.exit(2);
   }
-  const token = await login();
+
+  const login = await post("/api/auth/login", null, { email: EMAIL, password: PASSWORD });
+  const token = login.token;
+  const userId = login.user.userId;
   console.log("logged in ✅");
-  const sessionId = await createSession(token, "ENG-204 harness");
-  console.log("session:", sessionId);
-  console.log("→ sending:", message);
-  const res = await generate(token, sessionId, message, model);
-  console.log("\n=== CONTENT ===\n" + (res.content || "(empty)"));
-  const tools = (res.toolCalls || []).map((t: any) => t.toolName || t.name);
-  console.log("\n=== TOOL CALLS (" + tools.length + ") ===\n" + (tools.join(", ") || "(none)"));
+
+  // Grant wildcard skill access for the run so gated dev skills can install;
+  // restored in finally. (A hard crash would leave it set — restore manually.)
+  const savedSub = skillIds.length ? await getSubscription(EMAIL) : undefined;
+  try {
+    if (skillIds.length) {
+      await setSubscription(EMAIL, "ENG204-harness-wildcard");
+      const sessionId = await post("/api/agent-mode/sessions", token, { title: "ENG-204 harness" }).then((s) => s.sessionId || s.id);
+      const inst = await agentModeService.installSkills(skillIds, userId, sessionId);
+      console.log("installed:", JSON.stringify(inst.installedSkills || inst.message));
+      console.log("session:", sessionId, "\n");
+      await runTurns(token, sessionId, messages, model);
+    } else {
+      const sessionId = await post("/api/agent-mode/sessions", token, { title: "ENG-204 harness" }).then((s) => s.sessionId || s.id);
+      console.log("session:", sessionId, "\n");
+      await runTurns(token, sessionId, messages, model);
+    }
+  } finally {
+    if (savedSub !== undefined) { await setSubscription(EMAIL, savedSub); console.log(`\n(subscription restored: ${savedSub})`); }
+  }
   process.exit(0);
+}
+
+async function runTurns(token: string, sessionId: string, messages: string[], model?: string) {
+  for (let i = 0; i < messages.length; i++) {
+    console.log(`──────── TURN ${i + 1} ────────`);
+    console.log("→ " + messages[i]);
+    const body: any = { sessionId, userMessage: messages[i] };
+    if (model) body.llmModel = model;
+    const res = await post("/api/agent-mode/generate", token, body);
+    console.log("\nCONTENT:\n" + (res.content || "(empty)"));
+    const tools = (res.toolCalls || []).map((t: any) => t.toolName || t.name);
+    console.log("TOOL CALLS (" + tools.length + "): " + (tools.join(", ") || "(none)") + "\n");
+  }
 }
 
 main().catch((e) => { console.error("HARNESS ERROR:", e.message || e); process.exit(1); });
