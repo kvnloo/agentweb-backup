@@ -603,9 +603,10 @@ Runtime environment variables in Elastic Beanstalk do NOT affect the frontend.
 
 ### Build & Deploy Naming
 
-- Build artifacts and EB version labels use the format `<component>-yyyymmdd-pr<number>` (e.g., `backend-20260218-pr42`, `partner-20260218-pr42`)
+- Production build artifacts and EB version labels use the format `<component>-yyyymmdd-pr<number>` (e.g., `backend-20260218-pr42`, `partner-20260218-pr42`)
 - The PR number is extracted from the merge commit message; falls back to the short commit SHA if unavailable
-- Deployments are triggered automatically by file changes in `backend/` or `partner-portal/` — no manual version bump is needed
+- Staging labels append the short SHA — `backend-yyyymmdd-pr<number>-<sha>` — because a PR deploys to staging on every push and the deploy verification asserts the environment is running this exact label. Without the SHA that assertion would compare against a label the environment is already on (ENG-743)
+- Deployments are triggered automatically by file changes in `backend/` or `partner-portal/` — no manual version bump is needed. `.github/workflows/tests.yml` and `.github/scripts/eb-deploy.sh` also count as backend changes, so changes to the backend CI/deploy path run that path
 - `package.json` versions in backend, partner-portal, and customer-portal are independent but are **not** used for deployment gating
 
 ### DynamoDB Query Optimization
