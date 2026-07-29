@@ -173,7 +173,7 @@ describe('ENG-705 — share-token generate routes are usage-gated before any spe
     expect(mockWorkerService.runInWorker).not.toHaveBeenCalled();
   });
 
-  it('AC5: the refusal is loud — it names the limit and returns the usage status, not a silent success', async () => {
+  it('AC5: the refusal is loud — it names the limit, not a silent success', async () => {
     mockCheckTokenUsage.mockResolvedValue(usage(100) as any);
 
     const res = makeRes();
@@ -182,9 +182,44 @@ describe('ENG-705 — share-token generate routes are usage-gated before any spe
     expect(res.status).toHaveBeenCalledWith(429);
     const body = (res.json as jest.Mock).mock.calls[0][0];
     expect(body.error).toMatch(/limit/i);
-    expect(body.tokenUsage).toEqual(expect.objectContaining({ allowed: false, percentUsed: 100 }));
     // Not a degraded-but-billed path: no assistant content is returned.
     expect(body.content).toBeUndefined();
+  });
+
+  // ── Ownership boundary (Greptile P1, 2026-07-29) ─────────────────────────
+  // The caller here is ANONYMOUS — it holds a share token, not the owner's
+  // session. The denial must not become a read side-channel onto the owner's
+  // billing record. Returning `checkTokenUsage`'s status verbatim would have
+  // handed any link-holder the owner's dollar spend, allowance and bonus.
+  it('does not disclose the share OWNER\'s usage or billing record to an anonymous visitor', async () => {
+    mockCheckTokenUsage.mockResolvedValue(usage(100) as any);
+
+    const res = makeRes();
+    await agentModeController.generateSharedResponse(makeReq(), res);
+
+    expect(res.status).toHaveBeenCalledWith(429);
+    const body = (res.json as jest.Mock).mock.calls[0][0];
+
+    // The whole owner-facing status object must be absent...
+    expect(body.tokenUsage).toBeUndefined();
+    // ...and no individual field of it may leak under any other key. Asserting
+    // on the serialized body catches a future re-add by spread or rename.
+    for (const leaked of [
+      'used',
+      'allowance',
+      'bonus',
+      'effectiveAllowance',
+      'percentUsed',
+      'month',
+      'costUsed',
+      'costAllowance',
+      'costPercentUsed',
+      'costEnforced',
+    ]) {
+      expect(Object.keys(body)).not.toContain(leaked);
+    }
+    // The denial itself still has to be actionable for the visitor.
+    expect(body.error).toMatch(/contact the owner of this link/i);
   });
 
   // ── AC2 ──────────────────────────────────────────────────────────────────
