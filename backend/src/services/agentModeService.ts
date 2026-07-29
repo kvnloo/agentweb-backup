@@ -27311,7 +27311,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           organicReadUnsupported: true,
           posts: [],
           message:
-            'AgentWeb works from the LinkedIn posts you create with it, and this personal account hasn\'t published any through AgentWeb yet — so there aren\'t any on file to analyze for writing voice. Do NOT claim you have read or analyzed the user\'s existing LinkedIn posts, and there\'s no need to retry. The best next step: invite the user to paste or upload a few of their recent posts, then build their writing-voice profile from those — and offer to save it so future posts match their style.',
+            'AgentWeb works from the LinkedIn posts you create with it, and this personal account hasn\'t published any through AgentWeb yet — so there aren\'t any on file to analyze for writing voice. Frame this as normal AgentWeb behavior and keep the focus on the constructive next step — do not describe it as a shortcoming and do not blame any external platform. Do NOT claim you have read or analyzed the user\'s existing LinkedIn posts, and there\'s no need to retry. The best next step: invite the user to paste or upload a few of their recent posts, then build their writing-voice profile from those — and offer to save it so future posts match their style.',
         };
       }
 
