@@ -323,6 +323,63 @@ describe('ENG-693 vendor dimension — behavioral contract', () => {
     });
   });
 
+  // ── Defaults: unattributed and unpriced vendor spend is still recorded ──────
+  describe('vendor spend with an incomplete context is still captured, never dropped', () => {
+    it('books spend with no user under "system" rather than losing it', async () => {
+      const { userId, billingUserId, ...noUser } = v0Ctx;
+      await recordVendorUsage(noUser as any);
+
+      const row = materializeRow(updateParams());
+      expect(row.userId).toBe('system');
+      expect(row.billingUserId).toBe('system');
+    });
+
+    it('falls back to the acting user for billing when no billing user is given', async () => {
+      const { billingUserId, ...noBilling } = v0Ctx;
+      await recordVendorUsage(noBilling as any);
+      expect(materializeRow(updateParams()).billingUserId).toBe('user-1');
+    });
+
+    it('records an unpriced unit at cost 0 while still marking it a vendor entry', async () => {
+      // No rate card exists yet (ENG-703). An unpriced call must still land on the
+      // ledger with its quantity, not vanish — ENG-700 is what makes it loud.
+      const { costUsd, ...unpriced } = v0Ctx;
+      await recordVendorUsage(unpriced as any);
+
+      const row = materializeRow(updateParams());
+      expect(row.costMicroUsd).toBe(0);
+      expect(row.quantity).toBe(1);
+      expect(isVendorEntry(row as UsageRecordRow)).toBe(true);
+    });
+
+    it('defaults a missing feature to "unknown" instead of writing an empty key segment', async () => {
+      const { feature, ...noFeature } = v0Ctx;
+      await recordVendorUsage(noFeature as any);
+      expect(updateParams().Key.sk.endsWith('#unknown')).toBe(true);
+    });
+
+    it('carries onBehalfOf when present and omits it otherwise', async () => {
+      await recordVendorUsage(v0Ctx);
+      expect(updateParams(0).UpdateExpression).not.toContain('onBehalfOf');
+
+      await recordVendorUsage({ ...v0Ctx, onBehalfOf: 'client-7' });
+      expect(materializeRow(updateParams(1)).onBehalfOf).toBe('client-7');
+    });
+
+    it('carries sessionId onto a vendor row when the caller has one', async () => {
+      await recordVendorUsage({ ...v0Ctx, sessionId: 'sess-9' });
+      expect(materializeRow(updateParams()).sessionId).toBe('sess-9');
+    });
+
+    it('never writes a negative cost or a fractional quantity', async () => {
+      await recordVendorUsage({ ...v0Ctx, costUsd: -5, quantity: 2.6 });
+      const row = materializeRow(updateParams());
+      expect(row.costMicroUsd).toBe(0);
+      expect(Number.isInteger(row.quantity)).toBe(true);
+      expect(row.quantity).toBe(3);
+    });
+  });
+
   // ── Assertion 6 ────────────────────────────────────────────────────────────
   describe('6. an LLM entry is unchanged in tokens, cost, feature, and billing user', () => {
     it('writes the same token counts, cost, feature and billingUserId as before', async () => {
