@@ -1441,7 +1441,10 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
             // swallowed at the call site), so a successful cross-account tool
             // call can be missing from it. Confirm against the authoritative
             // tool-call message records before treating the report as safe.
-            const guardMessages = await chatbotDb.getMessagesFromMessagesTable(result.sessionId);
+            // Use a STRONGLY CONSISTENT read: this send fires immediately after
+            // the run wrote these messages, so an eventually-consistent read
+            // could miss the just-written cross-account tool call and fail open.
+            const guardMessages = await chatbotDb.getMessagesFromMessagesTable(result.sessionId, true);
             isSensitive = messagesReferenceCrossAccountTool(guardMessages as any);
           }
         } catch (classifyError) {
@@ -1481,6 +1484,17 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         // (a status message ONLY — never the report data) so the report is not
         // lost without a signal and the owner can add an authorized recipient.
         console.error(`Scheduled report for session ${result.sessionId} had no authorized recipients after the guard; report NOT delivered.`);
+        // Durable escalation so a fully-withheld report is never lost silently —
+        // this fires regardless of whether the owner email is known or its notice
+        // succeeds (owner-notice failure would otherwise be swallowed by sendEmail).
+        try {
+          await this.sendOncallAlert(
+            `Scheduled report withheld — no authorized recipients: ${scheduleName}`,
+            `Session ${result.sessionId} produced a report containing cross-account account data, but none of its configured recipients (or the schedule owner) are authorized (admin) to receive it, so it was not delivered. Owner: ${guardOwnerEmail || 'unknown'}. Add an authorized recipient or adjust the report.`
+          );
+        } catch (alertError) {
+          console.error(`Failed to send oncall alert for withheld report ${result.sessionId}:`, alertError);
+        }
         if (guardOwnerEmail) {
           try {
             const blockedSubject = `⚠️ Scheduled report not delivered: ${scheduleName}`;

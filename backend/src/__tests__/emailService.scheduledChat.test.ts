@@ -430,6 +430,7 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: false });
     (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
     const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+    const oncallSpy = jest.spyOn(emailService, 'sendOncallAlert').mockResolvedValue(undefined);
 
     await emailService.sendScheduledChatResultEmail(
       ['nonadmin@example.com'],
@@ -438,6 +439,8 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
       'schedule-123'
     );
 
+    // durable escalation fired (report not lost silently)
+    expect(oncallSpy).toHaveBeenCalledTimes(1);
     // exactly one send: the delivery-blocked STATUS notice to the owner (not the report)
     expect(spy).toHaveBeenCalledTimes(1);
     const [recipients, subject, , htmlContent] = spy.mock.calls[0];
