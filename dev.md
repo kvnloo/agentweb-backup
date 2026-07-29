@@ -35,6 +35,22 @@ Two cost-leak surfaces closed with primitives that already existed. Investigatio
 - **Known limitation, unchanged by this PR:** the landing-page rate limiter is an in-process
   `Map`, so limits are per backend instance rather than global. Pre-existing; worth noting if
   ENG-666/ENG-694 metering makes cross-instance accounting a requirement.
+- **The gate's first shape shipped a disclosure, and our own test hid it (Greptile P1, review of
+  `1c0a078a`).** Mirroring the authenticated `/generate` 429 "exactly" was right for the *check*
+  and wrong for the *response*: the authenticated path returns `tokenUsage: usageStatus` to the
+  account that owns it, but this route sits before `authenticateToken`, so the same body handed
+  any share-link holder the owner's allowance, bonus, effective allowance, billing month, dollar
+  spend (`costUsed`), cost cap and enforcement state — the same object the authenticated
+  subscription-usage endpoint serves. **Symmetry across an authentication boundary is not
+  symmetry.** When copying a response shape, re-ask who the reader is.
+- **The agent-written test asserted the bug.** It required the body to *contain* `tokenUsage`
+  (`expect(body.tokenUsage).toEqual(expect.objectContaining({...}))`), so the leak was pinned as
+  intended behavior and the suite went green over it — the exact failure mode
+  `loop-acceptance-tests.md` exists to prevent, and it survived because none of the six
+  human-written ACs constrain the denial body. The replacement asserts the ownership boundary
+  instead: no `TokenUsageStatus` field may appear under any key, so a future re-add by spread or
+  rename fails too. Worth remembering: a test written by whoever wrote the code will happily
+  describe the code rather than the requirement.
 
 ## ENG-446: canonical action payloads on existing report/run data (2026-07-29)
 
