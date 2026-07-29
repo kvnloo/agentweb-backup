@@ -13864,8 +13864,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * connections that actually work. Those are caught after the fact by
    * normalizeMetaAdsReadError. (ENG-629)
    */
-  private assertMetaAdsScope(selected: any): void {
-    const { getMetaAdsScopeState, buildMetaAdsScopeError } = require('../utils/metaAdsScope');
+  private async assertMetaAdsScope(selected: any): Promise<void> {
+    const { getMetaAdsScopeState, buildMetaAdsScopeError } = await import('../utils/metaAdsScope');
     if (getMetaAdsScopeState(selected?.config) !== 'missing') return;
 
     const label = selected?.account_id || selected?.config?.ad_account_id;
@@ -13895,7 +13895,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       isMetaAdsPermissionError,
       buildMetaAdsScopeError,
       META_ADS_READ_SCOPES,
-    } = require('../utils/metaAdsScope');
+    } = await import('../utils/metaAdsScope');
 
     if (!isMetaAdsPermissionError(error)) return;
 
@@ -13997,7 +13997,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       await this.ensureUsableMetaToken(selected, selected.userId || userId);
-      this.assertMetaAdsScope(selected);
+      await this.assertMetaAdsScope(selected);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
@@ -14021,7 +14021,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const selected = fbAccounts[0];
 
     await this.ensureUsableMetaToken(selected, selected.userId || userId);
-    this.assertMetaAdsScope(selected);
+    await this.assertMetaAdsScope(selected);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 
@@ -26850,11 +26850,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * Returns `{}` for non-Meta accounts and for Meta records whose grant we cannot
    * prove either way, so the payload only ever carries facts. (ENG-629 AC1)
    */
-  private describeMetaAdsCapability(acc: any): Record<string, any> {
+  private async describeMetaAdsCapability(acc: any): Promise<Record<string, any>> {
     if (acc?.platform !== 'meta' && acc?.platform !== 'facebook') return {};
     if (acc?.config?.account_type !== 'ad_account') return {};
 
-    const { getMetaAdsScopeState, META_ADS_RECONSENT_MESSAGE } = require('../utils/metaAdsScope');
+    const { getMetaAdsScopeState, META_ADS_RECONSENT_MESSAGE } = await import('../utils/metaAdsScope');
     const state = getMetaAdsScopeState(acc.config);
 
     if (state === 'granted') return { ads_capable: true };
@@ -26935,7 +26935,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // this, `is_active: true` alone reads as "fully capable" and the model
           // plans work it cannot complete (ENG-629). Only emitted when we actually
           // know — an unknown legacy record stays silent rather than crying wolf.
-          ...this.describeMetaAdsCapability(acc),
+          ...(await this.describeMetaAdsCapability(acc)),
         })))
       };
     } catch (error) {
