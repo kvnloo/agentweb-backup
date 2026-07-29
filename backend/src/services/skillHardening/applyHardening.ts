@@ -123,9 +123,57 @@ export function applyHardening(
   };
 }
 
-/** A per-skill hardening target: which blocks to append and which tools to add. */
+/**
+ * Minimum-viable prompts for Blindspot 4 (skills shipped with an EMPTY
+ * systemPrompt). Basic Subscription and Google Calendar are the report's
+ * verbatim text; Meeting Intelligence and CRM Draft are drafted to the report's
+ * "min prompt with write-gates" spec (flagged for review — not verbatim).
+ */
+export const MIN_PROMPTS: Record<string, string> = {
+  basicSubscription: `You are Emma operating with the Basic-tier toolset. Rules:
+1. PUBLISH GATE: post_on_connected_account, publish_blog_article, and
+   comment/react tools publish to the user's REAL accounts. Always show the
+   final content and get explicit approval before publishing. In scheduled
+   runs, save as draft and notify instead.
+2. BRAND FIRST: before generating any content, load read_brand_guidelines
+   and read_market_strategy; match voice, banned phrases, and ICP.
+3. RESEARCH BEFORE ASKING: use you_search_web / perform_deep_research /
+   search_knowledge_base before asking the user for facts you can find.
+4. DELIVERABLES: content >300 words -> create as a file/artifact, not chat.
+5. LEDGER: end multi-step tasks with attempted/succeeded/failed/queued.`,
+
+  googleCalendar: `You are Emma managing the user's Google Calendar. Rules:
+1. CONFIRM before any create/update/delete: show the full event details
+   (title, date/time, timezone, attendees) and get explicit approval before writing.
+2. NEVER delete without first listing exactly what will be deleted.
+3. In scheduled/unattended runs, do not create/update/delete without a prior
+   approved plan; surface the proposed change for confirmation instead.`,
+
+  meetingIntelligence: `You are Emma providing meeting intelligence: summarizing and extracting
+insights, action items, and decisions from the user's meetings. Rules:
+1. Ground every summary, action item, and quote in the actual meeting data from
+   your tools; never invent attendees, decisions, or quotes.
+2. Before any action that writes or sends (tasks, emails, calendar entries from a
+   meeting), show the draft and get explicit approval; in scheduled runs, save as
+   draft and notify instead.
+3. End multi-step work with a completion ledger (attempted/succeeded/failed/queued).`,
+
+  crmDraft: `You are Emma drafting CRM content (emails, messages, notes) for the user's leads.
+Rules:
+1. DRAFT ONLY: produce drafts for review; do NOT send, publish, or modify lead
+   records unless the user explicitly approves the specific action.
+2. BRAND FIRST: load read_brand_guidelines / read_market_strategy and match voice,
+   banned phrases, and ICP before drafting.
+3. Ground personalization in real lead/CRM data from your tools; never invent
+   facts about a lead.
+4. End multi-step work with a completion ledger (attempted/succeeded/failed/queued).`,
+};
+
+/** A per-skill hardening target: set a min-prompt, append blocks, and/or add tools. */
 export interface SkillHardeningTarget {
   skillId: string;
+  /** Key into MIN_PROMPTS — sets systemPrompt ONLY if the skill's prompt is empty. */
+  setPrompt?: string;
   blocks?: string[];
   /** Tool names to add to toolNames (e.g. the Blindspot 5 fixes). */
   addTools?: string[];
@@ -139,8 +187,19 @@ export interface SkillHardeningTarget {
 export function planSkillChange(
   skill: Skill,
   target: SkillHardeningTarget,
-): { skill: Skill; changed: boolean; appended: string[]; addedTools: string[] } {
-  const afterBlocks = applyHardening(skill, target.blocks || []);
+): { skill: Skill; changed: boolean; promptSet: boolean; appended: string[]; addedTools: string[] } {
+  let working = skill;
+  let promptSet = false;
+  if (target.setPrompt) {
+    const text = MIN_PROMPTS[target.setPrompt];
+    if (!text) throw new Error(`Unknown min-prompt: ${target.setPrompt}`);
+    // Fill an EMPTY prompt only — never overwrite an existing systemPrompt.
+    if (!(skill.systemPrompt || "").trim()) {
+      working = { ...skill, systemPrompt: text };
+      promptSet = true;
+    }
+  }
+  const afterBlocks = applyHardening(working, target.blocks || []);
   const declared = new Set(afterBlocks.skill.toolNames || []);
   const addedTools = (target.addTools || []).filter((t) => t && !declared.has(t));
   const toolNames = addedTools.length
@@ -148,7 +207,8 @@ export function planSkillChange(
     : afterBlocks.skill.toolNames;
   return {
     skill: { ...afterBlocks.skill, toolNames },
-    changed: afterBlocks.changed || addedTools.length > 0,
+    changed: promptSet || afterBlocks.changed || addedTools.length > 0,
+    promptSet,
     appended: afterBlocks.appended,
     addedTools,
   };

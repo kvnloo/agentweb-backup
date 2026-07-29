@@ -82,6 +82,7 @@ async function main(): Promise<void> {
       continue;
     }
     console.log(`${apply ? "→" : "·"} ${target.skillId} ${skill.name}`);
+    if (plan.promptSet) console.log(`    + prompt: set min-prompt (${target.setPrompt})`);
     if (plan.appended.length) console.log(`    + blocks: ${plan.appended.join(", ")}`);
     if (plan.addedTools.length) console.log(`    + tools:  ${plan.addedTools.join(", ")}`);
 
