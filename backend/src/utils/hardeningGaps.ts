@@ -17,7 +17,11 @@ export const POWER_TOOLS = new Set<string>([
   "import_leads_from_search",
 ]);
 
-const SAFETY_MARKER = "## SAFETY & VOLUME LIMITS";
+// A skill with send/publish power is "gated" if its prompt carries EITHER the
+// outreach volume-caps block OR a publish-approval gate. Matched as substrings
+// so both the block headings and an inline min-prompt rule ("PUBLISH GATE:")
+// count.
+const GATE_MARKERS = ["SAFETY & VOLUME LIMITS", "PUBLISH GATE"];
 
 /** Blindspot 4: a skill shipped with no usable systemPrompt. */
 export function hasEmptyPrompt(skill: Pick<Skill, "systemPrompt">): boolean {
@@ -35,5 +39,6 @@ export function powerToolsOf(skill: Pick<Skill, "toolNames">): string[] {
  */
 export function needsSafetyBlock(skill: Pick<Skill, "toolNames" | "systemPrompt">): boolean {
   if (powerToolsOf(skill).length === 0) return false;
-  return !(skill.systemPrompt || "").includes(SAFETY_MARKER);
+  const prompt = skill.systemPrompt || "";
+  return !GATE_MARKERS.some((m) => prompt.includes(m));
 }

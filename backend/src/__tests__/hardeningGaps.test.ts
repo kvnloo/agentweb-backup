@@ -34,6 +34,15 @@ describe("hardeningGaps", () => {
     ).toBe(false);
   });
 
+  it("needsSafetyBlock: a PUBLISH GATE also covers the gap -> false", () => {
+    expect(
+      needsSafetyBlock({
+        toolNames: ["post_on_connected_account"],
+        systemPrompt: "post stuff\n\n## PUBLISH GATE\n- approval before publishing",
+      }),
+    ).toBe(false);
+  });
+
   it("needsSafetyBlock: no power tool -> false regardless of prompt", () => {
     expect(needsSafetyBlock({ toolNames: ["read_brand_guidelines"], systemPrompt: "" })).toBe(false);
   });

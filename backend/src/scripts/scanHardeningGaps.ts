@@ -10,8 +10,11 @@
 import { skillService } from "../services/skillService";
 import { hasEmptyPrompt, needsSafetyBlock, powerToolsOf } from "../utils/hardeningGaps";
 
+/** QA/test skills that shouldn't count as production hardening gaps. */
+const isTestSkill = (name: string) => /\btest\b|smoke test/i.test(name || "");
+
 async function main(): Promise<void> {
-  const skills = await skillService.getAllSkills();
+  const skills = (await skillService.getAllSkills()).filter((s) => !isTestSkill(s.name));
 
   const emptyPublished = skills.filter((s) => s.isPublished && hasEmptyPrompt(s));
   const uncapped = skills.filter((s) => needsSafetyBlock(s));
