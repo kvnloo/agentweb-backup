@@ -27298,15 +27298,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // that were created through AgentWeb itself — it does not read a profile's
       // other existing posts. When none have been created here, a bare
       // "Successfully loaded 0 posts" led the model to claim the fetch of the
-      // user's posts succeeded (a tool-success hallucination). Return this as a
-      // non-success, explicitly-unsupported read so the model states the truth
-      // instead of implying it read the user's LinkedIn. Framed as AgentWeb's own
-      // by-design behavior (not a LinkedIn/platform limitation) so it reads as
-      // ownership, not weakness.
+      // user's posts succeeded (a tool-success hallucination). Signal this as an
+      // explicitly-unsupported read via organicReadUnsupported + the message so
+      // the model states the truth instead of implying it read the user's
+      // LinkedIn. success stays true on purpose: nothing failed (the account is
+      // connected and healthy — this is expected by-design behavior), so this
+      // must NOT render as a tool "failure" in the UI. Framed as AgentWeb's own
+      // behavior, not a LinkedIn/platform limitation, so it reads as ownership.
       const accountType = (matchingAccount.config as any)?.account_type;
       if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
         return {
-          success: false,
+          success: true,
           organicReadUnsupported: true,
           posts: [],
           message:
