@@ -600,7 +600,8 @@ router.post('/registration-status', async (req: Request, res: Response) => {
       return res.status(403).json({ message: 'Admin access required' });
     }
 
-    const emails = (req.body as { emails?: unknown })?.emails;
+    const body = (req.body as { emails?: unknown; includeChatSessionCount?: unknown }) ?? {};
+    const emails = body.emails;
     if (!Array.isArray(emails) || emails.length === 0) {
       return res.status(400).json({ message: 'Invalid body. Required: emails (non-empty array of strings).' });
     }
@@ -610,7 +611,10 @@ router.post('/registration-status', async (req: Request, res: Response) => {
       });
     }
 
-    const statuses = await userDb.getRegistrationStatusByEmails(emails as string[]);
+    const includeChatSessionCount = body.includeChatSessionCount === true;
+    const statuses = await userDb.getRegistrationStatusByEmails(emails as string[], {
+      includeChatSessionCount,
+    });
     const summary = {
       total: statuses.length,
       registered: statuses.filter((s) => s.registered).length,

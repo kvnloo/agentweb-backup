@@ -22,6 +22,9 @@ import { MAX_FILE_SIZE } from '../config';
 import { isSupportedFileType, getContentType } from '../utils/fileProcessor';
 import { uploadFileToS3 } from '../utils/s3Utils';
 import { classifyReport, ReportType } from '../services/reportClassificationService';
+// ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
+// on existing report/run envelopes. No surface parses or re-ranks on its own.
+import { MarketingActionCarrier, normalizeMarketingActions } from '../services/marketingActionEnvelope';
 
 interface AuthRequest extends Request {
   user?: { userId: string; email: string };
@@ -77,7 +80,38 @@ type FileRequest = AuthenticatedRequest & {
   file?: Express.Multer.File;
 };
 
-interface ResultFile {
+/**
+ * Build the response payload for the HTML-reports endpoint.
+ *
+ * Two responsibilities, both on a detached copy of `result`:
+ *  1. Strip searchableText (pre-existing behavior). In-place deletion would race
+ *     with the background enrichment that also writes file.searchableText on the
+ *     same objects (microtask ordering puts the route handler continuation
+ *     between the enrichment's fetch batch and its persist section). The JSON
+ *     round-trip creates a separate serialized copy so the live result objects
+ *     used by enrichment/classify are untouched.
+ *  2. ENG-446: normalize each report file's canonical marketing-action list, so
+ *     every consumer receives the ids and order the report source selected —
+ *     and an explicit empty list for legacy reports that carry none. Consumers
+ *     render this; they never re-rank or regenerate it.
+ */
+export function buildHtmlReportsResponsePayload(
+  result: Record<string, any>
+): Record<string, any> {
+  const responsePayload = JSON.parse(JSON.stringify(result));
+  for (const task of Object.values(responsePayload) as any[]) {
+    for (const execution of task.executions || []) {
+      const files: ResultFile[] = execution.result_files || [];
+      files.forEach((file, index) => {
+        delete file.searchableText;
+        files[index] = normalizeMarketingActions(file);
+      });
+    }
+  }
+  return responsePayload;
+}
+
+interface ResultFile extends MarketingActionCarrier {
   url: string;
   filename: string;
   token: string;
@@ -2636,21 +2670,7 @@ router.get('/executions/with-html-reports', authenticateToken, async (req: Reque
     }
 
     const result = await getExecutionsWithAssets(userId, 'html-reports', 'Error getting executions with HTML reports');
-    // Strip searchableText from the response payload without mutating result in-place.
-    // In-place deletion would race with the background enrichment that also writes
-    // file.searchableText on the same objects (microtask ordering puts the route
-    // handler continuation between the enrichment's fetch batch and its persist
-    // section). Using JSON round-trip creates a separate serialized copy so the
-    // live result objects used by enrichment/classify are untouched.
-    const responsePayload = JSON.parse(JSON.stringify(result));
-    for (const task of Object.values(responsePayload) as any[]) {
-      for (const execution of task.executions || []) {
-        for (const file of execution.result_files || []) {
-          delete file.searchableText;
-        }
-      }
-    }
-    res.json(responsePayload);
+    res.json(buildHtmlReportsResponsePayload(result));
   } catch (error) {
     console.error('Error getting executions with HTML reports:', error);
     res.status(500).json({ message: 'Internal server error' });

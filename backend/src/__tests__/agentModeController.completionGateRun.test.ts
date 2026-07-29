@@ -91,7 +91,7 @@ import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { scheduleDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { runScheduledChat } from '../controllers/agentModeController';
+import { runScheduledChat, runVerifiedChat } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -217,6 +217,49 @@ describe('runScheduledChat — deterministic completion gate', () => {
     await runScheduledChat(leadEngSchedule, 'test-user-123', true);
 
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('ENG-635: reports failure when the run still defers to the user after exhausting the completion gate', async () => {
+    // Every turn punts the decision back to an absent human instead of delivering.
+    // The gate issues its forceful "proceed best-effort, no human present" continuations,
+    // but the model keeps deferring — so after the budget is exhausted the run must NOT
+    // be reported as a clean success (it produced no deliverable).
+    mockWorker.runInWorker.mockResolvedValue(
+      workerResult("I found only 30 of the 100 requested ads. Should I proceed with cataloging the 30? Reply 'go' to proceed.")
+    );
+
+    const result = await runScheduledChat(leadEngSchedule, 'test-user-123', true);
+
+    // Bounded: 1 initial + up to 2 continuations = 3, well under maxAttempts(20).
+    const calls = mockWorker.runInWorker.mock.calls.length;
+    expect(calls).toBeGreaterThanOrEqual(2);
+    expect(calls).toBeLessThanOrEqual(3);
+    // Punted to an absent human and never delivered → recorded as a failure, not success.
+    expect(result).toEqual(expect.objectContaining({ status: 'failure' }));
+  });
+
+  it('ENG-635: a persistent defer keeps runVerifiedChat success:true + flags deferredUnresolved (non-scheduled HTTP callers must not 500)', async () => {
+    // Same persistent-defer scenario, but observed at the runVerifiedChat layer that
+    // the HTTP callers (imageReports/revision/resultEndpoint) consume directly. They
+    // key on `result.success`; a deliverable existed (requirements met), so success
+    // MUST stay true — the defer is surfaced only via the `deferredUnresolved` flag,
+    // which only the scheduled path turns into a failure.
+    mockWorker.runInWorker.mockResolvedValue(
+      workerResult("I found only 30 of the 100 requested ads. Should I proceed with cataloging the 30? Reply 'go' to proceed.")
+    );
+
+    const result = await runVerifiedChat({
+      sessionId: 'test-session-123',
+      userId: 'test-user-123',
+      startingMessage: 'catalog ads',
+      keywords: [],
+      requiredFunctions: [],
+      maxAttempts: 20,
+      completionGate: true,
+    });
+
+    expect(result.success).toBe(true);
+    expect((result as any).deferredUnresolved).toBe(true);
   });
 
   it('is bounded: stops after the max continuations even if it keeps admitting incompleteness', async () => {
