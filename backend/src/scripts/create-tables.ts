@@ -2410,6 +2410,7 @@ const createOrganizationsTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'orgId', AttributeType: 'S' },
       { AttributeName: 'ownerUserId', AttributeType: 'S' },
+      { AttributeName: 'autoJoinDomain', AttributeType: 'S' },
     ],
     KeySchema: [
       { AttributeName: 'orgId', KeyType: 'HASH' },
@@ -2419,6 +2420,17 @@ const createOrganizationsTable = async () => {
         IndexName: 'OwnerUserIdIndex',
         KeySchema: [
           { AttributeName: 'ownerUserId', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5,
+        },
+      },
+      {
+        IndexName: 'AutoJoinDomainIndex',
+        KeySchema: [
+          { AttributeName: 'autoJoinDomain', KeyType: 'HASH' },
         ],
         Projection: { ProjectionType: 'ALL' },
         ProvisionedThroughput: {

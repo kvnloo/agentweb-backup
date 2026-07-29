@@ -154,13 +154,29 @@ describe('POST /api/crm/registration-status', () => {
       .send({ emails: ['paid@x.com', 'free@x.com', 'ghost@x.com'] });
 
     expect(res.status).toBe(200);
-    expect(mockGetRegistrationStatusByEmails).toHaveBeenCalledWith([
-      'paid@x.com',
-      'free@x.com',
-      'ghost@x.com',
-    ]);
+    expect(mockGetRegistrationStatusByEmails).toHaveBeenCalledWith(
+      ['paid@x.com', 'free@x.com', 'ghost@x.com'],
+      { includeChatSessionCount: false },
+    );
     expect(res.body.summary).toEqual({ total: 3, registered: 2, premium: 1 });
     expect(res.body.statuses).toHaveLength(3);
+  });
+
+  it('passes includeChatSessionCount through to the db lookup when requested', async () => {
+    mockGetRegistrationStatusByEmails.mockResolvedValueOnce([
+      { email: 'paid@x.com', registered: true, isPremium: true, userId: 'u-1', chatSessionCount: 12 },
+    ]);
+
+    const res = await request(app)
+      .post('/api/crm/registration-status')
+      .send({ emails: ['paid@x.com'], includeChatSessionCount: true });
+
+    expect(res.status).toBe(200);
+    expect(mockGetRegistrationStatusByEmails).toHaveBeenCalledWith(
+      ['paid@x.com'],
+      { includeChatSessionCount: true },
+    );
+    expect(res.body.statuses[0].chatSessionCount).toBe(12);
   });
 
   it('returns 500 when the db lookup throws', async () => {

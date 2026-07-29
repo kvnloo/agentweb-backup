@@ -16,7 +16,7 @@ jest.mock('../services/db', () => ({
 }));
 jest.mock('../services/autoHumanEvalService', () => ({
   enqueueAutoHumanEval: jest.fn().mockResolvedValue(null),
-}), { virtual: true });
+}));
 
 import '../emma/tools';
 import { emmaToolRegistry } from '../emma/registry';

@@ -6,6 +6,7 @@ import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
 import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
+import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
@@ -679,7 +680,33 @@ export interface Organization {
     invitedAt: string;
     invitedBy: string;
   }>;
+  /**
+   * Owner opt-in: when true, new signups whose email domain matches
+   * autoJoinDomain create a pendingDomainJoinRequest and email the owner for
+   * approval, instead of requiring an explicit invite. autoJoinDomain is
+   * always derived server-side from the owner's own email domain — never
+   * client-supplied — so an owner can't claim a domain they don't belong to.
+   */
+  autoJoinEnabled?: boolean;
+  autoJoinDomain?: string;
+  pendingDomainJoinRequests?: Array<{
+    userId: string;
+    email: string;
+    requestedAt: string;
+    requestToken: string;
+  }>;
   maxMembers: number;
+  /**
+   * Denormalized, atomically-maintained member count — used ONLY as a fast
+   * capacity gate at join time (via a DynamoDB transaction pairing the
+   * increment with the joining user's write), never for display. Display
+   * always uses the live GSI-backed member list (getOrgMembers), which can
+   * never drift. Absent on orgs created before this field existed — every
+   * live path (join/leave) fails closed on a missing value rather than
+   * seeding it, since a live count can race with concurrent writes. Only
+   * scripts/backfill-org-member-count.ts is allowed to initialize this field.
+   */
+  memberCount?: number;
   createdAt: string;
   updatedAt: string;
   shareSettings?: OrgShareSettings;
@@ -775,6 +802,14 @@ export interface RegistrationStatus {
   createdAt?: string;
   subscriptionType?: string | null;
   subscriptionStatus?: string;
+  /**
+   * Live count of the user's (non-archived) chat sessions. Only populated when
+   * the caller passes { includeChatSessionCount: true } — it costs one COUNT
+   * query per registered user, so it's opt-in. Lets the funnel report compute
+   * the "Usage/Active" stage from this single join instead of scraping the admin
+   * page or reading a customFields copy. Absent for unregistered emails.
+   */
+  chatSessionCount?: number;
 }
 
 export class UserDB {
@@ -1471,6 +1506,93 @@ export class UserDB {
   }
 
   /**
+   * Atomically assigns a user to an org AND enforces the member cap in a
+   * single DynamoDB transaction — a plain read-then-write (check orgId /
+   * check member count, then separately write) has two distinct TOCTOU
+   * races: (1) two concurrent approvals for the SAME user from different
+   * orgs can both pass the "not already in an org" read-check before either
+   * write lands, and (2) two concurrent approvals for DIFFERENT users on
+   * the SAME org can both pass the "under capacity" read-check when only
+   * one slot remains, overshooting maxMembers. TransactWriteItems ties the
+   * org's memberCount increment (conditioned on staying under maxMembers)
+   * and the user's orgId write (conditioned on not already having one) into
+   * one all-or-nothing operation, closing both races at once.
+   *
+   * memberCount is denormalized purely for this atomic check — it is never
+   * used for display (see the field's doc comment on Organization). Orgs
+   * created before this field existed are backfilled by
+   * scripts/backfill-org-member-count.ts, but if a join lands on one before
+   * that runs, this function computes the org's real current count as the
+   * seed value (never a bare 0 default — see below) so the counter starts
+   * accurate on first use instead of silently discarding real membership.
+   */
+  async joinOrgWithCapacityCheck(
+    userId: string,
+    orgId: string,
+    orgRole: "member" | "owner",
+    maxMembers: number
+  ): Promise<"joined" | "org_full" | "already_in_org" | "not_migrated"> {
+    const user = await this.getUserById(userId);
+    if (!user || !user.email) {
+      throw new Error(`User with ID '${userId}' not found or has no email.`);
+    }
+
+    // Fail closed if memberCount is missing — never seed it from a live
+    // count here. A live path guessing at the "real" count and initializing
+    // the counter from it is exactly what produced several subtle races
+    // (GSI eventual-consistency staleness, double-accounting against a
+    // concurrent departure/join). The reviewed backfill migration
+    // (scripts/backfill-org-member-count.ts) is the only thing allowed to
+    // initialize memberCount; every live path just requires it to already
+    // exist and be under cap.
+    try {
+      await this.docClient
+        .transactWrite({
+          TransactItems: [
+            {
+              Update: {
+                TableName: ORGS_TABLE,
+                Key: { orgId },
+                UpdateExpression: "SET memberCount = memberCount + :one",
+                ConditionExpression: "attribute_exists(memberCount) AND memberCount < :maxMembers",
+                ExpressionAttributeValues: { ":one": 1, ":maxMembers": maxMembers },
+              },
+            },
+            {
+              Update: {
+                TableName: this.tableName,
+                Key: { email: user.email },
+                UpdateExpression: "SET orgId = :orgId, orgRole = :orgRole REMOVE pendingOrgInvite",
+                ConditionExpression: "attribute_not_exists(orgId)",
+                ExpressionAttributeValues: { ":orgId": orgId, ":orgRole": orgRole },
+              },
+            },
+          ],
+        })
+        .promise();
+      return "joined";
+    } catch (error: any) {
+      if (error.code === "TransactionCanceledException") {
+        const reasons: Array<{ Code?: string }> = error.CancellationReasons || [];
+        if (reasons[0]?.Code === "ConditionalCheckFailed") {
+          // Ambiguous by design between "org is full" and "org hasn't been
+          // backfilled yet" — both fail the same condition. Distinguish by
+          // checking which one it actually is, since the caller needs a
+          // different message for each.
+          const orgSnapshot = await this.docClient.get({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
+          return orgSnapshot.Item?.memberCount === undefined ? "not_migrated" : "org_full";
+        }
+        if (reasons[1]?.Code === "ConditionalCheckFailed") return "already_in_org";
+        // Unrecognized cancellation shape — treat conservatively as a
+        // capacity/assignment conflict rather than surfacing a 500.
+        return "already_in_org";
+      }
+      handleDynamoDbError(error, "joinOrgWithCapacityCheck");
+      throw error;
+    }
+  }
+
+  /**
    * Atomically increment a user's sessionVersion, invalidating all tokens issued
    * with the prior value. Used after a password change so that every other active
    * session (other devices) is logged out. Returns the new sessionVersion.
@@ -1677,7 +1799,10 @@ export class UserDB {
    * come back as { registered: false, isPremium: false }. Premium = the user's
    * subscription_status is "active" or "trialing".
    */
-  async getRegistrationStatusByEmails(emails: string[]): Promise<RegistrationStatus[]> {
+  async getRegistrationStatusByEmails(
+    emails: string[],
+    options?: { includeChatSessionCount?: boolean },
+  ): Promise<RegistrationStatus[]> {
     // Normalize, drop blanks, de-duplicate (preserve first-seen order).
     const seen = new Set<string>();
     const normalized: string[] = [];
@@ -1710,7 +1835,7 @@ export class UserDB {
       }
     }
 
-    return normalized.map((email) => {
+    const results: RegistrationStatus[] = normalized.map((email) => {
       const user = foundByEmail.get(email);
       // A tombstoned account (userId begins with "deleted_") is treated as
       // unregistered — it's a former user, not an active signup.
@@ -1730,21 +1855,118 @@ export class UserDB {
         isPremium,
       };
     });
+
+    // Opt-in: attach a live chat-session count for each registered user so the
+    // funnel report can compute its Usage/Active stage from this one join. One
+    // COUNT query per registered user, so it's gated behind the flag and run in
+    // small concurrent chunks to avoid a burst on large cohorts.
+    if (options?.includeChatSessionCount) {
+      const registered = results.filter((r) => r.registered && r.userId);
+      const CHUNK = 10;
+      for (let i = 0; i < registered.length; i += CHUNK) {
+        const chunk = registered.slice(i, i + CHUNK);
+        await Promise.all(
+          chunk.map(async (r) => {
+            try {
+              r.chatSessionCount = await this.getChatSessionCount(r.userId as string);
+            } catch (err: any) {
+              // A single user's COUNT query failing must not sink the whole
+              // batch — leave this user's chatSessionCount undefined (unknown)
+              // and let every other lead's status through.
+              console.error(
+                `getRegistrationStatusByEmails: chatSessionCount failed for ${r.userId}: ${err?.message}`,
+              );
+            }
+          }),
+        );
+      }
+    }
+
+    return results;
   }
 
   /**
-   * Remove orgId and orgRole from a user record (used when removing a member from an org).
+   * Remove orgId and orgRole from a user record (used when removing a member
+   * from an org, or a member leaving on their own). Also best-effort
+   * decrements the org's denormalized memberCount (see Organization.memberCount)
+   * so it stays accurate for the atomic capacity check at join time.
+   *
+   * The user-clear is conditioned on orgId still matching what was just
+   * read — this is what prevents a double-decrement when two concurrent
+   * calls target the same membership (e.g. an owner-initiated remove racing
+   * a self-initiated leave): only whichever call's conditioned REMOVE
+   * actually wins decrements the counter; the loser's condition fails
+   * (orgId is already gone) and it correctly skips decrementing, since the
+   * winner already accounted for the one real departure.
+   *
+   * The decrement is intentionally NOT in the same transaction as the
+   * membership clear, and intentionally non-fatal: leaving an org must never
+   * fail because of a counter-bookkeeping issue (missing/stale memberCount
+   * on an org predating this field, a rare inconsistency, etc.) — that
+   * failure mode would be worse than a temporarily-stale count, which only
+   * risks blocking one future join until reconciled, never overflow.
    */
   async clearOrgMembership(userId: string): Promise<void> {
     const user = await this.getUserById(userId);
     if (!user || !user.email) {
       throw new Error(`User with ID '${userId}' not found or has no email.`);
     }
-    await this.docClient.update({
-      TableName: this.tableName,
-      Key: { email: user.email },
-      UpdateExpression: "REMOVE orgId, orgRole",
-    }).promise();
+    const orgId = user.orgId;
+    if (!orgId) return; // Already cleared, e.g. by a concurrent call — nothing to do.
+
+    try {
+      await this.docClient
+        .update({
+          TableName: this.tableName,
+          Key: { email: user.email },
+          UpdateExpression: "REMOVE orgId, orgRole",
+          ConditionExpression: "orgId = :orgId",
+          ExpressionAttributeValues: { ":orgId": orgId },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error.code === "ConditionalCheckFailedException") {
+        // A concurrent call already cleared (or changed) this membership —
+        // it already performed the decrement, so skip ours to avoid double-
+        // counting one real departure as two.
+        return;
+      }
+      throw error;
+    }
+
+    // Fail closed: if memberCount isn't set yet, skip the decrement entirely
+    // rather than seeding it here. Only the reviewed backfill migration
+    // (scripts/backfill-org-member-count.ts) is allowed to initialize this
+    // field — a live path guessing at the "real" count via OrgIdIndex (a
+    // GSI, eventually consistent relative to the write we just made) is
+    // exactly what produced the earlier staleness bug. Skipping is safe:
+    // once the org is backfilled, decrements apply normally; until then,
+    // there's nothing to decrement from.
+    //
+    // Known narrow residual race (accepted, Greptile review): the orgId
+    // clear above and this decrement are two separate writes. If the
+    // backfill runs in that gap, it queries the live member list (which
+    // already excludes this departure, since orgId is already cleared) and
+    // seeds memberCount at the post-departure count — then this decrement
+    // still fires and subtracts again, leaving the counter one too low.
+    // Only possible during the brief backfill-run window, only ever
+    // under-counts (never lets capacity overshoot from this bug alone), and
+    // self-heals on the next join/leave. Mitigated operationally by running
+    // the backfill during low-traffic hours rather than a code-level fix.
+    try {
+      await this.docClient
+        .update({
+          TableName: ORGS_TABLE,
+          Key: { orgId },
+          UpdateExpression: "SET memberCount = memberCount - :one",
+          ConditionExpression: "attribute_exists(memberCount) AND memberCount > :zero",
+          ExpressionAttributeValues: { ":one": 1, ":zero": 0 },
+        })
+        .promise();
+    } catch (error: any) {
+      if (error.code === "ConditionalCheckFailedException") return; // Not backfilled yet, or already 0 — nothing to do.
+      console.error(`Failed to decrement memberCount for org ${orgId} (non-fatal):`, error);
+    }
   }
 }
 
@@ -7649,6 +7871,171 @@ export const browserCookieDb = {
       throw error;
     }
   },
+
+  /**
+   * Save a manually-imported (e.g. pasted from DevTools) cookie set for a specific
+   * domain, distinct from the auto-persisted '__all__' blob. Caller is responsible
+   * for normalizing `domain` (lowercase) before calling. Encrypted at rest — unlike
+   * the auto-persisted blob, this is a user-supplied, already-authenticated bearer
+   * credential.
+   */
+  async saveDomainCookies(userId: string, domain: string, cookies: any[]): Promise<void> {
+    const now = new Date().toISOString();
+    // Cookies from one parseCookieHeader() call all share the same synthetic expiry,
+    // but take the earliest present (defensive, e.g. if callers ever mix sources) as
+    // the honest floor: once ANY cookie in the set is past this, injection is a no-op
+    // anyway, so surface/exclude the whole entry rather than silently keep using it.
+    const expirySeconds = cookies
+      .map((c) => c.expires)
+      .filter((e): e is number => typeof e === 'number');
+    const expiresAt = expirySeconds.length > 0
+      ? new Date(Math.min(...expirySeconds) * 1000).toISOString()
+      : undefined;
+
+    try {
+      await dynamodb.put({
+        TableName: BROWSER_COOKIES_TABLE,
+        Item: {
+          userId,
+          domain,
+          encryptedCookies: encryptPassword(JSON.stringify(cookies), userId),
+          cookieCount: cookies.length,
+          ...(expiresAt ? { expiresAt } : {}),
+          updatedAt: now,
+          createdAt: now,
+        },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'saveDomainBrowserCookies');
+      throw error;
+    }
+  },
+
+  /** List manually-imported cookie domains for a user — metadata only, never the encrypted values. */
+  async listDomainCookies(userId: string): Promise<Array<{ domain: string; cookieCount: number; createdAt: string; expiresAt?: string; lastFailedAt?: string }>> {
+    try {
+      const items = await paginatedQuery(dynamodb, {
+        TableName: BROWSER_COOKIES_TABLE,
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+      });
+
+      return items
+        .filter((item) => item.domain !== '__all__')
+        .map((item) => ({
+          domain: item.domain,
+          cookieCount: item.cookieCount ?? 0,
+          createdAt: item.createdAt,
+          ...(item.expiresAt ? { expiresAt: item.expiresAt } : {}),
+          ...(item.lastFailedAt ? { lastFailedAt: item.lastFailedAt } : {}),
+        }));
+    } catch (error) {
+      handleDynamoDbError(error, 'listDomainBrowserCookies');
+      throw error;
+    }
+  },
+
+  /**
+   * Records that a manually-imported session for a domain failed to authenticate
+   * mid-task (e.g. the site still showed a signin page after load_browser_cookies
+   * injected it — the session died server-side before its synthetic expiresAt
+   * floor was reached). Called by Emma's mark_browser_session_failed tool so the
+   * failure is visible in Settings on the user's next visit instead of silently
+   * recurring on every future run. A fresh re-import (saveDomainCookies) fully
+   * overwrites the item, clearing this automatically.
+   *
+   * Best-effort: this is an observability signal, not a critical write. If the
+   * domain was deleted out from under it (condition fails) or the update
+   * otherwise errors, it's logged and swallowed rather than thrown — a failed
+   * "mark as failed" call must never break the automation task that reported it.
+   */
+  async markDomainCookiesFailed(userId: string, domain: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: BROWSER_COOKIES_TABLE,
+        Key: { userId, domain },
+        ConditionExpression: 'attribute_exists(userId)',
+        UpdateExpression: 'SET lastFailedAt = :now',
+        ExpressionAttributeValues: { ':now': new Date().toISOString() },
+      }).promise();
+    } catch (error) {
+      console.warn(`Failed to mark browser cookies as failed for domain "${domain}" (userId: ${userId}):`, error);
+    }
+  },
+
+  async deleteDomainCookies(userId: string, domain: string): Promise<void> {
+    try {
+      await dynamodb.delete({
+        TableName: BROWSER_COOKIES_TABLE,
+        Key: { userId, domain },
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'deleteDomainBrowserCookies');
+      throw error;
+    }
+  },
+
+  /**
+   * Combined cookie set for browser-automation injection: the auto-persisted
+   * '__all__' blob followed by every manually-imported per-domain entry. Order
+   * matters — per-domain (deliberately human-provided) cookies are appended AFTER
+   * '__all__' so they take precedence for the same site when Playwright's
+   * addCookies dedups by name/domain/path (empirically verified: last entry in
+   * the array wins). A per-domain entry past its `expiresAt` floor is skipped —
+   * injecting it would be a guaranteed no-op, so don't waste the attempt. A
+   * corrupted/undecryptable entry is likewise logged and skipped rather than
+   * failing the whole load.
+   *
+   * Defense in depth: the read path changed from a single get() to a query()
+   * to support per-domain entries, but the overwhelming majority of users
+   * have never touched that feature. If the query itself fails outright
+   * (throttling, a bug in this new path, etc.), fall back to the old,
+   * narrower get()-based read for '__all__' — the one nearly every user's
+   * automation actually depends on — rather than failing their whole task
+   * because of a code path they never opted into. If THAT also fails, the
+   * error is a real, visible infra problem and is allowed to propagate
+   * rather than being swallowed as a silent "no cookies saved".
+   */
+  async getAllCookiesForUser(userId: string): Promise<any[]> {
+    try {
+      const items = await paginatedQuery(dynamodb, {
+        TableName: BROWSER_COOKIES_TABLE,
+        KeyConditionExpression: 'userId = :userId',
+        ExpressionAttributeValues: { ':userId': userId },
+      });
+
+      const allItem = items.find((item) => item.domain === '__all__');
+      const combined: any[] = [...(allItem?.cookies || [])];
+      const now = Date.now();
+
+      for (const item of items) {
+        if (item.domain === '__all__') continue;
+
+        if (item.expiresAt && new Date(item.expiresAt).getTime() <= now) {
+          console.warn(`Skipping expired manually-imported browser cookies for domain "${item.domain}" (userId: ${userId}, expiresAt: ${item.expiresAt})`);
+          continue;
+        }
+
+        try {
+          const { password: cookiesJson } = decryptPassword(item.encryptedCookies);
+          combined.push(...JSON.parse(cookiesJson));
+        } catch (error) {
+          console.error(`Failed to decrypt/parse browser cookies for domain "${item.domain}" (userId: ${userId}):`, error);
+        }
+      }
+
+      return combined;
+    } catch (queryError) {
+      console.warn(`getAllCookiesForUser query failed for userId ${userId}, falling back to get()-based getCookies:`, queryError);
+      try {
+        const fallbackCookies = await browserCookieDb.getCookies(userId);
+        return fallbackCookies || [];
+      } catch (fallbackError) {
+        handleDynamoDbError(fallbackError, 'getAllBrowserCookiesForUser');
+        throw fallbackError;
+      }
+    }
+  },
 };
 
 export const accountMemoryDb = {
@@ -8301,33 +8688,44 @@ export const orgDb = {
       return org;
     }
 
-    const updateExpressions: string[] = [];
+    const setExpressions: string[] = [];
+    const removeExpressions: string[] = [];
     const expressionAttributeNames: Record<string, string> = {};
     const expressionAttributeValues: Record<string, any> = {};
 
     Object.entries(updatableFields).forEach(([key, value]) => {
-      if (value !== undefined) {
-        updateExpressions.push(`#${key} = :${key}`);
-        expressionAttributeNames[`#${key}`] = key;
+      if (value === undefined) return;
+      expressionAttributeNames[`#${key}`] = key;
+      if (value === null) {
+        // Same REMOVE-on-null convention as userDb.updateUser — needed to
+        // actually clear a GSI-keyed attribute like autoJoinDomain, since
+        // DynamoDB rejects SET-ing a GSI key to NULL.
+        removeExpressions.push(`#${key}`);
+      } else {
+        setExpressions.push(`#${key} = :${key}`);
         expressionAttributeValues[`:${key}`] = value;
       }
     });
 
-    if (updateExpressions.length === 0) {
+    if (setExpressions.length === 0 && removeExpressions.length === 0) {
       const org = await this.getOrgById(orgId);
       if (!org) throw new Error(`Organization ${orgId} not found`);
       return org;
     }
 
     // Always update updatedAt
-    updateExpressions.push("#updatedAt = :updatedAt");
+    setExpressions.push("#updatedAt = :updatedAt");
     expressionAttributeNames["#updatedAt"] = "updatedAt";
     expressionAttributeValues[":updatedAt"] = new Date().toISOString();
+
+    const updateExpressionParts: string[] = [];
+    updateExpressionParts.push(`SET ${setExpressions.join(", ")}`);
+    if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
 
     const params = {
       TableName: ORGS_TABLE,
       Key: { orgId },
-      UpdateExpression: `SET ${updateExpressions.join(", ")}`,
+      UpdateExpression: updateExpressionParts.join(" "),
       ExpressionAttributeNames: expressionAttributeNames,
       ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW" as const,
@@ -8399,6 +8797,99 @@ export const orgDb = {
       lastEvaluatedKey = result.LastEvaluatedKey;
     } while (lastEvaluatedKey);
     return null;
+  },
+
+  // Find all orgs with auto-join enabled for the given email domain (indexed
+  // query via AutoJoinDomainIndex, not a scan — this runs on every signup).
+  // Used at registration time to create pending domain-join requests.
+  async getOrgsWithAutoJoinDomain(domain: string): Promise<Organization[]> {
+    const allItems: Organization[] = [];
+    let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+    do {
+      const result = await dynamodb.query({
+        TableName: ORGS_TABLE,
+        IndexName: "AutoJoinDomainIndex",
+        KeyConditionExpression: "autoJoinDomain = :domain",
+        FilterExpression: "autoJoinEnabled = :enabled",
+        ExpressionAttributeValues: { ":domain": domain, ":enabled": true },
+        ...(lastEvaluatedKey ? { ExclusiveStartKey: lastEvaluatedKey } : {}),
+      }).promise();
+      allItems.push(...((result.Items as Organization[]) || []));
+      lastEvaluatedKey = result.LastEvaluatedKey;
+    } while (lastEvaluatedKey);
+    return allItems;
+  },
+
+  // Atomically appends a domain-join request via DynamoDB's list_append,
+  // rather than reading pendingDomainJoinRequests then SET-ing the whole
+  // array back (a read-modify-write that loses concurrent appends/removals
+  // to the same org — flagged in review). Two signups matching the same org
+  // at the same instant now both land correctly instead of one clobbering
+  // the other's read-modify-write.
+  async addPendingDomainJoinRequest(
+    orgId: string,
+    request: { userId: string; email: string; requestedAt: string; requestToken: string }
+  ): Promise<void> {
+    await dynamodb
+      .update({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+        UpdateExpression:
+          "SET pendingDomainJoinRequests = list_append(if_not_exists(pendingDomainJoinRequests, :empty), :new), updatedAt = :now",
+        ExpressionAttributeValues: {
+          ":empty": [],
+          ":new": [request],
+          ":now": new Date().toISOString(),
+        },
+      })
+      .promise();
+  },
+
+  // Atomically removes a domain-join request by token (approve/reject),
+  // via optimistic-concurrency retry rather than the read-filter-then-SET-
+  // whole-array pattern this replaced — that pattern silently dropped a
+  // concurrently-appended request (a new signup landing via
+  // addPendingDomainJoinRequest while an owner was mid-approve on this same
+  // org) or let two concurrent owner actions overwrite each other and
+  // resurrect an already-processed request (flagged in review). Each retry
+  // re-reads the org fresh and re-filters, conditioned on updatedAt not
+  // having changed since that read; on a conflict it just retries against
+  // the new state. Returns false if the token isn't found (already removed,
+  // or never existed) — never throws for that case.
+  async removeDomainJoinRequest(orgId: string, requestToken: string): Promise<boolean> {
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const result = await dynamodb.get({ TableName: ORGS_TABLE, Key: { orgId } }).promise();
+      const org = result.Item as Organization | undefined;
+      if (!org) return false;
+
+      const pending = org.pendingDomainJoinRequests || [];
+      const updated = pending.filter((r) => r.requestToken !== requestToken);
+      if (updated.length === pending.length) return false; // Not found.
+
+      try {
+        await dynamodb
+          .update({
+            TableName: ORGS_TABLE,
+            Key: { orgId },
+            UpdateExpression: "SET pendingDomainJoinRequests = :updated, updatedAt = :now",
+            ConditionExpression: "updatedAt = :expectedUpdatedAt",
+            ExpressionAttributeValues: {
+              ":updated": updated,
+              ":now": new Date().toISOString(),
+              ":expectedUpdatedAt": org.updatedAt,
+            },
+          })
+          .promise();
+        return true;
+      } catch (error: any) {
+        if (error.code === "ConditionalCheckFailedException") {
+          continue; // Org changed concurrently — re-read and retry.
+        }
+        throw error;
+      }
+    }
+    throw new Error(`removeDomainJoinRequest: exceeded ${MAX_ATTEMPTS} retry attempts for org ${orgId}`);
   },
 
   async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
