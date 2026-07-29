@@ -53,6 +53,44 @@ price book. Investigation findings:
   in the catalog — as does `gemini-3.1-pro-preview` — which is the live exposure to watch ahead of
   the 2026-10-20 Gemini platform migration.
 
+## ENG-743: the staging deploy gate now has to observe the deploy (2026-07-29)
+
+`backend-staging-deploy` in `.github/workflows/tests.yml` now calls
+`.github/scripts/eb-deploy.sh` — the script ENG-734/#2219 already shipped and proved — instead of
+its own inline `|| echo "...continuing..."` block plus a readiness wait that only looked at `Status`
+and `Health`. Investigation findings:
+
+- **This was the worse half of ENG-734, because the merge gate cites it.** Production's false green
+  misreports a deploy that already happened. Staging's false green is *upstream of the decision to
+  merge*: `autonomous-execution-and-merge` counts "staging deploy passed" as end-to-end evidence, so
+  a swallowed `update-environment` let a backend PR merge on evidence of a deploy that never applied.
+  Every backend merge today rested on this signal.
+- **Path filters made the fix unprovable, which is why #2219 deliberately skipped it.** The job is
+  filtered on `backend/**`, so a PR that only touches `.github/**` never runs it — a rewritten deploy
+  path would have shipped unexercised, and the first thing to exercise it would have been an
+  unrelated backend PR. The filter is now the fix: `.github/workflows/tests.yml` and
+  `.github/scripts/eb-deploy.sh` count as backend changes, so **whatever gates backend merges gates
+  its own changes**, and this PR runs the job it rewrites. That property is permanent, not a
+  one-off for this issue.
+- **The version label did not identify a build, so asserting on it proved nothing.** Staging labelled
+  every deploy `backend-<date>-pr<N>`, identical across all of a PR's pushes and reusing the same S3
+  key. So `create-application-version` hit the tolerated already-exists path, the S3 object was
+  silently rewritten under a label EB had already served, and — the real hole — the environment was
+  *already reporting that VersionLabel before the run started*. "Ready on our version" would have
+  been satisfiable without a deploy: the fix would have inherited the bug it was closing. The label
+  now carries the short SHA.
+- **Staging and production share EB application `agentweb-backend`.** They also shared the label
+  namespace, so a same-day staging deploy for PR N and the production deploy after merging PR N
+  produced the same label and S3 key: prod's `create-application-version` hit already-exists and
+  reused a version whose bundle staging had written. The SHA suffix removes that collision, so
+  production now always creates a fresh version. `MaxCountRule` is enabled at 200 versions (201
+  present today), so per-push staging labels churn that window faster rather than growing it —
+  bounded, at the cost of some rollback depth in days.
+- **Budget preserved, not extended.** The old steps allowed 5 min for the AWS calls plus 30 min of
+  readiness polling. The script gets `EB_TOTAL_TIMEOUT_SECONDS=1800` under a 35-minute step timeout,
+  so its own deadline always fires first and the log names the reason instead of the runner killing
+  it mid-poll.
+
 ## ENG-630: Meta Insights `filtering` shape + preserved 400 detail (2026-07-29)
 
 New pure module `backend/src/utils/metaInsightsFiltering.ts`, wired into
