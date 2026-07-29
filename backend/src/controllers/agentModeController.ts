@@ -33,6 +33,9 @@ import {
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
+// ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
+// on existing report/run envelopes. No surface parses or re-ranks on its own.
+import { MarketingActionCarrier, normalizeMarketingActions } from '../services/marketingActionEnvelope';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
@@ -1761,12 +1764,17 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
 }
 
 // Common function to run a scheduled chat (used by both test and actual execution)
+//
+// ENG-446: the run result IS the run envelope. It carries the canonical
+// marketing-action payload (MarketingActionCarrier — optional, because legacy
+// runs carry none) alongside the existing output, and is persisted verbatim by
+// scheduleDb.addRunResult, so no separate action storage path exists.
 export async function runScheduledChat(
   schedule: any,
   userId: string,
   isTest: boolean = false,
   preGeneratedRunId?: string
-): Promise<{
+): Promise<MarketingActionCarrier & {
   scheduleId: string;
   runId: string;
   // ENG-396: 'pending_user_input' when the run parked on a blocking AskUserQuestion.
@@ -4558,6 +4566,25 @@ export const agentModeController = {
 
       try {
 
+      // ENG-705: this route is registered before `router.use(authenticateToken)`,
+      // so the caller is anonymous — but the spend is not. Gate on the share
+      // OWNER's allowance (the account `generateSessionResponse` already bills
+      // via incrementUserTokenUsage) so an unauthenticated visitor can never
+      // cause more vendor spend than the owner could cause themselves. This runs
+      // before any LLM call: refuse loudly, never a degraded-but-billed path.
+      const usageStatus = await checkTokenUsage(session.userId);
+      if (!usageStatus.allowed) {
+        // The caller is anonymous, so the denial carries the message ONLY.
+        // `usageStatus` is the owner's billing record (allowance, bonus, dollar
+        // spend, cost cap, enforcement state); echoing it here would turn this
+        // public route into a read side-channel on the owner's account for
+        // anyone holding the share link. Authenticated owners still read their
+        // usage through the subscription-usage endpoint.
+        return res.status(429).json({
+          error: 'Monthly token limit reached for this shared session. Please contact the owner of this link.',
+        });
+      }
+
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
 
@@ -6465,7 +6492,19 @@ export const agentModeController = {
       // Get test history
       const testHistory = await scheduleDb.getRunResults(scheduleId);
 
-      res.json(testHistory);
+      // ENG-446: hand every consumer the canonical marketing-action list the run
+      // itself selected — same ids, same order, empty for legacy runs that carry
+      // none. Consumers render this; they never re-rank or regenerate it.
+      // Arrays are excluded deliberately: spreading one into an object literal
+      // would silently turn it into {0: …, 1: …}. A malformed entry passes
+      // through untouched rather than being corrupted into a wrong answer.
+      const historyWithActions = (testHistory || []).map((run: any) =>
+        run !== null && typeof run === 'object' && !Array.isArray(run)
+          ? normalizeMarketingActions(run)
+          : run
+      );
+
+      res.json(historyWithActions);
     } catch (error) {
       console.error('AgentMode: Get test history error:', error);
       res.status(500).json({ error: 'Failed to get test history' });
