@@ -2957,9 +2957,16 @@ export async function generateSessionResponse(
           // Resolve the schedule owner's admin status so the directive only
           // injects its admin-only (get_chat_history / list_all_clients) identity
           // slice for admin-owned scheduled runs. Scoped to the scheduled branch,
-          // so this is one extra read only on scheduled runs.
-          const directiveOwner = await userDb.getUserById(session.userId);
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType, directiveOwner?.isAdmin === true);
+          // so this is one extra read only on scheduled runs. A prompt-enrichment
+          // lookup must never break the run, so a failed read degrades to the safe
+          // default (treat as non-admin → omit the admin-only slice).
+          let ownerIsAdmin = false;
+          try {
+            ownerIsAdmin = (await userDb.getUserById(session.userId))?.isAdmin === true;
+          } catch (adminLookupError) {
+            console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
+          }
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
