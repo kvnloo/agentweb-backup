@@ -257,6 +257,124 @@ describe('normalizeMetaInsightsFiltering', () => {
       ).toThrow(/empty/i);
     });
   });
+
+  describe('a malformed filter VALUE is rejected here, not forwarded to Meta', () => {
+    // The value is the last place a bad shape could still reach the wire: field
+    // and operator are validated above, but `value` was previously passed through
+    // untouched. An object or nested array there either serializes to something
+    // the caller never asked for or fails the async report job minutes later with
+    // an opaque upstream parameter error.
+    it('throws when a scalar operator is given an object', () => {
+      expect(() =>
+        normalizeMetaInsightsFiltering({
+          field: 'campaign.id',
+          operator: 'EQUAL',
+          value: { id: '123' },
+        })
+      ).toThrow(MetaInsightsFilteringError);
+    });
+
+    it('names the offending shape and operator so the model can correct itself', () => {
+      expect(() =>
+        normalizeMetaInsightsFiltering({
+          field: 'campaign.id',
+          operator: 'EQUAL',
+          value: { id: '123' },
+        })
+      ).toThrow(/an object.*for operator EQUAL/i);
+    });
+
+    it('throws when a scalar operator is given an array', () => {
+      // EQUAL with a list is a caller reaching for IN; Meta rejects it upstream.
+      expect(() =>
+        normalizeMetaInsightsFiltering({
+          field: 'campaign.id',
+          operator: 'EQUAL',
+          value: ['123', '456'],
+        })
+      ).toThrow(/an array/i);
+    });
+
+    it('throws when a scalar operator is given a function', () => {
+      expect(() =>
+        normalizeMetaInsightsFiltering({
+          field: 'campaign.id',
+          operator: 'CONTAIN',
+          value: (() => 'x') as any,
+        })
+      ).toThrow(/a function/i);
+    });
+
+    it('throws on a nested array inside a list operator', () => {
+      expect(() =>
+        normalizeMetaInsightsFiltering({
+          field: 'campaign.id',
+          operator: 'IN',
+          value: [['123']],
+        })
+      ).toThrow(/an array.*value\[0\]/i);
+    });
+
+    it('throws on an object element inside a list operator', () => {
+      expect(() =>
+        normalizeMetaInsightsFiltering({
+          field: 'campaign.id',
+          operator: 'IN',
+          value: ['123', { id: '456' }],
+        })
+      ).toThrow(/an object.*value\[1\]/i);
+    });
+
+    it('throws on a null element inside a list operator', () => {
+      // A null hole in a list is not the same as an absent filter — dropping it
+      // would silently widen the query, which is the defect this module exists for.
+      expect(() =>
+        normalizeMetaInsightsFiltering({
+          field: 'campaign.id',
+          operator: 'IN',
+          value: ['123', null],
+        })
+      ).toThrow(/null.*value\[1\]/i);
+    });
+
+    it('throws on NaN, which serializes to null and filters on the wrong value', () => {
+      expect(() =>
+        normalizeMetaInsightsFiltering({
+          field: 'spend',
+          operator: 'GREATER_THAN',
+          value: Number.NaN,
+        })
+      ).toThrow(/non-finite/i);
+    });
+
+    it('throws on Infinity inside a list operator', () => {
+      expect(() =>
+        normalizeMetaInsightsFiltering({
+          field: 'spend',
+          operator: 'ANY',
+          value: [Number.POSITIVE_INFINITY],
+        })
+      ).toThrow(/non-finite/i);
+    });
+
+    it('still accepts the scalar shapes Meta actually supports', () => {
+      // The guard must not narrow a working call: string, number, and boolean
+      // values all survive, under both scalar and list operators.
+      expect(
+        normalizeMetaInsightsFiltering([
+          { field: 'campaign.id', operator: 'EQUAL', value: '123' },
+          { field: 'spend', operator: 'GREATER_THAN', value: 10.5 },
+          { field: 'is_active', operator: 'EQUAL', value: true },
+          { field: 'adset.id', operator: 'IN', value: ['a', 2, false] },
+        ])
+      ).toEqual([
+        { field: 'campaign.id', operator: 'EQUAL', value: '123' },
+        { field: 'spend', operator: 'GREATER_THAN', value: 10.5 },
+        { field: 'is_active', operator: 'EQUAL', value: true },
+        { field: 'adset.id', operator: 'IN', value: ['a', 2, false] },
+      ]);
+    });
+  });
 });
 
 describe('describeMetaGraphApiError — AC3', () => {
