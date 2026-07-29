@@ -43,6 +43,25 @@ describe("hardeningGaps", () => {
     ).toBe(false);
   });
 
+  it("needsSafetyBlock: a SEND tool is NOT covered by a bare PUBLISH GATE -> true", () => {
+    // send_email_to_lead carries volume risk the publish gate does not govern.
+    expect(
+      needsSafetyBlock({
+        toolNames: ["send_email_to_lead"],
+        systemPrompt: "email leads\n\n## PUBLISH GATE\n- approval before publishing",
+      }),
+    ).toBe(true);
+  });
+
+  it("needsSafetyBlock: a SEND tool WITH the SAFETY block -> false", () => {
+    expect(
+      needsSafetyBlock({
+        toolNames: ["send_email_to_lead"],
+        systemPrompt: "email leads\n\n## SAFETY & VOLUME LIMITS\n- 25 emails max",
+      }),
+    ).toBe(false);
+  });
+
   it("needsSafetyBlock: no power tool -> false regardless of prompt", () => {
     expect(needsSafetyBlock({ toolNames: ["read_brand_guidelines"], systemPrompt: "" })).toBe(false);
   });

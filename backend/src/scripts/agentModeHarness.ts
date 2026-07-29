@@ -46,6 +46,13 @@ async function setSubscription(email: string, value: string): Promise<void> {
     ExpressionAttributeValues: { ":v": value },
   }).promise();
 }
+async function removeSubscription(email: string): Promise<void> {
+  await ddb.update({
+    TableName: USERS_TABLE, Key: { email },
+    UpdateExpression: "REMOVE subscriptionType",
+  }).promise();
+}
+const isLocalApi = /(^|\/\/)(localhost|127\.0\.0\.1)(:|\/|$)/.test(API);
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -59,6 +66,13 @@ async function main() {
     console.error('Usage: agentModeHarness.ts [--install <skillId,...>] "<msg1>" ["<msg2>" ...] [--model <id>]');
     process.exit(2);
   }
+  // --install installs skills and toggles the subscription IN-PROCESS against the
+  // local NODE_ENV DB, while turns hit HARNESS_API. Those must be the same env, so
+  // refuse --install against a non-local API (would mutate the wrong environment).
+  if (skillIds.length && !isLocalApi) {
+    console.error(`--install mutates the local NODE_ENV data in-process; it only works against the local backend, but HARNESS_API=${API}. Refusing.`);
+    process.exit(2);
+  }
 
   const login = await post("/api/auth/login", null, { email: EMAIL, password: PASSWORD });
   const token = login.token;
@@ -67,7 +81,7 @@ async function main() {
 
   // Grant wildcard skill access for the run so gated dev skills can install;
   // restored in finally. (A hard crash would leave it set — restore manually.)
-  const savedSub = skillIds.length ? await getSubscription(EMAIL) : undefined;
+  const hadSub = skillIds.length ? await getSubscription(EMAIL) : undefined;
   try {
     if (skillIds.length) {
       await setSubscription(EMAIL, "ENG204-harness-wildcard");
@@ -82,7 +96,12 @@ async function main() {
       await runTurns(token, sessionId, messages, model);
     }
   } finally {
-    if (savedSub !== undefined) { await setSubscription(EMAIL, savedSub); console.log(`\n(subscription restored: ${savedSub})`); }
+    // Always undo the wildcard we set: restore the prior value, or REMOVE the
+    // attribute if the user had none (else the account stays elevated).
+    if (skillIds.length) {
+      if (hadSub !== undefined) { await setSubscription(EMAIL, hadSub); console.log(`\n(subscription restored: ${hadSub})`); }
+      else { await removeSubscription(EMAIL); console.log(`\n(subscription attribute removed — was absent before the run)`); }
+    }
   }
   process.exit(0);
 }
