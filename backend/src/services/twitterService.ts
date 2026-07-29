@@ -6,6 +6,38 @@ import {
   updateAccountConfig,
   TwitterXConfig,
 } from './connectedAccountsDb';
+import { recordVendorUsage } from './usageRecorderService';
+import {
+  TWITTER_PROVIDER,
+  TwitterOperation,
+  computeTwitterCost,
+  textContainsLink,
+} from '../utils/twitterPricing';
+
+/**
+ * Attribution + billing descriptor every X API call must carry (ENG-664).
+ *
+ * `operation` is a REQUIRED arg of withRetryOn401, so an uninstrumented call
+ * path cannot compile — attribution is never silently dropped (acceptance
+ * criterion 3). `units` derives the billable resource count from the successful
+ * result; `text` lets a post-create pick the $0.200 link rate.
+ */
+interface TwitterMeterSpec {
+  operation: TwitterOperation;
+  /** OAuth2 write scope this action needs (pre-write capability guard). */
+  requiredScope?: string;
+  /**
+   * Billable resource count from the result; defaults to 1 (single write/lookup).
+   * Typed `any` deliberately so it never constrains withRetryOn401's return-type
+   * inference — the operation's result type is fixed by `fn`, not by this reader.
+   */
+  units?: (result: any) => number;
+  /** Post-create body — a contained link selects the $0.200 rate over $0.015. */
+  text?: string;
+}
+
+/** Count the resources in an X read result (array of items), defensively. */
+const arrayLen = (r: unknown): number => (Array.isArray(r) ? r.length : 0);
 
 /**
  * TwitterService — official X API v2 integration (twitter-api-v2).
@@ -291,14 +323,16 @@ export class TwitterService {
     ownerUserId: string,
     accountId: string,
     fn: (client: TwitterApi) => Promise<T>,
-    requiredScope?: string
+    meter: TwitterMeterSpec
   ): Promise<T> {
-    const client = await this.getClient(ownerUserId, accountId, requiredScope);
+    const client = await this.getClient(ownerUserId, accountId, meter.requiredScope);
     const isXAuthError = (e: unknown): boolean =>
       typeof e === 'object' && e !== null && (e as any).code === 401;
 
     try {
-      return await fn(client);
+      const result = await fn(client);
+      this.meterCall(ownerUserId, accountId, meter, result);
+      return result;
     } catch (err) {
       if (!isXAuthError(err)) throw err;
 
@@ -319,7 +353,9 @@ export class TwitterService {
       }
 
       try {
-        return await fn(freshClient);
+        const result = await fn(freshClient);
+        this.meterCall(ownerUserId, accountId, meter, result);
+        return result;
       } catch (retryErr) {
         if (isXAuthError(retryErr)) {
           await this.markNeedsReconnect(ownerUserId, accountId);
@@ -329,6 +365,48 @@ export class TwitterService {
         }
         throw retryErr;
       }
+    }
+  }
+
+  /**
+   * Attribute one successful X API call into the shared usage ledger (ENG-664).
+   *
+   * Recorded via recordVendorUsage into {Dev-}AW-UsageRecords under:
+   *   - userId  = ownerUserId          → per-USER cut (who spent our X budget)
+   *   - model   = "twitter:{operation}" → per-TOOL cut (recordVendorUsage namespaces it)
+   *   - feature = "x-account:{accountId}" → per-ACCOUNT cut (the connected account)
+   * costSource is always "allocated" (see twitterPricing — X reports no per-call price).
+   *
+   * Fire-and-forget and fully guarded: metering must NEVER fail or slow an X call.
+   * recordVendorUsage swallows its own errors; this try/catch guards the
+   * units()/pricing computation on top.
+   */
+  private meterCall<T>(
+    ownerUserId: string,
+    accountId: string,
+    meter: TwitterMeterSpec,
+    result: T
+  ): void {
+    try {
+      const units = meter.units ? meter.units(result) : 1;
+      const cost = computeTwitterCost(meter.operation, units, {
+        hasLink: textContainsLink(meter.text),
+      });
+      void recordVendorUsage({
+        userId: ownerUserId,
+        provider: TWITTER_PROVIDER,
+        operation: meter.operation,
+        feature: `x-account:${accountId}`,
+        unit: cost.unit,
+        quantity: cost.quantity,
+        costUsd: cost.costUsd,
+        costSource: 'allocated',
+      });
+    } catch (err) {
+      this.log(
+        `usage metering failed for ${meter.operation} (non-fatal)`,
+        err instanceof Error ? err.message : err
+      );
     }
   }
 
@@ -353,11 +431,14 @@ export class TwitterService {
       throw new Error('Tweet text cannot be empty');
     }
     const finalText = this.trimToLimit(text.trim(), TWEET_CHAR_LIMIT);
-    return this.withRetryOn401(ownerUserId, accountId, (client) =>
-      opts?.inReplyToTweetId
-        ? client.v2.reply(finalText, opts.inReplyToTweetId!).then((r: any) => ({ id: r.data.id, text: r.data.text }))
-        : client.v2.tweet(finalText).then((r: any) => ({ id: r.data.id, text: r.data.text })),
-      'tweet.write'
+    return this.withRetryOn401(
+      ownerUserId,
+      accountId,
+      (client) =>
+        opts?.inReplyToTweetId
+          ? client.v2.reply(finalText, opts.inReplyToTweetId!).then((r: any) => ({ id: r.data.id, text: r.data.text }))
+          : client.v2.tweet(finalText).then((r: any) => ({ id: r.data.id, text: r.data.text })),
+      { operation: opts?.inReplyToTweetId ? 'reply' : 'post', requiredScope: 'tweet.write', text: finalText }
     );
   }
 
@@ -407,7 +488,7 @@ export class TwitterService {
         throw new Error(`Could not resolve X handle "@${handle}"`);
       }
       return client.v2.sendDmToParticipant(user.data.id, { text: finalText });
-    }, 'dm.write');
+    }, { operation: 'send_dm', requiredScope: 'dm.write' });
   }
 
   /**
@@ -417,7 +498,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.listDmEvents();
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'list_dms', units: arrayLen });
   }
 
   /**
@@ -432,7 +513,7 @@ export class TwitterService {
         'user.fields': ['public_metrics', 'description', 'verified', 'location', 'url', 'profile_image_url', 'created_at'],
       });
       return res.data;
-    });
+    }, { operation: 'get_profile', units: (r) => (r ? 1 : 0) });
   }
 
   /**
@@ -445,7 +526,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.deleteTweet(tweetId.trim());
       return { deleted: res?.data?.deleted ?? false };
-    }, 'tweet.write');
+    }, { operation: 'delete_tweet', requiredScope: 'tweet.write' });
   }
 
   // ─── Private helpers for actions that need the authed user's own Twitter ID ──
@@ -482,7 +563,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.follow(myId, targetId);
       return res?.data ?? res;
-    }, 'follows.write');
+    }, { operation: 'follow', requiredScope: 'follows.write' });
   }
 
   /**
@@ -495,7 +576,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unfollow(myId, targetId);
       return res?.data ?? res;
-    }, 'follows.write');
+    }, { operation: 'unfollow', requiredScope: 'follows.write' });
   }
 
   // ─── List followers / following ───────────────────────────────────────────────
@@ -510,7 +591,7 @@ export class TwitterService {
       const targetId = handle ? await this.resolveHandleToUserId(client, handle) : myId;
       const res: any = await client.v2.followers(targetId);
       return res?.data ?? [];
-    });
+    }, { operation: 'list_followers', units: arrayLen });
   }
 
   /**
@@ -522,7 +603,7 @@ export class TwitterService {
       const targetId = handle ? await this.resolveHandleToUserId(client, handle) : myId;
       const res: any = await client.v2.following(targetId);
       return res?.data ?? [];
-    });
+    }, { operation: 'list_following', units: arrayLen });
   }
 
   // ─── Search tweets ────────────────────────────────────────────────────────────
@@ -538,7 +619,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'search_tweets', units: arrayLen });
   }
 
   // ─── DM conversation ─────────────────────────────────────────────────────────
@@ -553,7 +634,7 @@ export class TwitterService {
       const participantId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.listDmEventsWithParticipant(participantId);
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'get_dm_conversation', units: arrayLen });
   }
 
   // ─── Like / unlike ────────────────────────────────────────────────────────────
@@ -565,7 +646,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.like(myId, tweetId.trim());
       return res?.data ?? res;
-    }, 'like.write');
+    }, { operation: 'like', requiredScope: 'like.write' });
   }
 
   /** Unlike a tweet. */
@@ -575,7 +656,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.unlike(myId, tweetId.trim());
       return res?.data ?? res;
-    }, 'like.write');
+    }, { operation: 'unlike', requiredScope: 'like.write' });
   }
 
   // ─── Retweet / unretweet ─────────────────────────────────────────────────────
@@ -587,7 +668,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.retweet(myId, tweetId.trim());
       return res?.data ?? res;
-    }, 'tweet.write');
+    }, { operation: 'retweet', requiredScope: 'tweet.write' });
   }
 
   /** Undo a retweet. */
@@ -597,7 +678,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.unretweet(myId, tweetId.trim());
       return res?.data ?? res;
-    }, 'tweet.write');
+    }, { operation: 'unretweet', requiredScope: 'tweet.write' });
   }
 
   // ─── User tweets timeline ────────────────────────────────────────────────────
@@ -614,7 +695,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'get_user_tweets', units: arrayLen });
   }
 
   // ─── Bookmarks ────────────────────────────────────────────────────────────────
@@ -625,7 +706,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.bookmark(tweetId.trim());
       return res?.data ?? res;
-    }, 'bookmark.write');
+    }, { operation: 'bookmark', requiredScope: 'bookmark.write' });
   }
 
   /** Retrieve the authed user's bookmarked tweets. */
@@ -633,7 +714,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.bookmarks();
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'get_bookmarks', units: arrayLen });
   }
 
   // ─── X Lists (read) ────────────────────────────────────────────────────────────
@@ -665,7 +746,7 @@ export class TwitterService {
           'list.fields': ['member_count', 'follower_count', 'private', 'description'],
         });
         return res?.data?.data ?? res?.data ?? [];
-      });
+      }, { operation: 'get_owned_lists', units: arrayLen });
     } catch (err) {
       return this.mapListScopeError(err);
     }
@@ -683,7 +764,7 @@ export class TwitterService {
           'user.fields': ['username', 'name', 'description', 'public_metrics'],
         });
         return res?.data?.data ?? res?.data ?? [];
-      });
+      }, { operation: 'get_list_members', units: arrayLen });
     } catch (err) {
       return this.mapListScopeError(err);
     }
@@ -716,7 +797,7 @@ export class TwitterService {
           created_at: t.created_at ?? null,
           public_metrics: t.public_metrics ?? null,
         }));
-      });
+      }, { operation: 'get_list_tweets', units: arrayLen });
     } catch (err) {
       return this.mapListScopeError(err);
     }
@@ -749,7 +830,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.quote(finalText, quotedTweetId.trim());
       return { id: res.data.id, text: res.data.text };
-    }, 'tweet.write');
+    }, { operation: 'quote', requiredScope: 'tweet.write', text: finalText });
   }
 
   // ─── Engagement lookup ────────────────────────────────────────────────────────
@@ -760,7 +841,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.tweetRetweetedBy(tweetId.trim());
       return res?.data ?? [];
-    });
+    }, { operation: 'get_retweeters', units: arrayLen });
   }
 
   /** List users who liked a tweet. */
@@ -769,7 +850,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.tweetLikedBy(tweetId.trim());
       return res?.data ?? [];
-    });
+    }, { operation: 'get_liking_users', units: arrayLen });
   }
 
   /** List quote tweets of a tweet. */
@@ -781,7 +862,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'get_quote_tweets', units: arrayLen });
   }
 
   // ─── Block / unblock ─────────────────────────────────────────────────────────
@@ -794,7 +875,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.block(myId, targetId);
       return res?.data ?? res;
-    }, 'block.write');
+    }, { operation: 'block', requiredScope: 'block.write' });
   }
 
   /** Unblock a user by handle. Requires block.write scope. */
@@ -805,7 +886,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unblock(myId, targetId);
       return res?.data ?? res;
-    }, 'block.write');
+    }, { operation: 'unblock', requiredScope: 'block.write' });
   }
 
   // ─── Mute / unmute ───────────────────────────────────────────────────────────
@@ -818,7 +899,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.mute(myId, targetId);
       return res?.data ?? res;
-    }, 'mute.write');
+    }, { operation: 'mute', requiredScope: 'mute.write' });
   }
 
   /** Unmute a user by handle. Requires mute.write scope. */
@@ -829,7 +910,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unmute(myId, targetId);
       return res?.data ?? res;
-    }, 'mute.write');
+    }, { operation: 'unmute', requiredScope: 'mute.write' });
   }
 
   // ─── Tweet metrics ───────────────────────────────────────────────────────────
@@ -842,7 +923,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at', 'text'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'get_tweet_metrics', units: arrayLen });
   }
 
   // ─── List replies ────────────────────────────────────────────────────────────
@@ -856,7 +937,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'list_replies', units: arrayLen });
   }
 }
 
