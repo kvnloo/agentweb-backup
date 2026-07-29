@@ -259,6 +259,52 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.lead_quality_layer.has_crm).toBe(false);
   });
 
+  it('should preserve legacy health signals when landing-page lookup fails', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'admin-user',
+      isAdmin: true,
+    });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client',
+      productDomain: 'client.example.com',
+      emailDomain: 'mail.client.example.com',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    (getLandingPagesByOwner as jest.Mock).mockRejectedValueOnce(
+      new Error('landing-page table unavailable')
+    );
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.lander_layer.has_lander).toBe(true);
+    expect(result.health.lead_quality_layer.has_crm).toBe(true);
+  });
+
+  it('should still return health when landing-page lookup fails without legacy signals', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'admin-user',
+      isAdmin: true,
+    });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    (getLandingPagesByOwner as jest.Mock).mockRejectedValueOnce(
+      new Error('landing-page table unavailable')
+    );
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.lander_layer.has_lander).toBe(false);
+    expect(result.health.lead_quality_layer.has_crm).toBe(false);
+  });
+
   // FAIL test 4: Lookup by name match when email not found
   it('should find client by name when email lookup fails', async () => {
     const adminUserId = 'admin-user';
@@ -491,6 +537,32 @@ describe('Client Health - listAllClients', () => {
     const result = await listAllClients('admin-user');
 
     expect(result.success).toBe(true);
+    expect(result.clients[0].has_lander).toBe(true);
+    expect(result.clients[0].has_crm).toBe(true);
+  });
+
+  it('should preserve the client list when landing-page lookup fails', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'admin-user',
+      isAdmin: true,
+    });
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([
+      {
+        userId: 'client-user',
+        email: 'client@example.com',
+        productDomain: 'client.example.com',
+        emailDomain: 'mail.client.example.com',
+      },
+    ]);
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    (getLandingPagesByOwner as jest.Mock).mockRejectedValueOnce(
+      new Error('landing-page table unavailable')
+    );
+
+    const result = await listAllClients('admin-user');
+
+    expect(result.success).toBe(true);
+    expect(result.clients).toHaveLength(1);
     expect(result.clients[0].has_lander).toBe(true);
     expect(result.clients[0].has_crm).toBe(true);
   });

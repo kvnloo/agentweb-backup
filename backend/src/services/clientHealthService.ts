@@ -110,21 +110,29 @@ async function getLandingPageSignals(
   if (cached) return cached;
 
   const loadSignals = (async () => {
-    const { getLandingPagesByOwner, getLandingPagesByOrg } = await import('./v0Service');
-    const [ownerPages, orgPages] = await Promise.all([
-      getLandingPagesByOwner(client.userId),
-      client.orgId ? getLandingPagesByOrg(client.orgId, client.userId) : Promise.resolve([]),
-    ]);
-    const deployedPages = [...ownerPages, ...orgPages].filter(
-      (page: any) => page.status === 'deployed'
-    );
+    try {
+      const { getLandingPagesByOwner, getLandingPagesByOrg } = await import('./v0Service');
+      const [ownerPages, orgPages] = await Promise.all([
+        getLandingPagesByOwner(client.userId),
+        client.orgId ? getLandingPagesByOrg(client.orgId, client.userId) : Promise.resolve([]),
+      ]);
+      const deployedPages = [...ownerPages, ...orgPages].filter(
+        (page: any) => page.status === 'deployed'
+      );
 
-    return {
-      hasLander: deployedPages.length > 0,
-      hasLeadCapture: deployedPages.some(
-        (page: any) => typeof page.leadListId === 'string' && page.leadListId.trim() !== ''
-      ),
-    };
+      return {
+        hasLander: deployedPages.length > 0,
+        hasLeadCapture: deployedPages.some(
+          (page: any) => typeof page.leadListId === 'string' && page.leadListId.trim() !== ''
+        ),
+      };
+    } catch (error) {
+      console.warn(
+        `Client health: landing-page signals unavailable for ${client.userId}; using legacy signals:`,
+        error instanceof Error ? error.message : error
+      );
+      return { hasLander: false, hasLeadCapture: false };
+    }
   })();
 
   cache?.set(cacheKey, loadSignals);
