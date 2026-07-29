@@ -30,11 +30,20 @@ price book. Investigation findings:
   `-YYYY-MM-DD` — not `-20251001-v1:0`. Without its own key the lookup misses and `getModelPrice`
   returns null, which the ledger books as $0. The pre-existing key covers a *different* id than it
   appears to.
-- **`gemini-3-pro-preview` is already withdrawn by Google and is still in our picker.** A live probe
-  returns 404 `"This model models/gemini-3-pro-preview is no longer available."` It remains listed by
-  `GET /api/agent-mode/public/llm-models`, so selecting it errors. Reported, not removed (ENG-744
-  AC #7 requires reporting). An in-code comment already noted the 404 for the *vision* path; the
-  inference that the model was gone everywhere was never made.
+- **`gemini-3-pro-preview` was withdrawn by Google on 2026-03-09 and we kept serving it for ~4.5
+  months.** A live probe returns 404 `"This model models/gemini-3-pro-preview is no longer
+  available."` while it was still listed by `GET /api/agent-mode/public/llm-models`, so every user
+  who picked it hit a hard failure. **Removed from the registry** under explicit authorization
+  (recorded on ENG-744 and in the PR body) — ENG-744 AC #7 forbids *silent* removal, not documented
+  removal. Migration target is `gemini-3.1-pro-preview`. The price entry is intentionally retained.
+  The signal was already in the tree and nobody joined it up: `llmPricing.ts` carried
+  `// DEPRECATED 2026-03-09` and a registry comment noted the id 404s for the *vision* path — but
+  neither was generalized to "this model is gone everywhere".
+- **A model can 404 on a real call while still appearing in Google's `ListModels`.**
+  `gemini-3-pro-preview` did exactly this. Discovery endpoints are therefore not evidence a model
+  works — verify by invoking. The same asymmetry runs the other way: Google enforces published
+  shutdown dates inconsistently (two image previews past their stated date still return 200), so
+  "it still responds" is not evidence of safety either. Trust the published date in both directions.
 - **The Gemini Pro line is not behind — Google has not shipped one.** `gemini-3.1-pro-preview` is
   the newest Pro in the live catalog; there is no 3.5/3.6 Pro despite 3.5/3.6 Flash existing. The
   "Pro lags Flash" reading of our catalog is Google's release cadence, not our drift.
