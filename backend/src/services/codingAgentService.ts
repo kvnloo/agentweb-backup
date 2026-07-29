@@ -1654,8 +1654,8 @@ export function _setVertexClientForTest(client: AnthropicLikeClient | null): voi
 // authenticate with a long-term Bedrock API key (bearer token) and hit the
 // invoke endpoint directly — it speaks native Anthropic Messages format, exactly
 // what the coding agent already builds.
-// Which models live in that separate account, and the invoke-endpoint profile
-// id each maps to, both come from utils/bedrockInferenceProfiles.ts.
+// Which models live in that account, and the invoke-endpoint profile id each
+// maps to, both come from utils/bedrockInferenceProfiles.ts.
 
 // Idle (inter-chunk) timeout for the streaming bearer path. Because we stream,
 // we don't need a hard cap on total request duration — a long-but-progressing

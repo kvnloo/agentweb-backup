@@ -711,10 +711,6 @@ const DATA_ANALYSIS_FILE_END_MARKER = '<<<AGENTWEB_FILE_END>>>';
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
 
-// Models served from the separate Bedrock account (231030591963) reached via a
-// long-term API key (bearer token) rather than the app's default SigV4 creds.
-const BEARER_TOKEN_MODELS = BEDROCK_BEARER_TOKEN_MODELS;
-
 // Legacy model ids persisted by sessions/schedules created before a model was
 // renamed. Maps the old id to its current registry key so old sessions keep
 // working instead of throwing "Invalid model". Opus 4.8 was renamed from the
@@ -1817,7 +1813,9 @@ export class AgentModeService {
     // default IAM credentials (992382574572) cannot reach. Authenticate that model
     // with a long-term Bedrock API key (bearer token) instead of SigV4, scoped to a
     // dedicated client so all other models keep using the default credential chain.
-    const usesBearerToken = BEARER_TOKEN_MODELS.has(modelId);
+    // Models served from the separate Bedrock account (231030591963) reached via
+    // a long-term API key (bearer token) rather than the app's default SigV4 creds.
+    const usesBearerToken = BEDROCK_BEARER_TOKEN_MODELS.has(modelId);
     let bedrockClient: any;
     if (usesBearerToken) {
       const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
