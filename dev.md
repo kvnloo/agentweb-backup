@@ -33,8 +33,26 @@ already-existing `GET /api/admin/usage/cost-aggregation` `topUsers` breakdown as
 a provider filter (All / LLM / X / other vendors) and an expandable per-tool breakdown. X spend flows
 into it automatically because it lands in the same ledger — no backend aggregation change was needed.
 
-**Not in scope (flagged for follow-up):** Harsha's audit "bonus" — making X 402 credit-exhaustion a
-typed, machine-detectable tool-error condition — is a separate operational win, left for its own change.
+**Typed X 402 (credit exhaustion).** X errors carry the HTTP status on `.code`, and the tool taxonomy
+only knew `.status`/`.statusCode` and had no 402 branch — so a depleted-wallet 402 (ENG-604/633/662)
+classified as a generic `Error` and a mid-run 402 could read as success. Fixed end to end:
+- `withRetryOn401` converts any X 402 into a typed `XCreditsExhaustedError` (name stable, `code=402`) at
+  the single chokepoint, logging an `X_CREDITS_EXHAUSTED` marker for ops alerting. It is non-retryable and
+  never metered (the call did not succeed).
+- `classifyToolErrorClass` gains a stable `payment_required` class, reached three ways: status 402 (now
+  also reads `.code`, guarded to the 100–599 HTTP range), the typed error's name, and "HTTP 402" in text.
+- `classifyToolFailureType` maps `payment_required → config` — a billing/quota gap, excluded from the
+  tool-bug rate but visible and clustered, never silently a success.
+
+**Reconciliation (AC #2) — design, not yet built.** X's dedup ("same resource once per UTC day") is
+**app-wide** (the credit pool is AgentWeb's one Developer App), so per-user cost can only ever be
+*allocated* load attribution, not a fair split of the billed figure. The correct reconciliation is two
+numbers, never conflated: allocated (our ledger, above) for "who drives spend", and **measured** pulled
+from X's own `GET /2/usage/tweets` (app-level `project_usage`/`project_cap`/`cap_reset_day`) via a
+scheduled poller, stored as a `costSource: "measured"` counter and shown beside allocated in the admin
+tab. The delta = dedup savings + our $0 interaction writes. A `(utcDay, resourceId)` dedup table would
+give exact per-user *billed* numbers but costs one write per resource read — deferred unless finance
+needs per-user billed (not load) figures.
 
 ## ENG-693: vendor dimension on the existing usage ledger (2026-07-29)
 
