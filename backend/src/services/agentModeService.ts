@@ -2400,6 +2400,15 @@ export class AgentModeService {
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
     'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
+    // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
+    // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
+    // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
+    // deprecated for this model") — verified against live Bedrock, not assumed.
+    'anthropic.claude-opus-5': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-sonnet-5': { client: null, supportsTemperature: false, supportsVision: true },
+    // Haiku 4.5 still accepts temperature (also live-verified).
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
