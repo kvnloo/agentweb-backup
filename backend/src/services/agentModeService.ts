@@ -27294,17 +27294,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
-      // ENG-660: for a personal LinkedIn account, AgentWeb only surfaces posts
-      // that were created through AgentWeb itself — it does not read a profile's
-      // other existing posts. When none have been created here, a bare
+      // ENG-660: for a personal LinkedIn account, AgentWeb works from the posts
+      // created through AgentWeb itself. When none have been created yet, a bare
       // "Successfully loaded 0 posts" led the model to claim the fetch of the
       // user's posts succeeded (a tool-success hallucination). Signal this as an
       // explicitly-unsupported read via organicReadUnsupported + the message so
       // the model states the truth instead of implying it read the user's
       // LinkedIn. success stays true on purpose: nothing failed (the account is
-      // connected and healthy — this is expected by-design behavior), so this
-      // must NOT render as a tool "failure" in the UI. Framed as AgentWeb's own
-      // behavior, not a LinkedIn/platform limitation, so it reads as ownership.
+      // connected and healthy), so this must NOT render as a tool "failure" in
+      // the UI. The message leads with what AgentWeb DOES (positive, ownership
+      // framing) so the model doesn't present this as a weakness/"limitation".
       const accountType = (matchingAccount.config as any)?.account_type;
       if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
         return {
@@ -27312,7 +27311,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           organicReadUnsupported: true,
           posts: [],
           message:
-            'AgentWeb only reads and works with LinkedIn posts that were created through AgentWeb itself — it does not read posts made outside of AgentWeb. This personal LinkedIn account has no AgentWeb-created posts yet, so there is nothing to read or analyze here. This is expected by-design behavior, not an error, so do NOT retry. Do NOT claim you have read or analyzed the user\'s existing LinkedIn posts. To analyze their writing voice, ask them to paste or upload a few of their posts and work from those.',
+            'AgentWeb works from the LinkedIn posts you create with it, and this personal account hasn\'t published any through AgentWeb yet — so there aren\'t any on file to analyze for writing voice. Do NOT claim you have read or analyzed the user\'s existing LinkedIn posts, and there\'s no need to retry. The best next step: invite the user to paste or upload a few of their recent posts, then build their writing-voice profile from those — and offer to save it so future posts match their style.',
         };
       }
 
