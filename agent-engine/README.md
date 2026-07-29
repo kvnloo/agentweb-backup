@@ -62,26 +62,31 @@ python task_monitor.py
 
 ## Scheduled Chat Processing
 
-The agent-engine now automatically processes scheduled chats alongside regular task schedules. When the agent-engine detects scheduled chat schedules that are due to run, it will:
+Legacy recurring task scheduling (direct `AW-TaskSchedules` polling) was removed in `fb83fc151`
+(2026-03-26). The agent-engine no longer reads that table at all — it does not have DynamoDB
+permissions on it (see `agent-engine/deploy/RUNBOOK.md` for the current IAM policy). Scheduling is
+fully owned by the backend; the agent-engine's only role is:
 
-1. **Detect Scheduled Chats**: Query the `AW-TaskSchedules` table for schedules with `type = 'scheduled_chat'`
-2. **Trigger Backend Processing**: Make an API call to the backend's `/api/agent-mode/run-scheduled-chats` endpoint
-3. **Log Results**: Display detailed logs of successful and failed scheduled chat executions
-
-### How It Works
-
-- The agent-engine runs every 5 seconds and checks for due schedules
-- Regular task schedules are processed locally by creating task executions
-- Scheduled chat schedules trigger the backend API to handle the chat processing
-- Both types of schedules get their `nextRunTime` updated after processing
+1. **Trigger Backend Processing**: On every poll loop, `process_schedules()` makes an authenticated
+   API call to the backend's `/api/agent-mode/run-scheduled-chats` endpoint, which does its own
+   due-schedule lookup and chat processing internally.
+2. **Log Results**: Display detailed logs of successful and failed scheduled chat executions returned
+   by that call.
 
 ### Configuration
 
-Make sure to set the `BACKEND_URL` environment variable to point to your AgentWeb backend:
+Set `BACKEND_URL` to point to your AgentWeb backend, and `SCHEDULED_CHATS_SERVICE_SECRET` for
+service-to-service auth (must match the backend's own `SCHEDULED_CHATS_SERVICE_SECRET`; set it here
+first — the backend only enforces the header once its own copy is set):
 
 ```bash
 export BACKEND_URL=http://localhost:3001
+export SCHEDULED_CHATS_SERVICE_SECRET=your_shared_secret_here
 ```
+
+In production, `SCHEDULED_CHATS_SERVICE_SECRET` is resolved via `secrets_manager.py` (GCP Secret
+Manager) if unset in the environment. `BACKEND_URL` is routing config, not a secret, and stays a
+plain environment variable in every environment.
 
 ## Testing Gemini Integration
 

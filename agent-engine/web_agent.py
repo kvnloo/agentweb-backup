@@ -22,7 +22,7 @@ import secrets_manager
 from pathlib import Path
 from browser_use.agent.views import ActionResult
 from cookie_sync import CookieSync
-from aws_utils import get_dynamodb_resource, get_bedrock_client
+from aws_utils import get_dynamodb_resource, get_bedrock_client, get_s3_client
 import time
 import asyncio
 import random
@@ -221,7 +221,7 @@ class WebAgent:
         self.current_task_id = None
         self.controller = Controller()
         self.question_count = 0  # Track number of questions asked
-        self.s3_client = boto3.client('s3')
+        self.s3_client = get_s3_client()
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
         self._log_handlers = []  # Store log handlers for cleanup
         self.generate_gif = None

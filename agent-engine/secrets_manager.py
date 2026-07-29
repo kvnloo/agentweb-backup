@@ -142,14 +142,29 @@ def get_azure_openai_api_version3(default: str = '2025-01-01-preview') -> str:
     return _env_or_json_secret('AZURE_OPENAI_API_VERSION3', 'azure-openai-3', 'apiVersion', default)
 
 
+def get_scheduled_chats_service_secret() -> str:
+    return _env_or_string_secret('SCHEDULED_CHATS_SERVICE_SECRET', 'scheduled-chats-service-secret')
+
+
 def get_alert_webhook_url() -> str:
     """Slack incoming-webhook URL used by deploy/alert_oncall.sh on process failure."""
     return _env_or_string_secret('AGENT_ENGINE_ALERT_WEBHOOK_URL', 'alert-webhook')
 
 
 def get_aws_access_key_id() -> str:
-    return _env_or_json_secret('AWS_ACCESS_KEY_ID', 'aws-credentials', 'accessKeyId')
+    return _env_or_json_secret('AWS_ACCESS_KEY_ID', 'aws-credentials', 'AWS_ACCESS_KEY_ID')
 
 
 def get_aws_secret_access_key() -> str:
-    return _env_or_json_secret('AWS_SECRET_ACCESS_KEY', 'aws-credentials', 'secretAccessKey')
+    return _env_or_json_secret('AWS_SECRET_ACCESS_KEY', 'aws-credentials', 'AWS_SECRET_ACCESS_KEY')
+
+
+def get_aws_region(default: str = 'us-west-2') -> str:
+    return _env_or_json_secret('AWS_REGION', 'aws-credentials', 'AWS_REGION', default)
+
+
+def get_aws_default_region(default: str = 'us-west-2') -> str:
+    # web_agent.py:223 uses a bare boto3.client('s3') on boto3's default
+    # credential/region chain, which does not read AWS_REGION — only
+    # AWS_DEFAULT_REGION (or an explicit region_name kwarg) satisfies it.
+    return _env_or_json_secret('AWS_DEFAULT_REGION', 'aws-credentials', 'AWS_DEFAULT_REGION', default)

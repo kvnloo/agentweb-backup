@@ -15,7 +15,7 @@ def get_aws_credentials():
     the actual credential source in prod.
     """
     return {
-        'region_name': os.getenv('AWS_REGION', 'us-west-2'),
+        'region_name': secrets_manager.get_aws_region(),
         'aws_access_key_id': secrets_manager.get_aws_access_key_id(),
         'aws_secret_access_key': secrets_manager.get_aws_secret_access_key(),
     }

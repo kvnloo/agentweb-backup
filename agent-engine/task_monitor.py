@@ -14,6 +14,7 @@ from decimal import Decimal
 import humanize  # Add this import at the top of the file
 from pathlib import Path
 from aws_utils import get_dynamodb_resource, get_s3_client
+import secrets_manager
 import yaml
 import random
 from typing import Dict, Any, List, Optional
@@ -305,7 +306,7 @@ async def trigger_scheduled_chats():
         # enforces it once its own SCHEDULED_CHATS_SERVICE_SECRET is set, so
         # set the env var here BEFORE setting it on the backend.
         headers = {'Content-Type': 'application/json'}
-        service_secret = os.getenv('SCHEDULED_CHATS_SERVICE_SECRET')
+        service_secret = secrets_manager.get_scheduled_chats_service_secret()
         if service_secret:
             headers['x-service-secret'] = service_secret
 

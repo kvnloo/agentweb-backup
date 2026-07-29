@@ -91,18 +91,23 @@ class TestSecretsManagerEnvFallback(unittest.TestCase):
 
     @patch('secrets_manager.secretmanager.SecretManagerServiceClient')
     def test_aws_credentials_fetched_from_json_secret(self, mock_client_cls):
-        payload = '{"accessKeyId": "AKIAFAKE", "secretAccessKey": "fakesecret"}'
+        # Matches the real payload shape created for agentengine-prod-aws-credentials.
+        payload = '{"AWS_ACCESS_KEY_ID": "AKIAFAKE", "AWS_SECRET_ACCESS_KEY": "fakesecret", "AWS_REGION": "us-west-2", "AWS_DEFAULT_REGION": "us-west-2"}'
         mock_client_cls.return_value = _mock_secret_manager_client(payload)
 
         with patch.dict(os.environ, {}, clear=True):
-            os.environ.pop('AWS_ACCESS_KEY_ID', None)
-            os.environ.pop('AWS_SECRET_ACCESS_KEY', None)
+            for var in ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_REGION', 'AWS_DEFAULT_REGION'):
+                os.environ.pop(var, None)
             access_key = secrets_manager.get_aws_access_key_id()
             secret_key = secrets_manager.get_aws_secret_access_key()
+            region = secrets_manager.get_aws_region()
+            default_region = secrets_manager.get_aws_default_region()
 
         self.assertEqual(access_key, 'AKIAFAKE')
         self.assertEqual(secret_key, 'fakesecret')
-        # Both getters resolve from the same underlying secret, fetched once.
+        self.assertEqual(region, 'us-west-2')
+        self.assertEqual(default_region, 'us-west-2')
+        # All four getters resolve from the same underlying secret, fetched once.
         mock_client_cls.return_value.access_secret_version.assert_called_once()
 
 
