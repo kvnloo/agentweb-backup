@@ -39,6 +39,22 @@ Findings that shaped it, for the eight metering slices blocked on this one:
 - **`taskId` is still dropped at the write.** It is declared on `RecordUsageContext` and populated by
   call sites alongside `sessionId`, but ENG-693's scope names only `provider` and `sessionId`. Left
   as-is rather than widening the slice.
+- **Not every descriptive attribute is safe to pin to a row — session was the exception** (Greptile
+  P1). The `if_not_exists` "first writer wins" rule above is sound only when the attribute is
+  *constant across every writer to that key*. `provider` / `unit` / `costSource` satisfy that because
+  `recordVendorUsage` namespaces the model slot as `{provider}:{operation}`, so a row cannot mix
+  vendors. `sessionId` does not: it is call-level, it is not in the sort key, and N sessions share one
+  `{date}#{model}#{feature}` bucket whose counters accumulate all of them. So a stored `sessionId`
+  reads as "this session owns this usage" while another session's tokens pile up underneath it —
+  false for every session but one, and silently so. Neither `if_not_exists` (first) nor plain `SET`
+  (last) fixes that, because the defect is the *name*, not the write mode. Renamed the stored
+  attribute to `lastSessionId` under plain `SET`: the name now states exactly what the value is — a
+  trace breadcrumb to the most recent contributing session, never an attribution key. The input field
+  on `UsageRecordIncrement` stays `sessionId` (accurate: it is that call's session). Real
+  session-granular spend needs the session in the sort key, which is a key change this slice
+  deliberately excludes. Generalizable rule for this table: **before adding a descriptive attribute,
+  ask whether it is single-valued for the whole key; if not, either it belongs in the key or its name
+  must admit it is a sample, not a fact about the row.**
 
 ## ENG-629: fail closed + prompt re-consent when a Meta connection lacks Ads scopes (2026-07-29)
 
