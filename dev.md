@@ -1,3 +1,41 @@
+## ENG-664: meter X (Twitter) API usage + cost per account and per tool (2026-07-29)
+
+Builds directly on the [[ENG-693]] vendor dimension — no new table, no new pipeline.
+
+**Metering.** `twitterService.withRetryOn401` is the single chokepoint every data-plane
+X call already funnels through (it has `ownerUserId` + `accountId` in scope). It now takes a
+**required** `meter: TwitterMeterSpec` arg (`operation`, optional `requiredScope`, `units(result)`,
+`text`). On each successful call `meterCall()` fires `recordVendorUsage()` into `AW-UsageRecords`:
+- `userId  = ownerUserId`            → per-USER cut ("who spent our X budget")
+- `model   = "twitter:{operation}"`  → per-TOOL cut (recordVendorUsage namespaces the model slot)
+- `feature = "x-account:{accountId}"`→ per-ACCOUNT cut (the connected account)
+
+Making `operation` a required parameter means an uninstrumented call path **fails to compile**
+(acceptance criterion 3 — attribution is never silently dropped). Metering is fully guarded and
+fire-and-forget: it never fails or slows an X call (the units/pricing computation is wrapped, and
+`recordVendorUsage` swallows its own errors).
+
+**Cost is ALLOCATED, never measured.** X exposes no per-call price at runtime (the rate-limit
+headers `twitter-api-v2` returns carry quota, not dollars), so `utils/twitterPricing.ts` applies X's
+published pay-per-use rate card (docs.x.com, effective Apr 2026): post-create $0.015 ($0.200 with a
+link), post-read $0.005/resource, user-read $0.010, owned-read $0.001, DM-read $0.010, DM-create
+$0.015; interaction writes (like/follow/retweet/block/mute/delete) are recorded at $0 since X
+publishes no price. Rows carry `costSource: "allocated"`.
+
+**Reconciliation caveat (acceptance criterion 2).** X charges a repeat read of the SAME resource
+within a UTC day only once; we do not track resource ids, so a computed total is an allocated
+UPPER BOUND — it reconciles as `>=` the X console's billed usage, not to the cent. Exact
+reconciliation would need per-resource-id dedup (follow-up, not this PR). The partner-portal view
+labels X figures "allocated" and shows the dedup caveat so the number never reads as measured.
+
+**Surface.** New admin **Usage & Cost** tab (`partner-portal/.../UsageCostByUserTab.tsx`) renders the
+already-existing `GET /api/admin/usage/cost-aggregation` `topUsers` breakdown as a per-user table with
+a provider filter (All / LLM / X / other vendors) and an expandable per-tool breakdown. X spend flows
+into it automatically because it lands in the same ledger — no backend aggregation change was needed.
+
+**Not in scope (flagged for follow-up):** Harsha's audit "bonus" — making X 402 credit-exhaustion a
+typed, machine-detectable tool-error condition — is a separate operational win, left for its own change.
+
 ## ENG-693: vendor dimension on the existing usage ledger (2026-07-29)
 
 Five optional non-key attributes on `AW-UsageRecords` (`provider`, `sessionId`, `unit`, `quantity`,
