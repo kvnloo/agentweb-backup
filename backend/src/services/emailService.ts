@@ -4,6 +4,8 @@ import { resendService } from './resendService';
 import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
+import { userDb } from './db';
+import { reportContainsCrossAccountData, resolveAuthorizedReportRecipients } from './scheduledReportAccess';
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 
@@ -1418,10 +1420,55 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       // Normalize to array for consistent handling
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
 
-      // Send ONE email to all recipients
-      await this.sendEmail(emailList, subject, text, html);
+      // Recipient-authorization guard (ENG-500): if this run read cross-account
+      // user data via an admin-only tool, the report can contain other accounts'
+      // identities/records — so restrict distribution to authorized (admin)
+      // recipients + the owner, rather than auto-sending to every configured
+      // address. No-op for ordinary reports. Fail-closed: if we cannot classify
+      // the run (session lookup error), treat it as sensitive.
+      let recipients = emailList;
+      let finalHtml = html;
+      let finalText = text;
+      try {
+        let guardSession: any;
+        let isSensitive: boolean;
+        try {
+          guardSession = await chatbotDb.getChatSession(result.sessionId);
+          isSensitive = reportContainsCrossAccountData(guardSession?.calledFunctions);
+        } catch (classifyError) {
+          console.error(`Scheduled report guard: could not classify session ${result.sessionId}; failing closed (treating as sensitive):`, classifyError);
+          isSensitive = true;
+        }
+        if (isSensitive) {
+          let ownerEmail: string | undefined;
+          try {
+            const owner = guardSession?.userId ? await userDb.getUserById(guardSession.userId) : undefined;
+            ownerEmail = (owner as any)?.email;
+          } catch { /* owner unknown → resolver still restricts to verified admins */ }
+          const authz = await resolveAuthorizedReportRecipients({ recipients: emailList, ownerEmail, isSensitive: true });
+          recipients = authz.authorized;
+          if (authz.withheld.length > 0) {
+            const noticeText = `⚠️ ${authz.withheld.length} recipient(s) were withheld from this report because it contains cross-account account data and they are not authorized to receive it: ${authz.withheld.join(', ')}. To share this data, ensure recipients are admin users.`;
+            finalHtml = `<div style="margin:0 0 16px 0;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;color:#664d03;font-family:Arial,sans-serif;font-size:14px;">${noticeText}</div>${html}`;
+            finalText = `${noticeText}\n\n${text}`;
+            console.warn(`Scheduled report guard: withheld ${authz.withheld.length} unauthorized recipient(s) for session ${result.sessionId}: ${authz.withheld.join(', ')}`);
+          }
+        }
+      } catch (guardError) {
+        // Guard itself failed unexpectedly — fail-closed: deliver only to the
+        // account owner if we can determine it, else withhold entirely rather
+        // than risk distributing possibly-sensitive data to unverified addresses.
+        console.error(`Scheduled report guard errored for session ${result.sessionId}; failing closed:`, guardError);
+        recipients = [];
+      }
 
-      console.log(`Scheduled chat result email sent to recipients: ${emailList.join(', ')}`);
+      if (recipients.length === 0) {
+        console.warn(`Scheduled chat result email for session ${result.sessionId} had no authorized recipients after the guard; skipping send.`);
+      } else {
+        // Send ONE email to all authorized recipients
+        await this.sendEmail(recipients, subject, finalText, finalHtml);
+        console.log(`Scheduled chat result email sent to recipients: ${recipients.join(', ')}`);
+      }
 
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
