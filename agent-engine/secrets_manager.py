@@ -197,10 +197,3 @@ def get_aws_secret_access_key() -> str:
 
 def get_aws_region(default: str = 'us-west-2') -> str:
     return _env_or_json_secret('AWS_REGION', 'aws-credentials', 'AWS_REGION', default)
-
-
-def get_aws_default_region(default: str = 'us-west-2') -> str:
-    # web_agent.py:223 uses a bare boto3.client('s3') on boto3's default
-    # credential/region chain, which does not read AWS_REGION — only
-    # AWS_DEFAULT_REGION (or an explicit region_name kwarg) satisfies it.
-    return _env_or_json_secret('AWS_DEFAULT_REGION', 'aws-credentials', 'AWS_DEFAULT_REGION', default)
