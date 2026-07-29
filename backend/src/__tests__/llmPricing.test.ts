@@ -119,6 +119,32 @@ describe('llmPricing', () => {
       expectRate('claude-haiku-4-5', 1, 5);
     });
 
+    /*
+     * ENG-744 — the Claude 5 generation must be priced under the EXACT registry
+     * id it is invoked as, or getModelPrice() returns null and the usage ledger
+     * silently books $0 (the ENG-693 vendor-dimension blind spot).
+     *
+     * Haiku 4.5 is the trap: the pre-existing 'anthropic.claude-haiku-4-5' key
+     * does NOT cover the registry id 'anthropic.claude-haiku-4-5-20251001-v1:0'
+     * — canonicalModelId only strips a trailing bare -YYYY-MM-DD, and this id
+     * ends in '-20251001-v1:0'. It needs its own key.
+     */
+    it('prices the Claude 5 generation under its exact registry id', () => {
+      expectRate('anthropic.claude-opus-5', 5, 25);
+      expectRate('anthropic.claude-sonnet-5', 3, 15);
+      expectRate('anthropic.claude-haiku-4-5-20251001-v1:0', 1, 5);
+    });
+
+    it('resolves a price for every Claude 5 registry id (no silent $0 in the ledger)', () => {
+      for (const id of [
+        'anthropic.claude-opus-5',
+        'anthropic.claude-sonnet-5',
+        'anthropic.claude-haiku-4-5-20251001-v1:0',
+      ]) {
+        expect(getModelPrice(id)).not.toBeNull();
+      }
+    });
+
     it('prices the Pro image model above the flash tier', () => {
       expect(IMAGE_GENERATION_PRICING_USD['gemini-3-pro-image-preview']).toBe(0.134);
     });

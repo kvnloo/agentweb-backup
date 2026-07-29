@@ -113,6 +113,62 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['anthropic.claude-opus-4-8'].client).toBeNull();
     });
 
+    /*
+     * ENG-744 — the Claude 5 generation is offered alongside the existing entries.
+     * AC #1 is the getSupportedModels() assertions; AC #5 (nothing re-routed) is
+     * covered by the "default model unchanged" test further down.
+     */
+    describe('ENG-744 — Claude 5 generation', () => {
+      const CLAUDE_5 = [
+        'anthropic.claude-opus-5',
+        'anthropic.claude-sonnet-5',
+        'anthropic.claude-haiku-4-5-20251001-v1:0',
+      ];
+
+      it.each(CLAUDE_5)('offers %s to non-admins (AC #1 — added, not admin-gated)', async (id) => {
+        const models = await agentModeService.getSupportedModels(false);
+        expect(models).toContain(id);
+      });
+
+      it.each(CLAUDE_5)('offers %s to admins', async (id) => {
+        const models = await agentModeService.getSupportedModels(true);
+        expect(models).toContain(id);
+      });
+
+      it.each(CLAUDE_5)('lazy-loads the client for %s', (id) => {
+        expect((agentModeService as any).llmModels[id].client).toBeNull();
+      });
+
+      /*
+       * Verified against live Bedrock, not assumed: Opus 5 and Sonnet 5 both
+       * return HTTP 400 "`temperature` is deprecated for this model", so sending
+       * temperature would break every call. Haiku 4.5 accepts it.
+       */
+      it('marks Opus 5 and Sonnet 5 as rejecting temperature (live-verified 400)', () => {
+        const llmModels = (agentModeService as any).llmModels;
+        expect(llmModels['anthropic.claude-opus-5'].supportsTemperature).toBe(false);
+        expect(llmModels['anthropic.claude-sonnet-5'].supportsTemperature).toBe(false);
+      });
+
+      it('keeps temperature enabled for Haiku 4.5, which still accepts it', () => {
+        const llmModels = (agentModeService as any).llmModels;
+        expect(llmModels['anthropic.claude-haiku-4-5-20251001-v1:0'].supportsTemperature).toBe(true);
+      });
+
+      it.each(CLAUDE_5)('marks %s as vision-capable', (id) => {
+        expect((agentModeService as any).llmModels[id].supportsVision).toBe(true);
+      });
+
+      it('AC #5 — does not change the default model', async () => {
+        expect((agentModeService as any).default_model).toBe('gpt-5.5');
+      });
+
+      it('AC #6 — leaves the live voice model untouched', () => {
+        const live = (agentModeService as any).llmModels['gemini-3.1-flash-live-preview'];
+        expect(live).toEqual({ client: null, supportsTemperature: false, isLive: true });
+      });
+    });
+
     it('should have temperature support enabled for Sonnet 4.5', async () => {
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-sonnet-4-5-20250929-v1:0'].supportsTemperature).toBe(true);
