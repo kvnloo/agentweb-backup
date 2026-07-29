@@ -1,3 +1,115 @@
+## ENG-693: vendor dimension on the existing usage ledger (2026-07-29)
+
+Five optional non-key attributes on `AW-UsageRecords` (`provider`, `sessionId`, `unit`, `quantity`,
+`costSource`) plus a `recordVendorUsage()` entry point delegating to the same `incrementUsage()`.
+Findings that shaped it, for the eight metering slices blocked on this one:
+
+- **A row is a DAILY AGGREGATE, not a call.** The sort key is `{date}#{model}#{feature}`, so N calls
+  collapse into one item and every counter is an `ADD`. This is the single most load-bearing fact
+  for anything downstream: a "usage entry" is a bucket, so any new attribute is either a counter
+  (`ADD`) or a description of the bucket (`SET`). `quantity` is a counter. `provider` / `unit` /
+  `costSource` / `sessionId` are descriptions, written `if_not_exists` so the first writer's value
+  sticks instead of flapping between concurrent callers.
+- **Same-key collision is the real hazard, and it was designed around, not fixed.** Two vendors
+  writing the same `{model}#{feature}` on the same day would share one row and overwrite each
+  other's `provider`. `recordVendorUsage` therefore namespaces the model slot as
+  `{provider}:{operation}` — the sort key FORMAT is untouched (changing it is a real key change and
+  out of scope) while making a cross-vendor collision impossible by construction. The residual case
+  is narrower and still open: two providers serving an *identical model string* on the LLM path
+  (`openai` vs `azure-openai` for `gpt-4o`). That is ENG-700's "derive the provider label from the
+  client that served the call". Do not assume per-provider LLM splits are exact until ENG-700 lands.
+- **`unit` is the discriminator between token-priced and unit-priced spend.** When `unit` is set,
+  `incrementUsage` omits the token counters *entirely* rather than writing zeros — otherwise "this
+  vendor does not bill by tokens" and "this call used zero tokens" are the same row. Consequence for
+  readers: `UsageRecordRow`'s token fields are now optional. Every existing reader
+  (`usageAnalyticsService` `toRow`/`addInto`/`aggregateBurn`) already coalesced with `|| 0`, so this
+  was type-only — `npm run typecheck` is clean with no reader changes.
+- **No backfill, and none is needed.** Every new attribute is optional, so a pre-change row stays
+  valid. `isVendorEntry(row)` requires BOTH `provider` and `unit`, so a legacy row reports false and
+  is never surfaced as a vendor entry costing $0 — its real token cost keeps reading from
+  `costMicroUsd`. This is what keeps the slice clear of the data-plane gate.
+- **`unit` is a DynamoDB reserved word.** All four descriptive attributes go through
+  `ExpressionAttributeNames` for that reason; dropping the `#unit` alias produces a
+  `ValidationException` at runtime, not at compile time.
+- **No rate card here, deliberately.** `recordVendorUsage` records the dollar figure its caller
+  supplies and states its provenance via `costSource` (`measured` = vendor-reported, `allocated` =
+  our rate applied). Existing LLM dollars are stamped `allocated`, which they always were with
+  nothing saying so. Choosing the allocated rates is ENG-703; making an unpriced unit fail loud is
+  ENG-700. Neither is guessed at here.
+- **`taskId` is still dropped at the write.** It is declared on `RecordUsageContext` and populated by
+  call sites alongside `sessionId`, but ENG-693's scope names only `provider` and `sessionId`. Left
+  as-is rather than widening the slice.
+- **Not every descriptive attribute is safe to pin to a row — session was the exception** (Greptile
+  P1). The `if_not_exists` "first writer wins" rule above is sound only when the attribute is
+  *constant across every writer to that key*. `provider` / `unit` / `costSource` satisfy that because
+  `recordVendorUsage` namespaces the model slot as `{provider}:{operation}`, so a row cannot mix
+  vendors. `sessionId` does not: it is call-level, it is not in the sort key, and N sessions share one
+  `{date}#{model}#{feature}` bucket whose counters accumulate all of them. So a stored `sessionId`
+  reads as "this session owns this usage" while another session's tokens pile up underneath it —
+  false for every session but one, and silently so. Neither `if_not_exists` (first) nor plain `SET`
+  (last) fixes that, because the defect is the *name*, not the write mode. Renamed the stored
+  attribute to `lastSessionId` under plain `SET`: the name now states exactly what the value is — a
+  trace breadcrumb to the most recent contributing session, never an attribution key. The input field
+  on `UsageRecordIncrement` stays `sessionId` (accurate: it is that call's session). Real
+  session-granular spend needs the session in the sort key, which is a key change this slice
+  deliberately excludes. Generalizable rule for this table: **before adding a descriptive attribute,
+  ask whether it is single-valued for the whole key; if not, either it belongs in the key or its name
+  must admit it is a sample, not a fact about the row.**
+
+## ENG-705: unauthenticated share generate + unrate-limited duplicate could burn v0/LLM credits (2026-07-29)
+
+Two cost-leak surfaces closed with primitives that already existed. Investigation findings:
+
+- **The filing's AC 2 (attribution) was already satisfied — only the gate was missing.** The issue
+  read as "these paths spend LLM budget with no usage gate **and no attributable user**". The first
+  half was true, the second was not: `generateSharedResponse` passes `session.userId` into
+  `generateSessionResponse`, which reaches `incrementUserTokenUsage(userId, ...)` in
+  `agentModeService.ts`. Share spend has always been booked to the share **owner**. So the fix is
+  one `checkTokenUsage(session.userId)` call, not a new attribution path or an anonymous-budget
+  concept. Two of the new tests pass against pre-fix code by design — they are characterization
+  tests pinning that fact so a future refactor cannot quietly lose it.
+- **`checkTokenUsage` was already imported in `agentModeController.ts`** (used by the authenticated
+  `/generate` path at the `usageStatus` check). The share gate is deliberately the *same* call in
+  the *same* shape returning the *same* 429 — zero new imports, zero new concepts.
+- **Gate placement matters for the session lock.** It sits inside the `try` that follows
+  `tryClaimSessionGeneration`, so the existing `finally { releaseSessionGeneration(...) }` releases
+  on the 429 path. Placing it before the claim would also have worked, but inside the try mirrors
+  the authenticated path exactly and is covered by a regression test asserting the owner is not
+  locked out of their own session after a visitor hits the limit.
+- **Duplicate reuses the module's existing `rateLimiter`, deliberately sharing generate's quota
+  bucket** rather than getting its own. A separate limiter would have let a caller drain 10
+  generates *and* 10 duplicates. Sharing the map means duplicate cannot be used to obtain fresh
+  quota — asserted directly.
+- **`"view"` → `"edit"` on duplicate is net-subtractive.** Duplicate was a third authorization
+  shape (deploy/iterate required `"edit"`, duplicate required `"view"`); it now matches iterate.
+  The pre-fix test run proved the impact concretely: a view-only org member received `201` — a
+  full v0 generation — on someone else's page.
+- **Gotcha for anyone adding a dependency to `generateSharedResponse`:** five test suites drive it
+  (`ishareModel`, `ishareAnonymousSender`, `agentModeSharing`, `sharingIntegration`,
+  `interactiveShareExpiration`). The first four needed a `tokenUsageService` stub added; each was
+  verified green on `origin/main` first so the failures were provably the new dependency, not a
+  regression, and no assertion was changed. `interactiveShareExpiration` needs none — it exercises
+  the expired-share 410 path, which returns before the gate.
+- **Known limitation, unchanged by this PR:** the landing-page rate limiter is an in-process
+  `Map`, so limits are per backend instance rather than global. Pre-existing; worth noting if
+  ENG-666/ENG-694 metering makes cross-instance accounting a requirement.
+- **The gate's first shape shipped a disclosure, and our own test hid it (Greptile P1, review of
+  `1c0a078a`).** Mirroring the authenticated `/generate` 429 "exactly" was right for the *check*
+  and wrong for the *response*: the authenticated path returns `tokenUsage: usageStatus` to the
+  account that owns it, but this route sits before `authenticateToken`, so the same body handed
+  any share-link holder the owner's allowance, bonus, effective allowance, billing month, dollar
+  spend (`costUsed`), cost cap and enforcement state — the same object the authenticated
+  subscription-usage endpoint serves. **Symmetry across an authentication boundary is not
+  symmetry.** When copying a response shape, re-ask who the reader is.
+- **The agent-written test asserted the bug.** It required the body to *contain* `tokenUsage`
+  (`expect(body.tokenUsage).toEqual(expect.objectContaining({...}))`), so the leak was pinned as
+  intended behavior and the suite went green over it — the exact failure mode
+  `loop-acceptance-tests.md` exists to prevent, and it survived because none of the six
+  human-written ACs constrain the denial body. The replacement asserts the ownership boundary
+  instead: no `TokenUsageStatus` field may appear under any key, so a future re-add by spread or
+  rename fails too. Worth remembering: a test written by whoever wrote the code will happily
+  describe the code rather than the requirement.
+
 ## ENG-629: fail closed + prompt re-consent when a Meta connection lacks Ads scopes (2026-07-29)
 
 Live signal: OPS-79 fired twice in 24h — the scheduled Meta Ads report on account

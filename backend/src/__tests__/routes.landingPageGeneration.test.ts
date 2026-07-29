@@ -1269,6 +1269,151 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
   });
 });
 
+// =============================================================================
+// ENG-705 — Finding 2: /generated/:id/duplicate re-runs a full v0 generation.
+// It was registered with NO rateLimiter argument (while /generate, /deploy and
+// /iterate all pass one) and authorized with mode "view" (while /deploy and
+// /iterate require "edit"). Net: a viewer could trigger unbounded full v0
+// generations against a shared, unmetered platform key.
+// =============================================================================
+describe("ENG-705: POST /generated/:id/duplicate is rate-limited and edit-gated", () => {
+  /**
+   * A plain org member with landing-page sharing enabled: may VIEW another
+   * member's page, may not EDIT it. This is exactly the "viewer" who could
+   * previously burn v0 credits through duplicate.
+   */
+  function arrangeViewOnlyMember() {
+    mockGetLandingPageById.mockResolvedValue({
+      id: "page-1",
+      userId: "other-user-id",
+      name: "Someone else's page",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGetUserById.mockImplementation(async (id: string) =>
+      id === "test-user-id"
+        ? { userId: "test-user-id", orgId: "org-1", orgRole: "member" }
+        : { userId: "other-user-id", orgId: "org-1", orgRole: "member" }
+    );
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "other-user-id",
+      shareSettings: { landingPages: { enabled: true, editors: [] } },
+    });
+  }
+
+  // ── AC3 ──────────────────────────────────────────────────────────────────
+  it("AC3: the 11th duplicate in the same hour is refused with 429", async () => {
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-2", status: "draft" });
+
+    for (let i = 0; i < 10; i++) {
+      const r = await request(app)
+        .post("/api/landing-pages/v0/generated/page-1/duplicate")
+        .send({ name: `Copy ${i}` });
+      expect(r.status).toBe(201);
+    }
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy 11" });
+
+    expect(res.status).toBe(429);
+    expect(res.body.error).toMatch(/Rate limit exceeded/);
+  });
+
+  it("AC3: duplicate draws on the SAME generation quota as generate — it cannot be used to bypass it", async () => {
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-x", status: "draft" });
+
+    // Exhaust the generation quota through /generate alone.
+    for (let i = 0; i < 10; i++) {
+      await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Page", lead_list_id: "list-1" });
+    }
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(429);
+  });
+
+  it("AC3: a rate-limited duplicate never reaches v0 — no vendor spend is incurred", async () => {
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-x", status: "draft" });
+    for (let i = 0; i < 10; i++) {
+      await request(app)
+        .post("/api/landing-pages/v0/generate")
+        .send({ prompt: "Page", lead_list_id: "list-1" });
+    }
+    mockGenerateLandingPage.mockClear();
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(429);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  // ── AC4 ──────────────────────────────────────────────────────────────────
+  it("AC4: a view-only org member is refused (403) and never triggers a generation", async () => {
+    arrangeViewOnlyMember();
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(403);
+    expect(mockGenerateLandingPage).not.toHaveBeenCalled();
+  });
+
+  it("AC4: duplicate demands exactly the access level iterate demands", async () => {
+    arrangeViewOnlyMember();
+    mockIterateLandingPage.mockResolvedValue({ id: "page-1", status: "draft", iterations: 1 });
+
+    const iterateRes = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/iterate")
+      .send({ message: "Edit" });
+    const duplicateRes = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(duplicateRes.status).toBe(iterateRes.status);
+    expect(duplicateRes.status).toBe(403);
+  });
+
+  // ── AC6 ──────────────────────────────────────────────────────────────────
+  it("AC6: an org editor may still duplicate another member's page", async () => {
+    arrangeViewOnlyMember();
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "other-user-id",
+      shareSettings: { landingPages: { enabled: true, editors: ["test-user-id"] } },
+    });
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockGenerateLandingPage).toHaveBeenCalled();
+  });
+
+  it("AC6: the owner's own duplicate still works and stays within the quota", async () => {
+    mockGenerateLandingPage.mockResolvedValue({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual(expect.objectContaining({ id: "page-2" }));
+  });
+});
+
 describe("Rate limiting on expensive endpoints", () => {
   it("FAIL: 11th generate request in same hour → 429", async () => {
     mockGenerateLandingPage.mockResolvedValue({ id: "page-1", status: "draft" });
