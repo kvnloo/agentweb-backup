@@ -573,7 +573,7 @@ class WebAgent:
                 if not query or not isinstance(query, str):
                     return ActionResult(error="Please provide a non-empty search query")
 
-                api_key = os.getenv('GOOGLE_SEARCH_API_KEY')
+                api_key = secrets_manager.get_google_search_api_key()
                 search_engine_id = os.getenv('GOOGLE_SEARCH_ENGINE_ID')
 
                 if not api_key or not search_engine_id:
@@ -1788,7 +1788,7 @@ class WebAgent:
                             return ActionResult(error="Runway ML package not installed. Install with: pip install runwayml")
                         
                         # Get API key
-                        api_key = os.getenv('RUNWAY_API_KEY')
+                        api_key = secrets_manager.get_runway_api_key()
                         if not api_key:
                             return ActionResult(error="RUNWAY_API_KEY environment variable is not set")
                         
@@ -1852,7 +1852,7 @@ class WebAgent:
                         import time
                         
                         # Get API key
-                        api_key = os.getenv('REELMIND_API_KEY')
+                        api_key = secrets_manager.get_reelmind_api_key()
                         if not api_key:
                             return ActionResult(error="REELMIND_API_KEY environment variable is not set (Do not retry - this is a permanent failure)")
                         
@@ -2066,7 +2066,7 @@ class WebAgent:
                             return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
                         
                         # Get API key
-                        api_key = os.getenv('GOOGLE_VEO_API_KEY')
+                        api_key = secrets_manager.get_google_veo_api_key()
                         if not api_key:
                             return ActionResult(error="GOOGLE_VEO_API_KEY environment variable is not set")
                         
@@ -3220,7 +3220,7 @@ class WebAgent:
                     azure_model_name = "gpt-image-1"
                 else:
                     # Use OpenAI for other models
-                    api_key = os.getenv('OPENAI_IMAGE_API_KEY')
+                    api_key = secrets_manager.get_openai_image_api_key()
                     if not api_key:
                         return ActionResult(error="OPENAI_IMAGE_API_KEY environment variable is not set")
                     

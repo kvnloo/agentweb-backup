@@ -100,7 +100,7 @@ def create_jwt_token(user_id: str) -> str:
         import jwt
         from datetime import datetime, timedelta
         
-        jwt_secret = os.getenv('JWT_SECRET')
+        jwt_secret = secrets_manager.get_jwt_secret()
         if not jwt_secret:
             logger.error("JWT_SECRET environment variable not set")
             return None
@@ -1438,7 +1438,7 @@ async def call_github_api(
     repo = "agentweb-agentcode"
     
     # Get GitHub API key
-    github_api_key = os.getenv('GITHUB_API_KEY')
+    github_api_key = secrets_manager.get_github_api_key()
     if not github_api_key:
         return 401, {}, "GitHub API key not found in environment"
     
@@ -1723,7 +1723,7 @@ def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = Non
                 iterations=100000,
             )
             # Convert JWT_SECRET to bytes for key derivation
-            secret_bytes = os.getenv('JWT_SECRET').encode('utf-8')
+            secret_bytes = secrets_manager.get_jwt_secret().encode('utf-8')
             key = kdf.derive(secret_bytes)
             
             # Create AESGCM instance with derived key
@@ -1734,11 +1734,11 @@ def decrypt_password(encrypted_password: str, user_id: str, shared_by: str = Non
             signed_password = decrypted.decode('utf-8')
             
             # Decode the signed password
-            decoded = jwt.decode(signed_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+            decoded = jwt.decode(signed_password, secrets_manager.get_jwt_secret(), algorithms=['HS256'])
         except Exception as e:
             # If decryption fails, try as old signed format
             logger.info("Decryption failed, trying old signed format")
-            decoded = jwt.decode(encrypted_password, os.getenv('JWT_SECRET'), algorithms=['HS256'])
+            decoded = jwt.decode(encrypted_password, secrets_manager.get_jwt_secret(), algorithms=['HS256'])
 
         # For shared passwords, verify against the original sharer's userId
         expected_user_id = shared_by if shared_by else user_id

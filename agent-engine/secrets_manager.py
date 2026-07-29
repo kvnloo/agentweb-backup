@@ -146,6 +146,42 @@ def get_scheduled_chats_service_secret() -> str:
     return _env_or_string_secret('SCHEDULED_CHATS_SERVICE_SECRET', 'scheduled-chats-service-secret')
 
 
+def get_jwt_secret() -> str:
+    return _env_or_string_secret('JWT_SECRET', 'jwt-secret')
+
+
+def get_smtp_user() -> str:
+    return _env_or_json_secret('SMTP_USER', 'smtp', 'user')
+
+
+def get_smtp_pass() -> str:
+    return _env_or_json_secret('SMTP_PASS', 'smtp', 'pass')
+
+
+def get_google_search_api_key() -> str:
+    return _env_or_string_secret('GOOGLE_SEARCH_API_KEY', 'google-search')
+
+
+def get_runway_api_key() -> str:
+    return _env_or_string_secret('RUNWAY_API_KEY', 'runway')
+
+
+def get_reelmind_api_key() -> str:
+    return _env_or_string_secret('REELMIND_API_KEY', 'reelmind')
+
+
+def get_google_veo_api_key() -> str:
+    return _env_or_string_secret('GOOGLE_VEO_API_KEY', 'google-veo')
+
+
+def get_openai_image_api_key() -> str:
+    return _env_or_string_secret('OPENAI_IMAGE_API_KEY', 'openai-image')
+
+
+def get_github_api_key() -> str:
+    return _env_or_string_secret('GITHUB_API_KEY', 'github')
+
+
 def get_alert_webhook_url() -> str:
     """Slack incoming-webhook URL used by deploy/alert_oncall.sh on process failure."""
     return _env_or_string_secret('AGENT_ENGINE_ALERT_WEBHOOK_URL', 'alert-webhook')
