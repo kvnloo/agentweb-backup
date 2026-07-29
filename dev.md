@@ -1,3 +1,45 @@
+## ENG-693: vendor dimension on the existing usage ledger (2026-07-29)
+
+Five optional non-key attributes on `AW-UsageRecords` (`provider`, `sessionId`, `unit`, `quantity`,
+`costSource`) plus a `recordVendorUsage()` entry point delegating to the same `incrementUsage()`.
+Findings that shaped it, for the eight metering slices blocked on this one:
+
+- **A row is a DAILY AGGREGATE, not a call.** The sort key is `{date}#{model}#{feature}`, so N calls
+  collapse into one item and every counter is an `ADD`. This is the single most load-bearing fact
+  for anything downstream: a "usage entry" is a bucket, so any new attribute is either a counter
+  (`ADD`) or a description of the bucket (`SET`). `quantity` is a counter. `provider` / `unit` /
+  `costSource` / `sessionId` are descriptions, written `if_not_exists` so the first writer's value
+  sticks instead of flapping between concurrent callers.
+- **Same-key collision is the real hazard, and it was designed around, not fixed.** Two vendors
+  writing the same `{model}#{feature}` on the same day would share one row and overwrite each
+  other's `provider`. `recordVendorUsage` therefore namespaces the model slot as
+  `{provider}:{operation}` — the sort key FORMAT is untouched (changing it is a real key change and
+  out of scope) while making a cross-vendor collision impossible by construction. The residual case
+  is narrower and still open: two providers serving an *identical model string* on the LLM path
+  (`openai` vs `azure-openai` for `gpt-4o`). That is ENG-700's "derive the provider label from the
+  client that served the call". Do not assume per-provider LLM splits are exact until ENG-700 lands.
+- **`unit` is the discriminator between token-priced and unit-priced spend.** When `unit` is set,
+  `incrementUsage` omits the token counters *entirely* rather than writing zeros — otherwise "this
+  vendor does not bill by tokens" and "this call used zero tokens" are the same row. Consequence for
+  readers: `UsageRecordRow`'s token fields are now optional. Every existing reader
+  (`usageAnalyticsService` `toRow`/`addInto`/`aggregateBurn`) already coalesced with `|| 0`, so this
+  was type-only — `npm run typecheck` is clean with no reader changes.
+- **No backfill, and none is needed.** Every new attribute is optional, so a pre-change row stays
+  valid. `isVendorEntry(row)` requires BOTH `provider` and `unit`, so a legacy row reports false and
+  is never surfaced as a vendor entry costing $0 — its real token cost keeps reading from
+  `costMicroUsd`. This is what keeps the slice clear of the data-plane gate.
+- **`unit` is a DynamoDB reserved word.** All four descriptive attributes go through
+  `ExpressionAttributeNames` for that reason; dropping the `#unit` alias produces a
+  `ValidationException` at runtime, not at compile time.
+- **No rate card here, deliberately.** `recordVendorUsage` records the dollar figure its caller
+  supplies and states its provenance via `costSource` (`measured` = vendor-reported, `allocated` =
+  our rate applied). Existing LLM dollars are stamped `allocated`, which they always were with
+  nothing saying so. Choosing the allocated rates is ENG-703; making an unpriced unit fail loud is
+  ENG-700. Neither is guessed at here.
+- **`taskId` is still dropped at the write.** It is declared on `RecordUsageContext` and populated by
+  call sites alongside `sessionId`, but ENG-693's scope names only `provider` and `sessionId`. Left
+  as-is rather than widening the slice.
+
 ## ENG-446: canonical action payloads on existing report/run data (2026-07-29)
 
 New pure module `backend/src/services/marketingActionEnvelope.ts` — the transport/persistence seam
