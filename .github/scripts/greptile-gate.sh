@@ -123,6 +123,9 @@ while :; do
 
     if [ -z "${body}" ]; then
       last_state="no Greptile review comment found on the pull request yet"
+      # Keep last_body in step with last_state, so the timeout dump never shows
+      # a stale error from an earlier poll next to an unrelated final state.
+      last_body=''
     else
       last_body="${body}"
 
