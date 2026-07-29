@@ -297,6 +297,16 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     // and the absence of a direct per-userId lookup is not a blocker
     expect(lower).toContain('not');
   });
+
+  it('warns that list_all_clients carries sensitive fields and forbids copying them into the report', () => {
+    const lower = directive.toLowerCase();
+    // it must flag that list_all_clients returns more than identity data
+    expect(lower).toContain('roles');
+    expect(lower).toContain('subscription');
+    expect(lower).toMatch(/stripe|billing|payment/);
+    // and instruct the model to extract only the identity mapping
+    expect(lower).toMatch(/only|never/);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
