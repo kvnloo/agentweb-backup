@@ -238,6 +238,110 @@ describe('isMetaAdsScopeRefusal', () => {
     expect(isMetaAdsScopeRefusal(undefined)).toBe(false);
     expect(isMetaAdsScopeRefusal('a string')).toBe(false);
   });
+
+  it('returns false for an object carrying no readable text at all', () => {
+    // An error-shaped object with nothing to inspect must not be guessed at.
+    expect(isMetaAdsScopeRefusal({})).toBe(false);
+    expect(isMetaAdsScopeRefusal({ response: {} })).toBe(false);
+  });
+
+  // ── Error-shape plumbing ───────────────────────────────────────────────────
+  // Meta does not deliver errors in one shape. The Graph SDK, axios, and
+  // metaService.handleError each nest the code and the human-readable text
+  // differently, so both extraction helpers have to look in several places.
+  // Each of these is a shape seen in the wild, not a synthetic permutation.
+
+  describe('reads the Graph code wherever Meta put it', () => {
+    it('finds the code on response.data.code', () => {
+      const error: any = new Error('ads_read permission is required');
+      error.response = { data: { code: 272 } };
+      expect(isMetaAdsScopeRefusal(error)).toBe(true);
+    });
+
+    it('finds the code on a nested error object', () => {
+      const error: any = new Error('ads_management not available');
+      error.error = { code: 10 };
+      expect(isMetaAdsScopeRefusal(error)).toBe(true);
+    });
+
+    it('ignores a non-numeric code rather than coercing it', () => {
+      // A garbage code must not accidentally land inside the 200-299 band, and
+      // must not mask the hard 190/100 exclusions either.
+      const error: any = new Error('ads_read is not granted');
+      error.code = 'PERMISSION_DENIED';
+      expect(isMetaAdsScopeRefusal(error)).toBe(true); // falls back to text shape
+    });
+
+    it('still applies the 190 exclusion when the code is nested', () => {
+      const error: any = new Error('ads_read permission lost — token expired');
+      error.response = { data: { error: { code: 190 } } };
+      expect(isMetaAdsScopeRefusal(error)).toBe(false);
+    });
+  });
+
+  describe('reads the refusal text wherever Meta put it', () => {
+    it('finds the Ads scope in structuredError.error_user_msg', () => {
+      const error: any = new Error('Request failed');
+      error.structuredError = {
+        code: 200,
+        error_user_msg: 'You have not granted ads_read for this ad account.',
+      };
+      expect(isMetaAdsScopeRefusal(error)).toBe(true);
+    });
+
+    it('finds the Ads scope in structuredError.error_user_title', () => {
+      const error: any = new Error('Request failed');
+      error.structuredError = { code: 200, error_user_title: 'ads_management required' };
+      expect(isMetaAdsScopeRefusal(error)).toBe(true);
+    });
+
+    it('finds the Ads scope in response.data.message', () => {
+      const error: any = new Error('Request failed with status code 400');
+      error.response = { data: { message: '(#200) ads_read has not been granted' } };
+      expect(isMetaAdsScopeRefusal(error)).toBe(true);
+    });
+
+    it('finds the Ads scope in a nested error.message', () => {
+      const error: any = new Error('Request failed');
+      error.error = { message: 'ads_management permission missing' };
+      expect(isMetaAdsScopeRefusal(error)).toBe(true);
+    });
+  });
+
+  describe('what makes a refusal "permission shaped"', () => {
+    // The scope name is necessary; one of these signals is what makes it
+    // sufficient. Each is exercised in isolation so none is load-bearing by accident.
+
+    it('accepts code 10 when the message names an Ads scope', () => {
+      const error: any = new Error('ads_read unavailable for this user');
+      error.code = 10;
+      expect(isMetaAdsScopeRefusal(error)).toBe(true);
+    });
+
+    it('accepts a PERMISSION_ERROR classification with no usable code', () => {
+      const error: any = new Error('ads_read unavailable');
+      error.structuredError = { classification: 'PERMISSION_ERROR' };
+      expect(isMetaAdsScopeRefusal(error)).toBe(true);
+    });
+
+    it('accepts the bare "(#200)" prefix with no code field', () => {
+      expect(isMetaAdsScopeRefusal(new Error('(#200) ads_read was refused'))).toBe(true);
+    });
+
+    it('accepts the word "permission" with no code field', () => {
+      expect(isMetaAdsScopeRefusal(new Error('ads_management permission denied'))).toBe(true);
+    });
+
+    it('accepts "not granted" with no code field', () => {
+      expect(isMetaAdsScopeRefusal(new Error('ads_read was not granted'))).toBe(true);
+    });
+
+    it('rejects a bare mention of an Ads scope with no refusal signal at all', () => {
+      // Naming the scope is necessary but never sufficient on its own — this is
+      // the branch that stops an incidental mention from revoking a grant.
+      expect(isMetaAdsScopeRefusal(new Error('requested fields: ads_read, spend'))).toBe(false);
+    });
+  });
 });
 
 describe('buildMetaAdsScopeError', () => {

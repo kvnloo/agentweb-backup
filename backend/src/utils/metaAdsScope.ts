@@ -100,29 +100,50 @@ export const hasMetaAdsReadScope = (
   config: MetaAdsScopeConfigLike | null | undefined
 ): boolean => getMetaAdsScopeState(config) === 'granted';
 
-/** Pull a Graph API error code out of any of the shapes Meta errors arrive in. */
-const extractGraphCode = (error: any): number | undefined => {
-  const raw =
-    error?.structuredError?.code ??
-    error?.response?.data?.error?.code ??
-    error?.response?.data?.code ??
-    error?.error?.code ??
-    error?.code;
-  const code = Number(raw);
-  return Number.isFinite(code) ? code : undefined;
+/**
+ * Read a nested value by path, yielding undefined the moment the chain breaks.
+ *
+ * Deliberately a loop over a declared path rather than an inline `a?.b?.c?.d`
+ * chain: Meta delivers errors in several shapes, and spelling each one out as
+ * optional chaining multiplies code paths for what is really one lookup.
+ */
+const pick = (source: unknown, path: readonly string[]): unknown =>
+  path.reduce<any>((value, key) => (value == null ? undefined : value[key]), source);
+
+/** Where Meta puts the Graph error code, most specific first. */
+const GRAPH_CODE_PATHS: readonly (readonly string[])[] = [
+  ['structuredError', 'code'],
+  ['response', 'data', 'error', 'code'],
+  ['response', 'data', 'code'],
+  ['error', 'code'],
+  ['code'],
+];
+
+/** Where Meta puts human-readable failure text. */
+const ERROR_TEXT_PATHS: readonly (readonly string[])[] = [
+  ['message'],
+  ['structuredError', 'message'],
+  ['structuredError', 'error_user_msg'],
+  ['structuredError', 'error_user_title'],
+  ['response', 'data', 'error', 'message'],
+  ['response', 'data', 'message'],
+  ['error', 'message'],
+];
+
+/** Pull a Graph API error code out of whichever shape this error arrived in. */
+const extractGraphCode = (error: unknown): number | undefined => {
+  for (const path of GRAPH_CODE_PATHS) {
+    const raw = pick(error, path);
+    if (raw == null) continue;
+    const code = Number(raw);
+    return Number.isFinite(code) ? code : undefined;
+  }
+  return undefined;
 };
 
 /** Every place Meta might put human-readable text, flattened for inspection. */
-const collectErrorText = (err: any): string =>
-  [
-    err?.message,
-    err?.structuredError?.message,
-    err?.structuredError?.error_user_msg,
-    err?.structuredError?.error_user_title,
-    err?.response?.data?.error?.message,
-    err?.response?.data?.message,
-    err?.error?.message,
-  ]
+const collectErrorText = (error: unknown): string =>
+  ERROR_TEXT_PATHS.map(path => pick(error, path))
     .filter((s: unknown): s is string => typeof s === 'string')
     .join(' | ')
     .toLowerCase();

@@ -53,6 +53,18 @@ unattended run produced a report with no data. Investigation findings that shape
   destroys working state — so the bar is asymmetric too: Meta must NAME an Ads scope, and a
   permission code alone is never sufficient. Renamed to `isMetaAdsScopeRefusal` because "permission
   error" was the wrong concept and the loose name invited the loose check.
+- **The 95% CI coverage gate only measures `src/utils/**`** (`jest.config.js` `collectCoverageFrom`),
+  and the coverage shard additionally ignores `/__tests__/agentMode*`. Two consequences worth
+  knowing before adding a util: `services/` and `routes/` changes are not measured at all, so the
+  *only* file in this PR the gate could see was `utils/metaAdsScope.ts` — which is why one new
+  pure module could drag the global branch number from >=95% to 94.81% on its own.
+- **Deep `?.`/`??` chains are a coverage tax.** istanbul counts every optional-chaining hop as a
+  branch, so `error?.response?.data?.error?.code` alone contributes four. Meta delivers errors in
+  several shapes, so the first cut spelled out five code paths and seven text paths as inline
+  chains — ~19 branches for what is really two lookups, most unreachable without absurd permutation
+  fixtures. Replaced with declared path lists plus one `pick()` reducer: same behavior, the shapes
+  are now a readable table, and the file went 89.44% -> 100% branch coverage while getting shorter
+  in intent. Prefer a data-driven lookup over a nested optional chain when probing foreign payloads.
 - Gate coverage note: the pre-flight gate sits in `getMetaCredentials`, the single choke point for
   every connected-account Meta tool, so it covers all ads paths including writes. Post-flight
   normalization is wired into the campaign read path named in the reporter signal; once the
