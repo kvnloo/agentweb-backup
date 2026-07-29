@@ -1,3 +1,61 @@
+## ENG-693: vendor dimension on the existing usage ledger (2026-07-29)
+
+Five optional non-key attributes on `AW-UsageRecords` (`provider`, `sessionId`, `unit`, `quantity`,
+`costSource`) plus a `recordVendorUsage()` entry point delegating to the same `incrementUsage()`.
+Findings that shaped it, for the eight metering slices blocked on this one:
+
+- **A row is a DAILY AGGREGATE, not a call.** The sort key is `{date}#{model}#{feature}`, so N calls
+  collapse into one item and every counter is an `ADD`. This is the single most load-bearing fact
+  for anything downstream: a "usage entry" is a bucket, so any new attribute is either a counter
+  (`ADD`) or a description of the bucket (`SET`). `quantity` is a counter. `provider` / `unit` /
+  `costSource` / `sessionId` are descriptions, written `if_not_exists` so the first writer's value
+  sticks instead of flapping between concurrent callers.
+- **Same-key collision is the real hazard, and it was designed around, not fixed.** Two vendors
+  writing the same `{model}#{feature}` on the same day would share one row and overwrite each
+  other's `provider`. `recordVendorUsage` therefore namespaces the model slot as
+  `{provider}:{operation}` — the sort key FORMAT is untouched (changing it is a real key change and
+  out of scope) while making a cross-vendor collision impossible by construction. The residual case
+  is narrower and still open: two providers serving an *identical model string* on the LLM path
+  (`openai` vs `azure-openai` for `gpt-4o`). That is ENG-700's "derive the provider label from the
+  client that served the call". Do not assume per-provider LLM splits are exact until ENG-700 lands.
+- **`unit` is the discriminator between token-priced and unit-priced spend.** When `unit` is set,
+  `incrementUsage` omits the token counters *entirely* rather than writing zeros — otherwise "this
+  vendor does not bill by tokens" and "this call used zero tokens" are the same row. Consequence for
+  readers: `UsageRecordRow`'s token fields are now optional. Every existing reader
+  (`usageAnalyticsService` `toRow`/`addInto`/`aggregateBurn`) already coalesced with `|| 0`, so this
+  was type-only — `npm run typecheck` is clean with no reader changes.
+- **No backfill, and none is needed.** Every new attribute is optional, so a pre-change row stays
+  valid. `isVendorEntry(row)` requires BOTH `provider` and `unit`, so a legacy row reports false and
+  is never surfaced as a vendor entry costing $0 — its real token cost keeps reading from
+  `costMicroUsd`. This is what keeps the slice clear of the data-plane gate.
+- **`unit` is a DynamoDB reserved word.** All four descriptive attributes go through
+  `ExpressionAttributeNames` for that reason; dropping the `#unit` alias produces a
+  `ValidationException` at runtime, not at compile time.
+- **No rate card here, deliberately.** `recordVendorUsage` records the dollar figure its caller
+  supplies and states its provenance via `costSource` (`measured` = vendor-reported, `allocated` =
+  our rate applied). Existing LLM dollars are stamped `allocated`, which they always were with
+  nothing saying so. Choosing the allocated rates is ENG-703; making an unpriced unit fail loud is
+  ENG-700. Neither is guessed at here.
+- **`taskId` is still dropped at the write.** It is declared on `RecordUsageContext` and populated by
+  call sites alongside `sessionId`, but ENG-693's scope names only `provider` and `sessionId`. Left
+  as-is rather than widening the slice.
+- **Not every descriptive attribute is safe to pin to a row — session was the exception** (Greptile
+  P1). The `if_not_exists` "first writer wins" rule above is sound only when the attribute is
+  *constant across every writer to that key*. `provider` / `unit` / `costSource` satisfy that because
+  `recordVendorUsage` namespaces the model slot as `{provider}:{operation}`, so a row cannot mix
+  vendors. `sessionId` does not: it is call-level, it is not in the sort key, and N sessions share one
+  `{date}#{model}#{feature}` bucket whose counters accumulate all of them. So a stored `sessionId`
+  reads as "this session owns this usage" while another session's tokens pile up underneath it —
+  false for every session but one, and silently so. Neither `if_not_exists` (first) nor plain `SET`
+  (last) fixes that, because the defect is the *name*, not the write mode. Renamed the stored
+  attribute to `lastSessionId` under plain `SET`: the name now states exactly what the value is — a
+  trace breadcrumb to the most recent contributing session, never an attribution key. The input field
+  on `UsageRecordIncrement` stays `sessionId` (accurate: it is that call's session). Real
+  session-granular spend needs the session in the sort key, which is a key change this slice
+  deliberately excludes. Generalizable rule for this table: **before adding a descriptive attribute,
+  ask whether it is single-valued for the whole key; if not, either it belongs in the key or its name
+  must admit it is a sample, not a fact about the row.**
+
 ## ENG-705: unauthenticated share generate + unrate-limited duplicate could burn v0/LLM credits (2026-07-29)
 
 Two cost-leak surfaces closed with primitives that already existed. Investigation findings:
@@ -51,6 +109,7 @@ Two cost-leak surfaces closed with primitives that already existed. Investigatio
   instead: no `TokenUsageStatus` field may appear under any key, so a future re-add by spread or
   rename fails too. Worth remembering: a test written by whoever wrote the code will happily
   describe the code rather than the requirement.
+
 ## ENG-629: fail closed + prompt re-consent when a Meta connection lacks Ads scopes (2026-07-29)
 
 Live signal: OPS-79 fired twice in 24h — the scheduled Meta Ads report on account
