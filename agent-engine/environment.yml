@@ -10,6 +10,10 @@ dependencies:
   - pytest
   - pip:
     - browser-use==0.8.0
+    # browser_use/config.py imports pydantic_settings directly but browser-use's
+    # own package metadata doesn't declare it as a dependency (upstream bug) —
+    # pin it explicitly or `import browser_use` fails with ModuleNotFoundError.
+    - pydantic-settings
     - aiohttp>=3.8.0
     - beautifulsoup4>=4.9.3
     - python-dotenv>=0.19.0
@@ -20,6 +24,6 @@ dependencies:
     - openai>=1.12.0
     - cryptography>=42.0.0
     - google-cloud-storage>=2.10.0
-    - google-cloud-discoveryengine>=1.0.0
+    - google-cloud-discoveryengine
     - google-cloud-secret-manager>=2.20.0
     - google-genai>=1.8.0
