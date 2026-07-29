@@ -182,11 +182,6 @@ def get_github_api_key() -> str:
     return _env_or_string_secret('GITHUB_API_KEY', 'github')
 
 
-def get_alert_webhook_url() -> str:
-    """Slack incoming-webhook URL used by deploy/alert_oncall.sh on process failure."""
-    return _env_or_string_secret('AGENT_ENGINE_ALERT_WEBHOOK_URL', 'alert-webhook')
-
-
 def get_aws_access_key_id() -> str:
     return _env_or_json_secret('AWS_ACCESS_KEY_ID', 'aws-credentials', 'AWS_ACCESS_KEY_ID')
 
