@@ -9,9 +9,23 @@ import type { Skill } from "../skillService";
  * from the file I/O so the format is unit-testable.
  */
 
-/** Deterministic JSON snapshot of a skill row (stable key order). */
+/**
+ * Deterministic JSON snapshot of a skill row (stable key order at every level).
+ * A recursive key-sorting REPLACER is used — not an array allowlist, which
+ * JSON.stringify applies at every depth and would strip nested objects like
+ * `schedule` down to `{}`, losing data the backup exists to protect.
+ */
 export function serializeSkillBackup(skill: Skill): string {
-  return JSON.stringify(skill, Object.keys(skill).sort(), 2);
+  return JSON.stringify(
+    skill,
+    (_key, value) =>
+      value && typeof value === "object" && !Array.isArray(value)
+        ? Object.fromEntries(
+            Object.entries(value).sort(([a], [b]) => a.localeCompare(b)),
+          )
+        : value,
+    2,
+  );
 }
 
 /** Parse a snapshot produced by serializeSkillBackup back into a Skill. */
