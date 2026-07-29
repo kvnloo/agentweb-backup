@@ -39,6 +39,15 @@ jest.mock('../utils/sseProgress', () => ({
   emitProgress: jest.fn(),
 }));
 
+// ENG-705: generateSharedResponse now gates on the share owner's token
+// allowance before generating. Stub it as "within limits" so these tests keep
+// exercising anonymous-sender tagging rather than the usage gate (which has its
+// own suite in agentModeController.ishareUsageGate.test.ts).
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn().mockResolvedValue({ allowed: true, warning: false, percentUsed: 0 }),
+  incrementUserTokenUsage: jest.fn(),
+}));
+
 import { chatbotDb } from '../services/chatbotService';
 import { agentModeService } from '../services/agentModeService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';

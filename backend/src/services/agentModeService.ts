@@ -13856,6 +13856,81 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Fail closed before spending a Meta API call we can prove will be refused.
+   *
+   * Only an authoritative 'missing' (recorded `granted_scopes` that contain no
+   * ads scope) blocks here. A legacy record with no `granted_scopes` reads as
+   * 'unknown' and is allowed through — its `scopes` field holds the scopes we
+   * *requested*, not what Meta granted, so refusing on it would lock out
+   * connections that actually work. Those are caught after the fact by
+   * normalizeMetaAdsReadError. (ENG-629)
+   */
+  private async assertMetaAdsScope(selected: any): Promise<void> {
+    const { getMetaAdsScopeState, buildMetaAdsScopeError } = await import('../utils/metaAdsScope');
+    if (getMetaAdsScopeState(selected?.config) !== 'missing') return;
+
+    const label = selected?.account_id || selected?.config?.ad_account_id;
+    throw buildMetaAdsScopeError({ accountLabel: label ? `act_${String(label).replace('act_', '')}` : undefined });
+  }
+
+  /**
+   * Turn Meta's authoritative "you never granted ads permission" refusal into the
+   * single actionable re-consent error, and record what we just learned.
+   *
+   * Two jobs, both required by ENG-629:
+   *  - Throw (not return a soft `{ success:false }`). The soft shape is what let
+   *    an unattended run render an empty report as though metrics came back.
+   *  - Persist the now-known grant so the next read fails at the pre-flight gate
+   *    instead of hitting Meta again with the same impossible request. The write
+   *    is best-effort: a persistence failure must never mask the user-facing error.
+   *
+   * Returns normally when the error is NOT a scope problem, so callers keep their
+   * existing handling for rate limits, validation errors (ENG-630), etc.
+   */
+  private async normalizeMetaAdsReadError(
+    error: any,
+    userId: string,
+    connection?: { platform?: string; account_id?: string; config?: any }
+  ): Promise<void> {
+    const {
+      isMetaAdsScopeRefusal,
+      buildMetaAdsScopeError,
+      META_ADS_READ_SCOPES,
+    } = await import('../utils/metaAdsScope');
+
+    // Strictly an Ads-scope refusal. A generic permission error must fall
+    // through untouched — narrowing a grant on that evidence would brick a
+    // connection that actually has ads access (Greptile P1-2).
+    if (!isMetaAdsScopeRefusal(error)) return;
+
+    if (connection?.account_id && connection?.platform) {
+      try {
+        const previous: unknown = connection.config?.granted_scopes;
+        const retained = (Array.isArray(previous) ? previous : [])
+          .filter((s: unknown) => typeof s === 'string')
+          .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+
+        const { updateAccountConfig } = await import('./connectedAccountsDb');
+        await updateAccountConfig(userId, connection.platform as any, connection.account_id, {
+          // Meta just told us authoritatively that no ads scope is granted.
+          // Recording it converts every subsequent attempt into a pre-flight refusal.
+          granted_scopes: retained,
+          ads_scope_revoked_at: new Date().toISOString(),
+        });
+      } catch (persistError: any) {
+        console.warn(
+          `[AgentMode] ENG-629: could not persist missing Meta ads scope for user ${userId}: ${persistError?.message ?? persistError}`
+        );
+      }
+    }
+
+    throw buildMetaAdsScopeError({
+      accountLabel: connection?.account_id ? `act_${String(connection.account_id).replace('act_', '')}` : undefined,
+      cause: error,
+    });
+  }
+
+  /**
    * Ensure the selected Meta ad-account token is usable, refreshing it inline
    * if it is expired or close to expiry. Meta has no refresh tokens, so we
    * re-exchange the still-valid (or recently-expired-but-exchangeable) token
@@ -13926,10 +14001,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       await this.ensureUsableMetaToken(selected, selected.userId || userId);
+      await this.assertMetaAdsScope(selected);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
-        accessToken: selected.config.access_token
+        accessToken: selected.config.access_token,
+        connection: selected
       };
     }
 
@@ -13948,12 +14025,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const selected = fbAccounts[0];
 
     await this.ensureUsableMetaToken(selected, selected.userId || userId);
+    await this.assertMetaAdsScope(selected);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 
     return {
       accountId: clean(selected.account_id || selected.config?.ad_account_id),
-      accessToken: selected.config.access_token
+      accessToken: selected.config.access_token,
+      connection: selected
     };
   }
 
@@ -14649,8 +14728,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     account_id?: string,
     options: { campaignId?: string; fields?: string | string[] } = {}
   ): Promise<any> {
+    let connection: any;
     try {
-      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      const credentials = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = credentials;
+      connection = (credentials as any).connection;
       // Only forward the read-options bag when the caller supplied a campaign_id filter or
       // an explicit fields selection; otherwise call listCampaigns the same 2-arg way as
       // before. This preserves the CALL CONVENTION for a plain list-all — it does NOT keep
@@ -14672,6 +14754,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
+      // A permission refusal from Meta is not a "no campaigns" result — throw the
+      // actionable re-consent error and record the grant we just learned (ENG-629).
+      await this.normalizeMetaAdsReadError(error, connection?.userId || userId, connection);
       console.error('AgentMode: Error fetching Meta ad campaigns:', error);
       return {
         success: false,
@@ -26776,6 +26861,26 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // List connected accounts helper
+  /**
+   * Capability annotation for a Meta ad account in list_connected_accounts.
+   *
+   * Returns `{}` for non-Meta accounts and for Meta records whose grant we cannot
+   * prove either way, so the payload only ever carries facts. (ENG-629 AC1)
+   */
+  private async describeMetaAdsCapability(acc: any): Promise<Record<string, any>> {
+    if (acc?.platform !== 'meta' && acc?.platform !== 'facebook') return {};
+    if (acc?.config?.account_type !== 'ad_account') return {};
+
+    const { getMetaAdsScopeState, META_ADS_RECONSENT_MESSAGE } = await import('../utils/metaAdsScope');
+    const state = getMetaAdsScopeState(acc.config);
+
+    if (state === 'granted') return { ads_capable: true };
+    if (state === 'missing') {
+      return { ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE };
+    }
+    return {};
+  }
+
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
     try {
       const { getAccountsByUserIdIncludingOrgShared, isTokenValid } = await import('./connectedAccountsDb');
@@ -26842,6 +26947,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 currency: (acc.config as { currency?: string }).currency || 'USD',
               }
             : {}),
+          // A Meta ad account can be connected and unexpired yet unable to read ads
+          // data because the owner never granted ads_read/ads_management. Without
+          // this, `is_active: true` alone reads as "fully capable" and the model
+          // plans work it cannot complete (ENG-629). Only emitted when we actually
+          // know — an unknown legacy record stays silent rather than crying wolf.
+          ...(await this.describeMetaAdsCapability(acc)),
         })))
       };
     } catch (error) {
@@ -27297,6 +27408,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           success: false,
           message: `Failed to load posts: ${accountResult.error}`,
           error: accountResult.error,
+        };
+      }
+
+      // ENG-660: for a personal LinkedIn account, AgentWeb works from the posts
+      // created through AgentWeb itself (personal profiles have no organic post
+      // ingestion — only AgentWeb-published posts are ever on file). When none
+      // are on file, a bare "Successfully loaded 0 posts" led the model to claim
+      // the fetch of the
+      // user's posts succeeded (a tool-success hallucination). Signal this as an
+      // explicitly-unsupported read via organicReadUnsupported + the message so
+      // the model states the truth instead of implying it read the user's
+      // LinkedIn. success stays true on purpose: nothing failed (the account is
+      // connected and healthy), so this must NOT render as a tool "failure" in
+      // the UI. The message leads with what AgentWeb DOES (positive, ownership
+      // framing) so the model doesn't present this as a weakness/"limitation".
+      const accountType = (matchingAccount.config as any)?.account_type;
+      if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
+        return {
+          success: true,
+          organicReadUnsupported: true,
+          posts: [],
+          message:
+            'AgentWeb works from the LinkedIn posts you create with it, and there aren\'t any AgentWeb-created posts on file for this personal account — so there\'s nothing here to analyze for writing voice. Frame this as normal AgentWeb behavior and keep the focus on the constructive next step — do not describe it as a shortcoming and do not blame any external platform. Do NOT claim you have read or analyzed the user\'s existing LinkedIn posts, and there\'s no need to retry. The best next step: invite the user to paste or upload a few of their recent posts, then build their writing-voice profile from those — and offer to save it so future posts match their style.',
         };
       }
 
