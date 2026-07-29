@@ -1,3 +1,56 @@
+## ENG-705: unauthenticated share generate + unrate-limited duplicate could burn v0/LLM credits (2026-07-29)
+
+Two cost-leak surfaces closed with primitives that already existed. Investigation findings:
+
+- **The filing's AC 2 (attribution) was already satisfied — only the gate was missing.** The issue
+  read as "these paths spend LLM budget with no usage gate **and no attributable user**". The first
+  half was true, the second was not: `generateSharedResponse` passes `session.userId` into
+  `generateSessionResponse`, which reaches `incrementUserTokenUsage(userId, ...)` in
+  `agentModeService.ts`. Share spend has always been booked to the share **owner**. So the fix is
+  one `checkTokenUsage(session.userId)` call, not a new attribution path or an anonymous-budget
+  concept. Two of the new tests pass against pre-fix code by design — they are characterization
+  tests pinning that fact so a future refactor cannot quietly lose it.
+- **`checkTokenUsage` was already imported in `agentModeController.ts`** (used by the authenticated
+  `/generate` path at the `usageStatus` check). The share gate is deliberately the *same* call in
+  the *same* shape returning the *same* 429 — zero new imports, zero new concepts.
+- **Gate placement matters for the session lock.** It sits inside the `try` that follows
+  `tryClaimSessionGeneration`, so the existing `finally { releaseSessionGeneration(...) }` releases
+  on the 429 path. Placing it before the claim would also have worked, but inside the try mirrors
+  the authenticated path exactly and is covered by a regression test asserting the owner is not
+  locked out of their own session after a visitor hits the limit.
+- **Duplicate reuses the module's existing `rateLimiter`, deliberately sharing generate's quota
+  bucket** rather than getting its own. A separate limiter would have let a caller drain 10
+  generates *and* 10 duplicates. Sharing the map means duplicate cannot be used to obtain fresh
+  quota — asserted directly.
+- **`"view"` → `"edit"` on duplicate is net-subtractive.** Duplicate was a third authorization
+  shape (deploy/iterate required `"edit"`, duplicate required `"view"`); it now matches iterate.
+  The pre-fix test run proved the impact concretely: a view-only org member received `201` — a
+  full v0 generation — on someone else's page.
+- **Gotcha for anyone adding a dependency to `generateSharedResponse`:** five test suites drive it
+  (`ishareModel`, `ishareAnonymousSender`, `agentModeSharing`, `sharingIntegration`,
+  `interactiveShareExpiration`). The first four needed a `tokenUsageService` stub added; each was
+  verified green on `origin/main` first so the failures were provably the new dependency, not a
+  regression, and no assertion was changed. `interactiveShareExpiration` needs none — it exercises
+  the expired-share 410 path, which returns before the gate.
+- **Known limitation, unchanged by this PR:** the landing-page rate limiter is an in-process
+  `Map`, so limits are per backend instance rather than global. Pre-existing; worth noting if
+  ENG-666/ENG-694 metering makes cross-instance accounting a requirement.
+- **The gate's first shape shipped a disclosure, and our own test hid it (Greptile P1, review of
+  `1c0a078a`).** Mirroring the authenticated `/generate` 429 "exactly" was right for the *check*
+  and wrong for the *response*: the authenticated path returns `tokenUsage: usageStatus` to the
+  account that owns it, but this route sits before `authenticateToken`, so the same body handed
+  any share-link holder the owner's allowance, bonus, effective allowance, billing month, dollar
+  spend (`costUsed`), cost cap and enforcement state — the same object the authenticated
+  subscription-usage endpoint serves. **Symmetry across an authentication boundary is not
+  symmetry.** When copying a response shape, re-ask who the reader is.
+- **The agent-written test asserted the bug.** It required the body to *contain* `tokenUsage`
+  (`expect(body.tokenUsage).toEqual(expect.objectContaining({...}))`), so the leak was pinned as
+  intended behavior and the suite went green over it — the exact failure mode
+  `loop-acceptance-tests.md` exists to prevent, and it survived because none of the six
+  human-written ACs constrain the denial body. The replacement asserts the ownership boundary
+  instead: no `TokenUsageStatus` field may appear under any key, so a future re-add by spread or
+  rename fails too. Worth remembering: a test written by whoever wrote the code will happily
+  describe the code rather than the requirement.
 ## ENG-629: fail closed + prompt re-consent when a Meta connection lacks Ads scopes (2026-07-29)
 
 Live signal: OPS-79 fired twice in 24h — the scheduled Meta Ads report on account
