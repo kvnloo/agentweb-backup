@@ -151,6 +151,8 @@ set_describe_states() {
 run_deploy() {
   local dir="$1"
   shift
+  local started
+  started=$(date +%s)
   set +e
   env \
     PATH="${WORKDIR}/bin:${PATH}" \
@@ -162,12 +164,13 @@ run_deploy() {
     EB_SOURCE_BUNDLE_S3_KEY='builds/backend-20260729-pr2216.zip' \
     EB_POLL_INTERVAL_SECONDS='0' \
     EB_SETTLE_TIMEOUT_SECONDS='2' \
-    EB_DEPLOY_TIMEOUT_SECONDS='2' \
+    EB_TOTAL_TIMEOUT_SECONDS='30' \
     EB_HEALTH_SETTLE_SECONDS='1' \
     "$@" \
     bash "${EB_DEPLOY_SCRIPT}" >"${WORKDIR}/out.txt" 2>&1
   LAST_EXIT=$?
   set -e
+  LAST_DURATION=$(( $(date +%s) - started ))
   LAST_OUTPUT="$(cat "${WORKDIR}/out.txt")"
 }
 
@@ -209,7 +212,7 @@ set_describe_states "$M" \
   'Ready|Green|old-version' \
   'Updating|Grey|old-version' \
   'Ready|Green|backend-20260729-pr2216'
-run_deploy "$M" EB_DEPLOY_TIMEOUT_SECONDS='30'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='30'
 check 'happy path exits 0 once the environment reports the new version' 0 \
   'SUCCESS: environment '"'"'test-env'"'"' is Ready, running version '"'"'backend-20260729-pr2216'"'"', health=Green.'
 
@@ -233,14 +236,14 @@ set_create_result "$M" '255|An error occurred (InvalidParameterValue) when calli
 set_describe_states "$M" \
   'Ready|Green|old-version' \
   'Ready|Green|backend-20260729-pr2216'
-run_deploy "$M" EB_DEPLOY_TIMEOUT_SECONDS='30'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='30'
 check 'AC2: an already-exists collision continues with the reason logged' 0 \
   'already exists; reusing the existing version'
 
 # AC3 — the environment settles Ready but on the wrong version: never success.
 M=$(new_mock_dir)
 set_describe_states "$M" 'Ready|Green|old-version'
-run_deploy "$M" EB_POLL_INTERVAL_SECONDS='1' EB_DEPLOY_TIMEOUT_SECONDS='2'
+run_deploy "$M" EB_POLL_INTERVAL_SECONDS='1' EB_TOTAL_TIMEOUT_SECONDS='2'
 check 'AC3: Ready on the wrong version fails instead of reporting success' 1 \
   'did not come up Ready on version'
 check 'AC3: the failure names the version actually observed' 1 'Version=old-version'
@@ -250,7 +253,7 @@ M=$(new_mock_dir)
 set_describe_states "$M" \
   'Ready|Green|old-version' \
   'Ready|Red|backend-20260729-pr2216'
-run_deploy "$M" EB_POLL_INTERVAL_SECONDS='1' EB_DEPLOY_TIMEOUT_SECONDS='30' EB_HEALTH_SETTLE_SECONDS='2'
+run_deploy "$M" EB_POLL_INTERVAL_SECONDS='1' EB_TOTAL_TIMEOUT_SECONDS='30' EB_HEALTH_SETTLE_SECONDS='2'
 check 'AC3: Red health on the new version fails the job' 1 'but its health stayed Red'
 
 # AC3 — Grey is transient and must not fail early.
@@ -259,7 +262,7 @@ set_describe_states "$M" \
   'Ready|Green|old-version' \
   'Ready|Grey|backend-20260729-pr2216' \
   'Ready|Green|backend-20260729-pr2216'
-run_deploy "$M" EB_POLL_INTERVAL_SECONDS='0' EB_DEPLOY_TIMEOUT_SECONDS='30' EB_HEALTH_SETTLE_SECONDS='30'
+run_deploy "$M" EB_POLL_INTERVAL_SECONDS='0' EB_TOTAL_TIMEOUT_SECONDS='30' EB_HEALTH_SETTLE_SECONDS='30'
 check 'AC3: transient Grey settles to Green and succeeds' 0 'health=Green'
 
 # AC3 — Yellow (degraded but serving) is accepted, matching prior behaviour.
@@ -267,7 +270,7 @@ M=$(new_mock_dir)
 set_describe_states "$M" \
   'Ready|Green|old-version' \
   'Ready|Yellow|backend-20260729-pr2216'
-run_deploy "$M" EB_DEPLOY_TIMEOUT_SECONDS='30'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='30'
 check 'AC3: Yellow health is accepted (only Red fails)' 0 'health=Yellow'
 
 # AC3 — the verify poll never terminates on a stuck environment.
@@ -275,7 +278,7 @@ M=$(new_mock_dir)
 set_describe_states "$M" \
   'Ready|Green|old-version' \
   'Updating|Grey|old-version'
-run_deploy "$M" EB_POLL_INTERVAL_SECONDS='1' EB_DEPLOY_TIMEOUT_SECONDS='2'
+run_deploy "$M" EB_POLL_INTERVAL_SECONDS='1' EB_TOTAL_TIMEOUT_SECONDS='2'
 check 'AC3: a never-finishing update times out and fails' 1 'did not come up Ready on version'
 
 # AC3 — a terminated environment fails immediately rather than burning the timeout.
@@ -294,7 +297,7 @@ set_describe_states "$M" \
   'Ready|Green|old-version' \
   'Ready|Green|old-version' \
   'Ready|Green|backend-20260729-pr2216'
-run_deploy "$M" EB_DEPLOY_TIMEOUT_SECONDS='30'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='30'
 check 'AC4: a concurrent-update collision is retried and then applied' 0 \
   'was mid-update on attempt 1/3'
 check 'AC4: the retried deploy still verifies the version' 0 'SUCCESS: environment'
@@ -315,6 +318,39 @@ set_describe_states "$M" 'Updating|Grey|old-version'
 run_deploy "$M" EB_POLL_INTERVAL_SECONDS='1' EB_SETTLE_TIMEOUT_SECONDS='2'
 check 'AC4: a never-settling environment fails before claiming a deploy' 1 \
   'for an in-progress update to finish'
+
+# AC3 — the health settle window restarts when the environment leaves and
+# re-enters Ready. Without the reset, the second Ready state is judged against
+# the first one's timestamp and fails immediately. (Greptile review, #2219.)
+M=$(new_mock_dir)
+set_describe_states "$M" \
+  'Ready|Green|old-version' \
+  'Ready|Red|backend-20260729-pr2216' \
+  'Updating|Grey|old-version' \
+  'Ready|Red|backend-20260729-pr2216' \
+  'Ready|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_POLL_INTERVAL_SECONDS='1' EB_TOTAL_TIMEOUT_SECONDS='30' EB_HEALTH_SETTLE_SECONDS='1'
+check 'AC3: leaving and re-entering Ready restarts the health settle window' 0 \
+  'restarting the health settle window'
+check 'AC3: the re-entered Ready state still verifies to success' 0 'SUCCESS: environment'
+
+# AC4 — the overall budget caps settling + retries + verification together, so
+# the script always reports the reason instead of being killed by the runner's
+# step timeout. (Greptile review, #2219.)
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version'
+run_deploy "$M" EB_POLL_INTERVAL_SECONDS='1' EB_SETTLE_TIMEOUT_SECONDS='60' \
+  EB_UPDATE_MAX_ATTEMPTS='3' EB_TOTAL_TIMEOUT_SECONDS='2'
+check 'AC4: the overall budget bounds the run and names itself in the failure' 1 \
+  'overall deploy budget of 2s was exhausted'
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if [ "${LAST_DURATION}" -le 20 ]; then
+  pass 'AC4: the run really stopped at the overall budget, not the 60s settle cap'
+else
+  printf '  FAIL %s\n       ran for %ss, expected <= 20s\n' \
+    'AC4: the run really stopped at the overall budget, not the 60s settle cap' "${LAST_DURATION}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
 
 # Environment lookup failures are fatal, not treated as "no version yet".
 M=$(new_mock_dir)

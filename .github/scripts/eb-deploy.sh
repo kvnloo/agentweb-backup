@@ -18,11 +18,17 @@
 #   EB_SOURCE_BUNDLE_S3_KEY      S3 key of the uploaded bundle
 #
 # Optional environment (defaults tuned for the production jobs):
-#   EB_SETTLE_TIMEOUT_SECONDS    Max wait for a pre-existing update to finish (default 600)
-#   EB_DEPLOY_TIMEOUT_SECONDS    Max wait for this version to go live (default 2400)
+#   EB_TOTAL_TIMEOUT_SECONDS     Absolute wall-clock budget for the whole script (default 2700)
+#   EB_SETTLE_TIMEOUT_SECONDS    Max wait per attempt for a pre-existing update (default 600)
 #   EB_HEALTH_SETTLE_SECONDS     Grace for health to leave Grey/Red once Ready (default 180)
 #   EB_POLL_INTERVAL_SECONDS     Seconds between describe-environments polls (default 15)
 #   EB_UPDATE_MAX_ATTEMPTS       Retries for a concurrent-update collision (default 3)
+#
+# EB_TOTAL_TIMEOUT_SECONDS is an absolute deadline covering settling, retries and
+# verification together, so the worst case cannot exceed it no matter how many
+# concurrent-update retries happen. The calling step's `timeout-minutes` must sit
+# above it, so this script always reports the reason rather than being killed
+# mid-poll by the runner.
 #
 # Exit status: 0 only when the environment is Ready, reports EB_VERSION_LABEL as
 # its running version, and its health is neither Grey nor Red. Anything else
@@ -30,11 +36,14 @@
 
 set -euo pipefail
 
+EB_TOTAL_TIMEOUT_SECONDS="${EB_TOTAL_TIMEOUT_SECONDS:-2700}"
 EB_SETTLE_TIMEOUT_SECONDS="${EB_SETTLE_TIMEOUT_SECONDS:-600}"
-EB_DEPLOY_TIMEOUT_SECONDS="${EB_DEPLOY_TIMEOUT_SECONDS:-2400}"
 EB_HEALTH_SETTLE_SECONDS="${EB_HEALTH_SETTLE_SECONDS:-180}"
 EB_POLL_INTERVAL_SECONDS="${EB_POLL_INTERVAL_SECONDS:-15}"
 EB_UPDATE_MAX_ATTEMPTS="${EB_UPDATE_MAX_ATTEMPTS:-3}"
+
+# Absolute epoch deadline for the whole run; set in main().
+EB_RUN_DEADLINE=0
 
 # Populated by read_environment_state.
 EB_STATUS=''
@@ -64,6 +73,23 @@ require_env() {
 
 now_seconds() {
   date +%s
+}
+
+# Clamps a phase deadline to the overall run deadline, so no phase can push the
+# total past EB_TOTAL_TIMEOUT_SECONDS.
+capped_deadline() {
+  local own="$1"
+  if [ "${own}" -gt "${EB_RUN_DEADLINE}" ]; then
+    printf '%s' "${EB_RUN_DEADLINE}"
+  else
+    printf '%s' "${own}"
+  fi
+}
+
+# True once the overall budget is spent, so timeout messages can name the right
+# budget instead of blaming the phase that happened to be running.
+run_budget_exhausted() {
+  [ "$(now_seconds)" -ge "${EB_RUN_DEADLINE}" ]
 }
 
 # Reads Status, Health and VersionLabel in a single describe-environments call
@@ -131,7 +157,7 @@ create_application_version() {
 wait_for_environment_ready() {
   local phase="$1"
   local deadline
-  deadline=$(( $(now_seconds) + EB_SETTLE_TIMEOUT_SECONDS ))
+  deadline=$(capped_deadline "$(( $(now_seconds) + EB_SETTLE_TIMEOUT_SECONDS ))")
 
   while :; do
     read_environment_state
@@ -140,6 +166,10 @@ wait_for_environment_ready() {
 
     if [ "${EB_STATUS}" = "Ready" ]; then
       return 0
+    fi
+
+    if run_budget_exhausted; then
+      fail "the overall deploy budget of ${EB_TOTAL_TIMEOUT_SECONDS}s was exhausted while the environment '${EB_ENVIRONMENT_NAME}' was still ${EB_STATUS} (${phase}). Version '${EB_VERSION_LABEL}' was NOT applied."
     fi
 
     if [ "$(now_seconds)" -ge "${deadline}" ]; then
@@ -185,8 +215,7 @@ update_environment() {
 # The gate that makes a green check mean something: poll until the environment
 # is Ready AND reports this exact version, then assert health is not Red.
 verify_deployment() {
-  local deadline ready_since
-  deadline=$(( $(now_seconds) + EB_DEPLOY_TIMEOUT_SECONDS ))
+  local ready_since
   ready_since=0
 
   while :; do
@@ -211,10 +240,19 @@ verify_deployment() {
       if [ "$(( $(now_seconds) - ready_since ))" -ge "${EB_HEALTH_SETTLE_SECONDS}" ]; then
         fail "environment '${EB_ENVIRONMENT_NAME}' took version '${EB_VERSION_LABEL}' but its health stayed ${EB_HEALTH} for ${EB_HEALTH_SETTLE_SECONDS}s after becoming Ready."
       fi
+    else
+      # The environment left Ready (or is reporting another version) again, so
+      # the health grace restarts when it next settles. Without this reset a
+      # later Ready state would be judged against the first one's timestamp and
+      # fail immediately instead of getting its own settle window.
+      if [ "${ready_since}" -ne 0 ]; then
+        log "Environment left the Ready/${EB_VERSION_LABEL} state; restarting the health settle window."
+        ready_since=0
+      fi
     fi
 
-    if [ "$(now_seconds)" -ge "${deadline}" ]; then
-      fail "environment '${EB_ENVIRONMENT_NAME}' did not come up Ready on version '${EB_VERSION_LABEL}' within ${EB_DEPLOY_TIMEOUT_SECONDS}s. Last observed Status=${EB_STATUS} Health=${EB_HEALTH} Version=${EB_CURRENT_VERSION}."
+    if run_budget_exhausted; then
+      fail "environment '${EB_ENVIRONMENT_NAME}' did not come up Ready on version '${EB_VERSION_LABEL}' within the overall deploy budget of ${EB_TOTAL_TIMEOUT_SECONDS}s. Last observed Status=${EB_STATUS} Health=${EB_HEALTH} Version=${EB_CURRENT_VERSION}."
     fi
 
     sleep "${EB_POLL_INTERVAL_SECONDS}"
@@ -228,7 +266,10 @@ main() {
   require_env EB_SOURCE_BUNDLE_S3_BUCKET
   require_env EB_SOURCE_BUNDLE_S3_KEY
 
+  EB_RUN_DEADLINE=$(( $(now_seconds) + EB_TOTAL_TIMEOUT_SECONDS ))
+
   log "Deploying '${EB_VERSION_LABEL}' to application '${EB_APPLICATION_NAME}' environment '${EB_ENVIRONMENT_NAME}'."
+  log "Overall budget: ${EB_TOTAL_TIMEOUT_SECONDS}s (settle cap ${EB_SETTLE_TIMEOUT_SECONDS}s per attempt, up to ${EB_UPDATE_MAX_ATTEMPTS} attempts)."
   create_application_version
   update_environment
   verify_deployment

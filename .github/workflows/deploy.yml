@@ -138,14 +138,14 @@ jobs:
       # environment actually came up on it. Every AWS failure fails this step —
       # see .github/scripts/eb-deploy.sh (ENG-734).
       - name: Deploy to Elastic Beanstalk and verify the environment took it
-        timeout-minutes: 55
+        timeout-minutes: 50
         env:
           EB_APPLICATION_NAME: ${{ vars.EB_BACKEND_APPLICATION_NAME }}
           EB_ENVIRONMENT_NAME: ${{ vars.EB_BACKEND_ENVIRONMENT_NAME }}
           EB_VERSION_LABEL: ${{ steps.version.outputs.version_label }}
           EB_SOURCE_BUNDLE_S3_BUCKET: elasticbeanstalk-${{ env.AWS_REGION }}-992382574572
           EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip
-          EB_DEPLOY_TIMEOUT_SECONDS: '2400'
+          EB_TOTAL_TIMEOUT_SECONDS: '2700'
         run: bash .github/scripts/eb-deploy.sh
 
       - name: Backend Deployment Status
@@ -242,14 +242,14 @@ jobs:
       # environment actually came up on it. Every AWS failure fails this step —
       # see .github/scripts/eb-deploy.sh (ENG-734).
       - name: Deploy to Elastic Beanstalk and verify the environment took it
-        timeout-minutes: 35
+        timeout-minutes: 30
         env:
           EB_APPLICATION_NAME: ${{ vars.EB_PARTNER_APPLICATION_NAME }}
           EB_ENVIRONMENT_NAME: ${{ vars.EB_PARTNER_ENVIRONMENT_NAME }}
           EB_VERSION_LABEL: ${{ steps.version.outputs.version_label }}
           EB_SOURCE_BUNDLE_S3_BUCKET: elasticbeanstalk-${{ env.AWS_REGION }}-992382574572
           EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip
-          EB_DEPLOY_TIMEOUT_SECONDS: '1200'
+          EB_TOTAL_TIMEOUT_SECONDS: '1500'
         run: bash .github/scripts/eb-deploy.sh
 
       - name: Partner Portal Deployment Status
