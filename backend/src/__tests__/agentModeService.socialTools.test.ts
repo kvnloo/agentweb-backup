@@ -531,6 +531,10 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.message.toLowerCase()).not.toContain('limitation');
       expect(result.message.toLowerCase()).toContain('do not blame any external platform');
       expect(result.message.toLowerCase()).toContain('do not claim');
+      // State-based ("none on file"), not a publish-history claim ("hasn't
+      // published yet") — the latter would be wrong if posts were published then
+      // all deleted, which also reaches this branch (0 rows, no error).
+      expect(result.message.toLowerCase()).toContain('on file');
     });
 
     // ENG-660 precedence guard: when a PERSONAL LinkedIn account's adapter
