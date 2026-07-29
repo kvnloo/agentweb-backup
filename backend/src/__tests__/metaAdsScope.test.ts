@@ -84,6 +84,38 @@ describe('getMetaAdsScopeState', () => {
     const config = { ...baseConfig, granted_scopes: [null, 42, 'ads_read'] as any };
     expect(getMetaAdsScopeState(config)).toBe<MetaAdsScopeState>('granted');
   });
+
+  // ── Recorded revocation ──────────────────────────────────────────────────
+  // When Meta authoritatively refuses a read we persist what we learned. For a
+  // legacy record that means granted_scopes becomes [] — which on its own is
+  // indistinguishable from "we never asked". `ads_scope_revoked_at` is what
+  // makes the refusal explicit, so the next read fails at the pre-flight gate
+  // instead of hitting Meta again with the same impossible request.
+
+  it("returns 'missing' when a revocation was recorded, even with an empty granted_scopes", () => {
+    const config = {
+      ...baseConfig,
+      granted_scopes: [],
+      ads_scope_revoked_at: '2026-07-29T09:00:00.000Z',
+    };
+    expect(getMetaAdsScopeState(config)).toBe<MetaAdsScopeState>('missing');
+  });
+
+  it("returns 'missing' when a revocation was recorded and granted_scopes is absent", () => {
+    const config = { ...baseConfig, ads_scope_revoked_at: '2026-07-29T09:00:00.000Z' };
+    expect(getMetaAdsScopeState(config)).toBe<MetaAdsScopeState>('missing');
+  });
+
+  it("lets a fresh grant win over a stale revocation marker — re-consent recovers", () => {
+    // If the user reconnects and Meta reports ads access, that is newer truth than
+    // any previously recorded refusal. Recovery must not require manual cleanup.
+    const config = {
+      ...baseConfig,
+      granted_scopes: ['ads_read'],
+      ads_scope_revoked_at: '2026-07-29T09:00:00.000Z',
+    };
+    expect(getMetaAdsScopeState(config)).toBe<MetaAdsScopeState>('granted');
+  });
 });
 
 describe('hasMetaAdsReadScope', () => {

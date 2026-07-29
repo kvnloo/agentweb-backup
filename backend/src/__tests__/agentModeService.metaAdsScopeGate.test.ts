@@ -254,6 +254,29 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       expect(updates.granted_scopes).not.toContain('ads_management');
     });
 
+    it('records a signal strong enough that the NEXT read fails without calling Meta', async () => {
+      // AC3, end to end. Asserting "the persisted array has no ads scope" is not
+      // enough: for a legacy record the retained array is [], which is
+      // indistinguishable from "we never asked" and would let the gate fall
+      // through to Meta again on every subsequent scheduled run.
+      (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(metaPermissionError());
+
+      await agentModeService.listMetaAdsCampaignsNew('user1').catch(() => undefined);
+
+      expect(metaService.listCampaigns).toHaveBeenCalledTimes(1);
+      const persisted = mockUpdateAccountConfig.mock.calls[0][3];
+
+      // Feed exactly what we persisted back in, as the next run would read it.
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        id: 'user1',
+        connected_accounts: [metaAccount({ ...legacyUser.connected_accounts[0].config, ...persisted })],
+      });
+
+      await expect(agentModeService.listMetaAdsCampaignsNew('user1')).rejects.toThrow(/ads_read/);
+      expect(metaService.listCampaigns).toHaveBeenCalledTimes(1); // still 1 — never retried
+    });
+
     it('still surfaces the actionable error even if persisting the capability fails', async () => {
       // The self-heal is best-effort; it must never mask the user-facing failure.
       (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);

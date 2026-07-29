@@ -38,6 +38,15 @@ export type MetaAdsScopeState = 'granted' | 'missing' | 'unknown';
 export interface MetaAdsScopeConfigLike {
   granted_scopes?: unknown;
   scopes?: unknown;
+  /**
+   * Set when Meta authoritatively refused an ads read for lack of permission.
+   *
+   * Load-bearing: for a legacy record the retained grant collapses to `[]`, which
+   * is indistinguishable from "we never asked". Without this marker the state
+   * would fall back to 'unknown' and every scheduled run would keep re-attempting
+   * the same impossible read.
+   */
+  ads_scope_revoked_at?: unknown;
 }
 
 /**
@@ -67,8 +76,20 @@ export const getMetaAdsScopeState = (
   config: MetaAdsScopeConfigLike | null | undefined
 ): MetaAdsScopeState => {
   const granted = config?.granted_scopes;
-  if (!Array.isArray(granted) || granted.length === 0) return 'unknown';
-  return granted.some(isAdsScope) ? 'granted' : 'missing';
+  const grantedList = Array.isArray(granted) ? granted : [];
+
+  // An affirmative grant is the newest truth and always wins — a user who
+  // reconnects recovers without anyone clearing the revocation marker by hand.
+  if (grantedList.some(isAdsScope)) return 'granted';
+
+  // Meta's own refusal, recorded. Authoritative even when the retained grant is
+  // empty, which is exactly the legacy-record case.
+  if (config?.ads_scope_revoked_at) return 'missing';
+
+  // No grant recorded and no refusal seen: we genuinely do not know.
+  if (grantedList.length === 0) return 'unknown';
+
+  return 'missing';
 };
 
 /**

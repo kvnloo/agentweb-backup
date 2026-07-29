@@ -34,6 +34,14 @@ unattended run produced a report with no data. Investigation findings that shape
 - **Non-secret by construction.** Meta echoes access tokens and `fbtrace_id` into error strings, so
   the upstream error is attached as `cause` for logs and never interpolated into the message. One
   canonical message for every trigger, so this is "one actionable error", not a family of near-duplicates.
+- **Self-review catch worth keeping.** The first cut of the self-heal wrote back the retained
+  grant, which for a legacy record collapses to `[]` — and `[]` was mapped to `unknown`, not
+  `missing`. So the pre-flight gate would have fallen through to Meta on every subsequent run,
+  defeating AC3 for exactly the records that needed it. The original test ("persisted array has no
+  ads scope") passed anyway, because `[]` trivially satisfies it. The fix is an explicit
+  `ads_scope_revoked_at` marker that makes the refusal unambiguous, plus a behavioral test that
+  feeds the persisted config back in and asserts the second read never calls Meta. Lesson: assert
+  the *downstream consequence* of a write, not the shape of the write.
 - Gate coverage note: the pre-flight gate sits in `getMetaCredentials`, the single choke point for
   every connected-account Meta tool, so it covers all ads paths including writes. Post-flight
   normalization is wired into the campaign read path named in the reporter signal; once the
