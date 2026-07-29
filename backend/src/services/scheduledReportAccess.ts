@@ -109,6 +109,23 @@ export async function resolveAuthorizedReportRecipients(params: {
   }
 
   const normalizedOwner = ownerEmail ? ownerEmail.toLowerCase() : undefined;
+
+  // Verify current admin status per address, cached so the owner (which may also
+  // appear in the recipient list) is looked up at most once. Fail-closed: an
+  // unverifiable address is treated as non-admin.
+  const adminCache = new Map<string, boolean>();
+  const isAdminEmail = async (normalized: string): Promise<boolean> => {
+    if (adminCache.has(normalized)) return adminCache.get(normalized)!;
+    let ok = false;
+    try {
+      ok = ((await userDb.getUserByEmail(normalized)) as any)?.isAdmin === true;
+    } catch {
+      ok = false;
+    }
+    adminCache.set(normalized, ok);
+    return ok;
+  };
+
   const authorized: string[] = [];
   const withheld: string[] = [];
 
@@ -117,33 +134,25 @@ export async function resolveAuthorizedReportRecipients(params: {
     if (!normalized) {
       continue;
     }
-    // Owner is always authorized to receive their own run's output.
-    if (normalized === normalizedOwner) {
-      authorized.push(email);
-      continue;
-    }
-    let isAdmin = false;
-    try {
-      const user = await userDb.getUserByEmail(normalized);
-      isAdmin = (user as any)?.isAdmin === true;
-    } catch {
-      isAdmin = false; // fail-closed: unverifiable recipient is withheld
-    }
-    if (isAdmin) {
+    // No special-casing for the owner: authorization is the recipient's CURRENT
+    // admin status, so an owner whose admin access was revoked before delivery
+    // is withheld like anyone else.
+    if (await isAdminEmail(normalized)) {
       authorized.push(email);
     } else {
       withheld.push(email);
     }
   }
 
-  // Ensure the owner receives the report + the withholding notice (custodian of
-  // the run's output) when something was withheld, or when no authorized
-  // recipient remains so the deliverable is not silently dropped.
+  // Add the owner (custodian of the run's output) so the report + withholding
+  // notice still lands when something was withheld or no authorized recipient
+  // remains — but ONLY if the owner is CURRENTLY an admin (revocation-safe).
   if (
     ownerEmail &&
     normalizedOwner &&
     !authorized.some((e) => e.toLowerCase() === normalizedOwner) &&
-    (withheld.length > 0 || authorized.length === 0)
+    (withheld.length > 0 || authorized.length === 0) &&
+    (await isAdminEmail(normalizedOwner))
   ) {
     authorized.push(ownerEmail);
   }

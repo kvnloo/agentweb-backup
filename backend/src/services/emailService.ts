@@ -1457,7 +1457,10 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
           recipients = authz.authorized;
           if (authz.withheld.length > 0) {
             const noticeText = `⚠️ ${authz.withheld.length} recipient(s) were withheld from this report because it contains cross-account account data and they are not authorized to receive it: ${authz.withheld.join(', ')}. To share this data, ensure recipients are admin users.`;
-            finalHtml = `<div style="margin:0 0 16px 0;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;color:#664d03;font-family:Arial,sans-serif;font-size:14px;">${noticeText}</div>${html}`;
+            // Escape the notice before HTML interpolation: withheld addresses are
+            // attacker-influenceable (a configured recipient can contain HTML
+            // metacharacters), so raw insertion would inject markup into the notice.
+            finalHtml = `<div style="margin:0 0 16px 0;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;color:#664d03;font-family:Arial,sans-serif;font-size:14px;">${this.escapeHtml(noticeText)}</div>${html}`;
             finalText = `${noticeText}\n\n${text}`;
             console.warn(`Scheduled report guard: withheld ${authz.withheld.length} unauthorized recipient(s) for session ${result.sessionId}: ${authz.withheld.join(', ')}`);
           }
