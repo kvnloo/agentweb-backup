@@ -33,6 +33,17 @@ async function main() {
   console.log(`created throwaway ${id}`);
 
   try {
+    // Give it a nested `schedule` so we exercise nested-field preservation
+    // (regression coverage for the backup array-replacer bug) end-to-end.
+    await skillService.updateSkill({
+      ...(await skillService.getSkill(id))!,
+      schedule: {
+        frequency: "weekly",
+        preferredTime: "09:00",
+        deliveryChannels: ["email"],
+        cronExpression: "0 9 * * 1",
+      },
+    });
     const original = (await skillService.getSkill(id))!;
     const dir = fs.mkdtempSync(`${os.tmpdir()}/eng204-e2e-`);
     const backupPath = backupSkill(original, dir, "e2e");
@@ -54,6 +65,7 @@ async function main() {
     check("apply: description preserved", applied.description === original.description);
     check("apply: isPublished preserved", applied.isPublished === original.isPublished);
     check("apply: createdAt preserved", applied.createdAt === original.createdAt);
+    check("apply: nested schedule preserved", JSON.stringify(applied.schedule) === JSON.stringify(original.schedule));
 
     // 3. idempotency — second apply must change nothing
     const plan2 = planSkillChange(applied, {
@@ -69,6 +81,7 @@ async function main() {
     const back = (await skillService.getSkill(id))!;
     check("rollback: systemPrompt restored", back.systemPrompt === original.systemPrompt);
     check("rollback: toolNames restored", sortedEq(back.toolNames, original.toolNames));
+    check("rollback: nested schedule restored", JSON.stringify(back.schedule) === JSON.stringify(original.schedule));
 
     fs.rmSync(dir, { recursive: true, force: true });
   } finally {

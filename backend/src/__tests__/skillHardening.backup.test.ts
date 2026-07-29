@@ -18,9 +18,26 @@ const skill = {
   updatedAt: "t1",
 } as any;
 
+const skillWithNesting = {
+  ...skill,
+  skillId: "s-nested",
+  schedule: {
+    frequency: "weekly",
+    preferredTime: "09:00",
+    deliveryChannels: ["email", "slack"],
+    cronExpression: "0 9 * * 1",
+  },
+} as any;
+
 describe("skill backup", () => {
   it("round-trips a skill through serialize/parse without loss", () => {
     expect(parseSkillBackup(serializeSkillBackup(skill))).toEqual(skill);
+  });
+
+  it("preserves NESTED objects (e.g. schedule) — regression for the array-replacer bug", () => {
+    const restored = parseSkillBackup(serializeSkillBackup(skillWithNesting));
+    expect(restored).toEqual(skillWithNesting);
+    expect(restored.schedule).toEqual(skillWithNesting.schedule);
   });
 
   it("serializes with stable (sorted) key order for reviewable diffs", () => {
