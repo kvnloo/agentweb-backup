@@ -33,6 +33,9 @@ import {
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
+// ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
+// on existing report/run envelopes. No surface parses or re-ranks on its own.
+import { MarketingActionCarrier, normalizeMarketingActions } from '../services/marketingActionEnvelope';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
@@ -1761,12 +1764,17 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
 }
 
 // Common function to run a scheduled chat (used by both test and actual execution)
+//
+// ENG-446: the run result IS the run envelope. It carries the canonical
+// marketing-action payload (MarketingActionCarrier — optional, because legacy
+// runs carry none) alongside the existing output, and is persisted verbatim by
+// scheduleDb.addRunResult, so no separate action storage path exists.
 export async function runScheduledChat(
   schedule: any,
   userId: string,
   isTest: boolean = false,
   preGeneratedRunId?: string
-): Promise<{
+): Promise<MarketingActionCarrier & {
   scheduleId: string;
   runId: string;
   // ENG-396: 'pending_user_input' when the run parked on a blocking AskUserQuestion.
@@ -6465,7 +6473,14 @@ export const agentModeController = {
       // Get test history
       const testHistory = await scheduleDb.getRunResults(scheduleId);
 
-      res.json(testHistory);
+      // ENG-446: hand every consumer the canonical marketing-action list the run
+      // itself selected — same ids, same order, empty for legacy runs that carry
+      // none. Consumers render this; they never re-rank or regenerate it.
+      const historyWithActions = (testHistory || []).map((run: any) =>
+        run !== null && typeof run === 'object' ? normalizeMarketingActions(run) : run
+      );
+
+      res.json(historyWithActions);
     } catch (error) {
       console.error('AgentMode: Get test history error:', error);
       res.status(500).json({ error: 'Failed to get test history' });
