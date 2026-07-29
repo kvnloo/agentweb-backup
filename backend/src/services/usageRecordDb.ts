@@ -52,7 +52,10 @@ export interface UsageRecordIncrement {
 
   /** Vendor that served the call: "bedrock", "openai", "v0", "you.com", … */
   provider?: string;
-  /** Chat session the spend belongs to (declared on the caller context since Ship 1). */
+  /**
+   * Chat session this CALL came from (declared on the caller context since Ship 1).
+   * Persisted as the row's `lastSessionId` breadcrumb — see `UsageRecordRow`.
+   */
   sessionId?: string;
   /**
    * The thing being counted for a vendor that does NOT bill by tokens
@@ -93,7 +96,13 @@ export interface UsageRecordRow {
   ttl: number;
   /** Vendor dimension (ENG-693) — absent on every row written before that change. */
   provider?: string;
-  sessionId?: string;
+  /**
+   * The most recent session that contributed to this row — a trace breadcrumb, NOT
+   * an attribution key. The row aggregates every session that used this
+   * {date}#{model}#{feature}, so its counters are not this session's alone. Never
+   * read it as "the session that owns this usage".
+   */
+  lastSessionId?: string;
   unit?: string;
   quantity?: number;
   costSource?: CostSource;
@@ -189,11 +198,13 @@ export const usageRecordDb = {
 
     // Descriptive (non-counter) attributes of the row. A row is a DAILY AGGREGATE
     // of N calls, so these are written with if_not_exists: the first writer's
-    // value sticks and the row never flaps between concurrent callers. All four
-    // go through ExpressionAttributeNames because `unit` is a DynamoDB reserved word.
+    // value sticks and the row never flaps between concurrent callers. That is
+    // sound only because each of these is constant across every writer to a given
+    // key — `recordVendorUsage` namespaces the model slot as `{provider}:{operation}`,
+    // so one row cannot mix vendors, units, or cost provenance. All three go through
+    // ExpressionAttributeNames because `unit` is a DynamoDB reserved word.
     const descriptive: Array<[string, unknown]> = [
       ["provider", inc.provider],
-      ["sessionId", inc.sessionId],
       ["unit", inc.unit],
       ["costSource", inc.costSource],
     ];
@@ -202,6 +213,20 @@ export const usageRecordDb = {
       names[`#${attr}`] = attr;
       values[`:${attr}`] = value;
       setClauses.push(`#${attr} = if_not_exists(#${attr}, :${attr})`);
+    }
+
+    // Session is the one call-level fact that is NOT constant across a row. The sort
+    // key is {date}#{model}#{feature}, so N sessions share one bucket while its
+    // counters accumulate all of their usage. Pinning a single id onto that row —
+    // the first (if_not_exists) or the last — reads as "this session owns this
+    // usage" and is false for every session but one. Stored as `lastSessionId`
+    // under plain SET so the attribute name states exactly what it holds: a trace
+    // breadcrumb to the most recent contributing session, never an attribution key.
+    // Session-granular spend would need the session in the sort key, which is a key
+    // change this slice deliberately excludes (see the issue's out-of-scope list).
+    if (inc.sessionId != null) {
+      values[":lastSessionId"] = inc.sessionId;
+      setClauses.push("lastSessionId = :lastSessionId");
     }
 
     await getDocumentClient()
