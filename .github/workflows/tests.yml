@@ -42,6 +42,15 @@ jobs:
           filters: |
             backend:
               - 'backend/**'
+              # This workflow builds, tests and deploys the backend, and
+              # eb-deploy.sh is what decides whether that deploy really
+              # happened, so both are part of the backend deploy path. Without
+              # these two lines a change to `backend-staging-deploy` can never
+              # run on its own PR: the fix ships unexercised, and the first
+              # thing to exercise it is somebody else's backend PR. Whatever
+              # gates backend merges has to gate its own changes (ENG-743).
+              - '.github/workflows/tests.yml'
+              - '.github/scripts/eb-deploy.sh'
             partner:
               - 'partner-portal/**'
             workflows:
@@ -289,13 +298,34 @@ jobs:
         working-directory: backend
         run: cp ../test-env/user-data-dev-auto.sh dist/
 
+      # Resolved once and reused by every later step, like deploy.yml's backend
+      # job: the date and PR suffix used to be recomputed in three places, so a
+      # run crossing midnight could upload one label and deploy another.
+      #
+      # The short SHA is what makes the verification below mean anything. A PR
+      # deploys to staging on every push, and a label of only `-prN` is the same
+      # string on every one of those pushes — so the environment is already
+      # reporting that VersionLabel before this run starts, and "the environment
+      # took our version" would be satisfied by a deploy that never ran. With
+      # the SHA the label names exactly one build, which is also what makes a
+      # rollback to a labelled version reproducible (ENG-743).
+      - name: Resolve staging version label
+        id: version
+        run: |
+          set -euo pipefail
+          SHORT_SHA="$(git rev-parse --short HEAD)"
+          VERSION_LABEL="backend-$(date +%Y%m%d)-pr${{ github.event.pull_request.number }}-${SHORT_SHA}"
+          echo "version_label=${VERSION_LABEL}" >> "$GITHUB_OUTPUT"
+          echo "Resolved staging version label: ${VERSION_LABEL}"
+
       - name: Package artifact
         working-directory: backend
+        env:
+          VERSION_LABEL: ${{ steps.version.outputs.version_label }}
         run: |
-          DATE=$(date +%Y%m%d)
-          PR_NUMBER=${{ github.event.pull_request.number }}
+          set -euo pipefail
           mkdir -p builds
-          zip -r "builds/backend-${DATE}-pr${PR_NUMBER}.zip" dist package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/backend-${DATE}-pr${PR_NUMBER}.zip" dist package.json package-lock.json
+          zip -r "builds/${VERSION_LABEL}.zip" dist package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/${VERSION_LABEL}.zip" dist package.json package-lock.json
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
@@ -304,61 +334,41 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy to Elastic Beanstalk (Staging)
-        timeout-minutes: 5
+      - name: Upload deployment package to S3
         working-directory: backend
-        run: |
-          DATE=$(date +%Y%m%d)
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          VERSION_LABEL="backend-${DATE}-pr${PR_NUMBER}"
-          echo "Deploying backend to staging: $VERSION_LABEL"
-
-          # Upload to S3
-          echo "Uploading deployment package to S3..."
-          aws s3 cp "builds/backend-${DATE}-pr${PR_NUMBER}.zip" "s3://elasticbeanstalk-${{ env.AWS_REGION }}-992382574572/builds/${VERSION_LABEL}.zip"
-
-          # Create new application version
-          echo "Creating new application version..."
-          aws elasticbeanstalk create-application-version \
-            --application-name ${{ vars.EB_BACKEND_STAGING_APPLICATION_NAME }} \
-            --version-label "$VERSION_LABEL" \
-            --source-bundle S3Bucket="elasticbeanstalk-${{ env.AWS_REGION }}-992382574572,S3Key=builds/${VERSION_LABEL}.zip" || echo "⚠️  Version creation failed (may already exist), continuing..."
-
-          # Deploy to environment
-          echo "Deploying to staging environment..."
-          aws elasticbeanstalk update-environment \
-            --environment-name ${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }} \
-            --version-label "$VERSION_LABEL" || echo "⚠️  Environment update failed (may be updating), but AWS deployment likely succeeded"
-
-      - name: Wait for staging backend readiness
-        timeout-minutes: 30
+        env:
+          VERSION_LABEL: ${{ steps.version.outputs.version_label }}
         run: |
           set -euo pipefail
-          for attempt in {1..120}; do
-            STATUS=$(aws elasticbeanstalk describe-environments \
-              --environment-names "${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}" \
-              --query 'Environments[0].Status' \
-              --output text)
-            HEALTH=$(aws elasticbeanstalk describe-environments \
-              --environment-names "${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}" \
-              --query 'Environments[0].Health' \
-              --output text)
-            echo "Staging status=$STATUS health=$HEALTH attempt=$attempt"
-            if [ "$STATUS" = "Ready" ] && [ "$HEALTH" != "Grey" ]; then
-              exit 0
-            fi
-            sleep 15
-          done
-          echo "Staging backend did not become ready."
-          exit 1
+          aws s3 cp "builds/${VERSION_LABEL}.zip" \
+            "s3://elasticbeanstalk-${{ env.AWS_REGION }}-992382574572/builds/${VERSION_LABEL}.zip"
 
+      # Creates the application version, applies it, and then proves the
+      # environment actually came up on it. Every AWS failure fails this step —
+      # see .github/scripts/eb-deploy.sh (ENG-734, wired to staging in ENG-743).
+      # The script's own budget stays under this step's timeout so it always
+      # reports the reason instead of being killed mid-poll; together they keep
+      # the 35 minutes the previous deploy + readiness steps allowed.
+      - name: Deploy to Elastic Beanstalk and verify the environment took it
+        timeout-minutes: 35
+        env:
+          EB_APPLICATION_NAME: ${{ vars.EB_BACKEND_STAGING_APPLICATION_NAME }}
+          EB_ENVIRONMENT_NAME: ${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }}
+          EB_VERSION_LABEL: ${{ steps.version.outputs.version_label }}
+          EB_SOURCE_BUNDLE_S3_BUCKET: elasticbeanstalk-${{ env.AWS_REGION }}-992382574572
+          EB_SOURCE_BUNDLE_S3_KEY: builds/${{ steps.version.outputs.version_label }}.zip
+          EB_TOTAL_TIMEOUT_SECONDS: '1800'
+        run: bash .github/scripts/eb-deploy.sh
+
+      # Only reachable when the step above proved the environment is Ready on
+      # this exact version, so this banner is now a report rather than a claim.
       - name: Backend Staging Deployment Status
+        env:
+          VERSION_LABEL: ${{ steps.version.outputs.version_label }}
         run: |
-          DATE=$(date +%Y%m%d)
-          PR_NUMBER=${{ github.event.pull_request.number }}
-          echo "🚀 Backend staging deployment initiated successfully!"
+          echo "🚀 Backend staging deployment verified!"
           echo "📊 Check deployment status: https://${{ env.AWS_REGION }}.console.aws.amazon.com/elasticbeanstalk/home?region=${{ env.AWS_REGION }}#/environments"
-          echo "✅ Deployed: backend-${DATE}-pr${PR_NUMBER}"
+          echo "✅ Environment ${{ vars.EB_BACKEND_STAGING_ENVIRONMENT_NAME }} is running: ${VERSION_LABEL}"
           echo "🔗 Staging URL: https://api-stage.agentweb.pro"
 
   partner-tests:
