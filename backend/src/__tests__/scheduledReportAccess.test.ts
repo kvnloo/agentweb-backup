@@ -127,17 +127,27 @@ describe('resolveAuthorizedReportRecipients', () => {
     expect(r.withheld).toEqual(['nonadmin@x.com', 'someone@x.com']);
   });
 
-  it('always authorizes the owner without a lookup, even if not an admin record', async () => {
-    // owner present in recipient list — must be kept regardless of lookup
+  it('withholds an owner whose admin access was revoked (no email special-casing)', async () => {
+    // owner is present in the recipient list but is no longer an admin — must be
+    // verified by current role and withheld, not trusted by email match.
     const r = await resolveAuthorizedReportRecipients({
-      recipients: ['owner@x.com', 'nonadmin@x.com'],
-      ownerEmail: 'owner@x.com',
+      recipients: ['nonadmin@x.com', 'admin2@x.com'],
+      ownerEmail: 'nonadmin@x.com', // former admin, now revoked
       isSensitive: true,
     });
-    expect(r.authorized).toContain('owner@x.com');
+    expect(r.authorized).toEqual(['admin2@x.com']); // owner NOT re-added
+    expect(r.withheld).toContain('nonadmin@x.com');
+    expect(mockGetUserByEmail).toHaveBeenCalledWith('nonadmin@x.com');
+  });
+
+  it('authorizes the owner only when the owner is currently an admin', async () => {
+    const r = await resolveAuthorizedReportRecipients({
+      recipients: ['nonadmin@x.com'],
+      ownerEmail: 'admin@x.com', // current admin, not in the recipient list
+      isSensitive: true,
+    });
+    expect(r.authorized).toEqual(['admin@x.com']); // added because currently admin
     expect(r.withheld).toEqual(['nonadmin@x.com']);
-    // owner was matched by email, not looked up
-    expect(mockGetUserByEmail).not.toHaveBeenCalledWith('owner@x.com');
   });
 
   it('fail-closed: a recipient whose lookup THROWS is withheld', async () => {

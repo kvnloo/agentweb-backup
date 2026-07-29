@@ -341,7 +341,7 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
     });
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: true });
     (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) =>
-      email === 'admin@example.com' ? { email, isAdmin: true } : { email, isAdmin: false }
+      email === 'admin@example.com' || email === 'owner@example.com' ? { email, isAdmin: true } : { email, isAdmin: false }
     );
     const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
 
@@ -364,6 +364,30 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
     expect(textContent).toContain('withheld');
   });
 
+  it('HTML-escapes withheld addresses in the notice so a crafted recipient cannot inject markup', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { list_all_clients: 1 },
+    });
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) =>
+      email === 'owner@example.com' ? { email, isAdmin: true } : { email, isAdmin: false }
+    );
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(
+      ['<img src=x onerror=alert(1)>@evil.com'],
+      'Daily User Activity Report',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    const [, , , htmlContent] = spy.mock.calls[0];
+    expect(htmlContent).not.toContain('<img src=x onerror=alert(1)>');
+    expect(htmlContent).toContain('&lt;img src=x onerror=alert(1)&gt;');
+  });
+
   it('still restricts when the counter is clean but the tool-call MESSAGES show a cross-account tool (swallowed-counter fail-open closed)', async () => {
     // calledFunctions missed list_all_clients (its counter write was swallowed),
     // but the authoritative tool-call message records prove it ran.
@@ -377,7 +401,9 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
       { role: 'tool', name: 'list_all_clients', content: '...' },
     ]);
     (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: true });
-    (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+    (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) =>
+      email === 'owner@example.com' ? { email, isAdmin: true } : { email, isAdmin: false }
+    );
     const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
 
     await emailService.sendScheduledChatResultEmail(
