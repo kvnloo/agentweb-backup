@@ -1,3 +1,41 @@
+## ENG-630: Meta Insights `filtering` shape + preserved 400 detail (2026-07-29)
+
+New pure module `backend/src/utils/metaInsightsFiltering.ts`, wired into
+`callMetaAdsInsightsApiWrapper`. Investigation findings:
+
+- **The reported `(#100) param filtering must be an array` is one of TWO defects sharing a root
+  cause, and the unreported one is worse.** The guard was `...(filtering?.length && { filtering })`.
+  A JSON *string* from the model has a truthy `.length`, so it went to Meta verbatim and got the
+  reported 400. A bare filter *object* has no `.length` at all, so the key was **silently omitted**
+  and Meta answered with whole-account rows — which the model then narrated as campaign-scoped
+  numbers. An error is loud; a widened query is a confident wrong answer. Both shapes are now
+  normalized, and anything unhonourable throws instead of being dropped.
+- **Normalization happens before `getMetaCredentials`**, so a malformed filter costs neither a
+  credential fetch/refresh nor an API call. The Insights path is an async report job (submit → poll
+  up to 60×10s → page results), so a filter defect that reaches the wire is expensive.
+- **`IN`/`NOT_IN`/`ANY`/`ALL`/`NONE` with a scalar value is the same shape defect one level down**
+  and is lifted to a single-element list. An `IN` with an *empty* list throws rather than being
+  forwarded: it can never match, so Meta would return a clean empty report for a question the user
+  really did ask — the same silent-empty failure class as ENG-629.
+- **`filtering` stays a native array in the POST body, not a JSON string.** The sibling `time_range`
+  object already rides this same `axios.post` body as a real object and works, so the transport was
+  never the problem — only the shape reaching it. No transport change was needed.
+- **A Meta 400 was collapsing to axios's `"Request failed with status code 400"`.** Meta's actual
+  explanation lives at `response.data.error` (`message`, `error_user_title`, `error_user_msg`,
+  `code`, `error_subcode`, `type`). `describeMetaGraphApiError` surfaces it and returns `undefined`
+  for a non-Graph rejection (socket hang-up, our own bug), so the caller keeps its own message
+  rather than reporting a misleading Meta explanation. Sanitization follows the precedent set by
+  ENG-629: `access_token=…` fragments and bare `EAA…` tokens are redacted, and `fbtrace_id` is
+  never included at all.
+- **Scoped around ENG-629 (PR #2211), in flight on the same file.** That PR edits
+  `getMetaCredentials`, `listMetaAdsCampaigns`, and `listConnectedAccounts`; this one edits only
+  `callMetaAdsInsightsApiWrapper`. Its `if (error.isMetaAuthError) throw error;` rethrow channel is
+  preserved and pinned by a test, so the re-consent path added there is unaffected by the new error
+  description. Neither PR masks the other's failure class.
+- **Verification is mock-only, deliberately.** OPS-79 means our own Meta connection currently lacks
+  `ads_read`, so no live Insights call is possible; the issue's AC5 forbids one regardless. Every
+  assertion is against the request body we hand axios and the error object we hand back.
+
 ## ENG-446: canonical action payloads on existing report/run data (2026-07-29)
 
 New pure module `backend/src/services/marketingActionEnvelope.ts` — the transport/persistence seam
