@@ -9,9 +9,10 @@ import { userDb } from '../services/db';
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     updateSessionInteractiveShareMetadata: jest.fn().mockResolvedValue(undefined),
-    getChatSession: jest.fn().mockResolvedValue(undefined),
-    // best-effort-counter fallback: the guard cross-checks tool-call messages
-    // when calledFunctions looks clean. Default to none (non-sensitive).
+    // Default to a PRESENT session with a clean tool record so the guard can
+    // positively verify the report is ordinary (fail-closed default treats an
+    // absent session as sensitive). Individual tests override for sensitive cases.
+    getChatSession: jest.fn().mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: {} }),
     getMessagesFromMessagesTable: jest.fn().mockResolvedValue([]),
     createOrReuseInteractiveShare: jest.fn().mockResolvedValue('https://app/share'),
   },
@@ -447,6 +448,27 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
     expect(recipients).toEqual(['owner@example.com']);
     expect(subject).toContain('not delivered');
     expect(htmlContent).not.toContain('<html>'); // the report body is NOT included
+  });
+
+  it('fails closed (restricts) when the session cannot be found — cannot verify ordinary', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(undefined); // missing session
+    (userDb.getUserById as jest.Mock).mockResolvedValue(undefined); // owner unknown
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+    const oncallSpy = jest.spyOn(emailService, 'sendOncallAlert').mockResolvedValue(undefined);
+
+    await emailService.sendScheduledChatResultEmail(
+      ['nonadmin@example.com'],
+      'Some Report',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    // unverifiable → treated sensitive → non-admin withheld → nobody authorized →
+    // no report broadcast, durable oncall escalation instead
+    expect(oncallSpy).toHaveBeenCalledTimes(1);
+    const reportSends = spy.mock.calls.filter(c => Array.isArray(c[0]) && c[0].includes('nonadmin@example.com'));
+    expect(reportSends).toHaveLength(0);
   });
 
   it('leaves recipients unchanged and does no lookups for an ordinary (non-sensitive) report', async () => {

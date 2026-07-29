@@ -1432,21 +1432,30 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       let guardOwnerEmail: string | undefined;
       try {
         let guardSession: any;
-        let isSensitive: boolean;
+        // FAIL-CLOSED DEFAULT: treat the report as sensitive UNLESS we can
+        // positively verify it is ordinary. Verification requires a present
+        // session AND a clean strongly-consistent tool-call record. A missing
+        // session, an unreadable/stale record, or any error therefore restricts
+        // distribution rather than broadcasting — closing the whole class of
+        // "couldn't classify → sent to everyone" fail-opens.
+        let isSensitive = true;
         try {
           guardSession = await chatbotDb.getChatSession(result.sessionId);
-          isSensitive = reportContainsCrossAccountData(guardSession?.calledFunctions);
-          if (!isSensitive) {
-            // calledFunctions is a best-effort counter (its write errors are
-            // swallowed at the call site), so a successful cross-account tool
-            // call can be missing from it. Confirm against the authoritative
-            // tool-call message records before treating the report as safe.
-            // Use a STRONGLY CONSISTENT read: this send fires immediately after
-            // the run wrote these messages, so an eventually-consistent read
-            // could miss the just-written cross-account tool call and fail open.
-            const guardMessages = await chatbotDb.getMessagesFromMessagesTable(result.sessionId, true);
-            isSensitive = messagesReferenceCrossAccountTool(guardMessages as any);
+          if (guardSession) {
+            if (reportContainsCrossAccountData(guardSession.calledFunctions)) {
+              isSensitive = true;
+            } else {
+              // calledFunctions is a best-effort counter (its write errors are
+              // swallowed at the call site), so a successful cross-account tool
+              // call can be missing from it. Confirm against the authoritative
+              // tool-call message records. Use a STRONGLY CONSISTENT read: this
+              // send fires immediately after the run wrote these messages, so an
+              // eventually-consistent read could miss a just-written call.
+              const guardMessages = await chatbotDb.getMessagesFromMessagesTable(result.sessionId, true);
+              isSensitive = messagesReferenceCrossAccountTool(guardMessages as any);
+            }
           }
+          // guardSession falsy → cannot verify → isSensitive stays true (closed).
         } catch (classifyError) {
           console.error(`Scheduled report guard: could not classify session ${result.sessionId}; failing closed (treating as sensitive):`, classifyError);
           isSensitive = true;
