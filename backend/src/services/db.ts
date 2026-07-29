@@ -9200,7 +9200,10 @@ export const oauthSessionDb = {
     userId: string;
     access_token: string;
     expires_in?: number;
+    /** Scopes REQUESTED during the OAuth dialog. Not a capability signal. */
     scopes: string[];
+    /** Scopes actually GRANTED, when the provider could tell us (ENG-629). */
+    granted_scopes?: string[];
     flow: string;
   }): Promise<void> {
     const TEN_MINUTES_SECONDS = 10 * 60;
@@ -9220,6 +9223,7 @@ export const oauthSessionDb = {
     access_token: string;
     expires_in?: number;
     scopes: string[];
+    granted_scopes?: string[];
     flow: string;
   } | null> {
     try {
