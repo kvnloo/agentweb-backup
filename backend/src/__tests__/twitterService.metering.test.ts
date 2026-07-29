@@ -128,4 +128,14 @@ describe('X usage metering — attribution', () => {
     await expect(twitterService.searchTweets(OWNER, ACCOUNT_ID, 'ai')).rejects.toThrow();
     expect(mockRecordVendorUsage).not.toHaveBeenCalled();
   });
+
+  it('converts a raw X 402 into a typed XCreditsExhaustedError (never metered, never retried)', async () => {
+    mockSearch.mockRejectedValue(Object.assign(new Error('Request failed with code 402'), { code: 402 }));
+
+    await expect(twitterService.searchTweets(OWNER, ACCOUNT_ID, 'ai')).rejects.toMatchObject({
+      name: 'XCreditsExhaustedError',
+      code: 402,
+    });
+    expect(mockRecordVendorUsage).not.toHaveBeenCalled();
+  });
 });

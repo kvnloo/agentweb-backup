@@ -156,3 +156,15 @@ describe('classifyToolFailureType', () => {
     });
   });
 });
+
+describe('payment_required → config (ENG-664)', () => {
+  it('treats X credit exhaustion as a config/quota gap, not a tool bug', () => {
+    expect(classifyToolFailureType('payment_required')).toBe('config');
+  });
+
+  it('classifies a 402 credit message as config even without an errorClass', () => {
+    expect(
+      classifyToolFailureType('', 'X API error (HTTP 402): AgentWeb X plan out of credits'),
+    ).toBe('config');
+  });
+});
