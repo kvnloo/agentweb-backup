@@ -57,6 +57,7 @@ import BenchmarksTab from "../components/admin/BenchmarksTab";
 import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import McpServersTab from "../components/admin/McpServersTab";
 import EmmaMcpUsageTab from "../components/admin/EmmaMcpUsageTab";
+import UsageCostByUserTab from "../components/admin/UsageCostByUserTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
@@ -3362,6 +3363,7 @@ export default function AdminDashboard() {
             <Tab label="Connected Accounts" {...a11yProps(21)} />
             <Tab label="Contractors" {...a11yProps(22)} />
             <Tab label="Emma MCP" {...a11yProps(23)} />
+            <Tab label="Usage & Cost" {...a11yProps(24)} />
           </Tabs>
         </Box>
 
@@ -6556,6 +6558,10 @@ export default function AdminDashboard() {
 
         <TabPanel value={tabValue} index={23}>
           <EmmaMcpUsageTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={24}>
+          <UsageCostByUserTab />
         </TabPanel>
 
       </Paper>
