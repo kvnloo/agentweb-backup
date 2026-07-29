@@ -112,3 +112,59 @@ describe('SDK construction guard', () => {
     expect(stale).toEqual([]);
   });
 });
+
+/**
+ * ENG-683 — Bedrock inference-profile drift guard.
+ *
+ * The model-id -> inference-profile mapping used to live in FOUR hand-synced
+ * copies (agentModeService, codingAgentService, llmService, rcaEnricher). It
+ * drifted: two copies were missing `anthropic.claude-opus-4-8`. Same failure
+ * shape as the guard above — a duplicated fact silently going stale — so it
+ * gets the same treatment: grep the source, fail if a second copy appears.
+ */
+const PROFILE_SOURCE_OF_TRUTH = 'utils/bedrockInferenceProfiles.ts';
+
+/** Literals that only ever belong in the source-of-truth module. */
+const PROFILE_LITERAL_PATTERNS: Array<{ name: string; re: RegExp }> = [
+  // Full cross-region inference-profile ARN, e.g.
+  // arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6
+  { name: 'inference-profile ARN literal', re: /arn:aws:bedrock:[^'"`\s]*inference-profile/ },
+  // Bare cross-region profile id for the bearer-token account, e.g.
+  // us.anthropic.claude-opus-4-8
+  { name: 'us.anthropic.* profile id literal', re: /['"`]us\.anthropic\.[^'"`]+['"`]/ },
+];
+
+describe('Bedrock inference-profile drift guard (ENG-683)', () => {
+  it('inference-profile literals appear in exactly one non-test file', () => {
+    const offenders: string[] = [];
+
+    for (const file of listSourceFiles(SRC_ROOT)) {
+      const rel = path.relative(SRC_ROOT, file).split(path.sep).join('/');
+      if (rel === PROFILE_SOURCE_OF_TRUTH) continue;
+      const content = fs.readFileSync(file, 'utf8');
+      for (const { name, re } of PROFILE_LITERAL_PATTERNS) {
+        if (re.test(content)) {
+          offenders.push(`${rel} contains ${name}`);
+        }
+      }
+    }
+
+    if (offenders.length > 0) {
+      throw new Error(
+        'A second copy of the Bedrock inference-profile mapping was reintroduced.\n' +
+          `Import BEDROCK_INFERENCE_PROFILE_MAP / resolveBedrockModelId from ` +
+          `src/${PROFILE_SOURCE_OF_TRUTH} instead of restating the ARN.\n\nOffenders:\n` +
+          offenders.map((o) => `  - ${o}`).join('\n')
+      );
+    }
+  });
+
+  it('the source-of-truth module actually exists and holds the literals', () => {
+    const full = path.join(SRC_ROOT, PROFILE_SOURCE_OF_TRUTH);
+    expect(fs.existsSync(full)).toBe(true);
+    const content = fs.readFileSync(full, 'utf8');
+    for (const { re } of PROFILE_LITERAL_PATTERNS) {
+      expect(re.test(content)).toBe(true);
+    }
+  });
+});

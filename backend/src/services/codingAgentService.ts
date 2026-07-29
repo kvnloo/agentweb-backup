@@ -13,6 +13,7 @@ import axios from 'axios';
 import { mcpFetch } from '../mcp/server/httpClient';
 import { agentModeService } from './agentModeService';
 import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
+import { BEDROCK_BEARER_TOKEN_MODELS, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import { recordUsage, computeCostMicroUsd } from './usageRecorderService';
 import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
 import { AcceptanceCheck, AcceptanceStatus, AcceptanceVerificationResult, verifyAcceptanceChecks } from './codingAgentAcceptance';
@@ -1653,11 +1654,8 @@ export function _setVertexClientForTest(client: AnthropicLikeClient | null): voi
 // authenticate with a long-term Bedrock API key (bearer token) and hit the
 // invoke endpoint directly — it speaks native Anthropic Messages format, exactly
 // what the coding agent already builds.
-// App model id -> Bedrock invoke-endpoint profile id, for the models served from
-// the separate bearer-token account (231030591963).
-const BEARER_TOKEN_INVOKE_MODELS: Record<string, string> = {
-  'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
-};
+// Which models live in that account, and the invoke-endpoint profile id each
+// maps to, both come from utils/bedrockInferenceProfiles.ts.
 
 // Idle (inter-chunk) timeout for the streaming bearer path. Because we stream,
 // we don't need a hard cap on total request duration — a long-but-progressing
@@ -1816,7 +1814,7 @@ async function getBedrockBearerClient(): Promise<AnthropicLikeClient> {
           // genuinely stuck request is caught by the idle timeout below.
           const { model, ...rest } = params as any;
           delete (rest as any).model;
-          const profileId = BEARER_TOKEN_INVOKE_MODELS[model] ?? model;
+          const profileId = resolveBedrockModelId(model);
           const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${profileId}/invoke-with-response-stream`;
           const body = { anthropic_version: 'bedrock-2023-05-31', ...rest };
 
@@ -1910,7 +1908,7 @@ export function _setBedrockBearerClientForTest(client: AnthropicLikeClient | nul
  * - Other "anthropic.*" ids are AWS Bedrock models (default IAM credentials).
  */
 async function getClientForModel(model: string): Promise<AnthropicLikeClient> {
-  if (model in BEARER_TOKEN_INVOKE_MODELS) {
+  if (BEDROCK_BEARER_TOKEN_MODELS.has(model)) {
     return getBedrockBearerClient();
   }
   if (model.startsWith('claude-')) {
@@ -1934,16 +1932,13 @@ async function callWithRetry(
   params: Anthropic.MessageCreateParamsNonStreaming
 ): Promise<Anthropic.Message> {
   // Map Bedrock model IDs to inference profile ARNs for models that require them.
-  // Vertex models (bare "claude-*") are not in this map and pass through unchanged —
+  // Vertex models (bare "claude-*") are not in the map and pass through unchanged —
   // the Vertex client puts the model id in the request URL.
-  const inferenceProfileMap: Record<string, string> = {
-    'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-    'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
-    'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
-  };
-
-  // Use inference profile ARN if available, otherwise use model ID as-is
-  const actualModel = inferenceProfileMap[params.model] || params.model;
+  // Bearer-account models are deliberately NOT resolved here: getBedrockBearerClient()
+  // owns its own invoke-URL construction and expects the app-level model id.
+  const actualModel = BEDROCK_BEARER_TOKEN_MODELS.has(params.model)
+    ? params.model
+    : resolveBedrockModelId(params.model);
   const updatedParams = { ...params, model: actualModel };
 
   let lastError: Error | undefined;
