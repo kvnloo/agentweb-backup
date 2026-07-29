@@ -174,6 +174,7 @@ import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, Me
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
+import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import {
@@ -14162,6 +14163,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      // Meta requires `filtering` to be a LIST. The model supplies it as a bare
+      // object or as pre-serialized JSON often enough that both shapes reached
+      // production: the string produced `(#100) param filtering must be an
+      // array`, and the object was silently dropped by the old `?.length` guard,
+      // widening the query to the whole account. Normalize both, and reject
+      // anything unhonourable here — before we spend a credential or an API
+      // call — rather than quietly answering a different question (ENG-630).
+      const normalizedFiltering = normalizeMetaInsightsFiltering(filtering);
+
       const { accountId, accessToken } =
         await this.getMetaCredentials(userId, account_id);
 
@@ -14192,7 +14202,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(action_breakdowns?.length && {
           action_breakdowns: action_breakdowns.join(","),
         }),
-        ...(filtering?.length && { filtering }),
+        ...(normalizedFiltering && { filtering: normalizedFiltering }),
       };
 
       // ENG-511: Run the full report (submit → poll → fetch) as one unit. Meta
@@ -14368,9 +14378,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error("Error in callMetaAdsInsightsApiWrapper:", error);
+      // An axios rejection stringifies to "Request failed with status code 400",
+      // which tells the model nothing it can act on and reads as an opaque
+      // outage. Meta's actual explanation lives in response.data.error — surface
+      // it, minus the credential material Meta echoes back (ENG-630).
       return {
         success: false,
-        error: error.message,
+        error: describeMetaGraphApiError(error) || error.message,
       };
     }
   }
