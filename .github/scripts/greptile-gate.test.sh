@@ -75,6 +75,9 @@ case "$url" in
       printf 'mock gh: simulated API failure\n' >&2
       exit "$code"
     fi
+    # A successful call that still writes to stderr (gh warnings, deprecation
+    # notices). Must not contaminate the JSON on stdout.
+    [ -f "${MOCK_DIR}/comments_stderr" ] && cat "${MOCK_DIR}/comments_stderr" >&2
     n=0
     [ -f "${MOCK_DIR}/comments_calls" ] && n=$(cat "${MOCK_DIR}/comments_calls")
     n=$(( n + 1 ))
@@ -319,6 +322,17 @@ M=$(new_mock_dir)
 printf '1\n' >"${M}/comments_exit"
 run_gate "$M"
 check 'AC4: a failing GitHub API call never passes' 1 'timed out'
+check 'AC4: the API error text is surfaced, not swallowed' 1 'simulated API failure'
+
+# A successful `gh` call that also writes to stderr (warnings, deprecation
+# notices) must not be misread as an unparseable response. Folding stderr into
+# stdout would turn a healthy 5/5 into a self-inflicted red on a gate whose
+# whole design is to fail closed.
+M=$(new_mock_dir)
+set_comments "$M" 1 "$(greptile_comments '5/5' "${HEAD}")"
+printf 'gh: a warning on stderr\n' >"${M}/comments_stderr"
+run_gate "$M"
+check 'stderr noise on a successful call does not break parsing' 0 'PASS'
 
 # Config guard — a truncated HEAD_SHA would make every comparison fail for the
 # wrong reason, so it is rejected up front rather than silently pending.

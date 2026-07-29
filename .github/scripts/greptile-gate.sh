@@ -86,19 +86,25 @@ fi
 
 log "requiring Greptile ${MIN_SCORE}/5 on head ${head_sha} of ${REPO}#${PR_NUMBER}"
 
+# stderr is captured separately rather than folded into stdout: a warning from
+# `gh` printed onto the JSON would make a healthy response unparseable, and this
+# gate fails closed on unparseable, so that would be a self-inflicted red.
+stderr_file="$(mktemp)"
+trap 'rm -f "${stderr_file}"' EXIT
+
 deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
 last_state="no Greptile review comment found on the pull request yet"
 last_body=''
 
 while :; do
-  comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>&1)"
+  comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>"${stderr_file}")"
   gh_exit=$?
 
   if [ "${gh_exit}" -ne 0 ]; then
     # Transient GitHub failures are retried, but they can only ever end in the
     # timeout below. There is no path from "the API is down" to a pass.
-    last_state="GitHub API call failed (exit ${gh_exit})"
-    last_body="${comments_json}"
+    last_state="GitHub API call failed (exit ${gh_exit}): $(tr '\n' ' ' <"${stderr_file}")"
+    last_body="$(cat "${stderr_file}")"
   else
     body="$(printf '%s' "${comments_json}" | jq -r '
         [ .[]
