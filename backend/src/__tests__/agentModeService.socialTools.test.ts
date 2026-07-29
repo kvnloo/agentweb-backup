@@ -524,9 +524,10 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.organicReadUnsupported).toBe(true);
       // Must NOT frame it as a successful read of the user's posts.
       expect(result.message).not.toContain('Successfully loaded');
-      // Owns it as AgentWeb's own behavior, not a platform/LinkedIn weakness.
+      // Owns it as AgentWeb's own behavior, framed positively (what AgentWeb
+      // DOES) — never as a weakness/"limitation".
       expect(result.message.toLowerCase()).toContain('agentweb');
-      expect(result.message.toLowerCase()).not.toContain('platform limitation');
+      expect(result.message.toLowerCase()).not.toContain('limitation');
       expect(result.message.toLowerCase()).toContain('do not claim');
     });
 
@@ -551,7 +552,7 @@ describe('AgentModeService - Social Media Tools', () => {
       // Must NOT be masked as a benign unsupported read (the error branch wins,
       // so the personal unsupported-read message/flag must not leak through).
       expect(result.organicReadUnsupported).toBeUndefined();
-      expect(result.message).not.toContain('AgentWeb only reads');
+      expect(result.message).not.toContain('AgentWeb works from the LinkedIn posts');
     });
 
     // Regression guard: a personal LinkedIn account that DOES have stored
