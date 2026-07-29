@@ -64,6 +64,41 @@ export class MetaInsightsFilteringError extends Error {
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
+/** Name the shape we actually got, so the error tells the caller what to change. */
+const describeValueShape = (v: unknown): string => {
+  if (Array.isArray(v)) return 'an array';
+  if (v === null) return 'null';
+  const shape = typeof v;
+  return /^[aeiou]/.test(shape) ? `an ${shape}` : `a ${shape}`;
+};
+
+/**
+ * A Meta filter `value` is a scalar — or, under a list operator, a list of them.
+ * Anything else (an object, a nested array, a function) is forwarded verbatim
+ * into the request body, where it either serializes to something the caller
+ * never asked for or fails the async report job minutes later with an opaque
+ * upstream parameter error. Reject it here for the same reason the whole module
+ * exists: a filter we cannot honour must throw, never travel (ENG-630).
+ *
+ * Non-finite numbers are rejected on the same grounds — `NaN` and `Infinity`
+ * have no JSON representation and serialize to `null`, which silently filters on
+ * a different value than the one requested.
+ */
+function assertScalarFilterValue(value: unknown, at: string, position: string): void {
+  if (typeof value === 'string' || typeof value === 'boolean') return;
+  if (typeof value === 'number') {
+    if (Number.isFinite(value)) return;
+    throw new MetaInsightsFilteringError(
+      `${at} has a non-finite number (${String(value)}) ${position}. ` +
+        'Supply a finite number, string, or boolean.'
+    );
+  }
+  throw new MetaInsightsFilteringError(
+    `${at} has ${describeValueShape(value)} ${position}. ` +
+      'Filter values must be a string, number, or boolean.'
+  );
+}
+
 /**
  * Coerce whatever the caller supplied into the array of filter objects the Meta
  * Insights API expects.
@@ -148,8 +183,8 @@ function normalizeFilterEntry(entry: unknown, index: number): MetaInsightsFilter
   let normalizedValue: unknown = value;
   if (LIST_VALUED_OPERATORS.has(upperOperator)) {
     // A scalar under IN/NOT_IN is the same shape defect one level down.
-    normalizedValue = Array.isArray(value) ? [...value] : [value];
-    if ((normalizedValue as unknown[]).length === 0) {
+    const values = Array.isArray(value) ? [...value] : [value];
+    if (values.length === 0) {
       // An empty list matches nothing, so Meta would return a clean, empty
       // report for a question the user really did ask.
       throw new MetaInsightsFilteringError(
@@ -157,6 +192,12 @@ function normalizeFilterEntry(entry: unknown, index: number): MetaInsightsFilter
           'Supply at least one value or drop the filter.'
       );
     }
+    values.forEach((element, elementIndex) =>
+      assertScalarFilterValue(element, at, `at value[${elementIndex}]`)
+    );
+    normalizedValue = values;
+  } else {
+    assertScalarFilterValue(value, at, `for operator ${upperOperator}`);
   }
 
   return { field: field.trim(), operator: upperOperator, value: normalizedValue };
