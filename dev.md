@@ -1,3 +1,57 @@
+## ENG-445: shared marketing-action contract + deterministic top-3 selector (2026-07-28)
+
+New pure module `backend/src/services/marketingActionContract.ts` — ONE typed contract for "a
+recommended marketing action" and ONE deterministic selector (`selectTopMarketingActions`, cap 3)
+for the ENG-444 "3 moves today" surfaces. Investigation findings that shaped it:
+
+- **ENG-87 campaign-health signal code does not exist in this repo** (no `campaignHealth`/
+  `healthSignal`/`struggling` module) — the contract therefore does not import a signal engine; it
+  is fed candidates by producers (ENG-446 wires existing report/run data into it).
+- **There is no `reportId` primitive anywhere in the backend.** "Source report/run ID" is an
+  opaque `sourceKind: 'report'|'run'` + `sourceId` pair, so `AW-AgentRuns` runIds, loop `RunId`s,
+  and report artifact ids all fit without a new table.
+- Shape reuse: tiers mirror `RcaRankedFix` (ai-eval-funnel), provenance mirrors loops/core
+  `MutationProposal`, stable-id + "recommendation is the product" mirrors
+  `agentMode/core/askUserQuestion.ts`; pure-module style mirrors `healthScoreService.ts`
+  (the existing top-3 tie-break precedent is `onboardingLoopApproval.ts:181`).
+- Determinism: identity = normalized sha256 of (actionType, scopeId) → duplicates collapse onto
+  one id and status changes never move it; ranking is a total order (critical/campaign tier →
+  weighted 5-factor score → per-factor tiers → id → canonical JSON), so output is invariant under
+  input permutation. Weights (5/4/3/2/1) encode the contract's stated factor order; campaign
+  priority is a hard tier that only `critical: true` overrides.
+- No consumers changed in this PR by design — ENG-446 (blocked by ENG-445) exposes canonical
+  payloads through existing report/run data.
+
+## ENG-259: Fathom→Linear router — cloud wiring in shadow mode (2026-07-28)
+
+The canonical reconciliation engine (`services/fathomLinearRouter.ts`, carried forward from the
+preserved `swarm/eng-259-fathom-linear-router` branch) is now WIRED: `/api/webhooks/fathom` runs
+deterministic extraction (`services/fathomExtraction.ts` — no LLM; retries produce byte-identical
+ids so `fathomKey` idempotency holds) and reconciles through the engine via the `LinearPort`
+resolved from `services/fathomLinearPortRegistry.ts`. Mode = `FATHOM_LINEAR_ROUTER_MODE`
+(off | shadow | live, default shadow — real board reads, zero writes, full run report logged as
+one `[FathomLinearRouter]` JSON line). Decision of record: ENG-447 selected Option 1 (managed
+durable workflow in the existing backend, Fathom-first, shadow before writes, no laptop fallback).
+
+Assumptions / boundaries:
+- The production LinearPort adapter is ENG-536 (blocked-by this): until it registers at the
+  composition root, the webhook answers `routed:false, reason: LinearPort not configured (ENG-536)`
+  with extraction counts — deliberate 200 so Fathom does not retry-spiral on a known-inactive path.
+- The legacy `meetingIntakeService` path was REMOVED from the webhook (it wrote to placeholder
+  Notion/ClickUp deps — dead destinations since the Linear migration). The service itself stays:
+  Emma's `fathom_route_action_items` tool still imports it, and changing Emma tool behavior is out
+  of swarm scope.
+- The ENG-246 onboarding leg (`FATHOM_ONBOARDING_AUTOMATION_ENABLED`) is preserved unchanged and
+  self-contained (never throws the webhook).
+- Extraction Harsha-filter: items explicitly assigned to a non-Harsha person become
+  `actionable:false` FYI (reported `notFiled`, never silently dropped) per issue scope #2.
+- Customer ambiguity is CRM-derived only (≥2 distinct crm_matches companies → `needsPm`); a
+  multi-external-domain call yields customer=undefined (absent, not ambiguous) so the engine's
+  anchor rule (customer+workflow required to bind) stays safe without flooding Needs PM.
+- Fathom's exact webhook payload field names for crm_matches/action-item assignees are asserted
+  loosely (string|object accepted, defensive) — verify against a real org-account payload when
+  ENG-447's credentials land; shadow mode makes any mismatch observable without writes.
+
 ## ENG-114: durable MCP session store so sessions resolve across instances (2026-07-21)
 
 MCP Streamable-HTTP sessions lived only in a per-process `Map` in `mcp/server/mcpServer.ts`. On a
