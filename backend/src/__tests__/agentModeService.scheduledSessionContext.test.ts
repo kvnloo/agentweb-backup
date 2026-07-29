@@ -273,6 +273,30 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(lower).toContain('does not loosen per-entity actions');
     expect(lower).toContain('per-entity completion loop');
   });
+
+  // ── (7) userId → email/name identity resolution ─────────────────────────────
+  // Regression coverage for ENG-500 (session fa552592, "Daily User Activity
+  // Report"): get_chat_history returns per-session data keyed by numeric userId
+  // only — no email/name — and there is no per-userId profile lookup tool. The
+  // run correctly recognised it could not turn userIds into human-readable
+  // identities, proposed the supported workaround (map userIds to emails via the
+  // client list), but — being unattended — stopped to ask for approval, so the
+  // report was never delivered. A sibling 5/5 run proved the report is fully
+  // achievable by resolving identities via list_all_clients. The directive must
+  // teach that supported mapping so the run completes on its own instead of
+  // stopping for a lookup tool that does not exist.
+  it('names list_all_clients as the supported userId → email/name resolution path', () => {
+    expect(directive).toContain('list_all_clients');
+  });
+
+  it('tells the run to map userIds to emails/names rather than ship raw userIds or stop', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('userid');
+    // the mapping produces a human-readable identity (email / name)
+    expect(lower).toMatch(/email.*(name|displayname)|(name|displayname).*email/);
+    // and the absence of a direct per-userId lookup is not a blocker
+    expect(lower).toContain('not');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
