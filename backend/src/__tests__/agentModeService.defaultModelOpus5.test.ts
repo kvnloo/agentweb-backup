@@ -55,10 +55,28 @@ const HAIKU_4_5 = 'anthropic.claude-haiku-4-5-20251001-v1:0';
 
 describe('ENG-759: default chat model is Claude Opus 5', () => {
   let service: AgentModeService;
+  const ENV_OVERRIDE = 'AZURE_OPENAI_DEPLOYMENT_AGENT_MODE';
+  let savedOverride: string | undefined;
 
   beforeEach(() => {
+    // `default_model` is a field initializer read at construction time, and
+    // AZURE_OPENAI_DEPLOYMENT_AGENT_MODE takes precedence over the literal. A
+    // runner with that variable set (some cloud-dev boxes export it) would fail
+    // these assertions despite correct application behaviour, so establish the
+    // no-override state explicitly rather than assuming it — and delete it
+    // BEFORE constructing, or the field is already resolved.
+    savedOverride = process.env[ENV_OVERRIDE];
+    delete process.env[ENV_OVERRIDE];
     service = new AgentModeService();
     jest.clearAllMocks();
+  });
+
+  afterEach(() => {
+    if (savedOverride === undefined) {
+      delete process.env[ENV_OVERRIDE];
+    } else {
+      process.env[ENV_OVERRIDE] = savedOverride;
+    }
   });
 
   // AC1 — a session with no explicit model selection resolves to Opus 5.
@@ -75,6 +93,20 @@ describe('ENG-759: default chat model is Claude Opus 5', () => {
 
     it('the default model is a servable, allow-listed model', async () => {
       await expect(service.getSupportedModels(true)).resolves.toContain(service.default_model);
+    });
+
+    // The precedence the assertions above depend on, asserted rather than
+    // assumed: env override wins over the literal. Documents why the suite
+    // clears the variable, and keeps that reasoning honest if it ever changes.
+    it('lets AZURE_OPENAI_DEPLOYMENT_AGENT_MODE override the literal when set', () => {
+      process.env[ENV_OVERRIDE] = 'gpt-5.4';
+      try {
+        expect(new AgentModeService().default_model).toBe('gpt-5.4');
+      } finally {
+        delete process.env[ENV_OVERRIDE];
+      }
+      // And with it cleared again, the literal is Opus 5.
+      expect(new AgentModeService().default_model).toBe(OPUS_5);
     });
   });
 
