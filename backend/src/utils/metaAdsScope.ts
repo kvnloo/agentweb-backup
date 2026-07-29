@@ -112,39 +112,75 @@ const extractGraphCode = (error: any): number | undefined => {
   return Number.isFinite(code) ? code : undefined;
 };
 
+/** Every place Meta might put human-readable text, flattened for inspection. */
+const collectErrorText = (err: any): string =>
+  [
+    err?.message,
+    err?.structuredError?.message,
+    err?.structuredError?.error_user_msg,
+    err?.structuredError?.error_user_title,
+    err?.response?.data?.error?.message,
+    err?.response?.data?.message,
+    err?.error?.message,
+  ]
+    .filter((s: unknown): s is string => typeof s === 'string')
+    .join(' | ')
+    .toLowerCase();
+
 /**
- * Is this Meta telling us, authoritatively, that the token lacks ads permission?
+ * Is this Meta *specifically* refusing us for lack of an Ads scope?
  *
- * Scoped tightly on purpose:
- *  - code 190 (expired/invalid token) is excluded — it has its own remedy and
- *    its own message; routing it here would hand the user the wrong fix.
- *  - code 100 (validation, e.g. the `filtering must be an array` defect owned
- *    by ENG-630) is excluded — it must not be masked by re-consent messaging.
+ * Deliberately strict, and the strictness is the point. Meta classifies a whole
+ * family of unrelated refusals as permission errors (code 10, code 200-299):
+ * missing `business_management`, an inaccessible ad account, a disabled asset.
+ * `metaService.handleError` stamps all of them `PERMISSION_ERROR`.
+ *
+ * This predicate authorizes two destructive-ish actions — replacing the error
+ * with re-consent guidance, and narrowing the stored grant. Firing on a generic
+ * permission error would strip `ads_read` from a connection that genuinely has
+ * it and then block every later request behind advice that cannot fix anything:
+ * a transient upstream error turned into a bricked customer connection.
+ *
+ * The costs are asymmetric, so the bar is asymmetric. A false negative just
+ * falls through to the pre-existing soft error path with Meta's own message.
+ * A false positive destroys working state. Therefore: Meta must NAME an Ads
+ * scope. A permission code alone is never sufficient.
+ *
+ * Also excluded regardless of wording:
+ *  - code 190 (expired/invalid token) — its own remedy, its own message.
+ *  - code 100 (validation, e.g. the `filtering must be an array` defect owned by
+ *    ENG-630) — a malformed-field error that happens to reference `ads_read`
+ *    must not revoke a grant.
  */
-export const isMetaAdsPermissionError = (error: unknown): boolean => {
+export const isMetaAdsScopeRefusal = (error: unknown): boolean => {
   if (!error || typeof error !== 'object') return false;
 
   const err = error as any;
-
-  if (err.structuredError?.classification === 'PERMISSION_ERROR') return true;
-
   const code = extractGraphCode(err);
-  if (code !== undefined) {
-    if (code === 190 || code === 100) return false;
-    if (code === 10 || (code >= 200 && code <= 299)) return true;
-  }
 
-  const message = typeof err.message === 'string' ? err.message.toLowerCase() : '';
-  if (!message) return false;
+  // Hard exclusions — these are never scope refusals, whatever the text says.
+  if (code === 190 || code === 100) return false;
 
-  // Meta prefixes the permission refusal with "(#200)"; the 403 path in
-  // metaService throws "Meta Permission Denied: ...".
-  if (message.includes('(#200)')) return true;
-  if (message.includes('meta permission denied')) return true;
-  if (message.includes('not granted') && message.includes('ads_')) return true;
-  if (message.includes('ads_management or ads_read')) return true;
+  const text = collectErrorText(err);
+  if (!text) return false;
 
-  return false;
+  // Necessary: Meta must name the capability it is refusing.
+  const namesAdsScope = (META_ADS_READ_SCOPES as readonly string[]).some(scope =>
+    text.includes(scope)
+  );
+  if (!namesAdsScope) return false;
+
+  // Sufficient: and it must read as a permission refusal rather than an
+  // incidental mention of the scope name.
+  const isPermissionShaped =
+    code === 10 ||
+    (code !== undefined && code >= 200 && code <= 299) ||
+    err.structuredError?.classification === 'PERMISSION_ERROR' ||
+    text.includes('(#200)') ||
+    text.includes('permission') ||
+    text.includes('not granted');
+
+  return Boolean(isPermissionShaped);
 };
 
 /**

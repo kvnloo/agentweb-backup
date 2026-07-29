@@ -42,6 +42,17 @@ unattended run produced a report with no data. Investigation findings that shape
   `ads_scope_revoked_at` marker that makes the refusal unambiguous, plus a behavioral test that
   feeds the persisted config back in and asserts the second read never calls Meta. Lesson: assert
   the *downstream consequence* of a write, not the shape of the write.
+- **A permission classification is not evidence of a missing scope** (Greptile P1-2). The first
+  predicate returned true for any code 10 / 200-299, and `metaService.handleError` stamps
+  `PERMISSION_ERROR` on that whole family — missing `business_management`, an inaccessible ad
+  account, a disabled asset. Since the normalization path *narrows the stored grant*, that would
+  have stripped `ads_read` from a connection that genuinely had it and then blocked every later
+  request behind re-consent advice that cannot fix anything: a transient upstream error converted
+  into a bricked customer connection. The costs are asymmetric — a false negative just falls
+  through to the pre-existing soft error path carrying Meta's own message, while a false positive
+  destroys working state — so the bar is asymmetric too: Meta must NAME an Ads scope, and a
+  permission code alone is never sufficient. Renamed to `isMetaAdsScopeRefusal` because "permission
+  error" was the wrong concept and the loose name invited the loose check.
 - Gate coverage note: the pre-flight gate sits in `getMetaCredentials`, the single choke point for
   every connected-account Meta tool, so it covers all ads paths including writes. Post-flight
   normalization is wired into the campaign read path named in the reporter signal; once the

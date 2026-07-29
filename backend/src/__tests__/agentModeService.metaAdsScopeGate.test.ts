@@ -303,6 +303,56 @@ describe('AgentModeService — Meta Ads scope fail-closed gate (ENG-629)', () =>
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
     });
 
+    /**
+     * Greptile P1-2. A permission-classified error that is NOT about Ads scopes
+     * must never narrow a stored grant. Getting this wrong takes a customer whose
+     * Meta connection genuinely has ads_read and permanently blocks it behind
+     * re-consent guidance that cannot fix anything.
+     */
+    it('does NOT strip Ads scopes from a working connection on an unrelated permission error', async () => {
+      const workingConnection = metaAccount({ granted_scopes: ['ads_read', 'pages_show_list'] });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        id: 'user1',
+        connected_accounts: [workingConnection],
+      });
+      const unrelated: any = new Error('(#200) Requires business_management permission');
+      unrelated.code = 200;
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(unrelated);
+
+      const result = await agentModeService.listMetaAdsCampaignsNew('user1');
+
+      // Nothing persisted — the stored grant is untouched.
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+      // The real error is surfaced verbatim, not replaced by re-consent guidance.
+      expect(result.success).toBe(false);
+      expect(result.message).toMatch(/business_management/);
+      expect(result.message).not.toMatch(/Reconnect Meta/i);
+    });
+
+    it('keeps the connection ads-capable after an unrelated permission error', async () => {
+      // The end-state assertion behind P1-2: the account must still be usable.
+      const workingConnection = metaAccount({ granted_scopes: ['ads_read'] });
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        id: 'user1',
+        connected_accounts: [workingConnection],
+      });
+      const unrelated: any = new Error('Application does not have permission for this action');
+      unrelated.code = 10;
+      (metaService.listCampaigns as jest.Mock).mockRejectedValue(unrelated);
+
+      await agentModeService.listMetaAdsCampaignsNew('user1');
+
+      const accounts = await agentModeService.listConnectedAccounts('user1');
+      const meta = accounts.accounts.find((a: any) => a.platform === 'meta');
+      expect(meta.ads_capable).toBe(true);
+      expect(meta.capability_warning).toBeUndefined();
+
+      // And a subsequent read still reaches Meta rather than being gated off.
+      (metaService.listCampaigns as jest.Mock).mockResolvedValue([{ id: 'c1' }]);
+      const retry = await agentModeService.listMetaAdsCampaignsNew('user1');
+      expect(retry.success).toBe(true);
+    });
+
     it('does not relabel a validation error (#100) as a scope problem — that is ENG-630', async () => {
       (userDb.getUserById as jest.Mock).mockResolvedValue(legacyUser);
       const validationError: any = new Error('(#100) param filtering must be an array');

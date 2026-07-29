@@ -19,7 +19,7 @@ import {
   META_ADS_RECONSENT_MESSAGE,
   getMetaAdsScopeState,
   hasMetaAdsReadScope,
-  isMetaAdsPermissionError,
+  isMetaAdsScopeRefusal,
   buildMetaAdsScopeError,
   MetaAdsScopeState,
 } from '../utils/metaAdsScope';
@@ -132,34 +132,77 @@ describe('hasMetaAdsReadScope', () => {
   });
 });
 
-describe('isMetaAdsPermissionError', () => {
+/**
+ * Greptile P1-2 ("Generic permission errors revoke Ads"), and it is the sharper
+ * half of this module.
+ *
+ * A permission *classification* is not proof that Ads scopes are absent. Meta
+ * labels a whole family of unrelated refusals with code 10 / 200-299 — missing
+ * `business_management`, an ad account the user cannot see, a disabled asset.
+ * If any of those were taken as evidence, the normalization path would strip the
+ * stored Ads grant from a connection that genuinely has it, then refuse every
+ * later request with re-consent guidance that cannot fix anything. That turns a
+ * transient upstream error into a bricked customer connection.
+ *
+ * So the predicate demands that Meta *name an Ads scope*. A false negative
+ * merely falls through to the pre-existing soft error path; a false positive
+ * destroys working state. The asymmetry decides the design.
+ */
+describe('isMetaAdsScopeRefusal', () => {
   it('recognizes the exact production message from OPS-79', () => {
     const error = new Error(
       '(#200) Ad account owner has NOT granted ads_management or ads_read permission'
     );
-    expect(isMetaAdsPermissionError(error)).toBe(true);
+    expect(isMetaAdsScopeRefusal(error)).toBe(true);
   });
 
-  it('recognizes a structuredError classified PERMISSION_ERROR by metaService.handleError', () => {
-    const error: any = new Error('Something went wrong');
-    error.structuredError = { code: 200, classification: 'PERMISSION_ERROR' };
-    expect(isMetaAdsPermissionError(error)).toBe(true);
-  });
-
-  it('recognizes Graph error code 10 (permission denied)', () => {
-    const error: any = new Error('Application does not have permission for this action');
-    error.code = 10;
-    expect(isMetaAdsPermissionError(error)).toBe(true);
-  });
-
-  it('recognizes a nested axios-shaped Graph error with code in the 200-299 band', () => {
+  it('recognizes a nested axios-shaped Graph error that names ads_read', () => {
     const error: any = new Error('Request failed with status code 400');
     error.response = { data: { error: { code: 272, message: 'Requires ads_read' } } };
-    expect(isMetaAdsPermissionError(error)).toBe(true);
+    expect(isMetaAdsScopeRefusal(error)).toBe(true);
   });
 
-  it('recognizes the "Meta Permission Denied" string thrown on a 403', () => {
-    expect(isMetaAdsPermissionError(new Error('Meta Permission Denied: ads_read required'))).toBe(true);
+  it('recognizes the "Meta Permission Denied" string when it names an Ads scope', () => {
+    expect(isMetaAdsScopeRefusal(new Error('Meta Permission Denied: ads_read required'))).toBe(true);
+  });
+
+  it('finds the Ads scope when it is only in the structuredError message', () => {
+    const error: any = new Error('Request failed');
+    error.structuredError = {
+      code: 200,
+      classification: 'PERMISSION_ERROR',
+      message: '(#200) ads_management permission is required',
+    };
+    expect(isMetaAdsScopeRefusal(error)).toBe(true);
+  });
+
+  // ── The P1-2 guards ────────────────────────────────────────────────────────
+
+  it('does NOT treat a generic PERMISSION_ERROR classification as an Ads refusal', () => {
+    // metaService.handleError stamps this on every code 10 / 200-299. On its own
+    // it says nothing about Ads scopes.
+    const error: any = new Error('Something went wrong');
+    error.structuredError = { code: 200, classification: 'PERMISSION_ERROR' };
+    expect(isMetaAdsScopeRefusal(error)).toBe(false);
+  });
+
+  it('does NOT treat a business_management refusal as an Ads refusal', () => {
+    // Real Meta error, real code 200, entirely unrelated capability.
+    const error: any = new Error('(#200) Requires business_management permission');
+    error.code = 200;
+    expect(isMetaAdsScopeRefusal(error)).toBe(false);
+  });
+
+  it('does NOT treat a bare code 10 permission denial as an Ads refusal', () => {
+    const error: any = new Error('Application does not have permission for this action');
+    error.code = 10;
+    expect(isMetaAdsScopeRefusal(error)).toBe(false);
+  });
+
+  it('does NOT treat an unrelated 200-299 code as an Ads refusal', () => {
+    const error: any = new Error('(#272) Ad account is not accessible to this user');
+    error.code = 272;
+    expect(isMetaAdsScopeRefusal(error)).toBe(false);
   });
 
   it('does NOT treat an expired token (code 190) as a scope problem', () => {
@@ -167,7 +210,7 @@ describe('isMetaAdsPermissionError', () => {
     // misrouting it into the scope error would give the user the wrong fix.
     const error: any = new Error('Meta access token expired or invalid');
     error.code = 190;
-    expect(isMetaAdsPermissionError(error)).toBe(false);
+    expect(isMetaAdsScopeRefusal(error)).toBe(false);
   });
 
   it('does NOT treat a validation error (code 100) as a scope problem', () => {
@@ -175,17 +218,25 @@ describe('isMetaAdsPermissionError', () => {
     // be swallowed by this issue's re-consent messaging.
     const error: any = new Error('(#100) param filtering must be an array');
     error.code = 100;
-    expect(isMetaAdsPermissionError(error)).toBe(false);
+    expect(isMetaAdsScopeRefusal(error)).toBe(false);
+  });
+
+  it('does NOT fire on a code-100 validation error that merely mentions ads_read', () => {
+    // Naming the scope is necessary but not sufficient — a malformed-field error
+    // that happens to reference the field must not revoke a grant.
+    const error: any = new Error('(#100) Invalid parameter: ads_read is not a valid field here');
+    error.code = 100;
+    expect(isMetaAdsScopeRefusal(error)).toBe(false);
   });
 
   it('does NOT treat a rate limit as a scope problem', () => {
-    expect(isMetaAdsPermissionError(new Error('Meta rate limit exceeded'))).toBe(false);
+    expect(isMetaAdsScopeRefusal(new Error('Meta rate limit exceeded'))).toBe(false);
   });
 
   it('returns false for null/undefined/non-error input rather than throwing', () => {
-    expect(isMetaAdsPermissionError(null)).toBe(false);
-    expect(isMetaAdsPermissionError(undefined)).toBe(false);
-    expect(isMetaAdsPermissionError('a string')).toBe(false);
+    expect(isMetaAdsScopeRefusal(null)).toBe(false);
+    expect(isMetaAdsScopeRefusal(undefined)).toBe(false);
+    expect(isMetaAdsScopeRefusal('a string')).toBe(false);
   });
 });
 

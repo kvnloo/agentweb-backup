@@ -13892,12 +13892,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     connection?: { platform?: string; account_id?: string; config?: any }
   ): Promise<void> {
     const {
-      isMetaAdsPermissionError,
+      isMetaAdsScopeRefusal,
       buildMetaAdsScopeError,
       META_ADS_READ_SCOPES,
     } = await import('../utils/metaAdsScope');
 
-    if (!isMetaAdsPermissionError(error)) return;
+    // Strictly an Ads-scope refusal. A generic permission error must fall
+    // through untouched — narrowing a grant on that evidence would brick a
+    // connection that actually has ads access (Greptile P1-2).
+    if (!isMetaAdsScopeRefusal(error)) return;
 
     if (connection?.account_id && connection?.platform) {
       try {
