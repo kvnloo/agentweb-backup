@@ -8,6 +8,11 @@ import {
 } from './connectedAccountsDb';
 import { recordVendorUsage } from './usageRecorderService';
 import {
+  describeXApiError,
+  isXApiCreditsError,
+  XCreditsExhaustedError,
+} from '../utils/twitterErrors';
+import {
   TWITTER_PROVIDER,
   TwitterOperation,
   computeTwitterCost,
@@ -334,6 +339,11 @@ export class TwitterService {
       this.meterCall(ownerUserId, accountId, meter, result);
       return result;
     } catch (err) {
+      // X 402 = AgentWeb's shared X wallet is out of credits (ENG-604/633/662).
+      // A hard, non-retryable, platform-side stop — convert it to a typed,
+      // clusterable error at this single chokepoint so it never reads as success
+      // and a retry never masks it. Not an auth error, so short-circuit here.
+      if (isXApiCreditsError(err)) throw this.asCreditsExhausted(err, accountId);
       if (!isXAuthError(err)) throw err;
 
       this.log(`Got 401 for account ${accountId} — force-refreshing and retrying`);
@@ -357,6 +367,7 @@ export class TwitterService {
         this.meterCall(ownerUserId, accountId, meter, result);
         return result;
       } catch (retryErr) {
+        if (isXApiCreditsError(retryErr)) throw this.asCreditsExhausted(retryErr, accountId);
         if (isXAuthError(retryErr)) {
           await this.markNeedsReconnect(ownerUserId, accountId);
           throw new Error(
@@ -366,6 +377,20 @@ export class TwitterService {
         throw retryErr;
       }
     }
+  }
+
+  /**
+   * Convert a raw X 402 into the typed, clusterable XCreditsExhaustedError
+   * (ENG-664). Already-typed errors pass through unchanged. Logs a single
+   * machine-detectable marker so ops alerting can key on X wallet depletion
+   * (the OPS-78 top-up signal) instead of digging it out of prose.
+   */
+  private asCreditsExhausted(err: unknown, accountId: string): XCreditsExhaustedError {
+    if (err instanceof XCreditsExhaustedError) return err;
+    console.error(
+      `[TwitterService] X_CREDITS_EXHAUSTED account=${accountId} — shared X API wallet is out of credits (HTTP 402)`
+    );
+    return new XCreditsExhaustedError(describeXApiError(err));
   }
 
   /**
