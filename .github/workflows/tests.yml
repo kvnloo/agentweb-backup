@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
   checks: read
+  # Greptile's verdict lives in a PR comment, which is served by the issues
+  # comments endpoint (.github/scripts/greptile-gate.sh).
+  issues: read
   pull-requests: write
   id-token: write
 
@@ -198,71 +201,68 @@ jobs:
               );
             }
 
-  # The deploy scripts are what tell us whether a production deploy actually
-  # happened, so they get their own regression suite (ENG-734). It runs the real
-  # script against a mocked AWS CLI — no AWS access, ~20s.
-  deploy-scripts-tests:
-    name: Deploy script tests
+  # These scripts are the ones that decide whether a deploy really happened
+  # (ENG-734) and whether Greptile really passed (ENG-754), so they get their own
+  # regression suites. Both run the real script against a mocked CLI — no AWS
+  # access, no GitHub access, ~30s.
+  ci-scripts-tests:
+    name: CI script tests
     needs: detect-changes
     if: needs.detect-changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
-      group: ${{ github.workflow }}-deploy-scripts-tests-${{ github.ref }}
+      group: ${{ github.workflow }}-ci-scripts-tests-${{ github.ref }}
       cancel-in-progress: true
     steps:
       - name: Checkout PR head
         uses: actions/checkout@v5
 
-      - name: Lint deploy scripts
+      - name: Lint CI scripts
         run: shellcheck .github/scripts/*.sh
 
       - name: Run eb-deploy.sh regression suite
         run: bash .github/scripts/eb-deploy.test.sh
 
+      - name: Run greptile-gate.sh regression suite
+        run: bash .github/scripts/greptile-gate.test.sh
+
+  # This job used to poll Greptile's own `Greptile Review` check-run and pass on
+  # conclusion=success. Greptile marks that check-run success for every completed
+  # review regardless of confidence score, so the job went green on 3/5 and 4/5
+  # reviews carrying live P1s. The 5/5 bar was held up by an agent choosing to
+  # open the comment and read the score — discipline, not a control (ENG-754).
+  # It now reads the score and the reviewed-commit pointer out of the comment
+  # body and fails closed. See .github/scripts/greptile-gate.sh for why the
+  # comment is the only source of the score.
   greptile-review:
     name: Require Greptile Review
     needs: detect-changes
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
+    # The script's own deadline is 20 minutes, leaving 5 minutes of runner
+    # budget so the gate fails with a diagnosable message instead of being
+    # killed mid-poll — the ENG-734 shape of a step timeout undercutting the
+    # budget it is supposed to contain.
     timeout-minutes: 25
     # A newer commit on the same PR cancels this superseded Greptile-wait job.
     concurrency:
       group: ${{ github.workflow }}-greptile-review-${{ github.ref }}
       cancel-in-progress: true
     steps:
-      - name: Wait for Greptile review check
+      # Deliberately the PR's own copy of the gate, not main's: whatever gates
+      # merges has to gate its own changes, or the fix ships unexercised
+      # (the ENG-743 lesson).
+      - name: Checkout PR head
+        uses: actions/checkout@v5
+
+      - name: Require a true Greptile 5/5 on this head
         env:
           GH_TOKEN: ${{ github.token }}
-          SHA: ${{ github.event.pull_request.head.sha }}
           REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-
-          for attempt in {1..60}; do
-            check_json="$(gh api "repos/${REPO}/commits/${SHA}/check-runs?check_name=Greptile%20Review" --jq '.check_runs[0] // empty')"
-
-            if [ -n "$check_json" ]; then
-              status="$(printf '%s' "$check_json" | jq -r '.status')"
-              conclusion="$(printf '%s' "$check_json" | jq -r '.conclusion // ""')"
-              echo "Greptile Review status=${status} conclusion=${conclusion:-pending} attempt=${attempt}"
-
-              if [ "$status" = "completed" ]; then
-                if [ "$conclusion" = "success" ]; then
-                  exit 0
-                fi
-                echo "Greptile Review completed with conclusion=${conclusion}"
-                exit 1
-              fi
-            else
-              echo "Waiting for Greptile Review check attempt=${attempt}"
-            fi
-
-            sleep 20
-          done
-
-          echo "Greptile Review did not complete within 20 minutes."
-          exit 1
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash .github/scripts/greptile-gate.sh
 
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
