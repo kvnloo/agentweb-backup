@@ -27,6 +27,7 @@ jobs:
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner }}
+      workflows: ${{ steps.filter.outputs.workflows }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -43,6 +44,8 @@ jobs:
               - 'backend/**'
             partner:
               - 'partner-portal/**'
+            workflows:
+              - '.github/**'
 
   # Job A: heavy agentMode files (~150 files, ~half the test time)
   backend-tests-a:
@@ -185,6 +188,28 @@ jobs:
                 `functions=${functions.pct}%, lines=${lines.pct}%`
               );
             }
+
+  # The deploy scripts are what tell us whether a production deploy actually
+  # happened, so they get their own regression suite (ENG-734). It runs the real
+  # script against a mocked AWS CLI — no AWS access, ~20s.
+  deploy-scripts-tests:
+    name: Deploy script tests
+    needs: detect-changes
+    if: needs.detect-changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-deploy-scripts-tests-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v5
+
+      - name: Lint deploy scripts
+        run: shellcheck .github/scripts/*.sh
+
+      - name: Run eb-deploy.sh regression suite
+        run: bash .github/scripts/eb-deploy.test.sh
 
   greptile-review:
     name: Require Greptile Review
