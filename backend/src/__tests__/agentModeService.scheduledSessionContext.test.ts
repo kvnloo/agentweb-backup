@@ -298,14 +298,29 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(lower).toContain('not');
   });
 
-  it('warns that list_all_clients carries sensitive fields and forbids copying them into the report', () => {
+  it('warns that list_all_clients carries sensitive fields and forbids leaking unrequested ones into the report', () => {
     const lower = directive.toLowerCase();
     // it must flag that list_all_clients returns more than identity data
     expect(lower).toContain('roles');
     expect(lower).toContain('subscription');
     expect(lower).toMatch(/stripe|billing|payment/);
-    // and instruct the model to extract only the identity mapping
+    // and instruct the model to include only the fields the task actually asked for
     expect(lower).toMatch(/only|never/);
+  });
+
+  // Purpose-limitation carve-out: the guard is "don't leak fields nobody asked
+  // for", NOT "refuse account data". When an admin scheduled report EXPLICITLY
+  // asks for billing/subscription fields (e.g. an MRR-by-account report),
+  // list_all_clients is admin-only so the requester is authorized — Emma must
+  // comply and include them, not over-refuse. Guards against the one behavioral
+  // regression the absolute wording could otherwise cause.
+  it('does not over-refuse: complies when an admin explicitly requests the account fields', () => {
+    const lower = directive.toLowerCase();
+    // it must carve out the explicit-request case
+    expect(lower).toContain('explicit');
+    expect(lower).toMatch(/comply|include them/);
+    // and ground the authorization in list_all_clients being admin-only
+    expect(lower).toContain('admin-only');
   });
 });
 
