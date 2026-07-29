@@ -1,3 +1,50 @@
+## ENG-754: the Greptile 5/5 bar is now a check, not a habit (2026-07-29)
+
+`Require Greptile Review` used to poll Greptile's own `Greptile Review` check-run and pass on
+`conclusion=success`. Greptile marks that check-run success for **every completed review regardless
+of confidence score**, so the job was green on four below-bar reviews in one day — agentweb#2215
+(4/5), #2219 (3/5), portal#985 (3/5, twice) — each carrying a live P1. All four were caught only
+because an agent chose to open the comment and read the score. Investigation findings:
+
+- **Greptile publishes no structured score. Checked all four plausible surfaces before parsing
+  prose.** The check-run's `output.summary` is `"Greptile has reviewed the Pull Request.\n\nN files
+  reviewed, M comments added."` with `output.text: null`; its PR review object is
+  `state: COMMENTED` with an empty body; the commit status API carries no Greptile context; and
+  Greptile's public API is repository query/indexing, with no credential of ours in Secrets Manager
+  anyway. The comment body is the only place the verdict exists, so the gate parses it strictly and
+  fails closed rather than pretending a structured source exists.
+- **Greptile edits its original comment in place — it never posts a second one.** On portal#985 a
+  single comment advanced `Reviews (2)` → `Reviews (3)`, each with a different `Last reviewed
+  commit`. So `id`, `created_at` and the comment *count* are all stable across re-reviews and are
+  useless as freshness signals; only `updated_at` and the body move. Anything waiting for a *new*
+  comment waits forever. This is also why the earlier worker on #985 misread the state: it saw 3/5
+  against a superseded SHA and could not tell a stale read from a fresh verdict, because the comment
+  was the same object either way.
+- **"Score present but SHA mismatched" must resolve to pending, never to pass or fail.** The body's
+  `commit/<40-hex>` pointer is the only authority on which commit a score belongs to. The gate
+  compares it to the head SHA positionally and never against `$REPO` — the footer URL lower-cases
+  the org (`github.com/agentwebpro/agentweb/...`) while `github.repository` is `AgentWebPro/agentweb`.
+- **A lenient parser would have recreated the same bug one layer down**, so every ambiguity fails
+  closed and dumps the raw body: no verdict footer for our head, a footer with no 40-hex pointer,
+  zero or multiple `Confidence Score` values, a non-`/5` scale, a score outside 0–5, or a non-JSON
+  payload. In particular a missing pointer must never fall back to "the score I found".
+- **The gate runs the PR's own copy of the script**, per the ENG-743 lesson that whatever gates
+  merges has to gate its own changes — this PR's merge was blocked by the gate it adds. The
+  corollary is worth stating plainly: a PR can edit `greptile-gate.sh` (or `tests.yml`) to neuter
+  the gate for itself. That is a pre-existing property of every `pull_request` workflow here, not
+  something this change introduces, and it is visible in the diff Greptile reviews.
+- **The script's 20-minute deadline sits under a 25-minute step timeout**, so the gate always fails
+  with a diagnosable message rather than being killed mid-poll — the ENG-734 shape of a step timeout
+  undercutting the budget it is meant to contain, which is exactly what Greptile's own 3/5 review
+  caught on #2219.
+- **`Require Greptile Review` was not actually a required status check.** Branch protection on
+  `main` required only `Detect changed projects`; the Greptile job merely gated the staging-deploy
+  job. Acceptance criterion 5 (human merges gated identically) therefore needed the context added to
+  branch protection, which this change does — code alone could not have closed it for humans.
+- **Left alone deliberately:** `agentweb-customer-portal` and `agentweb-landing-page` keep Greptile
+  advisory. Neither has a `greptile.json` or a `Require Greptile Review` job, so this mechanism does
+  not reach them; porting it is Harsha's call (criterion 6).
+
 ## ENG-743: the staging deploy gate now has to observe the deploy (2026-07-29)
 
 `backend-staging-deploy` in `.github/workflows/tests.yml` now calls
