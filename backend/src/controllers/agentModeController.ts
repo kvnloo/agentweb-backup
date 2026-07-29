@@ -4574,9 +4574,14 @@ export const agentModeController = {
       // before any LLM call: refuse loudly, never a degraded-but-billed path.
       const usageStatus = await checkTokenUsage(session.userId);
       if (!usageStatus.allowed) {
+        // The caller is anonymous, so the denial carries the message ONLY.
+        // `usageStatus` is the owner's billing record (allowance, bonus, dollar
+        // spend, cost cap, enforcement state); echoing it here would turn this
+        // public route into a read side-channel on the owner's account for
+        // anyone holding the share link. Authenticated owners still read their
+        // usage through the subscription-usage endpoint.
         return res.status(429).json({
           error: 'Monthly token limit reached for this shared session. Please contact the owner of this link.',
-          tokenUsage: usageStatus,
         });
       }
 
