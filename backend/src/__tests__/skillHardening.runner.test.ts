@@ -23,6 +23,16 @@ describe("dedupeTargets", () => {
     expect(out[0].addTools).toEqual(["x"]);
   });
 
+  it("preserves setPrompt through dedupe (regression)", () => {
+    const out = dedupeTargets([
+      { skillId: "a", setPrompt: "basicSubscription" },
+      { skillId: "a", blocks: ["safety"] },
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].setPrompt).toBe("basicSubscription");
+    expect(out[0].blocks).toEqual(["safety"]);
+  });
+
   it("passes distinct skills through unchanged", () => {
     const out = dedupeTargets([
       { skillId: "a", addTools: ["x"] },

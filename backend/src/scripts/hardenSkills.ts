@@ -42,10 +42,12 @@ export function dedupeTargets(targets: SkillHardeningTarget[]): SkillHardeningTa
     if (!cur) {
       byId.set(t.skillId, {
         skillId: t.skillId,
+        setPrompt: t.setPrompt,
         blocks: [...(t.blocks || [])],
         addTools: [...(t.addTools || [])],
       });
     } else {
+      if (t.setPrompt && !cur.setPrompt) cur.setPrompt = t.setPrompt;
       cur.blocks = [...new Set([...(cur.blocks || []), ...(t.blocks || [])])];
       cur.addTools = [...new Set([...(cur.addTools || []), ...(t.addTools || [])])];
     }
