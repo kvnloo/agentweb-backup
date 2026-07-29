@@ -1,3 +1,41 @@
+## ENG-705: unauthenticated share generate + unrate-limited duplicate could burn v0/LLM credits (2026-07-29)
+
+Two cost-leak surfaces closed with primitives that already existed. Investigation findings:
+
+- **The filing's AC 2 (attribution) was already satisfied — only the gate was missing.** The issue
+  read as "these paths spend LLM budget with no usage gate **and no attributable user**". The first
+  half was true, the second was not: `generateSharedResponse` passes `session.userId` into
+  `generateSessionResponse`, which reaches `incrementUserTokenUsage(userId, ...)` in
+  `agentModeService.ts`. Share spend has always been booked to the share **owner**. So the fix is
+  one `checkTokenUsage(session.userId)` call, not a new attribution path or an anonymous-budget
+  concept. Two of the new tests pass against pre-fix code by design — they are characterization
+  tests pinning that fact so a future refactor cannot quietly lose it.
+- **`checkTokenUsage` was already imported in `agentModeController.ts`** (used by the authenticated
+  `/generate` path at the `usageStatus` check). The share gate is deliberately the *same* call in
+  the *same* shape returning the *same* 429 — zero new imports, zero new concepts.
+- **Gate placement matters for the session lock.** It sits inside the `try` that follows
+  `tryClaimSessionGeneration`, so the existing `finally { releaseSessionGeneration(...) }` releases
+  on the 429 path. Placing it before the claim would also have worked, but inside the try mirrors
+  the authenticated path exactly and is covered by a regression test asserting the owner is not
+  locked out of their own session after a visitor hits the limit.
+- **Duplicate reuses the module's existing `rateLimiter`, deliberately sharing generate's quota
+  bucket** rather than getting its own. A separate limiter would have let a caller drain 10
+  generates *and* 10 duplicates. Sharing the map means duplicate cannot be used to obtain fresh
+  quota — asserted directly.
+- **`"view"` → `"edit"` on duplicate is net-subtractive.** Duplicate was a third authorization
+  shape (deploy/iterate required `"edit"`, duplicate required `"view"`); it now matches iterate.
+  The pre-fix test run proved the impact concretely: a view-only org member received `201` — a
+  full v0 generation — on someone else's page.
+- **Gotcha for anyone adding a dependency to `generateSharedResponse`:** five test suites drive it
+  (`ishareModel`, `ishareAnonymousSender`, `agentModeSharing`, `sharingIntegration`,
+  `interactiveShareExpiration`). The first four needed a `tokenUsageService` stub added; each was
+  verified green on `origin/main` first so the failures were provably the new dependency, not a
+  regression, and no assertion was changed. `interactiveShareExpiration` needs none — it exercises
+  the expired-share 410 path, which returns before the gate.
+- **Known limitation, unchanged by this PR:** the landing-page rate limiter is an in-process
+  `Map`, so limits are per backend instance rather than global. Pre-existing; worth noting if
+  ENG-666/ENG-694 metering makes cross-instance accounting a requirement.
+
 ## ENG-446: canonical action payloads on existing report/run data (2026-07-29)
 
 New pure module `backend/src/services/marketingActionEnvelope.ts` — the transport/persistence seam
