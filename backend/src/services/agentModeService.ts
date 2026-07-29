@@ -2385,8 +2385,13 @@ export class AgentModeService {
     'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
     'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     // List gemini models - client will be lazy-loaded
-    // gemini-3-pro-preview omitted from vision: the Gemini API returns 404 for this id (not served).
-    'gemini-3-pro-preview': { client: null, supportsTemperature: true },
+    // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
+    // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
+    // so picking it was a guaranteed failure. llmPricing.ts already carried the
+    // DEPRECATED 2026-03-09 note; only the registry had not caught up. Migrate to
+    // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
+    // Its price entry is intentionally left in place — a rate for a removed model is
+    // harmless, a missing rate for a live one is not.
     'gemini-3-flash-preview': { client: null, supportsTemperature: true, supportsVision: true },
     'gemini-3.1-pro-preview': { client: null, supportsTemperature: true, supportsVision: true },
     'gemini-3.1-flash-lite': { client: null, supportsTemperature: true, supportsVision: true },
@@ -2426,7 +2431,7 @@ export class AgentModeService {
   }
   /**
    * Make an LLM call with the specified model and parameters
-   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3-pro-preview')
+   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3.1-pro-preview')
    * @param messages - Array of chat messages
    * @param options - Optional parameters for the LLM call
    * @returns The LLM response
