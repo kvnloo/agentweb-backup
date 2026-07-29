@@ -5,7 +5,7 @@ import { deriveBlockedByCost } from './tokenUsageService';
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from '../config';
 import { chatbotDb } from './chatbotService';
 import { userDb } from './db';
-import { reportContainsCrossAccountData, resolveAuthorizedReportRecipients } from './scheduledReportAccess';
+import { reportContainsCrossAccountData, messagesReferenceCrossAccountTool, resolveAuthorizedReportRecipients } from './scheduledReportAccess';
 import { settingsService } from './settingsService';
 import { Citation, CitationRenderFormat, renderCitationMarkers, stripCitationMarkers } from '../utils/citations';
 
@@ -1435,6 +1435,14 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
         try {
           guardSession = await chatbotDb.getChatSession(result.sessionId);
           isSensitive = reportContainsCrossAccountData(guardSession?.calledFunctions);
+          if (!isSensitive) {
+            // calledFunctions is a best-effort counter (its write errors are
+            // swallowed at the call site), so a successful cross-account tool
+            // call can be missing from it. Confirm against the authoritative
+            // tool-call message records before treating the report as safe.
+            const guardMessages = await chatbotDb.getMessagesFromMessagesTable(result.sessionId);
+            isSensitive = messagesReferenceCrossAccountTool(guardMessages as any);
+          }
         } catch (classifyError) {
           console.error(`Scheduled report guard: could not classify session ${result.sessionId}; failing closed (treating as sensitive):`, classifyError);
           isSensitive = true;

@@ -46,6 +46,35 @@ export function reportContainsCrossAccountData(
   return names.some((n) => CROSS_ACCOUNT_USER_DATA_TOOLS.includes(n));
 }
 
+/**
+ * Authoritative cross-account detection from the run's tool-call MESSAGE
+ * records. `calledFunctions` is a best-effort aggregate counter whose write
+ * errors are swallowed at the call site (agentModeService), so a successful
+ * cross-account tool call can be missing from it — relying on the counter alone
+ * fails open. The tool-call messages are the source of truth for what actually
+ * ran, so this is used to confirm a report is safe before broadcasting it.
+ *
+ * Scans each message for a cross-account tool name in either an assistant
+ * message's `tool_calls[].function.name` or a tool-result message's `name`.
+ */
+export function messagesReferenceCrossAccountTool(
+  messages: Array<Record<string, any>> | null | undefined
+): boolean {
+  if (!messages || messages.length === 0) return false;
+  for (const m of messages) {
+    const toolCalls = m?.tool_calls;
+    if (Array.isArray(toolCalls)) {
+      for (const tc of toolCalls) {
+        const name = tc?.function?.name ?? tc?.name;
+        if (name && CROSS_ACCOUNT_USER_DATA_TOOLS.includes(name)) return true;
+      }
+    }
+    const directName = m?.name; // tool-result messages carry the tool name
+    if (directName && CROSS_ACCOUNT_USER_DATA_TOOLS.includes(directName)) return true;
+  }
+  return false;
+}
+
 export interface RecipientAuthzResult {
   /** Addresses the report may be delivered to. */
   authorized: string[];
