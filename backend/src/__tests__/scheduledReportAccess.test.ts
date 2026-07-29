@@ -8,6 +8,7 @@
 import {
   CROSS_ACCOUNT_USER_DATA_TOOLS,
   reportContainsCrossAccountData,
+  messagesReferenceCrossAccountTool,
   resolveAuthorizedReportRecipients,
 } from '../services/scheduledReportAccess';
 import { userDb } from '../services/db';
@@ -50,6 +51,34 @@ describe('reportContainsCrossAccountData', () => {
 
   it('lists list_all_clients and get_chat_history as cross-account tools', () => {
     expect(CROSS_ACCOUNT_USER_DATA_TOOLS).toEqual(expect.arrayContaining(['list_all_clients', 'get_chat_history']));
+  });
+});
+
+describe('messagesReferenceCrossAccountTool (authoritative fallback for the swallowed counter)', () => {
+  it('detects a cross-account tool in an assistant message tool_calls', () => {
+    expect(messagesReferenceCrossAccountTool([
+      { role: 'assistant', tool_calls: [{ type: 'function', function: { name: 'list_all_clients' } }] },
+    ])).toBe(true);
+  });
+
+  it('detects a cross-account tool in a tool-result message name', () => {
+    expect(messagesReferenceCrossAccountTool([
+      { role: 'assistant', content: 'thinking' },
+      { role: 'tool', name: 'get_chat_history', content: '...' },
+    ])).toBe(true);
+  });
+
+  it('returns false when only non-cross-account tools appear', () => {
+    expect(messagesReferenceCrossAccountTool([
+      { role: 'assistant', tool_calls: [{ function: { name: 'install_skills' } }] },
+      { role: 'tool', name: 'search_tool_response' },
+    ])).toBe(false);
+  });
+
+  it('returns false for empty/missing message lists', () => {
+    expect(messagesReferenceCrossAccountTool([])).toBe(false);
+    expect(messagesReferenceCrossAccountTool(null)).toBe(false);
+    expect(messagesReferenceCrossAccountTool(undefined)).toBe(false);
   });
 });
 
