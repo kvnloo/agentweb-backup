@@ -1,3 +1,49 @@
+## ENG-744: Claude 5 generation added to the model catalog (2026-07-29)
+
+Added `anthropic.claude-opus-5`, `anthropic.claude-sonnet-5` and
+`anthropic.claude-haiku-4-5-20251001-v1:0` to the registry, the ENG-683 profile map, and the
+price book. Investigation findings:
+
+- **A listed ACTIVE inference profile is NOT proof of account access, and the difference is
+  invisible until runtime.** `list-inference-profiles` in us-west-2 reports
+  `us.anthropic.claude-opus-5` and `us.anthropic.claude-sonnet-5` ACTIVE, but invoking either with
+  the app's default credentials (992382574572) returns
+  `AccessDeniedException: ... is not available for this account`. Both are only reachable from the
+  **bearer-token account (231030591963)** — the same cross-account path Opus 4.8 already uses. Adding
+  them on the strength of the profile listing alone would have shipped two picker entries that 403
+  for every user. Always invoke before adding.
+- **Haiku 4.5 is the opposite case and must NOT be given bearer auth.** It IS served on the default
+  account, so it takes a normal `global.*` cross-region ARN and stays out of
+  `BEDROCK_BEARER_TOKEN_MODELS`. The account assignment is per-model, not per-generation — there is
+  no "Claude 5 goes to the bearer account" rule to lean on.
+- **Opus 5 returns a `reasoningContent` block before its text block** (thinking is on by default on
+  Opus 5, unlike 4.8/4.7 where omitting the `thinking` param meant no thinking). The Converse parser
+  in `agentModeService` collects *all* `text` blocks and ignores unknown ones, so this is handled —
+  but a parser that assumed `content[0].text` would silently return empty replies for Opus 5 only.
+  Verified against live Bedrock via ConverseCommand, with and without a tool.
+- **Opus 5 and Sonnet 5 reject `temperature` with HTTP 400 `"temperature is deprecated for this
+  model"`** — hence `supportsTemperature: false`, matching Opus 4.8. Haiku 4.5 still accepts it.
+  Confirmed empirically rather than inferred from the generation number.
+- **Haiku 4.5's price key is a canonicalization trap.** `llmPricing` already had
+  `anthropic.claude-haiku-4-5`, but the registry id is
+  `anthropic.claude-haiku-4-5-20251001-v1:0`, and `canonicalModelId` only strips a trailing bare
+  `-YYYY-MM-DD` — not `-20251001-v1:0`. Without its own key the lookup misses and `getModelPrice`
+  returns null, which the ledger books as $0. The pre-existing key covers a *different* id than it
+  appears to.
+- **`gemini-3-pro-preview` is already withdrawn by Google and is still in our picker.** A live probe
+  returns 404 `"This model models/gemini-3-pro-preview is no longer available."` It remains listed by
+  `GET /api/agent-mode/public/llm-models`, so selecting it errors. Reported, not removed (ENG-744
+  AC #7 requires reporting). An in-code comment already noted the 404 for the *vision* path; the
+  inference that the model was gone everywhere was never made.
+- **The Gemini Pro line is not behind — Google has not shipped one.** `gemini-3.1-pro-preview` is
+  the newest Pro in the live catalog; there is no 3.5/3.6 Pro despite 3.5/3.6 Flash existing. The
+  "Pro lags Flash" reading of our catalog is Google's release cadence, not our drift.
+- **Live voice is healthy; the `generateContent` 404 against it is a probe artifact.**
+  `gemini-3.1-flash-live-preview` only advertises `bidiGenerateContent`, the WebSocket method
+  `liveVoiceService` actually uses. It is not withdrawn. It does, however, have **no GA successor**
+  in the catalog — as does `gemini-3.1-pro-preview` — which is the live exposure to watch ahead of
+  the 2026-10-20 Gemini platform migration.
+
 ## ENG-630: Meta Insights `filtering` shape + preserved 400 detail (2026-07-29)
 
 New pure module `backend/src/utils/metaInsightsFiltering.ts`, wired into
