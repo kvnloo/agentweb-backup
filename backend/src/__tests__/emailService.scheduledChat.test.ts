@@ -1,11 +1,38 @@
 import { emailService } from '../services/emailService';
+import { chatbotDb } from '../services/chatbotService';
+import { userDb } from '../services/db';
 
-// Mock chatbotService used inside sendScheduledChatResultEmail to avoid side effects
+// Mock chatbotService used inside sendScheduledChatResultEmail to avoid side effects.
+// getChatSession is read by the recipient-authorization guard (ENG-500); default it
+// to undefined so the guard classifies the report as non-sensitive (no-op) unless a
+// test overrides it.
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     updateSessionInteractiveShareMetadata: jest.fn().mockResolvedValue(undefined),
+    getChatSession: jest.fn().mockResolvedValue(undefined),
+    createOrReuseInteractiveShare: jest.fn().mockResolvedValue('https://app/share'),
   },
 }));
+
+// The guard resolves per-recipient admin status + the owner via userDb.
+jest.mock('../services/db', () => ({
+  userDb: { getUserByEmail: jest.fn(), getUserById: jest.fn() },
+}));
+
+// Shared result fixture for the guard tests (module scope so it is visible
+// regardless of which describe block the guard tests live in).
+const GUARD_BASE_RESULT = {
+  passed: true,
+  actualResponse: 'Hello world',
+  keywordMatches: [] as string[],
+  keywordMisses: [] as string[],
+  functionCallMatches: [] as string[],
+  functionCallMisses: [] as string[],
+  executionTime: 1234,
+  sessionId: 'session-abc',
+  attempt: 1,
+  createdAt: new Date().toISOString(),
+};
 
 describe('emailService.sendScheduledChatResultEmail', () => {
   const baseResult = {
@@ -300,6 +327,59 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
     expect(htmlContent).not.toContain('<a href="https://evil.example">');
     expect(htmlContent).toContain('&lt;script&gt;');
     expect(htmlContent).toContain('&lt;a href=');
+  });
+
+  // ── Recipient-authorization guard (ENG-500), end-to-end through the real send ──
+  it('withholds non-admin recipients for a cross-account (sensitive) report and adds a notice', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { list_all_clients: 1, get_chat_history: 1 },
+    });
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) =>
+      email === 'admin@example.com' ? { email, isAdmin: true } : { email, isAdmin: false }
+    );
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(
+      ['admin@example.com', 'nonadmin@example.com'],
+      'Daily User Activity Report',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients, , textContent, htmlContent] = spy.mock.calls[0];
+    // non-admin withheld; admin kept; owner added (custodian + gets the notice)
+    expect(recipients).toContain('admin@example.com');
+    expect(recipients).toContain('owner@example.com');
+    expect(recipients).not.toContain('nonadmin@example.com');
+    // the withholding notice is injected into the delivered body
+    expect(htmlContent).toContain('withheld');
+    expect(htmlContent).toContain('nonadmin@example.com');
+    expect(textContent).toContain('withheld');
+  });
+
+  it('leaves recipients unchanged and does no lookups for an ordinary (non-sensitive) report', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { install_skills: 1 },
+    });
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(
+      ['a@example.com', 'b@example.com'],
+      'Weekly Digest',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients] = spy.mock.calls[0];
+    expect(recipients).toEqual(['a@example.com', 'b@example.com']);
+    expect(userDb.getUserByEmail).not.toHaveBeenCalled();
   });
 });
 
