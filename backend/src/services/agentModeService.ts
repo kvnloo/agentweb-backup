@@ -27397,6 +27397,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
+      // ENG-660: for a personal LinkedIn account, AgentWeb works from the posts
+      // created through AgentWeb itself (personal profiles have no organic post
+      // ingestion — only AgentWeb-published posts are ever on file). When none
+      // are on file, a bare "Successfully loaded 0 posts" led the model to claim
+      // the fetch of the
+      // user's posts succeeded (a tool-success hallucination). Signal this as an
+      // explicitly-unsupported read via organicReadUnsupported + the message so
+      // the model states the truth instead of implying it read the user's
+      // LinkedIn. success stays true on purpose: nothing failed (the account is
+      // connected and healthy), so this must NOT render as a tool "failure" in
+      // the UI. The message leads with what AgentWeb DOES (positive, ownership
+      // framing) so the model doesn't present this as a weakness/"limitation".
+      const accountType = (matchingAccount.config as any)?.account_type;
+      if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
+        return {
+          success: true,
+          organicReadUnsupported: true,
+          posts: [],
+          message:
+            'AgentWeb works from the LinkedIn posts you create with it, and there aren\'t any AgentWeb-created posts on file for this personal account — so there\'s nothing here to analyze for writing voice. Frame this as normal AgentWeb behavior and keep the focus on the constructive next step — do not describe it as a shortcoming and do not blame any external platform. Do NOT claim you have read or analyzed the user\'s existing LinkedIn posts, and there\'s no need to retry. The best next step: invite the user to paste or upload a few of their recent posts, then build their writing-voice profile from those — and offer to save it so future posts match their style.',
+        };
+      }
+
       return {
         success: true,
         message: `Successfully loaded ${result.posts.length} posts`,
