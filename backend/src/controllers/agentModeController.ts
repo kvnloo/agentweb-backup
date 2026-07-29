@@ -4578,6 +4578,25 @@ export const agentModeController = {
 
       try {
 
+      // ENG-705: this route is registered before `router.use(authenticateToken)`,
+      // so the caller is anonymous — but the spend is not. Gate on the share
+      // OWNER's allowance (the account `generateSessionResponse` already bills
+      // via incrementUserTokenUsage) so an unauthenticated visitor can never
+      // cause more vendor spend than the owner could cause themselves. This runs
+      // before any LLM call: refuse loudly, never a degraded-but-billed path.
+      const usageStatus = await checkTokenUsage(session.userId);
+      if (!usageStatus.allowed) {
+        // The caller is anonymous, so the denial carries the message ONLY.
+        // `usageStatus` is the owner's billing record (allowance, bonus, dollar
+        // spend, cost cap, enforcement state); echoing it here would turn this
+        // public route into a read side-channel on the owner's account for
+        // anyone holding the share link. Authenticated owners still read their
+        // usage through the subscription-usage endpoint.
+        return res.status(429).json({
+          error: 'Monthly token limit reached for this shared session. Please contact the owner of this link.',
+        });
+      }
+
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
 

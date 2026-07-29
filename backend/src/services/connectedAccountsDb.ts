@@ -72,6 +72,18 @@ export interface MetaAdAccountConfig extends BaseOAuthConfig {
   ad_account_id: string;
   currency?: string;
   account_status?: number;
+  /**
+   * Scopes Meta actually granted, read back from debug_token at connect time.
+   *
+   * Distinct from the inherited `scopes`, which for Meta holds the scopes we
+   * REQUESTED and is therefore not a capability signal — a user can decline the
+   * ads permissions and still be issued a token (ENG-629 / OPS-79). Absent when
+   * the grant could not be determined; never written as [] in that case, since
+   * an empty array means "nothing granted". Evaluate via getMetaAdsScopeState.
+   */
+  granted_scopes?: string[];
+  /** Set when Meta authoritatively refused an ads read for lack of permission. */
+  ads_scope_revoked_at?: string;
 }
 
 /**

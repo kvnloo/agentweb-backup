@@ -672,6 +672,58 @@ export class MetaService {
   }
 
   /**
+   * The scopes Meta ACTUALLY granted for this token, per debug_token.
+   *
+   * The OAuth finalize path can only ever know what it *requested* — the user is
+   * free to untick individual permissions at the consent dialog, and Meta returns
+   * the token regardless. Persisting the requested set therefore records a claim
+   * we never verified, which is precisely how a connection with no ads permission
+   * came to be reported as ads-capable (ENG-629 / OPS-79).
+   *
+   * Merges the flat `scopes` list with `granular_scopes[].scope`, since object-
+   * scoped grants (a specific ad account) appear only in the latter.
+   *
+   * Returns `undefined` — never `[]` — when the grant could not be determined, so
+   * callers can distinguish "we could not ask" from "nothing was granted". Storing
+   * an empty array in the former case would later read as an authoritative refusal.
+   */
+  public async getGrantedScopes(accessToken: string): Promise<string[] | undefined> {
+    try {
+      const { getMetaCredentials } = await import('../utils/secretsManager');
+      const creds = await getMetaCredentials();
+      const apiVersion = process.env.META_API_VERSION || 'v25.0';
+      const appToken = `${creds.clientId}|${creds.clientSecret}`;
+
+      const res = await fetch(
+        `https://graph.facebook.com/${apiVersion}/debug_token` +
+          `?input_token=${encodeURIComponent(accessToken)}` +
+          `&access_token=${encodeURIComponent(appToken)}`
+      );
+      const body: any = await res.json();
+
+      if (body?.error) {
+        console.warn(`[MetaService] getGrantedScopes: debug_token returned an error: ${body.error?.message ?? 'unknown'}`);
+        return undefined;
+      }
+
+      const flat: unknown[] = Array.isArray(body?.data?.scopes) ? body.data.scopes : [];
+      const granular: unknown[] = Array.isArray(body?.data?.granular_scopes)
+        ? body.data.granular_scopes.map((g: any) => g?.scope)
+        : [];
+
+      const merged = [...flat, ...granular].filter(
+        (s): s is string => typeof s === 'string' && s.trim().length > 0
+      );
+
+      if (merged.length === 0) return undefined;
+      return Array.from(new Set(merged.map(s => s.trim())));
+    } catch (error: any) {
+      console.warn(`[MetaService] getGrantedScopes failed: ${error?.message ?? error}`);
+      return undefined;
+    }
+  }
+
+  /**
    * Best-effort fallback for getPages: enumerate the page IDs the user opted in
    * during OAuth (debug_token granular_scopes → pages_show_list.target_ids) and
    * read each page directly. Returns [] on any failure rather than throwing —
