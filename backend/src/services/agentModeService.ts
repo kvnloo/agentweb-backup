@@ -51,6 +51,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
+import { BEDROCK_BEARER_TOKEN_MODELS, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
   imageGenerationCostUsd,
@@ -709,10 +710,6 @@ const DATA_ANALYSIS_FILE_END_MARKER = '<<<AGENTWEB_FILE_END>>>';
 
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
-
-// Models served from the separate Bedrock account (231030591963) reached via a
-// long-term API key (bearer token) rather than the app's default SigV4 creds.
-const BEARER_TOKEN_MODELS = new Set(['anthropic.claude-opus-4-8']);
 
 // Legacy model ids persisted by sessions/schedules created before a model was
 // renamed. Maps the old id to its current registry key so old sessions keep
@@ -1816,7 +1813,9 @@ export class AgentModeService {
     // default IAM credentials (992382574572) cannot reach. Authenticate that model
     // with a long-term Bedrock API key (bearer token) instead of SigV4, scoped to a
     // dedicated client so all other models keep using the default credential chain.
-    const usesBearerToken = BEARER_TOKEN_MODELS.has(modelId);
+    // Models served from the separate Bedrock account (231030591963) reached via
+    // a long-term API key (bearer token) rather than the app's default SigV4 creds.
+    const usesBearerToken = BEDROCK_BEARER_TOKEN_MODELS.has(modelId);
     let bedrockClient: any;
     if (usesBearerToken) {
       const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
@@ -1852,14 +1851,7 @@ export class AgentModeService {
 
     // Map certain model IDs to their corresponding inference profile ARNs
     // Note: Newer Claude models require using inference profiles for cross-region access
-    const inferenceProfileMap: Record<string, string> = {
-      'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-      'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
-      'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
-      // Opus 4.8 lives in account 231030591963 (reached via bearer token above).
-      'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
-    };
-    const actualModelId = inferenceProfileMap[modelId] || modelId;
+    const actualModelId = resolveBedrockModelId(modelId);
 
     // Create OpenAI-compatible wrapper using direct Converse API
     return {
