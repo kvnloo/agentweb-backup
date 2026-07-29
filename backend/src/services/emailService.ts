@@ -1429,6 +1429,7 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       let recipients = emailList;
       let finalHtml = html;
       let finalText = text;
+      let guardOwnerEmail: string | undefined;
       try {
         let guardSession: any;
         let isSensitive: boolean;
@@ -1447,13 +1448,14 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
           console.error(`Scheduled report guard: could not classify session ${result.sessionId}; failing closed (treating as sensitive):`, classifyError);
           isSensitive = true;
         }
+        // Resolve the owner email up front — used both to authorize the owner and
+        // to notify them if delivery ends up blocked.
+        try {
+          const owner = guardSession?.userId ? await userDb.getUserById(guardSession.userId) : undefined;
+          guardOwnerEmail = (owner as any)?.email;
+        } catch { /* owner unknown → resolver still restricts to verified admins */ }
         if (isSensitive) {
-          let ownerEmail: string | undefined;
-          try {
-            const owner = guardSession?.userId ? await userDb.getUserById(guardSession.userId) : undefined;
-            ownerEmail = (owner as any)?.email;
-          } catch { /* owner unknown → resolver still restricts to verified admins */ }
-          const authz = await resolveAuthorizedReportRecipients({ recipients: emailList, ownerEmail, isSensitive: true });
+          const authz = await resolveAuthorizedReportRecipients({ recipients: emailList, ownerEmail: guardOwnerEmail, isSensitive: true });
           recipients = authz.authorized;
           if (authz.withheld.length > 0) {
             const noticeText = `⚠️ ${authz.withheld.length} recipient(s) were withheld from this report because it contains cross-account account data and they are not authorized to receive it: ${authz.withheld.join(', ')}. To share this data, ensure recipients are admin users.`;
@@ -1466,15 +1468,30 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
           }
         }
       } catch (guardError) {
-        // Guard itself failed unexpectedly — fail-closed: deliver only to the
-        // account owner if we can determine it, else withhold entirely rather
+        // Guard itself failed unexpectedly — fail-closed: withhold entirely rather
         // than risk distributing possibly-sensitive data to unverified addresses.
+        // The empty-recipients branch below notifies the owner so it is not silent.
         console.error(`Scheduled report guard errored for session ${result.sessionId}; failing closed:`, guardError);
         recipients = [];
       }
 
       if (recipients.length === 0) {
-        console.warn(`Scheduled chat result email for session ${result.sessionId} had no authorized recipients after the guard; skipping send.`);
+        // Fail-closed left no authorized recipient. Do NOT silently drop the
+        // completed report: notify the schedule owner that delivery was blocked
+        // (a status message ONLY — never the report data) so the report is not
+        // lost without a signal and the owner can add an authorized recipient.
+        console.error(`Scheduled report for session ${result.sessionId} had no authorized recipients after the guard; report NOT delivered.`);
+        if (guardOwnerEmail) {
+          try {
+            const blockedSubject = `⚠️ Scheduled report not delivered: ${scheduleName}`;
+            const blockedText = `Your scheduled report "${scheduleName}" was not delivered because it contains cross-account account data and none of its configured recipients are authorized (admin) to receive it. Add an admin recipient (or adjust the report) and re-run.`;
+            const blockedHtml = `<div style="font-family:Arial,sans-serif;font-size:14px;color:#664d03;padding:12px 16px;background-color:#fff3cd;border:1px solid #ffe69c;border-radius:6px;">${this.escapeHtml(blockedText)}</div>`;
+            await this.sendEmail([guardOwnerEmail], blockedSubject, blockedText, blockedHtml);
+            console.log(`Scheduled report delivery-blocked notice sent to owner ${guardOwnerEmail} for session ${result.sessionId}`);
+          } catch (notifyError) {
+            console.error(`Failed to send delivery-blocked notice for session ${result.sessionId}:`, notifyError);
+          }
+        }
       } else {
         // Send ONE email to all authorized recipients
         await this.sendEmail(recipients, subject, finalText, finalHtml);
