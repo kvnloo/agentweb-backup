@@ -435,10 +435,11 @@ To find the model ID and inference profile for a new Claude model on AWS Bedrock
 1. **Look up the model ID** on the [Bedrock supported models page](https://docs.aws.amazon.com/bedrock/latest/userguide/models-supported.html). Example: `anthropic.claude-sonnet-4-6`
 2. **Look up the inference profile ID** on the [cross-region inference page](https://docs.aws.amazon.com/bedrock/latest/userguide/cross-region-inference-support.html). Use the `global.*` prefix for cross-region access. Example: `global.anthropic.claude-sonnet-4-6`
 3. **Update these files:**
-   - `backend/src/services/agentModeService.ts` — add to `llmModels` registry and `inferenceProfileMap` in `getBedrockClient()`
-   - `backend/src/utils/llmService.ts` — add to the inference profile `if/else` chain in the constructor
+   - `backend/src/utils/bedrockInferenceProfiles.ts` — add ONE entry to `BEDROCK_INFERENCE_PROFILE_MAP`. This is the single source of truth; `agentModeService`, `codingAgentService`, `llmService`, and the loops all resolve through it. If the model is served from the separate bearer-token account (231030591963), also add it to `BEDROCK_BEARER_TOKEN_MODELS`.
+   - `backend/src/services/agentModeService.ts` — add to the `llmModels` registry (model metadata only — NOT the profile mapping)
    - `backend/src/__tests__/agentModeService.sonnet45.test.ts` — add model registry, lazy-loading, and inference profile ARN tests
 4. The inference profile ARN format is: `arn:aws:bedrock:us-west-2:992382574572:inference-profile/{profile_id}`
+   Do **not** paste that ARN into a service file — `backend/src/__tests__/sdkConstructionGuard.test.ts` fails the build if these literals appear outside `bedrockInferenceProfiles.ts` (ENG-683: the map was previously duplicated across four files and drifted).
 5. **Run benchmarks** to validate: `npm run benchmark -- --url http://localhost:3001 --model <model-id>` (requires local backend running with admin credentials in dev DB)
 
 ### Browser Automation

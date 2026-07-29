@@ -6,6 +6,7 @@ import { JsonOutputParser } from '@langchain/core/output_parsers';
 import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import { extractJson, JsonExtractError } from '../services/util/extractJson';
 import { meterUserUsage } from '../services/usageRecorderService';
+import { resolveBedrockModelId } from './bedrockInferenceProfiles';
 
 export type OutputFormat = 'json' | 'xml';
 
@@ -65,6 +66,12 @@ export class LLMService {
       const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || 'us-west-2';
       const bedrockClient = new BedrockRuntimeClient({
         region,
+        // Pin SigV4 explicitly. If AWS_BEARER_TOKEN_BEDROCK is present in the
+        // environment (e.g. cloud-dev boxes set it for the Claude Code CLI), the
+        // SDK would otherwise default to bearer-first auth and send that token —
+        // scoped to the Opus 4.8 account (231030591963) — for every Bedrock call,
+        // 403ing models like Sonnet/Opus 4.6 that live in the default account.
+        authSchemePreference: ['sigv4'],
         credentials: process.env.AWS_ACCESS_KEY_ID ? {
           accessKeyId: process.env.AWS_ACCESS_KEY_ID,
           secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
@@ -75,15 +82,10 @@ export class LLMService {
         } as any,
       });
 
-      // Map model IDs to inference profile ARNs for cross-region access
-      let modelId = model;
-      if (model === 'anthropic.claude-sonnet-4-5-20250929-v1:0') {
-        modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0';
-      } else if (model === 'anthropic.claude-sonnet-4-6') {
-        modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6';
-      } else if (model === 'anthropic.claude-opus-4-6-v1') {
-        modelId = 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1';
-      }
+      // Map model IDs to inference profile ARNs for cross-region access.
+      // NOTE: bearer-token models (see BEDROCK_BEARER_TOKEN_MODELS) resolve here
+      // but are still unreachable from this client, which is SigV4-only.
+      const modelId = resolveBedrockModelId(model);
 
       this.chatModel = new ChatBedrockConverse({
         model: modelId,
