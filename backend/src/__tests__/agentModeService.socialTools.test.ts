@@ -499,13 +499,14 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.message).toContain('Successfully loaded 0 posts');
     });
 
-    // ENG-660: a personal LinkedIn profile's post/comment history is NOT
-    // readable through the connection (only AgentWeb-published posts are stored
-    // and returned). Reporting a bare "Successfully loaded 0 posts" here led the
-    // model to claim the fetch succeeded / that it had read the user's LinkedIn,
-    // which reads as a tool-success hallucination. Zero posts on a personal
-    // account must be reported as an unsupported read, not an empty success.
-    it('reports an unsupported read (not a bare empty success) when a personal LinkedIn account has 0 posts', async () => {
+    // ENG-660: for a personal LinkedIn account, AgentWeb only surfaces posts it
+    // created itself — it does not read a profile's other existing posts.
+    // Reporting a bare "Successfully loaded 0 posts" here led the model to claim
+    // the fetch succeeded / that it had read the user's LinkedIn, which reads as
+    // a tool-success hallucination. Zero posts on a personal account must be
+    // reported as a non-success, explicitly-unsupported read that owns the
+    // AgentWeb-only behavior (not framed as a LinkedIn/platform limitation).
+    it('reports a non-success unsupported read (not a bare empty success) when a personal LinkedIn account has 0 posts', async () => {
       mockGetAccountsByUserId.mockResolvedValue([mockPersonalLinkedInAccount as any]);
       mockAdapter.listPosts.mockResolvedValue([]);
 
@@ -514,12 +515,14 @@ describe('AgentModeService - Social Media Tools', () => {
         'urn:li:person:ilhAte8iXG'
       );
 
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
       expect(result.posts).toEqual([]);
       expect(result.organicReadUnsupported).toBe(true);
       // Must NOT frame it as a successful read of the user's posts.
       expect(result.message).not.toContain('Successfully loaded');
-      expect(result.message.toLowerCase()).toContain('personal linkedin');
+      // Owns it as AgentWeb's own behavior, not a platform/LinkedIn weakness.
+      expect(result.message.toLowerCase()).toContain('agentweb');
+      expect(result.message.toLowerCase()).not.toContain('platform limitation');
       expect(result.message.toLowerCase()).toContain('do not claim');
     });
 
@@ -541,9 +544,10 @@ describe('AgentModeService - Social Media Tools', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('LinkedIn access token expired');
-      // Must NOT be masked as a benign unsupported read.
+      // Must NOT be masked as a benign unsupported read (the error branch wins,
+      // so the personal unsupported-read message/flag must not leak through).
       expect(result.organicReadUnsupported).toBeUndefined();
-      expect(result.message).not.toContain('platform limitation');
+      expect(result.message).not.toContain('AgentWeb only reads');
     });
 
     // Regression guard: a personal LinkedIn account that DOES have stored
