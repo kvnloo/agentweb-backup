@@ -1,3 +1,40 @@
+## ENG-446: canonical action payloads on existing report/run data (2026-07-29)
+
+New pure module `backend/src/services/marketingActionEnvelope.ts` — the transport/persistence seam
+ENG-445 deliberately left to this issue. Investigation findings that shaped it:
+
+- **There is no `ReportResult` / `RunResult` / `ReportEnvelope` type in the backend.** The two real
+  envelopes are (a) the scheduled-chat run result — an inline object literal returned by
+  `runScheduledChat` (`controllers/agentModeController.ts`) and persisted untyped
+  (`scheduleDb.addRunResult(scheduleId, runResult: any)`, `services/db.ts`), and (b) the HTML-report
+  file entry (`ResultFile`, `routes/tasks.ts`). Both already carry arbitrary JSON, so the payload
+  needed **no new table, no new attribute path, and no new storage system** — assertion 1 is
+  satisfied by one optional field, `marketingActions`, on the existing envelopes.
+- **The payload is stored as a native array, not a serialized string.** `parseMarketingActions`
+  (ENG-445) takes JSON text, so `readMarketingActions` round-trips via `JSON.stringify` into it.
+  That keeps exactly ONE parser and ONE identity check in the system whatever the transport, and
+  the canonical-id re-derivation still rejects a drifted or foreign id.
+- **Assertion 6 (retry mints no new ids) is free from ENG-445's design** — `marketingActionId` is a
+  normalized content hash of (actionType, scopeId), so re-attaching the same underlying actions is
+  inherently idempotent, including across cosmetic producer variance in case/whitespace. What was
+  NOT free: a retry re-attaching would reset status to `proposed`. `attachMarketingActions`
+  therefore carries forward any status already recorded against a canonical id, so a duplicate
+  scheduled delivery can never silently un-approve a move a human approved.
+- **Two read paths, one helper.** `GET /scheduled-chats/:id/test-history` and the
+  with-html-reports response both call `normalizeMarketingActions`. Neither re-ranks: stored order
+  is returned verbatim (assertion 3), and legacy rows normalize to `[]` (assertion 4). The report
+  route's inline post-processing was extracted to `buildHtmlReportsResponsePayload` so it is
+  directly testable — the pre-existing searchableText JSON round-trip (which exists to avoid racing
+  the background enrichment writer) is preserved unchanged inside it.
+- **Gotchas confirmed and left alone**: `agentModeController` deletes `actualResponse` before
+  persisting a run result (space saving, re-hydrated on read) — `marketingActions` survives that
+  path; and `GET /scheduled-chats` strips `runResults` wholesale, so an eventual portal "3 moves
+  today" card must read `/test-history`, not the schedule list. Noted for ENG-444.
+- No producer of `MarketingActionCandidate` exists yet by design — deriving candidates from
+  campaign data is downstream of ENG-444's taste gate. This PR is the carrier, so a producer needs
+  zero further plumbing. AgentMode chat behavior (outputs, tool selection, prompts, model defaults)
+  is untouched.
+
 ## ENG-445: shared marketing-action contract + deterministic top-3 selector (2026-07-28)
 
 New pure module `backend/src/services/marketingActionContract.ts` — ONE typed contract for "a
