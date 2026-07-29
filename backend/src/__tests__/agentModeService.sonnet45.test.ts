@@ -169,6 +169,48 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       });
     });
 
+    /*
+     * ENG-744 — gemini-3-pro-preview was shut down by Google on 2026-03-09 and
+     * returns a hard 404 ("This model ... is no longer available") on a real
+     * generateContent call, yet it stayed in the registry and was still offered
+     * by GET /public/llm-models. Selecting it was a guaranteed user-facing
+     * failure for ~4.5 months. llmPricing.ts:94 already carried a DEPRECATED
+     * 2026-03-09 note — pricing knew; the registry never caught up.
+     *
+     * NOTE: the issue's AC #7 says withdrawn models are "reported rather than
+     * silently removed". This removal is deliberate and explicitly authorized
+     * (PM tick, recorded on ENG-744 and in the PR body) — i.e. reported, not
+     * silent. Migration target is gemini-3.1-pro-preview.
+     *
+     * It also stands as the reason AC #3 is verified by invoking rather than by
+     * listing: this model still appears in Google's ListModels while 404ing on
+     * the actual call, so a discovery-endpoint check proves nothing.
+     */
+    describe('ENG-744 — withdrawn model removal', () => {
+      it('no longer offers the shut-down gemini-3-pro-preview to anyone', async () => {
+        for (const isAdmin of [true, false]) {
+          const models = await agentModeService.getSupportedModels(isAdmin);
+          expect(models).not.toContain('gemini-3-pro-preview');
+        }
+      });
+
+      it('drops it from the registry entirely, not just from the served list', () => {
+        expect((agentModeService as any).llmModels['gemini-3-pro-preview']).toBeUndefined();
+      });
+
+      it('keeps the still-live Gemini models it sat next to', async () => {
+        const models = await agentModeService.getSupportedModels(false);
+        for (const id of [
+          'gemini-3-flash-preview',
+          'gemini-3.1-pro-preview',
+          'gemini-3.1-flash-lite',
+          'gemini-3.5-flash',
+        ]) {
+          expect(models).toContain(id);
+        }
+      });
+    });
+
     it('should have temperature support enabled for Sonnet 4.5', async () => {
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-sonnet-4-5-20250929-v1:0'].supportsTemperature).toBe(true);
