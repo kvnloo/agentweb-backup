@@ -77,6 +77,13 @@ interface ClientSummary {
   monthly_amount_cents: number | null;
 }
 
+interface LandingPageSignals {
+  hasLander: boolean;
+  hasLeadCapture: boolean;
+}
+
+type LandingPageSignalCache = Map<string, Promise<LandingPageSignals>>;
+
 function buildPaymentInfo(user: any): PaymentInfo {
   return {
     subscription_type: user.subscriptionType || null,
@@ -85,6 +92,51 @@ function buildPaymentInfo(user: any): PaymentInfo {
     has_payment_method: user.has_payment_method === true,
     monthly_amount_cents: user.subscription_amount ?? null,
   };
+}
+
+/**
+ * Resolve deployed landing-page signals across the client's organization.
+ *
+ * Landing pages are org-visible assets but are stored under the user who
+ * created them. Looking only at fields on the client record therefore reports
+ * false negatives for teammates such as RankAI's Hugo/Dyllan accounts.
+ */
+async function getLandingPageSignals(
+  client: any,
+  cache?: LandingPageSignalCache
+): Promise<LandingPageSignals> {
+  const cacheKey = client.orgId ? `org:${client.orgId}` : `user:${client.userId}`;
+  const cached = cache?.get(cacheKey);
+  if (cached) return cached;
+
+  const loadSignals = (async () => {
+    try {
+      const { getLandingPagesByOwner, getLandingPagesByOrg } = await import('./v0Service');
+      const [ownerPages, orgPages] = await Promise.all([
+        getLandingPagesByOwner(client.userId),
+        client.orgId ? getLandingPagesByOrg(client.orgId, client.userId) : Promise.resolve([]),
+      ]);
+      const deployedPages = [...ownerPages, ...orgPages].filter(
+        (page: any) => page.status === 'deployed'
+      );
+
+      return {
+        hasLander: deployedPages.length > 0,
+        hasLeadCapture: deployedPages.some(
+          (page: any) => typeof page.leadListId === 'string' && page.leadListId.trim() !== ''
+        ),
+      };
+    } catch (error) {
+      console.warn(
+        `Client health: landing-page signals unavailable for ${client.userId}; using legacy signals:`,
+        error instanceof Error ? error.message : error
+      );
+      return { hasLander: false, hasLeadCapture: false };
+    }
+  })();
+
+  cache?.set(cacheKey, loadSignals);
+  return loadSignals;
 }
 
 /**
@@ -235,14 +287,17 @@ export async function assessClientHealth(
     };
 
     // --- Lander Layer ---
-    // Check for landing page indicators: productDomain, seoDomains, or website-related configs
+    const landingPageSignals = await getLandingPageSignals(client);
+    // Check both legacy per-user domain fields and deployed org landing pages.
     const hasLander = !!(
       client.productDomain ||
-      (client.seoDomains && client.seoDomains.length > 0)
+      (client.seoDomains && client.seoDomains.length > 0) ||
+      landingPageSignals.hasLander
     );
     const landerPlatforms: string[] = [];
     if (client.productDomain) landerPlatforms.push('product_domain');
     if (client.seoDomains && client.seoDomains.length > 0) landerPlatforms.push('seo_domains');
+    if (landingPageSignals.hasLander) landerPlatforms.push('landing_page');
 
     const landerLayer: LanderLayerHealth = {
       has_lander: hasLander,
@@ -250,9 +305,11 @@ export async function assessClientHealth(
     };
 
     // --- Lead Quality Layer ---
-    // Check for CRM integrations via connected accounts or email domain setup
+    // Check for CRM integrations via connected accounts, email setup, or a
+    // deployed landing page wired to a lead list.
     const hasCrm = !!(
       client.emailDomain ||
+      landingPageSignals.hasLeadCapture ||
       connectedAccounts.some((acc: any) =>
         acc.platform === 'linkedin' && acc.config?.account_type === 'personal'
       )
@@ -261,6 +318,9 @@ export async function assessClientHealth(
     if (client.emailDomain) crmPlatforms.push('email_outreach');
     if (connectedAccounts.some((acc: any) => acc.platform === 'linkedin')) {
       crmPlatforms.push('linkedin');
+    }
+    if (landingPageSignals.hasLeadCapture) {
+      crmPlatforms.push('landing_page_lead_capture');
     }
 
     const leadQualityLayer: LeadQualityLayerHealth = {
@@ -371,10 +431,14 @@ export async function listAllClients(callerUserId: string, callerIsAdmin?: boole
     }
 
     const allUsers = await userDb.getAllUsers();
+    const landingPageSignalCache: LandingPageSignalCache = new Map();
 
     const clients: ClientSummary[] = await Promise.all(
       allUsers.map(async (user: any) => {
-        const accounts = await getAccountsByUserId(user.userId);
+        const [accounts, landingPageSignals] = await Promise.all([
+          getAccountsByUserId(user.userId),
+          getLandingPageSignals(user, landingPageSignalCache),
+        ]);
 
         const hasAds = !!(
           accounts.some(
@@ -384,11 +448,13 @@ export async function listAllClients(callerUserId: string, callerIsAdmin?: boole
 
         const hasLander = !!(
           user.productDomain ||
-          (user.seoDomains && user.seoDomains.length > 0)
+          (user.seoDomains && user.seoDomains.length > 0) ||
+          landingPageSignals.hasLander
         );
 
         const hasCrm = !!(
           user.emailDomain ||
+          landingPageSignals.hasLeadCapture ||
           accounts.some((acc: any) => acc.platform === 'linkedin')
         );
 

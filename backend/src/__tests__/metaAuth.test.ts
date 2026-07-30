@@ -400,4 +400,101 @@ describe('Meta Auth Routes', () => {
             );
         });
     });
+
+    /**
+     * ENG-629 — persist the scopes Meta actually GRANTED, not the ones requested.
+     *
+     * Before this, `config.scopes` was set to `flowCfg.scopes` unconditionally, so
+     * a connection recorded ads_management/ads_read even when the user unticked
+     * them at the consent dialog. That is the defect behind OPS-79: the capability
+     * signal was a copy of our own request.
+     */
+    describe('POST /connect-ad-accounts — granted scope capture (ENG-629)', () => {
+        const connectWithGrant = async (granted: string[] | undefined) => {
+            (axios.get as jest.Mock).mockResolvedValue({
+                data: { access_token: 'valid_access_token', expires_in: 3600 }
+            });
+            (metaService.getAdAccounts as jest.Mock).mockResolvedValue([
+                { account_id: 'act_123', name: 'Test Ad Account', currency: 'USD', account_status: 1 }
+            ]);
+            (metaService.getPages as jest.Mock).mockResolvedValue([]);
+            (metaService.getGrantedScopes as jest.Mock).mockResolvedValue(granted);
+            (connectedAccountsDb.createAccount as jest.Mock).mockResolvedValue({
+                platform: 'meta',
+                account_id: 'act_123'
+            });
+            jest.spyOn(jwt, 'verify').mockReturnValue({ userId: 'test_user_id', flow: 'marketing' } as any);
+
+            const finalizeRes = await request(app)
+                .post('/auth/meta/finalize')
+                .send({ code: 'valid_code', state: 'valid_state' });
+
+            return request(app)
+                .post('/auth/meta/connect-ad-accounts')
+                .send({
+                    tokenSessionId: finalizeRes.body.tokenSessionId,
+                    adAccounts: [{ account_id: 'act_123', name: 'Test Ad Account', currency: 'USD', account_status: 1 }]
+                });
+        };
+
+        it('inspects the issued token to discover what Meta actually granted', async () => {
+            await connectWithGrant(['ads_read', 'pages_show_list']);
+
+            expect(metaService.getGrantedScopes).toHaveBeenCalledWith('valid_access_token');
+        });
+
+        it('stores granted_scopes on the ad account config', async () => {
+            const response = await connectWithGrant(['ads_read', 'pages_show_list']);
+
+            expect(response.status).toBe(200);
+            expect(connectedAccountsDb.createAccount).toHaveBeenCalledWith(
+                'test_user_id',
+                'meta',
+                expect.objectContaining({
+                    config: expect.objectContaining({
+                        granted_scopes: ['ads_read', 'pages_show_list']
+                    })
+                })
+            );
+        });
+
+        it('records a grant WITHOUT ads scopes truthfully instead of echoing the request', async () => {
+            // The OPS-79 consent shape. Previously this stored ads_management anyway.
+            const response = await connectWithGrant(['pages_show_list', 'public_profile']);
+
+            expect(response.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.granted_scopes).toEqual(['pages_show_list', 'public_profile']);
+            expect(config.granted_scopes).not.toContain('ads_read');
+            expect(config.granted_scopes).not.toContain('ads_management');
+        });
+
+        it('omits granted_scopes entirely when the grant could not be determined', async () => {
+            // Must not write [] — that would read as an authoritative "nothing granted"
+            // and lock out a working connection.
+            const response = await connectWithGrant(undefined);
+
+            expect(response.status).toBe(200);
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.granted_scopes).toBeUndefined();
+        });
+
+        it('still connects the account when scope inspection fails outright', async () => {
+            (metaService.getGrantedScopes as jest.Mock).mockRejectedValue(new Error('debug_token down'));
+            const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+            const response = await connectWithGrant(undefined);
+
+            expect(response.status).toBe(200);
+            expect(response.body.success).toBe(true);
+            consoleWarnSpy.mockRestore();
+        });
+
+        it('keeps the legacy requested-scopes field for backward compatibility', async () => {
+            await connectWithGrant(['ads_read']);
+
+            const config = (connectedAccountsDb.createAccount as jest.Mock).mock.calls[0][2].config;
+            expect(config.scopes).toEqual(['ads_management', 'pages_show_list']);
+        });
+    });
 });

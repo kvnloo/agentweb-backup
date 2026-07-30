@@ -70,9 +70,20 @@ describe('get_registration_status', () => {
       expect.objectContaining({
         method: 'POST',
         path: '/api/crm/registration-status',
-        body: { emails: ['a@x.com', 'b@x.com'] },
+        body: { emails: ['a@x.com', 'b@x.com'], includeChatSessionCount: false },
       }),
     );
+  });
+
+  it('passes include_chat_session_count through to the request body', async () => {
+    mockMcpFetch.mockResolvedValue({ statuses: [], summary: { total: 0, registered: 0, premium: 0 } });
+    await mcpToolRegistry.execute(
+      'get_registration_status',
+      { emails: ['a@x.com'], include_chat_session_count: true },
+      context,
+    );
+    const body = (mockMcpFetch.mock.calls[0][0] as any).body;
+    expect(body).toEqual({ emails: ['a@x.com'], includeChatSessionCount: true });
   });
 
   it('passes through the structured response verbatim', async () => {

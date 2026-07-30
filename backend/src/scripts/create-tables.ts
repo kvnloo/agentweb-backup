@@ -885,6 +885,42 @@ const createSettingsTable = async () => {
   }
 };
 
+// Create Prompt Templates table
+// Single-key config table (PK: templateId). Holds admin-editable prompt
+// templates: the ad-image archetypes / global image directives
+// (promptTemplatesService) and the onboarding outreach-invite prompt
+// (outreachInvitePromptService). Both services only ever get/put by
+// templateId, so no GSIs are needed. This table was introduced by ENG-242 but
+// never added to provisioning, so it was missing in production — reads there
+// silently fell back to seed defaults while saves returned HTTP 500
+// (ResourceNotFoundException). See ENG-603.
+const createPromptTemplatesTable = async () => {
+  const params: AWS.DynamoDB.CreateTableInput = {
+    TableName: `${TABLE_PREFIX}AW-PromptTemplates`,
+    KeySchema: [
+      { AttributeName: 'templateId', KeyType: 'HASH' }
+    ],
+    AttributeDefinitions: [
+      { AttributeName: 'templateId', AttributeType: 'S' }
+    ],
+    ProvisionedThroughput: {
+      ReadCapacityUnits: 5,
+      WriteCapacityUnits: 5
+    }
+  };
+
+  try {
+    const result = await dynamodb.createTable(params).promise();
+    console.log(`Created ${params.TableName} table:`, result);
+  } catch (error: any) {
+    if (error.code === 'ResourceInUseException') {
+      console.log(`${params.TableName} table already exists`);
+    } else {
+      throw error;
+    }
+  }
+};
+
 // Create Email Events table
 const createEmailEventsTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
@@ -2268,6 +2304,7 @@ const main = async () => {
     await createAssetApprovalsTable();
     await createBatchReviewsTable();
     await createSettingsTable();
+    await createPromptTemplatesTable();
     await createEmailEventsTable();
     await createBenchmarkTestsTable();
     await createGTMPlansTable();
@@ -2373,6 +2410,7 @@ const createOrganizationsTable = async () => {
     AttributeDefinitions: [
       { AttributeName: 'orgId', AttributeType: 'S' },
       { AttributeName: 'ownerUserId', AttributeType: 'S' },
+      { AttributeName: 'autoJoinDomain', AttributeType: 'S' },
     ],
     KeySchema: [
       { AttributeName: 'orgId', KeyType: 'HASH' },
@@ -2382,6 +2420,17 @@ const createOrganizationsTable = async () => {
         IndexName: 'OwnerUserIdIndex',
         KeySchema: [
           { AttributeName: 'ownerUserId', KeyType: 'HASH' },
+        ],
+        Projection: { ProjectionType: 'ALL' },
+        ProvisionedThroughput: {
+          ReadCapacityUnits: 5,
+          WriteCapacityUnits: 5,
+        },
+      },
+      {
+        IndexName: 'AutoJoinDomainIndex',
+        KeySchema: [
+          { AttributeName: 'autoJoinDomain', KeyType: 'HASH' },
         ],
         Projection: { ProjectionType: 'ALL' },
         ProvisionedThroughput: {

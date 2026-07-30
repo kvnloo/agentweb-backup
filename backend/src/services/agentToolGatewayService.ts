@@ -490,12 +490,12 @@ const SIDE_EFFECTING_PREFIXES = [
   'update_',
 ];
 
-const EXTERNAL_SEND_TOOLS = new Set([
+export const EXTERNAL_SEND_TOOLS = new Set([
   'send_email',
   'linkedin_outreach',
 ]);
 
-const EXTERNAL_PUBLISH_TOOLS = new Set([
+export const EXTERNAL_PUBLISH_TOOLS = new Set([
   'publish_blog_article',
   'publish_landing_page_changes',
 ]);

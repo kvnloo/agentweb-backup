@@ -1,3 +1,466 @@
+## ENG-754: the Greptile 5/5 bar is now a check, not a habit (2026-07-29)
+
+`Require Greptile Review` used to poll Greptile's own `Greptile Review` check-run and pass on
+`conclusion=success`. Greptile marks that check-run success for **every completed review regardless
+of confidence score**, so the job was green on four below-bar reviews in one day — agentweb#2215
+(4/5), #2219 (3/5), portal#985 (3/5, twice) — each carrying a live P1. All four were caught only
+because an agent chose to open the comment and read the score. Investigation findings:
+
+- **Greptile publishes no structured score. Checked all four plausible surfaces before parsing
+  prose.** The check-run's `output.summary` is `"Greptile has reviewed the Pull Request.\n\nN files
+  reviewed, M comments added."` with `output.text: null`; its PR review object is
+  `state: COMMENTED` with an empty body; the commit status API carries no Greptile context; and
+  Greptile's public API is repository query/indexing, with no credential of ours in Secrets Manager
+  anyway. The comment body is the only place the verdict exists, so the gate parses it strictly and
+  fails closed rather than pretending a structured source exists.
+- **Greptile edits its original comment in place — it never posts a second one.** On portal#985 a
+  single comment advanced `Reviews (2)` → `Reviews (3)`, each with a different `Last reviewed
+  commit`. So `id`, `created_at` and the comment *count* are all stable across re-reviews and are
+  useless as freshness signals; only `updated_at` and the body move. Anything waiting for a *new*
+  comment waits forever. This is also why the earlier worker on #985 misread the state: it saw 3/5
+  against a superseded SHA and could not tell a stale read from a fresh verdict, because the comment
+  was the same object either way.
+- **"Score present but SHA mismatched" must resolve to pending, never to pass or fail.** The body's
+  `commit/<40-hex>` pointer is the only authority on which commit a score belongs to. The gate
+  compares it to the head SHA positionally and never against `$REPO` — the footer URL lower-cases
+  the org (`github.com/agentwebpro/agentweb/...`) while `github.repository` is `AgentWebPro/agentweb`.
+- **A lenient parser would have recreated the same bug one layer down**, so every ambiguity fails
+  closed and dumps the raw body: no verdict footer for our head, a footer with no 40-hex pointer,
+  zero or multiple `Confidence Score` values, a non-`/5` scale, a score outside 0–5, or a non-JSON
+  payload. In particular a missing pointer must never fall back to "the score I found".
+- **The gate runs the PR's own copy of the script**, per the ENG-743 lesson that whatever gates
+  merges has to gate its own changes — this PR's merge was blocked by the gate it adds. The
+  corollary is worth stating plainly: a PR can edit `greptile-gate.sh` (or `tests.yml`) to neuter
+  the gate for itself. That is a pre-existing property of every `pull_request` workflow here, not
+  something this change introduces, and it is visible in the diff Greptile reviews.
+- **The script's 20-minute deadline sits under a 25-minute step timeout**, so the gate always fails
+  with a diagnosable message rather than being killed mid-poll — the ENG-734 shape of a step timeout
+  undercutting the budget it is meant to contain, which is exactly what Greptile's own 3/5 review
+  caught on #2219.
+- **`Require Greptile Review` was not actually a required status check.** Branch protection on
+  `main` required only `Detect changed projects`; the Greptile job merely gated the staging-deploy
+  job. Acceptance criterion 5 (human merges gated identically) therefore needed the context added to
+  branch protection, which this change does — code alone could not have closed it for humans.
+- **Left alone deliberately:** `agentweb-customer-portal` and `agentweb-landing-page` keep Greptile
+  advisory. Neither has a `greptile.json` or a `Require Greptile Review` job, so this mechanism does
+  not reach them; porting it is Harsha's call (criterion 6).
+
+## ENG-744: Claude 5 generation added to the model catalog (2026-07-29)
+
+Added `anthropic.claude-opus-5`, `anthropic.claude-sonnet-5` and
+`anthropic.claude-haiku-4-5-20251001-v1:0` to the registry, the ENG-683 profile map, and the
+price book. Investigation findings:
+
+- **A listed ACTIVE inference profile is NOT proof of account access, and the difference is
+  invisible until runtime.** `list-inference-profiles` in us-west-2 reports
+  `us.anthropic.claude-opus-5` and `us.anthropic.claude-sonnet-5` ACTIVE, but invoking either with
+  the app's default credentials (992382574572) returns
+  `AccessDeniedException: ... is not available for this account`. Both are only reachable from the
+  **bearer-token account (231030591963)** — the same cross-account path Opus 4.8 already uses. Adding
+  them on the strength of the profile listing alone would have shipped two picker entries that 403
+  for every user. Always invoke before adding.
+- **Haiku 4.5 is the opposite case and must NOT be given bearer auth.** It IS served on the default
+  account, so it takes a normal `global.*` cross-region ARN and stays out of
+  `BEDROCK_BEARER_TOKEN_MODELS`. The account assignment is per-model, not per-generation — there is
+  no "Claude 5 goes to the bearer account" rule to lean on.
+- **Opus 5 returns a `reasoningContent` block before its text block** (thinking is on by default on
+  Opus 5, unlike 4.8/4.7 where omitting the `thinking` param meant no thinking). The Converse parser
+  in `agentModeService` collects *all* `text` blocks and ignores unknown ones, so this is handled —
+  but a parser that assumed `content[0].text` would silently return empty replies for Opus 5 only.
+  Verified against live Bedrock via ConverseCommand, with and without a tool.
+- **Opus 5 and Sonnet 5 reject `temperature` with HTTP 400 `"temperature is deprecated for this
+  model"`** — hence `supportsTemperature: false`, matching Opus 4.8. Haiku 4.5 still accepts it.
+  Confirmed empirically rather than inferred from the generation number.
+- **Haiku 4.5's price key is a canonicalization trap.** `llmPricing` already had
+  `anthropic.claude-haiku-4-5`, but the registry id is
+  `anthropic.claude-haiku-4-5-20251001-v1:0`, and `canonicalModelId` only strips a trailing bare
+  `-YYYY-MM-DD` — not `-20251001-v1:0`. Without its own key the lookup misses and `getModelPrice`
+  returns null, which the ledger books as $0. The pre-existing key covers a *different* id than it
+  appears to.
+- **`gemini-3-pro-preview` was withdrawn by Google on 2026-03-09 and we kept serving it for ~4.5
+  months.** A live probe returns 404 `"This model models/gemini-3-pro-preview is no longer
+  available."` while it was still listed by `GET /api/agent-mode/public/llm-models`, so every user
+  who picked it hit a hard failure. **Removed from the registry** under explicit authorization
+  (recorded on ENG-744 and in the PR body) — ENG-744 AC #7 forbids *silent* removal, not documented
+  removal. Migration target is `gemini-3.1-pro-preview`. The price entry is intentionally retained.
+  The signal was already in the tree and nobody joined it up: `llmPricing.ts` carried
+  `// DEPRECATED 2026-03-09` and a registry comment noted the id 404s for the *vision* path — but
+  neither was generalized to "this model is gone everywhere".
+- **A model can 404 on a real call while still appearing in Google's `ListModels`.**
+  `gemini-3-pro-preview` did exactly this. Discovery endpoints are therefore not evidence a model
+  works — verify by invoking. The same asymmetry runs the other way: Google enforces published
+  shutdown dates inconsistently (two image previews past their stated date still return 200), so
+  "it still responds" is not evidence of safety either. Trust the published date in both directions.
+- **The Gemini Pro line is not behind — Google has not shipped one.** `gemini-3.1-pro-preview` is
+  the newest Pro in the live catalog; there is no 3.5/3.6 Pro despite 3.5/3.6 Flash existing. The
+  "Pro lags Flash" reading of our catalog is Google's release cadence, not our drift.
+- **Live voice is healthy; the `generateContent` 404 against it is a probe artifact.**
+  `gemini-3.1-flash-live-preview` only advertises `bidiGenerateContent`, the WebSocket method
+  `liveVoiceService` actually uses. It is not withdrawn. It does, however, have **no GA successor**
+  in the catalog — as does `gemini-3.1-pro-preview` — which is the live exposure to watch ahead of
+  the 2026-10-20 Gemini platform migration.
+
+## ENG-743: the staging deploy gate now has to observe the deploy (2026-07-29)
+
+`backend-staging-deploy` in `.github/workflows/tests.yml` now calls
+`.github/scripts/eb-deploy.sh` — the script ENG-734/#2219 already shipped and proved — instead of
+its own inline `|| echo "...continuing..."` block plus a readiness wait that only looked at `Status`
+and `Health`. Investigation findings:
+
+- **This was the worse half of ENG-734, because the merge gate cites it.** Production's false green
+  misreports a deploy that already happened. Staging's false green is *upstream of the decision to
+  merge*: `autonomous-execution-and-merge` counts "staging deploy passed" as end-to-end evidence, so
+  a swallowed `update-environment` let a backend PR merge on evidence of a deploy that never applied.
+  Every backend merge today rested on this signal.
+- **Path filters made the fix unprovable, which is why #2219 deliberately skipped it.** The job is
+  filtered on `backend/**`, so a PR that only touches `.github/**` never runs it — a rewritten deploy
+  path would have shipped unexercised, and the first thing to exercise it would have been an
+  unrelated backend PR. The filter is now the fix: `.github/workflows/tests.yml` and
+  `.github/scripts/eb-deploy.sh` count as backend changes, so **whatever gates backend merges gates
+  its own changes**, and this PR runs the job it rewrites. That property is permanent, not a
+  one-off for this issue.
+- **The version label did not identify a build, so asserting on it proved nothing.** Staging labelled
+  every deploy `backend-<date>-pr<N>`, identical across all of a PR's pushes and reusing the same S3
+  key. So `create-application-version` hit the tolerated already-exists path, the S3 object was
+  silently rewritten under a label EB had already served, and — the real hole — the environment was
+  *already reporting that VersionLabel before the run started*. "Ready on our version" would have
+  been satisfiable without a deploy: the fix would have inherited the bug it was closing. The label
+  now carries the short SHA.
+- **Staging and production share EB application `agentweb-backend`.** They also shared the label
+  namespace, so a same-day staging deploy for PR N and the production deploy after merging PR N
+  produced the same label and S3 key: prod's `create-application-version` hit already-exists and
+  reused a version whose bundle staging had written. The SHA suffix removes that collision, so
+  production now always creates a fresh version. `MaxCountRule` is enabled at 200 versions (201
+  present today), so per-push staging labels churn that window faster rather than growing it —
+  bounded, at the cost of some rollback depth in days.
+- **Budget preserved, not extended.** The old steps allowed 5 min for the AWS calls plus 30 min of
+  readiness polling. The script gets `EB_TOTAL_TIMEOUT_SECONDS=1800` under a 35-minute step timeout,
+  so its own deadline always fires first and the log names the reason instead of the runner killing
+  it mid-poll.
+
+## ENG-630: Meta Insights `filtering` shape + preserved 400 detail (2026-07-29)
+
+New pure module `backend/src/utils/metaInsightsFiltering.ts`, wired into
+`callMetaAdsInsightsApiWrapper`. Investigation findings:
+
+- **The reported `(#100) param filtering must be an array` is one of TWO defects sharing a root
+  cause, and the unreported one is worse.** The guard was `...(filtering?.length && { filtering })`.
+  A JSON *string* from the model has a truthy `.length`, so it went to Meta verbatim and got the
+  reported 400. A bare filter *object* has no `.length` at all, so the key was **silently omitted**
+  and Meta answered with whole-account rows — which the model then narrated as campaign-scoped
+  numbers. An error is loud; a widened query is a confident wrong answer. Both shapes are now
+  normalized, and anything unhonourable throws instead of being dropped.
+- **Normalization happens before `getMetaCredentials`**, so a malformed filter costs neither a
+  credential fetch/refresh nor an API call. The Insights path is an async report job (submit → poll
+  up to 60×10s → page results), so a filter defect that reaches the wire is expensive.
+- **`IN`/`NOT_IN`/`ANY`/`ALL`/`NONE` with a scalar value is the same shape defect one level down**
+  and is lifted to a single-element list. An `IN` with an *empty* list throws rather than being
+  forwarded: it can never match, so Meta would return a clean empty report for a question the user
+  really did ask — the same silent-empty failure class as ENG-629.
+- **`filtering` stays a native array in the POST body, not a JSON string.** The sibling `time_range`
+  object already rides this same `axios.post` body as a real object and works, so the transport was
+  never the problem — only the shape reaching it. No transport change was needed.
+- **A Meta 400 was collapsing to axios's `"Request failed with status code 400"`.** Meta's actual
+  explanation lives at `response.data.error` (`message`, `error_user_title`, `error_user_msg`,
+  `code`, `error_subcode`, `type`). `describeMetaGraphApiError` surfaces it and returns `undefined`
+  for a non-Graph rejection (socket hang-up, our own bug), so the caller keeps its own message
+  rather than reporting a misleading Meta explanation. Sanitization follows the precedent set by
+  ENG-629: `access_token=…` fragments and bare `EAA…` tokens are redacted, and `fbtrace_id` is
+  never included at all.
+- **Scoped around ENG-629 (PR #2211), in flight on the same file.** That PR edits
+  `getMetaCredentials`, `listMetaAdsCampaigns`, and `listConnectedAccounts`; this one edits only
+  `callMetaAdsInsightsApiWrapper`. Its `if (error.isMetaAuthError) throw error;` rethrow channel is
+  preserved and pinned by a test, so the re-consent path added there is unaffected by the new error
+  description. Neither PR masks the other's failure class.
+- **Verification is mock-only, deliberately.** OPS-79 means our own Meta connection currently lacks
+  `ads_read`, so no live Insights call is possible; the issue's AC5 forbids one regardless. Every
+  assertion is against the request body we hand axios and the error object we hand back.
+- **The filter `value` was the last unvalidated hop, and review caught it, not the tests.** The
+  first cut validated `field` and `operator` but forwarded `value` verbatim, so a supported
+  operator carrying an object or a nested array still travelled to Meta — the exact class of defect
+  the module was written to stop, surviving inside the fix for it. Values are now asserted scalar
+  (and each element of a list-operator value individually). Non-finite numbers go too: `NaN` and
+  `Infinity` have no JSON representation and serialize to `null`, so they filter on a value nobody
+  asked for. Generalizable: **when you add a boundary, enumerate every field crossing it — a guard
+  that covers two of three fields reads as "validated" and is trusted like it.**
+
+## ENG-693: vendor dimension on the existing usage ledger (2026-07-29)
+
+Five optional non-key attributes on `AW-UsageRecords` (`provider`, `sessionId`, `unit`, `quantity`,
+`costSource`) plus a `recordVendorUsage()` entry point delegating to the same `incrementUsage()`.
+Findings that shaped it, for the eight metering slices blocked on this one:
+
+- **A row is a DAILY AGGREGATE, not a call.** The sort key is `{date}#{model}#{feature}`, so N calls
+  collapse into one item and every counter is an `ADD`. This is the single most load-bearing fact
+  for anything downstream: a "usage entry" is a bucket, so any new attribute is either a counter
+  (`ADD`) or a description of the bucket (`SET`). `quantity` is a counter. `provider` / `unit` /
+  `costSource` / `sessionId` are descriptions, written `if_not_exists` so the first writer's value
+  sticks instead of flapping between concurrent callers.
+- **Same-key collision is the real hazard, and it was designed around, not fixed.** Two vendors
+  writing the same `{model}#{feature}` on the same day would share one row and overwrite each
+  other's `provider`. `recordVendorUsage` therefore namespaces the model slot as
+  `{provider}:{operation}` — the sort key FORMAT is untouched (changing it is a real key change and
+  out of scope) while making a cross-vendor collision impossible by construction. The residual case
+  is narrower and still open: two providers serving an *identical model string* on the LLM path
+  (`openai` vs `azure-openai` for `gpt-4o`). That is ENG-700's "derive the provider label from the
+  client that served the call". Do not assume per-provider LLM splits are exact until ENG-700 lands.
+- **`unit` is the discriminator between token-priced and unit-priced spend.** When `unit` is set,
+  `incrementUsage` omits the token counters *entirely* rather than writing zeros — otherwise "this
+  vendor does not bill by tokens" and "this call used zero tokens" are the same row. Consequence for
+  readers: `UsageRecordRow`'s token fields are now optional. Every existing reader
+  (`usageAnalyticsService` `toRow`/`addInto`/`aggregateBurn`) already coalesced with `|| 0`, so this
+  was type-only — `npm run typecheck` is clean with no reader changes.
+- **No backfill, and none is needed.** Every new attribute is optional, so a pre-change row stays
+  valid. `isVendorEntry(row)` requires BOTH `provider` and `unit`, so a legacy row reports false and
+  is never surfaced as a vendor entry costing $0 — its real token cost keeps reading from
+  `costMicroUsd`. This is what keeps the slice clear of the data-plane gate.
+- **`unit` is a DynamoDB reserved word.** All four descriptive attributes go through
+  `ExpressionAttributeNames` for that reason; dropping the `#unit` alias produces a
+  `ValidationException` at runtime, not at compile time.
+- **No rate card here, deliberately.** `recordVendorUsage` records the dollar figure its caller
+  supplies and states its provenance via `costSource` (`measured` = vendor-reported, `allocated` =
+  our rate applied). Existing LLM dollars are stamped `allocated`, which they always were with
+  nothing saying so. Choosing the allocated rates is ENG-703; making an unpriced unit fail loud is
+  ENG-700. Neither is guessed at here.
+- **`taskId` is still dropped at the write.** It is declared on `RecordUsageContext` and populated by
+  call sites alongside `sessionId`, but ENG-693's scope names only `provider` and `sessionId`. Left
+  as-is rather than widening the slice.
+- **Not every descriptive attribute is safe to pin to a row — session was the exception** (Greptile
+  P1). The `if_not_exists` "first writer wins" rule above is sound only when the attribute is
+  *constant across every writer to that key*. `provider` / `unit` / `costSource` satisfy that because
+  `recordVendorUsage` namespaces the model slot as `{provider}:{operation}`, so a row cannot mix
+  vendors. `sessionId` does not: it is call-level, it is not in the sort key, and N sessions share one
+  `{date}#{model}#{feature}` bucket whose counters accumulate all of them. So a stored `sessionId`
+  reads as "this session owns this usage" while another session's tokens pile up underneath it —
+  false for every session but one, and silently so. Neither `if_not_exists` (first) nor plain `SET`
+  (last) fixes that, because the defect is the *name*, not the write mode. Renamed the stored
+  attribute to `lastSessionId` under plain `SET`: the name now states exactly what the value is — a
+  trace breadcrumb to the most recent contributing session, never an attribution key. The input field
+  on `UsageRecordIncrement` stays `sessionId` (accurate: it is that call's session). Real
+  session-granular spend needs the session in the sort key, which is a key change this slice
+  deliberately excludes. Generalizable rule for this table: **before adding a descriptive attribute,
+  ask whether it is single-valued for the whole key; if not, either it belongs in the key or its name
+  must admit it is a sample, not a fact about the row.**
+
+## ENG-705: unauthenticated share generate + unrate-limited duplicate could burn v0/LLM credits (2026-07-29)
+
+Two cost-leak surfaces closed with primitives that already existed. Investigation findings:
+
+- **The filing's AC 2 (attribution) was already satisfied — only the gate was missing.** The issue
+  read as "these paths spend LLM budget with no usage gate **and no attributable user**". The first
+  half was true, the second was not: `generateSharedResponse` passes `session.userId` into
+  `generateSessionResponse`, which reaches `incrementUserTokenUsage(userId, ...)` in
+  `agentModeService.ts`. Share spend has always been booked to the share **owner**. So the fix is
+  one `checkTokenUsage(session.userId)` call, not a new attribution path or an anonymous-budget
+  concept. Two of the new tests pass against pre-fix code by design — they are characterization
+  tests pinning that fact so a future refactor cannot quietly lose it.
+- **`checkTokenUsage` was already imported in `agentModeController.ts`** (used by the authenticated
+  `/generate` path at the `usageStatus` check). The share gate is deliberately the *same* call in
+  the *same* shape returning the *same* 429 — zero new imports, zero new concepts.
+- **Gate placement matters for the session lock.** It sits inside the `try` that follows
+  `tryClaimSessionGeneration`, so the existing `finally { releaseSessionGeneration(...) }` releases
+  on the 429 path. Placing it before the claim would also have worked, but inside the try mirrors
+  the authenticated path exactly and is covered by a regression test asserting the owner is not
+  locked out of their own session after a visitor hits the limit.
+- **Duplicate reuses the module's existing `rateLimiter`, deliberately sharing generate's quota
+  bucket** rather than getting its own. A separate limiter would have let a caller drain 10
+  generates *and* 10 duplicates. Sharing the map means duplicate cannot be used to obtain fresh
+  quota — asserted directly.
+- **`"view"` → `"edit"` on duplicate is net-subtractive.** Duplicate was a third authorization
+  shape (deploy/iterate required `"edit"`, duplicate required `"view"`); it now matches iterate.
+  The pre-fix test run proved the impact concretely: a view-only org member received `201` — a
+  full v0 generation — on someone else's page.
+- **Gotcha for anyone adding a dependency to `generateSharedResponse`:** five test suites drive it
+  (`ishareModel`, `ishareAnonymousSender`, `agentModeSharing`, `sharingIntegration`,
+  `interactiveShareExpiration`). The first four needed a `tokenUsageService` stub added; each was
+  verified green on `origin/main` first so the failures were provably the new dependency, not a
+  regression, and no assertion was changed. `interactiveShareExpiration` needs none — it exercises
+  the expired-share 410 path, which returns before the gate.
+- **Known limitation, unchanged by this PR:** the landing-page rate limiter is an in-process
+  `Map`, so limits are per backend instance rather than global. Pre-existing; worth noting if
+  ENG-666/ENG-694 metering makes cross-instance accounting a requirement.
+- **The gate's first shape shipped a disclosure, and our own test hid it (Greptile P1, review of
+  `1c0a078a`).** Mirroring the authenticated `/generate` 429 "exactly" was right for the *check*
+  and wrong for the *response*: the authenticated path returns `tokenUsage: usageStatus` to the
+  account that owns it, but this route sits before `authenticateToken`, so the same body handed
+  any share-link holder the owner's allowance, bonus, effective allowance, billing month, dollar
+  spend (`costUsed`), cost cap and enforcement state — the same object the authenticated
+  subscription-usage endpoint serves. **Symmetry across an authentication boundary is not
+  symmetry.** When copying a response shape, re-ask who the reader is.
+- **The agent-written test asserted the bug.** It required the body to *contain* `tokenUsage`
+  (`expect(body.tokenUsage).toEqual(expect.objectContaining({...}))`), so the leak was pinned as
+  intended behavior and the suite went green over it — the exact failure mode
+  `loop-acceptance-tests.md` exists to prevent, and it survived because none of the six
+  human-written ACs constrain the denial body. The replacement asserts the ownership boundary
+  instead: no `TokenUsageStatus` field may appear under any key, so a future re-add by spread or
+  rename fails too. Worth remembering: a test written by whoever wrote the code will happily
+  describe the code rather than the requirement.
+
+## ENG-629: fail closed + prompt re-consent when a Meta connection lacks Ads scopes (2026-07-29)
+
+Live signal: OPS-79 fired twice in 24h — the scheduled Meta Ads report on account
+`922903076601160` failed with `(#200) Ad account owner has NOT granted ads_management or ads_read
+permission`, while `list_connected_accounts` reported the account connected + active and the
+unattended run produced a report with no data. Investigation findings that shaped the fix:
+
+- **`BaseOAuthConfig.scopes` is not a capability signal for Meta — it is a copy of our own OAuth
+  request.** `routes/metaAuth.ts` stored `scopes: flowCfg.scopes` after the token exchange, and the
+  token response was only destructured for `{ access_token, expires_in }`. No `debug_token` or
+  `/me/permissions` call existed in the marketing flow. So every Meta marketing connection records
+  `ads_read` + `ads_management` regardless of what the user actually ticked at the consent dialog.
+  **This is the trap**: a pre-flight gate reading `config.scopes` would have passed for exactly the
+  account that is failing in production, and the whole fix would have been a no-op. The gate had to
+  be built on a newly captured `granted_scopes`, mirroring the existing Gmail/YouTube/HubSpot field.
+- **Capability is tri-state, not boolean.** `granted_scopes` present without an ads scope is an
+  authoritative refusal; `granted_scopes` absent (every pre-existing record) is genuinely *unknown*.
+  Treating unknown as "missing" would lock out every working legacy connection; treating it as
+  "granted" reproduces the bug. `getMetaAdsScopeState` returns `granted | missing | unknown`, and
+  only `missing` refuses work before calling Meta.
+- **The soft-result shape was the actual user-visible defect.** `listMetaAdsCampaignsNew` caught the
+  Meta error and returned `{ success: false, ... }` with no `campaigns` key, which reads to the model
+  as "this account has no campaigns" — hence a clean-looking empty report instead of a failure. Meta
+  auth errors already had a rethrow channel (`error.isMetaAuthError`); the scope error joins it, so
+  it throws rather than degrading.
+- **Self-heal closes AC3 for legacy records.** When Meta authoritatively refuses, we now write the
+  learned grant back via the existing `updateAccountConfig` contract, so the *next* read fails at the
+  pre-flight gate without another API call. Best-effort by design — a persistence failure logs and
+  still surfaces the actionable error, never masking it. Re-consent overwrites `granted_scopes` at
+  connect, so the record self-corrects; no cache invalidation logic was needed.
+- **Scoped exclusions, deliberate.** Code 190 (expired token) and code 100 (validation — the
+  `filtering must be an array` defect owned by ENG-630) are explicitly NOT classified as scope
+  problems; misrouting either would hand the user the wrong remedy. Tests pin both.
+- **Non-secret by construction.** Meta echoes access tokens and `fbtrace_id` into error strings, so
+  the upstream error is attached as `cause` for logs and never interpolated into the message. One
+  canonical message for every trigger, so this is "one actionable error", not a family of near-duplicates.
+- **Self-review catch worth keeping.** The first cut of the self-heal wrote back the retained
+  grant, which for a legacy record collapses to `[]` — and `[]` was mapped to `unknown`, not
+  `missing`. So the pre-flight gate would have fallen through to Meta on every subsequent run,
+  defeating AC3 for exactly the records that needed it. The original test ("persisted array has no
+  ads scope") passed anyway, because `[]` trivially satisfies it. The fix is an explicit
+  `ads_scope_revoked_at` marker that makes the refusal unambiguous, plus a behavioral test that
+  feeds the persisted config back in and asserts the second read never calls Meta. Lesson: assert
+  the *downstream consequence* of a write, not the shape of the write.
+- **A permission classification is not evidence of a missing scope** (Greptile P1-2). The first
+  predicate returned true for any code 10 / 200-299, and `metaService.handleError` stamps
+  `PERMISSION_ERROR` on that whole family — missing `business_management`, an inaccessible ad
+  account, a disabled asset. Since the normalization path *narrows the stored grant*, that would
+  have stripped `ads_read` from a connection that genuinely had it and then blocked every later
+  request behind re-consent advice that cannot fix anything: a transient upstream error converted
+  into a bricked customer connection. The costs are asymmetric — a false negative just falls
+  through to the pre-existing soft error path carrying Meta's own message, while a false positive
+  destroys working state — so the bar is asymmetric too: Meta must NAME an Ads scope, and a
+  permission code alone is never sufficient. Renamed to `isMetaAdsScopeRefusal` because "permission
+  error" was the wrong concept and the loose name invited the loose check.
+- **The 95% CI coverage gate only measures `src/utils/**`** (`jest.config.js` `collectCoverageFrom`),
+  and the coverage shard additionally ignores `/__tests__/agentMode*`. Two consequences worth
+  knowing before adding a util: `services/` and `routes/` changes are not measured at all, so the
+  *only* file in this PR the gate could see was `utils/metaAdsScope.ts` — which is why one new
+  pure module could drag the global branch number from >=95% to 94.81% on its own.
+- **Deep `?.`/`??` chains are a coverage tax.** istanbul counts every optional-chaining hop as a
+  branch, so `error?.response?.data?.error?.code` alone contributes four. Meta delivers errors in
+  several shapes, so the first cut spelled out five code paths and seven text paths as inline
+  chains — ~19 branches for what is really two lookups, most unreachable without absurd permutation
+  fixtures. Replaced with declared path lists plus one `pick()` reducer: same behavior, the shapes
+  are now a readable table, and the file went 89.44% -> 100% branch coverage while getting shorter
+  in intent. Prefer a data-driven lookup over a nested optional chain when probing foreign payloads.
+- Gate coverage note: the pre-flight gate sits in `getMetaCredentials`, the single choke point for
+  every connected-account Meta tool, so it covers all ads paths including writes. Post-flight
+  normalization is wired into the campaign read path named in the reporter signal; once the
+  self-heal records the missing grant, every other path fails pre-flight too.
+- AgentMode chat behavior (outputs, tool selection, prompts, model defaults) is untouched. The
+  system prompt already forbade fabricating metrics; it needed no edit.
+
+## ENG-446: canonical action payloads on existing report/run data (2026-07-29)
+
+New pure module `backend/src/services/marketingActionEnvelope.ts` — the transport/persistence seam
+ENG-445 deliberately left to this issue. Investigation findings that shaped it:
+
+- **There is no `ReportResult` / `RunResult` / `ReportEnvelope` type in the backend.** The two real
+  envelopes are (a) the scheduled-chat run result — an inline object literal returned by
+  `runScheduledChat` (`controllers/agentModeController.ts`) and persisted untyped
+  (`scheduleDb.addRunResult(scheduleId, runResult: any)`, `services/db.ts`), and (b) the HTML-report
+  file entry (`ResultFile`, `routes/tasks.ts`). Both already carry arbitrary JSON, so the payload
+  needed **no new table, no new attribute path, and no new storage system** — assertion 1 is
+  satisfied by one optional field, `marketingActions`, on the existing envelopes.
+- **The payload is stored as a native array, not a serialized string.** `parseMarketingActions`
+  (ENG-445) takes JSON text, so `readMarketingActions` round-trips via `JSON.stringify` into it.
+  That keeps exactly ONE parser and ONE identity check in the system whatever the transport, and
+  the canonical-id re-derivation still rejects a drifted or foreign id.
+- **Assertion 6 (retry mints no new ids) is free from ENG-445's design** — `marketingActionId` is a
+  normalized content hash of (actionType, scopeId), so re-attaching the same underlying actions is
+  inherently idempotent, including across cosmetic producer variance in case/whitespace. What was
+  NOT free: a retry re-attaching would reset status to `proposed`. `attachMarketingActions`
+  therefore carries forward any status already recorded against a canonical id, so a duplicate
+  scheduled delivery can never silently un-approve a move a human approved.
+- **Two read paths, one helper.** `GET /scheduled-chats/:id/test-history` and the
+  with-html-reports response both call `normalizeMarketingActions`. Neither re-ranks: stored order
+  is returned verbatim (assertion 3), and legacy rows normalize to `[]` (assertion 4). The report
+  route's inline post-processing was extracted to `buildHtmlReportsResponsePayload` so it is
+  directly testable — the pre-existing searchableText JSON round-trip (which exists to avoid racing
+  the background enrichment writer) is preserved unchanged inside it.
+- **Gotchas confirmed and left alone**: `agentModeController` deletes `actualResponse` before
+  persisting a run result (space saving, re-hydrated on read) — `marketingActions` survives that
+  path; and `GET /scheduled-chats` strips `runResults` wholesale, so an eventual portal "3 moves
+  today" card must read `/test-history`, not the schedule list. Noted for ENG-444.
+- No producer of `MarketingActionCandidate` exists yet by design — deriving candidates from
+  campaign data is downstream of ENG-444's taste gate. This PR is the carrier, so a producer needs
+  zero further plumbing. AgentMode chat behavior (outputs, tool selection, prompts, model defaults)
+  is untouched.
+
+## ENG-445: shared marketing-action contract + deterministic top-3 selector (2026-07-28)
+
+New pure module `backend/src/services/marketingActionContract.ts` — ONE typed contract for "a
+recommended marketing action" and ONE deterministic selector (`selectTopMarketingActions`, cap 3)
+for the ENG-444 "3 moves today" surfaces. Investigation findings that shaped it:
+
+- **ENG-87 campaign-health signal code does not exist in this repo** (no `campaignHealth`/
+  `healthSignal`/`struggling` module) — the contract therefore does not import a signal engine; it
+  is fed candidates by producers (ENG-446 wires existing report/run data into it).
+- **There is no `reportId` primitive anywhere in the backend.** "Source report/run ID" is an
+  opaque `sourceKind: 'report'|'run'` + `sourceId` pair, so `AW-AgentRuns` runIds, loop `RunId`s,
+  and report artifact ids all fit without a new table.
+- Shape reuse: tiers mirror `RcaRankedFix` (ai-eval-funnel), provenance mirrors loops/core
+  `MutationProposal`, stable-id + "recommendation is the product" mirrors
+  `agentMode/core/askUserQuestion.ts`; pure-module style mirrors `healthScoreService.ts`
+  (the existing top-3 tie-break precedent is `onboardingLoopApproval.ts:181`).
+- Determinism: identity = normalized sha256 of (actionType, scopeId) → duplicates collapse onto
+  one id and status changes never move it; ranking is a total order (critical/campaign tier →
+  weighted 5-factor score → per-factor tiers → id → canonical JSON), so output is invariant under
+  input permutation. Weights (5/4/3/2/1) encode the contract's stated factor order; campaign
+  priority is a hard tier that only `critical: true` overrides.
+- No consumers changed in this PR by design — ENG-446 (blocked by ENG-445) exposes canonical
+  payloads through existing report/run data.
+
+## ENG-259: Fathom→Linear router — cloud wiring in shadow mode (2026-07-28)
+
+The canonical reconciliation engine (`services/fathomLinearRouter.ts`, carried forward from the
+preserved `swarm/eng-259-fathom-linear-router` branch) is now WIRED: `/api/webhooks/fathom` runs
+deterministic extraction (`services/fathomExtraction.ts` — no LLM; retries produce byte-identical
+ids so `fathomKey` idempotency holds) and reconciles through the engine via the `LinearPort`
+resolved from `services/fathomLinearPortRegistry.ts`. Mode = `FATHOM_LINEAR_ROUTER_MODE`
+(off | shadow | live, default shadow — real board reads, zero writes, full run report logged as
+one `[FathomLinearRouter]` JSON line). Decision of record: ENG-447 selected Option 1 (managed
+durable workflow in the existing backend, Fathom-first, shadow before writes, no laptop fallback).
+
+Assumptions / boundaries:
+- The production LinearPort adapter is ENG-536 (blocked-by this): until it registers at the
+  composition root, the webhook answers `routed:false, reason: LinearPort not configured (ENG-536)`
+  with extraction counts — deliberate 200 so Fathom does not retry-spiral on a known-inactive path.
+- The legacy `meetingIntakeService` path was REMOVED from the webhook (it wrote to placeholder
+  Notion/ClickUp deps — dead destinations since the Linear migration). The service itself stays:
+  Emma's `fathom_route_action_items` tool still imports it, and changing Emma tool behavior is out
+  of swarm scope.
+- The ENG-246 onboarding leg (`FATHOM_ONBOARDING_AUTOMATION_ENABLED`) is preserved unchanged and
+  self-contained (never throws the webhook).
+- Extraction Harsha-filter: items explicitly assigned to a non-Harsha person become
+  `actionable:false` FYI (reported `notFiled`, never silently dropped) per issue scope #2.
+- Customer ambiguity is CRM-derived only (≥2 distinct crm_matches companies → `needsPm`); a
+  multi-external-domain call yields customer=undefined (absent, not ambiguous) so the engine's
+  anchor rule (customer+workflow required to bind) stays safe without flooding Needs PM.
+- Fathom's exact webhook payload field names for crm_matches/action-item assignees are asserted
+  loosely (string|object accepted, defensive) — verify against a real org-account payload when
+  ENG-447's credentials land; shadow mode makes any mismatch observable without writes.
+
 ## ENG-114: durable MCP session store so sessions resolve across instances (2026-07-21)
 
 MCP Streamable-HTTP sessions lived only in a per-process `Map` in `mcp/server/mcpServer.ts`. On a
@@ -60,6 +523,7 @@ pair), so they never hit the fixed path; new Emma ads are already correct. (2) `
 convention (meta vs facebook) stays a Session:Taste call in ENG-327. (3) Backfilling the live RankAI
 ads is a separate real-money action (rebuilding existing-post ads would drop social proof) — not in
 this PR.
+
 ## ENG-413: X posting fails silently — 3 code gaps made a read-only grant undiagnosable (2026-07-20)
 
 The live 403 (Reply Guy scheduled chat, all `twitter_manage_post` replies 403'd while reads worked)
