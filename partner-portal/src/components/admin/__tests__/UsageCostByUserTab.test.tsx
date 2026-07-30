@@ -9,6 +9,8 @@ import UsageCostByUserTab, {
   rankedUserRows,
   providerIsAllocatedEstimate,
   xAccountsFromFeatures,
+  xAccountRows,
+  xAccountLabel,
   CostAggregation,
 } from "../UsageCostByUserTab";
 
@@ -31,6 +33,7 @@ const AGG: CostAggregation = {
     { feature: "x-account:acc-1", costUsd: 0.3, callCount: 18, totalTokens: 0 },
     { feature: "agent-chat", costUsd: 0.94, callCount: 22, totalTokens: 1000 },
   ],
+  byXAccount: [{ accountId: "acc-1", handle: "alice", costUsd: 0.3, callCount: 18 }],
   topUsers: [
     {
       userId: "user-a",
@@ -111,10 +114,23 @@ describe("UsageCostByUserTab pure helpers", () => {
     expect(providerIsAllocatedEstimate("llm")).toBe(false);
   });
 
-  it("extracts per-X-account rollups from the feature dimension, skipping non-X features", () => {
+  it("extracts per-X-account rollups from the feature dimension (handle null), skipping non-X features", () => {
     const accts = xAccountsFromFeatures(AGG.byFeature);
-    expect(accts).toEqual([{ accountId: "acc-1", costUsd: 0.3, callCount: 18 }]);
+    expect(accts).toEqual([{ accountId: "acc-1", handle: null, costUsd: 0.3, callCount: 18 }]);
     expect(xAccountsFromFeatures(undefined)).toEqual([]);
+  });
+
+  it("prefers the server-enriched byXAccount cut (with @handle) over the feature fallback", () => {
+    expect(xAccountRows(AGG)).toEqual([{ accountId: "acc-1", handle: "alice", costUsd: 0.3, callCount: 18 }]);
+    // Falls back to feature derivation (handle null) when byXAccount is absent.
+    const noEnrich = { ...AGG, byXAccount: undefined };
+    expect(xAccountRows(noEnrich)[0]).toMatchObject({ accountId: "acc-1", handle: null });
+    expect(xAccountRows(null)).toEqual([]);
+  });
+
+  it("labels an account by @handle when known, else the raw id", () => {
+    expect(xAccountLabel({ accountId: "acc-1", handle: "alice", costUsd: 0, callCount: 0 })).toBe("@alice");
+    expect(xAccountLabel({ accountId: "acc-1", handle: null, costUsd: 0, callCount: 0 })).toBe("acc-1");
   });
 });
 
@@ -129,8 +145,9 @@ describe("UsageCostByUserTab rendering", () => {
     expect(screen.getByText("(no email on file)")).toBeInTheDocument();
     expect(screen.getByTestId("total-cost")).toHaveTextContent("$1.24");
 
-    // by-account cut
+    // by-account cut — shows the enriched @handle (with the raw id alongside)
     const acctTable = await screen.findByTestId("x-account-table");
+    expect(acctTable).toHaveTextContent("@alice");
     expect(acctTable).toHaveTextContent("acc-1");
 
     // reconciliation panel (measured vs allocated)

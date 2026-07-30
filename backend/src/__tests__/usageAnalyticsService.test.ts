@@ -15,6 +15,11 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+const mockGetAccountById = jest.fn();
+jest.mock('../services/connectedAccountsDb', () => ({
+  getAccountById: (...a: any[]) => mockGetAccountById(...a),
+}));
+
 import { usageRecordDb } from '../services/usageRecordDb';
 import { userDb } from '../services/db';
 import {
@@ -28,6 +33,7 @@ import {
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
 const mockScan = usageRecordDb.scanByDateRange as jest.Mock;
 const mockGetUser = userDb.getUserById as jest.Mock;
+beforeEach(() => mockGetAccountById.mockReset());
 
 const row = (overrides: any = {}) => ({
   userId: 'user-1',
@@ -558,6 +564,7 @@ describe('usageAnalyticsService', () => {
         series: [],
         byFeature: [],
         topUsers: [],
+        byXAccount: [],
       });
       expect(mockGetUser).not.toHaveBeenCalled();
     });
@@ -643,5 +650,66 @@ describe('currentXBillingCycle', () => {
     expect(c.start <= c.end).toBe(true);
     // April (30 days): reset day 31 mid-May clamps to Apr 30.
     expect(currentXBillingCycle(31, new Date('2026-05-10T00:00:00Z')).start).toBe('2026-04-30');
+  });
+});
+
+describe('getCostAggregation — byXAccount (@handle enrichment, ENG-664)', () => {
+  const xr = (accountId: string, userId: string, costMicroUsd: number, callCount = 1) => ({
+    userId,
+    sk: `2026-07-10#twitter:search_tweets#x-account:${accountId}`,
+    date: '2026-07-10',
+    model: 'twitter:search_tweets',
+    feature: `x-account:${accountId}`,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    callCount,
+    quantity: callCount,
+    costMicroUsd,
+  });
+
+  it('groups X rows by account and enriches the handle via the heaviest-spending owner', async () => {
+    mockScan.mockResolvedValue([
+      xr('acc-1', 'owner-1', 90_000, 9), // owner-1 spends most on acc-1
+      xr('acc-1', 'member-2', 10_000, 1),
+      xr('acc-2', 'owner-3', 5_000, 1),
+      // a non-X row must not appear as an account
+      { ...xr('acc-1', 'owner-1', 999_000), model: 'gpt-5-chat-2', feature: 'agent-chat' },
+    ]);
+    mockGetUser.mockResolvedValue(null);
+    mockGetAccountById.mockImplementation((accountId: string, userId: string) => {
+      if (accountId === 'acc-1' && userId === 'owner-1') return Promise.resolve({ account_name: '@a', config: { username: 'alice' } });
+      if (accountId === 'acc-2') return Promise.resolve({ account_name: 'Bob', config: {} });
+      return Promise.resolve(null);
+    });
+
+    const result = await getCostAggregation('2026-07-01', '2026-07-31');
+
+    expect(result.byXAccount.map((a) => a.accountId)).toEqual(['acc-1', 'acc-2']); // sorted by spend
+    expect(result.byXAccount[0]).toMatchObject({ accountId: 'acc-1', handle: 'alice', callCount: 10 });
+    expect(result.byXAccount[0].costUsd).toBeCloseTo(0.1, 6); // (90000+10000)/1e6
+    // handle resolution used the OWNER (owner-1), not the member.
+    expect(mockGetAccountById).toHaveBeenCalledWith('acc-1', 'owner-1', 'twitter');
+    // acc-2 config has no username → falls back to account_name.
+    expect(result.byXAccount[1]).toMatchObject({ accountId: 'acc-2', handle: 'Bob' });
+  });
+
+  it('yields handle=null when the account cannot be resolved (fallback to raw id)', async () => {
+    mockScan.mockResolvedValue([xr('acc-x', 'u1', 5_000)]);
+    mockGetUser.mockResolvedValue(null);
+    mockGetAccountById.mockResolvedValue(null);
+
+    const result = await getCostAggregation('2026-07-01', '2026-07-31');
+    expect(result.byXAccount).toEqual([
+      { accountId: 'acc-x', handle: null, costMicroUsd: 5_000, costUsd: 0.005, callCount: 1 },
+    ]);
+  });
+
+  it('is empty when there are no X rows', async () => {
+    mockScan.mockResolvedValue([]);
+    mockGetUser.mockResolvedValue(null);
+    const result = await getCostAggregation('2026-07-01', '2026-07-31');
+    expect(result.byXAccount).toEqual([]);
+    expect(mockGetAccountById).not.toHaveBeenCalled();
   });
 });
