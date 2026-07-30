@@ -65,4 +65,21 @@ describe("hardeningGaps", () => {
   it("needsSafetyBlock: no power tool -> false regardless of prompt", () => {
     expect(needsSafetyBlock({ toolNames: ["read_brand_guidelines"], systemPrompt: "" })).toBe(false);
   });
+
+  it("needsSafetyBlock: high-power tools that previously escaped detection are caught", () => {
+    // Each of these carries publish/send/destructive effect and needs the SAFETY block.
+    for (const tool of [
+      "twitter_manage_post",   // posts threads + deletes at volume
+      "twitter_outreach",      // X DMs / outreach
+      "send_email_from_sender",
+      "delete_leads",
+      "delete_lead_list",
+    ]) {
+      expect(needsSafetyBlock({ toolNames: [tool], systemPrompt: "do stuff" })).toBe(true);
+      // ...and a bare PUBLISH GATE does NOT cover their volume/destructive risk.
+      expect(
+        needsSafetyBlock({ toolNames: [tool], systemPrompt: "## PUBLISH GATE\napprove first" }),
+      ).toBe(true);
+    }
+  });
 });

@@ -17,13 +17,23 @@ export const PUBLISH_TOOLS = new Set<string>([
 /**
  * Send/delete/enrich/import tools — these carry VOLUME and destructive risk that
  * only the SAFETY & VOLUME LIMITS block governs; a bare publish gate does NOT
- * cover them.
+ * cover them. Includes the `*_manage_post` tools: they post multi-item threads
+ * AND delete/like/retweet at volume, so a single publish gate is insufficient.
  */
 export const SEND_TOOLS = new Set<string>([
+  // LinkedIn / X outreach + post management (DMs, threads, replies, deletes)
   "linkedin_outreach",
   "linkedin_manage_post",
+  "twitter_outreach",
+  "twitter_manage_post",
+  // Email sends
   "send_email_to_lead",
+  "send_email_from_sender",
+  // Destructive CRM deletions
+  "delete_leads",
   "delete_leads_by_filter",
+  "delete_lead_list",
+  // Enrichment / import (volume + spend)
   "enrich_leads_execute",
   "import_leads_from_search",
 ]);
