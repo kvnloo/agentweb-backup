@@ -11,6 +11,7 @@ import {
   computeTwitterCost,
   TWITTER_PROVIDER,
   isTwitterOperation,
+  isPostReadOperation,
   TwitterOperation,
 } from "../utils/twitterPricing";
 
@@ -103,6 +104,29 @@ describe("isTwitterOperation", () => {
   it("accepts a known operation and rejects junk", () => {
     expect(isTwitterOperation("search_tweets")).toBe(true);
     expect(isTwitterOperation("nope")).toBe(false);
+  });
+});
+
+describe("isPostReadOperation", () => {
+  it("is true for post-read operations X counts in project_usage", () => {
+    for (const op of [
+      "search_tweets",
+      "list_replies",
+      "get_quote_tweets",
+      "get_tweet_metrics",
+      "get_list_tweets",
+      "get_user_tweets",
+    ] as TwitterOperation[]) {
+      expect(isPostReadOperation(op)).toBe(true);
+    }
+  });
+
+  it("is false for writes, user reads, owned reads, DM reads, and junk", () => {
+    expect(isPostReadOperation("post")).toBe(false);
+    expect(isPostReadOperation("get_profile")).toBe(false); // user read
+    expect(isPostReadOperation("get_bookmarks")).toBe(false); // owned read
+    expect(isPostReadOperation("list_dms")).toBe(false); // dm read
+    expect(isPostReadOperation("nope")).toBe(false);
   });
 });
 

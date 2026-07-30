@@ -21,6 +21,8 @@ import {
   getUserUsageByModelDay,
   getUsageComparison,
   getCostAggregation,
+  getXAllocatedTotals,
+  currentXBillingCycle,
 } from '../services/usageAnalyticsService';
 
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
@@ -559,5 +561,71 @@ describe('usageAnalyticsService', () => {
       });
       expect(mockGetUser).not.toHaveBeenCalled();
     });
+  });
+});
+
+// ── ENG-664: X allocated totals + billing-cycle window ────────────────────────
+
+const xRow = (model: string, over: any = {}) => ({
+  userId: over.userId ?? 'user-1',
+  sk: `2026-07-10#${model}#x-account:acc-1`,
+  date: '2026-07-10',
+  model,
+  feature: 'x-account:acc-1',
+  callCount: 1,
+  quantity: 1,
+  costMicroUsd: 0,
+  ...over,
+});
+
+describe('getXAllocatedTotals', () => {
+  it('sums only twitter:* rows and counts post-read units separately', async () => {
+    mockScan.mockResolvedValue([
+      xRow('twitter:search_tweets', { quantity: 10, callCount: 1, costMicroUsd: 50_000 }), // $0.05, 10 post-reads
+      xRow('twitter:get_profile', { quantity: 1, callCount: 1, costMicroUsd: 10_000 }),     // $0.01, user read (not post-read)
+      xRow('twitter:post', { quantity: 1, callCount: 1, costMicroUsd: 15_000 }),            // $0.015 write
+      // Non-twitter rows must be ignored entirely.
+      { ...xRow('gpt-5-chat-2'), model: 'gpt-5-chat-2', costMicroUsd: 999_000 },
+    ]);
+
+    const t = await getXAllocatedTotals('2026-07-03', '2026-07-31');
+    expect(t.costUsd).toBeCloseTo(0.075, 6); // 0.05 + 0.01 + 0.015 — the LLM row excluded
+    expect(t.callCount).toBe(3);
+    expect(t.postReadUnits).toBe(10); // only search_tweets counts
+    expect(t.byOperation.map((r) => r.operation)).toContain('search_tweets');
+    expect(t.byOperation[0].operation).toBe('search_tweets'); // sorted by spend desc
+  });
+
+  it('returns zeros for an empty window', async () => {
+    mockScan.mockResolvedValue([]);
+    const t = await getXAllocatedTotals('2026-07-01', '2026-07-02');
+    expect(t.costUsd).toBe(0);
+    expect(t.callCount).toBe(0);
+    expect(t.postReadUnits).toBe(0);
+    expect(t.byOperation).toEqual([]);
+  });
+
+  it('rejects a malformed or inverted range', async () => {
+    await expect(getXAllocatedTotals('nope', '2026-07-02')).rejects.toThrow(/YYYY-MM-DD/);
+    await expect(getXAllocatedTotals('2026-07-05', '2026-07-01')).rejects.toThrow(/<=/);
+  });
+});
+
+describe('currentXBillingCycle', () => {
+  it('starts on the reset day this month when today is past it', () => {
+    const c = currentXBillingCycle(3, new Date('2026-07-20T12:00:00Z'));
+    expect(c.start).toBe('2026-07-03');
+    expect(c.end).toBe('2026-07-20');
+  });
+
+  it('rolls back to last month when today is before the reset day', () => {
+    const c = currentXBillingCycle(15, new Date('2026-07-05T00:00:00Z'));
+    expect(c.start).toBe('2026-06-15');
+    expect(c.end).toBe('2026-07-05');
+  });
+
+  it('falls back to day 1 when the reset day is null/invalid', () => {
+    expect(currentXBillingCycle(null, new Date('2026-07-20T00:00:00Z')).start).toBe('2026-07-01');
+    expect(currentXBillingCycle(99, new Date('2026-07-20T00:00:00Z')).start).toBe('2026-07-01');
   });
 });
