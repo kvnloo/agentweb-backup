@@ -3,6 +3,8 @@ Description=Alert oncall that %i failed
 
 [Service]
 Type=oneshot
+User=agentengine
+Group=agentengine
 WorkingDirectory=/opt/agent-engine/agentweb/agent-engine
 Environment=AGENT_ENGINE_ENV=production
 Environment=AWS_REGION=us-west-2
