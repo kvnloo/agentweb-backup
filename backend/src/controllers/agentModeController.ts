@@ -2954,7 +2954,19 @@ export async function generateSessionResponse(
           if (scheduleIdMatch) {
             systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
           }
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType);
+          // Resolve the schedule owner's admin status so the directive only
+          // injects its admin-only (get_chat_history / list_all_clients) identity
+          // slice for admin-owned scheduled runs. Scoped to the scheduled branch,
+          // so this is one extra read only on scheduled runs. A prompt-enrichment
+          // lookup must never break the run, so a failed read degrades to the safe
+          // default (treat as non-admin → omit the admin-only slice).
+          let ownerIsAdmin = false;
+          try {
+            ownerIsAdmin = (await userDb.getUserById(session.userId))?.isAdmin === true;
+          } catch (adminLookupError) {
+            console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
+          }
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
@@ -4565,6 +4577,25 @@ export const agentModeController = {
       }
 
       try {
+
+      // ENG-705: this route is registered before `router.use(authenticateToken)`,
+      // so the caller is anonymous — but the spend is not. Gate on the share
+      // OWNER's allowance (the account `generateSessionResponse` already bills
+      // via incrementUserTokenUsage) so an unauthenticated visitor can never
+      // cause more vendor spend than the owner could cause themselves. This runs
+      // before any LLM call: refuse loudly, never a degraded-but-billed path.
+      const usageStatus = await checkTokenUsage(session.userId);
+      if (!usageStatus.allowed) {
+        // The caller is anonymous, so the denial carries the message ONLY.
+        // `usageStatus` is the owner's billing record (allowance, bonus, dollar
+        // spend, cost cap, enforcement state); echoing it here would turn this
+        // public route into a read side-channel on the owner's account for
+        // anyone holding the share link. Authenticated owners still read their
+        // usage through the subscription-usage endpoint.
+        return res.status(429).json({
+          error: 'Monthly token limit reached for this shared session. Please contact the owner of this link.',
+        });
+      }
 
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
