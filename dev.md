@@ -132,6 +132,192 @@ org-owner level (`resolveBillingUserId`, as LLM already does) and kept behind `E
 (observe-only) until ENG-703 defines Emma-Credit pricing. `recordVendorUsage` deliberately does NOT call
 `incrementUserTokenUsage` today — X spend is visible but does not draw down any cap yet.
 
+## ENG-754: the Greptile 5/5 bar is now a check, not a habit (2026-07-29)
+
+`Require Greptile Review` used to poll Greptile's own `Greptile Review` check-run and pass on
+`conclusion=success`. Greptile marks that check-run success for **every completed review regardless
+of confidence score**, so the job was green on four below-bar reviews in one day — agentweb#2215
+(4/5), #2219 (3/5), portal#985 (3/5, twice) — each carrying a live P1. All four were caught only
+because an agent chose to open the comment and read the score. Investigation findings:
+
+- **Greptile publishes no structured score. Checked all four plausible surfaces before parsing
+  prose.** The check-run's `output.summary` is `"Greptile has reviewed the Pull Request.\n\nN files
+  reviewed, M comments added."` with `output.text: null`; its PR review object is
+  `state: COMMENTED` with an empty body; the commit status API carries no Greptile context; and
+  Greptile's public API is repository query/indexing, with no credential of ours in Secrets Manager
+  anyway. The comment body is the only place the verdict exists, so the gate parses it strictly and
+  fails closed rather than pretending a structured source exists.
+- **Greptile edits its original comment in place — it never posts a second one.** On portal#985 a
+  single comment advanced `Reviews (2)` → `Reviews (3)`, each with a different `Last reviewed
+  commit`. So `id`, `created_at` and the comment *count* are all stable across re-reviews and are
+  useless as freshness signals; only `updated_at` and the body move. Anything waiting for a *new*
+  comment waits forever. This is also why the earlier worker on #985 misread the state: it saw 3/5
+  against a superseded SHA and could not tell a stale read from a fresh verdict, because the comment
+  was the same object either way.
+- **"Score present but SHA mismatched" must resolve to pending, never to pass or fail.** The body's
+  `commit/<40-hex>` pointer is the only authority on which commit a score belongs to. The gate
+  compares it to the head SHA positionally and never against `$REPO` — the footer URL lower-cases
+  the org (`github.com/agentwebpro/agentweb/...`) while `github.repository` is `AgentWebPro/agentweb`.
+- **A lenient parser would have recreated the same bug one layer down**, so every ambiguity fails
+  closed and dumps the raw body: no verdict footer for our head, a footer with no 40-hex pointer,
+  zero or multiple `Confidence Score` values, a non-`/5` scale, a score outside 0–5, or a non-JSON
+  payload. In particular a missing pointer must never fall back to "the score I found".
+- **The gate runs the PR's own copy of the script**, per the ENG-743 lesson that whatever gates
+  merges has to gate its own changes — this PR's merge was blocked by the gate it adds. The
+  corollary is worth stating plainly: a PR can edit `greptile-gate.sh` (or `tests.yml`) to neuter
+  the gate for itself. That is a pre-existing property of every `pull_request` workflow here, not
+  something this change introduces, and it is visible in the diff Greptile reviews.
+- **The script's 20-minute deadline sits under a 25-minute step timeout**, so the gate always fails
+  with a diagnosable message rather than being killed mid-poll — the ENG-734 shape of a step timeout
+  undercutting the budget it is meant to contain, which is exactly what Greptile's own 3/5 review
+  caught on #2219.
+- **`Require Greptile Review` was not actually a required status check.** Branch protection on
+  `main` required only `Detect changed projects`; the Greptile job merely gated the staging-deploy
+  job. Acceptance criterion 5 (human merges gated identically) therefore needed the context added to
+  branch protection, which this change does — code alone could not have closed it for humans.
+- **Left alone deliberately:** `agentweb-customer-portal` and `agentweb-landing-page` keep Greptile
+  advisory. Neither has a `greptile.json` or a `Require Greptile Review` job, so this mechanism does
+  not reach them; porting it is Harsha's call (criterion 6).
+
+## ENG-744: Claude 5 generation added to the model catalog (2026-07-29)
+
+Added `anthropic.claude-opus-5`, `anthropic.claude-sonnet-5` and
+`anthropic.claude-haiku-4-5-20251001-v1:0` to the registry, the ENG-683 profile map, and the
+price book. Investigation findings:
+
+- **A listed ACTIVE inference profile is NOT proof of account access, and the difference is
+  invisible until runtime.** `list-inference-profiles` in us-west-2 reports
+  `us.anthropic.claude-opus-5` and `us.anthropic.claude-sonnet-5` ACTIVE, but invoking either with
+  the app's default credentials (992382574572) returns
+  `AccessDeniedException: ... is not available for this account`. Both are only reachable from the
+  **bearer-token account (231030591963)** — the same cross-account path Opus 4.8 already uses. Adding
+  them on the strength of the profile listing alone would have shipped two picker entries that 403
+  for every user. Always invoke before adding.
+- **Haiku 4.5 is the opposite case and must NOT be given bearer auth.** It IS served on the default
+  account, so it takes a normal `global.*` cross-region ARN and stays out of
+  `BEDROCK_BEARER_TOKEN_MODELS`. The account assignment is per-model, not per-generation — there is
+  no "Claude 5 goes to the bearer account" rule to lean on.
+- **Opus 5 returns a `reasoningContent` block before its text block** (thinking is on by default on
+  Opus 5, unlike 4.8/4.7 where omitting the `thinking` param meant no thinking). The Converse parser
+  in `agentModeService` collects *all* `text` blocks and ignores unknown ones, so this is handled —
+  but a parser that assumed `content[0].text` would silently return empty replies for Opus 5 only.
+  Verified against live Bedrock via ConverseCommand, with and without a tool.
+- **Opus 5 and Sonnet 5 reject `temperature` with HTTP 400 `"temperature is deprecated for this
+  model"`** — hence `supportsTemperature: false`, matching Opus 4.8. Haiku 4.5 still accepts it.
+  Confirmed empirically rather than inferred from the generation number.
+- **Haiku 4.5's price key is a canonicalization trap.** `llmPricing` already had
+  `anthropic.claude-haiku-4-5`, but the registry id is
+  `anthropic.claude-haiku-4-5-20251001-v1:0`, and `canonicalModelId` only strips a trailing bare
+  `-YYYY-MM-DD` — not `-20251001-v1:0`. Without its own key the lookup misses and `getModelPrice`
+  returns null, which the ledger books as $0. The pre-existing key covers a *different* id than it
+  appears to.
+- **`gemini-3-pro-preview` was withdrawn by Google on 2026-03-09 and we kept serving it for ~4.5
+  months.** A live probe returns 404 `"This model models/gemini-3-pro-preview is no longer
+  available."` while it was still listed by `GET /api/agent-mode/public/llm-models`, so every user
+  who picked it hit a hard failure. **Removed from the registry** under explicit authorization
+  (recorded on ENG-744 and in the PR body) — ENG-744 AC #7 forbids *silent* removal, not documented
+  removal. Migration target is `gemini-3.1-pro-preview`. The price entry is intentionally retained.
+  The signal was already in the tree and nobody joined it up: `llmPricing.ts` carried
+  `// DEPRECATED 2026-03-09` and a registry comment noted the id 404s for the *vision* path — but
+  neither was generalized to "this model is gone everywhere".
+- **A model can 404 on a real call while still appearing in Google's `ListModels`.**
+  `gemini-3-pro-preview` did exactly this. Discovery endpoints are therefore not evidence a model
+  works — verify by invoking. The same asymmetry runs the other way: Google enforces published
+  shutdown dates inconsistently (two image previews past their stated date still return 200), so
+  "it still responds" is not evidence of safety either. Trust the published date in both directions.
+- **The Gemini Pro line is not behind — Google has not shipped one.** `gemini-3.1-pro-preview` is
+  the newest Pro in the live catalog; there is no 3.5/3.6 Pro despite 3.5/3.6 Flash existing. The
+  "Pro lags Flash" reading of our catalog is Google's release cadence, not our drift.
+- **Live voice is healthy; the `generateContent` 404 against it is a probe artifact.**
+  `gemini-3.1-flash-live-preview` only advertises `bidiGenerateContent`, the WebSocket method
+  `liveVoiceService` actually uses. It is not withdrawn. It does, however, have **no GA successor**
+  in the catalog — as does `gemini-3.1-pro-preview` — which is the live exposure to watch ahead of
+  the 2026-10-20 Gemini platform migration.
+
+## ENG-743: the staging deploy gate now has to observe the deploy (2026-07-29)
+
+`backend-staging-deploy` in `.github/workflows/tests.yml` now calls
+`.github/scripts/eb-deploy.sh` — the script ENG-734/#2219 already shipped and proved — instead of
+its own inline `|| echo "...continuing..."` block plus a readiness wait that only looked at `Status`
+and `Health`. Investigation findings:
+
+- **This was the worse half of ENG-734, because the merge gate cites it.** Production's false green
+  misreports a deploy that already happened. Staging's false green is *upstream of the decision to
+  merge*: `autonomous-execution-and-merge` counts "staging deploy passed" as end-to-end evidence, so
+  a swallowed `update-environment` let a backend PR merge on evidence of a deploy that never applied.
+  Every backend merge today rested on this signal.
+- **Path filters made the fix unprovable, which is why #2219 deliberately skipped it.** The job is
+  filtered on `backend/**`, so a PR that only touches `.github/**` never runs it — a rewritten deploy
+  path would have shipped unexercised, and the first thing to exercise it would have been an
+  unrelated backend PR. The filter is now the fix: `.github/workflows/tests.yml` and
+  `.github/scripts/eb-deploy.sh` count as backend changes, so **whatever gates backend merges gates
+  its own changes**, and this PR runs the job it rewrites. That property is permanent, not a
+  one-off for this issue.
+- **The version label did not identify a build, so asserting on it proved nothing.** Staging labelled
+  every deploy `backend-<date>-pr<N>`, identical across all of a PR's pushes and reusing the same S3
+  key. So `create-application-version` hit the tolerated already-exists path, the S3 object was
+  silently rewritten under a label EB had already served, and — the real hole — the environment was
+  *already reporting that VersionLabel before the run started*. "Ready on our version" would have
+  been satisfiable without a deploy: the fix would have inherited the bug it was closing. The label
+  now carries the short SHA.
+- **Staging and production share EB application `agentweb-backend`.** They also shared the label
+  namespace, so a same-day staging deploy for PR N and the production deploy after merging PR N
+  produced the same label and S3 key: prod's `create-application-version` hit already-exists and
+  reused a version whose bundle staging had written. The SHA suffix removes that collision, so
+  production now always creates a fresh version. `MaxCountRule` is enabled at 200 versions (201
+  present today), so per-push staging labels churn that window faster rather than growing it —
+  bounded, at the cost of some rollback depth in days.
+- **Budget preserved, not extended.** The old steps allowed 5 min for the AWS calls plus 30 min of
+  readiness polling. The script gets `EB_TOTAL_TIMEOUT_SECONDS=1800` under a 35-minute step timeout,
+  so its own deadline always fires first and the log names the reason instead of the runner killing
+  it mid-poll.
+
+## ENG-630: Meta Insights `filtering` shape + preserved 400 detail (2026-07-29)
+
+New pure module `backend/src/utils/metaInsightsFiltering.ts`, wired into
+`callMetaAdsInsightsApiWrapper`. Investigation findings:
+
+- **The reported `(#100) param filtering must be an array` is one of TWO defects sharing a root
+  cause, and the unreported one is worse.** The guard was `...(filtering?.length && { filtering })`.
+  A JSON *string* from the model has a truthy `.length`, so it went to Meta verbatim and got the
+  reported 400. A bare filter *object* has no `.length` at all, so the key was **silently omitted**
+  and Meta answered with whole-account rows — which the model then narrated as campaign-scoped
+  numbers. An error is loud; a widened query is a confident wrong answer. Both shapes are now
+  normalized, and anything unhonourable throws instead of being dropped.
+- **Normalization happens before `getMetaCredentials`**, so a malformed filter costs neither a
+  credential fetch/refresh nor an API call. The Insights path is an async report job (submit → poll
+  up to 60×10s → page results), so a filter defect that reaches the wire is expensive.
+- **`IN`/`NOT_IN`/`ANY`/`ALL`/`NONE` with a scalar value is the same shape defect one level down**
+  and is lifted to a single-element list. An `IN` with an *empty* list throws rather than being
+  forwarded: it can never match, so Meta would return a clean empty report for a question the user
+  really did ask — the same silent-empty failure class as ENG-629.
+- **`filtering` stays a native array in the POST body, not a JSON string.** The sibling `time_range`
+  object already rides this same `axios.post` body as a real object and works, so the transport was
+  never the problem — only the shape reaching it. No transport change was needed.
+- **A Meta 400 was collapsing to axios's `"Request failed with status code 400"`.** Meta's actual
+  explanation lives at `response.data.error` (`message`, `error_user_title`, `error_user_msg`,
+  `code`, `error_subcode`, `type`). `describeMetaGraphApiError` surfaces it and returns `undefined`
+  for a non-Graph rejection (socket hang-up, our own bug), so the caller keeps its own message
+  rather than reporting a misleading Meta explanation. Sanitization follows the precedent set by
+  ENG-629: `access_token=…` fragments and bare `EAA…` tokens are redacted, and `fbtrace_id` is
+  never included at all.
+- **Scoped around ENG-629 (PR #2211), in flight on the same file.** That PR edits
+  `getMetaCredentials`, `listMetaAdsCampaigns`, and `listConnectedAccounts`; this one edits only
+  `callMetaAdsInsightsApiWrapper`. Its `if (error.isMetaAuthError) throw error;` rethrow channel is
+  preserved and pinned by a test, so the re-consent path added there is unaffected by the new error
+  description. Neither PR masks the other's failure class.
+- **Verification is mock-only, deliberately.** OPS-79 means our own Meta connection currently lacks
+  `ads_read`, so no live Insights call is possible; the issue's AC5 forbids one regardless. Every
+  assertion is against the request body we hand axios and the error object we hand back.
+- **The filter `value` was the last unvalidated hop, and review caught it, not the tests.** The
+  first cut validated `field` and `operator` but forwarded `value` verbatim, so a supported
+  operator carrying an object or a nested array still travelled to Meta — the exact class of defect
+  the module was written to stop, surviving inside the fix for it. Values are now asserted scalar
+  (and each element of a list-operator value individually). Non-finite numbers go too: `NaN` and
+  `Infinity` have no JSON representation and serialize to `null`, so they filter on a value nobody
+  asked for. Generalizable: **when you add a boundary, enumerate every field crossing it — a guard
+  that covers two of three fields reads as "validated" and is trusted like it.**
+
 ## ENG-693: vendor dimension on the existing usage ledger (2026-07-29)
 
 Five optional non-key attributes on `AW-UsageRecords` (`provider`, `sessionId`, `unit`, `quantity`,
@@ -471,6 +657,7 @@ pair), so they never hit the fixed path; new Emma ads are already correct. (2) `
 convention (meta vs facebook) stays a Session:Taste call in ENG-327. (3) Backfilling the live RankAI
 ads is a separate real-money action (rebuilding existing-post ads would drop social proof) — not in
 this PR.
+
 ## ENG-413: X posting fails silently — 3 code gaps made a read-only grant undiagnosable (2026-07-20)
 
 The live 403 (Reply Guy scheduled chat, all `twitter_manage_post` replies 403'd while reads worked)

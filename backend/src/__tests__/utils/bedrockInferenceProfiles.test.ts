@@ -38,8 +38,73 @@ describe('bedrockInferenceProfiles', () => {
       }
     );
 
-    it('exposes exactly the pre-consolidation entries — no additions, no losses', () => {
-      expect({ ...BEDROCK_INFERENCE_PROFILE_MAP }).toEqual(PRE_CONSOLIDATION_AGENT_MODE_MAP);
+    it('preserves every pre-consolidation entry byte-for-byte — no losses, no rewrites', () => {
+      for (const [modelId, expectedArn] of Object.entries(PRE_CONSOLIDATION_AGENT_MODE_MAP)) {
+        expect(BEDROCK_INFERENCE_PROFILE_MAP[modelId]).toBe(expectedArn);
+      }
+    });
+
+    /*
+     * The original ENG-683 assertion was `toEqual(PRE_CONSOLIDATION_...)` — "no
+     * additions, no losses" — which proved the consolidation invented nothing.
+     * Adding a model is now the intended way to grow the map, so the additions
+     * half is re-expressed as an exact key-set pin: a new entry still has to be
+     * declared here deliberately, and an accidental one still fails the build.
+     */
+    it('exposes exactly the expected model set — a new entry must be added deliberately', () => {
+      expect(Object.keys(BEDROCK_INFERENCE_PROFILE_MAP).sort()).toEqual(
+        [
+          'anthropic.claude-sonnet-4-5-20250929-v1:0',
+          'anthropic.claude-sonnet-4-6',
+          'anthropic.claude-opus-4-6-v1',
+          'anthropic.claude-opus-4-8',
+          // ENG-744 — the Claude 5 generation
+          'anthropic.claude-opus-5',
+          'anthropic.claude-sonnet-5',
+          'anthropic.claude-haiku-4-5-20251001-v1:0',
+        ].sort()
+      );
+    });
+  });
+
+  /*
+   * ENG-744 — Claude 5 generation.
+   *
+   * Enablement was verified against live Bedrock in us-west-2 before these were
+   * added (see the PR body). The account split is the load-bearing detail:
+   *   - Opus 5 / Sonnet 5 are AccessDenied on the default account (992382574572)
+   *     and only invocable through the bearer-token account (231030591963), so
+   *     they take a bare profile id AND must be in BEDROCK_BEARER_TOKEN_MODELS.
+   *   - Haiku 4.5 IS served on the default account, so it takes a normal
+   *     cross-region ARN and must NOT be routed through bearer auth.
+   * Getting either half wrong is a 403 at runtime, not a test failure, which is
+   * exactly why both halves are pinned here.
+   */
+  describe('ENG-744 — Claude 5 generation', () => {
+    it.each([
+      ['anthropic.claude-opus-5', 'us.anthropic.claude-opus-5'],
+      ['anthropic.claude-sonnet-5', 'us.anthropic.claude-sonnet-5'],
+    ])('routes %s to the bearer-account profile id %s', (modelId, expected) => {
+      expect(resolveBedrockModelId(modelId)).toBe(expected);
+    });
+
+    it.each(['anthropic.claude-opus-5', 'anthropic.claude-sonnet-5'])(
+      'marks %s as bearer-token served (default-account creds get AccessDenied)',
+      (modelId) => {
+        expect(BEDROCK_BEARER_TOKEN_MODELS.has(modelId)).toBe(true);
+      }
+    );
+
+    it('routes haiku-4-5 to a default-account cross-region ARN', () => {
+      expect(resolveBedrockModelId('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe(
+        'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-haiku-4-5-20251001-v1:0'
+      );
+    });
+
+    it('does NOT route haiku-4-5 through bearer auth — it lives on the default account', () => {
+      expect(BEDROCK_BEARER_TOKEN_MODELS.has('anthropic.claude-haiku-4-5-20251001-v1:0')).toBe(
+        false
+      );
     });
   });
 
