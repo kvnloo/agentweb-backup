@@ -3349,17 +3349,16 @@ export class AgentModeService {
         }
 
         // ENG-737: Gemini thinking models (e.g. gemini-3.5-flash) leak their raw
-        // chain-of-thought into `content` — the OpenAI-compat endpoint returns the
-        // partial thought (a leading `thought` marker and/or a degenerate loop of
-        // repeated search queries) as the assistant message. This happens both when
-        // a turn is truncated mid-reasoning by the token limit (finish_reason=length,
-        // session d103071a) AND when the model prefixes a completed tool call with a
-        // raw `thought\n…` monologue (finish_reason=tool_calls, session 97d37f59).
-        // The fragment would otherwise be persisted as a visible assistant message
-        // AND (on truncation) re-fed through the max-tokens continuation loop,
+        // chain-of-thought into `content` when a turn is truncated by the token
+        // limit WHILE still reasoning — the OpenAI-compat endpoint returns the
+        // partial thought (a lowercase `thought` marker and/or a degenerate loop of
+        // repeated search queries) as the assistant message (session d103071a).
+        // Each truncated fragment would otherwise be persisted as a visible
+        // assistant message AND re-fed through the max-tokens continuation loop,
         // leaking internal reasoning and repeated tool queries into the chat.
-        // Suppress the leaked text (any accompanying tool call still executes); the
-        // model's real synthesized answer arrives on the final clean turn.
+        // Suppress the leaked fragment; the continuation loop still delivers the
+        // model's real synthesized answer on the final (non-truncated) turn. Gated
+        // to finish_reason=length so a COMPLETED answer is never blanked.
         if (
           isReasoningLeak({
             finishReason: response.choices[0]?.finish_reason,
