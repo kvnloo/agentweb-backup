@@ -228,7 +228,8 @@
   /* WhatsApp-style local-time stamp tucked into the bubble's bottom-right corner (no extra row). */
   .ts-in { position: absolute; right: 12px; bottom: 5px; font-size: 10px; line-height: 1; color: var(--dim); white-space: nowrap; }
   /* Per-turn token totals, bottom-LEFT of the bubble — opposite the timestamp, in the same reserved strip. */
-  .stats-in { position: absolute; left: 12px; bottom: 5px; font-size: 10px; line-height: 1; color: var(--dim); white-space: nowrap; max-width: 55%; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+  .stats-in { position: absolute; left: 12px; bottom: 5px; font-size: 10px; line-height: 1; color: var(--dim); white-space: nowrap; max-width: 70%; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+  .stats-in .ar { font-size: 14px; font-weight: 700; vertical-align: -1px; } /* ↑/↓ a touch bigger + bolder than the 10px counts */
   /* Markdown styling applies in BOTH chat bubbles (.msg) and pipeline stage bodies (.sbody),
      since both render md() output. Scoping to .msg only left stage reports with no spacing. */
   :is(.msg, .sbody) code { background: #10131a; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
@@ -326,6 +327,8 @@
   #hint { color: var(--dim); font-size: 11px; margin-top: 6px; }
   #hint .cap-full { color: var(--amber); }
   #hint .vhint { opacity: .7; }
+  #hint .mk-editable { color: var(--amber); cursor: pointer; border: 1px solid var(--border); border-radius: 6px; padding: 1px 7px; margin-left: 6px; white-space: nowrap; }
+  #hint .mk-editable:hover { background: rgba(0,0,0,.2); }
   /* Voice (push-to-talk) indicator — shown while the mic is open */
   #voice { display: none; align-items: center; gap: 9px; padding: 8px 20px; color: var(--red); font-size: 12px; border-top: 1px solid var(--border); background: var(--panel); }
   #voice .mic { width: 9px; height: 9px; border-radius: 50%; background: var(--red); animation: pulse 1.1s infinite; }
@@ -516,6 +519,7 @@ const OUTCOME_BADGE = {
   fixed_needs_human: ['needs human','b-red'], cannot_fix: ['cannot fix','b-gray'],
   no_change: ['no change','b-gray'], started: ['running','b-blue'], recovered: ['retrying','b-blue'],
   blocked: ['blocked','b-orange'], recovery_failed: ['crashed','b-red'], setup_failed: ['setup failed','b-red'],
+  editing: ['editing','b-blue'], // developer took a blocked issue over via "make editable"
 };
 const badge = (o) => { const [t, c] = OUTCOME_BADGE[o] || [o, 'b-gray']; return `<span class="badge ${c}">${esc(t)}</span>`; };
 // The issue's live Linear workflow state (auto-refreshed from Linear by the poller). Outlined chip with a
@@ -688,16 +692,20 @@ function stampTime(bubbleEl, iso, durMs) {
   ts.title = (dur ? `Turn took ${dur} · ` : '') + fmtAt(iso); // full date + duration on hover
   bubbleEl.appendChild(ts); // bottom-right corner of the bubble (absolute)
 }
-// Per-turn tokens in the bubble's bottom-LEFT corner (opposite the timestamp). `↑` = input processed
-// this turn (fresh + cache read + cache write), `↓` = output generated. Hover shows the full breakdown.
+// Per-turn tokens in the bubble's bottom-LEFT corner (opposite the timestamp). `↑` = INPUT (fresh
+// tokens sent this turn), `↓` = OUTPUT (tokens generated). Cache is an input-only concept — cache-read +
+// cache-write are shown as one `(… cache)` figure beside the ↑; output is never cached. Hover splits it.
 function stampStats(bubbleEl, tok, cost) {
   if (!bubbleEl || !tok || (!tok.in && !tok.out)) return;
   const el = document.createElement('span');
   el.className = 'stats-in';
-  const dollars = cost != null ? ` · $${cost.toFixed(2)}` : ''; // anchors the big token count to real limit impact
-  el.textContent = `↑ ${fmtTok(tok.in)}  ↓ ${fmtTok(tok.out)}${dollars}`;
-  const k = (n) => (n || 0).toLocaleString();
-  el.title = `Tokens this turn — input ${k(tok.in)} (fresh ${k(tok.fresh)}, cache read ${k(tok.cacheRead)}, cache write ${k(tok.cacheWrite)}) · output ${k(tok.out)}${cost != null ? ` · cost $${cost.toFixed(2)}` : ''}`;
+  const dollars = cost != null ? ` · $${cost.toFixed(2)}` : ''; // anchors the token counts to real limit impact
+  const cacheTok = (tok.cacheRead || 0) + (tok.cacheWrite || 0); // cache read + write, both part of input
+  const cache = cacheTok ? ` (${fmtTok(cacheTok)} cached)` : '';
+  // Numbers are safe (fmtTok → digits + k/M/B, dollars → $N.NN); only the static arrows get wrapped/enlarged.
+  el.innerHTML = `${fmtTok(tok.fresh)}${cache} <span class="ar">↑</span> · ${fmtTok(tok.out)} <span class="ar">↓</span>${dollars}`;
+  const k = (n) => (n || 0).toLocaleString('en-US'); // hover shows the exact comma-grouped counts
+  el.title = `Tokens this turn — input ${k(tok.in)} = ${k(tok.fresh)} fresh + ${k(tok.cacheRead)} cache-read + ${k(tok.cacheWrite)} cache-write · output ${k(tok.out)}${cost != null ? ` · cost $${cost.toFixed(2)}` : ''}`;
   bubbleEl.appendChild(el);
 }
 
@@ -709,6 +717,7 @@ const COMMANDS = [
   { name: '/context', desc: 'Context window usage' },
   { name: '/compact', desc: 'Summarize & compact the conversation' },
   { name: '/btw', desc: 'Open the side thread with its history (or /btw <question> to ask directly)' },
+  { name: '/make-editable', desc: 'Provision a worktree + branch so a blocked/read-only chat can edit code' },
 ];
 
 // ---------- voice (push-to-talk): hold space to dictate via the browser's Web Speech API ----------
@@ -1424,10 +1433,31 @@ function setThinking(label) { $('thinking-label').textContent = label; }
 function updateHint() {
   const cap = S.detail?.capability;
   if (!cap) { $('hint').textContent = ''; return; }
+  // A blocked / branch-less chat is read-only because no fix branch exists — offer to provision one
+  // (a fresh worktree + branch) so the agent can edit code here. Only that specific reason is fixable;
+  // "pipeline is working" / "cannot push fixes" are not.
+  const canPromote = cap.level !== 'full' && /no fix branch/i.test(cap.reason || '');
+  const promote = canPromote ? ' <b class="mk-editable" title="Give this chat its own worktree + branch so the agent can edit code">✎ Make editable</b>' : '';
   $('hint').innerHTML = cap.level === 'full'
     ? '<span class="cap-full">Full access</span> — ask anything, or request changes: the agent edits this issue\'s branch and new commits auto-push to the open PR.'
-    : `Read-only — ${esc(cap.reason || '')}. The agent can answer anything but cannot change code here.`;
+    : `Read-only — ${esc(cap.reason || '')}. The agent can answer anything but cannot change code here.${promote}`;
   if (V.supported && !V.denied) $('hint').innerHTML += ' <span class="vhint">· Hold <b>space</b> to talk.</span>';
+  const btn = $('hint').querySelector('.mk-editable');
+  if (btn) btn.onclick = makeEditable;
+}
+// Promote a read-only (blocked / branch-less) chat to editable: provision a worktree + fix branch, then
+// refresh so the capability flips to full and the composer unlocks.
+async function makeEditable() {
+  if (!S.sel) return;
+  const btn = $('hint').querySelector('.mk-editable');
+  if (btn) { btn.textContent = '⏳ Provisioning worktree…'; btn.onclick = null; }
+  try {
+    const r = await fetch(`/api/issues/${S.sel}/chat/make-editable`, { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) { addSys('⚠ ' + (j.error || `couldn't make this chat editable (${r.status})`), 'err'); updateHint(); return; }
+    addSys(`✅ This chat is now editable — worktree ready on \`${j.branch}\`. Ask for a change and the agent will commit to that branch.`);
+    await refreshDetail(S.sel); // capability is recomputed server-side; pulls the new full-access state
+  } catch (e) { addSys('⚠ ' + String(e.message || e), 'err'); updateHint(); }
 }
 
 // ---------- edit & rewrite history ----------
@@ -2000,6 +2030,7 @@ function runCommand(cmd) {
   if (name === '/context') return openContext();
   if (name === '/compact') return startCompact(raw.slice(name.length).trim());
   if (name === '/btw') return openBtw(raw.slice(name.length).trim());
+  if (name === '/make-editable') return makeEditable();
   addSys('Unknown command: ' + name + ' — try /status, /context, /compact, or /btw', 'err');
 }
 // /compact — hand the whole conversation to the agent for a summary, then continue on a tiny
@@ -2094,7 +2125,7 @@ async function openStatus() {
   // Only patch the body if the Status overlay is still the one open (user may have closed it).
   if (S.cmd === 'Status') { const b = document.querySelector('#cmd .cbody'); if (b) b.innerHTML = '<div class="csub">Account usage</div>' + usageHtml + issueHtml; }
 }
-const fmtTok = (n) => (n >= 1e6 ? String(+(n / 1e6).toFixed(1)) + 'M' : n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n));
+const fmtTok = (n) => (n >= 1e9 ? String(+(n / 1e9).toFixed(1)) + 'B' : n >= 1e6 ? String(+(n / 1e6).toFixed(1)) + 'M' : n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n));
 function openContext() {
   const d = S.detail; if (!d) return;
   const u = d.usage;

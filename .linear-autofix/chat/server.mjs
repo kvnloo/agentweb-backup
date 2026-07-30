@@ -22,9 +22,11 @@ import { resolveIssue } from '../linear.mjs';
 import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity, applyWorktreeIdentity } from '../git-identity.mjs';
 import { acquireLock, releaseLock } from '../lock.mjs';
 import { transcriptContextUsed, pickResumeBase } from './context-usage.mjs';
+import { usageSnapshot } from './usage.mjs';
+import { makeEditableDecision, buildEditableBranch, promotedOutcome } from './editable.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
-  headShas, resetTo, ensureOpenPrs, touchedPreviewFiles, commitsDropped,
+  headShas, resetTo, ensureOpenPrs, touchedPreviewFiles, commitsDropped, assigneeBranchPrefix, kebab,
 } from '../autofix.mjs';
 import { atConcurrentPreviewCap, runningPreviewIds } from '../preview/policy.mjs';
 
@@ -676,6 +678,7 @@ function runClaudeStream(args, prompt, cwd, timeoutMs, onEvent, register, env = 
         // ≈ the CURRENT context size. result.usage sums every internal tool-call turn, so with prompt
         // caching it re-counts the cached context per turn and balloons — don't use it for context size.
         if (j.message?.usage) out.lastUsage = j.message.usage;
+        if (j.message?.model) out.lastModel = j.message.model; // the model that produced THIS message — sizes the context window (see usage.mjs)
         for (const block of j.message?.content || []) {
           if (block.type === 'text' && block.text) { out.texts.push(block.text); out.blocks.push({ t: 'text', text: block.text }); onEvent({ type: 'text', text: block.text }); }
           if (block.type === 'tool_use') {
@@ -1346,25 +1349,13 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
           blocks: reconcileOut.blocks.slice(0, 400),
         });
       }
-      // Snapshot context/cost so /status and /context have real data. Context size = the LAST assistant
-      // turn's (input + cache_read + cache_creation) — NOT result.usage, which sums every internal
-      // tool-call turn and (with prompt caching re-counting the cached context each turn) balloons to
-      // many× the real window. Cost still comes from result (it legitimately accumulates).
-      const u = out.lastUsage || out.result?.usage, mu = out.result?.modelUsage;
-      // An Opus turn still makes tiny background haiku calls (title/summary) and may spawn subagents on
-      // other models, so modelUsage has several keys. Pick the PRIMARY one — the model that did the most
-      // work (the user-facing agent) — not just the first key, so /status shows the real model and the
-      // context window is sized to it.
-      const muTot = (x) => (x ? (x.inputTokens || 0) + (x.outputTokens || 0) + (x.cacheReadInputTokens || 0) + (x.cacheCreationInputTokens || 0) : 0);
-      const mk = mu ? Object.keys(mu).sort((a, b) => muTot(mu[b]) - muTot(mu[a]))[0] : null;
-      if (u || mk) {
-        cs.usage = {
-          contextUsed: u ? ((u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0)) : (cs.usage?.contextUsed ?? null),
-          contextWindow: mk ? mu[mk].contextWindow : (cs.usage?.contextWindow ?? null),
-          model: mk || cs.usage?.model || null,
-          turns: out.result?.num_turns ?? null,
-          at: new Date().toISOString(),
-        };
+      // Snapshot context/cost so /status and /context have real data. usageSnapshot() sizes the window to
+      // the FINAL message's model (the same source as contextUsed) — not the most-tokens model, which can be
+      // a Haiku Explore subagent that wrongly caps the window at 200K and shows a false >100% (see usage.mjs
+      // + test/usage-snapshot.test.mjs). Cost still comes from result (it legitimately accumulates).
+      const snap = usageSnapshot(cs.usage, out.lastUsage, out.lastModel, out.result);
+      if (snap) {
+        cs.usage = { ...snap, at: new Date().toISOString() };
         cs.costTotal = (cs.costTotal || 0) + (out.result?.total_cost_usd || 0);
       }
       return cs;
@@ -1522,6 +1513,37 @@ async function runBtw(identifier, question) {
   }
 }
 
+// Promote a blocked / branch-less chat from read-only to editable: provision a fresh assignee-prefixed
+// fix branch + worktree (off origin/main, the same way the pipeline assembles one), then persist
+// entry.branch so capabilityOf() flips it to full. Guarded by makeEditableDecision so we never promote a
+// chat the pipeline is mid-run on, a standalone (already editable), or one that already has a worktree.
+async function makeEditable(identifier) {
+  const found = findEntry(identifier);
+  if (!found) return { code: 404, error: `no autofix record for ${identifier}` };
+  const WT = path.join(worktreesDir, identifier);
+  const dec = makeEditableDecision(found.entry, { fixEnabled: fixEnabled(), worktreeExists: existsSync(WT) });
+  if (!dec.ok) return { code: 409, error: dec.reason };
+  // Serialize against turns/previews for this issue while we build the worktree.
+  const lockPath = acquireLock(identifier);
+  if (!lockPath) return { code: 409, error: 'busy — an operation holds this chat; try again in a moment' };
+  try {
+    const identity = resolveAssigneeIdentity(found.entry.assignee);
+    const title = found.entry.linearTitle || (await fetchLinear(identifier))?.title || '';
+    const branch = buildEditableBranch(identifier, assigneeBranchPrefix(identity, config.branchPrefix), kebab(title));
+    const asm = assembleFromBranch(WT, branch); // not-yet-pushed branch → builds from origin/<base> with -B
+    if (!asm.ok) return { code: 500, error: `could not create the ${asm.repo} worktree: ${(asm.err || '').slice(0, 500)}` };
+    prepareWorktreeDeps(WT);
+    if (identity) applyWorktreeIdentity(WT, identity, (m) => log(`make-editable ${identifier}: ${m}`));
+    updateIssueEntry(identifier, (e) => ({ ...e, branch, outcome: promotedOutcome(e.outcome) })); // branch → full access; clear "blocked"
+    log(`make-editable ${identifier}: provisioned worktree + branch ${branch} — chat is now full-access`);
+    return { code: 200, body: { editable: true, branch } };
+  } catch (e) {
+    return { code: 500, error: String(e?.message || e) };
+  } finally {
+    releaseLock(lockPath);
+  }
+}
+
 // Self-authorized message for the inline reconcile turn: fired only when the deterministic reconcile
 // (reconcileWithRemote) could not resolve a diverged remote — a true conflict that needs judgment.
 // The agent already committed this turn; its job now is to reconcile the branch with the rewritten
@@ -1573,7 +1595,7 @@ function mergeMsg(entry) {
     '1. If it is a draft, mark it ready: `gh pr ready <pr>`.',
     '2. Sync its branch with the base branch: `gh pr update-branch <pr>` (or merge the latest base in), resolving any conflicts.',
     '3. Check CI: `gh pr checks <pr>`. If any check is failing, read the failing logs (`gh run view <run-id> --log-failed`), fix the code, and commit — your commit auto-pushes. Repeat until every check passes.',
-    '4. **Greptile review is a required, merge-blocking gate.** Greptile is an automated code reviewer (a bot) that posts a review on every PR; the branch protection keeps the PR **BLOCKED until Greptile gives a passing/approving review**. Inspect it with `gh pr view <pr> --json reviews,statusCheckRollup` (and `gh pr checks <pr>` — Greptile may also surface as a status check). When Greptile requests changes or flags issues, read its full review, then **classify each point** so this stays autonomous:',
+    '4. **Greptile review is a required, merge-blocking gate.** Greptile is an automated code reviewer (a bot) that posts a review on every PR; the branch protection keeps the PR **BLOCKED until Greptile gives a passing/approving review**. Inspect it with `gh pr view <pr> --json reviews,statusCheckRollup` (and `gh pr checks <pr>` — Greptile may also surface as a status check). **ALWAYS pull up and read Greptile\'s actual review comments before merging — even if the PR already shows a passing/approving review or every check is green. A Greptile pass routinely still carries inline comments and suggestions; a green status is NOT permission to skip reading them.** Never merge a PR you have not read Greptile\'s comments on. Also check for comments Greptile posts as inline PR review comments, not just the top-level review verdict: `gh pr view <pr> --json reviews` plus `gh api repos/{owner}/{repo}/pulls/<pr>/comments`. When Greptile requests changes OR leaves any comments (blocking or not), read them in full, then **classify each point** so this stays autonomous:',
     '   - **Mechanical / clear-cut fixes** (bugs it caught, missing null checks, typos, obviously-correct suggestions with no judgment call): just fix them yourself, commit (auto-pushes), and let Greptile re-review. Do NOT come back to the developer for these — keep going.',
     '   - **Decision changes** (Greptile is questioning an approach, a product/UX/behavior choice, a tradeoff, or anything where a reasonable person could disagree and the "right" answer needs the developer): do NOT guess. Stop and surface it (see MERGE_BLOCKED below) with a crisp summary of exactly what decision is needed.',
     '   - **Passed WITH optional/non-blocking suggestions** (Greptile approved but still left "nit"/"consider"/"suggestion" comments): its pass already unblocks the merge, so these are NOT required. You cannot apply them for free — ANY new commit re-triggers CI and a fresh Greptile review, and the PR stays blocked until they re-pass, so a code change always costs another full verification cycle. So: apply a suggestion pre-merge ONLY if it is quick, clearly safe, and genuinely worth another CI+Greptile round; otherwise merge as-is and capture the rest as a follow-up (a note in a PR comment, or a new Linear issue). Never delay or loop the merge on optional polish.',
@@ -1875,7 +1897,7 @@ async function route(req, res) {
   if (req.method === 'GET' && p === '/api/previews') { json(res, 200, { previews: listPreviews(), cap: config.maxConcurrentPreviews ?? 0 }); return; }
   if (req.method === 'POST' && p === '/api/chats') { const r = createChat((await readBody(req))?.email); json(res, r.code, r.body || { error: r.error }); return; }
 
-  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);
+  const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/make-editable|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);
   if (!m) { json(res, 404, { error: 'not found' }); return; }
   const identifier = m[1].toUpperCase();
   const sub = m[2] || '';
@@ -1960,6 +1982,11 @@ async function route(req, res) {
   }
   if (req.method === 'POST' && sub === '/chat/btw') {
     const r = await runBtw(identifier, (await readBody(req))?.question);
+    json(res, r.code, r.body || { error: r.error });
+    return;
+  }
+  if (req.method === 'POST' && sub === '/chat/make-editable') {
+    const r = await makeEditable(identifier);
     json(res, r.code, r.body || { error: r.error });
     return;
   }
