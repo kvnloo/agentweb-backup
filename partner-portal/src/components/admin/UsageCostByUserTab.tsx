@@ -7,7 +7,6 @@ import {
   Collapse,
   Grid,
   IconButton,
-  MenuItem,
   Paper,
   Table,
   TableBody,
@@ -15,7 +14,6 @@ import {
   TableContainer,
   TableHead,
   TableRow,
-  TextField,
   Tooltip,
   Typography,
 } from "@mui/material";
@@ -486,7 +484,10 @@ export default function UsageCostByUserTab() {
   const { token } = useAuth();
   const [start, setStart] = useState(defaultStartDate);
   const [end, setEnd] = useState(() => formatDateInput(new Date()));
-  const [provider, setProvider] = useState("all");
+  // X (Twitter)-only for now (ENG-664). The provider machinery (providersInData,
+  // userRowForProvider, providerLabel) is retained so this tab can broaden to other
+  // metered vendors later — just restore the Provider selector and default to "all".
+  const provider = TWITTER_PROVIDER_KEY;
   const [agg, setAgg] = useState<CostAggregation | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -521,7 +522,6 @@ export default function UsageCostByUserTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const providers = useMemo(() => providersInData(agg), [agg]);
   const rows = useMemo(() => rankedUserRows(agg, provider), [agg, provider]);
   const xAccounts = useMemo(() => xAccountRows(agg), [agg]);
   const filteredTotals = useMemo(
@@ -541,10 +541,10 @@ export default function UsageCostByUserTab() {
     <Box>
       <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2, mb: 2 }}>
         <Box>
-          <Typography variant="h6">Usage &amp; cost by user</Typography>
+          <Typography variant="h6">X (Twitter) usage &amp; cost by user</Typography>
           <Typography variant="body2" color="text.secondary">
-            Credits (metered $ cost) each user has spent across LLM and vendor APIs (incl. X/Twitter),
-            over the selected range.
+            Allocated X (Twitter) API $ cost each user has spent, by account and tool, over the
+            selected range. Other metered vendors will be added here later.
           </Typography>
         </Box>
         <Button startIcon={<RefreshIcon />} variant="outlined" onClick={() => loadAggregation()} disabled={loading}>
@@ -554,7 +554,7 @@ export default function UsageCostByUserTab() {
 
       <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
         <Grid container spacing={2} alignItems="center">
-          <Grid item xs={12} md={3}>
+          <Grid item xs={12} md={4}>
             <DatePicker
               label="Start"
               value={parseDateInput(start)}
@@ -563,7 +563,7 @@ export default function UsageCostByUserTab() {
               slotProps={{ textField: { fullWidth: true, size: "small" } }}
             />
           </Grid>
-          <Grid item xs={12} md={3}>
+          <Grid item xs={12} md={4}>
             <DatePicker
               label="End"
               value={parseDateInput(end)}
@@ -572,23 +572,7 @@ export default function UsageCostByUserTab() {
               slotProps={{ textField: { fullWidth: true, size: "small" } }}
             />
           </Grid>
-          <Grid item xs={12} md={3}>
-            <TextField
-              select
-              fullWidth
-              size="small"
-              label="Provider"
-              value={provider}
-              onChange={(e) => setProvider(e.target.value)}
-            >
-              {providers.map((p) => (
-                <MenuItem key={p} value={p}>
-                  {providerLabel(p)}
-                </MenuItem>
-              ))}
-            </TextField>
-          </Grid>
-          <Grid item xs={12} md={3}>
+          <Grid item xs={12} md={4}>
             <Button fullWidth variant="contained" onClick={() => loadAggregation()} disabled={loading}>
               Apply range
             </Button>
