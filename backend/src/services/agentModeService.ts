@@ -16620,9 +16620,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       },
       {
         id: 'traffic',
-        label: 'Traffic / Awareness',
-        consequence: 'Optimizes for clicks/reach, not conversions — exposure only, not the default.',
+        label: 'Traffic',
+        consequence: 'Optimizes for clicks/landing-page views, not reach or conversions — exposure only, not the default.',
         payload: { objective: 'OUTCOME_TRAFFIC' },
+      },
+      {
+        id: 'awareness',
+        label: 'Awareness',
+        consequence: 'Optimizes for reach/impressions, not clicks or conversions — the objective REACH-optimized ad sets require.',
+        payload: { objective: 'OUTCOME_AWARENESS' },
       },
     ];
 
