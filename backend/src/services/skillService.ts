@@ -232,14 +232,7 @@ export class SkillService {
     }
   }
 
-  /**
-   * Persist a skill row. Pass `opts.expectedUpdatedAt` for an atomic optimistic
-   * lock: the put only succeeds if the stored row's `updatedAt` still equals that
-   * value, so a read-modify-write can never silently clobber a concurrent edit
-   * (throws ConditionalCheckFailedException instead). Omit it for an unconditional
-   * write (unchanged default behavior).
-   */
-  async updateSkill(skill: Skill, opts?: { expectedUpdatedAt?: string }): Promise<void> {
+  async updateSkill(skill: Skill): Promise<void> {
     const skillItem: any = {
       ...skill,
       updatedAt: new Date().toISOString()
@@ -249,15 +242,10 @@ export class SkillService {
       skillItem.toolNames = dynamodb.createSet(skill.toolNames);
     }
 
-    const params: any = {
+    const params = {
       TableName: this.tableName,
       Item: skillItem,
     };
-
-    if (opts?.expectedUpdatedAt !== undefined) {
-      params.ConditionExpression = "updatedAt = :expectedUpdatedAt";
-      params.ExpressionAttributeValues = { ":expectedUpdatedAt": opts.expectedUpdatedAt };
-    }
 
     try {
       await dynamodb.put(params).promise();
