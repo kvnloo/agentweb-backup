@@ -58,6 +58,7 @@ import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import McpServersTab from "../components/admin/McpServersTab";
 import EmmaMcpUsageTab from "../components/admin/EmmaMcpUsageTab";
 import UsageCostByUserTab from "../components/admin/UsageCostByUserTab";
+import CostDashboardTab from "../components/admin/CostDashboardTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
@@ -785,7 +786,8 @@ export default function AdminDashboard() {
     'connected-accounts': 21,
     'contractors': 22,
     'emma-mcp': 23,
-    'usage-cost': 24,
+    'costs': 24,
+    'usage-cost': 25,
   };
   
   // Get initial tab value from URL or default to Users
@@ -3416,7 +3418,8 @@ export default function AdminDashboard() {
             <Tab label="Connected Accounts" {...a11yProps(21)} />
             <Tab label="Contractors" {...a11yProps(22)} />
             <Tab label="Emma MCP" {...a11yProps(23)} />
-            <Tab label="Usage & Cost" {...a11yProps(24)} />
+            <Tab label="LLM Costs" {...a11yProps(24)} />
+            <Tab label="Usage & Cost" {...a11yProps(25)} />
           </Tabs>
         </Box>
 
@@ -6645,6 +6648,10 @@ export default function AdminDashboard() {
         </TabPanel>
 
         <TabPanel value={tabValue} index={24}>
+          <CostDashboardTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={25}>
           <UsageCostByUserTab />
         </TabPanel>
 
