@@ -39,7 +39,13 @@ const get = (path: string, token: string | null) =>
     headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
   }).then(j);
 
-const WILDCARD_SUB = "ENG204-harness-wildcard";
+// Unique per invocation so two overlapping runs against the same test account
+// never accept each other's grant as their own — each run only ever restores
+// over the exact sentinel it wrote. Any unrecognized subscriptionType resolves to
+// wildcard skill access (getAllowedSkills returns ["*"] for unknown tiers), so a
+// unique value still grants access.
+const WILDCARD_PREFIX = "ENG204-harness-wildcard";
+const WILDCARD_SUB = `${WILDCARD_PREFIX}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 
 /**
  * Atomically set the wildcard AND return the value it overwrote (ReturnValues:
@@ -79,37 +85,57 @@ async function waitForWildcardVisible(userId: string): Promise<void> {
   console.warn("(wildcard not yet visible on UserIdIndex after ~5s — proceeding)");
 }
 /**
- * Best-effort restore, guarded so we never clobber a change made DURING the run:
- * only write back if subscriptionType is still the wildcard we set. If a
- * webhook/admin changed it meanwhile, leave the newer value in place.
+ * Restore the pre-run subscription, guarded so we only ever act on OUR OWN grant:
+ * - Condition `subscriptionType = <this run's unique sentinel>` means a change
+ *   made during the run (webhook/admin) OR another overlapping run's grant is
+ *   left untouched (ConditionalCheckFailed → skip).
+ * - If the captured prior is itself a harness sentinel (e.g. we overwrote an
+ *   overlapping run's grant), it is NOT a real tier — remove the attribute rather
+ *   than persist a bogus wildcard.
+ * - Transient failures (throttling/network) are retried; if they exhaust, we flag
+ *   LOUDLY and mark the run failed (exit != 0) so the elevated grant is repaired,
+ *   never left silent.
  */
 async function restoreSubscription(email: string, prev: string | undefined): Promise<void> {
-  const guard = {
+  const effectivePrev =
+    typeof prev === "string" && prev.startsWith(WILDCARD_PREFIX) ? undefined : prev;
+  const req: any = {
     TableName: USERS_TABLE, Key: { email },
     ConditionExpression: "subscriptionType = :w",
+    ExpressionAttributeValues: { ":w": WILDCARD_SUB } as any,
   };
-  try {
-    if (prev !== undefined) {
-      await ddb.update({
-        ...guard,
-        UpdateExpression: "SET subscriptionType = :v",
-        ExpressionAttributeValues: { ":w": WILDCARD_SUB, ":v": prev },
-      }).promise();
-      console.log(`\n(subscription restored: ${prev})`);
-    } else {
-      await ddb.update({
-        ...guard,
-        UpdateExpression: "REMOVE subscriptionType",
-        ExpressionAttributeValues: { ":w": WILDCARD_SUB },
-      }).promise();
-      console.log(`\n(subscription attribute removed — was absent before the run)`);
-    }
-  } catch (e: any) {
-    if (e.code === "ConditionalCheckFailedException") {
-      console.log(`\n(subscription changed during the run — left as-is, not restoring the stale value)`);
-    } else {
-      // Cleanup is best-effort: log, don't mask any primary error from the run.
-      console.warn(`\n(could not restore subscription: ${e.message || e})`);
+  if (effectivePrev !== undefined) {
+    req.UpdateExpression = "SET subscriptionType = :v";
+    req.ExpressionAttributeValues[":v"] = effectivePrev;
+  } else {
+    req.UpdateExpression = "REMOVE subscriptionType";
+  }
+
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      await ddb.update(req).promise();
+      console.log(
+        effectivePrev !== undefined
+          ? `\n(subscription restored: ${effectivePrev})`
+          : `\n(subscription attribute removed)`,
+      );
+      return;
+    } catch (e: any) {
+      if (e.code === "ConditionalCheckFailedException") {
+        console.log(`\n(subscription is no longer our grant — left as-is, not restoring)`);
+        return;
+      }
+      if (attempt < 4) {
+        await new Promise((r) => setTimeout(r, 250 * attempt));
+        continue;
+      }
+      // Retries exhausted on a transient error — do NOT leave this silent.
+      console.error(
+        `\n⚠️  FAILED to restore subscription for ${email} after ${attempt} attempts: ${e.message || e}. ` +
+          `The account may still hold '${WILDCARD_SUB}' — repair manually.`,
+      );
+      process.exitCode = 1;
+      return;
     }
   }
 }
@@ -190,7 +216,9 @@ async function main() {
       await restoreSubscription(EMAIL, hadSub);
     }
   }
-  process.exit(0);
+  // Respect a non-zero exitCode set by a failed subscription restore (leaves the
+  // run visibly failed rather than a silent success with the account elevated).
+  process.exit(process.exitCode ?? 0);
 }
 
 async function runTurns(token: string, sessionId: string, messages: string[], model?: string) {
