@@ -70,6 +70,8 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
+  /** Allocated X (Twitter) API $ spend this calendar month (ENG-664). */
+  xCostThisMonth?: number;
   extraCostUsage?: {
     month: string;
     totalCost: number;

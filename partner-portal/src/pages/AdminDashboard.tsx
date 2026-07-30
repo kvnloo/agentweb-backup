@@ -63,7 +63,7 @@ import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
 import V0CreditsCard from "../components/admin/V0CreditsCard";
 import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
-import XCostBreakdown, { UserXBreakdown } from "../components/admin/XCostBreakdown";
+import XCostBreakdownBody, { XOrgUsageRollup } from "../components/admin/XCostBreakdownBody";
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
@@ -295,8 +295,6 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
-  /** Allocated X (Twitter) API $ spend this calendar month (ENG-664). */
-  xCostThisMonth?: number;
   extraCostUsage?: {
     month: string;
     totalCost: number;
@@ -949,7 +947,7 @@ export default function AdminDashboard() {
   // reads the X-only ledger cut; reuses costBreakdownView for the table/bars toggle.
   const [xBreakdownUser, setXBreakdownUser] = useState<User | null>(null);
   const [xBreakdownMonth, setXBreakdownMonth] = useState<string>("");
-  const [xBreakdownData, setXBreakdownData] = useState<UserXBreakdown | null>(null);
+  const [xBreakdownData, setXBreakdownData] = useState<XOrgUsageRollup | null>(null);
   const [xBreakdownLoading, setXBreakdownLoading] = useState(false);
   const [xBreakdownError, setXBreakdownError] = useState<string | null>(null);
   const xBreakdownReqRef = useRef(0);
@@ -1176,10 +1174,11 @@ export default function AdminDashboard() {
     setXBreakdownLoading(true);
     setXBreakdownError(null);
     try {
+      // Org-aware rollup: allocated X spend summed across all org members, with a
+      // per-member breakdown (mirrors the LLM org-rollup; see backend).
       const response = await axios.get(
-        buildApiUrl(`/api/admin/users/${userId}/usage/x-breakdown`),
-        // '31' upper-bounds the month; non-existent days simply have no rows.
-        { headers: { Authorization: `Bearer ${token}` }, params: { start: `${month}-01`, end: `${month}-31` } }
+        buildApiUrl(`/api/admin/users/${userId}/usage/x-org-rollup`),
+        { headers: { Authorization: `Bearer ${token}` }, params: { month } }
       );
       if (isStale()) return;
       setXBreakdownData(response.data);
@@ -6895,7 +6894,7 @@ export default function AdminDashboard() {
           ) : xBreakdownError ? (
             <Typography color="error" variant="body2" sx={{ py: 2 }}>{xBreakdownError}</Typography>
           ) : (
-            <XCostBreakdown data={xBreakdownData} view={costBreakdownView} />
+            <XCostBreakdownBody rollup={xBreakdownData} view={costBreakdownView} />
           )}
         </DialogContent>
         <DialogActions>
