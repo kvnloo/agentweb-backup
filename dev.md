@@ -44,15 +44,39 @@ classified as a generic `Error` and a mid-run 402 could read as success. Fixed e
 - `classifyToolFailureType` maps `payment_required → config` — a billing/quota gap, excluded from the
   tool-bug rate but visible and clustered, never silently a success.
 
-**Reconciliation (AC #2) — design, not yet built.** X's dedup ("same resource once per UTC day") is
+**Reconciliation (AC #2) — built (on-demand).** X's dedup ("same resource once per UTC day") is
 **app-wide** (the credit pool is AgentWeb's one Developer App), so per-user cost can only ever be
-*allocated* load attribution, not a fair split of the billed figure. The correct reconciliation is two
-numbers, never conflated: allocated (our ledger, above) for "who drives spend", and **measured** pulled
-from X's own `GET /2/usage/tweets` (app-level `project_usage`/`project_cap`/`cap_reset_day`) via a
-scheduled poller, stored as a `costSource: "measured"` counter and shown beside allocated in the admin
-tab. The delta = dedup savings + our $0 interaction writes. A `(utcDay, resourceId)` dedup table would
-give exact per-user *billed* numbers but costs one write per resource read — deferred unless finance
-needs per-user billed (not load) figures.
+*allocated* load attribution, not a fair split of the billed figure. So reconciliation is two numbers,
+never conflated: **allocated** (our ledger, above, an upper bound) for "who drives spend", and
+**measured** pulled live from X's own `GET /2/usage/tweets`. The shared app's Bearer token lives in the
+`{dev,prod}/AgentWeb/Twitter` secret (now exposed on `TwitterCredentials.bearerToken`);
+`twitterService.getXProjectUsage()` fetches app-only (never metered — not a user call) and returns
+`projectUsage`/`projectCap`/`capResetDay`. `GET /api/admin/usage/x-reconciliation` derives the current
+billing cycle from `capResetDay` (`currentXBillingCycle`), sums our allocated X ledger over that same
+window (`getXAllocatedTotals`, filtered to `twitter:*`), and returns measured beside allocated + the
+dedup delta + a cap gauge. Rendered as the "X API reconciliation" panel in the admin tab; an
+X-unreachable failure degrades to a warning (502) without breaking the tab.
+
+Note what `/2/usage/tweets` covers: **post-read consumption against the 2M cap** — X's authoritative,
+deduped count. It does NOT report writes or dollars, so `measuredDerivedCostUsd = measured reads × $0.005
++ our directly-counted non-read allocated`; that's a *tighter* dollar figure than allocated-from-log
+because the read count is already deduped. A `(utcDay, resourceId)` dedup table would give exact per-user
+*billed* numbers but costs one write per resource read — deferred unless finance needs per-user billed
+(not load) figures. A scheduled poller for historical snapshots + low-credit alerting is the next step.
+
+**By-account cut.** Each X call already records `feature = x-account:{accountId}`, so the cost
+aggregation's `byFeature` dimension carries per-account totals. The admin tab surfaces them as a "By X
+account" table (`xAccountsFromFeatures` filters the `x-account:` prefix). Account ids are shown raw for
+now (handle enrichment is a follow-up).
+
+**Fair per-user drawdown (the ENG-664 "eventually" goal) — design only.** Because dedup is app-wide,
+enforcing a cap on raw allocated numbers over-bills shared reads. The right mechanism is **proportional
+settlement**: keep the live ledger allocated, then a periodic settlement pulls the measured app total,
+computes `factor = measured / allocated`, and charges each org owner their allocated-weighted share so
+`Σ charged = measured` exactly (reconciles) and each pays in proportion to load (fair). Applied at the
+org-owner level (`resolveBillingUserId`, as LLM already does) and kept behind `ENFORCE_COST_CAP=false`
+(observe-only) until ENG-703 defines Emma-Credit pricing. `recordVendorUsage` deliberately does NOT call
+`incrementUserTokenUsage` today — X spend is visible but does not draw down any cap yet.
 
 ## ENG-693: vendor dimension on the existing usage ledger (2026-07-29)
 
