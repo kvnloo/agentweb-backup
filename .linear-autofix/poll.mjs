@@ -14,6 +14,7 @@ import { listNewBugs, listForcedBugs, listStaleInProgress, resolveIssue, addComm
 import { assigneeRefreshPatch } from './git-identity.mjs';
 import { admitSnapshot } from './admission.mjs';
 import { abortWithdrawnInFlight } from './gc.mjs';
+import { recoveryDecision } from './recovery.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const statePath = path.join(__dirname, 'state.json');
@@ -118,18 +119,19 @@ async function recoverStale() {
   const changed = {}; // only the entries we actually touch, so we can re-apply against a FRESH read
   for (const issue of stale) {
     const entry = state[issue.id];
-    if (!entry || entry.outcome !== 'started') continue; // human-owned issue or a finished run
+    const dec = recoveryDecision(entry, { maxRecoveries: config.maxRecoveries ?? 1 });
+    if (dec.action === 'skip') continue; // human-owned issue, a finished run, or a pending retry
     try {
-      if ((entry.recoveries || 0) === 0) {
+      if (dec.action === 'requeue') {
         log(`${issue.identifier}: autofix started this run but never finished — resetting for one retry`);
         const sid = (await findStateId(issue.team.id, 'Backlog', 'backlog')) || (await findStateId(issue.team.id, 'Todo', 'unstarted'));
-        if (sid) await moveIssue(issue.id, sid);
+        if (sid) await moveIssue(issue.id, sid); // move back to a pickup state → releases the WIP slot into the queue
         await addComment(issue.id, '⚠️ **Auto-fix run appears to have crashed** (the issue sat In Progress with no result). Resetting it so the poller retries once.');
-        changed[issue.id] = { ...entry, outcome: 'recovered', recoveries: 1, at: new Date().toISOString() };
-      } else {
+        changed[issue.id] = { ...entry, outcome: dec.outcome, recoveries: dec.recoveries, at: new Date().toISOString() };
+      } else { // 'flag'
         log(`${issue.identifier} crashed again after a recovery — flagging for a human`);
         await addComment(issue.id, '🔴 **Auto-fix crashed twice on this issue — needs a human.** It will not be retried automatically.');
-        changed[issue.id] = { ...entry, outcome: 'recovery_failed', at: new Date().toISOString() };
+        changed[issue.id] = { ...entry, outcome: dec.outcome, at: new Date().toISOString() };
       }
     } catch (e) { console.error(`[poll] recovery of ${issue.identifier} failed:`, e.message); }
   }
