@@ -69,7 +69,7 @@ jest.mock('../services/db', () => ({
     clearRunInFlight: jest.fn().mockResolvedValue(true),
     getInFlightSchedules: jest.fn().mockResolvedValue([]),
     claimAbandonedRun: jest.fn().mockResolvedValue(true),
-    clearPendingResume: jest.fn().mockResolvedValue(undefined),
+    claimPendingResume: jest.fn().mockResolvedValue(true),
     updateSchedule: jest.fn(),
     getSchedulesByUserId: jest.fn(),
   },
@@ -276,7 +276,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
         expect(result.sessionId).toBe(resumeSessionId);
         // The resume marker is consumed (at-most-once resume).
-        expect(mockScheduleDb.clearPendingResume).toHaveBeenCalledWith(mockScheduleId);
+        expect(mockScheduleDb.claimPendingResume).toHaveBeenCalledWith(mockScheduleId, resumeSessionId);
         // The model turn is driven against the existing session with a CONTINUATION
         // directive, not the original task prompt (which would restart the task).
         const workerArg = (mockGenerateMarketingResponseWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
@@ -303,7 +303,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         // Unsafe boundary → normal fresh session is created, marker still consumed.
         expect(mockChatbotDb.createChatSession).toHaveBeenCalledTimes(1);
-        expect(mockScheduleDb.clearPendingResume).toHaveBeenCalledWith(mockScheduleId);
+        expect(mockScheduleDb.claimPendingResume).toHaveBeenCalledWith(mockScheduleId, resumeSessionId);
         expect(result.sessionId).toBe(mockSession.sessionId);
         const workerArg = (mockGenerateMarketingResponseWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
         expect(workerArg.messageContent).toBe(baseSchedule.startingMessage);
@@ -344,6 +344,20 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
       });
 
+      it('does NOT resume when it loses the atomic claim (another dispatcher won) — starts fresh, no double resume', async () => {
+        (mockScheduleDb.claimPendingResume as jest.Mock).mockResolvedValue(false);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
+        } as any);
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        // Lost claim → never continue the same session; do a normal fresh run instead.
+        expect(mockChatbotDb.createChatSession).toHaveBeenCalledTimes(1);
+        expect(result.sessionId).toBe(mockSession.sessionId);
+        expect(result.sessionId).not.toBe(resumeSessionId);
+      });
+
       it('ignores the resume marker for a manual test run (never resumes)', async () => {
         mockChatbotDb.getChatSession.mockResolvedValue({
           ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
@@ -353,7 +367,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         // isTest=true → resume path is skipped entirely; a fresh session is created.
         expect(mockChatbotDb.createChatSession).toHaveBeenCalledTimes(1);
-        expect(mockScheduleDb.clearPendingResume).not.toHaveBeenCalled();
+        expect(mockScheduleDb.claimPendingResume).not.toHaveBeenCalled();
       });
     });
 
