@@ -5,6 +5,7 @@
 
 import { usageRecordDb, UsageRecordRow } from "./usageRecordDb";
 import { userDb, orgDb, User } from "./db";
+import { getAccountById } from "./connectedAccountsDb";
 import { TWITTER_PROVIDER, isPostReadOperation } from "../utils/twitterPricing";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -222,6 +223,19 @@ export interface CostTopUser extends CounterTotals {
   byModel: CostByModelRow[];
 }
 
+/**
+ * Per-connected-X-account spend (ENG-664). Keyed on the `x-account:{id}` feature
+ * X rows carry, best-effort enriched with the account's @handle.
+ */
+export interface CostByXAccountRow {
+  accountId: string;
+  /** X handle (without @), or null when the account can't be resolved. */
+  handle: string | null;
+  costMicroUsd: number;
+  costUsd: number;
+  callCount: number;
+}
+
 export interface CostAggregation {
   start: string;
   end: string;
@@ -234,6 +248,8 @@ export interface CostAggregation {
   byFeature: CostByFeatureRow[];
   /** Sorted by spend, highest first, limited to topUsersLimit. */
   topUsers: CostTopUser[];
+  /** Per-X-account spend with @handle enrichment, sorted by spend. */
+  byXAccount: CostByXAccountRow[];
 }
 
 function zeroTotals(): CounterTotals {
@@ -391,7 +407,71 @@ export async function getCostAggregation(
     })
   );
 
-  return { start, end, totals, byModel, series, byFeature, topUsers };
+  // Per-X-account cut (ENG-664): X rows carry feature "x-account:{id}". Group by
+  // that id, tracking per-user spend so we can enrich the @handle via the account
+  // OWNER (heaviest spender is the owner in the common case) with getAccountById —
+  // the scoped lookup that avoids a full-table scan (there is no accountId GSI).
+  const byXAccount = await buildXAccountBreakdown(items);
+
+  return { start, end, totals, byModel, series, byFeature, topUsers, byXAccount };
+}
+
+const X_FEATURE_PREFIX = "x-account:";
+
+/**
+ * Group X ledger rows by connected account and best-effort enrich each with its
+ * @handle. Handle resolution is decoration — a lookup miss (e.g. an org-shared
+ * account the heaviest caller does not own) yields handle=null and the caller
+ * falls back to the raw accountId. Never fails the aggregation.
+ */
+async function buildXAccountBreakdown(
+  items: UsageRecordRow[]
+): Promise<CostByXAccountRow[]> {
+  const acctMap = new Map<
+    string,
+    { costMicroUsd: number; callCount: number; userCost: Map<string, number> }
+  >();
+
+  for (const item of items) {
+    if (!item.feature || !item.feature.startsWith(X_FEATURE_PREFIX)) continue;
+    const accountId = item.feature.slice(X_FEATURE_PREFIX.length);
+    if (!accountId) continue;
+    const cost = item.costMicroUsd || 0;
+    let bucket = acctMap.get(accountId);
+    if (!bucket) {
+      bucket = { costMicroUsd: 0, callCount: 0, userCost: new Map() };
+      acctMap.set(accountId, bucket);
+    }
+    bucket.costMicroUsd += cost;
+    bucket.callCount += item.callCount || 0;
+    bucket.userCost.set(item.userId, (bucket.userCost.get(item.userId) || 0) + cost);
+  }
+
+  const ranked = [...acctMap.entries()].sort(
+    (a, b) => b[1].costMicroUsd - a[1].costMicroUsd || a[0].localeCompare(b[0])
+  );
+
+  return Promise.all(
+    ranked.map(async ([accountId, bucket]) => {
+      // Representative user = heaviest spender on this account (the owner, normally).
+      const repUserId = [...bucket.userCost.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+      let handle: string | null = null;
+      if (repUserId) {
+        const acct = await getAccountById(accountId, repUserId, "twitter").catch(() => null);
+        handle =
+          (acct?.config as { username?: string } | undefined)?.username ??
+          acct?.account_name ??
+          null;
+      }
+      return {
+        accountId,
+        handle,
+        costMicroUsd: bucket.costMicroUsd,
+        costUsd: bucket.costMicroUsd / 1_000_000,
+        callCount: bucket.callCount,
+      };
+    })
+  );
 }
 
 // ── Org-aware cost rollup (ENG-200 follow-up) ────────────────────────────────
