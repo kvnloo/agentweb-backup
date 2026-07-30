@@ -13,6 +13,7 @@ import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
 import { isReasoningLeak } from './agentMode/core/reasoningLeak';
+import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -1562,6 +1563,32 @@ export class AgentModeService {
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
 
+  // ENG-737: native @google/genai adapter (leak-free) + its kill-switch cache.
+  private gemini_native_client: any | null = null;
+  private gemini_api_key_promise: Promise<string> | null = null;
+  private geminiNativeFlagCache: { value: boolean; expiresAt: number } | null = null;
+  private static readonly GEMINI_NATIVE_FLAG_TTL_MS = 60_000;
+
+  /** Resolve the Gemini API key from env or secrets (cached; shared by both clients). */
+  private async getGeminiApiKey(): Promise<string> {
+    if (this.gemini_api_key_promise) return this.gemini_api_key_promise;
+    this.gemini_api_key_promise = (async () => {
+      let geminiApiKey = process.env.GEMINI_API_KEY;
+      if (!geminiApiKey) {
+        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+        geminiApiKey = await getSecret(`${environment}/AgentWeb/GeminiAPIKey`);
+      }
+      if (!geminiApiKey || !geminiApiKey.trim()) {
+        throw new Error('Gemini API key is empty or not found in env/secrets');
+      }
+      return geminiApiKey.trim();
+    })().catch((err) => {
+      this.gemini_api_key_promise = null; // allow retry on transient secret failures
+      throw err;
+    });
+    return this.gemini_api_key_promise;
+  }
+
   // Helper method to get Gemini client (lazy-loaded from secrets manager)
   public async getGeminiClient(): Promise<OpenAI> {
     // Return cached client if available
@@ -1603,6 +1630,67 @@ export class AgentModeService {
     })();
 
     return this.gemini_client_promise;
+  }
+
+  /**
+   * ENG-737: native @google/genai client wrapper for gemini agent calls, presenting
+   * the same OpenAI-shaped `chat.completions.create` surface as getGeminiClient.
+   * Unlike the compat endpoint, this filters chain-of-thought natively
+   * (thinkingConfig.includeThoughts=false + part.thought), so no reasoning leaks.
+   */
+  public getGeminiNativeClient(): any {
+    if (this.gemini_native_client) return this.gemini_native_client;
+    this.gemini_native_client = createGeminiNativeClient({
+      defaultMaxTokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
+      getClient: async () => {
+        const { GoogleGenAI } = await import('@google/genai');
+        const apiKey = await this.getGeminiApiKey();
+        return new GoogleGenAI({ apiKey });
+      },
+    });
+    return this.gemini_native_client;
+  }
+
+  /**
+   * Kill-switch for the native gemini adapter (ENG-737). Reads env override first,
+   * then the AW-Settings row `gemini_native_adapter_enabled`, TTL-cached ~60s so a
+   * prod flip takes effect without redeploy. Defaults ON. When OFF, gemini falls
+   * back to the OpenAI-compat client (and the isReasoningLeak heuristic still guards
+   * leaks on that path). Fail-open to the default on any read error.
+   */
+  private async isGeminiNativeAdapterEnabled(): Promise<boolean> {
+    const envOverride = process.env.GEMINI_NATIVE_ADAPTER;
+    if (envOverride === '0' || envOverride === 'false') return false;
+    if (envOverride === '1' || envOverride === 'true') return true;
+
+    const now = Date.now();
+    if (this.geminiNativeFlagCache && this.geminiNativeFlagCache.expiresAt > now) {
+      return this.geminiNativeFlagCache.value;
+    }
+    let value = true; // default ON
+    try {
+      const setting = await settingsService.getSetting('gemini_native_adapter_enabled');
+      const raw = setting?.settingValue?.trim().toLowerCase();
+      if (raw === '0' || raw === 'false' || raw === 'off') value = false;
+      else if (raw === '1' || raw === 'true' || raw === 'on') value = true;
+    } catch (error) {
+      console.error('AgentMode: Error reading gemini_native_adapter_enabled setting; defaulting ON:', error);
+      value = true;
+    }
+    this.geminiNativeFlagCache = { value, expiresAt: now + AgentModeService.GEMINI_NATIVE_FLAG_TTL_MS };
+    return value;
+  }
+
+  /**
+   * Route gemini agent calls to the native adapter (ENG-737) or the compat client
+   * per the kill-switch. Resolved per-call (not cached on the model registry) so the
+   * flag can flip without a restart.
+   */
+  public async getGeminiAgentClient(): Promise<any> {
+    if (await this.isGeminiNativeAdapterEnabled()) {
+      return this.getGeminiNativeClient();
+    }
+    return this.getGeminiClient();
   }
 
   public async getVertexClient(modelId: string): Promise<any> {
@@ -2563,11 +2651,12 @@ export class AgentModeService {
 
     // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
     let client = this.llmModels[model].client;
-    if (!client) {
-      if (model.startsWith('gemini-')) {
-        client = await this.getGeminiClient();
-        this.llmModels[model].client = client;
-      } else if (model.startsWith('anthropic.')) {
+    if (model.startsWith('gemini-')) {
+      // ENG-737: resolve gemini per-call (native adapter vs compat) so the
+      // kill-switch flips without a restart — never cache on the registry.
+      client = await this.getGeminiAgentClient();
+    } else if (!client) {
+      if (model.startsWith('anthropic.')) {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
       } else if (model.startsWith('claude-')) {
