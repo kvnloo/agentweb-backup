@@ -690,13 +690,28 @@ export function currentXBillingCycle(
   resetDay: number | null,
   now: Date = new Date()
 ): { start: string; end: string } {
-  const day = resetDay && resetDay >= 1 && resetDay <= 31 ? Math.floor(resetDay) : 1;
+  const wanted = resetDay && resetDay >= 1 && resetDay <= 31 ? Math.floor(resetDay) : 1;
   const y = now.getUTCFullYear();
   const m = now.getUTCMonth();
   const todayDom = now.getUTCDate();
-  // Cycle started on `day` this month if we're at/past it, else last month.
-  const startMs =
-    todayDom >= day ? Date.UTC(y, m, day) : Date.UTC(y, m - 1, day);
+
+  // The cycle started on `wanted` this month if we're at/past it, else the prior
+  // month (which rolls the year back at January). Clamp `wanted` to the target
+  // month's real length so a reset day of 29–31 never overflows a short month
+  // (e.g. Date.UTC(y, Feb, 31) would spill into March and could push start>end).
+  let startY = y;
+  let startM = m;
+  if (todayDom < wanted) {
+    startM = m - 1;
+    if (startM < 0) {
+      startM = 11;
+      startY = y - 1;
+    }
+  }
+  const lastDayOfStartMonth = new Date(Date.UTC(startY, startM + 1, 0)).getUTCDate();
+  const startDay = Math.min(wanted, lastDayOfStartMonth);
+  const startMs = Date.UTC(startY, startM, startDay);
+
   const fmt = (ms: number) => new Date(ms).toISOString().slice(0, 10);
   return { start: fmt(startMs), end: now.toISOString().slice(0, 10) };
 }

@@ -39,6 +39,13 @@ interface TwitterMeterSpec {
   units?: (result: any) => number;
   /** Post-create body — a contained link selects the $0.200 rate over $0.015. */
   text?: string;
+  /**
+   * Number of internal handle→id resolutions (userByUsername) this op makes
+   * before its main call. Each is a separate billable user-read ($0.010),
+   * recorded as its own "resolve_handle" row so no billable sub-call is left
+   * unattributed (acceptance criterion 1). 0/undefined = none.
+   */
+  extraUserReads?: number;
 }
 
 /** Count the resources in an X read result (array of items), defensively. */
@@ -443,6 +450,21 @@ export class TwitterService {
         costUsd: cost.costUsd,
         costSource: 'allocated',
       });
+      // Companion charge: internal handle→id resolutions are separate billable
+      // user-reads (ENG-664 AC1 — no billable sub-call left unattributed).
+      if (meter.extraUserReads && meter.extraUserReads > 0) {
+        const resolveCost = computeTwitterCost('resolve_handle', meter.extraUserReads);
+        void recordVendorUsage({
+          userId: ownerUserId,
+          provider: TWITTER_PROVIDER,
+          operation: 'resolve_handle',
+          feature: `x-account:${accountId}`,
+          unit: resolveCost.unit,
+          quantity: resolveCost.quantity,
+          costUsd: resolveCost.costUsd,
+          costSource: 'allocated',
+        });
+      }
     } catch (err) {
       this.log(
         `usage metering failed for ${meter.operation} (non-fatal)`,
@@ -577,7 +599,7 @@ export class TwitterService {
         throw new Error(`Could not resolve X handle "@${handle}"`);
       }
       return client.v2.sendDmToParticipant(user.data.id, { text: finalText });
-    }, { operation: 'send_dm', requiredScope: 'dm.write' });
+    }, { operation: 'send_dm', requiredScope: 'dm.write', extraUserReads: 1 });
   }
 
   /**
@@ -652,7 +674,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.follow(myId, targetId);
       return res?.data ?? res;
-    }, { operation: 'follow', requiredScope: 'follows.write' });
+    }, { operation: 'follow', requiredScope: 'follows.write', extraUserReads: 1 });
   }
 
   /**
@@ -665,7 +687,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unfollow(myId, targetId);
       return res?.data ?? res;
-    }, { operation: 'unfollow', requiredScope: 'follows.write' });
+    }, { operation: 'unfollow', requiredScope: 'follows.write', extraUserReads: 1 });
   }
 
   // ─── List followers / following ───────────────────────────────────────────────
@@ -680,7 +702,7 @@ export class TwitterService {
       const targetId = handle ? await this.resolveHandleToUserId(client, handle) : myId;
       const res: any = await client.v2.followers(targetId);
       return res?.data ?? [];
-    }, { operation: 'list_followers', units: arrayLen });
+    }, { operation: 'list_followers', units: arrayLen, extraUserReads: handle ? 1 : 0 });
   }
 
   /**
@@ -692,7 +714,7 @@ export class TwitterService {
       const targetId = handle ? await this.resolveHandleToUserId(client, handle) : myId;
       const res: any = await client.v2.following(targetId);
       return res?.data ?? [];
-    }, { operation: 'list_following', units: arrayLen });
+    }, { operation: 'list_following', units: arrayLen, extraUserReads: handle ? 1 : 0 });
   }
 
   // ─── Search tweets ────────────────────────────────────────────────────────────
@@ -723,7 +745,7 @@ export class TwitterService {
       const participantId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.listDmEventsWithParticipant(participantId);
       return res?.data?.data ?? res?.data ?? [];
-    }, { operation: 'get_dm_conversation', units: arrayLen });
+    }, { operation: 'get_dm_conversation', units: arrayLen, extraUserReads: 1 });
   }
 
   // ─── Like / unlike ────────────────────────────────────────────────────────────
@@ -784,7 +806,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    }, { operation: 'get_user_tweets', units: arrayLen });
+    }, { operation: 'get_user_tweets', units: arrayLen, extraUserReads: 1 });
   }
 
   // ─── Bookmarks ────────────────────────────────────────────────────────────────
@@ -964,7 +986,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.block(myId, targetId);
       return res?.data ?? res;
-    }, { operation: 'block', requiredScope: 'block.write' });
+    }, { operation: 'block', requiredScope: 'block.write', extraUserReads: 1 });
   }
 
   /** Unblock a user by handle. Requires block.write scope. */
@@ -975,7 +997,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unblock(myId, targetId);
       return res?.data ?? res;
-    }, { operation: 'unblock', requiredScope: 'block.write' });
+    }, { operation: 'unblock', requiredScope: 'block.write', extraUserReads: 1 });
   }
 
   // ─── Mute / unmute ───────────────────────────────────────────────────────────
@@ -988,7 +1010,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.mute(myId, targetId);
       return res?.data ?? res;
-    }, { operation: 'mute', requiredScope: 'mute.write' });
+    }, { operation: 'mute', requiredScope: 'mute.write', extraUserReads: 1 });
   }
 
   /** Unmute a user by handle. Requires mute.write scope. */
@@ -999,7 +1021,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unmute(myId, targetId);
       return res?.data ?? res;
-    }, { operation: 'unmute', requiredScope: 'mute.write' });
+    }, { operation: 'unmute', requiredScope: 'mute.write', extraUserReads: 1 });
   }
 
   // ─── Tweet metrics ───────────────────────────────────────────────────────────

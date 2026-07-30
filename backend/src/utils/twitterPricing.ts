@@ -48,6 +48,11 @@ export type TwitterOperation =
   | "get_list_members"
   | "list_followers"
   | "list_following"
+  // Companion user-read: a handle→id resolution (userByUsername) that several
+  // write/read ops make internally before their main call. Billed $0.010/user
+  // like any other user read; recorded separately so it never inflates the
+  // parent operation's own count. (ENG-664)
+  | "resolve_handle"
   // ── Owned reads ──
   | "get_bookmarks"
   | "get_owned_lists"
@@ -107,6 +112,7 @@ const RATE_CARD: Record<TwitterOperation, RateCard> = {
   get_list_members: USER_READ,
   list_followers: USER_READ,
   list_following: USER_READ,
+  resolve_handle: USER_READ,
   // Owned reads
   get_bookmarks: OWNED_READ,
   get_owned_lists: OWNED_READ,

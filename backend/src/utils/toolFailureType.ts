@@ -59,10 +59,12 @@ const SCHEMA_RE =
 // still classified — e.g. provider 429s, which would otherwise fall to 'bug'.
 // "summarizer summary" = downstream of a provider 429 (cascade). "operation was
 // aborted" = an AbortController timeout — a tunable-infra issue, not a code bug.
-// "402" / "out of credits" / "payment required" = a metered vendor wallet is
-// depleted (X shared app, ENG-664) — a billing/quota config gap, not a tool bug.
+// "HTTP 402" / "out of credits" / "payment required" = a metered vendor wallet
+// is depleted (X shared app, ENG-664) — a billing/quota config gap, not a tool
+// bug. The 402 alternation is anchored to an HTTP-status context (not a bare
+// "402" number, which could appear in an unrelated id/line-number message).
 const CONFIG_RE =
-  /\b429\b|\b402\b|out of credits|payment required|too many requests|rate.?limit|quota exceeded|unauthorized|forbidden|invalid api key|missing credentials|bad credentials|authentication failed|does not exist|not configured|not a member of channel|not authorized|no secrets configured|account connected|specified bucket|job timed out|insights job|unable to retrieve a summarizer|status code 404|operation was aborted/i;
+  /\b429\b|http\s*402|status(?:\s+code)?\s+402|out of credits|payment required|too many requests|rate.?limit|quota exceeded|unauthorized|forbidden|invalid api key|missing credentials|bad credentials|authentication failed|does not exist|not configured|not a member of channel|not authorized|no secrets configured|account connected|specified bucket|job timed out|insights job|unable to retrieve a summarizer|status code 404|operation was aborted/i;
 
 /**
  * @param errorClass  output of classifyToolErrorClass (may be '', undefined)
