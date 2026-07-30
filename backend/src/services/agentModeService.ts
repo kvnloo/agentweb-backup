@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
@@ -16907,10 +16908,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             // Already an array (e.g. from JSON)
             parsedPayload = userPayload;
           } else if (typeof userPayload === 'string') {
-            // Split by newline to get rows
-            const rows = userPayload.split(/\r?\n/).filter(row => row.trim().length > 0);
-            // Split by comma to get columns
-            parsedPayload = rows.map(row => row.split(',').map(cell => cell.trim()));
+            // Real CSV parsing (quoted fields containing commas, e.g. a phone
+            // value with an extension) — a naive split(',') silently corrupts
+            // column alignment on exactly this kind of real-world export.
+            try {
+              parsedPayload = parseCsv(userPayload, {
+                skip_empty_lines: true,
+                trim: true,
+                relax_column_count: true,
+              });
+            } catch (parseError: any) {
+              throw new Error(`Failed to parse CSV payload: ${parseError.message}`);
+            }
           } else {
             // Fallback or error
             parsedPayload = [];

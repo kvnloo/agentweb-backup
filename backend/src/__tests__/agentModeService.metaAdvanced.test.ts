@@ -367,6 +367,35 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
         expect(result.message).toBe('Successfully initiated user upload to audience audience_123');
       });
 
+      // ENG-600 known gap, now fixed: the naive split(',') parser mis-splits
+      // any quoted field containing a comma (e.g. a phone value with an
+      // extension, "555-5678, ext. 2"), silently corrupting column alignment
+      // instead of parsing it as one field.
+      it('correctly parses a quoted field containing a comma (real-world CSV export)', async () => {
+        const params = {
+          action: 'upload_users',
+          audience_id: 'audience_123',
+          schema: ['EMAIL', 'PHONE'],
+          payload: 'john@example.com,"555-1234"\njane@example.com,"555-5678, ext. 2"',
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.uploadCustomAudienceUsers as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.manageMetaCustomAudiences('user123', 'UPLOAD_USERS', '123456789', {
+          id: params.audience_id, schema: params.schema, payload: params.payload,
+        });
+
+        expect(result.success).toBe(true);
+        const [, , , , hashedPayload] = (metaService.uploadCustomAudienceUsers as jest.Mock).mock.calls[0];
+        // Each row must still resolve to exactly 2 columns (email, phone) —
+        // the naive parser would have split row 2 into 3 columns and thrown
+        // a schema-mismatch error instead of reaching this point at all.
+        expect(hashedPayload).toHaveLength(2);
+        expect(hashedPayload[0]).toHaveLength(2);
+        expect(hashedPayload[1]).toHaveLength(2);
+      });
+
       it('should handle array payload', async () => {
         const params = {
           action: 'upload_users',
