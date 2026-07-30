@@ -3134,6 +3134,14 @@ export class AgentModeService {
       // this flag to backfill a neutral message so the user is never left with an
       // empty reply (the ENG-324/473/657 silent-failure class).
       let suppressedReasoningLeak = false;
+      // ENG-737: tracks whether the immediately-preceding assistant fragment in the
+      // current max-tokens continuation chain was itself suppressed as a leak. This
+      // lets the detector catch a MARKERLESS reasoning continuation (a truncated
+      // fragment that continues a just-suppressed `thought` leak as a degenerate
+      // query loop, e.g. session d103071a fragment 31) without ever suppressing
+      // standalone repetitive content. It is reset to the current fragment's own
+      // suppression outcome each iteration, so any non-suppressed turn breaks the chain.
+      let precededBySuppressedLeak = false;
       while (iteration < maxIterations) {
         // Check for cancellation before each iteration
         if (isCancelled?.()) {
@@ -3359,19 +3367,23 @@ export class AgentModeService {
         // synthesized answer on the final (non-truncated) turn. Deliberately narrow
         // (finish_reason=length + lowercase `thought` marker only) so a COMPLETED or
         // legitimately-repetitive answer is never blanked.
-        if (
-          isReasoningLeak({
-            finishReason: response.choices[0]?.finish_reason,
-            content: responseContent,
-            hasThoughtSignature: !!(responseMessage as any)?.extra_content?.google?.thought_signature,
-            model: llmModel,
-          })
-        ) {
+        const isLeakFragment = isReasoningLeak({
+          finishReason: response.choices[0]?.finish_reason,
+          content: responseContent,
+          hasThoughtSignature: !!(responseMessage as any)?.extra_content?.google?.thought_signature,
+          model: llmModel,
+          precededBySuppressedLeak,
+        });
+        if (isLeakFragment) {
           console.warn(`AgentMode: Suppressing leaked Gemini reasoning fragment (finish_reason=${response.choices[0]?.finish_reason}) in session ${sessionId}`);
           responseContent = '';
           responseMessage.content = '';
           suppressedReasoningLeak = true;
         }
+        // Carry the leak-continuation state to the next iteration: a markerless
+        // degenerate-loop fragment is only treated as a leak when it directly
+        // continues a just-suppressed one, so any non-suppressed turn breaks the chain.
+        precededBySuppressedLeak = isLeakFragment;
 
         // Update content with LLM's response
         if (responseContent) {
