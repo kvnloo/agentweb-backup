@@ -81,10 +81,17 @@ structural presence ≠ compliance) → promote to prod → re-verify.
 > override; re-verified behaviorally. Every send/publish skill is behaviorally
 > tested via `scripts/agentModeHarness.ts`.
 
-## PR 3 — structural (ENG-612/613/614) — not started
-Luma de-hardcode + dedup (3→1) · Inbound Website de-hardcode · Video Production
-split · LinkedIn Post Writing dedup (delete 1). Needs your content calls (Luma
-keeper, generic Video Production copy).
+## PR 3 — structural (ENG-612/613/614) — in progress
+
+### ENG-613 — Inbound Website Lead Engagement de-hardcode (Blindspot 3)
+| Skill | change | dev | verified | promoted |
+|---|---|---|---|---|
+| Inbound Website Lead Engagement Logic (`92ed7c80`) | de-hardcode → runtime ICP/lists per requesting org + CONTEXT+SAFETY+FAILURE | ✅ | ✅ beh (loads read_market_strategy/read_brand_guidelines + get_lead_lists at runtime; discovers lists dynamically; verifies account, refuses inactive-account send; no hallucination) | ☐ admin-API PUT after review |
+
+Reproducible artifact: `backend/src/scripts/dehardenInboundWebsite.ts` (+ `inboundWebsite.dehardened.md`). Prompt 4777→7551 chars, 0 hardcoded leaks. **Prod promotion pending developer review of the new prompt + admin token.**
+
+### ENG-612 / ENG-614 — blocked on Harsha data-plane decisions
+Evidence packets posted to **ENG-624** (Luma) + **ENG-626** (Video/LinkedIn) with read-only diffs, keeper/delete IDs, restorable backups; `Requires: Me` restored. **Key finding:** the 3 Luma rows are 3 DIFFERENT users' private, diverged skills (not catalog dupes) → recommended C (de-hardcode only, no delete). LinkedIn Post Writing is clean → recommended A (keep `23c80388` 8-tool, delete `aabe2602` draft).
 
 ## PR 4 / PR 5 — new skills (ENG-615…618) — not started
 10 new skills; #1/#3/#5/#6 ship hardened; #7 blocked on privacy review.
