@@ -9,11 +9,18 @@
  */
 
 import {
-  isTruncatedReasoningLeak,
+  isReasoningLeak,
   looksLikeLeakedReasoning,
+  hasLeadingThoughtMarker,
   hasDegenerateRepeatedLine,
   type LeakedReasoningInput,
 } from '../reasoningLeak';
+
+// A leaked `thought` monologue prefixed to a COMPLETED tool call — the shape seen
+// in production session 97d37f59 (finish_reason='tool_calls', no thought_signature).
+const LEAKED_TOOL_PREAMBLE =
+  "thought\nAh, let's read the content of `tool-responses/abc.txt` to find the article.\n" +
+  "Wait, let's use `read_tool_response` on `tool-responses/abc.txt` which is small enough.";
 
 // A degenerate reasoning loop: the same query line repeated back-to-back.
 const REPEATED_QUERY =
@@ -59,6 +66,22 @@ describe('hasDegenerateRepeatedLine', () => {
   });
 });
 
+describe('hasLeadingThoughtMarker', () => {
+  it('fires when the first non-blank line is exactly "thought"', () => {
+    expect(hasLeadingThoughtMarker('thought\nLet me reconsider.')).toBe(true);
+    expect(hasLeadingThoughtMarker('\n\n  thought\nmore')).toBe(true);
+  });
+
+  it('does NOT fire when "thought" is only a prefix of a longer first line', () => {
+    expect(hasLeadingThoughtMarker('thought leadership is a strategy')).toBe(false);
+    expect(hasLeadingThoughtMarker('Thoughts on the plan:')).toBe(false);
+  });
+
+  it('returns false on empty content', () => {
+    expect(hasLeadingThoughtMarker('')).toBe(false);
+  });
+});
+
 describe('looksLikeLeakedReasoning', () => {
   it('fires on a leading bare "thought" marker line', () => {
     expect(looksLikeLeakedReasoning('thought\nLet me reconsider the plan.')).toBe(true);
@@ -81,22 +104,22 @@ describe('looksLikeLeakedReasoning', () => {
   });
 });
 
-describe('isTruncatedReasoningLeak', () => {
+describe('isReasoningLeak', () => {
   it('suppresses a truncated gemini thinking turn that leaked its chain-of-thought', () => {
-    expect(isTruncatedReasoningLeak(base)).toBe(true);
+    expect(isReasoningLeak(base)).toBe(true);
   });
 
   it('suppresses a truncated continuation fragment (no marker, still looping)', () => {
-    expect(isTruncatedReasoningLeak({ ...base, content: LEAKED_CONTINUATION })).toBe(true);
+    expect(isReasoningLeak({ ...base, content: LEAKED_CONTINUATION })).toBe(true);
   });
 
   it('does NOT suppress the final, non-truncated answer turn (finish_reason=stop)', () => {
-    expect(isTruncatedReasoningLeak({ ...base, finishReason: 'stop', content: CLEAN_ANSWER })).toBe(false);
+    expect(isReasoningLeak({ ...base, finishReason: 'stop', content: CLEAN_ANSWER })).toBe(false);
   });
 
   it('does NOT suppress a normal truncated answer fragment (no reasoning signature)', () => {
     expect(
-      isTruncatedReasoningLeak({
+      isReasoningLeak({
         ...base,
         content: 'Here is the first half of a long, legitimate answer that ran out of tokens',
       }),
@@ -105,7 +128,7 @@ describe('isTruncatedReasoningLeak', () => {
 
   it('does NOT touch non-gemini providers, even when truncated with a reasoning-shaped body', () => {
     expect(
-      isTruncatedReasoningLeak({
+      isReasoningLeak({
         finishReason: 'length',
         content: LEAKED_THOUGHT_LOOP,
         hasThoughtSignature: false,
@@ -116,7 +139,33 @@ describe('isTruncatedReasoningLeak', () => {
 
   it('fires for a gemini-* model even without a thought_signature present', () => {
     expect(
-      isTruncatedReasoningLeak({ ...base, hasThoughtSignature: false, model: 'gemini-3.5-flash' }),
+      isReasoningLeak({ ...base, hasThoughtSignature: false, model: 'gemini-3.5-flash' }),
     ).toBe(true);
+  });
+
+  // Production session 97d37f59: the `thought` marker leaked on a COMPLETED tool-call
+  // turn (finish_reason != 'length', no thought_signature). The old length-only gate
+  // missed this; a bare `thought` marker is a leak regardless of finish_reason.
+  it('suppresses a leaked `thought` preamble on a completed tool-call turn (finish_reason=tool_calls)', () => {
+    expect(
+      isReasoningLeak({
+        finishReason: 'tool_calls',
+        content: LEAKED_TOOL_PREAMBLE,
+        hasThoughtSignature: false,
+        model: 'gemini-3.5-flash',
+      }),
+    ).toBe(true);
+  });
+
+  it('suppresses a leaked `thought` marker even on a naturally-stopped turn (finish_reason=stop)', () => {
+    expect(isReasoningLeak({ ...base, finishReason: 'stop' })).toBe(true);
+  });
+
+  // The degenerate-loop signature stays conservatively length-gated: a repetitive
+  // BUT complete answer (finished on its own) must never be blanked.
+  it('does NOT suppress a degenerate repeated-line loop when the turn completed (finish_reason=stop)', () => {
+    expect(
+      isReasoningLeak({ ...base, finishReason: 'stop', content: LEAKED_CONTINUATION }),
+    ).toBe(false);
   });
 });
