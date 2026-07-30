@@ -47,12 +47,58 @@ export interface CostTopUser {
   byModel: CostByModelRow[];
 }
 
+export interface CostByFeatureRow {
+  feature: string;
+  costUsd: number;
+  callCount: number;
+  totalTokens: number;
+}
+
 export interface CostAggregation {
   start: string;
   end: string;
   totals: { costUsd: number; callCount: number; totalTokens: number };
   byModel: CostByModelRow[];
+  byFeature: CostByFeatureRow[];
   topUsers: CostTopUser[];
+}
+
+// ── X reconciliation, mirroring GET /api/admin/usage/x-reconciliation ─────────
+export interface XReconciliation {
+  cycle: { start: string; end: string };
+  measured: {
+    projectId: string | null;
+    projectCap: number;
+    projectUsage: number;
+    capResetDay: number | null;
+  };
+  allocated: { costUsd: number; callCount: number; postReadUnits: number };
+  reconciliation: {
+    allocatedPostReadUnits: number;
+    measuredPostReadUnits: number;
+    dedupSavingsUnits: number;
+    capUsedPct: number | null;
+    measuredDerivedCostUsd: number;
+  };
+}
+
+export interface XAccountRow {
+  accountId: string;
+  costUsd: number;
+  callCount: number;
+}
+
+/**
+ * Per-X-account rollup from the feature dimension. X rows are stored with
+ * feature "x-account:{id}" (twitterService), so filtering that prefix yields
+ * per-account totals; every other feature (LLM session types) is skipped.
+ */
+export function xAccountsFromFeatures(byFeature: CostByFeatureRow[] | undefined): XAccountRow[] {
+  const prefix = "x-account:";
+  return (byFeature || [])
+    .filter((f) => f.feature.startsWith(prefix))
+    .map((f) => ({ accountId: f.feature.slice(prefix.length), costUsd: f.costUsd, callCount: f.callCount }))
+    .sort((a, b) => b.costUsd - a.costUsd || a.accountId.localeCompare(b.accountId));
 }
 
 // ── Pure helpers (exported for unit tests) ────────────────────────────────────
@@ -208,6 +254,150 @@ const UserUsageRow: React.FC<{ rank: number; row: UserRowView; provider: string 
   );
 };
 
+/**
+ * X (Twitter) reconciliation panel — X's own measured consumption beside our
+ * allocated ledger for the same billing cycle. Fetched separately so an
+ * X-unreachable failure (e.g. bearer not configured → 502) degrades to a note
+ * without breaking the rest of the tab.
+ */
+const XReconciliationPanel: React.FC = () => {
+  const { token } = useAuth();
+  const [data, setData] = useState<XReconciliation | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await axios.get<XReconciliation>(
+          buildApiUrl("/api/admin/usage/x-reconciliation"),
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (alive) setData(res.data);
+      } catch (err: any) {
+        if (alive)
+          setError(err?.response?.data?.message || err?.message || "X usage unavailable");
+      } finally {
+        if (alive) setLoading(false);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  if (loading) return null;
+  if (error || !data) {
+    return (
+      <Alert severity="warning" sx={{ mb: 2 }} data-testid="x-recon-error">
+        X reconciliation unavailable: {error || "no data"}
+      </Alert>
+    );
+  }
+
+  const { measured, allocated, reconciliation: r, cycle } = data;
+  const capPct = r.capUsedPct ?? 0;
+  const capColor = capPct >= 90 ? "error.main" : capPct >= 70 ? "warning.main" : "success.main";
+
+  return (
+    <Paper variant="outlined" sx={{ p: 2, mb: 2 }} data-testid="x-recon-panel">
+      <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1 }}>
+        <Typography variant="subtitle1" fontWeight={600}>
+          X API reconciliation
+        </Typography>
+        <Tooltip
+          title="Measured = X's own GET /2/usage/tweets (app-wide, deduped). Allocated = our per-call ledger × X's rate card (upper bound). The gap is dedup savings + $0 interaction writes."
+          arrow
+        >
+          <InfoIcon sx={{ fontSize: 16, color: "text.disabled", cursor: "help" }} />
+        </Tooltip>
+        <Typography variant="caption" color="text.secondary">
+          cycle {cycle.start} → {cycle.end}
+          {measured.capResetDay ? ` (resets day ${measured.capResetDay})` : ""}
+        </Typography>
+      </Box>
+      <Grid container spacing={2}>
+        <Grid item xs={12} md={3}>
+          <Typography variant="caption" color="text.secondary">
+            Post-read cap used (measured)
+          </Typography>
+          <Typography variant="h6" sx={{ color: capColor, fontVariantNumeric: "tabular-nums" }} data-testid="x-recon-cap">
+            {measured.projectUsage.toLocaleString()} / {measured.projectCap.toLocaleString()}
+            {r.capUsedPct != null ? ` (${capPct.toFixed(1)}%)` : ""}
+          </Typography>
+        </Grid>
+        <Grid item xs={12} md={3}>
+          <Typography variant="caption" color="text.secondary">
+            Allocated reads (ours)
+          </Typography>
+          <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>
+            {r.allocatedPostReadUnits.toLocaleString()}
+          </Typography>
+          <Typography variant="caption" color="text.secondary" data-testid="x-recon-dedup">
+            {r.dedupSavingsUnits.toLocaleString()} deduped by X
+          </Typography>
+        </Grid>
+        <Grid item xs={12} md={3}>
+          <Typography variant="caption" color="text.secondary">
+            Allocated cost (upper bound)
+          </Typography>
+          <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>
+            {usd(allocated.costUsd)}
+          </Typography>
+        </Grid>
+        <Grid item xs={12} md={3}>
+          <Typography variant="caption" color="text.secondary">
+            Measured-derived cost
+          </Typography>
+          <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }} data-testid="x-recon-measured-cost">
+            {usd(r.measuredDerivedCostUsd)}
+          </Typography>
+          <Typography variant="caption" color="text.secondary">
+            X reads × rate + our writes
+          </Typography>
+        </Grid>
+      </Grid>
+    </Paper>
+  );
+};
+
+const XAccountTable: React.FC<{ accounts: XAccountRow[] }> = ({ accounts }) => {
+  if (accounts.length === 0) return null;
+  return (
+    <Box sx={{ mt: 3 }} data-testid="x-account-table">
+      <Typography variant="subtitle1" fontWeight={600} sx={{ mb: 1 }}>
+        By X account
+      </Typography>
+      <TableContainer component={Paper} variant="outlined">
+        <Table size="small">
+          <TableHead>
+            <TableRow>
+              <TableCell>Connected account</TableCell>
+              <TableCell align="right">Calls</TableCell>
+              <TableCell align="right">Cost (allocated)</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {accounts.map((a) => (
+              <TableRow key={a.accountId} hover>
+                <TableCell>{a.accountId}</TableCell>
+                <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                  {a.callCount.toLocaleString()}
+                </TableCell>
+                <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
+                  {usd(a.costUsd)}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </TableContainer>
+    </Box>
+  );
+};
+
 export default function UsageCostByUserTab() {
   const { token } = useAuth();
   const [start, setStart] = useState(defaultStartDate);
@@ -249,6 +439,7 @@ export default function UsageCostByUserTab() {
 
   const providers = useMemo(() => providersInData(agg), [agg]);
   const rows = useMemo(() => rankedUserRows(agg, provider), [agg, provider]);
+  const xAccounts = useMemo(() => xAccountsFromFeatures(agg?.byFeature), [agg]);
   const filteredTotals = useMemo(
     () =>
       rows.reduce(
@@ -324,6 +515,8 @@ export default function UsageCostByUserTab() {
           </Grid>
         </Grid>
       </Paper>
+
+      <XReconciliationPanel />
 
       {providerIsAllocatedEstimate(provider) && (
         <Alert severity="info" icon={<InfoIcon />} sx={{ mb: 2 }}>
@@ -404,6 +597,8 @@ export default function UsageCostByUserTab() {
               </Table>
             </TableContainer>
           )}
+
+          <XAccountTable accounts={xAccounts} />
         </>
       )}
     </Box>
