@@ -1,0 +1,110 @@
+// DRAFT — validate against CloudTrail (last 90d of agentweb-test-env-ec2-role); apply in a canary
+// watching poll.log for AccessDenied. ENG-651/562.
+//
+// Least-privilege policy for the autofix RUNNER's instance role (the reused cloud test-env role
+// agentweb-test-env-ec2-role; account 992382574572, us-west-2). Every Allow below is grounded in
+// OBSERVED runner usage — source cited per Sid. This is JSONC for review: STRIP all `//` comments
+// before `aws iam put-role-policy` (IAM rejects comments and unknown fields).
+//
+// Deliberately OMITTED — no observed INSTANCE-ROLE usage. Add a scoped statement ONLY if the
+// CloudTrail replay / canary surfaces an AccessDenied for it:
+//   - s3:*                 no S3 call in the runner or preview-backend path (backend's S3 writes
+//                          are not exercised by UI previews).
+//   - ec2:*                provision.sh's run/describe/SG/key-pair calls use the OPERATOR's account
+//                          credentials, not this role (see "scoped account IAM policy" note in provision.sh).
+//   - ssm:GetParameter     provision.sh's AL2023 AMI lookup is operator-run, not the instance role.
+//   - sts:*                not proven at runtime (session.mjs / bootstrap don't call it).
+//   - elasticbeanstalk:*   request/retrieve-environment-info are operator/agent debugging, not the role.
+//   - iam:*                never granted to the runner; the role/instance-profile are created from the
+//                          operator side during provisioning.
+//   - dynamodb:ListTables  account-level (cannot be resource-scoped to a table ARN, and we never use `*`).
+//                          create-tables.ts checks existence via DescribeTable, which IS granted below.
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DevDynamoFullCrud",
+      "//": "OBSERVED: per-fix preview DEV backend + create-tables.ts (NODE_ENV=development) — full CRUD on Dev-AW-* only.",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:BatchGetItem",
+        "dynamodb:BatchWriteItem",
+        "dynamodb:ConditionCheckItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:Query",
+        "dynamodb:Scan",
+        "dynamodb:UpdateItem",
+        "dynamodb:CreateTable",
+        "dynamodb:DescribeTable",
+        "dynamodb:DescribeTimeToLive",
+        "dynamodb:UpdateTimeToLive"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-west-2:992382574572:table/Dev-AW-*",
+        "arn:aws:dynamodb:us-west-2:992382574572:table/Dev-AW-*/index/*"
+      ]
+    },
+    {
+      "Sid": "ProdDynamoReadOnly",
+      "//": "OBSERVED: session.mjs read-only prod pulls (AW-ChatSessions / AW-ChatMessages / AW-TaskExecutions). Read verbs only.",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:GetItem",
+        "dynamodb:Query",
+        "dynamodb:BatchGetItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-*",
+        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-*/index/*"
+      ]
+    },
+    {
+      "Sid": "DevSecretsRead",
+      "//": "PINNED: runtime DEV backend secrets (dev/AgentWeb/Google/Vertex, /LinkedIn, etc. — accessed at runtime).",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:us-west-2:992382574572:secret:dev/AgentWeb/*"
+    },
+    {
+      "Sid": "TestEnvSecretsRead",
+      "//": "REVIEW — OBSERVED but BEYOND the dev/AgentWeb-only pin: bootstrap.sh pulls backend/.env from agentweb/test-env/backend-env, and the SSH password lives at agentweb/test-env/ssh-password. Drop this statement if the role must read dev/AgentWeb/* ONLY (bootstrap's backend/.env pull then breaks).",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:us-west-2:992382574572:secret:agentweb/test-env/*"
+    },
+    {
+      "Sid": "DenyProdDynamoScan",
+      "//": "PINNED DENY: no full-table scans of prod (Deny wins over any future broadening Allow).",
+      "Effect": "Deny",
+      "Action": "dynamodb:Scan",
+      "Resource": [
+        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-*",
+        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-*/index/*"
+      ]
+    },
+    {
+      "Sid": "DenyProdDynamoWrites",
+      "//": "PINNED DENY: the runner must NEVER mutate prod data. (Dev-AW-* does not match AW-*, so dev CRUD is unaffected.)",
+      "Effect": "Deny",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:BatchWriteItem"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-*",
+        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-*/index/*"
+      ]
+    },
+    {
+      "Sid": "DenyProdSecrets",
+      "//": "PINNED DENY: prod/AgentWeb/* secrets are off-limits to the runner (all actions).",
+      "Effect": "Deny",
+      "Action": "secretsmanager:*",
+      "Resource": "arn:aws:secretsmanager:us-west-2:992382574572:secret:prod/AgentWeb/*"
+    }
+  ]
+}
