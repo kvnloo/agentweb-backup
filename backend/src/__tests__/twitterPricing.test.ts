@@ -130,6 +130,14 @@ describe("isPostReadOperation", () => {
   });
 });
 
+describe("resolve_handle companion read", () => {
+  it("is priced as a user read ($0.010/user)", () => {
+    const c = computeTwitterCost("resolve_handle", 1);
+    expect(c.unit).toBe("user");
+    expect(c.costUsd).toBeCloseTo(0.01, 6);
+  });
+});
+
 describe("provider constant", () => {
   it("is the stable ledger provider id 'twitter'", () => {
     expect(TWITTER_PROVIDER).toBe("twitter");

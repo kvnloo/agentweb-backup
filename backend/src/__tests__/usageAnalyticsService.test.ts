@@ -628,4 +628,20 @@ describe('currentXBillingCycle', () => {
     expect(currentXBillingCycle(null, new Date('2026-07-20T00:00:00Z')).start).toBe('2026-07-01');
     expect(currentXBillingCycle(99, new Date('2026-07-20T00:00:00Z')).start).toBe('2026-07-01');
   });
+
+  it('rolls the year back at the January boundary', () => {
+    const c = currentXBillingCycle(15, new Date('2026-01-05T00:00:00Z'));
+    expect(c.start).toBe('2025-12-15');
+    expect(c.end).toBe('2026-01-05');
+  });
+
+  it('clamps a 29-31 reset day to a short prior month (no month overflow, never start>end)', () => {
+    // Feb 2026 (28 days): reset day 31 early in March must clamp to Feb 28, not spill to Mar 3.
+    const c = currentXBillingCycle(31, new Date('2026-03-01T00:00:00Z'));
+    expect(c.start).toBe('2026-02-28');
+    expect(c.end).toBe('2026-03-01');
+    expect(c.start <= c.end).toBe(true);
+    // April (30 days): reset day 31 mid-May clamps to Apr 30.
+    expect(currentXBillingCycle(31, new Date('2026-05-10T00:00:00Z')).start).toBe('2026-04-30');
+  });
 });

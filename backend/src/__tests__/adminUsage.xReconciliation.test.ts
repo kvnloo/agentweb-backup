@@ -88,6 +88,15 @@ describe("GET /api/admin/usage/x-reconciliation", () => {
     expect(mockAllocated).not.toHaveBeenCalled();
   });
 
+  it("surfaces an allocated-compute failure as 500 (after X succeeded)", async () => {
+    mockUsage.mockResolvedValue({ projectId: "p1", projectCap: 2_000_000, projectUsage: 100, capResetDay: 3 });
+    mockAllocated.mockRejectedValue(new Error("scan failed"));
+    const res = await request(app)
+      .get("/api/admin/usage/x-reconciliation")
+      .set("Authorization", `Bearer ${adminToken}`);
+    expect(res.status).toBe(500);
+  });
+
   it("403s a non-admin", async () => {
     const res = await request(app)
       .get("/api/admin/usage/x-reconciliation")

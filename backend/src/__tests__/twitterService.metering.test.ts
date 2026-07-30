@@ -14,6 +14,7 @@ const mockTweet = jest.fn();
 const mockSearch = jest.fn();
 const mockFollow = jest.fn();
 const mockUserByUsername = jest.fn();
+const mockFollowers = jest.fn();
 
 jest.mock(
   'twitter-api-v2',
@@ -25,6 +26,7 @@ jest.mock(
         search: (...a: any[]) => mockSearch(...a),
         follow: (...a: any[]) => mockFollow(...a),
         userByUsername: (...a: any[]) => mockUserByUsername(...a),
+        followers: (...a: any[]) => mockFollowers(...a),
       },
     })),
   }),
@@ -103,13 +105,28 @@ describe('X usage metering — attribution', () => {
     expect(ctx.costUsd).toBeCloseTo(0.2, 6);
   });
 
-  it('records an interaction write at $0 but still attributes the call', async () => {
+  it('records an interaction write at $0 AND its handle-resolution user-read (AC1: no unattributed sub-call)', async () => {
     await twitterService.followUser(OWNER, ACCOUNT_ID, '@target');
 
-    const ctx = lastCall();
-    expect(ctx.operation).toBe('follow');
-    expect(ctx.costUsd).toBe(0);
-    expect(ctx.unit).toBe('request');
+    // Two ledger rows: the follow ($0 write) and the resolve_handle user-read ($0.010).
+    expect(mockRecordVendorUsage).toHaveBeenCalledTimes(2);
+    const ops = mockRecordVendorUsage.mock.calls.map((c) => c[0]);
+    const follow = ops.find((o) => o.operation === 'follow');
+    const resolve = ops.find((o) => o.operation === 'resolve_handle');
+
+    expect(follow).toMatchObject({ costUsd: 0, unit: 'request', feature: `x-account:${ACCOUNT_ID}` });
+    expect(resolve).toMatchObject({ unit: 'user', quantity: 1, costSource: 'allocated', feature: `x-account:${ACCOUNT_ID}` });
+    expect(resolve.costUsd).toBeCloseTo(0.01, 6);
+  });
+
+  it('does NOT add a resolve_handle charge for list_followers without a handle (own account)', async () => {
+    // No handle → reads the account's OWN followers → no userByUsername resolve.
+    mockFollowers.mockResolvedValue({ data: [{ id: 'f1' }] });
+
+    await twitterService.listFollowers(OWNER, ACCOUNT_ID);
+    const ops = mockRecordVendorUsage.mock.calls.map((c) => c[0].operation);
+    expect(ops).toContain('list_followers');
+    expect(ops).not.toContain('resolve_handle');
   });
 
   it('a metering failure never breaks the underlying X call', async () => {
