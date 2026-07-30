@@ -41,16 +41,21 @@ const get = (path: string, token: string | null) =>
 
 const WILDCARD_SUB = "ENG204-harness-wildcard";
 
-async function getSubscription(email: string): Promise<string | undefined> {
-  const r = await ddb.get({ TableName: USERS_TABLE, Key: { email } }).promise();
-  return r.Item?.subscriptionType;
-}
-async function setSubscription(email: string, value: string): Promise<void> {
-  await ddb.update({
+/**
+ * Atomically set the wildcard AND return the value it overwrote (ReturnValues:
+ * ALL_OLD). Capturing the prior value in the SAME write as the overwrite closes
+ * the read-then-write window a concurrent webhook/admin change could slip
+ * through — the returned value is exactly what was present at the instant we
+ * replaced it, which is the only safe basis for the cleanup restore.
+ */
+async function setWildcardCapturingPrev(email: string): Promise<string | undefined> {
+  const r = await ddb.update({
     TableName: USERS_TABLE, Key: { email },
     UpdateExpression: "SET subscriptionType = :v",
-    ExpressionAttributeValues: { ":v": value },
+    ExpressionAttributeValues: { ":v": WILDCARD_SUB },
+    ReturnValues: "ALL_OLD",
   }).promise();
+  return r.Attributes?.subscriptionType;
 }
 /**
  * Best-effort restore, guarded so we never clobber a change made DURING the run:
@@ -119,10 +124,12 @@ async function main() {
 
   // Grant wildcard skill access for the run so gated dev skills can install;
   // restored in finally. (A hard crash would leave it set — restore manually.)
-  const hadSub = skillIds.length ? await getSubscription(EMAIL) : undefined;
+  // hadSub is captured atomically WITH the wildcard write below (ALL_OLD), so no
+  // read-then-write window exists for a concurrent change to slip through.
+  let hadSub: string | undefined = undefined;
   try {
     if (skillIds.length) {
-      await setSubscription(EMAIL, WILDCARD_SUB);
+      hadSub = await setWildcardCapturingPrev(EMAIL);
       const sessionId = await post("/api/agent-mode/sessions", token, { title: "ENG-204 harness" }).then((s) => s.sessionId || s.id);
       const inst = await agentModeService.installSkills(skillIds, userId, sessionId);
       console.log("installed:", JSON.stringify(inst.installedSkills || inst.message));
