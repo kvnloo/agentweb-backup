@@ -4,7 +4,14 @@ After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=5
-OnFailure=agent-engine-alert@%n.service
+# %N, not %n — %n is the full unit name INCLUDING the .service suffix, so
+# %n.service produces a mangled double-suffixed target
+# (agent-engine-alert@agent-engine.service.service) that doesn't exist and
+# fails to start. %N strips the suffix first. Confirmed live via ENG-389
+# systemd supervision testing: with %n, systemd correctly logged
+# "Triggering OnFailure=" but the actual companion unit failed to start,
+# so the alert silently never fired.
+OnFailure=agent-engine-alert@%N.service
 
 [Service]
 Type=simple
