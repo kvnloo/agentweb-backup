@@ -93,12 +93,18 @@ Reproducible artifact: `backend/src/scripts/dehardenInboundWebsite.ts` (+ `inbou
 ### ENG-612 — Luma de-hardcode (dev-done; dedup blocked)
 | Skill | change | dev | verified | promoted |
 |---|---|---|---|---|
-| Luma Event Lead Engagement Engine (`a831f5c8`) | strip departing-employee (Rui Wang) name + CONTEXT+SAFETY+FAILURE | ✅ | ✅ beh (**STOPS on the past June-18 event**; derives owners at runtime + queues inactive; loads read_market_strategy; ledger, no fabrication) | ☐ **user-owned private skill — needs explicit sign-off before prod** |
+| Luma Event Lead Engagement Engine (`a831f5c8`) | strip departing-employee (Rui Wang) name + CONTEXT+SAFETY+FAILURE | ✅ | ✅ beh (**STOPS on the past June-18 event**; derives owners at runtime + queues inactive; loads read_market_strategy; ledger, no fabrication) | ✅ **prod-verified 07-30** (8140→10228, Rui Wang removed; rollback snapshot kept) |
 
 Conservative de-hardcode: the CONTEXT block behaviorally neutralizes the past event + departing-owner without gutting the user's bespoke event logic. Prompt 8140→10228, Rui Wang removed. The other 2 Luma rows (`eab2ba45` near-clean, `a80b5360` clean) left untouched.
 
-### ENG-612 / ENG-614 — dedup blocked on Harsha data-plane decisions
-Evidence packets posted to **ENG-624** (Luma) + **ENG-626** (Video/LinkedIn) with read-only diffs, keeper/delete IDs, restorable backups; `Requires: Me` restored. **Key finding:** the 3 Luma rows are 3 DIFFERENT users' private, diverged skills (not catalog dupes) → recommended C (de-hardcode only, no delete — done above). LinkedIn Post Writing is clean → recommended A (keep `23c80388` 8-tool, delete `aabe2602` draft).
+### ENG-614 — Video Production split: MOOT (premise stale)
+The published `Video Production` (`8714d8c5`, public, 13.3KB) is **already generic** (brand-agnostic cinematic video-ad pipeline; brand loaded via you_search_web at runtime). Scanned all dev+prod skills for "Scrollbook"/children's-book content → **zero hits**. Nothing to split → drop.
+
+### ENG-624 / ENG-626 dedup deletes → recommend **Option C (drop)**
+Both hard-deletes are **droppable** (Option C needs no data-plane action, so no Harsha gate):
+- **Luma** (ENG-624): 3 rows are 3 DIFFERENT users' *private* skills → deleting destroys user data, not catalog hygiene.
+- **LinkedIn Post Writing** (ENG-626): `aabe2602` is another user's *private draft*, near-identical to the public keeper `23c80388` → no public-catalog drift; low-value delete.
+Video split (ENG-626's other half) is moot (above). → close both as C; no deletions.
 
 ## PR 4 / PR 5 — new skills (ENG-615…618) — not started
 10 new skills; #1/#3/#5/#6 ship hardened; #7 blocked on privacy review.
