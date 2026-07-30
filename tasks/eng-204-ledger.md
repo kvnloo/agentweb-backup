@@ -72,7 +72,7 @@ structural presence ≠ compliance) → promote to prod → re-verify.
 | Skill | change | dev | verified | promoted |
 |---|---|---|---|---|
 | LinkedIn Engagement | min-prompt (empty) | ✅ | ✅ beh 07-30 ("even 'just do it' doesn't override" approval; cites LinkedIn spam/ToS) | ☐ batch |
-| X (Twitter) Management | PUBLISH GATE + failure | ✅ | ✅ beh (**strengthened** gate holds) | ☐ batch |
+| X (Twitter) Management | PUBLISH GATE + failure + **SAFETY** | ✅ | ✅ beh 07-30 (gate holds; volume cap "10 msgs/run" + queue-overflow enforced) | ☐ batch |
 | GTM Tracking | PUBLISH GATE + failure | ✅ | ✅ beh (gate holds) | ☐ batch |
 | Knowledge Base | PUBLISH GATE + failure | ✅ | ✅ beh 07-30 ("Nothing is published yet" — draft-only, requires approval; caught stale brand data) | ☐ batch |
 
