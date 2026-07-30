@@ -63,6 +63,7 @@ import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
 import V0CreditsCard from "../components/admin/V0CreditsCard";
 import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
+import XCostBreakdown, { UserXBreakdown } from "../components/admin/XCostBreakdown";
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
@@ -941,6 +942,15 @@ export default function AdminDashboard() {
     setCostBreakdownView(v);
     try { localStorage.setItem("costBreakdownView", v); } catch { /* non-fatal */ }
   };
+
+  // Per-user X (Twitter) cost breakdown modal (ENG-664) — mirrors the LLM one but
+  // reads the X-only ledger cut; reuses costBreakdownView for the table/bars toggle.
+  const [xBreakdownUser, setXBreakdownUser] = useState<User | null>(null);
+  const [xBreakdownMonth, setXBreakdownMonth] = useState<string>("");
+  const [xBreakdownData, setXBreakdownData] = useState<UserXBreakdown | null>(null);
+  const [xBreakdownLoading, setXBreakdownLoading] = useState(false);
+  const [xBreakdownError, setXBreakdownError] = useState<string | null>(null);
+  const xBreakdownReqRef = useRef(0);
   const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
   const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
   const [grantBonusEmail, setGrantBonusEmail] = useState("");
@@ -1156,6 +1166,43 @@ export default function AdminDashboard() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [costBreakdownUser?.userId, costBreakdownMonth]);
+
+  // ── Per-user X (Twitter) cost breakdown (ENG-664) ──
+  const fetchXBreakdown = async (userId: string, month: string) => {
+    const reqId = ++xBreakdownReqRef.current;
+    const isStale = () => reqId !== xBreakdownReqRef.current;
+    setXBreakdownLoading(true);
+    setXBreakdownError(null);
+    try {
+      const response = await axios.get(
+        buildApiUrl(`/api/admin/users/${userId}/usage/x-breakdown`),
+        // '31' upper-bounds the month; non-existent days simply have no rows.
+        { headers: { Authorization: `Bearer ${token}` }, params: { start: `${month}-01`, end: `${month}-31` } }
+      );
+      if (isStale()) return;
+      setXBreakdownData(response.data);
+    } catch (error: any) {
+      if (isStale()) return;
+      setXBreakdownData(null);
+      setXBreakdownError(error.response?.data?.message || "Failed to load X breakdown");
+    } finally {
+      if (!isStale()) setXBreakdownLoading(false);
+    }
+  };
+
+  const openXBreakdown = (user: User) => {
+    setXBreakdownUser(user);
+    setXBreakdownData(null);
+    setXBreakdownError(null);
+    setXBreakdownMonth(new Date().toISOString().slice(0, 7));
+  };
+
+  useEffect(() => {
+    if (xBreakdownUser && xBreakdownMonth) {
+      fetchXBreakdown(xBreakdownUser.userId, xBreakdownMonth);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [xBreakdownUser?.userId, xBreakdownMonth]);
 
   // Load waitlist data only when Waitlist tab (3) is selected
   useEffect(() => {
@@ -4928,6 +4975,21 @@ export default function AdminDashboard() {
                                     )}
                                   </Box>
                                 </Grid>
+                                {/* X (Twitter) API cost — allocated, observe-only (ENG-664) */}
+                                {user.roles?.includes("customer") && (
+                                  <Grid item xs={6}>
+                                    <HelpCaption
+                                      label="X (Twitter) Cost"
+                                      help="Allocated $ cost of this user's X/Twitter API calls this month — X's pay-per-use rate card applied to their call counts. Observe-only: X spend is NOT deducted from any cap. Open the breakdown for per-tool cost."
+                                    />
+                                    <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                      <Typography variant="body2" color="text.secondary">allocated</Typography>
+                                      <Tooltip title="View per-tool X (Twitter) cost breakdown">
+                                        <IconButton size="small" onClick={() => openXBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
+                                      </Tooltip>
+                                    </Box>
+                                  </Grid>
+                                )}
                                 {/* Extra Cost Usage (enrichment, image gen, etc.) */}
                                 {user.roles?.includes("customer") && (
                                   <Grid item xs={6}>
@@ -6786,6 +6848,54 @@ export default function AdminDashboard() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setCostBreakdownUser(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Per-user X (Twitter) cost breakdown (ENG-664) */}
+      <Dialog open={!!xBreakdownUser} onClose={() => setXBreakdownUser(null)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2 }}>
+          <span>X (Twitter) Cost — {xBreakdownUser?.email}</span>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1.5 }}>
+            <ButtonGroup size="small" aria-label="x cost breakdown view">
+              <Button
+                variant={costBreakdownView === "table" ? "contained" : "outlined"}
+                onClick={() => changeCostBreakdownView("table")}
+              >
+                Table
+              </Button>
+              <Button
+                variant={costBreakdownView === "bars" ? "contained" : "outlined"}
+                onClick={() => changeCostBreakdownView("bars")}
+                startIcon={<BarChartIcon fontSize="small" />}
+              >
+                Bars
+              </Button>
+            </ButtonGroup>
+            <TextField
+              select
+              size="small"
+              label="Month"
+              value={xBreakdownMonth}
+              onChange={(e) => setXBreakdownMonth(e.target.value)}
+              sx={{ width: 170 }}
+            >
+              {recentMonthOptions(12).map((m) => (
+                <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
+              ))}
+            </TextField>
+          </Box>
+        </DialogTitle>
+        <DialogContent dividers>
+          {xBreakdownLoading ? (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
+          ) : xBreakdownError ? (
+            <Typography color="error" variant="body2" sx={{ py: 2 }}>{xBreakdownError}</Typography>
+          ) : (
+            <XCostBreakdown data={xBreakdownData} view={costBreakdownView} />
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setXBreakdownUser(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 
