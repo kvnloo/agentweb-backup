@@ -1167,6 +1167,72 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
   }
 });
 
+// ENG-600: audience_source shape shared by both new tools below. Exactly one
+// of hubspot_list_id / csv_url must be given — csv_url accepts a chat file
+// attachment's stored URL directly (the underlying UPLOAD_USERS action fetches
+// and parses it automatically; do not route it through read_file_content first).
+const AUDIENCE_SOURCE_SCHEMA = {
+  type: "object",
+  description: "Exactly one of hubspot_list_id or csv_url must be provided as the seed audience's source data.",
+  properties: {
+    hubspot_list_id: { type: "string", description: "HubSpot contact list (segment) ID to pull members from." },
+    csv_url: { type: "string", description: "URL of an uploaded CSV attachment (email/phone columns). Pass the chat attachment's stored URL directly — it will be fetched and parsed automatically. Do not use read_file_content first." }
+  }
+} as const;
+
+emmaToolRegistry.register({
+  name: "launch_targeted_audience_campaign",
+  definition: {
+    name: "launch_targeted_audience_campaign",
+    description: "Launch a Meta campaign targeted at a Custom Audience sourced from a HubSpot list or a CSV, optionally via a Lookalike built from that seed. Creates or reuses (by name) the Custom Audience, optionally creates a Lookalike from it, and attaches it to a NEW ad set under an existing campaign (kept separate from any broad/control campaign). Two-phase like call_meta_marketing_api writes: call once without confirm to get a preview (awaitingUserConfirmation), show it to the user, then call again with confirm=true to execute. Returns a completion ledger (source, audience, lookalike, campaign/ad set, any failures). Distinct from launch_retargeting_campaign, which requires exclude_audience_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        account_id: { type: "string", description: "Meta ad account ID (no 'act_' prefix)." },
+        campaign_id: { type: "string", description: "Existing campaign to attach the new targeted ad set to. Create it first via call_meta_marketing_api CAMPAIGN CREATE if it doesn't exist — this tool does not create campaigns." },
+        audience_name: { type: "string", description: "Name for the Meta Custom Audience to create or reuse. If an audience with this name already exists, its use is surfaced in the preview for confirmation, never reused silently." },
+        audience_source: AUDIENCE_SOURCE_SCHEMA,
+        use_lookalike: { type: "boolean", description: "Create a Lookalike Audience from the seed audience and target that instead of the seed directly." },
+        lookalike_ratio: { type: "number", description: "Lookalike ratio 0.01-0.20 (e.g. 0.01 = top 1% of country population). Required if use_lookalike is true — no default is applied." },
+        lookalike_country: { type: "string", description: "2-letter ISO country code for the lookalike (e.g. 'US'). Required if use_lookalike is true — no default is applied." },
+        ad_set_params: { type: "object", description: "Standard ad set fields (name, daily_budget/lifetime_budget, optimization_goal, billing_event, targeting.geo_locations, start_time, etc.) — same shape as call_meta_marketing_api AD_SET CREATE params, minus targeting.custom_audiences which this tool sets automatically." },
+        confirm: { type: "boolean", description: "Set true only after showing the user the resolved audience + ad set target from the preview and getting explicit approval." }
+      },
+      required: ["account_id", "campaign_id", "audience_name", "audience_source", "ad_set_params"]
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.launchTargetedAudienceCampaign(context?.userId, args);
+  }
+});
+
+emmaToolRegistry.register({
+  name: "launch_retargeting_campaign",
+  definition: {
+    name: "launch_retargeting_campaign",
+    description: "Launch a Meta retargeting campaign against a Custom Audience sourced from a HubSpot list or a CSV (e.g. past customers/existing contacts), REQUIRING an exclude_audience_id (typically the broad/prospecting audience) so retargeting spend never overlaps prospecting spend. Otherwise behaves like launch_targeted_audience_campaign: creates or reuses the audience by name, optionally builds a Lookalike from it (off by default here — retargeting usually targets the seed directly), attaches it to a NEW ad set under an existing campaign, and uses the same two-phase preview/confirm gate. Returns a completion ledger.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        account_id: { type: "string", description: "Meta ad account ID (no 'act_' prefix)." },
+        campaign_id: { type: "string", description: "Existing campaign for the retargeting ad set. This tool does not create campaigns." },
+        audience_name: { type: "string", description: "Name for the Meta Custom Audience to create or reuse. If an audience with this name already exists, its use is surfaced in the preview for confirmation, never reused silently." },
+        audience_source: AUDIENCE_SOURCE_SCHEMA,
+        exclude_audience_id: { type: "string", description: "REQUIRED. Custom Audience ID to exclude (typically the broad/prospecting audience or a control custom audience) so retargeting spend never overlaps prospecting spend. This is the key structural-separation mechanism for retargeting and has no equivalent in launch_targeted_audience_campaign." },
+        use_lookalike: { type: "boolean", description: "Optional — retargeting normally targets the seed audience directly, not a lookalike of it." },
+        lookalike_ratio: { type: "number", description: "Lookalike ratio 0.01-0.20. Required if use_lookalike is true — no default is applied." },
+        lookalike_country: { type: "string", description: "2-letter ISO country code. Required if use_lookalike is true — no default is applied." },
+        ad_set_params: { type: "object", description: "Standard ad set fields — same shape as call_meta_marketing_api AD_SET CREATE params, minus targeting.custom_audiences/excluded_custom_audiences which this tool sets automatically." },
+        confirm: { type: "boolean", description: "Set true only after showing the user the resolved audience + ad set target from the preview and getting explicit approval." }
+      },
+      required: ["account_id", "campaign_id", "audience_name", "audience_source", "exclude_audience_id", "ad_set_params"]
+    }
+  },
+  execute: async (args, context) => {
+    return await agentModeService.launchRetargetingCampaign(context?.userId, args);
+  }
+});
+
 emmaToolRegistry.register({
   name: "call_meta_ads_insights_api",
   definition: {

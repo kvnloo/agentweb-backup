@@ -355,6 +355,54 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
           ])
         );
       });
+
+      // ENG-600: the two new HubSpot/CSV audience-sourcing workflows pass an
+      // uploaded CSV attachment's URL straight through as `payload` — this
+      // locks in that the existing URL-detection/fetch path actually works
+      // before relying on it, rather than assuming.
+      it('fetches and parses a CSV payload from an https:// URL', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.uploadCustomAudienceUsers as jest.Mock).mockResolvedValue({ success: true });
+        (axios.get as jest.Mock).mockResolvedValue({
+          data: 'email1@example.com,+1234567890\nemail2@example.com,+9876543210',
+        });
+
+        const result = await agentModeService.manageMetaCustomAudiences(
+          'user123',
+          'UPLOAD_USERS',
+          '123456789',
+          { id: 'audience_123', schema: ['EMAIL', 'PHONE'], payload: 'https://s3.example.com/uploads/audience.csv' }
+        );
+
+        expect(axios.get).toHaveBeenCalledWith('https://s3.example.com/uploads/audience.csv');
+        expect(result.success).toBe(true);
+        expect(metaService.uploadCustomAudienceUsers).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          'audience_123',
+          ['EMAIL', 'PHONE'],
+          [
+            [expect.any(String), expect.any(String)],
+            [expect.any(String), expect.any(String)],
+          ]
+        );
+      });
+
+      it('surfaces an error when the CSV payload URL fails to fetch', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (axios.get as jest.Mock).mockRejectedValue(new Error('Network timeout'));
+
+        const result = await agentModeService.manageMetaCustomAudiences(
+          'user123',
+          'UPLOAD_USERS',
+          '123456789',
+          { id: 'audience_123', schema: ['EMAIL'], payload: 'https://s3.example.com/uploads/missing.csv' }
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Failed to fetch CSV content from URL');
+        expect(metaService.uploadCustomAudienceUsers).not.toHaveBeenCalled();
+      });
     });
 
     it('should return error for invalid action', async () => {

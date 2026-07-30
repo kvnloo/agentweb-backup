@@ -183,6 +183,7 @@ import {
 } from './googleAdsCampaignCriteria';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
+import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
@@ -16992,6 +16993,324 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         error: error.message
       };
     }
+  }
+
+  // ENG-600: fixed EMAIL/PHONE schema for the HubSpot/CSV audience-sourcing
+  // workflows — ticket scope is email/phone seed data, not arbitrary schemas.
+  private static AUDIENCE_SOURCE_SCHEMA = ['EMAIL', 'PHONE'];
+
+  /**
+   * Resolves the Meta Custom Audience that a targeted/retargeting campaign
+   * workflow should target: reuse an existing audience whose name matches
+   * (case-insensitive), or create a new one. Either way, the resolved
+   * audience is (re)populated from the caller's HubSpot list or CSV source —
+   * reuse does not skip the upload, so pointing an existing audience at a
+   * fresh source keeps it current rather than silently reusing stale data.
+   *
+   * `dryRun: true` only resolves the reuse-vs-create decision (for building
+   * a pre-execution confirmation preview) without creating/uploading anything.
+   *
+   * Any hard failure (LIST/CREATE/UPLOAD_USERS erroring) is thrown, not
+   * swallowed — the caller (the two new launch* orchestration methods) must
+   * fail the whole campaign-launch rather than attach an empty/broken audience.
+   * Only non-fatal source-side issues (e.g. contacts with no email/phone) are
+   * returned in `failures`.
+   */
+  private async resolveOrCreateSeedAudience(
+    userId: string,
+    accountId: string,
+    audienceName: string,
+    source: { type: 'hubspot_list'; listId: string } | { type: 'csv'; csvUrl: string },
+    opts: { dryRun: boolean }
+  ): Promise<{
+    plannedAction: 'reuse' | 'create';
+    audience?: { id: string; name: string };
+    created: boolean;
+    sourceSummary: string;
+    failures: string[];
+    recordsFound?: number;
+    recordsUsable?: number;
+  }> {
+    const listResult = await this.manageMetaCustomAudiences(userId, 'LIST', accountId, {});
+    if (!listResult.success) {
+      throw new Error(listResult.message || 'Failed to list existing Meta custom audiences.');
+    }
+    const existing = (listResult.audiences || []).find(
+      (a: any) => String(a?.name ?? '').toLowerCase() === audienceName.toLowerCase()
+    );
+    const plannedAction: 'reuse' | 'create' = existing ? 'reuse' : 'create';
+    const sourceSummary = source.type === 'hubspot_list'
+      ? `HubSpot list ${source.listId}`
+      : `CSV upload (${source.csvUrl})`;
+
+    if (opts.dryRun) {
+      return {
+        plannedAction,
+        audience: existing ? { id: existing.id, name: existing.name } : undefined,
+        created: false,
+        sourceSummary,
+        failures: [],
+      };
+    }
+
+    const failures: string[] = [];
+    let schema: string[] = AgentModeService.AUDIENCE_SOURCE_SCHEMA;
+    let payload: string[][] | string;
+    let recordsFound: number | undefined;
+    let recordsUsable: number | undefined;
+
+    if (source.type === 'hubspot_list') {
+      const hubspotSvc = await this.resolveHubSpotService(userId);
+      const contacts = await hubspotSvc.getContactsForList(source.listId);
+      const rows: string[][] = [];
+      let skipped = 0;
+      for (const c of contacts) {
+        if (c.email || c.phone) {
+          rows.push([c.email || '', c.phone || '']);
+        } else {
+          skipped++;
+        }
+      }
+      if (skipped > 0) {
+        failures.push(`${skipped} of ${contacts.length} HubSpot contacts had neither email nor phone, skipped.`);
+      }
+      payload = rows;
+      recordsFound = contacts.length;
+      recordsUsable = rows.length;
+    } else {
+      // CSV URL passed straight through — UPLOAD_USERS already fetches/parses it.
+      payload = source.csvUrl;
+    }
+
+    let audienceId: string;
+    let audienceLabel: string;
+    if (plannedAction === 'create') {
+      const createResult = await this.manageMetaCustomAudiences(userId, 'CREATE', accountId, {
+        name: audienceName,
+        subtype: 'CUSTOM',
+        customer_file_source: 'USER_PROVIDED_ONLY',
+        confirm: true,
+      });
+      if (!createResult.success) {
+        throw new Error(createResult.message || 'Failed to create Meta custom audience.');
+      }
+      audienceId = createResult.audience.id;
+      audienceLabel = createResult.audience.name;
+    } else {
+      audienceId = existing.id;
+      audienceLabel = existing.name;
+    }
+
+    const uploadResult = await this.manageMetaCustomAudiences(userId, 'UPLOAD_USERS', accountId, {
+      id: audienceId,
+      schema,
+      payload,
+      confirm: true,
+    });
+    if (!uploadResult.success) {
+      throw new Error(uploadResult.message || 'Failed to upload users to Meta custom audience.');
+    }
+
+    return {
+      plannedAction,
+      audience: { id: audienceId, name: audienceLabel },
+      created: plannedAction === 'create',
+      sourceSummary,
+      failures,
+      recordsFound,
+      recordsUsable,
+    };
+  }
+
+  /**
+   * Builds the human-readable preview shown before launching a targeted-audience
+   * or retargeting campaign, so the user always sees and confirms the resolved
+   * audience reuse/create decision before anything is created/uploaded — per
+   * ENG-600 product decision, name-collision reuse is never silent.
+   */
+  private buildAudienceCampaignConfirmationSummary(
+    workflow: 'targeted_audience' | 'retargeting',
+    args: any,
+    plan: { plannedAction: 'reuse' | 'create'; audience?: { id: string; name: string }; sourceSummary: string }
+  ): string {
+    const lines: string[] = [];
+    lines.push(
+      `${plan.plannedAction === 'reuse' ? 'Reuse existing' : 'Create a NEW'} Custom Audience "${args.audience_name}"` +
+      `${plan.audience ? ` (${plan.audience.id})` : ''}, sourced from ${plan.sourceSummary}.`
+    );
+    if (args.use_lookalike) {
+      lines.push(`Create a Lookalike Audience (ratio ${args.lookalike_ratio}, country ${args.lookalike_country}) from that seed.`);
+    }
+    lines.push(`Attach it to a NEW ad set under campaign ${args.campaign_id} (ad account ${args.account_id}).`);
+    if (workflow === 'retargeting') {
+      lines.push(`Exclude custom audience ${args.exclude_audience_id} so retargeting spend does not overlap the broad/prospecting audience.`);
+    }
+    return lines.join(' ');
+  }
+
+  /**
+   * Resolves args.audience_source into the discriminated union
+   * resolveOrCreateSeedAudience expects. Throws if neither or both of
+   * hubspot_list_id/csv_url are provided.
+   */
+  private resolveAudienceSourceArg(audience_source: any): { type: 'hubspot_list'; listId: string } | { type: 'csv'; csvUrl: string } {
+    const hasHubSpot = !!audience_source?.hubspot_list_id;
+    const hasCsv = !!audience_source?.csv_url;
+    if (hasHubSpot === hasCsv) {
+      throw new Error('audience_source must include exactly one of hubspot_list_id or csv_url.');
+    }
+    return hasHubSpot
+      ? { type: 'hubspot_list', listId: audience_source.hubspot_list_id }
+      : { type: 'csv', csvUrl: audience_source.csv_url };
+  }
+
+  /**
+   * Shared implementation for launchTargetedAudienceCampaign / launchRetargetingCampaign
+   * (ENG-600). Sources or reuses a Meta Custom Audience from a HubSpot list or CSV,
+   * optionally creates a Lookalike from it, attaches it to a new ad set under an
+   * existing campaign, and returns a completion ledger. Uses the same 2-phase
+   * preview/confirm gate as call_meta_marketing_api's write actions
+   * (buildMetaWriteConfirmation) — collectConfirmationPrompt halts the turn on any
+   * result with awaitingUserConfirmation===true, regardless of which method produced it.
+   */
+  private async launchAudienceCampaign(
+    userId: string,
+    args: any,
+    workflow: 'targeted_audience' | 'retargeting'
+  ): Promise<any> {
+    try {
+      assertMetaAccountAllowed(args.account_id);
+
+      if (workflow === 'retargeting' && !args.exclude_audience_id) {
+        throw new Error('exclude_audience_id is required for the retargeting workflow.');
+      }
+      if (args.use_lookalike) {
+        if (args.lookalike_ratio === undefined || args.lookalike_ratio === null) {
+          throw new Error('lookalike_ratio is required when use_lookalike is true (0.01-0.20). No default is applied.');
+        }
+        if (!args.lookalike_country) {
+          throw new Error('lookalike_country is required when use_lookalike is true (2-letter ISO country code). No default is applied.');
+        }
+      }
+
+      const source = this.resolveAudienceSourceArg(args.audience_source);
+      const confirmed = args.confirm === true;
+
+      if (!confirmed) {
+        const plan = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: true });
+        const summary = this.buildAudienceCampaignConfirmationSummary(workflow, args, plan);
+        return {
+          success: true,
+          requiresConfirmation: true,
+          awaitingUserConfirmation: true,
+          summary,
+          confirmationPrompt:
+            `Based on your request, here's the ${workflow === 'retargeting' ? 'retargeting' : 'targeted-audience'} campaign ` +
+            `I'm about to launch — please check it's correct before I proceed:\n\n${summary}\n\n` +
+            `Reply "yes" / "confirm" if this is correct, or tell me what to change.`,
+          confirmationDetail: summary,
+          message: `Confirm this ${workflow} campaign launch before it runs: ${summary} Show the user the plan above ` +
+            `and get explicit approval. Once approved, call this tool again with the same arguments plus confirm=true.`,
+        };
+      }
+
+      const seed = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: false });
+
+      let attachAudienceId = seed.audience!.id;
+      let lookalike: { id: string; name: string; ratio: number; country: string } | null = null;
+      if (args.use_lookalike) {
+        const lookalikeResult = await this.manageMetaCustomAudiences(userId, 'CREATE', args.account_id, {
+          name: `${args.audience_name} - Lookalike`,
+          subtype: 'LOOKALIKE',
+          lookalike_spec: {
+            origin: [{ id: seed.audience!.id }],
+            ratio: args.lookalike_ratio,
+            country: args.lookalike_country,
+          },
+          confirm: true,
+        });
+        if (!lookalikeResult.success) {
+          throw new Error(lookalikeResult.message || 'Failed to create Lookalike Audience.');
+        }
+        attachAudienceId = lookalikeResult.audience.id;
+        lookalike = {
+          id: lookalikeResult.audience.id,
+          name: lookalikeResult.audience.name,
+          ratio: args.lookalike_ratio,
+          country: args.lookalike_country,
+        };
+      }
+
+      const targeting: any = {
+        ...(args.ad_set_params?.targeting || {}),
+        custom_audiences: [{ id: attachAudienceId }],
+      };
+      if (workflow === 'retargeting') {
+        targeting.excluded_custom_audiences = [{ id: args.exclude_audience_id }];
+      }
+
+      const adSetResult = await this.createMetaAdsAdSet(userId, {
+        ...args.ad_set_params,
+        account_id: args.account_id,
+        campaign_id: args.campaign_id,
+        targeting,
+      });
+      if (!adSetResult.success) {
+        throw new Error(adSetResult.message || 'Failed to create ad set.');
+      }
+
+      const ledger = {
+        source: {
+          type: source.type,
+          identifier: source.type === 'hubspot_list' ? source.listId : source.csvUrl,
+          recordsFound: seed.recordsFound,
+          recordsUsable: seed.recordsUsable,
+        },
+        audience: { id: seed.audience!.id, name: seed.audience!.name, created: seed.created, subtype: 'CUSTOM' as const },
+        lookalike,
+        campaign: { id: args.campaign_id },
+        adSet: {
+          id: adSetResult.adSet.id,
+          name: adSetResult.adSet.name,
+          targetedAudienceId: attachAudienceId,
+          excludedAudienceId: workflow === 'retargeting' ? args.exclude_audience_id : undefined,
+        },
+        failures: seed.failures.map((message: string) => ({ step: 'seed_audience_source', message })),
+      };
+
+      return {
+        success: true,
+        workflow,
+        ledger,
+        message: `Launched ${workflow} campaign: audience "${ledger.audience.name}" (${seed.created ? 'created' : 'reused'})` +
+          `${lookalike ? `, lookalike "${lookalike.name}"` : ''} attached to ad set "${ledger.adSet.name}".`,
+      };
+    } catch (error: any) {
+      return {
+        success: false,
+        workflow,
+        ledger: { failures: [{ step: 'launch', message: error.message }] },
+        message: error.message || `Failed to launch ${workflow} campaign.`,
+      };
+    }
+  }
+
+  /**
+   * ENG-600: sources/reuses a Meta Custom Audience from a HubSpot list or CSV,
+   * optionally builds a Lookalike from it, and attaches it to a new ad set under
+   * an existing "targeted" campaign kept separate from any broad/control campaign.
+   */
+  public async launchTargetedAudienceCampaign(userId: string, args: any): Promise<any> {
+    return this.launchAudienceCampaign(userId, args, 'targeted_audience');
+  }
+
+  /**
+   * ENG-600: same audience-sourcing path as launchTargetedAudienceCampaign, but
+   * requires exclude_audience_id (typically the broad/prospecting audience) so
+   * retargeting spend structurally never overlaps prospecting spend.
+   */
+  public async launchRetargetingCampaign(userId: string, args: any): Promise<any> {
+    return this.launchAudienceCampaign(userId, args, 'retargeting');
   }
 
   /**
