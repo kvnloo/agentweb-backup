@@ -12,7 +12,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
-import { isTruncatedReasoningLeak } from './agentMode/core/reasoningLeak';
+import { isReasoningLeak } from './agentMode/core/reasoningLeak';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -3349,24 +3349,26 @@ export class AgentModeService {
         }
 
         // ENG-737: Gemini thinking models (e.g. gemini-3.5-flash) leak their raw
-        // chain-of-thought into `content` when a turn is truncated by the token
-        // limit WHILE still reasoning — the OpenAI-compat endpoint returns the
-        // partial thought (a leading `thought` marker + a google thought_signature,
-        // often a degenerate loop of repeated search queries) as the assistant
-        // message. Each truncated fragment would otherwise be persisted as a
-        // visible assistant message AND re-fed through the max-tokens continuation
-        // loop, leaking internal reasoning and repeated tool queries into the chat.
-        // Suppress the leaked fragment; the continuation loop still delivers the
-        // model's real synthesized answer on the final (non-truncated) turn.
+        // chain-of-thought into `content` — the OpenAI-compat endpoint returns the
+        // partial thought (a leading `thought` marker and/or a degenerate loop of
+        // repeated search queries) as the assistant message. This happens both when
+        // a turn is truncated mid-reasoning by the token limit (finish_reason=length,
+        // session d103071a) AND when the model prefixes a completed tool call with a
+        // raw `thought\n…` monologue (finish_reason=tool_calls, session 97d37f59).
+        // The fragment would otherwise be persisted as a visible assistant message
+        // AND (on truncation) re-fed through the max-tokens continuation loop,
+        // leaking internal reasoning and repeated tool queries into the chat.
+        // Suppress the leaked text (any accompanying tool call still executes); the
+        // model's real synthesized answer arrives on the final clean turn.
         if (
-          isTruncatedReasoningLeak({
+          isReasoningLeak({
             finishReason: response.choices[0]?.finish_reason,
             content: responseContent,
             hasThoughtSignature: !!(responseMessage as any)?.extra_content?.google?.thought_signature,
             model: llmModel,
           })
         ) {
-          console.warn(`AgentMode: Suppressing leaked Gemini reasoning fragment (finish_reason=length) in session ${sessionId}`);
+          console.warn(`AgentMode: Suppressing leaked Gemini reasoning fragment (finish_reason=${response.choices[0]?.finish_reason}) in session ${sessionId}`);
           responseContent = '';
           responseMessage.content = '';
           suppressedReasoningLeak = true;

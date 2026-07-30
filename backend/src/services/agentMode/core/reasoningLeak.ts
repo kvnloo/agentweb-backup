@@ -14,15 +14,20 @@
  * final non-truncated turn.
  *
  * This module identifies such a leaked fragment so the caller can suppress it.
- * It is intentionally conservative: it only fires on a TRUNCATED
- * (`finish_reason === 'length'`) Gemini-thinking turn whose content carries an
- * unmistakable reasoning-leak signature, so a normal truncated answer fragment
- * (which the continuation loop legitimately keeps and stitches together) is never
- * suppressed.
+ * It is intentionally conservative and only ever fires on a Gemini-thinking turn
+ * whose content carries an unmistakable reasoning-leak signature:
+ *   - a bare leading `thought` part marker — this is leaked thought output on ANY
+ *     finish_reason (observed both on truncated `length` turns, session
+ *     d103071a, AND on a completed tool-call turn, session 97d37f59, where the
+ *     model prefixed its tool call with a raw `thought\n…` monologue); or
+ *   - a degenerate repeated-line loop — only trusted on a TRUNCATED
+ *     (`finish_reason === 'length'`) turn, where the max-tokens continuation loop
+ *     will re-synthesize the real answer, so a normal (possibly repetitive but
+ *     complete) answer that finished on its own is never suppressed.
  */
 
 export interface LeakedReasoningInput {
-  /** finish_reason from the model response (only 'length' turns can be a truncated leak) */
+  /** finish_reason from the model response ('length' = truncated; gates the degenerate-loop signature) */
   finishReason?: string;
   /** the assistant content the turn returned */
   content: string;
@@ -30,6 +35,18 @@ export interface LeakedReasoningInput {
   hasThoughtSignature: boolean;
   /** the model id in use for this turn */
   model: string;
+}
+
+/**
+ * A leading `thought` part marker: the first non-blank line is exactly `thought`
+ * (case-insensitive), the OpenAI-compat label for a Gemini thought part. This is
+ * an unmistakable leak of internal reasoning that never appears at the start of a
+ * real user-facing answer, so it is a leak signal on ANY finish_reason.
+ */
+export function hasLeadingThoughtMarker(content: string): boolean {
+  if (!content) return false;
+  const firstLine = content.trimStart().split('\n', 1)[0].trim();
+  return /^thought$/i.test(firstLine);
 }
 
 /**
@@ -42,15 +59,7 @@ export interface LeakedReasoningInput {
  */
 export function looksLikeLeakedReasoning(content: string): boolean {
   if (!content) return false;
-
-  // 1. Leading OpenAI-compat "thought" part marker (a line that is exactly "thought").
-  const firstLine = content.trimStart().split('\n', 1)[0].trim();
-  if (/^thought$/i.test(firstLine)) return true;
-
-  // 2. Degenerate repeated-line loop.
-  if (hasDegenerateRepeatedLine(content)) return true;
-
-  return false;
+  return hasLeadingThoughtMarker(content) || hasDegenerateRepeatedLine(content);
 }
 
 /**
@@ -75,16 +84,20 @@ export function hasDegenerateRepeatedLine(content: string, minLen = 12, minRepea
 }
 
 /**
- * True when this turn is a truncated Gemini-thinking turn whose content is leaked
- * chain-of-thought and should therefore be suppressed from the chat. All of:
- *   - the turn was truncated by the token limit (`finish_reason === 'length'`), so
- *     the max-tokens continuation loop will run again and deliver the real answer;
- *   - it is a Gemini thinking turn (thought_signature present, or a gemini-* model);
- *   - the content carries an unmistakable reasoning-leak signature.
+ * True when this Gemini-thinking turn's content is leaked chain-of-thought and
+ * should therefore be suppressed from the chat. Requires a Gemini thinking turn
+ * (thought_signature present, or a gemini-* model) plus one of:
+ *   - a bare leading `thought` marker — a leak on ANY finish_reason (seen both on
+ *     a truncated `length` turn and on a completed tool-call turn); or
+ *   - a degenerate repeated-line loop on a TRUNCATED (`finish_reason === 'length'`)
+ *     turn, where the max-tokens continuation loop will still deliver the real
+ *     answer. The length gate keeps a legitimately repetitive BUT complete answer
+ *     (one that finished on its own) from ever being blanked.
  */
-export function isTruncatedReasoningLeak(input: LeakedReasoningInput): boolean {
-  if (input.finishReason !== 'length') return false;
+export function isReasoningLeak(input: LeakedReasoningInput): boolean {
   const isGeminiThinking = input.hasThoughtSignature || input.model.startsWith('gemini-');
   if (!isGeminiThinking) return false;
-  return looksLikeLeakedReasoning(input.content);
+  if (hasLeadingThoughtMarker(input.content)) return true;
+  if (input.finishReason === 'length' && hasDegenerateRepeatedLine(input.content)) return true;
+  return false;
 }
