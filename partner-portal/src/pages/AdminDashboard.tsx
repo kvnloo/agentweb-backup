@@ -817,6 +817,10 @@ export default function AdminDashboard() {
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [userActivities, setUserActivities] = useState<Record<string, Array<{ sessionId: string; title: string; createdAt: string; updatedAt: string; portalType?: string; sessionType?: string; delegateInfo?: { adminEmail: string; isDelegated: boolean }; }>>>({});
   const [userActivitiesLoading, setUserActivitiesLoading] = useState<Record<string, boolean>>({});
+  // Per-user current-month X (Twitter) $ cost, fetched lazily when a card expands
+  // (ENG-664) — avoids a full ledger scan on every /admin/users load. undefined =
+  // not fetched yet, null = loading, number = loaded.
+  const [xCostByUser, setXCostByUser] = useState<Record<string, number | null>>({});
   const [waitlistOrderBy, setWaitlistOrderBy] = useState<keyof WaitlistEntry>("joinedAt");
   const [waitlistOrder, setWaitlistOrder] = useState<"asc" | "desc">("desc");
   const [message, setMessage] = useState("");
@@ -4473,6 +4477,18 @@ export default function AdminDashboard() {
                           if (nextExpanded && userNotesMap[nextExpanded] === undefined) {
                             loadUserNotes(nextExpanded);
                           }
+                          // Lazily fetch this user's current-month X cost (single-user
+                          // ledger query) only when the card opens — never on list load.
+                          if (nextExpanded && xCostByUser[nextExpanded] === undefined) {
+                            const month = new Date().toISOString().slice(0, 7);
+                            setXCostByUser(prev => ({ ...prev, [nextExpanded]: null }));
+                            axios.get(buildApiUrl(`/api/admin/users/${nextExpanded}/usage/x-breakdown`), {
+                              headers: { Authorization: `Bearer ${token}` },
+                              params: { start: `${month}-01`, end: `${month}-31` },
+                            })
+                              .then(res => setXCostByUser(prev => ({ ...prev, [nextExpanded]: res.data?.costUsd ?? 0 })))
+                              .catch(() => setXCostByUser(prev => ({ ...prev, [nextExpanded]: 0 })));
+                          }
                         }}
                       >
                         <TableCell sx={{ p: 0.5, width: 32 }}>
@@ -4985,7 +5001,9 @@ export default function AdminDashboard() {
                                     />
                                     <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
                                       <Typography variant="body2">
-                                        ${(user.xCostThisMonth ?? 0).toFixed(4)} this month
+                                        {xCostByUser[user.userId] === null
+                                          ? "…"
+                                          : `$${(xCostByUser[user.userId] ?? 0).toFixed(4)} this month`}
                                       </Typography>
                                       <Tooltip title="View per-tool X (Twitter) cost breakdown">
                                         <IconButton size="small" onClick={() => openXBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>

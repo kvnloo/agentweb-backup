@@ -25,7 +25,6 @@ import { encryptPassword } from "../utils/crypto";
 import { generateSecurePassword, getInitialPasswordExpiry } from "../utils/secureRandom";
 import { grantTokenBonus, getUserTokenUsage, getUserTokenAllowance } from "../services/tokenUsageService";
 import { getRevenueMetrics } from "../services/revenueService";
-import { getXCostByActingUser } from "../services/usageAnalyticsService";
 import { getBusinessFunnelMetrics } from "../services/businessFunnelService";
 import { resyncAllSubscriptionAmounts, reconcileStripeUserById } from "../services/stripeService";
 import { syncNewUserToLeadList, syncUserUpdateToLeadList } from "../services/crmAutoSyncService";
@@ -722,21 +721,6 @@ router.get("/users", async (req, res) => {
           user.subscriptionType = orgInfo.ownerSubscriptionType;
         }
       }
-    }
-
-    // Attach each user's allocated X (Twitter) $ spend for the current calendar
-    // month (ENG-664) in ONE ledger scan, keyed on the acting userId so the card
-    // figure matches the per-user X breakdown modal. Fail-open: a metering hiccup
-    // must never break the whole user list — users just render $0 then.
-    try {
-      const monthStart = `${new Date().toISOString().slice(0, 7)}-01`;
-      const today = new Date().toISOString().slice(0, 10);
-      const xCostByUser = await getXCostByActingUser(monthStart, today);
-      for (const user of sanitized) {
-        user.xCostThisMonth = xCostByUser[user.userId] ?? 0;
-      }
-    } catch (xErr) {
-      console.error("Error attaching X cost to user list:", xErr);
     }
 
     // Batch-fetch Clarity replay session URLs for all users
