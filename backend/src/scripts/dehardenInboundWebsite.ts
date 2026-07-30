@@ -24,6 +24,7 @@
  */
 import * as fs from "fs";
 import * as path from "path";
+import AWS from "aws-sdk";
 import { skillService } from "../services/skillService";
 import { planSkillChange } from "../services/skillHardening/applyHardening";
 
@@ -48,11 +49,20 @@ function report(label: string, prompt: string, tools: string[]) {
   return leaks.length === 0 && MARKERS.every((m) => prompt.includes(m));
 }
 
+// Resolve against PROD (AW-Skills) directly — the row may not be staged to dev yet
+// on a fresh environment, so a dev-only lookup would wrongly throw before syncSkill.
 async function resolveProdId(): Promise<string> {
-  const all = await skillService.getAllSkills(); // dev + prod aware via service
-  const hit = all.find((s: any) => s.skillId.startsWith(PROD_PREFIX));
-  if (hit) return hit.skillId;
-  throw new Error(`skill ${PROD_PREFIX} not found`);
+  const ddb = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
+  let ExclusiveStartKey: any;
+  do {
+    const r = await ddb
+      .scan({ TableName: "AW-Skills", ProjectionExpression: "skillId", ExclusiveStartKey })
+      .promise();
+    const hit = (r.Items || []).find((i: any) => (i.skillId || "").startsWith(PROD_PREFIX));
+    if (hit) return hit.skillId as string;
+    ExclusiveStartKey = r.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  throw new Error(`prod skill ${PROD_PREFIX} not found in AW-Skills`);
 }
 
 async function main() {
@@ -63,8 +73,9 @@ async function main() {
 
   if (verifyOnly) {
     const cur = await skillService.getSkill(skillId);
-    if (!cur) return console.log("(not in dev)");
-    report("DEV current", cur.systemPrompt || "", cur.toolNames || []);
+    if (!cur) throw new Error("skill not found in dev");
+    const ok = report("DEV current", cur.systemPrompt || "", cur.toolNames || []);
+    if (!ok) throw new Error("DEV prompt failed verification (leaks or missing markers)");
     return;
   }
 
@@ -80,6 +91,13 @@ async function main() {
   if (!ok) throw new Error("planned prompt failed verification (leaks or missing markers) — refusing");
 
   if (apply) {
+    // Guard against a stale read-modify-write: re-read immediately before the put
+    // and bail if the row changed since we planned against it, so a concurrent edit
+    // is never silently clobbered (mirrors hardenSkills.ts).
+    const current = await skillService.getSkill(skillId);
+    if (!current || current.updatedAt !== dev.updatedAt) {
+      throw new Error("dev row changed since read (updatedAt) — aborting to avoid clobbering a concurrent edit");
+    }
     await skillService.updateSkill(plan.skill);
     const after = await skillService.getSkill(skillId);
     report("DEV after write", after!.systemPrompt || "", after!.toolNames || []);
