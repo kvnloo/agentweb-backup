@@ -13,7 +13,19 @@ import {
   Typography,
 } from "@mui/material";
 import InfoIcon from "@mui/icons-material/InfoOutlined";
-import { prettyOperation, XOperationRow } from "./XCostBreakdown";
+
+/** One X tool's spend within a rollup (the ledger model minus the "twitter:" prefix). */
+export interface XOperationRow {
+  operation: string;
+  callCount: number;
+  quantity: number;
+  costUsd: number;
+}
+
+/** "search_tweets" → "search tweets" for a friendlier tool label. */
+export function prettyOperation(op: string): string {
+  return op.replace(/_/g, " ");
+}
 
 // ── Org-aware X (Twitter) rollup, mirroring the backend GET
 // /api/admin/users/:userId/usage/x-org-rollup response (usageAnalyticsService).
