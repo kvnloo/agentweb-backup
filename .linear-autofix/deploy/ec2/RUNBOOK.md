@@ -196,9 +196,16 @@ runner (changes commit + auto-push to the open PR), read-only anywhere else. The
 resumes the pipeline's own Claude session, so the agent remembers making the fix. See the tool
 README "Chat UI".
 
+The chat + WATCH server is a **systemd service** (`autofix-chat.service`, installed by `bootstrap.sh`):
+`Restart=on-failure` gives instant crash recovery (no ≤5-min gap) and `WantedBy=multi-user.target`
+brings it back on reboot. systemd is the **single owner** — `run.sh`'s `run-chat.sh ensure` (cron)
+detects the active unit and drops to a health-only probe, so the two never race to spawn a second server.
+
 ```bash
-# on the instance (long-running, like the preview proxy — survives until stop/reboot)
-~/agentweb/.linear-autofix/chat/run-chat.sh start     # also: stop | status | restart
+# on the instance — manage the service via systemd
+sudo systemctl status  autofix-chat        # active? last restart? pid?
+sudo systemctl restart autofix-chat        # also: start | stop
+journalctl -u autofix-chat -f              # live server logs (also teed to chat/chat.log)
 
 # from your laptop — the tunnel IS the auth; no port is opened in the security group
 ssh -i <key> -L 8790:localhost:8790 ec2-user@<public-ip>
@@ -206,9 +213,12 @@ ssh -i <key> -L 8790:localhost:8790 ec2-user@<public-ip>
 ```
 
 - Full access needs `AUTOFIX_RUN_ENABLED=1` (already set in `.env` on the runner); elsewhere the chat is read-only.
-- Logs: `tail -f ~/agentweb/.linear-autofix/chat/chat.log`; per-turn transcripts in `logs/<ID>/chat-*.txt`.
-- After a stop/start cycle, restart it: `chat/run-chat.sh start` (optionally add a crontab line
-  `@reboot ~/agentweb/.linear-autofix/chat/run-chat.sh start`).
+- Logs: `journalctl -u autofix-chat -f` or `tail -f ~/agentweb/.linear-autofix/chat/chat.log`; per-turn transcripts in `logs/<ID>/chat-*.txt`.
+- Reboot recovery is automatic (the unit is enabled) — no `@reboot` crontab line needed.
+- `.env` note: systemd's `EnvironmentFile` (unlike bash) does **not** strip trailing `# comments` from a
+  value — keep any comments in `.linear-autofix/.env` on their **own lines**, or the value is corrupted.
+- Manual/legacy fallback (only if the unit is absent): `chat/run-chat.sh start|stop|status|restart` still
+  works and self-supervises; it no-ops while the systemd unit is active.
 
 ## 8. Operations
 
