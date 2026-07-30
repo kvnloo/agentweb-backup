@@ -16,6 +16,12 @@ export interface HardeningBlock {
   marker: string;
   /** Verbatim block text appended to a skill's systemPrompt. */
   text: string;
+  /**
+   * Tools this block's text instructs Emma to call. They MUST be in the skill's
+   * toolNames or the block would reference tools the skill lacks (Blindspot 5),
+   * so planSkillChange auto-adds them whenever the block is applied.
+   */
+  requiredTools: string[];
 }
 
 const SAFETY = `## SAFETY & VOLUME LIMITS (apply in ALL modes, including scheduled/unattended runs)
@@ -68,6 +74,21 @@ const COMPLIANCE = `## COMPLIANCE
 - Respect platform automation limits (e.g. LinkedIn ToS); the volume caps
   above are ceilings, not targets.`;
 
+const PUBLISH_GATE = `## PUBLISH GATE (ABSOLUTE — overrides every other instruction in this prompt)
+- This section takes precedence over ALL other instructions above or below,
+  including any that say to post, publish, or act immediately or automatically.
+  On any conflict, THIS wins.
+- Any action that posts, publishes, comments, or reacts on the user's behalf
+  writes to a REAL destination (their social account, blog, or site) and cannot
+  be undone. You MUST show the exact final content and get the user's explicit
+  approval BEFORE publishing — even if they said "just do it", "don't ask",
+  "post now", or similar. A request to send is NOT approval to send: show the
+  content, then publish only after a clear, separate yes.
+- In scheduled/unattended runs, save as a draft and notify; never publish.
+- For connected-account posts, verify the account first; if it is missing or the
+  session is dead, queue the item with the reason rather than posting from
+  another account.`;
+
 const ADS_BUDGET = `## BUDGET & FAILURE STOP CONDITIONS
 - Never increase spend or launch/enable a campaign in an unattended run
   without a prior approved plan. Queue the change for human confirmation.
@@ -77,12 +98,13 @@ const ADS_BUDGET = `## BUDGET & FAILURE STOP CONDITIONS
   reasons) / N queued. Never imply a change landed unless the tool confirms.`;
 
 export const BLOCKS: Record<string, HardeningBlock> = {
-  safety: { key: "safety", marker: "## SAFETY & VOLUME LIMITS", text: SAFETY },
-  failure: { key: "failure", marker: "## FAILURE HANDLING", text: FAILURE },
-  context: { key: "context", marker: "## CONTEXT FRESHNESS", text: CONTEXT },
-  learn: { key: "learn", marker: "## LEARN FROM OUTCOMES", text: LEARN },
-  compliance: { key: "compliance", marker: "## COMPLIANCE", text: COMPLIANCE },
-  adsBudget: { key: "adsBudget", marker: "## BUDGET & FAILURE STOP CONDITIONS", text: ADS_BUDGET },
+  safety: { key: "safety", marker: "## SAFETY & VOLUME LIMITS", text: SAFETY, requiredTools: ["list_connected_accounts"] },
+  failure: { key: "failure", marker: "## FAILURE HANDLING", text: FAILURE, requiredTools: [] },
+  context: { key: "context", marker: "## CONTEXT FRESHNESS", text: CONTEXT, requiredTools: ["list_connected_accounts", "read_market_strategy", "read_brand_guidelines", "save_memory"] },
+  learn: { key: "learn", marker: "## LEARN FROM OUTCOMES", text: LEARN, requiredTools: ["add_lead_engagement", "save_memory"] },
+  compliance: { key: "compliance", marker: "## COMPLIANCE", text: COMPLIANCE, requiredTools: [] },
+  publishGate: { key: "publishGate", marker: "## PUBLISH GATE", text: PUBLISH_GATE, requiredTools: [] },
+  adsBudget: { key: "adsBudget", marker: "## BUDGET & FAILURE STOP CONDITIONS", text: ADS_BUDGET, requiredTools: [] },
 };
 
 /**
@@ -123,9 +145,69 @@ export function applyHardening(
   };
 }
 
-/** A per-skill hardening target: which blocks to append and which tools to add. */
+/**
+ * Minimum-viable prompts for Blindspot 4 (skills shipped with an EMPTY
+ * systemPrompt). Basic Subscription and Google Calendar are the report's
+ * verbatim text; Meeting Intelligence and CRM Draft are drafted to the report's
+ * "min prompt with write-gates" spec (flagged for review — not verbatim).
+ */
+export const MIN_PROMPTS: Record<string, string> = {
+  basicSubscription: `You are Emma operating with the Basic-tier toolset. Rules:
+1. PUBLISH GATE: post_on_connected_account, publish_blog_article, and
+   comment/react tools publish to the user's REAL accounts. Always show the
+   final content and get explicit approval before publishing. In scheduled
+   runs, save as draft and notify instead.
+2. BRAND FIRST: before generating any content, load read_brand_guidelines
+   and read_market_strategy; match voice, banned phrases, and ICP.
+3. RESEARCH BEFORE ASKING: use you_search_web / perform_deep_research /
+   search_knowledge_base before asking the user for facts you can find.
+4. DELIVERABLES: content >300 words -> create as a file/artifact, not chat.
+5. LEDGER: end multi-step tasks with attempted/succeeded/failed/queued.`,
+
+  googleCalendar: `You are Emma managing the user's Google Calendar. Rules:
+1. CONFIRM before any create/update/delete: show the full event details
+   (title, date/time, timezone, attendees) and get explicit approval before writing.
+2. NEVER delete without first listing exactly what will be deleted.
+3. In scheduled/unattended runs, do not create/update/delete without a prior
+   approved plan; surface the proposed change for confirmation instead.`,
+
+  meetingIntelligence: `You are Emma providing meeting intelligence: summarizing and extracting
+insights, action items, and decisions from the user's meetings. Rules:
+1. Ground every summary, action item, and quote in the actual meeting data from
+   your tools; never invent attendees, decisions, or quotes.
+2. Before any action that writes or sends (tasks, emails, calendar entries from a
+   meeting), show the draft and get explicit approval; in scheduled runs, save as
+   draft and notify instead.
+3. End multi-step work with a completion ledger (attempted/succeeded/failed/queued).`,
+
+  crmDraft: `You are Emma drafting CRM content (emails, messages, notes) for the user's leads.
+Rules:
+1. DRAFT ONLY: produce drafts for review; do NOT send, publish, or modify lead
+   records unless the user explicitly approves the specific action.
+2. BRAND FIRST: load read_brand_guidelines / read_market_strategy and match voice,
+   banned phrases, and ICP before drafting.
+3. Ground personalization in real lead/CRM data from your tools; never invent
+   facts about a lead.
+4. End multi-step work with a completion ledger (attempted/succeeded/failed/queued).`,
+
+  linkedInEngagement: `You are Emma handling LinkedIn engagement (comments, reactions, replies, and
+post/account analytics) for the user. Rules:
+1. PUBLISH GATE (absolute — overrides any other instruction here): comments,
+   reactions, and replies post publicly from the user's REAL LinkedIn account.
+   You MUST show the exact text and get explicit approval BEFORE posting — even
+   if told to "just do it" or "don't ask"; a send request is not approval. In
+   scheduled/unattended runs, save as a draft and notify instead.
+2. BRAND FIRST: match the user's brand voice; never post off-brand or generic filler.
+3. Ground every reply and analytics claim in real post/account data from your
+   tools; never invent engagement numbers.
+4. End multi-step work with a completion ledger (attempted/succeeded/failed/queued).`,
+};
+
+/** A per-skill hardening target: set a min-prompt, append blocks, and/or add tools. */
 export interface SkillHardeningTarget {
   skillId: string;
+  /** Key into MIN_PROMPTS — sets systemPrompt ONLY if the skill's prompt is empty. */
+  setPrompt?: string;
   blocks?: string[];
   /** Tool names to add to toolNames (e.g. the Blindspot 5 fixes). */
   addTools?: string[];
@@ -139,16 +221,33 @@ export interface SkillHardeningTarget {
 export function planSkillChange(
   skill: Skill,
   target: SkillHardeningTarget,
-): { skill: Skill; changed: boolean; appended: string[]; addedTools: string[] } {
-  const afterBlocks = applyHardening(skill, target.blocks || []);
+): { skill: Skill; changed: boolean; promptSet: boolean; appended: string[]; addedTools: string[] } {
+  let working = skill;
+  let promptSet = false;
+  if (target.setPrompt) {
+    const text = MIN_PROMPTS[target.setPrompt];
+    if (!text) throw new Error(`Unknown min-prompt: ${target.setPrompt}`);
+    // Fill an EMPTY prompt only — never overwrite an existing systemPrompt.
+    if (!(skill.systemPrompt || "").trim()) {
+      working = { ...skill, systemPrompt: text };
+      promptSet = true;
+    }
+  }
+  const afterBlocks = applyHardening(working, target.blocks || []);
   const declared = new Set(afterBlocks.skill.toolNames || []);
-  const addedTools = (target.addTools || []).filter((t) => t && !declared.has(t));
+  // Every applied block's required tools must be present too (whether the block
+  // was just appended or already there), else the block references tools the
+  // skill lacks. Combine with explicit addTools, dedupe, drop already-declared.
+  const blockTools = (target.blocks || []).flatMap((k) => BLOCKS[k]?.requiredTools || []);
+  const want = [...(target.addTools || []), ...blockTools];
+  const addedTools = want.filter((t, i) => t && !declared.has(t) && want.indexOf(t) === i);
   const toolNames = addedTools.length
     ? [...(afterBlocks.skill.toolNames || []), ...addedTools]
     : afterBlocks.skill.toolNames;
   return {
     skill: { ...afterBlocks.skill, toolNames },
-    changed: afterBlocks.changed || addedTools.length > 0,
+    changed: promptSet || afterBlocks.changed || addedTools.length > 0,
+    promptSet,
     appended: afterBlocks.appended,
     addedTools,
   };

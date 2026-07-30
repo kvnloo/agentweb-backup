@@ -1,5 +1,6 @@
 import {
   BLOCKS,
+  MIN_PROMPTS,
   appendBlocks,
   applyHardening,
   planSkillChange,
@@ -97,6 +98,23 @@ describe("planSkillChange", () => {
     expect(res.skill.toolNames).toEqual(["a_tool"]);
   });
 
+  it("auto-adds a block's required tools even without explicit addTools", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "" } as any;
+    const res = planSkillChange(skill, { skillId: "s", blocks: ["learn"] });
+    expect([...res.addedTools].sort()).toEqual(["add_lead_engagement", "save_memory"]);
+    expect(res.skill.toolNames).toEqual(
+      expect.arrayContaining(["add_lead_engagement", "save_memory"]),
+    );
+  });
+
+  it("adds a block's required tools even when the block is already present (repair)", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: BLOCKS.learn.text } as any;
+    const res = planSkillChange(skill, { skillId: "s", blocks: ["learn"] });
+    expect(res.appended).toEqual([]); // block text already present
+    expect([...res.addedTools].sort()).toEqual(["add_lead_engagement", "save_memory"]);
+    expect(res.changed).toBe(true);
+  });
+
   it("applies blocks and tools together and reports both", () => {
     const skill = { skillId: "s", toolNames: [], systemPrompt: "base" } as any;
     const res = planSkillChange(skill, {
@@ -107,5 +125,49 @@ describe("planSkillChange", () => {
     expect(res.appended).toEqual(["safety"]);
     expect(res.addedTools).toEqual(["list_connected_accounts"]);
     expect(res.skill.systemPrompt).toContain(BLOCKS.safety.marker);
+  });
+});
+
+describe("planSkillChange setPrompt (Blindspot 4 empty prompts)", () => {
+  it("fills an empty systemPrompt with the named min-prompt", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "" } as any;
+    const res = planSkillChange(skill, { skillId: "s", setPrompt: "basicSubscription" });
+    expect(res.promptSet).toBe(true);
+    expect(res.changed).toBe(true);
+    expect(res.skill.systemPrompt).toBe(MIN_PROMPTS.basicSubscription);
+  });
+
+  it("does NOT overwrite a skill that already has a systemPrompt", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "existing prompt" } as any;
+    const res = planSkillChange(skill, { skillId: "s", setPrompt: "googleCalendar" });
+    expect(res.promptSet).toBe(false);
+    expect(res.changed).toBe(false);
+    expect(res.skill.systemPrompt).toBe("existing prompt");
+  });
+
+  it("treats a whitespace-only prompt as empty", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "   \n " } as any;
+    const res = planSkillChange(skill, { skillId: "s", setPrompt: "crmDraft" });
+    expect(res.promptSet).toBe(true);
+    expect(res.skill.systemPrompt).toBe(MIN_PROMPTS.crmDraft);
+  });
+
+  it("throws on an unknown min-prompt key", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "" } as any;
+    expect(() => planSkillChange(skill, { skillId: "s", setPrompt: "nope" })).toThrow(/unknown min-prompt/i);
+  });
+
+  it("sets the prompt then appends blocks + tools in one plan", () => {
+    const skill = { skillId: "s", toolNames: [], systemPrompt: "" } as any;
+    const res = planSkillChange(skill, {
+      skillId: "s",
+      setPrompt: "meetingIntelligence",
+      blocks: ["failure"],
+      addTools: ["x_tool"],
+    });
+    expect(res.promptSet).toBe(true);
+    expect(res.skill.systemPrompt).toContain("meeting intelligence");
+    expect(res.skill.systemPrompt).toContain(BLOCKS.failure.marker);
+    expect(res.addedTools).toEqual(["x_tool"]);
   });
 });
