@@ -43,6 +43,18 @@ describe("hardeningGaps", () => {
     ).toBe(false);
   });
 
+  it("needsSafetyBlock: the post_on_account MCP alias is treated as a publisher", () => {
+    // No gate at all -> gap.
+    expect(needsSafetyBlock({ toolNames: ["post_on_account"], systemPrompt: "post" })).toBe(true);
+    // A publish gate covers it (publish-power, not send-volume).
+    expect(
+      needsSafetyBlock({
+        toolNames: ["post_on_account"],
+        systemPrompt: "post\n\n## PUBLISH GATE\napprove first",
+      }),
+    ).toBe(false);
+  });
+
   it("needsSafetyBlock: a SEND tool is NOT covered by a bare PUBLISH GATE -> true", () => {
     // send_email_to_lead carries volume risk the publish gate does not govern.
     expect(

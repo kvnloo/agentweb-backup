@@ -10,6 +10,7 @@ import type { Skill } from "../services/skillService";
  * the PUBLISH GATE or the SAFETY block.
  */
 export const PUBLISH_TOOLS = new Set<string>([
+  "post_on_account",           // MCP alias — posts to a connected social account
   "post_on_connected_account",
   "publish_blog_article",
 ]);
