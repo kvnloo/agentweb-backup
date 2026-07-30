@@ -1013,7 +1013,16 @@ async def execute_task(execution):
     agent = None
     filtered_activity_log = None
     log_sync_manager = None  # Initialize to None
-    
+    # Read from `execution` (always available) rather than inside the
+    # `task_id.startswith('task-')` branch below (only entered when there's
+    # a real AW-Tasks entry) — referenced unconditionally later (revision
+    # handling), so they must be defined regardless of which branch runs.
+    # Previously caused UnboundLocalError for any ad-hoc ("task-"-prefixed)
+    # execution, e.g. workflow step tasks — found via ENG-389 live testing.
+    revision_prompt = execution.get('revision_prompt')
+    original_image_url = execution.get('original_image_url')
+    original_report_url = execution.get('original_report_url')
+
     try:
         # Get task details from tasks table if taskId doesn't start with 'task-'
         task_id = execution['taskId']
@@ -1079,10 +1088,8 @@ async def execute_task(execution):
             # Prepare the prompt with previous feedback and user_id context
             base_prompt = execution.get('prompt') or task['prompt']
             
-            # Check if this is a revision execution
-            revision_prompt = execution.get('revision_prompt')
-            original_image_url = execution.get('original_image_url')
-            original_report_url = execution.get('original_report_url')
+            # Check if this is a revision execution (revision_prompt/original_image_url/
+            # original_report_url already set above, unconditionally)
             original_execution_id = execution.get('original_execution_id')
             
             if revision_prompt and (original_image_url or original_report_url):
