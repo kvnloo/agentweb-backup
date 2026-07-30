@@ -124,8 +124,15 @@ steps from Provisioning before restarting.
 ```bash
 systemctl status agent-engine.service
 journalctl -u agent-engine -f
-tail -f /opt/agent-engine/agentweb/agent-engine/log/systemd_task_monitor.log
 ```
+
+`agent-engine.service` deliberately has no `StandardOutput`/`StandardError=append:<path>`
+— that path would live inside the `agentengine`-owned checkout, and systemd
+opens it as root before dropping privileges, which is a symlink-swap
+privilege-escalation path (Greptile finding on the PR). Journal is the only
+log surface for this unit; `ruiw`'s pre-hardening setup did use a file
+under the checkout (`log/systemd_task_monitor.log`) — that pattern is not
+carried forward here.
 
 Two alerting layers:
 

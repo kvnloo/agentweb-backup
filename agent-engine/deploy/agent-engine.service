@@ -20,8 +20,12 @@ Restart=on-failure
 RestartSec=10
 TimeoutStopSec=30
 KillMode=mixed
-StandardOutput=append:/opt/agent-engine/agentweb/agent-engine/log/systemd_task_monitor.log
-StandardError=append:/opt/agent-engine/agentweb/agent-engine/log/systemd_task_monitor.log
+# Deliberately no StandardOutput/StandardError=append:<path inside the
+# agentengine-owned checkout> — systemd (root/PID1) opens that path before
+# dropping to User=agentengine, so a compromised agentengine process could
+# swap the log file for a symlink and get a privileged append on next
+# restart. Default (journal) has no such path-ownership crossing; view logs
+# with `journalctl -u agent-engine`.
 
 [Install]
 WantedBy=multi-user.target
