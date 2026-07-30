@@ -2068,18 +2068,29 @@ export async function runScheduledChat(
         ? schedule.pendingResumeSessionId
         : undefined;
     if (pendingResumeSessionId) {
+      // Atomically CLAIM the marker (single-consumer): only the dispatcher that wins
+      // the conditional clear proceeds to resume, so two concurrent dispatchers can
+      // never continue the same session in parallel. A lost claim falls through to a
+      // normal fresh run below (never a second resume of the same session).
+      let claimedResume = false;
       try {
-        await scheduleDb.clearPendingResume(schedule.scheduleId);
+        claimedResume = await scheduleDb.claimPendingResume(schedule.scheduleId, pendingResumeSessionId);
       } catch (clearError) {
-        console.error(`Failed to clear pending resume marker for schedule ${schedule.scheduleId}:`, clearError);
+        console.error(`Failed to claim pending resume marker for schedule ${schedule.scheduleId}:`, clearError);
       }
-      try {
+      if (claimedResume) {
+       try {
         const resumeSession = await chatbotDb.getChatSession(pendingResumeSessionId);
         if (
           resumeSession &&
           resumeSession.userId === userId &&
           planScheduledRunResume((resumeSession.messages || []) as any).resumable
         ) {
+          // NOTE: the reconciler does not append a jobIncomplete placeholder on the
+          // resumable path, and buildMarketingContext() drops any assistant message
+          // flagged metadata.isErrorMessage (covers both jobIncomplete and
+          // isRunFailureNotice), so no run-failure placeholder reaches the model on
+          // resume even though the worker reloads the full transcript from the DB.
           isResumeRun = true;
           sessionId = pendingResumeSessionId;
           // Collect the tool calls already made before the interruption so the
@@ -2097,8 +2108,11 @@ export async function runScheduledChat(
         } else {
           console.warn(`runScheduledChat: resume marker for session ${pendingResumeSessionId} no longer resumable (missing/owner-mismatch/unsafe boundary); starting a fresh run.`);
         }
-      } catch (resumeError) {
+       } catch (resumeError) {
         console.error(`runScheduledChat: failed to load resume session ${pendingResumeSessionId}, starting fresh:`, resumeError);
+       }
+      } else {
+        console.warn(`runScheduledChat: lost the resume claim for session ${pendingResumeSessionId} on schedule ${schedule.scheduleId} (another dispatcher claimed it or the marker changed); starting a fresh run.`);
       }
     }
 

@@ -3298,18 +3298,26 @@ export const scheduleDb = {
     }
   },
 
-  // ENG-657: consume the resume marker once a dispatch has read it, so a resume is
-  // attempted at most once per abandonment. Unconditional (no runId guard): the
-  // marker is a hint, not a lease — a lost race just means the run restarts fresh.
-  async clearPendingResume(scheduleId: string): Promise<void> {
+  // ENG-657: atomically CLAIM the resume marker so a session is resumed by at most
+  // one dispatcher. The conditional REMOVE succeeds for exactly one caller whose read
+  // matches the stored sessionId; any concurrent dispatcher (or a marker that changed
+  // underneath) gets ConditionalCheckFailed and returns false, and must NOT resume —
+  // preventing two workers from continuing the same session in parallel. Returns true
+  // only when THIS caller won the claim.
+  async claimPendingResume(scheduleId: string, sessionId: string): Promise<boolean> {
     try {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: { scheduleId },
         UpdateExpression: 'REMOVE pendingResumeSessionId',
+        ConditionExpression: 'pendingResumeSessionId = :sid',
+        ExpressionAttributeValues: { ':sid': sessionId },
       }).promise();
-    } catch (error) {
-      handleDynamoDbError(error, 'clearPendingResume');
+      return true;
+    } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(error, 'claimPendingResume');
+      return false;
     }
   },
 
