@@ -91,14 +91,17 @@ async function main() {
   if (!ok) throw new Error("planned prompt failed verification (leaks or missing markers) — refusing");
 
   if (apply) {
-    // Guard against a stale read-modify-write: re-read immediately before the put
-    // and bail if the row changed since we planned against it, so a concurrent edit
-    // is never silently clobbered (mirrors hardenSkills.ts).
-    const current = await skillService.getSkill(skillId);
-    if (!current || current.updatedAt !== dev.updatedAt) {
-      throw new Error("dev row changed since read (updatedAt) — aborting to avoid clobbering a concurrent edit");
+    // Atomic optimistic lock: the put only lands if the row's updatedAt is still
+    // what we planned against, so a concurrent edit can never be silently
+    // overwritten (the condition is evaluated inside the write, no TOCTOU window).
+    try {
+      await skillService.updateSkill(plan.skill, { expectedUpdatedAt: dev.updatedAt });
+    } catch (e: any) {
+      if (e.code === "ConditionalCheckFailedException") {
+        throw new Error("dev row changed since read — a concurrent edit would be overwritten; aborting.");
+      }
+      throw e;
     }
-    await skillService.updateSkill(plan.skill);
     const after = await skillService.getSkill(skillId);
     report("DEV after write", after!.systemPrompt || "", after!.toolNames || []);
     console.log("\napplied to DEV ✅  (promote to prod separately via admin API after review)");
