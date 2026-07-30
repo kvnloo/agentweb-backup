@@ -74,6 +74,29 @@ function makeLeakedReasoningResponse() {
 }
 
 /**
+ * The MARKERLESS continuation fragment (session d103071a fragment 31): a truncated
+ * thinking turn with NO leading `thought` marker, but a degenerate repeated-query
+ * loop. On its own this is not a leak; it is only suppressed because it directly
+ * continues a just-suppressed marker leak (precededBySuppressedLeak wiring).
+ */
+function makeMarkerlessLoopResponse() {
+  return {
+    choices: [
+      {
+        message: {
+          role: 'assistant',
+          content: `*   Wait, let's look at the results:\n${LEAKED_QUERY}\n${LEAKED_QUERY}\n${LEAKED_QUERY}\n${LEAKED_QUERY}`,
+          tool_calls: null,
+          extra_content: { google: { thought_signature: 'CikBk9x2contsig==' } },
+        },
+        finish_reason: 'length',
+      },
+    ],
+    usage: { prompt_tokens: 6000, completion_tokens: 32000, total_tokens: 38000 },
+  };
+}
+
+/**
  * A LEGITIMATE truncated Gemini answer: finish_reason is 'length' and it is a
  * thinking turn (thought_signature present), but `content` is a real partial
  * answer with no reasoning-leak signature. This must NOT be suppressed — the
@@ -147,6 +170,37 @@ describe('AgentModeService - Gemini reasoning-leak suppression (ENG-737)', () =>
     expect(assistantMsgs[0].content).toBe(''); // leak suppressed
     expect(assistantMsgs[1].content).toBe(REAL_ANSWER);
     // No persisted assistant message anywhere carries the leaked query.
+    for (const m of assistantMsgs) {
+      expect(typeof m.content === 'string' ? m.content : '').not.toContain(LEAKED_QUERY);
+    }
+  });
+
+  it('suppresses a MARKERLESS continuation fragment that follows a suppressed marker leak', async () => {
+    mockDeps();
+
+    const REAL_ANSWER = 'The Washington State Legislature is in regular session; here is the 2026 agenda.';
+    jest
+      .spyOn(agentModeService as any, 'callLLM')
+      .mockResolvedValueOnce(makeLeakedReasoningResponse()) // iter 1: marker leak (finish_reason=length) -> suppressed
+      .mockResolvedValueOnce(makeMarkerlessLoopResponse())  // iter 2: markerless loop continuation -> suppressed via chain state
+      .mockResolvedValueOnce(makeTextResponse(REAL_ANSWER)); // iter 3: real answer
+
+    const result = await agentModeService.generateMarketingResponse(
+      'What is the status and agenda of the Washington State Legislature?',
+      [],
+      'test-user',
+      GEMINI_MODEL,
+      'test-session'
+    );
+
+    expect(result.content).toBe(REAL_ANSWER);
+    // Neither the marker leak nor the markerless continuation may reach the user.
+    expect(result.content).not.toContain(LEAKED_QUERY);
+    const assistantMsgs = (result.responseMessages as any[]).filter((m) => m.role === 'assistant');
+    expect(assistantMsgs).toHaveLength(3);
+    expect(assistantMsgs[0].content).toBe(''); // marker leak suppressed
+    expect(assistantMsgs[1].content).toBe(''); // markerless continuation suppressed
+    expect(assistantMsgs[2].content).toBe(REAL_ANSWER);
     for (const m of assistantMsgs) {
       expect(typeof m.content === 'string' ? m.content : '').not.toContain(LEAKED_QUERY);
     }
