@@ -774,6 +774,37 @@ export async function getXAllocatedTotals(
   return { start, end, ...groupTwitterRows(items) };
 }
 
+/**
+ * Allocated X (Twitter) $ spend per ACTING user over an inclusive window, in a
+ * SINGLE ledger scan (ENG-664) — powers the "X (Twitter) Cost" figure on every
+ * admin user card without a per-user query. Keyed on the row's `userId` (the
+ * acting member), so a user's total here equals what `getUserXBreakdown` shows
+ * in that user's own breakdown modal. Users with no X spend are absent from the
+ * map (the caller renders $0).
+ */
+export async function getXCostByActingUser(
+  start: string,
+  end: string
+): Promise<Record<string, number>> {
+  if (!DATE_RE.test(start) || !DATE_RE.test(end)) {
+    throw new Error("start and end must be YYYY-MM-DD");
+  }
+  if (start > end) {
+    throw new Error("start must be <= end");
+  }
+  const items = await usageRecordDb.scanByDateRange(start, end);
+  const microByUser = new Map<string, number>();
+  for (const item of items) {
+    if (!item.model || !item.model.startsWith(TWITTER_MODEL_PREFIX)) continue;
+    const uid = item.userId;
+    if (!uid) continue;
+    microByUser.set(uid, (microByUser.get(uid) || 0) + (item.costMicroUsd || 0));
+  }
+  const out: Record<string, number> = {};
+  for (const [uid, micro] of microByUser) out[uid] = micro / 1_000_000;
+  return out;
+}
+
 export interface UserXBreakdown {
   userId: string;
   start: string;
