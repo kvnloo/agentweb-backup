@@ -104,11 +104,12 @@ async function acquireWildcard(email: string): Promise<{ acquired: boolean; sent
  * The grant is written to the base table by `email`, but installSkills resolves
  * the tier by `userId` through the UserIdIndex GSI, which is eventually consistent.
  * Wait for OUR sentinel to become visible on that index before installing —
- * otherwise a stale tier read could reject a gated skill and make the read-back
- * falsely abort a valid run. Bounded (~5s); proceeds anyway if it doesn't converge.
+ * otherwise a stale tier read could reject a gated skill. Bounded (~10s); if the
+ * grant is still not confirmed visible we THROW rather than proceed, so the run
+ * never proceeds on an unconfirmed grant (the finally still restores it).
  */
 async function waitForWildcardVisible(userId: string, sentinel: string): Promise<void> {
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 40; i++) {
     const r = await ddb.query({
       TableName: USERS_TABLE, IndexName: "UserIdIndex",
       KeyConditionExpression: "userId = :u",
@@ -117,7 +118,10 @@ async function waitForWildcardVisible(userId: string, sentinel: string): Promise
     if (r.Items?.[0]?.subscriptionType === sentinel) return;
     await new Promise((res) => setTimeout(res, 250));
   }
-  console.warn("(wildcard not yet visible on UserIdIndex after ~5s — proceeding)");
+  throw new Error(
+    "wildcard grant did not become visible on UserIdIndex within ~10s — refusing to " +
+      "proceed on an unconfirmed grant (the grant is restored in the finally).",
+  );
 }
 /**
  * Restore the real prior tier, guarded so we only ever act on OUR OWN grant:
@@ -174,6 +178,41 @@ async function restoreSubscription(email: string, sentinel: string, prev: string
 }
 const isLocalApi = /(^|\/\/)(localhost|127\.0\.0\.1)(:|\/|$)/.test(API);
 
+// Interrupt safety: if the process is interrupted (Ctrl-C / SIGTERM / SIGHUP) or
+// dies on an uncaught error/rejection AFTER the grant is acquired but before the
+// finally runs, restore the grant before exiting so an interruption can't leave
+// wildcard access stranded. (A SIGKILL / power-loss can't be trapped by ANY
+// process — that residual is healed by the next run's reclaim, since the sentinel
+// carries the real tier.)
+let activeGrant: { sentinel: string; prev?: string } | null = null;
+let cleaningUp = false;
+async function cleanupOnInterrupt(reason: string, code: number): Promise<void> {
+  if (cleaningUp) return;
+  cleaningUp = true;
+  if (activeGrant) {
+    console.error(`\n(interrupted by ${reason} — restoring subscription before exit)`);
+    const g = activeGrant;
+    activeGrant = null;
+    try {
+      await restoreSubscription(EMAIL, g.sentinel, g.prev);
+    } catch {
+      /* restoreSubscription already logs + flags on failure */
+    }
+  }
+  process.exit(code);
+}
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+  process.on(sig, () => void cleanupOnInterrupt(sig, 130));
+}
+process.on("uncaughtException", (e) => {
+  console.error("uncaughtException:", e);
+  void cleanupOnInterrupt("uncaughtException", 1);
+});
+process.on("unhandledRejection", (e) => {
+  console.error("unhandledRejection:", e);
+  void cleanupOnInterrupt("unhandledRejection", 1);
+});
+
 async function main() {
   const argv = process.argv.slice(2);
   const flagVal = (n: string) => { const i = argv.indexOf(n); return i > -1 ? argv[i + 1] : undefined; };
@@ -216,6 +255,9 @@ async function main() {
             `contention on the test account). Run harness invocations sequentially and retry.`,
         );
       }
+      // Expose the grant to the interrupt handlers so a Ctrl-C/SIGTERM/error
+      // between here and the finally still restores it before exit.
+      activeGrant = { sentinel: grant.sentinel, prev: grant.prev };
       await waitForWildcardVisible(userId, grant.sentinel);
       const sessionId = await post("/api/agent-mode/sessions", token, { title: "ENG-204 harness" }).then((s) => s.sessionId || s.id);
       const inst = await agentModeService.installSkills(skillIds, userId, sessionId);
@@ -254,6 +296,7 @@ async function main() {
     // run that reclaimed our grant (that reclaimer carries the real tier forward).
     if (grant?.acquired) {
       await restoreSubscription(EMAIL, grant.sentinel, grant.prev);
+      activeGrant = null; // restored — interrupt handlers must not restore again
     }
   }
   // Respect a non-zero exitCode set by a failed subscription restore (leaves the
