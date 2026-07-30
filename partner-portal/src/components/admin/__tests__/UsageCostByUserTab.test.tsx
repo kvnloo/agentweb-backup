@@ -90,9 +90,12 @@ describe("UsageCostByUserTab pure helpers", () => {
     expect(providerOfModel("claude-opus-4-8")).toBe("llm");
   });
 
-  it("lists the providers present, 'all' first", () => {
+  it("lists the providers present, 'all' first, and always offers twitter", () => {
     expect(providersInData(AGG)).toEqual(["all", "llm", "twitter"]);
-    expect(providersInData(null)).toEqual(["all"]);
+    // twitter is always offered so the X filter is discoverable before any X usage.
+    expect(providersInData(null)).toEqual(["all", "twitter"]);
+    const noX = { ...AGG, topUsers: [{ ...AGG.topUsers[0], byModel: [{ model: "claude-opus-4-8", costUsd: 1, callCount: 1, totalTokens: 1 }] }] };
+    expect(providersInData(noX)).toEqual(["all", "llm", "twitter"]);
   });
 
   it("recomputes a user's cost/calls under a provider filter", () => {

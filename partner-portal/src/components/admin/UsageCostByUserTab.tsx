@@ -148,12 +148,20 @@ export function providerOfModel(model: string): string {
   return i > 0 ? model.slice(0, i) : "llm";
 }
 
-/** Distinct providers present in the aggregation, "all" first, then sorted. */
+const TWITTER_PROVIDER_KEY = "twitter";
+
+/**
+ * Provider options for the filter: "all" first, then the providers present in
+ * the data. "twitter" is ALWAYS offered even with no X rows — this tab exists for
+ * X metering, so the X filter must be discoverable before any X usage accrues
+ * (selecting it then shows the empty state rather than hiding the option).
+ */
 export function providersInData(agg: CostAggregation | null): string[] {
-  if (!agg) return ["all"];
-  const set = new Set<string>();
-  for (const u of agg.topUsers) {
-    for (const m of u.byModel) set.add(providerOfModel(m.model));
+  const set = new Set<string>([TWITTER_PROVIDER_KEY]);
+  if (agg) {
+    for (const u of agg.topUsers) {
+      for (const m of u.byModel) set.add(providerOfModel(m.model));
+    }
   }
   return ["all", ...[...set].sort()];
 }
