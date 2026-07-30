@@ -1176,6 +1176,7 @@ const AUDIENCE_SOURCE_SCHEMA = {
   description: "Exactly one of hubspot_list_id or csv_url must be provided as the seed audience's source data.",
   properties: {
     hubspot_list_id: { type: "string", description: "HubSpot contact list (segment) ID to pull members from." },
+    hubspot_account_id: { type: "string", description: "HubSpot connected-account ID that owns hubspot_list_id. REQUIRED whenever the user has more than one HubSpot account connected (list_connected_accounts platform=hubspot) — the tool cannot guess which portal a list ID belongs to, and errors asking for this if omitted and ambiguous. Not needed if only one HubSpot account is connected, or when using csv_url." },
     csv_url: { type: "string", description: "URL of an uploaded CSV attachment (email/phone columns). Pass the chat attachment's stored URL directly — it will be fetched and parsed automatically. Do not use read_file_content first." }
   }
 } as const;

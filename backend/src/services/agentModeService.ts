@@ -17031,7 +17031,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     userId: string,
     accountId: string,
     audienceName: string,
-    source: { type: 'hubspot_list'; listId: string } | { type: 'csv'; csvUrl: string },
+    source: { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string },
     opts: { dryRun: boolean }
   ): Promise<{
     plannedAction: 'reuse' | 'create';
@@ -17071,7 +17071,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     let recordsUsable: number | undefined;
 
     if (source.type === 'hubspot_list') {
-      const hubspotSvc = await this.resolveHubSpotService(userId);
+      const hubspotSvc = await this.resolveHubSpotService(userId, source.hubspotAccountId);
       const contacts = await hubspotSvc.getContactsForList(source.listId);
       const rows: string[][] = [];
       let skipped = 0;
@@ -17164,14 +17164,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * resolveOrCreateSeedAudience expects. Throws if neither or both of
    * hubspot_list_id/csv_url are provided.
    */
-  private resolveAudienceSourceArg(audience_source: any): { type: 'hubspot_list'; listId: string } | { type: 'csv'; csvUrl: string } {
+  private resolveAudienceSourceArg(audience_source: any): { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string } {
     const hasHubSpot = !!audience_source?.hubspot_list_id;
     const hasCsv = !!audience_source?.csv_url;
     if (hasHubSpot === hasCsv) {
       throw new Error('audience_source must include exactly one of hubspot_list_id or csv_url.');
     }
     return hasHubSpot
-      ? { type: 'hubspot_list', listId: audience_source.hubspot_list_id }
+      ? { type: 'hubspot_list', listId: audience_source.hubspot_list_id, hubspotAccountId: audience_source.hubspot_account_id }
       : { type: 'csv', csvUrl: audience_source.csv_url };
   }
 

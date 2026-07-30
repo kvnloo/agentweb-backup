@@ -163,6 +163,33 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(result.recordsUsable).toBe(3);
     });
 
+    // ENG-600 live-test finding: a user with 2+ connected HubSpot accounts has
+    // no way to disambiguate which one owns a given list_id — resolveHubSpotService
+    // throws "Multiple HubSpot accounts found" when accountId is omitted. The
+    // hubspot_list source must carry an optional hubspotAccountId through to
+    // resolveHubSpotService.
+    it('passes hubspotAccountId through to resolveHubSpotService when provided', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [] } as any);
+      spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_new_4', name: 'X' } } as any);
+      spy.mockResolvedValueOnce({ success: true } as any);
+
+      const mockGetContactsForList = jest.fn().mockResolvedValue([
+        { contactId: '1', email: 'a@example.com', phone: '111' },
+      ]);
+      const resolveHubSpotSpy = jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue({
+        getContactsForList: mockGetContactsForList,
+      });
+
+      await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-27', hubspotAccountId: '245815183' },
+        { dryRun: false }
+      );
+
+      expect(resolveHubSpotSpy).toHaveBeenCalledWith(USER_ID, '245815183');
+    });
+
     it('throws (fails fast) when the LIST lookup fails, without attempting CREATE/UPLOAD_USERS', async () => {
       jest.spyOn(agentModeService, 'manageMetaCustomAudiences').mockResolvedValueOnce({
         success: false, message: 'Meta API unreachable',
