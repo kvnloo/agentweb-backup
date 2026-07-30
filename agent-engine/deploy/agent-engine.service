@@ -28,7 +28,17 @@ Environment="FROM_EMAIL=AgentWeb <no-reply@agentweb.pro>"
 Environment=SITE_DOMAIN=https://partner.agentweb.pro
 Environment=CUSTOMER_FRONTEND_URL=https://app.agentweb.pro
 Environment=ONCALL_EMAIL_LIST=harsha@agentweb.pro
+# BROWSER_HEADLESS=false means Playwright launches a real (non-headless)
+# browser, which needs an X server. Xvfb is already running on :99 on this
+# VM (long-running, PID predates this ticket) — found via live testing
+# ("Missing X server or $DISPLAY" from Playwright) that DISPLAY isn't set
+# anywhere else discoverable (not in the old .env, not in the recovered
+# original systemd unit). How the currently-live ruiw process gets a
+# working DISPLAY is unclear — this may be a latent gap there too, not
+# something newly introduced here. Setting explicitly rather than relying
+# on an unexplained mechanism.
 Environment=BROWSER_HEADLESS=false
+Environment=DISPLAY=:99
 Environment=MAX_CONCURRENT_TASKS=5
 Environment=TASK_EXECUTION_TIMEOUT_SECONDS=900
 Environment=COMPLEX_TASK_EXECUTION_TIMEOUT_SECONDS=5400
