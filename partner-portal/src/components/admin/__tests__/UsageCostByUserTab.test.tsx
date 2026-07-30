@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom";
 import axios from "axios";
@@ -8,6 +8,7 @@ import UsageCostByUserTab, {
   userRowForProvider,
   rankedUserRows,
   providerIsAllocatedEstimate,
+  xAccountsFromFeatures,
   CostAggregation,
 } from "../UsageCostByUserTab";
 
@@ -26,6 +27,10 @@ const AGG: CostAggregation = {
   end: "2026-07-29",
   totals: { costUsd: 1.24, callCount: 40, totalTokens: 1000 },
   byModel: [],
+  byFeature: [
+    { feature: "x-account:acc-1", costUsd: 0.3, callCount: 18, totalTokens: 0 },
+    { feature: "agent-chat", costUsd: 0.94, callCount: 22, totalTokens: 1000 },
+  ],
   topUsers: [
     {
       userId: "user-a",
@@ -52,6 +57,29 @@ const AGG: CostAggregation = {
   ],
 };
 
+const RECON = {
+  cycle: { start: "2026-07-03", end: "2026-07-20" },
+  measured: { projectId: "p1", projectCap: 2_000_000, projectUsage: 4141, capResetDay: 3 },
+  allocated: { costUsd: 0.3, callCount: 18, postReadUnits: 5000 },
+  reconciliation: {
+    allocatedPostReadUnits: 5000,
+    measuredPostReadUnits: 4141,
+    dedupSavingsUnits: 859,
+    capUsedPct: (4141 / 2_000_000) * 100,
+    measuredDerivedCostUsd: 0.28,
+  },
+};
+
+// Route axios by endpoint — the tab fetches cost-aggregation AND x-reconciliation.
+function routeAxios(opts?: { reconError?: any }) {
+  mockedAxios.get.mockImplementation((url: string) => {
+    if (url.includes("/x-reconciliation")) {
+      return opts?.reconError ? Promise.reject(opts.reconError) : Promise.resolve({ data: RECON });
+    }
+    return Promise.resolve({ data: AGG });
+  });
+}
+
 describe("UsageCostByUserTab pure helpers", () => {
   it("classifies vendor-namespaced models by provider and plain ids as llm", () => {
     expect(providerOfModel("twitter:post")).toBe("twitter");
@@ -69,7 +97,6 @@ describe("UsageCostByUserTab pure helpers", () => {
     expect(x).not.toBeNull();
     expect(x!.costUsd).toBeCloseTo(0.1, 6);
     expect(x!.callCount).toBe(10);
-    // A user with no spend under a provider drops out.
     expect(userRowForProvider(AGG.topUsers[0], "v0")).toBeNull();
   });
 
@@ -83,37 +110,64 @@ describe("UsageCostByUserTab pure helpers", () => {
     expect(providerIsAllocatedEstimate("twitter")).toBe(true);
     expect(providerIsAllocatedEstimate("llm")).toBe(false);
   });
+
+  it("extracts per-X-account rollups from the feature dimension, skipping non-X features", () => {
+    const accts = xAccountsFromFeatures(AGG.byFeature);
+    expect(accts).toEqual([{ accountId: "acc-1", costUsd: 0.3, callCount: 18 }]);
+    expect(xAccountsFromFeatures(undefined)).toEqual([]);
+  });
 });
 
 describe("UsageCostByUserTab rendering", () => {
   beforeEach(() => jest.resetAllMocks());
 
-  it("renders per-user rows from the cost-aggregation endpoint", async () => {
-    mockedAxios.get.mockResolvedValueOnce({ data: AGG });
+  it("renders per-user rows, the by-account table, and the reconciliation panel", async () => {
+    routeAxios();
     render(<UsageCostByUserTab />);
 
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
     expect(screen.getByText("(no email on file)")).toBeInTheDocument();
-    // All-provider total is the sum of both users' full spend.
     expect(screen.getByTestId("total-cost")).toHaveTextContent("$1.24");
+
+    // by-account cut
+    const acctTable = await screen.findByTestId("x-account-table");
+    expect(acctTable).toHaveTextContent("acc-1");
+
+    // reconciliation panel (measured vs allocated)
+    const panel = await screen.findByTestId("x-recon-panel");
+    expect(panel).toBeInTheDocument();
+    expect(screen.getByTestId("x-recon-cap")).toHaveTextContent("4,141");
+    expect(screen.getByTestId("x-recon-dedup")).toHaveTextContent("859");
   });
 
   it("filtering to X recomputes totals and shows the allocated caveat", async () => {
-    mockedAxios.get.mockResolvedValue({ data: AGG });
+    routeAxios();
     render(<UsageCostByUserTab />);
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
 
     await userEvent.click(screen.getByLabelText("Provider"));
     await userEvent.click(await screen.findByRole("option", { name: "X (Twitter)" }));
 
-    // twitter-only total = 0.1 + 0.2 = 0.30
     await waitFor(() => expect(screen.getByTestId("total-cost")).toHaveTextContent("$0.30"));
-    // The allocated caveat appears both as the info banner and per-row chips.
     expect(screen.getAllByText(/allocated/i).length).toBeGreaterThan(0);
   });
 
-  it("surfaces a load error", async () => {
-    mockedAxios.get.mockRejectedValueOnce({ response: { data: { message: "nope" } } });
+  it("degrades gracefully when X reconciliation is unavailable (502)", async () => {
+    routeAxios({ reconError: { response: { data: { message: "X app bearer token is not configured" } } } });
+    render(<UsageCostByUserTab />);
+
+    await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+    const err = await screen.findByTestId("x-recon-error");
+    expect(err).toHaveTextContent(/bearer token/i);
+    // The rest of the tab still renders.
+    expect(screen.getByTestId("total-cost")).toBeInTheDocument();
+  });
+
+  it("surfaces a load error for the main aggregation", async () => {
+    mockedAxios.get.mockImplementation((url: string) => {
+      if (url.includes("/x-reconciliation")) return Promise.resolve({ data: RECON });
+      return Promise.reject({ response: { data: { message: "nope" } } });
+    });
     render(<UsageCostByUserTab />);
     await waitFor(() => expect(screen.getByText("nope")).toBeInTheDocument());
   });
