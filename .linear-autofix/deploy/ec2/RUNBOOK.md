@@ -235,6 +235,20 @@ ssh -i <key> -L 8790:localhost:8790 ec2-user@<public-ip>
   interactive Claude use. Default model is Sonnet; an `opus`/`hard`/`complex` label on
   an issue switches that one to Opus.
 
+### Observability (ENG-655)
+
+- **Log retention:** `bootstrap.sh` installs `/etc/logrotate.d/autofix` (from
+  `deploy/ec2/autofix-logrotate.conf`) — `poll.log` + `chat.log` are `copytruncate`-rotated at 20 MB,
+  5 compressed generations, run daily by `logrotate.timer`. This is an independent backstop to `run.sh`'s
+  per-cycle rotation (which stops if the poll cron stops). Inspect: `sudo logrotate --debug /etc/logrotate.d/autofix`.
+- **SSM Agent:** `bootstrap.sh` installs + enables `amazon-ssm-agent` (Session Manager / Run Command).
+  It runs, but the box only becomes a **managed instance** once the IAM role grants
+  `AmazonSSMManagedInstanceCore` — that IAM change is deferred to Harsha / **ENG-562**, not applied here.
+- **CloudWatch alarms:** `deploy/ec2/cloudwatch-alarms.draft.json` is a **DRAFT** (not applied) — four
+  alarms: no-successful-poll-in-15 min (off the poll heartbeat / metrics `lastPollAt`), disk %, mem %, and
+  IAM AccessDenied count. Each entry is a `put-metric-alarm --cli-input-json` payload; the header lists the
+  metric-publishing prerequisites. Apply via Harsha / **ENG-562** after filling `<INSTANCE_ID>`/`<SNS_TOPIC_ARN>`.
+
 ## 9. Granting access to other users
 
 The security group only allows the **provisioner's** IP on port 22 (and your IP changes
