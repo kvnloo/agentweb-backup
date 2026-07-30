@@ -34,6 +34,10 @@ const post = (path: string, token: string | null, body: any) =>
     headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     body: JSON.stringify(body),
   }).then(j);
+const get = (path: string, token: string | null) =>
+  fetch(`${API}${path}`, {
+    headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+  }).then(j);
 
 async function getSubscription(email: string): Promise<string | undefined> {
   const r = await ddb.get({ TableName: USERS_TABLE, Key: { email } }).promise();
@@ -67,8 +71,11 @@ async function main() {
     process.exit(2);
   }
   // --install installs skills and toggles the subscription IN-PROCESS against the
-  // local NODE_ENV DB, while turns hit HARNESS_API. Those must be the same env, so
-  // refuse --install against a non-local API (would mutate the wrong environment).
+  // local NODE_ENV DB, while turns hit HARNESS_API. Those must be the same env.
+  // A non-local API is refused up front (cheap pre-check); a localhost URL alone
+  // does NOT prove same NODE_ENV/AWS account, so the authoritative guard is the
+  // post-install read-back below, which verifies the skills actually landed in
+  // the session the backend serves.
   if (skillIds.length && !isLocalApi) {
     console.error(`--install mutates the local NODE_ENV data in-process; it only works against the local backend, but HARNESS_API=${API}. Refusing.`);
     process.exit(2);
@@ -89,6 +96,27 @@ async function main() {
       const inst = await agentModeService.installSkills(skillIds, userId, sessionId);
       console.log("installed:", JSON.stringify(inst.installedSkills || inst.message));
       console.log("session:", sessionId, "\n");
+      // Prove the in-process install actually landed in the session the BACKEND
+      // serves. A localhost URL doesn't guarantee the harness process and
+      // HARNESS_API share a NODE_ENV / AWS account; this read-back does. It also
+      // catches skills that silently failed to install (unpublished / not
+      // available to the user), so a turn that ran WITHOUT the skill is never
+      // mistaken for a behavioral pass.
+      const view = await get(`/api/agent-mode/session/${sessionId}`, token);
+      const landed = new Set(
+        (view.skills || []).filter((s: any) => s.installed).map((s: any) => s.skillId),
+      );
+      const missing = skillIds.filter((id) => !landed.has(id));
+      if (missing.length) {
+        throw new Error(
+          `Requested skill(s) not present in the backend's session: ${missing.join(", ")}. ` +
+            `Cause is either (a) HARNESS_API=${API} is a different environment than this process ` +
+            `(NODE_ENV=${process.env.NODE_ENV}), so the in-process install hit a different data store, ` +
+            `or (b) the skill is unavailable to the test user (e.g. unpublished). ` +
+            `Aborting before turns so a skill-less run is never read as a behavioral pass.`,
+        );
+      }
+      console.log("install verified in session ✅\n");
       await runTurns(token, sessionId, messages, model);
     } else {
       const sessionId = await post("/api/agent-mode/sessions", token, { title: "ENG-204 harness" }).then((s) => s.sessionId || s.id);
