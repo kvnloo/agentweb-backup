@@ -16,6 +16,7 @@ import { applyAssigneeIdentity, applyWorktreeIdentity, resolveAssigneeGhToken } 
 import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
 import { evictPreviewsToFit, atConcurrentPreviewCap } from './preview/policy.mjs';
 import { acquireLock, releaseLock } from './lock.mjs';
+import { admissionWithdrawal, signalSuppressionVerdict } from './admission.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..'); // the agentweb (main) repo root
@@ -63,7 +64,23 @@ function saveState(s) { writeFileSync(statePath, JSON.stringify(s, null, 2)); }
 // git identity (commit attribution) and their raw Linear email (keys the per-assignee PR-token map,
 // which may differ from the commit email when a git-identity override is used). Both are needed by
 // the chat UI to attribute its own commits/PRs, so they must survive every rewrite.
-const STICKY_FIELDS = ['assignee', 'assigneeEmail'];
+const STICKY_FIELDS = ['assignee', 'assigneeEmail', 'admit'];
+
+// The in-flight run's abort context (ENG-654): so a between-stage admission re-check OR an external
+// SIGTERM (from gc/poll) can kill THIS run's detached claude process group and tear its workspace down.
+// Populated once main() has resolved the issue, lock, and worktree.
+const currentRun = { id: null, issueId: null, WT: null, lockPath: null, claudePid: null };
+// Kill the detached claude process GROUP for the current stage, if one is running (negative pid = the
+// whole group, exactly like runClaude's timeout kill — takes claude AND its dev servers/workers).
+function killCurrentClaude() {
+  const pid = currentRun.claudePid;
+  if (!pid) return;
+  try { process.kill(-pid, 'SIGKILL'); } catch { try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ } }
+  currentRun.claudePid = null;
+}
+function dropStateEntry(issueId) {
+  try { const s = loadState(); if (s[issueId]) { delete s[issueId]; saveState(s); } } catch { /* best-effort */ }
+}
 // Read-modify-write against a FRESH read, so concurrent autofix/revise processes (maxConcurrent > 1)
 // can't clobber each other's entries with a stale in-memory copy. Sticky fields are carried forward
 // from the prior entry unless the new one sets them explicitly.
@@ -193,6 +210,28 @@ export function prepareWorktreeDeps(WT) {
   }
 }
 
+// Between-stage admission re-check (ENG-654): before each EXPENSIVE stage, re-read the LIVE issue and, if
+// a human has withdrawn its admission (force label removed / moved to Done·Canceled·Blocked / reassigned
+// away), ABORT — kill claude, comment, tear down the workspace + preview, drop the state entry, and exit.
+// Fail-safe: a missing admit (non-forced run) or a transient Linear read is treated as "keep going"
+// (admissionWithdrawal already returns not-withdrawn for an absent issue), so a healthy run is never aborted.
+async function assertAdmission(stage) {
+  if (!currentRun.issueId) return;
+  let admit; try { admit = loadState()[currentRun.issueId]?.admit; } catch { admit = null; }
+  if (!admit) return; // not an admitted/forced run — nothing to withdraw
+  let live; try { live = await resolveIssue(currentRun.id); } catch { return; } // transient read → proceed
+  const w = admissionWithdrawal(admit, live, config);
+  if (!w.withdrawn) return;
+  log(`Admission withdrawn before ${stage} (${w.reason}) — aborting ${currentRun.id}.`);
+  killCurrentClaude();
+  try { await addComment(live.id, `🛑 **Admission withdrawn — aborted.** ${w.reason}. The in-flight autofix run was stopped and its workspace removed before the \`${stage}\` stage.`); } catch { /* best-effort */ }
+  try { teardown(currentRun.WT); } catch { /* best-effort */ }
+  try { spawnSync('node', [previewScript, 'down', currentRun.id], { stdio: 'ignore' }); } catch { /* best-effort */ }
+  dropStateEntry(currentRun.issueId);
+  try { releaseLock(currentRun.lockPath); } catch { /* best-effort */ }
+  process.exit(0);
+}
+
 async function main() {
   const ref = process.argv[2];
   const dryRun = process.argv.includes('--dry-run');
@@ -238,6 +277,21 @@ async function main() {
   const model = labelNames.some((n) => config.opusLabels.includes(n)) ? config.opusModel : config.defaultModel;
   const branch = `${assigneeBranchPrefix(identity, config.branchPrefix)}${id.toLowerCase()}-${kebab(issue.title)}`;
   const WT = path.resolve(agentRoot, config.worktreesDir, id);
+
+  // ENG-654: arm the abort context + an external-abort signal. gc/poll SIGTERM this pipeline process when
+  // they detect a withdrawn admission; here we kill our own detached claude group, tear down, and exit.
+  // (gc has already posted the withdrawal comment on that path.) Only synchronous cleanup — the handler
+  // may fire mid-await.
+  currentRun.id = id; currentRun.issueId = issue.id; currentRun.WT = WT; currentRun.lockPath = lockPath;
+  process.once('SIGTERM', () => {
+    log(`SIGTERM — admission withdrawn externally; aborting ${id}.`);
+    killCurrentClaude();
+    try { teardown(WT); } catch { /* best-effort */ }
+    try { spawnSync('node', [previewScript, 'down', id], { stdio: 'ignore' }); } catch { /* best-effort */ }
+    dropStateEntry(issue.id);
+    try { releaseLock(lockPath); } catch { /* best-effort */ }
+    process.exit(0);
+  });
 
   if (dryRun) {
     log(`DRY RUN — model=${model}, branch=${branch}`);
@@ -320,6 +374,7 @@ async function main() {
   // Run claude -p at the workspace root, on your subscription. The fixer only COMMITS; the PR is
   // opened later by this orchestrator, after the review + browser-verify gates.
   log(`Running claude (model=${model}) — this can take up to ${Math.round(config.timeoutMs / 60000)} min...`);
+  await assertAdmission('fixer'); // ENG-654: don't spend a fixer run on a withdrawn admission
   const result = await runClaude(claudeArgs({ model, maxTurns: config.maxTurns }), prompt, WT, config.timeoutMs, 'fixer');
   let marker = parseMarker(result);
   let changed = detectChangedRepos(WT);
@@ -345,6 +400,7 @@ async function main() {
 
     // --- Code review gate: experts -> manager -> re-fix (BEFORE the PR and BEFORE browser verify) ---
     if (config.review?.enabled) {
+      await assertAdmission('review'); // ENG-654
       try { review = await runReview(issue, WT, changed, branch, sessionContext); }
       catch (e) { log('Review error:', e.message); }
       changed = detectChangedRepos(WT); // a re-fix may have added commits (or reverted to none)
@@ -359,6 +415,7 @@ async function main() {
     // --- Final test: bring up a full preview and drive a real browser on the reviewed code ---
     let verify = null;
     if (config.verify?.enabled) {
+      await assertAdmission('verify'); // ENG-654: bringing up a full preview stack is the priciest stage
       try { verify = await runVerify(issue, WT); } catch (e) { log('Verify error:', e.message); }
     }
 
@@ -397,6 +454,16 @@ async function main() {
       log(`Push to ${pushFailed.join(', ')} failed — downgrading triage green → manual (fix is not on the remote).`);
       triage = 'manual';
     }
+    // ENG-654 SIGNAL-SUPPRESSION guard: a "fix" whose NET diff only deletes/skips/weakens tests (or
+    // silences a reliability signal) must NOT pass the reliability gate. Force it to rework
+    // (→ fixed_needs_human) so a person reviews it; it is never advertised green / auto-merged.
+    try {
+      const sup = signalSuppressionVerdict(netDiffFiles(changed), { skipsAdded: countAddedSkipMarkers(changed) });
+      if (sup.suppressed && triage !== 'rework') {
+        log(`Signal-suppression rejected: ${sup.reason} — downgrading triage ${triage} → rework (fixed_needs_human).`);
+        triage = 'rework';
+      }
+    } catch (e) { log(`signal-suppression check failed (ignored): ${e.message}`); }
     log(`Triage: ${triage}`);
     enforcePreviewPolicy(id, triage);
 
@@ -486,6 +553,7 @@ export function runClaude(args, prompt, cwd, timeoutMs = config.timeoutMs, stage
     // (dev servers, workers, test runners). A plain child.kill orphaned a 3.7GB backend worker
     // for 6 hours on ENG-124 and helped OOM the box.
     const child = spawn('claude', args, { cwd, env: process.env, detached: true });
+    currentRun.claudePid = child.pid; // ENG-654: so an admission-withdrawal abort can kill this group
     let out = '';
     let timedOut = false;
     const timer = setTimeout(() => {
@@ -494,12 +562,13 @@ export function runClaude(args, prompt, cwd, timeoutMs = config.timeoutMs, stage
     }, timeoutMs);
     // A spawn failure (e.g. `claude` not on PATH under cron) emits 'error' and would otherwise
     // CRASH the whole run as an unhandled event — resolve with empty output instead.
-    child.on('error', (e) => { clearTimeout(timer); log(`claude spawn failed${stage ? ` (stage ${stage})` : ''}: ${e.message}`); resolve({ out, timedOut, spawnError: e.message }); });
+    child.on('error', (e) => { clearTimeout(timer); currentRun.claudePid = null; log(`claude spawn failed${stage ? ` (stage ${stage})` : ''}: ${e.message}`); resolve({ out, timedOut, spawnError: e.message }); });
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => process.stderr.write(d));
     child.stdin.on('error', () => { /* EPIPE when the child never started */ });
     child.on('close', () => {
       clearTimeout(timer);
+      currentRun.claudePid = null; // stage done — nothing to kill until the next stage spawns
       if (stage) {
         if (timedOut) log(`Stage ${stage} hit its ${Math.round(timeoutMs / 60000)}min timeout (SIGKILL) — continuing with partial output.`);
         try {
@@ -600,6 +669,33 @@ export function detectChangedRepos(WT) {
     }
   }
   return found;
+}
+
+// ENG-654: aggregate `git diff --numstat` across all changed repos into [{path, added, removed}] for the
+// signal-suppression gate (admission.mjs). Binary files (numstat '-') are skipped.
+export function netDiffFiles(changed) {
+  const files = [];
+  for (const c of changed || []) {
+    const out = gitIn(c.wt, ['diff', '--numstat', `origin/${c.base}...HEAD`]).stdout || '';
+    for (const line of out.split('\n')) {
+      const m = /^(\d+)\t(\d+)\t(.+)$/.exec(line.trim());
+      if (m) files.push({ path: m[3], added: Number(m[1]), removed: Number(m[2]) });
+    }
+  }
+  return files;
+}
+// Count ADDED test-skip / focus markers in the diff — a fix that just skips the failing test is signal
+// suppression even when line counts look net-neutral (a skip is one changed word, not a net deletion).
+export function countAddedSkipMarkers(changed) {
+  let n = 0;
+  const re = /\bx(it|describe)\b|\b(it|describe|test)\.(skip|only)\b|@pytest\.mark\.skip|@unittest\.skip\b|\bt\.Skip\(/;
+  for (const c of changed || []) {
+    const out = gitIn(c.wt, ['diff', `origin/${c.base}...HEAD`]).stdout || '';
+    for (const line of out.split('\n')) {
+      if (line.startsWith('+') && !line.startsWith('+++') && re.test(line)) n++;
+    }
+  }
+  return n;
 }
 
 // Did the commits between `headBefore` (per-repo shas snapshotted before a chat turn) and HEAD touch

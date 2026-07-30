@@ -9,8 +9,9 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from 'no
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
-import { resolveIssue } from './linear.mjs';
+import { resolveIssue, addComment } from './linear.mjs';
 import { lockActive } from './lock.mjs';
+import { admissionWithdrawal } from './admission.mjs';
 import { evictIdlePreviews, evictUnderMemoryPressure, stalePreviews } from './preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -20,6 +21,7 @@ const chatStatePath = path.join(__dirname, 'chat', 'chat-state.json');
 const previewScript = path.join(__dirname, 'preview', 'preview.mjs');
 const worktreesDir = path.resolve(agentRoot, config.worktreesDir);
 const logsDir = path.join(__dirname, 'logs');
+const locksDir = path.join(__dirname, 'chat', 'locks');
 const DONE_TYPES = config.gcDoneStateTypes || ['completed', 'canceled'];
 const log = (...a) => console.log('[gc]', ...a);
 
@@ -56,6 +58,67 @@ function removeWorktree(id) {
   rmSync(WT, { recursive: true, force: true });
 }
 
+// The lock file for `id` records the holder PID. Return it ONLY when it is a LIVE pipeline process
+// (autofix.mjs / revise.mjs) — never the long-lived chat server — so an external abort can SIGTERM the
+// right process and never take down the server. Linux /proc is the box's platform.
+function pipelineLockPid(id) {
+  try {
+    const j = JSON.parse(readFileSync(path.join(locksDir, `${id}.lock`), 'utf8'));
+    const pid = j.pid;
+    if (!pid) return null;
+    try { process.kill(pid, 0); } catch { return null; }        // dead → nothing to signal
+    let cmd = ''; try { cmd = readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch { return null; }
+    return /autofix\.mjs|revise\.mjs/.test(cmd) ? pid : null;    // confirm it's a pipeline run, not the chat server
+  } catch { return null; }
+}
+
+// ENG-654: abort IN-FLIGHT forced runs whose admission a human has WITHDRAWN (force label removed, moved
+// to Done/Canceled/Blocked, or reassigned away). Unlike the terminal-state reap below, this fires while a
+// run is LIVE. For a live pipeline holder we SIGTERM it (its own handler kills its detached claude group +
+// tears down + drops the entry); if the run already died we tear the workspace down here; if a
+// NON-pipeline op (a chat turn) holds the lock we defer (never kill the server, never yank its worktree).
+// The Linear/teardown/kill probes are injectable so this is unit-testable without touching real state.
+export async function abortWithdrawnInFlight({
+  resolveIssue: resolveFn = resolveIssue,
+  lockActive: lockFn = lockActive,
+  pipelinePid = pipelineLockPid,
+  comment = addComment,
+  kill = (pid) => process.kill(pid, 'SIGTERM'),
+  teardown = removeWorktree,
+  log: logFn = log,
+  statePathOverride = statePath,
+} = {}) {
+  let state = {}; try { state = JSON.parse(readFileSync(statePathOverride, 'utf8')); } catch { return []; }
+  const aborted = [];
+  for (const e of Object.values(state)) {
+    if (!e?.identifier || e.standalone || !e.admit) continue;   // only admitted (forced) runs are abortable
+    // Abortable = still in-flight: a bare admit entry (outcome not yet set), or a live pipeline outcome.
+    if (e.outcome && !['started', 'recovered'].includes(e.outcome)) continue;
+    let issue; try { issue = await resolveFn(e.identifier); } catch { continue; } // transient/deleted → leave it
+    const w = admissionWithdrawal(e.admit, issue, config);
+    if (!w.withdrawn) continue;
+    if (lockFn(e.identifier)) {
+      const pid = pipelinePid(e.identifier);
+      if (!pid) { logFn(`${e.identifier}: admission withdrawn (${w.reason}) but a non-pipeline op holds it — deferring abort`); continue; }
+      logFn(`${e.identifier}: admission withdrawn (${w.reason}) → SIGTERM pipeline pid ${pid}`);
+      try { await comment(issue.id, `🛑 **Admission withdrawn — aborted.** ${w.reason}. The in-flight autofix run was stopped and its workspace removed.`); } catch { /* best-effort */ }
+      try { kill(pid); } catch { /* already gone */ }
+    } else {
+      logFn(`${e.identifier}: admission withdrawn (${w.reason}) → no live holder, tearing down orphaned run`);
+      try { await comment(issue.id, `🛑 **Admission withdrawn — aborted.** ${w.reason}. The stranded autofix workspace was removed.`); } catch { /* best-effort */ }
+      try { teardown(e.identifier); } catch { /* best-effort */ }
+    }
+    aborted.push(e.identifier);
+  }
+  if (aborted.length) {
+    // Drop the aborted entries against a FRESH read (the pipeline handler may have dropped some already).
+    let fresh = {}; try { fresh = JSON.parse(readFileSync(statePathOverride, 'utf8')); } catch { /* none */ }
+    for (const k of Object.keys(fresh)) if (aborted.includes(fresh[k].identifier)) delete fresh[k];
+    writeFileSync(statePathOverride, JSON.stringify(fresh, null, 2));
+  }
+  return aborted;
+}
+
 // Given the current state.json entries and the set of ids that DO have a worktree, return the ids of
 // worktree-less entries whose Linear issue is Done/Canceled and are therefore safe to reap. Standalone
 // CHAT-* entries (not Linear issues), still-open issues, locked/in-flight issues, and issues that no
@@ -86,6 +149,11 @@ export async function reapableWorktreelessIds(entries, worktreeIds, {
 
 async function main() {
   if (!process.env.LINEAR_API_KEY) { console.error('[gc] LINEAR_API_KEY not set'); process.exit(2); }
+
+  // ENG-654: abort any in-flight forced run whose admission a human withdrew — BEFORE the normal reap
+  // (which skips locked/in-flight worktrees). Best-effort; never let it block the rest of the GC pass.
+  try { const ab = await abortWithdrawnInFlight(); if (ab.length) log(`aborted ${ab.length} withdrawn in-flight run(s): ${ab.join(', ')}`); }
+  catch (e) { log(`withdrawal-abort sweep failed: ${e.message}`); }
 
   // Reap previews untouched for previewIdleHours (default 24h), independent of worktree state — a
   // long-abandoned preview holds ~0.8GB even while its issue is still open. Uses the same last-hit

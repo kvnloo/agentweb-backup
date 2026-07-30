@@ -12,6 +12,8 @@ import path from 'node:path';
 import { config } from './config.mjs';
 import { listNewBugs, listForcedBugs, listStaleInProgress, resolveIssue, addComment, findStateId, moveIssue, linearStatePatch, linearPriorityPatch, linearTitlePatch } from './linear.mjs';
 import { assigneeRefreshPatch } from './git-identity.mjs';
+import { admitSnapshot } from './admission.mjs';
+import { abortWithdrawnInFlight } from './gc.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const statePath = path.join(__dirname, 'state.json');
@@ -55,6 +57,14 @@ async function processNewBugs() {
     forcedIds = new Set(forced.map((b) => b.identifier));
     eligibleCount += forced.length;
     if (forced.length) {
+      // ADMISSION SNAPSHOT (ENG-654): record WHAT admitted each forced bug (force label + assignee +
+      // state) BEFORE the run, keyed by issue id. autofix carries it forward (STICKY_FIELDS) through every
+      // state rewrite; the between-stage / gc / poll re-checks compare it to the live issue to detect a
+      // human withdrawal and abort. Written to a fresh read so we don't clobber concurrent chat entries.
+      const now = new Date().toISOString();
+      const s0 = loadState();
+      for (const b of forced) s0[b.id] = { ...(s0[b.id] || {}), identifier: b.identifier, admit: admitSnapshot(b, now) };
+      saveState(s0);
       forced.sort(byPriority);
       // Urgent → no concurrency cap: run ALL forced bugs at once (or `maxForcedConcurrent` if set > 0).
       const fw = config.maxForcedConcurrent > 0 ? config.maxForcedConcurrent : forced.length;
@@ -183,6 +193,9 @@ async function main() {
     console.error('[poll] refusing to run: AUTOFIX_RUN_ENABLED != 1 (fixes are EC2-only; set it in .linear-autofix/.env on the designated runner)');
     process.exit(2);
   }
+  // ENG-654: before picking anything, abort any in-flight forced run whose admission a human has
+  // withdrawn (label pulled / moved to Done·Canceled·Blocked / reassigned). Shared with gc; idempotent.
+  try { await abortWithdrawnInFlight(); } catch (e) { console.error('[poll] withdrawal-abort sweep failed:', e.message); }
   const eligibleCount = await processNewBugs();
   await recoverStale();
   await scanRevisions();
