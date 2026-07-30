@@ -24,7 +24,7 @@
   "Statement": [
     {
       "Sid": "DevDynamoFullCrud",
-      "//": "OBSERVED: per-fix preview DEV backend — item CRUD on Dev-AW-* only. Tight canary: CreateTable + UpdateTimeToLive dropped (assumes Dev-AW-* already provisioned); re-add if the preview backend must run create-tables.ts.",
+      "//": "OBSERVED: per-fix preview DEV backend — item CRUD on Dev-AW-* only. Tight canary: table-create and TTL-write verbs removed (assumes Dev-AW-* is already provisioned); re-add them if the preview backend provisions tables at boot.",
       "Effect": "Allow",
       "Action": [
         "dynamodb:BatchGetItem",
@@ -46,7 +46,7 @@
     },
     {
       "Sid": "ProdDynamoReadOnly",
-      "//": "OBSERVED: session.mjs read-only prod pulls (AW-ChatSessions / AW-ChatMessages / AW-TaskExecutions). Tight canary: GetItem on the base table only — Query, BatchGetItem, and the GSI index/* resource dropped (session.mjs uses get-item). Re-add if a prod Query/GSI read shows AccessDenied.",
+      "//": "OBSERVED: session.mjs read-only prod pulls (AW-ChatSessions / AW-ChatMessages / AW-TaskExecutions). Tight canary: get-item on the base table only — batch and query reads plus the GSI index/* resource were removed (session.mjs uses get-item). Re-add a query/GSI read only if the canary shows AccessDenied.",
       "Effect": "Allow",
       "Action": "dynamodb:GetItem",
       "Resource": "arn:aws:dynamodb:us-west-2:992382574572:table/AW-*"
