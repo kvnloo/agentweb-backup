@@ -147,6 +147,32 @@ The agent is typically called from the main application, but you can also test i
 ./web_agent.py --task_id <task_id> --prompt "your task prompt here"
 ```
 
+## Production Deployment
+
+Production runs on a dedicated GCP VM under systemd, as a dedicated
+`agentengine` OS user — not a personal account, not a `screen` session.
+Full provisioning, secrets, deploy, monitoring, and rollback steps are in
+[`deploy/RUNBOOK.md`](deploy/RUNBOOK.md).
+
+Quick reference:
+
+```bash
+# Status / logs
+systemctl status agent-engine.service
+journalctl -u agent-engine -f
+
+# Restart after a deploy
+sudo systemctl restart agent-engine
+```
+
+Secrets (API keys, AWS credentials, etc.) are fetched from **GCP Secret
+Manager** at runtime via `secrets_manager.py`, not read from a plaintext
+`.env` file in production. Local development is unaffected — set the same
+variable names in `.env` as always; an env var always takes precedence over
+Secret Manager, so nothing changes for local dev. See `.env.example` for the
+full list and `deploy/RUNBOOK.md`'s Secrets section for the Secret Manager
+naming scheme.
+
 ## Development
 
 To extend the agent's capabilities:

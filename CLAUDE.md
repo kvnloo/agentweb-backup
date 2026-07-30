@@ -470,7 +470,7 @@ Uses browser-use library with Playwright:
 **Production:**
 - Backend: AWS Elastic Beanstalk (Node.js platform), environment `Agentweb-backend-env-prod-3` → `https://api.agentweb.pro`
 - Partner Portal: AWS Elastic Beanstalk → `https://agentweb.pro`
-- Agent Engine: Google Cloud VM (manually deployed)
+- Agent Engine: Google Cloud VM, systemd-managed (dedicated `agentengine` OS user, auto-restart on crash + boot). See `agent-engine/deploy/RUNBOOK.md` for provisioning, secrets, deploy, and rollback.
 
 **Staging:**
 - Backend: AWS Elastic Beanstalk, environment `Agentweb-backend-env-1` → `https://api-stage.agentweb.pro`
@@ -553,14 +553,15 @@ zip -r "builds/${LABEL}.zip" dist package.json package-lock.json
 ```
 
 **Agent Engine:**
+
+Runs under systemd on `agentweb-agentengine-instance-prod2`, as the `agentengine`
+OS user. Full deploy/restart/rollback steps: `agent-engine/deploy/RUNBOOK.md`.
+Quick reference:
 ```bash
-# SSH to Google Cloud VM
-cd ~/agentweb
-git pull
-conda activate agent-engine
-pip install -r requirements.txt
-playwright install
-# Restart task_monitor.py
+sudo -u agentengine -i
+cd /opt/agent-engine/agentweb
+git pull origin main   # see RUNBOOK.md for the deploy-token auth step
+sudo systemctl restart agent-engine
 ```
 
 ## Environment Configuration
@@ -587,6 +588,16 @@ Secrets stored in AWS Secrets Manager (accessed at runtime):
 - `dev/AgentWeb/Webflow` or `dev/AgentWeb/Webflow/<userId>` - Webflow CMS credentials
 - `dev/AgentWeb/LinkedIn/Personal` - LinkedIn personal profile credentials
 - `dev/AgentWeb/LinkedIn/Company` - LinkedIn company page credentials
+
+### Agent Engine `.env`
+
+Agent-engine's own secrets (API keys, AWS credentials for DynamoDB/S3/Bedrock,
+SMTP, etc.) are **not** in AWS Secrets Manager above — they're in **GCP Secret
+Manager** (project `agent-engine-460619`, IDs `agentengine-<env>-<name>`),
+since the VM has no AWS-facing identity federation. See
+`agent-engine/deploy/RUNBOOK.md`'s Secrets section for the full list and why.
+Local dev still uses `agent-engine/.env` (see `.env.example`) exactly as
+before — env vars always take precedence over Secret Manager.
 
 ### Frontend `.env` (Build Time)
 
