@@ -309,6 +309,41 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(workerArg.messageContent).toBe(baseSchedule.startingMessage);
       });
 
+      it('counts the abandoned portion\'s required function calls so a resume is not falsely failed (ENG-657)', async () => {
+        // Schedule REQUIRES get_marketing_tips (a subscription-allowed function in
+        // this suite's mock); it was called before the crash and is in the resumable
+        // history. The continuation turn does NOT re-call it.
+        const priorCall = 'get_marketing_tips';
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'automated run' },
+            { role: 'user', content: 'Do the marketing task.' },
+            { role: 'assistant', content: 'Fetching tips.', tool_calls: [{ id: 'c1', function: { name: priorCall } }] },
+            { role: 'tool', tool_call_id: 'c1', content: '{"ok":true}' },
+          ],
+        } as any);
+        // Continuation produces only the final write-up — does NOT re-call the tool.
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+          ...mockResponse, content: 'Here are the top 10 recommended leads and 2 follow-up drafts.', toolCalls: [],
+        });
+
+        const result = await runScheduledChat(
+          { ...resumeSchedule, requiredFunctionCalls: [priorCall] } as any,
+          mockUserId,
+          false,
+        );
+
+        // sanity: resume actually fired (no fresh session)
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        // The prior call is credited → run passes without re-running it...
+        expect(result.functionCallMatches).toContain(priorCall);
+        expect(result.functionCallMisses).not.toContain(priorCall);
+        expect(result.passed).toBe(true);
+        // ...and the verify loop does NOT retry (which could have re-driven the tool).
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      });
+
       it('ignores the resume marker for a manual test run (never resumes)', async () => {
         mockChatbotDb.getChatSession.mockResolvedValue({
           ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
