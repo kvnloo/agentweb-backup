@@ -3,9 +3,12 @@
  *
  * The shapes below mirror the production session d103071a-…-f118f50eb366:
  * gemini-3.5-flash truncated its answer mid-reasoning and the OpenAI-compat
- * endpoint returned the raw chain-of-thought (a leading `thought` marker + a
+ * endpoint returned the raw chain-of-thought (a lowercase `thought` marker + a
  * degenerate loop of repeated search queries) as the assistant content, which
  * leaked into the chat. No real customer data is embedded here.
+ *
+ * The detector is deliberately conservative: it fires ONLY on a TRUNCATED
+ * (finish_reason='length') Gemini turn, so a COMPLETED answer is never blanked.
  */
 
 import {
@@ -16,8 +19,10 @@ import {
   type LeakedReasoningInput,
 } from '../reasoningLeak';
 
-// A leaked `thought` monologue prefixed to a COMPLETED tool call — the shape seen
-// in production session 97d37f59 (finish_reason='tool_calls', no thought_signature).
+// A leaked `thought` monologue prefixed to a COMPLETED tool call (session 97d37f59,
+// finish_reason='tool_calls'). The detector deliberately does NOT suppress this — a
+// finished turn is never blanked, even with a thought marker — to guarantee a real
+// answer is never erased.
 const LEAKED_TOOL_PREAMBLE =
   "thought\nAh, let's read the content of `tool-responses/abc.txt` to find the article.\n" +
   "Wait, let's use `read_tool_response` on `tool-responses/abc.txt` which is small enough.";
@@ -46,17 +51,19 @@ const base: LeakedReasoningInput = {
 };
 
 describe('hasDegenerateRepeatedLine', () => {
-  it('detects a long line repeated 4+ times consecutively', () => {
-    expect(hasDegenerateRepeatedLine(Array(4).fill(REPEATED_QUERY).join('\n'))).toBe(true);
+  it('detects a long line repeated 6+ times consecutively', () => {
+    expect(hasDegenerateRepeatedLine(Array(6).fill(REPEATED_QUERY).join('\n'))).toBe(true);
   });
 
-  it('does not fire on 3 repeats (below threshold)', () => {
-    expect(hasDegenerateRepeatedLine(Array(3).fill(REPEATED_QUERY).join('\n'))).toBe(false);
+  it('does not fire on 5 repeats (below the conservative threshold)', () => {
+    // Legit content may intentionally repeat an identical line a handful of times
+    // (template / data / code rows); the real leak repeats 10-12×.
+    expect(hasDegenerateRepeatedLine(Array(5).fill(REPEATED_QUERY).join('\n'))).toBe(false);
   });
 
   it('ignores short/trivial repeated lines (e.g. list bullets, rules)', () => {
-    expect(hasDegenerateRepeatedLine('---\n---\n---\n---\n---')).toBe(false);
-    expect(hasDegenerateRepeatedLine('\n\n\n\n\n')).toBe(false);
+    expect(hasDegenerateRepeatedLine('---\n---\n---\n---\n---\n---\n---')).toBe(false);
+    expect(hasDegenerateRepeatedLine('\n\n\n\n\n\n\n')).toBe(false);
   });
 
   it('does not treat non-adjacent duplicates separated by other content as a loop', () => {
@@ -67,9 +74,14 @@ describe('hasDegenerateRepeatedLine', () => {
 });
 
 describe('hasLeadingThoughtMarker', () => {
-  it('fires when the first non-blank line is exactly "thought"', () => {
+  it('fires when the first non-blank line is exactly the lowercase word "thought"', () => {
     expect(hasLeadingThoughtMarker('thought\nLet me reconsider.')).toBe(true);
     expect(hasLeadingThoughtMarker('\n\n  thought\nmore')).toBe(true);
+  });
+
+  it('does NOT fire on a capitalized "Thought" heading (case-sensitive — never a real heading)', () => {
+    expect(hasLeadingThoughtMarker('Thought\nA reflection on the strategy.')).toBe(false);
+    expect(hasLeadingThoughtMarker('THOUGHT\nsomething')).toBe(false);
   });
 
   it('does NOT fire when "thought" is only a prefix of a longer first line', () => {
@@ -83,7 +95,7 @@ describe('hasLeadingThoughtMarker', () => {
 });
 
 describe('looksLikeLeakedReasoning', () => {
-  it('fires on a leading bare "thought" marker line', () => {
+  it('fires on a leading bare lowercase "thought" marker line', () => {
     expect(looksLikeLeakedReasoning('thought\nLet me reconsider the plan.')).toBe(true);
   });
 
@@ -143,10 +155,11 @@ describe('isReasoningLeak', () => {
     ).toBe(true);
   });
 
-  // Production session 97d37f59: the `thought` marker leaked on a COMPLETED tool-call
-  // turn (finish_reason != 'length', no thought_signature). The old length-only gate
-  // missed this; a bare `thought` marker is a leak regardless of finish_reason.
-  it('suppresses a leaked `thought` preamble on a completed tool-call turn (finish_reason=tool_calls)', () => {
+  // A COMPLETED turn is never a candidate — even one carrying a `thought` marker.
+  // This is the deliberate safety guarantee: a finished answer can never be blanked.
+  // (Cost: the rarer completed-tool-call-preamble leak shape, session 97d37f59, is
+  // not caught. Accepted, because guaranteeing a real answer is never erased wins.)
+  it('does NOT suppress a `thought` preamble on a completed tool-call turn (finish_reason=tool_calls)', () => {
     expect(
       isReasoningLeak({
         finishReason: 'tool_calls',
@@ -154,15 +167,13 @@ describe('isReasoningLeak', () => {
         hasThoughtSignature: false,
         model: 'gemini-3.5-flash',
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
-  it('suppresses a leaked `thought` marker even on a naturally-stopped turn (finish_reason=stop)', () => {
-    expect(isReasoningLeak({ ...base, finishReason: 'stop' })).toBe(true);
+  it('does NOT suppress on a naturally-stopped turn even with a leak-shaped body', () => {
+    expect(isReasoningLeak({ ...base, finishReason: 'stop' })).toBe(false);
   });
 
-  // The degenerate-loop signature stays conservatively length-gated: a repetitive
-  // BUT complete answer (finished on its own) must never be blanked.
   it('does NOT suppress a degenerate repeated-line loop when the turn completed (finish_reason=stop)', () => {
     expect(
       isReasoningLeak({ ...base, finishReason: 'stop', content: LEAKED_CONTINUATION }),
