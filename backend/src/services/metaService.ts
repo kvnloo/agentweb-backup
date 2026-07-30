@@ -1871,30 +1871,59 @@ export class MetaService {
     }
   }
 
+  // Meta caps a single POST /{audience_id}/users request at 10,000 records.
+  // Uploads above that must be split into sequential batches sharing one
+  // session_id, with batch_seq incrementing from 1 and last_batch_flag set
+  // only on the final batch — Meta's documented multi-batch upload protocol.
+  private static readonly CUSTOM_AUDIENCE_USERS_BATCH_SIZE = 10000;
+
   /**
-   * Add users to a Custom Audience (from CSV/Hashed data)
+   * Add users to a Custom Audience (from CSV/Hashed data). Payloads over
+   * 10,000 rows are chunked into sequential session-batched requests
+   * (see CUSTOM_AUDIENCE_USERS_BATCH_SIZE); smaller payloads are sent as a
+   * single request with no session object, unchanged from prior behavior.
    */
   public async uploadCustomAudienceUsers(adAccountId: string, accessToken: string, audienceId: string, schema: string[], payload: string | string[][]) {
     try {
       this.initApi(accessToken);
       const audience = new CustomAudience(audienceId);
-      
-      this.log(`Uploading users to custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
-      
-      const params = {
-        payload: {
-          schema: schema,
-          data: payload
-        }
-      };
 
-      // For 'createUser' edge (POST /users), the first arg is 'fields' (usually empty), second is 'params'
-      const result = await audience.createUser(
-        [], 
-        params
-      );
-      
-      return result._data || result;
+      this.log(`Uploading users to custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
+
+      const rows = payload;
+      if (!Array.isArray(rows) || rows.length <= MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE) {
+        const result = await audience.createUser([], { payload: { schema, data: payload } });
+        return result._data || result;
+      }
+
+      // Multi-batch upload: same session_id across every chunk, sequential
+      // (not parallel) so batch_seq ordering matches send order.
+      const sessionId = Math.floor(Math.random() * 1_000_000_000);
+      const totalBatches = Math.ceil(rows.length / MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE);
+      let lastResult: any;
+      for (let i = 0; i < totalBatches; i++) {
+        const chunk = rows.slice(
+          i * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE,
+          (i + 1) * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE
+        );
+        const batchSeq = i + 1;
+        const isLastBatch = batchSeq === totalBatches;
+        this.log(`Uploading batch ${batchSeq}/${totalBatches} to custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
+        const result = await audience.createUser([], {
+          payload: {
+            schema,
+            data: chunk,
+            session: {
+              session_id: sessionId,
+              batch_seq: batchSeq,
+              last_batch_flag: isLastBatch,
+              estimated_num_total: rows.length,
+            },
+          },
+        });
+        lastResult = result._data || result;
+      }
+      return lastResult;
     } catch (error) {
        return this.handleError(error, 'uploadCustomAudienceUsers');
     }

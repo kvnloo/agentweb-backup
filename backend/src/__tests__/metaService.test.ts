@@ -754,6 +754,83 @@ describe('MetaService', () => {
             }));
             expect(result).toEqual(mockAudienceData);
         });
+
+        describe('uploadCustomAudienceUsers', () => {
+            it('sends a single request with no session object when the payload is <= 10,000 rows', async () => {
+                const mockCreateUser = jest.fn().mockResolvedValue({ _data: { num_received: 2 } });
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    createUser: mockCreateUser,
+                }));
+
+                const payload = [['hash1', 'hash2'], ['hash3', 'hash4']];
+                const result = await service.uploadCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL', 'PHONE'], payload
+                );
+
+                expect(mockCreateUser).toHaveBeenCalledTimes(1);
+                const [, calledParams] = mockCreateUser.mock.calls[0];
+                expect(calledParams.payload.schema).toEqual(['EMAIL', 'PHONE']);
+                expect(calledParams.payload.data).toEqual(payload);
+                expect(calledParams.payload.session).toBeUndefined();
+                expect(result).toEqual({ num_received: 2 });
+            });
+
+            // ENG-600 known gap, now fixed: Meta caps a single /users request at
+            // 10,000 records ("If you have an upload with more than 10,000 users,
+            // you need to split it into separate batches"). A payload above that
+            // must be chunked into sequential requests sharing one session_id,
+            // incrementing batch_seq from 1, with last_batch_flag only on the
+            // final chunk — Meta's documented multi-batch upload protocol.
+            it('chunks a payload over 10,000 rows into sequential session-batched requests', async () => {
+                const mockCreateUser = jest.fn()
+                    .mockResolvedValueOnce({ _data: { num_received: 10000 } })
+                    .mockResolvedValueOnce({ _data: { num_received: 500 } });
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    createUser: mockCreateUser,
+                }));
+
+                const payload = Array.from({ length: 10500 }, (_, i) => [`hash${i}`]);
+                await service.uploadCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL'], payload
+                );
+
+                expect(mockCreateUser).toHaveBeenCalledTimes(2);
+
+                const [, firstParams] = mockCreateUser.mock.calls[0];
+                expect(firstParams.payload.data).toHaveLength(10000);
+                expect(firstParams.payload.session.batch_seq).toBe(1);
+                expect(firstParams.payload.session.last_batch_flag).toBe(false);
+                expect(typeof firstParams.payload.session.session_id).toBe('number');
+
+                const [, secondParams] = mockCreateUser.mock.calls[1];
+                expect(secondParams.payload.data).toHaveLength(500);
+                expect(secondParams.payload.session.batch_seq).toBe(2);
+                expect(secondParams.payload.session.last_batch_flag).toBe(true);
+                // Same session_id across all batches in the upload.
+                expect(secondParams.payload.session.session_id).toBe(firstParams.payload.session.session_id);
+            });
+
+            it('surfaces a mid-upload batch failure (throws) without silently dropping it', async () => {
+                const mockCreateUser = jest.fn()
+                    .mockResolvedValueOnce({ _data: { num_received: 10000 } })
+                    .mockRejectedValueOnce(new Error('Batch 2 rejected'));
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    createUser: mockCreateUser,
+                }));
+
+                const payload = Array.from({ length: 10500 }, (_, i) => [`hash${i}`]);
+
+                // handleError(error, context) throws (context is provided by every
+                // caller in this service) rather than returning an error shape —
+                // a batch failure partway through a chunked upload must propagate,
+                // not be silently swallowed after already having sent batch 1.
+                await expect(service.uploadCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL'], payload
+                )).rejects.toThrow('Batch 2 rejected');
+
+                expect(mockCreateUser).toHaveBeenCalledTimes(2);
+            });
+        });
     });
 
     describe('Targeting Operations', () => {
