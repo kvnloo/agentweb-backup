@@ -63,6 +63,15 @@ const ACCOUNTS = [
 // split in the per-user table without changing who the cost bills to.
 const ACTING_MEMBER_EMAIL = "ruiwa.ng.wa.rm@gmail.com";
 
+// Members of the AgentWeb HQ owner's ORG who also act on that X account — so the
+// org-aware X rollup (x-org-rollup) shows a real per-member split, not just the
+// owner. Billing still rolls to the owner (test@example.com). These are real
+// members of that org in the dev DB.
+const ORG_MEMBER_EMAILS = [
+  "eng288member+1783925045@example.com",
+  "eng288discriminator+1783936267327@example.com",
+];
+
 // Per-day operation mix. Units scale by the account's `activity` factor and a
 // deterministic per-day wobble so the time series isn't a flat line. `link` marks
 // post-creates that carry a URL (triggers the $0.20 rate instead of $0.015).
@@ -178,6 +187,48 @@ async function seed() {
     }
     console.log(`  ✓ seeded ${cfg.handle} (@${cfg.accountId}) owned by ${cfg.ownerEmail}`);
   }
+
+  // Org-member spend on the AgentWeb HQ account → the x-org-rollup shows a real
+  // per-member split. Acting = the member; billing = the AgentWeb HQ owner.
+  const agentweb = owners.find((o) => o.cfg.accountId === "eng664-demo-acct-agentweb");
+  if (agentweb) {
+    for (let mi = 0; mi < ORG_MEMBER_EMAILS.length; mi++) {
+      const mem = await userDb.getUserByEmail(ORG_MEMBER_EMAILS[mi]);
+      const memId = mem?.userId as string | undefined;
+      if (!memId) {
+        console.warn(`  ⚠ org member ${ORG_MEMBER_EMAILS[mi]} not found — skipping`);
+        continue;
+      }
+      // A lighter spread than the owner: search + reply over the last week.
+      for (let day = 0; day < 7; day++) {
+        const date = dateNDaysAgo(day);
+        for (const spec of [
+          { op: "search_tweets" as TwitterOperation, base: 3 },
+          { op: "reply" as TwitterOperation, base: 1 },
+        ]) {
+          const units = spec.base * (mi + 1) + wobble(day, mi);
+          const cost = computeTwitterCost(spec.op, units);
+          await usageRecordDb.incrementUsage({
+            userId: memId,
+            billingUserId: agentweb.ownerId,
+            date,
+            model: `${TWITTER_PROVIDER}:${spec.op}`,
+            feature: `x-account:${agentweb.cfg.accountId}`,
+            inputTokens: 0,
+            outputTokens: 0,
+            costMicroUsd: Math.round(cost.costUsd * 1e6),
+            provider: TWITTER_PROVIDER,
+            unit: cost.unit,
+            quantity: cost.quantity,
+            costSource: "allocated",
+          });
+          rowWrites++;
+        }
+      }
+      console.log(`  ✓ seeded org-member spend for ${ORG_MEMBER_EMAILS[mi]}`);
+    }
+  }
+
   console.log(`Done. ${rowWrites} incrementUsage writes across ${owners.length} account(s).`);
 }
 
@@ -189,6 +240,11 @@ async function clean() {
   const actingIds = new Set<string>();
   owners.forEach((o) => actingIds.add(o.ownerId));
   if (memberId) actingIds.add(memberId);
+  // Org members seeded on the AgentWeb HQ account (for the x-org-rollup demo).
+  for (const email of ORG_MEMBER_EMAILS) {
+    const m = await userDb.getUserByEmail(email);
+    if (m?.userId) actingIds.add(m.userId as string);
+  }
 
   const demoAccountIds = new Set<string>(ACCOUNTS.map((a) => a.accountId));
   const startDate = dateNDaysAgo(DAYS - 1);
