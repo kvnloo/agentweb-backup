@@ -1565,6 +1565,7 @@ export class AgentModeService {
 
   // ENG-737: native @google/genai adapter (leak-free) + its kill-switch cache.
   private gemini_native_client: any | null = null;
+  private gemini_native_sdk_promise: Promise<any> | null = null;
   private gemini_api_key_promise: Promise<string> | null = null;
   private geminiNativeFlagCache: { value: boolean; expiresAt: number } | null = null;
   private static readonly GEMINI_NATIVE_FLAG_TTL_MS = 60_000;
@@ -1642,10 +1643,20 @@ export class AgentModeService {
     if (this.gemini_native_client) return this.gemini_native_client;
     this.gemini_native_client = createGeminiNativeClient({
       defaultMaxTokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
-      getClient: async () => {
-        const { GoogleGenAI } = await import('@google/genai');
-        const apiKey = await this.getGeminiApiKey();
-        return new GoogleGenAI({ apiKey });
+      getClient: () => {
+        // Cache the SDK client so each agent turn reuses it (the key fetch is
+        // already cached); reset the promise on failure so a transient secret
+        // error can be retried.
+        if (this.gemini_native_sdk_promise) return this.gemini_native_sdk_promise;
+        this.gemini_native_sdk_promise = (async () => {
+          const { GoogleGenAI } = await import('@google/genai');
+          const apiKey = await this.getGeminiApiKey();
+          return new GoogleGenAI({ apiKey });
+        })().catch((err) => {
+          this.gemini_native_sdk_promise = null;
+          throw err;
+        });
+        return this.gemini_native_sdk_promise;
       },
     });
     return this.gemini_native_client;

@@ -41,6 +41,26 @@ describe('toGeminiRequest', () => {
     ]);
   });
 
+  it('sets a request timeout (default 5 min, override honored)', () => {
+    const def = toGeminiRequest({ model: 'gemini-3.5-flash', messages: [{ role: 'user', content: 'hi' }] }, OPTS);
+    expect(def.config.httpOptions).toEqual({ timeout: 5 * 60 * 1000 });
+
+    const override = toGeminiRequest(
+      { model: 'gemini-3.5-flash', messages: [{ role: 'user', content: 'hi' }] },
+      { defaultMaxTokens: 32000, requestTimeoutMs: 1234 },
+    );
+    expect(override.config.httpOptions).toEqual({ timeout: 1234 });
+  });
+
+  it('guards an empty contents (system-only history) with a minimal user turn', () => {
+    const req = toGeminiRequest(
+      { model: 'gemini-3.5-flash', messages: [{ role: 'system', content: 'only system' }] },
+      OPTS,
+    );
+    expect(req.config.systemInstruction).toBe('only system');
+    expect(req.contents).toEqual([{ role: 'user', parts: [{ text: '.' }] }]);
+  });
+
   it('always sets thinkingConfig.includeThoughts=false (the leak fix)', () => {
     const req = toGeminiRequest(
       { model: 'gemini-3.5-flash', messages: [{ role: 'user', content: 'hi' }] },

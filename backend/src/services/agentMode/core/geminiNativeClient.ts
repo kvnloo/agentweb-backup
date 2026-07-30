@@ -26,9 +26,14 @@ export interface OpenAIChatParams {
   response_format?: { type?: 'text' | 'json_object' } | null;
 }
 
+/** Per-request timeout matching the Vertex/Bedrock adapters (5 min). */
+export const GEMINI_REQUEST_TIMEOUT_MS = 5 * 60 * 1000;
+
 export interface GeminiRequestOptions {
   /** maxOutputTokens fallback when the caller does not specify one. */
   defaultMaxTokens: number;
+  /** Request timeout in ms; defaults to GEMINI_REQUEST_TIMEOUT_MS. */
+  requestTimeoutMs?: number;
 }
 
 /**
@@ -152,10 +157,20 @@ export function toGeminiRequest(
     }
   }
 
+  // Gemini rejects an empty `contents`; a call whose only messages were `system`
+  // (routed to systemInstruction) would otherwise 400. Fall back to a minimal user
+  // turn, matching the Vertex adapter's '.' guard.
+  if (contents.length === 0) {
+    contents.push({ role: 'user', parts: [{ text: '.' }] });
+  }
+
   const config: any = {
     // THE leak fix: keep thinking on but never return thought parts.
     thinkingConfig: { includeThoughts: false },
     maxOutputTokens: params.max_completion_tokens || opts.defaultMaxTokens,
+    // Match the 5-min per-request budget of the Vertex/Bedrock adapters instead of
+    // inheriting the SDK default (long research turns are exactly where this runs).
+    httpOptions: { timeout: opts.requestTimeoutMs ?? GEMINI_REQUEST_TIMEOUT_MS },
   };
   if (systemParts.length > 0) config.systemInstruction = systemParts.join('\n');
   if (params.temperature !== undefined && params.temperature !== null) {
