@@ -76,10 +76,16 @@ because the read count is already deduped. A `(utcDay, resourceId)` dedup table 
 *billed* numbers but costs one write per resource read — deferred unless finance needs per-user billed
 (not load) figures. A scheduled poller for historical snapshots + low-credit alerting is the next step.
 
-**By-account cut.** Each X call already records `feature = x-account:{accountId}`, so the cost
-aggregation's `byFeature` dimension carries per-account totals. The admin tab surfaces them as a "By X
-account" table (`xAccountsFromFeatures` filters the `x-account:` prefix). Account ids are shown raw for
-now (handle enrichment is a follow-up).
+**By-account cut + @handle enrichment.** Each X call records `feature = x-account:{accountId}`, so the
+cost aggregation groups those rows into `byXAccount`. There is **no global GSI on account_id** (connected
+accounts are nested in the User record), so a scan-free handle lookup needs the owning userId — which the
+ledger row's partition key already carries. `buildXAccountBreakdown` groups by accountId, tracks per-user
+spend, and best-effort resolves the @handle via `getAccountById(accountId, heaviestSpenderUserId,
+'twitter')` (the heaviest spender is the owner in the common case) → `config.username`. This mirrors the
+existing `topUsers` email enrichment: a miss (e.g. an org-shared account the heaviest caller doesn't own)
+yields `handle: null` and the UI falls back to the raw accountId. Never fails the aggregation. The admin
+tab renders `@handle` (raw id alongside) via `xAccountRows`/`xAccountLabel`, falling back to the
+client-side `byFeature` derivation if the server omits the enriched cut.
 
 **Fair per-user drawdown (the ENG-664 "eventually" goal) — design only.** Because dedup is app-wide,
 enforcing a cap on raw allocated numbers over-bills shared reads. The right mechanism is **proportional
