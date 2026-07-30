@@ -57,6 +57,27 @@ async function setWildcardCapturingPrev(email: string): Promise<string | undefin
   }).promise();
   return r.Attributes?.subscriptionType;
 }
+
+/**
+ * The wildcard is written to the base table by `email`, but installSkills resolves
+ * the tier by `userId` through the UserIdIndex GSI, which is eventually consistent.
+ * Wait for the write to propagate to that index before installing — otherwise a
+ * stale tier read could reject a gated skill and make the read-back falsely abort
+ * a valid run. Bounded (~5s); proceeds anyway if it doesn't converge (the
+ * install + read-back will surface any genuine problem).
+ */
+async function waitForWildcardVisible(userId: string): Promise<void> {
+  for (let i = 0; i < 20; i++) {
+    const r = await ddb.query({
+      TableName: USERS_TABLE, IndexName: "UserIdIndex",
+      KeyConditionExpression: "userId = :u",
+      ExpressionAttributeValues: { ":u": userId },
+    }).promise();
+    if (r.Items?.[0]?.subscriptionType === WILDCARD_SUB) return;
+    await new Promise((res) => setTimeout(res, 250));
+  }
+  console.warn("(wildcard not yet visible on UserIdIndex after ~5s — proceeding)");
+}
 /**
  * Best-effort restore, guarded so we never clobber a change made DURING the run:
  * only write back if subscriptionType is still the wildcard we set. If a
@@ -130,6 +151,7 @@ async function main() {
   try {
     if (skillIds.length) {
       hadSub = await setWildcardCapturingPrev(EMAIL);
+      await waitForWildcardVisible(userId);
       const sessionId = await post("/api/agent-mode/sessions", token, { title: "ENG-204 harness" }).then((s) => s.sessionId || s.id);
       const inst = await agentModeService.installSkills(skillIds, userId, sessionId);
       console.log("installed:", JSON.stringify(inst.installedSkills || inst.message));
