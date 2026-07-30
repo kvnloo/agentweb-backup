@@ -140,12 +140,19 @@ export function xAccountLabel(row: XAccountRow): string {
 
 /**
  * Provider a ledger `model` string belongs to. Vendor rows are namespaced
- * `{provider}:{operation}` (e.g. "twitter:post", "v0:generate"); a plain model
- * id (e.g. "claude-opus-4-8") is an LLM row.
+ * `{provider}:{operation}` where the operation is a WORD (e.g. "twitter:post",
+ * "v0:generate"). An LLM model id is "llm" — including Bedrock ids that carry a
+ * NUMERIC version suffix after a colon (e.g.
+ * "anthropic.claude-sonnet-4-5-20250929-v1:0"), which must NOT be mistaken for a
+ * vendor namespace. A plain id ("claude-opus-4-8") is likewise LLM.
  */
 export function providerOfModel(model: string): string {
   const i = model.indexOf(":");
-  return i > 0 ? model.slice(0, i) : "llm";
+  if (i <= 0) return "llm";
+  const suffix = model.slice(i + 1);
+  // A purely-numeric suffix is a model version tag (Bedrock), not a vendor op.
+  if (/^\d+$/.test(suffix)) return "llm";
+  return model.slice(0, i);
 }
 
 const TWITTER_PROVIDER_KEY = "twitter";

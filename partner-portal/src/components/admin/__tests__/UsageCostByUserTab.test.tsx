@@ -90,6 +90,14 @@ describe("UsageCostByUserTab pure helpers", () => {
     expect(providerOfModel("claude-opus-4-8")).toBe("llm");
   });
 
+  it("treats a Bedrock numeric version suffix as llm, not a vendor", () => {
+    // Bedrock ids carry a ":0" version tag — must NOT become its own provider.
+    expect(providerOfModel("anthropic.claude-sonnet-4-5-20250929-v1:0")).toBe("llm");
+    expect(providerOfModel("anthropic.claude-3-5-sonnet-20241022-v2:0")).toBe("llm");
+    // A word suffix is still a real vendor operation.
+    expect(providerOfModel("you.com:search")).toBe("you.com");
+  });
+
   it("lists the providers present, 'all' first, and always offers twitter", () => {
     expect(providersInData(AGG)).toEqual(["all", "llm", "twitter"]);
     // twitter is always offered so the X filter is discoverable before any X usage.
