@@ -24,7 +24,7 @@
   "Statement": [
     {
       "Sid": "DevDynamoFullCrud",
-      "//": "OBSERVED: per-fix preview DEV backend + create-tables.ts (NODE_ENV=development) — full CRUD on Dev-AW-* only.",
+      "//": "OBSERVED: per-fix preview DEV backend — item CRUD on Dev-AW-* only. Tight canary: CreateTable + UpdateTimeToLive dropped (assumes Dev-AW-* already provisioned); re-add if the preview backend must run create-tables.ts.",
       "Effect": "Allow",
       "Action": [
         "dynamodb:BatchGetItem",
@@ -36,10 +36,8 @@
         "dynamodb:Query",
         "dynamodb:Scan",
         "dynamodb:UpdateItem",
-        "dynamodb:CreateTable",
         "dynamodb:DescribeTable",
-        "dynamodb:DescribeTimeToLive",
-        "dynamodb:UpdateTimeToLive"
+        "dynamodb:DescribeTimeToLive"
       ],
       "Resource": [
         "arn:aws:dynamodb:us-west-2:992382574572:table/Dev-AW-*",
@@ -48,17 +46,10 @@
     },
     {
       "Sid": "ProdDynamoReadOnly",
-      "//": "OBSERVED: session.mjs read-only prod pulls (AW-ChatSessions / AW-ChatMessages / AW-TaskExecutions). Read verbs only.",
+      "//": "OBSERVED: session.mjs read-only prod pulls (AW-ChatSessions / AW-ChatMessages / AW-TaskExecutions). Tight canary: GetItem on the base table only — Query, BatchGetItem, and the GSI index/* resource dropped (session.mjs uses get-item). Re-add if a prod Query/GSI read shows AccessDenied.",
       "Effect": "Allow",
-      "Action": [
-        "dynamodb:GetItem",
-        "dynamodb:Query",
-        "dynamodb:BatchGetItem"
-      ],
-      "Resource": [
-        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-*",
-        "arn:aws:dynamodb:us-west-2:992382574572:table/AW-*/index/*"
-      ]
+      "Action": "dynamodb:GetItem",
+      "Resource": "arn:aws:dynamodb:us-west-2:992382574572:table/AW-*"
     },
     {
       "Sid": "DevSecretsRead",
@@ -68,11 +59,18 @@
       "Resource": "arn:aws:secretsmanager:us-west-2:992382574572:secret:dev/AgentWeb/*"
     },
     {
-      "Sid": "TestEnvSecretsRead",
-      "//": "REVIEW — OBSERVED but BEYOND the dev/AgentWeb-only pin: bootstrap.sh pulls backend/.env from agentweb/test-env/backend-env, and the SSH password lives at agentweb/test-env/ssh-password. Drop this statement if the role must read dev/AgentWeb/* ONLY (bootstrap's backend/.env pull then breaks).",
+      "Sid": "TestEnvBackendEnvRead",
+      "//": "OBSERVED: bootstrap.sh pulls backend/.env from agentweb/test-env/backend-env via the instance role. Tight canary: narrowed from agentweb/test-env/* to the backend-env secret ONLY (the `*` suffix covers Secrets Manager's 6-char ARN suffix), so the runner can no longer read the SSH password or any other test-env secret.",
       "Effect": "Allow",
       "Action": "secretsmanager:GetSecretValue",
-      "Resource": "arn:aws:secretsmanager:us-west-2:992382574572:secret:agentweb/test-env/*"
+      "Resource": "arn:aws:secretsmanager:us-west-2:992382574572:secret:agentweb/test-env/backend-env*"
+    },
+    {
+      "Sid": "DenyTestEnvSshPassword",
+      "//": "TIGHTENING: the runner must never read the shared SSH password — explicit Deny beats any future broadening of the test-env Allow above.",
+      "Effect": "Deny",
+      "Action": "secretsmanager:*",
+      "Resource": "arn:aws:secretsmanager:us-west-2:992382574572:secret:agentweb/test-env/ssh-password*"
     },
     {
       "Sid": "DenyProdDynamoScan",
