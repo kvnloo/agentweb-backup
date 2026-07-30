@@ -103,7 +103,8 @@ async function main() {
       throw e;
     }
     const after = await skillService.getSkill(skillId);
-    report("DEV after write", after!.systemPrompt || "", after!.toolNames || []);
+    const persistedOk = report("DEV after write", after!.systemPrompt || "", after!.toolNames || []);
+    if (!persistedOk) throw new Error("persisted DEV prompt failed verification (leaks or missing markers)");
     console.log("\napplied to DEV ✅  (promote to prod separately via admin API after review)");
   } else {
     console.log("\n(dry-run — pass --apply to write DEV)");
