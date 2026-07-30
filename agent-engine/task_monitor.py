@@ -1022,6 +1022,10 @@ async def execute_task(execution):
     revision_prompt = execution.get('revision_prompt')
     original_image_url = execution.get('original_image_url')
     original_report_url = execution.get('original_report_url')
+    # Same class of bug as above — only ever set inside the task-lookup
+    # branch, referenced unconditionally later (prompt augmentation,
+    # run_web_agent_cli call).
+    lead_list_identifier = None
 
     try:
         # Get task details from tasks table if taskId doesn't start with 'task-'
@@ -1032,15 +1036,15 @@ async def execute_task(execution):
             
             if not task:
                 raise Exception(f"Task {task_id} not found")
-                
+
+            lead_list_identifier = task.get('leadListIdentifier')
+
             # Check if this is a deep research task and track it
             is_deep_research = task.get('isDeepResearch', False)
             if is_deep_research:
                 running_task_ids[execution_id] = 'deep_research'
             else:
                 running_task_ids[execution_id] = 'standard'
-
-            lead_list_identifier = task.get('leadListIdentifier') if task else None
 
             # Get both accepted and rejected executions
             accepted_executions = executions_table.query(
