@@ -1,0 +1,52 @@
+# AgentWeb autofix chat + WATCH server (ENG-652) — durable supervision for the LONG-RUNNING server that
+# hosts the chat UI and drives the autonomous merge-WATCH loop. Cron (run.sh → poll.mjs/gc.mjs) is a
+# separate, short-lived cycle and is deliberately NOT managed here.
+#
+# Install (idempotent): deploy/ec2/bootstrap.sh copies this to /etc/systemd/system/ and runs
+#   sudo systemctl daemon-reload && sudo systemctl enable --now autofix-chat.service
+# Manage: systemctl status|restart|stop autofix-chat   ·   journalctl -u autofix-chat -f
+#
+# NOTE: this is the SINGLE owner of the server. run.sh's `run-chat.sh ensure` detects an active unit and
+# drops to a health-only probe, so the two supervisors never race to spawn a second server (EADDRINUSE).
+
+[Unit]
+Description=AgentWeb autofix chat + WATCH server (ENG-652)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+Group=ec2-user
+WorkingDirectory=/home/ec2-user/agentweb/.linear-autofix/chat
+
+# Load the runner env so LINEAR_API_KEY, AUTOFIX_RUN_ENABLED, the per-assignee GH/Linear keys, and the
+# MCP secret refs (NOTION_MCP_HEADERS / OKAREO_API_KEY, expanded by .mcp.json) are all present. `-` =
+# tolerate the file being absent at unit-load time (bootstrap creates it later). IMPORTANT: systemd does
+# NOT strip trailing `# comments` from values the way bash does — keep .env comments on their OWN lines.
+EnvironmentFile=-/home/ec2-user/agentweb/.linear-autofix/.env
+
+# systemd starts services with a minimal PATH; the server spawns node, claude, gh, and uvx (Okareo MCP),
+# so mirror the effective PATH run-chat.sh gives it (~/.local/bin for uvx; /usr/bin for node/claude/gh).
+Environment=PATH=/home/ec2-user/.local/bin:/home/ec2-user/.nvm/versions/node/v20.19.5/bin:/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin
+Environment=HOME=/home/ec2-user
+
+# Same launch run-chat.sh uses (node server.mjs), foreground so systemd supervises the PID directly.
+ExecStart=/usr/bin/node /home/ec2-user/agentweb/.linear-autofix/chat/server.mjs
+
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+
+# The server spawns DETACHED claude process groups (chat turns, the merge-WATCH loop, ENG-654 aborts).
+# KillMode=process kills ONLY the server pid on stop/restart — it does NOT tear down the whole cgroup —
+# so a restart never abruptly kills an in-flight WATCH turn; those finish (or are reclaimed by the lock)
+# and the fresh server resumes watches from persisted state.
+KillMode=process
+
+# Tee stdout+stderr into the same log the cron rotation (run.sh copytruncate) already manages.
+StandardOutput=append:/home/ec2-user/agentweb/.linear-autofix/chat/chat.log
+StandardError=append:/home/ec2-user/agentweb/.linear-autofix/chat/chat.log
+
+[Install]
+WantedBy=multi-user.target

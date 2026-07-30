@@ -28,8 +28,15 @@ healthy() {
   return 1
 }
 
+# ENG-652: systemd (autofix-chat.service) is the SINGLE owner of the server when its unit is active.
+# In that mode this script must NEVER spawn a second `node server.mjs` (they'd fight over :8790 /
+# EADDRINUSE) and must NOT restart it (systemd's Restart=on-failure does that instantly). So `start`
+# no-ops and `ensure` drops to a health-only probe, leaving all lifecycle to systemd.
+systemd_owns() { command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet autofix-chat 2>/dev/null; }
+
 case "${1:-}" in
   start)
+    if systemd_owns; then echo "[chat] managed by systemd (autofix-chat.service) — use 'systemctl start autofix-chat'"; exit 0; fi
     if alive; then echo "[chat] already running (pid $(cat "$PIDFILE"))"; exit 0; fi
     if [ -f "$LOGFILE" ] && [ "$(stat -c%s "$LOGFILE" 2>/dev/null || echo 0)" -gt 5242880 ]; then
       mv "$LOGFILE" "$LOGFILE.1"
@@ -67,11 +74,19 @@ case "${1:-}" in
     bash "$HERE/run-chat.sh" stop; bash "$HERE/run-chat.sh" start
     ;;
   ensure)
-    # Health-gated supervision — this is what run.sh's cron calls every 5 min (NOT plain `start`).
-    # `start` only revives a DEAD server (alive() = pid check). But a server can be alive-but-not-
-    # serving: wedged on a hang, or (pre-fix) lingering after a swallowed listen error. Plain `start`
-    # no-ops on those (pid exists) and the tunnel stays dead until a human notices. Here we probe the
-    # health endpoint: dead → start; alive-but-unhealthy → restart; healthy → leave it alone.
+    # ENG-652: when systemd owns the server, cron must NOT supervise it — drop to a health-only probe so
+    # the two never race to spawn/restart. systemd (Restart=on-failure, RestartSec=2) already revives a
+    # crash instantly; here we just log if it happens to be down mid-restart and leave recovery to systemd.
+    if systemd_owns; then
+      if healthy; then exit 0; fi
+      echo "[chat] systemd unit active but not serving on :$PORT (mid-restart?) — leaving recovery to systemd"
+      exit 0
+    fi
+    # Legacy self-supervision (no systemd unit). Health-gated: this is what run.sh's cron calls every
+    # 5 min (NOT plain `start`). `start` only revives a DEAD server (alive() = pid check). But a server
+    # can be alive-but-not-serving: wedged on a hang, or lingering after a swallowed listen error. Plain
+    # `start` no-ops on those (pid exists) and the tunnel stays dead until a human notices. Here we probe
+    # the health endpoint: dead → start; alive-but-unhealthy → restart; healthy → leave it alone.
     if alive; then
       if healthy; then exit 0; fi
       echo "[chat] pid $(cat "$PIDFILE") alive but not serving on :$PORT — restarting"

@@ -117,6 +117,24 @@ if [ ! -f "$WORKDIR/.linear-autofix/.env" ]; then
   echo "    Created .linear-autofix/.env — EDIT IT and paste your LINEAR_API_KEY (lin_api_...)."
 fi
 
+# ENG-652: durable supervision for the long-running chat + WATCH server via systemd (Restart=on-failure
+# for instant crash recovery + WantedBy=multi-user.target for reboot recovery). Idempotent: re-copies the
+# unit each run and re-enables it. Cron (run.sh → poll.mjs/gc.mjs) is untouched — this covers ONLY the
+# server. `enable --now` starts it immediately AND on every boot. `run-chat.sh ensure` (from cron) detects
+# the active unit and drops to a health-only probe, so systemd is the single owner.
+echo "==> systemd unit: autofix-chat.service (durable chat/WATCH-server supervision)"
+UNIT_SRC="$WORKDIR/.linear-autofix/deploy/ec2/autofix-chat.service"
+if [ -f "$UNIT_SRC" ]; then
+  # A legacy run-chat.sh-launched server would fight the unit for :8790 — stop it before handing over.
+  bash "$WORKDIR/.linear-autofix/chat/run-chat.sh" stop >/dev/null 2>&1 || true
+  sudo cp "$UNIT_SRC" /etc/systemd/system/autofix-chat.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now autofix-chat.service
+  echo "    autofix-chat.service enabled + started (systemctl status autofix-chat · journalctl -u autofix-chat -f)."
+else
+  echo "    WARNING: $UNIT_SRC not found — skipping systemd install (older checkout?)."
+fi
+
 cat <<EOF
 
 ==> Bootstrap complete. Remaining interactive steps (see RUNBOOK.md):

@@ -104,4 +104,6 @@ Next:
   scp -i ~/.ssh/${KEY_NAME}.pem .linear-autofix/deploy/ec2/bootstrap.sh ec2-user@${PUBIP}:~
   ssh -i ~/.ssh/${KEY_NAME}.pem ec2-user@${PUBIP} 'bash ~/bootstrap.sh'
 Then follow RUNBOOK.md (subscription login, gh auth, Linear key, app creds, cron).
+Note: bootstrap.sh installs + enables the systemd unit for the long-running chat/WATCH server
+(autofix-chat.service — Restart=on-failure, starts on boot). Cron still drives poll.mjs/gc.mjs.
 EOF
