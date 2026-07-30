@@ -26,6 +26,10 @@
     "okareo": {
       "command": "uvx",
       "args": [
+        "--with",
+        "mcp[cli]<2",
+        "--from",
+        "okareo-mcp==0.0.43",
         "okareo-mcp"
       ],
       "env": {
