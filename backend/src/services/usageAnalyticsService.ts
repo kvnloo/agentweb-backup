@@ -308,7 +308,18 @@ function bucketByModel(items: UsageRecordRow[]): CostByModelRow[] {
 export async function getCostAggregation(
   start: string,
   end: string,
-  topUsersLimit = 10
+  topUsersLimit = 10,
+  // Which slice of the ledger to aggregate (ENG-664). The admin cost tooling has
+  // two consumers with DIFFERENT scopes sharing this one endpoint:
+  //   - "llm"     → LLM (token-priced) rows only. DEFAULT, so the ENG-353 LLM Costs
+  //                 tab (which sends no provider param) never shows vendor rows like
+  //                 twitter:* mixed into its by-model / totals cuts.
+  //   - a vendor  → that vendor's rows only, by `provider`/model prefix (e.g.
+  //                 "twitter" for the X-only Usage & Cost tab).
+  //   - "all"     → every row (no filter).
+  // The filter runs BEFORE aggregation, so every cut (totals, byModel, series,
+  // byFeature, topUsers, byXAccount) is consistently scoped to the request.
+  provider: string = "llm"
 ): Promise<CostAggregation> {
   if (!DATE_RE.test(start) || !DATE_RE.test(end)) {
     throw new Error("start and end must be YYYY-MM-DD");
@@ -320,7 +331,19 @@ export async function getCostAggregation(
     throw new Error("topUsersLimit must be an integer between 1 and 100");
   }
 
-  const items = await usageRecordDb.scanByDateRange(start, end);
+  const allItems = await usageRecordDb.scanByDateRange(start, end);
+  const items =
+    provider === "all"
+      ? allItems
+      : provider === "llm"
+      ? // LLM = everything that is NOT a per-unit vendor row (isVendorEntry needs
+        // both provider+unit, so pre-ENG-693 LLM rows correctly stay in).
+        allItems.filter((r) => !isVendorEntry(r))
+      : // A specific vendor: match the provider field or the "{provider}:" model
+        // namespace (recordVendorUsage writes both).
+        allItems.filter(
+          (r) => r.provider === provider || (r.model || "").startsWith(`${provider}:`)
+        );
 
   // Overall totals.
   const totals = zeroTotals();

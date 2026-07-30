@@ -223,7 +223,15 @@ router.get(
         }
       }
 
-      const result = await getCostAggregation(start, end, topUsersLimit);
+      // Provider scope (ENG-664): absent → "llm" (the LLM Costs tab sends no
+      // provider param and must never show vendor rows); "twitter"/vendor or "all"
+      // are opt-in. Validated to a safe token so it can't inject anything downstream.
+      const provider = String(req.query.provider || "llm");
+      if (!/^[a-z0-9._-]+$/.test(provider)) {
+        return res.status(400).json({ message: "provider must be a simple token (a-z0-9._-)" });
+      }
+
+      const result = await getCostAggregation(start, end, topUsersLimit, provider);
       return res.json(result);
     } catch (error) {
       console.error("[adminUsage] cost-aggregation failed:", error);

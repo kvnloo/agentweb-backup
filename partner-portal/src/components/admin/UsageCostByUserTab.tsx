@@ -498,9 +498,11 @@ export default function UsageCostByUserTab() {
     try {
       const response = await axios.get<CostAggregation>(
         buildApiUrl(
+          // provider=twitter: this tab is X-only (ENG-664), so the server scopes
+          // every cut to X rows. Broaden this when the tab expands to other vendors.
           `/api/admin/usage/cost-aggregation?start=${encodeURIComponent(
             s
-          )}&end=${encodeURIComponent(e)}&topUsers=100`
+          )}&end=${encodeURIComponent(e)}&topUsers=100&provider=${TWITTER_PROVIDER_KEY}`
         ),
         { headers: { Authorization: `Bearer ${token}` } }
       );
