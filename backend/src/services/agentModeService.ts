@@ -17240,7 +17240,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           name: `${args.audience_name} - Lookalike`,
           subtype: 'LOOKALIKE',
           lookalike_spec: {
-            origin: [{ id: seed.audience!.id }],
+            origin: [{ id: seed.audience!.id, type: 'custom_audience' }],
             ratio: args.lookalike_ratio,
             country: args.lookalike_country,
           },

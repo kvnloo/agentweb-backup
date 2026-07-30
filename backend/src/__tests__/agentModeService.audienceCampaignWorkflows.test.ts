@@ -307,9 +307,13 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         ...baseArgs(), confirm: true, use_lookalike: true, lookalike_ratio: 0.01, lookalike_country: 'US',
       });
 
+      // ENG-600 live-test finding: Meta rejected lookalike_spec.origin entries
+      // missing "type": "custom_audience" with "(#2654) ... No custom_audience
+      // ID given for lookalike cluster" — the origin entry must be fully
+      // shaped, not just {id}.
       expect(manageSpy).toHaveBeenCalledWith(USER_ID, 'CREATE', ACCOUNT_ID, expect.objectContaining({
         subtype: 'LOOKALIKE',
-        lookalike_spec: { origin: [{ id: 'aud_seed_2' }], ratio: 0.01, country: 'US' },
+        lookalike_spec: { origin: [{ id: 'aud_seed_2', type: 'custom_audience' }], ratio: 0.01, country: 'US' },
       }));
       expect(result.ledger.lookalike).toEqual({ id: 'aud_lookalike_1', name: 'RankAI Warm List - Lookalike', ratio: 0.01, country: 'US' });
       const adSetCallArgs = (agentModeService.createMetaAdsAdSet as jest.Mock).mock.calls[0][1];
