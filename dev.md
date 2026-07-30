@@ -1,3 +1,19 @@
+## ENG-664: per-user X cost breakdown on the admin user card + LLM-only fix (2026-07-30)
+
+**LLM-only fix.** The user card's "LLM Cost" 📊 opens `getUserOrgUsageRollup` (gross burn vs the LLM
+quota counter). Because X writes to the same ledger, X rows were leaking into that rollup — inflating
+gross burn and depressing "charged coverage" (X never deducts from the quota counter). Fixed by filtering
+`!isVendorEntry(row)` at the query, so gross burn / byModel / members are purely LLM. Per-unit vendor
+rows (X/Twitter, v0, …) are excluded; token-priced image/video (recordUsage, no `unit`) stay in — they
+DO count toward the cap.
+
+**Per-user X breakdown (Option A).** New `getUserXBreakdown(userId, start, end)` (shares
+`groupTwitterRows` with `getXAllocatedTotals`) → `GET /api/admin/users/:userId/usage/x-breakdown`. A new
+"X (Twitter) Cost" stat + 📊 on the user card opens a modal (`XCostBreakdown`, bars + table, reusing the
+LLM modal's table/bars toggle) showing that user's X spend by tool, labelled **allocated** and noting it
+is observe-only (not deducted from any cap). Mirrors the LLM Cost affordance without borrowing its
+quota framing.
+
 ## ENG-664 (Option B): attribute X ledger to the acting user, bill the owner (2026-07-30)
 
 Aligns X metering with the LLM rail. Previously the X shadow ledger keyed on the account OWNER
