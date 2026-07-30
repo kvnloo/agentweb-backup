@@ -2,7 +2,6 @@ import React from "react";
 import {
   Alert,
   Box,
-  Chip,
   Grid,
   LinearProgress,
   Paper,
@@ -68,7 +67,6 @@ export const XCostBreakdown: React.FC<{
               <Typography variant="caption" color="text.secondary">
                 Total X cost
               </Typography>
-              <Chip size="small" label="allocated" variant="outlined" color="warning" />
               <Tooltip
                 title="X publishes no per-call price, so this applies X's pay-per-use rate card to this user's call counts — an allocated upper-bound estimate, not a billed figure."
                 arrow
@@ -77,7 +75,10 @@ export const XCostBreakdown: React.FC<{
               </Tooltip>
             </Box>
             <Typography variant="h6" data-testid="x-breakdown-total" sx={{ fontVariantNumeric: "tabular-nums" }}>
-              {usd(data.costUsd)}
+              {usd(data.costUsd)}{" "}
+              <Typography component="span" variant="caption" color="text.secondary">
+                allocated
+              </Typography>
             </Typography>
           </Paper>
         </Grid>

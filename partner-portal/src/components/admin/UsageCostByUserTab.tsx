@@ -3,7 +3,6 @@ import {
   Alert,
   Box,
   Button,
-  Chip,
   CircularProgress,
   Collapse,
   Grid,
@@ -297,7 +296,14 @@ const UserUsageRow: React.FC<{ rank: number; row: UserRowView; provider: string 
         <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
           {usd(row.costUsd)}
           {providerIsAllocatedEstimate(provider) && (
-            <Chip size="small" label="allocated" sx={{ ml: 1 }} variant="outlined" color="warning" />
+            <Typography
+              component="span"
+              variant="caption"
+              color="text.secondary"
+              sx={{ ml: 0.75 }}
+            >
+              allocated
+            </Typography>
           )}
         </TableCell>
       </TableRow>
