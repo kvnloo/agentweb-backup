@@ -1,3 +1,23 @@
+## ENG-664 (Option B): attribute X ledger to the acting user, bill the owner (2026-07-30)
+
+Aligns X metering with the LLM rail. Previously the X shadow ledger keyed on the account OWNER
+(`ownerUserId` is all `twitterService` receives, so token refreshes write back to the owner). The LLM
+rail instead records the ACTING user in the shadow ledger and rolls billing to the org owner. For an org
+where several members share one X account, owner-keying collapsed all their spend onto the owner — you
+couldn't see which member drove it.
+
+Option B records `userId = acting member` and `billingUserId = account owner`, matching LLM. Since
+`twitterService` methods only receive `ownerUserId`, the acting user is carried via an
+`AsyncLocalStorage` (`runWithXActingUser`) that the two Emma dispatchers (`twitterManagePost`,
+`twitterOutreach`) and the `TwitterAdapter` (createPost/listPosts) bind. `meterCall` reads it:
+`userId = actingUserId ?? ownerUserId`, `billingUserId = ownerUserId`. An UNWRAPPED path (some future
+caller) has no acting user in context and safely falls back to owner-attribution — never an error.
+
+Knock-on: `@handle` enrichment must resolve through the OWNER, so `buildXAccountBreakdown` now enriches
+via the row's `billingUserId` (owner), not `userId` (acting member). Pre-Option-B rows have
+`billingUserId === userId`, so it still works. This also pre-wires ENG-703 drawdown, which will charge
+`billingUserId` (the owner), exactly like the LLM cap already does via `resolveBillingUserId`.
+
 ## ENG-664: meter X (Twitter) API usage + cost per account and per tool (2026-07-29)
 
 Builds directly on the [[ENG-693]] vendor dimension — no new table, no new pipeline.
