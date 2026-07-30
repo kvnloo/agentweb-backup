@@ -38,7 +38,13 @@ def get_secret(secret_id: str) -> str:
         logger.error(f"Error fetching secret {secret_id}: {e}")
         raise
 
-    value = response.payload.data.decode('UTF-8')
+    # .strip() — found live: every secret created via a `grep | cut` pipe
+    # from the source .env picked up a trailing newline, which most
+    # consumers tolerate silently but which `requests` correctly rejects
+    # as an invalid HTTP header value (CRLF injection protection) — broke
+    # the scheduled-chats service-secret header outright. Safe for JSON
+    # payloads too (JSON parsing ignores surrounding whitespace).
+    value = response.payload.data.decode('UTF-8').strip()
     if not value:
         raise ValueError(f"Secret {secret_id} is empty")
 

@@ -38,6 +38,21 @@ class TestSecretsManagerEnvFallback(unittest.TestCase):
         mock_client_cls.assert_not_called()
 
     @patch('secrets_manager.secretmanager.SecretManagerServiceClient')
+    def test_secret_value_is_stripped_of_trailing_whitespace(self, mock_client_cls):
+        # Regression: secrets created via `grep | cut` from a .env file carry
+        # the source line's trailing newline. Most consumers tolerate it
+        # silently, but `requests` rejects a newline in an HTTP header value
+        # outright (CRLF injection protection) — broke the scheduled-chats
+        # service-secret header in production testing.
+        mock_client_cls.return_value = _mock_secret_manager_client('sm-value-with-newline\n')
+
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ.pop('RESEND_API_KEY', None)
+            result = secrets_manager.get_resend_api_key()
+
+        self.assertEqual(result, 'sm-value-with-newline')
+
+    @patch('secrets_manager.secretmanager.SecretManagerServiceClient')
     def test_string_secret_falls_back_to_secret_manager_when_env_unset(self, mock_client_cls):
         mock_client_cls.return_value = _mock_secret_manager_client('sm-value')
 
