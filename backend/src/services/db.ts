@@ -3076,6 +3076,21 @@ export const scheduleDb = {
     }
   },
 
+  // ENG-657: consume the resume marker once a dispatch has read it, so a resume is
+  // attempted at most once per abandonment. Unconditional (no runId guard): the
+  // marker is a hint, not a lease — a lost race just means the run restarts fresh.
+  async clearPendingResume(scheduleId: string): Promise<void> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+        UpdateExpression: 'REMOVE pendingResumeSessionId',
+      }).promise();
+    } catch (error) {
+      handleDynamoDbError(error, 'clearPendingResume');
+    }
+  },
+
   // Scheduled-chat schedules that currently hold an in-flight lease. Sparse by
   // nature — most schedules have no runInFlight. We sweep BOTH 'active' and
   // 'paused' partitions of StatusStartTimeIndex: a runCount-limited schedule
@@ -3112,28 +3127,43 @@ export const scheduleDb = {
   async claimAbandonedRun(
     scheduleId: string,
     runId: string,
-    requeue: { nextRunTime: string; retryCount: number; sessionId: string; lastAt: string } | null
+    // ENG-657: `resumeSessionId`, when set, marks the requeued run to CONTINUE the
+    // named session from its last persisted step (the reconciler decided it ended
+    // on a safe boundary) instead of restarting the task in a fresh session. The
+    // next dispatch reads `pendingResumeSessionId`; when absent we REMOVE any stale
+    // marker so a prior resume can never leak into an unrelated later run.
+    requeue: { nextRunTime: string; retryCount: number; sessionId: string; lastAt: string; resumeSessionId?: string } | null
   ): Promise<boolean> {
     const nowIso = new Date().toISOString();
     try {
       if (requeue) {
+        const setParts = [
+          '#status = :active', 'nextRunTime = :nextRunTime', 'zeroAssistantRetryCount = :n',
+          'lastZeroAssistantOutputAt = :lastAt', 'lastZeroAssistantOutputSessionId = :sid', 'updatedAt = :now',
+        ];
+        const removeParts = ['runInFlight'];
+        const values: Record<string, any> = {
+          ':active': 'active',
+          ':nextRunTime': requeue.nextRunTime,
+          ':n': requeue.retryCount,
+          ':lastAt': requeue.lastAt,
+          ':sid': requeue.sessionId,
+          ':now': nowIso,
+          ':runId': runId,
+        };
+        if (requeue.resumeSessionId) {
+          setParts.push('pendingResumeSessionId = :resumeSid');
+          values[':resumeSid'] = requeue.resumeSessionId;
+        } else {
+          removeParts.push('pendingResumeSessionId');
+        }
         await dynamodb.update({
           TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
           Key: { scheduleId },
-          UpdateExpression:
-            'SET #status = :active, nextRunTime = :nextRunTime, zeroAssistantRetryCount = :n, ' +
-            'lastZeroAssistantOutputAt = :lastAt, lastZeroAssistantOutputSessionId = :sid, updatedAt = :now REMOVE runInFlight',
+          UpdateExpression: `SET ${setParts.join(', ')} REMOVE ${removeParts.join(', ')}`,
           ConditionExpression: 'runInFlight.runId = :runId',
           ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: {
-            ':active': 'active',
-            ':nextRunTime': requeue.nextRunTime,
-            ':n': requeue.retryCount,
-            ':lastAt': requeue.lastAt,
-            ':sid': requeue.sessionId,
-            ':now': nowIso,
-            ':runId': runId,
-          },
+          ExpressionAttributeValues: values,
         }).promise();
       } else {
         await dynamodb.update({

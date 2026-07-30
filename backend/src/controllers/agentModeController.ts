@@ -14,6 +14,7 @@ import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
+import { planScheduledRunResume } from '../services/agentMode/core/resumePlan';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
@@ -76,6 +77,18 @@ const SCHEDULED_JOB_INCOMPLETE_MESSAGE =
   "can exceed the run's time or memory budget and end without finishing. " +
   "The run will be retried automatically. If this keeps happening, split the request into smaller batches " +
   "(fewer items per run) so each run can complete and report its results.";
+
+// ENG-657: injected as the user turn when RESUMING an abandoned scheduled run
+// (its instance was terminated mid-flight, e.g. by a deploy). The full transcript
+// up to the last completed step is already the session history, so the model must
+// continue from there — NOT restart the task or re-run steps whose results it can
+// already see above.
+const SCHEDULED_RUN_RESUME_MESSAGE =
+  "[SYSTEM] This scheduled run was interrupted (the machine it was running on was " +
+  "replaced) after completing the steps shown above. This is an automated run with no " +
+  "human present. Do NOT start over and do NOT repeat any tool call whose result is " +
+  "already visible in the history above. Continue from exactly where you left off, using " +
+  "the data already gathered, and produce the final deliverable the task asked for.";
 
 /**
  * In-memory set of session IDs that are currently generating a response.
@@ -2020,19 +2033,56 @@ export async function runScheduledChat(
       }
     }
 
-    // Create a session for the run.
-    const testSession = await chatbotDb.createChatSession(
-      userId,
-      undefined,
-      "agent",
-      pageIdentifier,
-      undefined,
-      undefined,
-      undefined,
-      schedule.emailCampaignTaskId,
-      'scheduled' // sessionType
-    );
-    sessionId = testSession.sessionId;
+    // ENG-657: resume path. When the reconciler marked this schedule to resume an
+    // abandoned session (it ended on a safe boundary), CONTINUE that session from
+    // its last completed step instead of creating a fresh one and re-running the
+    // whole task. The marker is consumed unconditionally (at-most-once resume);
+    // anything off — session gone, wrong owner, or no longer safely resumable —
+    // falls back to a normal fresh run, so this is strictly additive.
+    let isResumeRun = false;
+    const pendingResumeSessionId: string | undefined =
+      !isTest && typeof schedule.pendingResumeSessionId === 'string' && schedule.pendingResumeSessionId
+        ? schedule.pendingResumeSessionId
+        : undefined;
+    if (pendingResumeSessionId) {
+      try {
+        await scheduleDb.clearPendingResume(schedule.scheduleId);
+      } catch (clearError) {
+        console.error(`Failed to clear pending resume marker for schedule ${schedule.scheduleId}:`, clearError);
+      }
+      try {
+        const resumeSession = await chatbotDb.getChatSession(pendingResumeSessionId);
+        if (
+          resumeSession &&
+          resumeSession.userId === userId &&
+          planScheduledRunResume((resumeSession.messages || []) as any).resumable
+        ) {
+          isResumeRun = true;
+          sessionId = pendingResumeSessionId;
+          console.log(`runScheduledChat: RESUMING abandoned session ${sessionId} for schedule ${schedule.scheduleId} (${schedule.scheduleName})`);
+        } else {
+          console.warn(`runScheduledChat: resume marker for session ${pendingResumeSessionId} no longer resumable (missing/owner-mismatch/unsafe boundary); starting a fresh run.`);
+        }
+      } catch (resumeError) {
+        console.error(`runScheduledChat: failed to load resume session ${pendingResumeSessionId}, starting fresh:`, resumeError);
+      }
+    }
+
+    // Create a session for the run (skipped when resuming an existing one).
+    if (!isResumeRun) {
+      const testSession = await chatbotDb.createChatSession(
+        userId,
+        undefined,
+        "agent",
+        pageIdentifier,
+        undefined,
+        undefined,
+        undefined,
+        schedule.emailCampaignTaskId,
+        'scheduled' // sessionType
+      );
+      sessionId = testSession.sessionId;
+    }
 
     // Attach the freshly-created session to the lease so the reconciler's recovery
     // annotates the correct session if this run is later abandoned. Best-effort:
@@ -2063,11 +2113,16 @@ export async function runScheduledChat(
       minCount: functionCallMinCalls[funcName] || 1
     }));
 
-    const resolvedStartingMessage = applyScheduledChatVariableValues(
-      schedule.startingMessage,
-      schedule.variableValues || {},
-      scheduleVariables
-    );
+    // On a resume, the original task prompt is already the first message of the
+    // session being continued; re-sending it would make the model start over. Send
+    // a continuation directive instead so it picks up from the last completed step.
+    const resolvedStartingMessage = isResumeRun
+      ? SCHEDULED_RUN_RESUME_MESSAGE
+      : applyScheduledChatVariableValues(
+          schedule.startingMessage,
+          schedule.variableValues || {},
+          scheduleVariables
+        );
 
     // Extract file attachments from file-type variables
     const fileAttachments = extractFileAttachmentsFromVariables(
@@ -2544,30 +2599,58 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
     ? new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString()
     : undefined;
 
+  // ENG-657: decide whether the requeued run should RESUME this session from its
+  // last persisted step instead of restarting the task from scratch. Only when the
+  // transcript ends on a safe, balanced boundary (planScheduledRunResume) — a run
+  // killed mid-tool-execution is NOT resumed (never re-drive a half-applied side
+  // effect). Best-effort: any read/plan failure falls back to a fresh restart.
+  let resumeSessionId = '';
+  if (willRequeue && lease.sessionId) {
+    try {
+      const priorMessages = await chatbotDb.getMessagesFromMessagesTable(lease.sessionId);
+      if (planScheduledRunResume(priorMessages as any).resumable) {
+        resumeSessionId = lease.sessionId;
+      }
+    } catch (planError) {
+      console.error(`recoverAbandonedScheduledRun: resume-plan check failed for session ${lease.sessionId}, will restart fresh:`, planError);
+    }
+  }
+
   // Atomic single-winner claim. If another instance already reaped this lease the
   // conditional write fails and we return false without touching the session.
   const won = await scheduleDb.claimAbandonedRun(
     schedule.scheduleId,
     lease.runId,
     willRequeue
-      ? { nextRunTime: requeuedAt!, retryCount: nextRetryCount, sessionId: lease.sessionId || '', lastAt: nowIso }
+      ? { nextRunTime: requeuedAt!, retryCount: nextRetryCount, sessionId: lease.sessionId || '', lastAt: nowIso, ...(resumeSessionId ? { resumeSessionId } : {}) }
       : null
   );
   if (!won) return false;
 
   // We own the recovery. Make the orphaned session self-explanatory (best-effort).
+  // When the run will RESUME, do NOT append the "job incomplete" placeholder — the
+  // session is being continued, not given up on, and the placeholder would read to
+  // the model as an assistant turn that already quit. Record a non-terminal note so
+  // the state is still visible.
   if (lease.sessionId) {
     try {
-      await chatbotDb.addMessageToSession(lease.sessionId, {
-        role: 'assistant',
-        content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
-        timestamp: nowIso,
-        metadata: { timestamp: nowIso, isErrorMessage: true, jobIncomplete: true },
-      });
-      await chatbotDb.updateSessionError(
-        lease.sessionId,
-        'Scheduled run abandoned: the owning process terminated mid-run (recovered by reconciler).'
-      );
+      if (resumeSessionId) {
+        await chatbotDb.updateSessionError(
+          lease.sessionId,
+          'Scheduled run interrupted mid-run (instance terminated); queued to resume from the last completed step.'
+        );
+      } else {
+        await chatbotDb.addMessageToSession(lease.sessionId, {
+          role: 'assistant',
+          content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+          timestamp: nowIso,
+          metadata: { timestamp: nowIso, isErrorMessage: true, jobIncomplete: true },
+        });
+        await chatbotDb.updateSessionError(
+          lease.sessionId,
+          'Scheduled run abandoned: the owning process terminated mid-run (recovered by reconciler).'
+        );
+      }
     } catch (annotateError) {
       console.error(`recoverAbandonedScheduledRun: failed to annotate session ${lease.sessionId}:`, annotateError);
     }
