@@ -19,7 +19,10 @@ import {
   getUsageComparison,
   getCostAggregation,
   getUserOrgUsageRollup,
+  getXAllocatedTotals,
+  currentXBillingCycle,
 } from "../services/usageAnalyticsService";
+import { twitterService } from "../services/twitterService";
 
 const router = express.Router();
 
@@ -156,6 +159,64 @@ router.get(
       console.error("[adminUsage] cost-aggregation failed:", error);
       return res.status(500).json({
         message: "Failed to load cost aggregation",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+/**
+ * X (Twitter) usage reconciliation (ENG-664, acceptance criterion 2).
+ *
+ * Returns X's OWN measured consumption (GET /2/usage/tweets — app-wide, deduped)
+ * beside our allocated ledger totals for the SAME billing cycle, so an admin can
+ * see how our allocated upper bound tracks the figure X actually bills. The
+ * allocated window is derived from X's cap_reset_day so the two are comparable.
+ * A failure to reach X (e.g. bearer not configured) is surfaced as 502 without
+ * taking down the rest of the usage tab, which loads this panel separately.
+ */
+router.get(
+  "/usage/x-reconciliation",
+  authenticateToken,
+  isAdmin,
+  async (_req: AuthRequest, res: Response) => {
+    let measured;
+    try {
+      measured = await twitterService.getXProjectUsage();
+    } catch (error) {
+      console.error("[adminUsage] x-reconciliation: X usage fetch failed:", error);
+      return res.status(502).json({
+        message: "Failed to read X app usage",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+
+    try {
+      const cycle = currentXBillingCycle(measured.capResetDay);
+      const allocated = await getXAllocatedTotals(cycle.start, cycle.end);
+      // Tighter dollar estimate: X's deduped read count × the post-read rate,
+      // plus our directly-counted (non-read) allocated spend. Reads are the only
+      // dimension X's measured number covers; writes/DMs stay allocated-only.
+      const POST_READ_USD = 0.005;
+      const measuredReadCostUsd = measured.projectUsage * POST_READ_USD;
+      const allocatedNonReadCostUsd = Math.max(0, allocated.costUsd - allocated.postReadUnits * POST_READ_USD);
+      return res.json({
+        cycle,
+        measured,
+        allocated,
+        reconciliation: {
+          allocatedPostReadUnits: allocated.postReadUnits,
+          measuredPostReadUnits: measured.projectUsage,
+          // >= 0 — allocated over-counts reads X deduped within a UTC day.
+          dedupSavingsUnits: Math.max(0, allocated.postReadUnits - measured.projectUsage),
+          capUsedPct: measured.projectCap > 0 ? (measured.projectUsage / measured.projectCap) * 100 : null,
+          measuredDerivedCostUsd: measuredReadCostUsd + allocatedNonReadCostUsd,
+        },
+      });
+    } catch (error) {
+      console.error("[adminUsage] x-reconciliation: allocated totals failed:", error);
+      return res.status(500).json({
+        message: "Failed to compute X reconciliation",
         error: error instanceof Error ? error.message : "Unknown error",
       });
     }

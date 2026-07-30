@@ -65,6 +65,22 @@ export interface TweetResult {
   text: string;
 }
 
+/**
+ * App-level billed consumption from GET /2/usage/tweets (ENG-664 reconciliation).
+ * These are X's OWN numbers for the shared Developer App — the authoritative,
+ * app-wide-deduped read consumption against the pay-per-use cap. This is the
+ * "measured" side that the per-user allocated ledger reconciles against.
+ */
+export interface XProjectUsage {
+  projectId: string | null;
+  /** Monthly post-read cap (2,000,000 on pay-per-use). */
+  projectCap: number;
+  /** Post reads consumed this billing cycle — X's deduped, measured count. */
+  projectUsage: number;
+  /** Day of month the cycle resets, or null if X did not return it. */
+  capResetDay: number | null;
+}
+
 export class TwitterService {
   private cachedClientId: string | null = null;
   private cachedClientSecret: string | null = null;
@@ -433,6 +449,54 @@ export class TwitterService {
         err instanceof Error ? err.message : err
       );
     }
+  }
+
+  // ─── App-level usage (reconciliation) ─────────────────────────────────────────
+
+  private cachedBearerToken: string | null = null;
+
+  /** App-only OAuth2 Bearer for app-level endpoints (GET /2/usage/tweets). */
+  private async getBearerToken(): Promise<string> {
+    if (!this.cachedBearerToken) {
+      const creds = await getTwitterCredentials();
+      if (!creds.bearerToken) {
+        throw new Error(
+          'X app bearer token is not configured — the Twitter secret is missing "bearerToken", ' +
+          'so app-level usage (GET /2/usage/tweets) cannot be read.'
+        );
+      }
+      this.cachedBearerToken = creds.bearerToken;
+    }
+    return this.cachedBearerToken;
+  }
+
+  /**
+   * Fetch the shared X Developer App's own billed consumption (ENG-664).
+   * App-only Bearer auth — NOT a per-user call, so it is not metered/attributed.
+   * This is the "measured" reconciliation anchor: X's deduped read count against
+   * the pay-per-use cap. Throws a surfaced error (describeXApiError) on failure.
+   */
+  async getXProjectUsage(): Promise<XProjectUsage> {
+    const bearer = await this.getBearerToken();
+    const client = new TwitterApi(bearer);
+    let res: any;
+    try {
+      res = await client.v2.get('usage/tweets');
+    } catch (err) {
+      throw new Error(describeXApiError(err));
+    }
+    const d = res?.data ?? res ?? {};
+    const toNum = (v: unknown): number => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const resetDay = Number(d.cap_reset_day);
+    return {
+      projectId: typeof d.project_id === 'string' ? d.project_id : null,
+      projectCap: toNum(d.project_cap),
+      projectUsage: toNum(d.project_usage),
+      capResetDay: Number.isFinite(resetDay) ? resetDay : null,
+    };
   }
 
   // ─── Connectivity ─────────────────────────────────────────────────────────────

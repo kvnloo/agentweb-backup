@@ -130,6 +130,16 @@ export function isTwitterOperation(op: string): op is TwitterOperation {
   return Object.prototype.hasOwnProperty.call(RATE_CARD, op);
 }
 
+/**
+ * True when an operation is a POST READ (priced $0.005/resource). These are the
+ * only calls X counts in `project_usage` on GET /2/usage/tweets, so
+ * reconciliation compares the sum of these operations' quantities against X's
+ * measured number. Derived from the rate card so it can never drift from pricing.
+ */
+export function isPostReadOperation(op: string): boolean {
+  return isTwitterOperation(op) && RATE_CARD[op] === POST_READ;
+}
+
 export interface TwitterCost {
   /** Ledger unit label. */
   unit: string;

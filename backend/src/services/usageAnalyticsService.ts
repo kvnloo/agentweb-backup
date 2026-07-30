@@ -5,9 +5,13 @@
 
 import { usageRecordDb, UsageRecordRow } from "./usageRecordDb";
 import { userDb, orgDb, User } from "./db";
+import { TWITTER_PROVIDER, isPostReadOperation } from "../utils/twitterPricing";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const MONTH_RE = /^\d{4}-\d{2}$/;
+
+/** Ledger `model` prefix for X vendor rows, e.g. "twitter:search_tweets". */
+const TWITTER_MODEL_PREFIX = `${TWITTER_PROVIDER}:`;
 
 export interface ModelDayUsageRow {
   date: string;
@@ -586,4 +590,113 @@ export async function getUserOrgUsageRollup(
     members,
     byModel: orgAgg.byModel,
   };
+}
+
+// ── ENG-664: X (Twitter) allocated totals, for reconciliation against X's own
+// measured consumption (twitterService.getXProjectUsage / GET /2/usage/tweets).
+//
+// "Allocated" = our per-call ledger × the published X rate card. It is an
+// upper bound on the billed figure (X dedups a repeat read of the same resource
+// within a UTC day; we do not track resource ids), so allocatedPostReadUnits
+// reconciles as >= X's measured project_usage. The delta is dedup savings.
+
+export interface XAllocatedOperationRow {
+  /** The X tool, e.g. "search_tweets" (the ledger model minus the "twitter:" prefix). */
+  operation: string;
+  callCount: number;
+  quantity: number;
+  costUsd: number;
+}
+
+export interface XAllocatedTotals {
+  start: string;
+  end: string;
+  costUsd: number;
+  callCount: number;
+  /** Σ quantity across POST-READ operations — the figure comparable to X project_usage. */
+  postReadUnits: number;
+  /** Per-operation breakdown, sorted by spend desc. */
+  byOperation: XAllocatedOperationRow[];
+}
+
+/**
+ * Sum every X ledger row (model "twitter:*") across an inclusive date window.
+ * Reads the costMicroUsd/quantity already recorded at call time — never
+ * re-derives cost.
+ */
+export async function getXAllocatedTotals(
+  start: string,
+  end: string
+): Promise<XAllocatedTotals> {
+  if (!DATE_RE.test(start) || !DATE_RE.test(end)) {
+    throw new Error("start and end must be YYYY-MM-DD");
+  }
+  if (start > end) {
+    throw new Error("start must be <= end");
+  }
+
+  const items = await usageRecordDb.scanByDateRange(start, end);
+
+  const byOp = new Map<string, XAllocatedOperationRow>();
+  let costMicroUsd = 0;
+  let callCount = 0;
+  let postReadUnits = 0;
+
+  for (const item of items) {
+    if (!item.model || !item.model.startsWith(TWITTER_MODEL_PREFIX)) continue;
+    const operation = item.model.slice(TWITTER_MODEL_PREFIX.length);
+    const cost = item.costMicroUsd || 0;
+    const calls = item.callCount || 0;
+    const qty = item.quantity || 0;
+
+    costMicroUsd += cost;
+    callCount += calls;
+    if (isPostReadOperation(operation)) postReadUnits += qty;
+
+    let row = byOp.get(operation);
+    if (!row) {
+      row = { operation, callCount: 0, quantity: 0, costUsd: 0 };
+      byOp.set(operation, row);
+    }
+    row.callCount += calls;
+    row.quantity += qty;
+    row.costUsd += cost / 1_000_000;
+  }
+
+  const byOperation = [...byOp.values()].sort(
+    (a, b) => b.costUsd - a.costUsd || a.operation.localeCompare(b.operation)
+  );
+
+  return {
+    start,
+    end,
+    costUsd: costMicroUsd / 1_000_000,
+    callCount,
+    postReadUnits,
+    byOperation,
+  };
+}
+
+/**
+ * The current X billing-cycle window [start, end] (UTC) given the cycle's
+ * reset day-of-month. X's GET /2/usage/tweets reports usage for the cycle to
+ * date, so allocated totals must be summed over the SAME window to compare.
+ * Exported for unit testing the month-boundary logic.
+ *
+ * @param resetDay  cap_reset_day from X (1–31); falls back to 1 when null.
+ * @param now       reference instant (defaults to current time).
+ */
+export function currentXBillingCycle(
+  resetDay: number | null,
+  now: Date = new Date()
+): { start: string; end: string } {
+  const day = resetDay && resetDay >= 1 && resetDay <= 31 ? Math.floor(resetDay) : 1;
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const todayDom = now.getUTCDate();
+  // Cycle started on `day` this month if we're at/past it, else last month.
+  const startMs =
+    todayDom >= day ? Date.UTC(y, m, day) : Date.UTC(y, m - 1, day);
+  const fmt = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+  return { start: fmt(startMs), end: now.toISOString().slice(0, 10) };
 }
