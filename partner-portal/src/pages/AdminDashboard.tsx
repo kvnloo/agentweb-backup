@@ -784,6 +784,7 @@ export default function AdminDashboard() {
     'connected-accounts': 21,
     'contractors': 22,
     'emma-mcp': 23,
+    'usage-cost': 24,
   };
   
   // Get initial tab value from URL or default to Users
