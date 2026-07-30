@@ -49,7 +49,16 @@ Environment=VERTEX_AI_SEARCH_APP_ID=agentweb-kb-prod_1748622422971
 Environment=GCS_BUCKET_NAME=agentweb-knowledge-base
 Environment=VERTEX_AI_LOCATION_PRIVATE=us
 Environment=VERTEX_AI_SEARCH_APP_ID_PRIVATE=agentweb-kb-private-prod_1749666665455
+# AWS_S3_BUCKET/S3_BUCKET_NAME/AWS_S3_BUCKET_INTERNAL contain a digit ("S3"),
+# which the first audit pass's [A-Z_]+ regex silently excluded — found only
+# by actually running the code and hitting the resulting crash
+# (cookie_sync.py: "AWS_S3_BUCKET_INTERNAL environment variable must be
+# set"). Lesson: grep-based env-var audits need [A-Z0-9_]+, or better, don't
+# fully trust static analysis over actually running the code.
 Environment=GCS_BUCKET_NAME_PRIVATE=agentweb-knowledge-base-private-prod
+Environment=AWS_S3_BUCKET=agentweb-execution-gifs
+Environment=S3_BUCKET_NAME=agentweb-execution-gifs
+Environment=AWS_S3_BUCKET_INTERNAL=agentweb-internal
 ExecStart=/opt/agent-engine/miniconda/envs/agent-engine/bin/python task_monitor.py
 Restart=on-failure
 RestartSec=10
