@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'async_hooks';
 import { TwitterApi } from 'twitter-api-v2';
 import { getTwitterCredentials } from '../utils/secretsManager';
 import {
@@ -50,6 +51,22 @@ interface TwitterMeterSpec {
 
 /** Count the resources in an X read result (array of items), defensively. */
 const arrayLen = (r: unknown): number => (Array.isArray(r) ? r.length : 0);
+
+/**
+ * Request-scoped acting user for X metering (ENG-664, Option B).
+ *
+ * twitterService methods only receive the account OWNER's `ownerUserId` (so token
+ * refreshes write back to the owner). To match the LLM rail — where the shadow
+ * ledger records the ACTING user and billing rolls to the org owner — a caller
+ * (the Emma dispatchers / the adapter) wraps its X calls in `runWithXActingUser`.
+ * `meterCall` then records `userId = acting user` and `billingUserId = owner`.
+ * An unwrapped call path safely falls back to owner-attribution (old behavior).
+ */
+const xActingUserStore = new AsyncLocalStorage<{ actingUserId?: string }>();
+
+export function runWithXActingUser<T>(actingUserId: string | undefined, fn: () => T): T {
+  return xActingUserStore.run({ actingUserId }, fn);
+}
 
 /**
  * TwitterService — official X API v2 integration (twitter-api-v2).
@@ -436,12 +453,20 @@ export class TwitterService {
     result: T
   ): void {
     try {
+      // Attribution (Option B, matches the LLM rail): the shadow-ledger subject is
+      // the ACTING user (the member who triggered it, from the request context);
+      // billing rolls to the account OWNER (ownerUserId). Unwrapped paths have no
+      // acting user in context → attribute to the owner (prior behavior).
+      const actingUserId = xActingUserStore.getStore()?.actingUserId;
+      const userId = actingUserId || ownerUserId;
+
       const units = meter.units ? meter.units(result) : 1;
       const cost = computeTwitterCost(meter.operation, units, {
         hasLink: textContainsLink(meter.text),
       });
       void recordVendorUsage({
-        userId: ownerUserId,
+        userId,
+        billingUserId: ownerUserId,
         provider: TWITTER_PROVIDER,
         operation: meter.operation,
         feature: `x-account:${accountId}`,
@@ -455,7 +480,8 @@ export class TwitterService {
       if (meter.extraUserReads && meter.extraUserReads > 0) {
         const resolveCost = computeTwitterCost('resolve_handle', meter.extraUserReads);
         void recordVendorUsage({
-          userId: ownerUserId,
+          userId,
+          billingUserId: ownerUserId,
           provider: TWITTER_PROVIDER,
           operation: 'resolve_handle',
           feature: `x-account:${accountId}`,

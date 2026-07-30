@@ -429,7 +429,7 @@ async function buildXAccountBreakdown(
 ): Promise<CostByXAccountRow[]> {
   const acctMap = new Map<
     string,
-    { costMicroUsd: number; callCount: number; userCost: Map<string, number> }
+    { costMicroUsd: number; callCount: number; ownerCost: Map<string, number> }
   >();
 
   for (const item of items) {
@@ -439,12 +439,17 @@ async function buildXAccountBreakdown(
     const cost = item.costMicroUsd || 0;
     let bucket = acctMap.get(accountId);
     if (!bucket) {
-      bucket = { costMicroUsd: 0, callCount: 0, userCost: new Map() };
+      bucket = { costMicroUsd: 0, callCount: 0, ownerCost: new Map() };
       acctMap.set(accountId, bucket);
     }
     bucket.costMicroUsd += cost;
     bucket.callCount += item.callCount || 0;
-    bucket.userCost.set(item.userId, (bucket.userCost.get(item.userId) || 0) + cost);
+    // Resolve the @handle through the account OWNER, which the row carries as
+    // billingUserId (Option B: userId is the acting member, billingUserId the
+    // owner). Pre-Option-B rows have billingUserId === userId, so this still
+    // works. getAccountById needs the owner's userId to find the account.
+    const owner = item.billingUserId || item.userId;
+    bucket.ownerCost.set(owner, (bucket.ownerCost.get(owner) || 0) + cost);
   }
 
   const ranked = [...acctMap.entries()].sort(
@@ -453,8 +458,9 @@ async function buildXAccountBreakdown(
 
   return Promise.all(
     ranked.map(async ([accountId, bucket]) => {
-      // Representative user = heaviest spender on this account (the owner, normally).
-      const repUserId = [...bucket.userCost.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+      // Representative owner = the billing user with the most spend on this account
+      // (for X there is exactly one owner per account, so this is deterministic).
+      const repUserId = [...bucket.ownerCost.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
       let handle: string | null = null;
       if (repUserId) {
         const acct = await getAccountById(accountId, repUserId, "twitter").catch(() => null);
