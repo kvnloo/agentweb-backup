@@ -86,7 +86,7 @@ structural presence ≠ compliance) → promote to prod → re-verify.
 ### ENG-613 — Inbound Website Lead Engagement de-hardcode (Blindspot 3)
 | Skill | change | dev | verified | promoted |
 |---|---|---|---|---|
-| Inbound Website Lead Engagement Logic (`92ed7c80`) | de-hardcode → runtime ICP/lists per requesting org + CONTEXT+SAFETY+FAILURE | ✅ | ✅ beh (loads read_market_strategy/read_brand_guidelines + get_lead_lists at runtime; discovers lists dynamically; verifies account, refuses inactive-account send; no hallucination) | ☐ admin-API PUT after review |
+| Inbound Website Lead Engagement Logic (`92ed7c80`) | de-hardcode → runtime ICP/lists per requesting org + CONTEXT+SAFETY+FAILURE | ✅ | ✅ beh (loads read_market_strategy/read_brand_guidelines + get_lead_lists at runtime; discovers lists dynamically; verifies account, refuses inactive-account send; no hallucination) | ✅ **prod-verified 07-30** (4773→7549 chars, 3 blocks, 0 leaks) |
 
 Reproducible artifact: `backend/src/scripts/dehardenInboundWebsite.ts` (+ `inboundWebsite.dehardened.md`). Prompt 4777→7551 chars, 0 hardcoded leaks. **Prod promotion pending developer review of the new prompt + admin token.**
 
