@@ -1,0 +1,90 @@
+// DRAFT — apply via Harsha/ENG-562. Nothing here is live; these are alarm DEFINITIONS for review.
+//
+// Four alarms for the autofix runner box (ENG-655 observability). Each `alarms[]` entry is a ready-to-use
+// `aws cloudwatch put-metric-alarm --cli-input-json` payload — this is JSONC for review, so STRIP the `//`
+// comments and fill the PLACEHOLDERS before applying. Placeholders:
+//   <INSTANCE_ID>       the runner's EC2 instance id (i-…)
+//   <SNS_TOPIC_ARN>     an SNS topic Harsha owns for autofix alerts (used for AlarmActions/OKActions)
+//   us-west-2 / 992382574572   region / account (already filled where an ARN is needed)
+//
+// METRIC PREREQUISITES (each alarm's metric must be published first — none exist yet; that wiring is part
+// of the apply step, not this draft):
+//   1. PollHeartbeat (no-successful-poll): publish a custom metric each successful poll cycle. The value is
+//      already available — GET :8790/api/metrics returns __meta.lastPollAt (ENG metrics endpoint). Simplest
+//      wiring: at the END of run.sh's cycle,
+//        aws cloudwatch put-metric-data --namespace AgentWeb/Autofix --metric-name PollSuccess --value 1
+//      then this alarm fires when NO datapoint arrives within the window (TreatMissingData=breaching).
+//   2. disk_used_percent / mem_used_percent: require the CloudWatch Agent (namespace CWAgent) on the box —
+//      install + config is a separate step (can fold into bootstrap.sh once the role has cloudwatch:PutMetricData).
+//   3. IAMAccessDenied: a CloudTrail → CloudWatch Logs metric filter counting `errorCode = AccessDenied` for
+//      the runner role (ties to the ENG-651 IAM canary — watch for the least-privilege policy denying a real call).
+{
+  "alarms": [
+    {
+      "//": "1) No successful poll in 15 min — off the poll heartbeat (metrics lastPollAt). Missing data = breaching, so a stalled/crashed poller (cron wedged, box down) trips it.",
+      "AlarmName": "autofix-no-successful-poll-15m",
+      "AlarmDescription": "No successful autofix poll cycle recorded in 15 minutes (heartbeat from run.sh / metrics lastPollAt). Indicates the poll cron is wedged or the box is down.",
+      "Namespace": "AgentWeb/Autofix",
+      "MetricName": "PollSuccess",
+      "Statistic": "Sum",
+      "Period": 900,
+      "EvaluationPeriods": 1,
+      "Threshold": 1,
+      "ComparisonOperator": "LessThanThreshold",
+      "TreatMissingData": "breaching",
+      "Dimensions": [{ "Name": "InstanceId", "Value": "<INSTANCE_ID>" }],
+      "AlarmActions": ["<SNS_TOPIC_ARN>"],
+      "OKActions": ["<SNS_TOPIC_ARN>"]
+    },
+    {
+      "//": "2) Root disk > 85% — worktrees + 3× node_modules + previews fill the 100GB gp3 volume. Requires the CloudWatch Agent (CWAgent namespace).",
+      "AlarmName": "autofix-disk-used-percent-high",
+      "AlarmDescription": "Root filesystem usage on the autofix runner exceeded 85%.",
+      "Namespace": "CWAgent",
+      "MetricName": "disk_used_percent",
+      "Statistic": "Average",
+      "Period": 300,
+      "EvaluationPeriods": 2,
+      "Threshold": 85,
+      "ComparisonOperator": "GreaterThanThreshold",
+      "TreatMissingData": "missing",
+      "Dimensions": [
+        { "Name": "InstanceId", "Value": "<INSTANCE_ID>" },
+        { "Name": "path", "Value": "/" },
+        { "Name": "fstype", "Value": "xfs" }
+      ],
+      "AlarmActions": ["<SNS_TOPIC_ARN>"],
+      "OKActions": ["<SNS_TOPIC_ARN>"]
+    },
+    {
+      "//": "3) Memory > 90% — a handful of live preview stacks (backend + 2× vite + Chromium each) can exhaust the 16GB box; the preview memory-pressure eviction is the mitigation, this alarm is the warning. Requires the CloudWatch Agent.",
+      "AlarmName": "autofix-mem-used-percent-high",
+      "AlarmDescription": "Memory usage on the autofix runner exceeded 90%.",
+      "Namespace": "CWAgent",
+      "MetricName": "mem_used_percent",
+      "Statistic": "Average",
+      "Period": 300,
+      "EvaluationPeriods": 2,
+      "Threshold": 90,
+      "ComparisonOperator": "GreaterThanThreshold",
+      "TreatMissingData": "missing",
+      "Dimensions": [{ "Name": "InstanceId", "Value": "<INSTANCE_ID>" }],
+      "AlarmActions": ["<SNS_TOPIC_ARN>"],
+      "OKActions": ["<SNS_TOPIC_ARN>"]
+    },
+    {
+      "//": "4) AccessDenied count ≥ 1 in 5 min — surfaces the least-privilege IAM policy (ENG-651) denying a real call during/after the canary. Metric comes from a CloudTrail→Logs metric filter on errorCode=AccessDenied for the runner role.",
+      "AlarmName": "autofix-iam-access-denied",
+      "AlarmDescription": "One or more AccessDenied errors for the autofix runner role in 5 minutes — likely the ENG-651 least-privilege policy denying a real call.",
+      "Namespace": "AgentWeb/Autofix",
+      "MetricName": "IAMAccessDenied",
+      "Statistic": "Sum",
+      "Period": 300,
+      "EvaluationPeriods": 1,
+      "Threshold": 1,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold",
+      "TreatMissingData": "notBreaching",
+      "AlarmActions": ["<SNS_TOPIC_ARN>"]
+    }
+  ]
+}

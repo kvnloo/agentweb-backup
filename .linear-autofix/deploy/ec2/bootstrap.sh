@@ -135,6 +135,33 @@ else
   echo "    WARNING: $UNIT_SRC not found — skipping systemd install (older checkout?)."
 fi
 
+# ENG-655: durable log retention. Install a logrotate policy so poll.log + chat.log can't grow unbounded
+# even if the poll cron (which does per-cycle rotation) stops. Idempotent — re-copies the config each run.
+echo "==> Log retention: logrotate for poll.log + chat.log"
+sudo dnf -y install logrotate >/dev/null 2>&1 || true
+LOGROTATE_SRC="$WORKDIR/.linear-autofix/deploy/ec2/autofix-logrotate.conf"
+if [ -f "$LOGROTATE_SRC" ]; then
+  sudo cp "$LOGROTATE_SRC" /etc/logrotate.d/autofix
+  sudo systemctl enable --now logrotate.timer >/dev/null 2>&1 || true   # AL2023 runs logrotate via a timer
+  sudo logrotate --debug /etc/logrotate.d/autofix >/dev/null 2>&1 && echo "    /etc/logrotate.d/autofix installed (validated)." || echo "    /etc/logrotate.d/autofix installed."
+else
+  echo "    WARNING: $LOGROTATE_SRC not found — skipping logrotate install."
+fi
+
+# ENG-655: SSM Agent for remote management / Session Manager / Run Command. Idempotent install + enable.
+# On AL2023 it is usually preinstalled; this makes sure it's present and running.
+# NOTE (do NOT apply here): the instance only becomes a MANAGED instance once its IAM role grants SSM
+# permissions (AmazonSSMManagedInstanceCore, i.e. ssm:UpdateInstanceInformation + messages/* etc). That
+# is an IAM change — flag it for the role/IAM step (Harsha / ENG-562); the agent running without perms is
+# harmless (it just can't register).
+echo "==> SSM Agent (install + enable; managed-instance registration needs IAM perms — see ENG-562)"
+if ! systemctl list-unit-files 2>/dev/null | grep -q '^amazon-ssm-agent'; then
+  sudo dnf -y install amazon-ssm-agent >/dev/null 2>&1 || true
+fi
+sudo systemctl enable --now amazon-ssm-agent >/dev/null 2>&1 \
+  && echo "    amazon-ssm-agent enabled (grant the role AmazonSSMManagedInstanceCore to register — ENG-562)." \
+  || echo "    amazon-ssm-agent present/enable attempted — registration still needs role SSM perms (ENG-562)."
+
 cat <<EOF
 
 ==> Bootstrap complete. Remaining interactive steps (see RUNBOOK.md):
