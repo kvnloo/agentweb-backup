@@ -90,8 +90,15 @@ structural presence ≠ compliance) → promote to prod → re-verify.
 
 Reproducible artifact: `backend/src/scripts/dehardenInboundWebsite.ts` (+ `inboundWebsite.dehardened.md`). Prompt 4777→7551 chars, 0 hardcoded leaks. **Prod promotion pending developer review of the new prompt + admin token.**
 
-### ENG-612 / ENG-614 — blocked on Harsha data-plane decisions
-Evidence packets posted to **ENG-624** (Luma) + **ENG-626** (Video/LinkedIn) with read-only diffs, keeper/delete IDs, restorable backups; `Requires: Me` restored. **Key finding:** the 3 Luma rows are 3 DIFFERENT users' private, diverged skills (not catalog dupes) → recommended C (de-hardcode only, no delete). LinkedIn Post Writing is clean → recommended A (keep `23c80388` 8-tool, delete `aabe2602` draft).
+### ENG-612 — Luma de-hardcode (dev-done; dedup blocked)
+| Skill | change | dev | verified | promoted |
+|---|---|---|---|---|
+| Luma Event Lead Engagement Engine (`a831f5c8`) | strip departing-employee (Rui Wang) name + CONTEXT+SAFETY+FAILURE | ✅ | ✅ beh (**STOPS on the past June-18 event**; derives owners at runtime + queues inactive; loads read_market_strategy; ledger, no fabrication) | ☐ **user-owned private skill — needs explicit sign-off before prod** |
+
+Conservative de-hardcode: the CONTEXT block behaviorally neutralizes the past event + departing-owner without gutting the user's bespoke event logic. Prompt 8140→10228, Rui Wang removed. The other 2 Luma rows (`eab2ba45` near-clean, `a80b5360` clean) left untouched.
+
+### ENG-612 / ENG-614 — dedup blocked on Harsha data-plane decisions
+Evidence packets posted to **ENG-624** (Luma) + **ENG-626** (Video/LinkedIn) with read-only diffs, keeper/delete IDs, restorable backups; `Requires: Me` restored. **Key finding:** the 3 Luma rows are 3 DIFFERENT users' private, diverged skills (not catalog dupes) → recommended C (de-hardcode only, no delete — done above). LinkedIn Post Writing is clean → recommended A (keep `23c80388` 8-tool, delete `aabe2602` draft).
 
 ## PR 4 / PR 5 — new skills (ENG-615…618) — not started
 10 new skills; #1/#3/#5/#6 ship hardened; #7 blocked on privacy review.
