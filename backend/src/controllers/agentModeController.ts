@@ -1092,6 +1092,13 @@ export async function runVerifiedChat(
     // rather than dropped into a void no one will ever action. Fail-safe default
     // means a NEW headless caller is covered automatically (no drift).
     parkNotifiable?: boolean;
+    // ENG-657: tool calls already made in a PRIOR (abandoned) portion of this
+    // session that this run is RESUMING. Seeded into the run's accumulated tool
+    // calls so keyword/required-function verification counts the whole task, not
+    // just the continuation turns — otherwise a resumed run would be wrongly marked
+    // `passed: false` for calls it made before the interruption, and the verify
+    // retry loop could re-prompt the model into re-running a completed side-effect.
+    priorToolCalls?: Array<{ name: string }>;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -1219,8 +1226,13 @@ export async function runVerifiedChat(
     remainingFunctionCallCounts[reqFunc.functionName] = reqFunc.minCount;
   });
 
-  // Track all function calls across attempts.
-  const allActualFunctionCallsForReporting: string[] = [];
+  // Track all function calls across attempts. ENG-657: on a resume, seed with the
+  // tool calls the abandoned portion already made so requiredFunctionCalls counts
+  // the whole task — otherwise a resumed run is falsely marked incomplete and the
+  // verify loop could re-prompt the model into re-running a completed side effect.
+  const allActualFunctionCallsForReporting: string[] = Array.isArray(params.priorToolCalls)
+    ? params.priorToolCalls.map((c) => c.name).filter(Boolean)
+    : [];
 
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
@@ -2040,6 +2052,9 @@ export async function runScheduledChat(
     // anything off — session gone, wrong owner, or no longer safely resumable —
     // falls back to a normal fresh run, so this is strictly additive.
     let isResumeRun = false;
+    // ENG-657: tool calls the abandoned portion already made, seeded into the
+    // resumed run's verification so requiredFunctionCalls counts the whole task.
+    let resumePriorToolCalls: Array<{ name: string }> = [];
     const pendingResumeSessionId: string | undefined =
       !isTest && typeof schedule.pendingResumeSessionId === 'string' && schedule.pendingResumeSessionId
         ? schedule.pendingResumeSessionId
@@ -2059,7 +2074,18 @@ export async function runScheduledChat(
         ) {
           isResumeRun = true;
           sessionId = pendingResumeSessionId;
-          console.log(`runScheduledChat: RESUMING abandoned session ${sessionId} for schedule ${schedule.scheduleId} (${schedule.scheduleName})`);
+          // Collect the tool calls already made before the interruption so the
+          // resumed run's verification counts them (top-level or metadata-mirrored).
+          resumePriorToolCalls = (resumeSession.messages || []).flatMap((m: any) => {
+            const calls = (Array.isArray(m?.tool_calls) && m.tool_calls.length)
+              ? m.tool_calls
+              : (Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : []);
+            return calls
+              .map((tc: any) => tc?.function?.name || tc?.name)
+              .filter(Boolean)
+              .map((name: string) => ({ name }));
+          });
+          console.log(`runScheduledChat: RESUMING abandoned session ${sessionId} for schedule ${schedule.scheduleId} (${schedule.scheduleName}); ${resumePriorToolCalls.length} prior tool call(s) carried into verification`);
         } else {
           console.warn(`runScheduledChat: resume marker for session ${pendingResumeSessionId} no longer resumable (missing/owner-mismatch/unsafe boundary); starting a fresh run.`);
         }
@@ -2145,6 +2171,9 @@ export async function runScheduledChat(
       maxAttempts: 20,
       attachments: fileAttachments,
       llmModel: schedule.llmModel || defaultModel,
+      // ENG-657: on a resume, count the abandoned portion's tool calls in
+      // verification so requiredFunctionCalls isn't falsely missed (empty otherwise).
+      priorToolCalls: resumePriorToolCalls,
       // Deterministic backstop for multi-entity scheduled runs (PR #1941 follow-up):
       // if the run admits it left work unfinished, auto-continue before finishing.
       completionGate: true,
