@@ -135,12 +135,33 @@ Two alerting layers:
    recipient was ever wrong (was Rui's personal Gmail — fixed).
 2. **Process-level** — systemd's `OnFailure=agent-engine-alert@%n.service`
    fires when `agent-engine.service` exhausts its restart budget
-   (`StartLimitBurst=5` within `StartLimitIntervalSec=300`). Runs
-   `deploy/alert_oncall.sh`, which emails `harsha@agentweb.pro` via the same
-   SMTP secret (`agentengine-prod-smtp`) — reuses the task-level mechanism
-   rather than a separate Slack webhook. Confirmed via live recovery
-   incident (2026-07-29) that no process-level alerting existed before this
-   ticket at all.
+   (`StartLimitBurst=5` within `StartLimitIntervalSec=300`). Emails
+   `harsha@agentweb.pro` via the same SMTP secret (`agentengine-prod-smtp`)
+   as the task-level alert — one alerting mechanism, not two. Confirmed via
+   live recovery incident (2026-07-29) that no process-level alerting
+   existed before this ticket at all.
+
+   **Deliberately isolated from the checkout it monitors** (Greptile
+   finding on the PR): `agent-engine.service` and the alert unit both run
+   as `agentengine`, but the alert script/interpreter live under
+   `/opt/agent-engine-alert`, root-owned and read/execute-only for
+   `agentengine` — not inside `/opt/agent-engine/agentweb`, which
+   `agentengine` owns and can write to. If `agentengine` is ever
+   compromised (plausible — it executes browser-automation against
+   arbitrary web content), it must not be able to tamper with the one
+   thing that reports its own failure. `deploy/alert_oncall.py` is
+   deliberately self-contained (does not `import secrets_manager` from the
+   main checkout) for the same reason — do not "simplify" that.
+
+   Provisioning (one-time, in addition to the main setup):
+   ```bash
+   sudo mkdir -p /opt/agent-engine-alert
+   sudo python3 -m venv /opt/agent-engine-alert/venv
+   sudo /opt/agent-engine-alert/venv/bin/pip install google-cloud-secret-manager
+   sudo cp agent-engine/deploy/alert_oncall.py /opt/agent-engine-alert/
+   sudo chown -R root:root /opt/agent-engine-alert
+   sudo chmod -R a+rX,go-w /opt/agent-engine-alert
+   ```
 
 ## Restart / rollback
 
