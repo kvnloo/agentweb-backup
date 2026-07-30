@@ -1066,7 +1066,10 @@ export class MetaService {
       this.log(`Creating ad set in account: ${adAccountId} with payload:`, adSetParams);
       
       // Note: SDK v24.0.1+ internal POST mapping handlesact_ prefix and body params correctly.
-      const adSet = await account.createAdSet([], adSetParams);
+      // Request id+name back explicitly — Meta's create response only echoes an
+      // empty fields array as {id}, so callers reading adSet.name (e.g. success
+      // message strings) got literal "undefined" against the live API.
+      const adSet = await account.createAdSet(['id', 'name'], adSetParams);
       return adSet._data;
     } catch (error: any) {
       return this.handleError(error, 'createAdSet');
@@ -1861,7 +1864,7 @@ export class MetaService {
       }
 
       this.log(`Creating custom audience in account: ${adAccountId}`, audienceParams);
-      const audience = await account.createCustomAudience([], audienceParams);
+      const audience = await account.createCustomAudience(['id', 'name'], audienceParams);
       return audience._data;
     } catch (error) {
       return this.handleError(error, 'createCustomAudience');

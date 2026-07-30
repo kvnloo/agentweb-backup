@@ -224,10 +224,19 @@ describe('MetaService', () => {
 
             const result = await service.createAdSet(mockAdAccountId, mockAccessToken, params);
 
-            expect(mockCreateAdSet).toHaveBeenCalledWith([], expect.objectContaining({
-                name: 'New Ad Set',
-                campaign_id: 'camp_123',
-            }));
+            // ENG-600 live-test finding: requesting zero fields back means Meta's
+            // real create response only echoes {id} — every caller that reads
+            // adSet.name off the result (e.g. the success message string) got
+            // literal "undefined" against the live API, even though mocked tests
+            // never caught it (the mock always returns the full object regardless
+            // of what fields were requested).
+            expect(mockCreateAdSet).toHaveBeenCalledWith(
+                expect.arrayContaining(['id', 'name']),
+                expect.objectContaining({
+                    name: 'New Ad Set',
+                    campaign_id: 'camp_123',
+                })
+            );
             expect(result).toEqual(mockAdSetData);
         });
 
@@ -247,7 +256,7 @@ describe('MetaService', () => {
                 destination_type: 'WEBSITE',
             });
 
-            expect(mockCreateAdSet).toHaveBeenCalledWith([], expect.objectContaining({ destination_type: 'WEBSITE' }));
+            expect(mockCreateAdSet.mock.calls[0][1]).toEqual(expect.objectContaining({ destination_type: 'WEBSITE' }));
         });
 
         it('omits destination_type from the payload when not provided (ENG-415)', async () => {
@@ -700,7 +709,7 @@ describe('MetaService', () => {
 
             const result = await service.createCustomAudience(mockAdAccountId, mockAccessToken, params);
 
-            expect(mockCreateCustomAudience).toHaveBeenCalledWith([], expect.objectContaining({
+            expect(mockCreateCustomAudience).toHaveBeenCalledWith(expect.arrayContaining(['id', 'name']), expect.objectContaining({
                 name: 'My Custom Audience',
                 subtype: 'CUSTOM',
                 customer_file_source: 'USER_PROVIDED_ONLY',
