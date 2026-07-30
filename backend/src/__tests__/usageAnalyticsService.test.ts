@@ -29,6 +29,7 @@ import {
   getUsageComparison,
   getCostAggregation,
   getXAllocatedTotals,
+  getXCostByActingUser,
   currentXBillingCycle,
   getUserXBreakdown,
 } from '../services/usageAnalyticsService';
@@ -618,6 +619,36 @@ describe('getXAllocatedTotals', () => {
   it('rejects a malformed or inverted range', async () => {
     await expect(getXAllocatedTotals('nope', '2026-07-02')).rejects.toThrow(/YYYY-MM-DD/);
     await expect(getXAllocatedTotals('2026-07-05', '2026-07-01')).rejects.toThrow(/<=/);
+  });
+});
+
+describe('getXCostByActingUser', () => {
+  it('sums twitter:* $ per acting userId and excludes non-twitter rows', async () => {
+    mockScan.mockResolvedValue([
+      xRow('twitter:search_tweets', { userId: 'user-1', costMicroUsd: 50_000 }), // $0.05
+      xRow('twitter:get_profile', { userId: 'user-1', costMicroUsd: 10_000 }),   // +$0.01 → user-1 = $0.06
+      xRow('twitter:post', { userId: 'user-2', costMicroUsd: 15_000 }),          // user-2 = $0.015
+      // An LLM row for user-1 must NOT inflate their X total.
+      { ...xRow('gpt-5-chat-2', { userId: 'user-1' }), model: 'gpt-5-chat-2', costMicroUsd: 999_000 },
+      // A row with no userId is skipped.
+      xRow('twitter:like', { userId: undefined, costMicroUsd: 0 }),
+    ]);
+
+    const map = await getXCostByActingUser('2026-07-01', '2026-07-31');
+    expect(map['user-1']).toBeCloseTo(0.06, 6);
+    expect(map['user-2']).toBeCloseTo(0.015, 6);
+    // No entry for users without X spend (caller renders $0).
+    expect(map['user-3']).toBeUndefined();
+  });
+
+  it('returns an empty map for an empty window', async () => {
+    mockScan.mockResolvedValue([]);
+    await expect(getXCostByActingUser('2026-07-01', '2026-07-02')).resolves.toEqual({});
+  });
+
+  it('rejects a malformed or inverted range', async () => {
+    await expect(getXCostByActingUser('nope', '2026-07-02')).rejects.toThrow(/YYYY-MM-DD/);
+    await expect(getXCostByActingUser('2026-07-05', '2026-07-01')).rejects.toThrow(/<=/);
   });
 });
 
