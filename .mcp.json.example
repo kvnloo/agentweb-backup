@@ -15,7 +15,7 @@
     },
     "okareo": {
       "command": "uvx",
-      "args": ["okareo-mcp"],
+      "args": ["--with", "mcp[cli]<2", "--from", "okareo-mcp==0.0.43", "okareo-mcp"],
       "env": {
         "OKAREO_API_KEY": "${OKAREO_API_KEY}"
       }
