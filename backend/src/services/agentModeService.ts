@@ -16987,9 +16987,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error managing custom audiences:', error);
+      // Meta's raw error.message (e.g. "Permissions error") is often too terse to
+      // act on. metaService.handleError attaches a structuredError with Meta's own
+      // consumer-facing error_user_msg (e.g. the exact accept-terms URL for
+      // "Custom audience terms not accepted", subcode 1870090) — prefer it when present.
+      const structured = error.structuredError;
+      let message = error.message || 'Failed to manage custom audiences.';
+      if (structured?.error_user_msg) {
+        message = structured.error_subcode === 1870090
+          ? `${structured.error_user_msg} This is a one-time setup step per ad account — once accepted, retry the same request.`
+          : structured.error_user_msg;
+      }
       return {
         success: false,
-        message: error.message || 'Failed to manage custom audiences.',
+        message,
         error: error.message
       };
     }

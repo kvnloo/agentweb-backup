@@ -309,6 +309,44 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
           })
         );
       });
+
+      // ENG-600: real live-test finding — Meta's raw error.message ("Permissions
+      // error") was surfacing to the user with no way to act on it. The SDK
+      // attaches a friendlier error_user_msg (with the exact accept-terms URL)
+      // via structuredError; prefer that when present.
+      it('surfaces the friendly error_user_msg (with accept-terms URL) instead of the generic SDK message', async () => {
+        const sdkError: any = new Error('Permissions error');
+        sdkError.structuredError = {
+          message: 'Permissions error',
+          code: 200,
+          error_subcode: 1870090,
+          error_user_title: 'Custom audience terms not accepted',
+          error_user_msg: 'Custom audience terms not accepted. To create or edit an audience with an uploaded customer list, agree to the custom audience terms at https://business.facebook.com/ads/manage/customaudiences/tos/?act=123456789.',
+          classification: 'PERMISSION_ERROR',
+        };
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.createCustomAudience as jest.Mock).mockRejectedValue(sdkError);
+
+        const result = await agentModeService.manageMetaCustomAudiences('user123', 'CREATE', '123456789', {
+          action: 'create', name: 'X', subtype: 'CUSTOM',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('agree to the custom audience terms at https://business.facebook.com/ads/manage/customaudiences/tos/?act=123456789');
+        expect(result.message).toContain('one-time setup');
+      });
+
+      it('falls back to error.message when no structuredError is present', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.createCustomAudience as jest.Mock).mockRejectedValue(new Error('Network timeout'));
+
+        const result = await agentModeService.manageMetaCustomAudiences('user123', 'CREATE', '123456789', {
+          action: 'create', name: 'X', subtype: 'CUSTOM',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toBe('Network timeout');
+      });
     });
 
     describe('manageMetaCustomAudiences - upload_users', () => {
