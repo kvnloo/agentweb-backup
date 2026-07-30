@@ -654,8 +654,11 @@ describe('currentXBillingCycle', () => {
 });
 
 describe('getCostAggregation — byXAccount (@handle enrichment, ENG-664)', () => {
-  const xr = (accountId: string, userId: string, costMicroUsd: number, callCount = 1) => ({
-    userId,
+  // Option B: userId = acting member; billingUserId = account owner. Enrichment
+  // resolves the handle through the OWNER (billingUserId).
+  const xr = (accountId: string, actingUserId: string, owner: string, costMicroUsd: number, callCount = 1) => ({
+    userId: actingUserId,
+    billingUserId: owner,
     sk: `2026-07-10#twitter:search_tweets#x-account:${accountId}`,
     date: '2026-07-10',
     model: 'twitter:search_tweets',
@@ -668,13 +671,14 @@ describe('getCostAggregation — byXAccount (@handle enrichment, ENG-664)', () =
     costMicroUsd,
   });
 
-  it('groups X rows by account and enriches the handle via the heaviest-spending owner', async () => {
+  it('groups X rows by account and enriches the handle via the OWNER (billingUserId), across acting members', async () => {
     mockScan.mockResolvedValue([
-      xr('acc-1', 'owner-1', 90_000, 9), // owner-1 spends most on acc-1
-      xr('acc-1', 'member-2', 10_000, 1),
-      xr('acc-2', 'owner-3', 5_000, 1),
+      // acc-1 owned by owner-1, but the calls were made by two different members.
+      xr('acc-1', 'member-a', 'owner-1', 90_000, 9),
+      xr('acc-1', 'member-b', 'owner-1', 10_000, 1),
+      xr('acc-2', 'owner-3', 'owner-3', 5_000, 1),
       // a non-X row must not appear as an account
-      { ...xr('acc-1', 'owner-1', 999_000), model: 'gpt-5-chat-2', feature: 'agent-chat' },
+      { ...xr('acc-1', 'member-a', 'owner-1', 999_000), model: 'gpt-5-chat-2', feature: 'agent-chat' },
     ]);
     mockGetUser.mockResolvedValue(null);
     mockGetAccountById.mockImplementation((accountId: string, userId: string) => {
@@ -687,15 +691,16 @@ describe('getCostAggregation — byXAccount (@handle enrichment, ENG-664)', () =
 
     expect(result.byXAccount.map((a) => a.accountId)).toEqual(['acc-1', 'acc-2']); // sorted by spend
     expect(result.byXAccount[0]).toMatchObject({ accountId: 'acc-1', handle: 'alice', callCount: 10 });
-    expect(result.byXAccount[0].costUsd).toBeCloseTo(0.1, 6); // (90000+10000)/1e6
-    // handle resolution used the OWNER (owner-1), not the member.
+    expect(result.byXAccount[0].costUsd).toBeCloseTo(0.1, 6); // (90000+10000)/1e6, both members
+    // Handle resolved via the OWNER (billingUserId), NOT either acting member.
     expect(mockGetAccountById).toHaveBeenCalledWith('acc-1', 'owner-1', 'twitter');
+    expect(mockGetAccountById).not.toHaveBeenCalledWith('acc-1', 'member-a', 'twitter');
     // acc-2 config has no username → falls back to account_name.
     expect(result.byXAccount[1]).toMatchObject({ accountId: 'acc-2', handle: 'Bob' });
   });
 
   it('yields handle=null when the account cannot be resolved (fallback to raw id)', async () => {
-    mockScan.mockResolvedValue([xr('acc-x', 'u1', 5_000)]);
+    mockScan.mockResolvedValue([xr('acc-x', 'u1', 'u1', 5_000)]);
     mockGetUser.mockResolvedValue(null);
     mockGetAccountById.mockResolvedValue(null);
 

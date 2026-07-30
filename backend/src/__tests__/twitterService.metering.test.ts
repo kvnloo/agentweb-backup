@@ -50,7 +50,7 @@ jest.mock('../services/usageRecorderService', () => ({
   recordVendorUsage: (...a: any[]) => mockRecordVendorUsage(...a),
 }));
 
-import { twitterService } from '../services/twitterService';
+import { twitterService, runWithXActingUser } from '../services/twitterService';
 
 const OWNER = 'user-1';
 const ACCOUNT_ID = 'tw-acct-1';
@@ -86,7 +86,9 @@ describe('X usage metering — attribution', () => {
 
     expect(mockRecordVendorUsage).toHaveBeenCalledTimes(1);
     const ctx = lastCall();
+    // No acting-user context wrapped → attribute to the owner (billingUserId == userId).
     expect(ctx.userId).toBe(OWNER);
+    expect(ctx.billingUserId).toBe(OWNER);
     expect(ctx.provider).toBe('twitter');
     expect(ctx.operation).toBe('search_tweets');
     expect(ctx.feature).toBe(`x-account:${ACCOUNT_ID}`);
@@ -144,6 +146,27 @@ describe('X usage metering — attribution', () => {
 
     await expect(twitterService.searchTweets(OWNER, ACCOUNT_ID, 'ai')).rejects.toThrow();
     expect(mockRecordVendorUsage).not.toHaveBeenCalled();
+  });
+
+  it('Option B: attributes the ledger to the ACTING user and bills the account owner', async () => {
+    mockSearch.mockResolvedValue({ data: { data: [{ id: '1' }, { id: '2' }] } });
+
+    // OWNER owns the account; a different member triggers the call.
+    await runWithXActingUser('member-42', () =>
+      twitterService.searchTweets(OWNER, ACCOUNT_ID, 'ai')
+    );
+
+    const ctx = lastCall();
+    expect(ctx.userId).toBe('member-42'); // acting user → shadow ledger subject
+    expect(ctx.billingUserId).toBe(OWNER); // account owner → billing subject
+  });
+
+  it('Option B: the resolve_handle companion also attributes acting user / bills owner', async () => {
+    await runWithXActingUser('member-42', () =>
+      twitterService.followUser(OWNER, ACCOUNT_ID, '@target')
+    );
+    const resolve = mockRecordVendorUsage.mock.calls.map((c) => c[0]).find((o) => o.operation === 'resolve_handle');
+    expect(resolve).toMatchObject({ userId: 'member-42', billingUserId: OWNER });
   });
 
   it('converts a raw X 402 into a typed XCreditsExhaustedError (never metered, never retried)', async () => {
