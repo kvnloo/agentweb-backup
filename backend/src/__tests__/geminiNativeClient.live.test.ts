@@ -18,6 +18,10 @@
 
 import { createGeminiNativeClient } from '../services/agentMode/core/geminiNativeClient';
 
+// A manual mock at src/__mocks__/@google/genai.js is auto-applied to this node
+// module (it only stubs generateContentStream). This test needs the REAL SDK.
+jest.unmock('@google/genai');
+
 const GEMINI_KEY = process.env.GEMINI_API_KEY?.trim();
 const describeLive = GEMINI_KEY ? describe : describe.skip;
 const MODEL = 'gemini-3.5-flash';
