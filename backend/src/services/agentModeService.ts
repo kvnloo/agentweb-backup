@@ -3125,6 +3125,15 @@ export class AgentModeService {
       // partial text. The completion gate consumes this flag directly rather than
       // pattern-matching the response text.
       let truncatedByStepBudget = false;
+      // ENG-737: set true whenever a leaked-reasoning fragment was suppressed
+      // (blanked to '') on a truncated Gemini turn. The suppression can exhaust the
+      // max-tokens continuation ladder while `content` is still empty and no tool
+      // ran (so the empty-synthesis nudge — which requires toolCallsSoFar>0 — never
+      // fires either), which would otherwise break the loop with an empty response
+      // at iteration<maxIterations, delivering a silent zero-output turn. We use
+      // this flag to backfill a neutral message so the user is never left with an
+      // empty reply (the ENG-324/473/657 silent-failure class).
+      let suppressedReasoningLeak = false;
       while (iteration < maxIterations) {
         // Check for cancellation before each iteration
         if (isCancelled?.()) {
@@ -3360,6 +3369,7 @@ export class AgentModeService {
           console.warn(`AgentMode: Suppressing leaked Gemini reasoning fragment (finish_reason=length) in session ${sessionId}`);
           responseContent = '';
           responseMessage.content = '';
+          suppressedReasoningLeak = true;
         }
 
         // Update content with LLM's response
@@ -3455,6 +3465,19 @@ export class AgentModeService {
             console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
             (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
+          }
+
+          // ENG-737: the loop is about to terminate. If every turn's content was a
+          // suppressed reasoning leak and the continuation/synthesis ladder is now
+          // exhausted with no real content, `content` is empty and iteration is below
+          // maxIterations, so the maxIterations backfill below never runs — the user
+          // would receive a silent zero-output turn (a regression from the previously
+          // corrupted-but-visible output). Backfill the neutral apology so there is
+          // always a non-empty reply; keep the persisted assistant message in sync.
+          if (!content && suppressedReasoningLeak) {
+            console.warn(`AgentMode: Backfilling neutral response after suppressed reasoning leak left content empty in session ${sessionId}`);
+            content = "I've reached the maximum number of processing steps for this request. Here's what was completed so far — please review and let me know if you'd like me to continue with any remaining items.";
+            responseMessage.content = content;
           }
 
           // Log the stop reason for debugging
