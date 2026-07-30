@@ -359,6 +359,33 @@ describe('usageAnalyticsService', () => {
       expect(mockScan).toHaveBeenCalledWith('2026-06-01', '2026-06-30');
     });
 
+    it('provider scope: default "llm" excludes vendor rows; "twitter" keeps only X; "all" keeps both', async () => {
+      // A realistic mixed ledger: one LLM row and one X vendor row (provider+unit,
+      // as recordVendorUsage writes) — so the LLM Costs tab (default "llm") must
+      // NOT show the twitter row (ENG-664 leak fix).
+      const rows = [
+        aggRow({ costMicroUsd: 3_000_000 }), // LLM $3
+        xRow('twitter:post', { provider: 'twitter', unit: 'post', costMicroUsd: 500_000 }), // X $0.50
+      ];
+      // The X cut enriches @handles via getAccountById — return null (unresolved).
+      mockGetAccountById.mockResolvedValue(null);
+
+      mockScan.mockResolvedValue(rows);
+      const llm = await getCostAggregation('2026-06-01', '2026-06-30'); // default "llm"
+      expect(llm.byModel.some((m) => m.model.startsWith('twitter:'))).toBe(false);
+      expect(llm.totals.costUsd).toBeCloseTo(3, 6);
+
+      mockScan.mockResolvedValue(rows);
+      const x = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'twitter');
+      expect(x.byModel.length).toBeGreaterThan(0);
+      expect(x.byModel.every((m) => m.model.startsWith('twitter:'))).toBe(true);
+      expect(x.totals.costUsd).toBeCloseTo(0.5, 6);
+
+      mockScan.mockResolvedValue(rows);
+      const all = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
+      expect(all.totals.costUsd).toBeCloseTo(3.5, 6);
+    });
+
     it('aggregates by model: totals equal the sum of underlying per-user stored costs (assertion 2)', async () => {
       mockScan.mockResolvedValue([
         aggRow({ userId: 'user-1', costMicroUsd: 3_500_000, callCount: 3 }),
