@@ -286,6 +286,10 @@ export const config = {
     bind: '127.0.0.1',               // NEVER 0.0.0.0 — no auth layer; SSH tunnel only
     btwModel: 'sonnet',              // /btw side-thread model — a read-only aside doesn't need Opus, so it
                                      // runs on Sonnet (cheaper) while keeping the read-only tool set.
+    nlMergeTrigger: true,            // may a natural-language message ("merge it when green") trigger the
+                                     // merge-watch, or is merging BUTTON-ONLY? true = NL allowed (still gated
+                                     // by the strict isMergeRequest classifier); false = only the Merge button
+                                     // counts as a standing merge instruction (ENG-654 merge gate 3a).
     // Skills that must NEVER auto-load into a chat session. A chat turn resumes the WHOLE session every
     // time, so a heavyweight *reference* skill baked into the session is re-billed on every later turn.
     // claude-api is the proven offender: a ~194k-token API/pricing manual that AUTO-triggers on any

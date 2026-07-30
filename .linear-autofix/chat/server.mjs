@@ -1431,7 +1431,7 @@ function startTurn(identifier, body) {
   (async () => {
     let override = null;
     try {
-      if (cap === 'full' && (found.entry.prs || []).filter(Boolean).length && message && await isMergeRequest(message)) {
+      if (cap === 'full' && CHAT.nlMergeTrigger !== false && (found.entry.prs || []).filter(Boolean).length && message && await isMergeRequest(message)) {
         override = mergeMsg(found.entry);
         log(`turn ${turnId} (${identifier}): explicit merge request → running the merge flow`);
       }
@@ -1586,6 +1586,8 @@ function mergeMsg(entry) {
   const list = urls.map((u) => `- ${u}`).join('\n') || '- (this chat has no recorded PR — do NOT go looking for one; end with MERGE_BLOCKED explaining there is no PR to merge)';
   return [
     '**Merge THIS chat\'s PR(s).** Get the specific PR(s) below mergeable and MERGE — fully autonomously. There is NO confirmation step: the moment a PR\'s gates are green you are authorized to merge it immediately, without asking anyone.',
+    '',
+    `**Merge gate (ALL FOUR must hold — this is a hard safety boundary).** You may run \`gh pr merge\` ONLY when: (a) you have a standing explicit merge instruction (this turn is one); (b) CI is green; (c) Greptile has passed; and (d) admission is still valid — if this chat is tied to a Linear issue, it must still carry the \`${config.forceLabel}\` label, still be assigned to the same person, and NOT have moved to Done/Canceled/Blocked. If ANY of the four is missing, do NOT merge — end with \`MERGE_BLOCKED: <which gate failed>\`. NEVER use \`gh pr merge --admin\` or any other bypass of branch protection under any circumstance.`,
     '',
     'The ONLY PR(s) you may act on are exactly these (this chat owns them):',
     list,
