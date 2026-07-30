@@ -17,6 +17,7 @@ import sys
 from datetime import datetime, timezone
 from email.mime.text import MIMEText
 
+import google.auth.compute_engine
 from google.cloud import secretmanager
 
 GCP_PROJECT_ID = "agent-engine-460619"
@@ -29,7 +30,17 @@ ALERT_RECIPIENT = "harsha@agentweb.pro"
 def get_smtp_credentials() -> dict:
     import json
 
-    client = secretmanager.SecretManagerServiceClient()
+    # Explicit compute_engine.Credentials(), not the bare client (which
+    # calls google.auth.default() internally). default() checks
+    # ~/.config/gcloud/application_default_credentials.json in the
+    # *invoking user's* home before falling back to instance metadata —
+    # since this runs as agentengine, in agentengine's own writable home,
+    # a compromised agentengine could plant a credentials file there to
+    # hijack this script's own credential resolution. Forcing metadata-
+    # server-only credentials closes that: the metadata server isn't a
+    # local file agentengine can write to.
+    credentials = google.auth.compute_engine.Credentials()
+    client = secretmanager.SecretManagerServiceClient(credentials=credentials)
     name = f"projects/{GCP_PROJECT_ID}/secrets/{SMTP_SECRET_ID}/versions/latest"
     response = client.access_secret_version(request={"name": name})
     return json.loads(response.payload.data.decode("UTF-8"))

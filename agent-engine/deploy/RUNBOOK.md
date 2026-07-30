@@ -44,6 +44,36 @@ VM is ever rebuilt.
       from google.cloud import secretmanager, discoveryengine, storage; \
       import secrets_manager, aws_utils, task_utils, email_utils, web_agent"
    ```
+7. `BROWSER_HEADLESS=false` (the real prod value) needs a working X server.
+   Install and start Xvfb if the VM doesn't already have one:
+   ```
+   sudo apt-get install -y xvfb
+   Xvfb :99 -screen 0 1024x768x24 &   # or a systemd unit / cron @reboot if this needs to survive reboots
+   ```
+   The current VM already has one running on `:99` from before this ticket
+   (mechanism undocumented — see the `DISPLAY` note in `agent-engine.service`).
+8. Set up the isolated alert-notifier runtime (root-owned, `agentengine`
+   read/execute-only — see "Design decisions" in the Monitoring section
+   below for why this is separate from the main checkout):
+   ```
+   sudo mkdir -p /opt/agent-engine-alert
+   sudo python3 -m venv /opt/agent-engine-alert/venv
+   sudo /opt/agent-engine-alert/venv/bin/pip install google-cloud-secret-manager
+   sudo cp agent-engine/deploy/alert_oncall.py /opt/agent-engine-alert/
+   sudo chown -R root:root /opt/agent-engine-alert
+   sudo chmod -R a+rX,go-w /opt/agent-engine-alert
+   ```
+9. Install and enable the systemd units:
+   ```
+   sudo cp agent-engine/deploy/agent-engine.service /etc/systemd/system/
+   sudo cp agent-engine/deploy/agent-engine-alert@.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable agent-engine.service
+   sudo systemctl start agent-engine.service
+   systemctl status agent-engine.service
+   ```
+   `agent-engine-alert@.service` is a template unit — nothing to `enable`,
+   it only runs when `OnFailure=` triggers it.
 
 ## browser-use version — do not touch without reading this
 
@@ -140,7 +170,7 @@ Two alerting layers:
    `ONCALL_EMAIL_LIST` (currently `harsha@agentweb.pro`) when a single task
    fails across every configured LLM. Pre-existing mechanism; only the
    recipient was ever wrong (was Rui's personal Gmail — fixed).
-2. **Process-level** — systemd's `OnFailure=agent-engine-alert@%n.service`
+2. **Process-level** — systemd's `OnFailure=agent-engine-alert@%N.service`
    fires when `agent-engine.service` exhausts its restart budget
    (`StartLimitBurst=5` within `StartLimitIntervalSec=300`). Emails
    `harsha@agentweb.pro` via the same SMTP secret (`agentengine-prod-smtp`)
@@ -158,17 +188,16 @@ Two alerting layers:
    arbitrary web content), it must not be able to tamper with the one
    thing that reports its own failure. `deploy/alert_oncall.py` is
    deliberately self-contained (does not `import secrets_manager` from the
-   main checkout) for the same reason — do not "simplify" that.
+   main checkout) for the same reason — do not "simplify" that. It also
+   explicitly constructs `google.auth.compute_engine.Credentials()` rather
+   than letting the GCP client library fall back to its default credential
+   resolution, which checks a well-known ADC file under the *invoking
+   user's* home directory before the instance metadata server — since this
+   runs as `agentengine`, in `agentengine`'s own writable home, a
+   compromised `agentengine` could otherwise plant a credentials file there
+   to hijack the alert's own Secret Manager access.
 
-   Provisioning (one-time, in addition to the main setup):
-   ```bash
-   sudo mkdir -p /opt/agent-engine-alert
-   sudo python3 -m venv /opt/agent-engine-alert/venv
-   sudo /opt/agent-engine-alert/venv/bin/pip install google-cloud-secret-manager
-   sudo cp agent-engine/deploy/alert_oncall.py /opt/agent-engine-alert/
-   sudo chown -R root:root /opt/agent-engine-alert
-   sudo chmod -R a+rX,go-w /opt/agent-engine-alert
-   ```
+   Provisioning steps are in the Provisioning section above (step 8).
 
 ## Restart / rollback
 
