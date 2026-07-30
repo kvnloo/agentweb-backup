@@ -21,6 +21,7 @@ import {
   getUserOrgUsageRollup,
   getXAllocatedTotals,
   currentXBillingCycle,
+  getUserXBreakdown,
 } from "../services/usageAnalyticsService";
 import { twitterService } from "../services/twitterService";
 
@@ -114,6 +115,41 @@ router.get(
       console.error("[adminUsage] org-rollup failed:", error);
       return res.status(500).json({
         message: "Failed to load org usage rollup",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+/**
+ * One user's X (Twitter) spend by tool over a date range (ENG-664) — powers the
+ * per-user "X Cost" breakdown on the admin user card.
+ */
+router.get(
+  "/users/:userId/usage/x-breakdown",
+  authenticateToken,
+  isAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const { userId } = req.params as { userId: string };
+      const start = String(req.query.start || "");
+      const end = String(req.query.end || "");
+
+      if (!DATE_RE.test(start) || !DATE_RE.test(end)) {
+        return res
+          .status(400)
+          .json({ message: "start and end query params are required (YYYY-MM-DD)" });
+      }
+      if (start > end) {
+        return res.status(400).json({ message: "start must be <= end" });
+      }
+
+      const result = await getUserXBreakdown(userId, start, end);
+      return res.json(result);
+    } catch (error) {
+      console.error("[adminUsage] x-breakdown failed:", error);
+      return res.status(500).json({
+        message: "Failed to load X breakdown",
         error: error instanceof Error ? error.message : "Unknown error",
       });
     }

@@ -3,7 +3,7 @@
  * (Ship 1: shadow visibility only; nothing here gates user behavior).
  */
 
-import { usageRecordDb, UsageRecordRow } from "./usageRecordDb";
+import { usageRecordDb, UsageRecordRow, isVendorEntry } from "./usageRecordDb";
 import { userDb, orgDb, User } from "./db";
 import { getAccountById } from "./connectedAccountsDb";
 import { TWITTER_PROVIDER, isPostReadOperation } from "../utils/twitterPricing";
@@ -628,7 +628,14 @@ export async function getUserOrgUsageRollup(
   // 500 and the admin sees "failed to load" rather than confidently-wrong numbers.
   const perMember = await Promise.all(
     memberUsers.map(async (m) => {
-      const rows = await usageRecordDb.queryByUserDateRange(m.userId, start, end);
+      // LLM-only: this rollup drives the "LLM Cost" card (gross burn vs the LLM
+      // quota counter). Per-unit vendor rows (X/Twitter, v0, …) are NOT token
+      // spend and never deduct from that counter, so including them would inflate
+      // gross burn and depress "charged coverage". X has its own per-user
+      // breakdown (getUserXBreakdown); keep this one purely LLM (ENG-664).
+      const rows = (await usageRecordDb.queryByUserDateRange(m.userId, start, end)).filter(
+        (r) => !isVendorEntry(r)
+      );
       return { user: m, rows, agg: aggregateBurn(rows) };
     })
   );
@@ -706,23 +713,16 @@ export interface XAllocatedTotals {
 }
 
 /**
- * Sum every X ledger row (model "twitter:*") across an inclusive date window.
- * Reads the costMicroUsd/quantity already recorded at call time — never
- * re-derives cost.
+ * Group X ledger rows (model "twitter:*") by tool. Reads the costMicroUsd/quantity
+ * already recorded at call time — never re-derives cost. Shared by the cross-user
+ * allocated totals and the per-user breakdown.
  */
-export async function getXAllocatedTotals(
-  start: string,
-  end: string
-): Promise<XAllocatedTotals> {
-  if (!DATE_RE.test(start) || !DATE_RE.test(end)) {
-    throw new Error("start and end must be YYYY-MM-DD");
-  }
-  if (start > end) {
-    throw new Error("start must be <= end");
-  }
-
-  const items = await usageRecordDb.scanByDateRange(start, end);
-
+function groupTwitterRows(items: UsageRecordRow[]): {
+  costUsd: number;
+  callCount: number;
+  postReadUnits: number;
+  byOperation: XAllocatedOperationRow[];
+} {
   const byOp = new Map<string, XAllocatedOperationRow>();
   let costMicroUsd = 0;
   let callCount = 0;
@@ -753,14 +753,56 @@ export async function getXAllocatedTotals(
     (a, b) => b.costUsd - a.costUsd || a.operation.localeCompare(b.operation)
   );
 
-  return {
-    start,
-    end,
-    costUsd: costMicroUsd / 1_000_000,
-    callCount,
-    postReadUnits,
-    byOperation,
-  };
+  return { costUsd: costMicroUsd / 1_000_000, callCount, postReadUnits, byOperation };
+}
+
+/**
+ * Sum every X ledger row (model "twitter:*") across an inclusive date window,
+ * over ALL users (for reconciliation).
+ */
+export async function getXAllocatedTotals(
+  start: string,
+  end: string
+): Promise<XAllocatedTotals> {
+  if (!DATE_RE.test(start) || !DATE_RE.test(end)) {
+    throw new Error("start and end must be YYYY-MM-DD");
+  }
+  if (start > end) {
+    throw new Error("start must be <= end");
+  }
+  const items = await usageRecordDb.scanByDateRange(start, end);
+  return { start, end, ...groupTwitterRows(items) };
+}
+
+export interface UserXBreakdown {
+  userId: string;
+  start: string;
+  end: string;
+  costUsd: number;
+  callCount: number;
+  /** Per-tool X spend for this user, sorted by spend desc. */
+  byOperation: XAllocatedOperationRow[];
+}
+
+/**
+ * One user's X (Twitter) spend broken down by tool over an inclusive date range
+ * (ENG-664) — powers the per-user "X Cost" breakdown on the admin user card.
+ * Attribution follows the shadow ledger's subject (the acting user, Option B).
+ */
+export async function getUserXBreakdown(
+  userId: string,
+  start: string,
+  end: string
+): Promise<UserXBreakdown> {
+  if (!DATE_RE.test(start) || !DATE_RE.test(end)) {
+    throw new Error("start and end must be YYYY-MM-DD");
+  }
+  if (start > end) {
+    throw new Error("start must be <= end");
+  }
+  const items = await usageRecordDb.queryByUserDateRange(userId, start, end);
+  const { costUsd, callCount, byOperation } = groupTwitterRows(items);
+  return { userId, start, end, costUsd, callCount, byOperation };
 }
 
 /**
