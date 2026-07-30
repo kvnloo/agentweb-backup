@@ -25,6 +25,7 @@ import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import KeyboardArrowRightIcon from "@mui/icons-material/KeyboardArrowRight";
 import InfoIcon from "@mui/icons-material/InfoOutlined";
 import axios from "axios";
+import { DatePicker } from "@mui/x-date-pickers/DatePicker";
 import { useAuth } from "../../contexts/AuthContext";
 import { buildApiUrl } from "../../config";
 
@@ -217,13 +218,43 @@ export function providerIsAllocatedEstimate(provider: string): boolean {
   return provider === "twitter";
 }
 
+/** Format a Date as local YYYY-MM-DD (no UTC shift — matches what the user picks). */
 function formatDateInput(date: Date): string {
-  return date.toISOString().slice(0, 10);
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+/** Parse a YYYY-MM-DD string to a local-midnight Date for the calendar picker. */
+function parseDateInput(s: string): Date | null {
+  if (!s) return null;
+  const d = new Date(`${s}T00:00:00`);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 function defaultStartDate(): string {
   const d = new Date();
   d.setDate(d.getDate() - 30);
   return formatDateInput(d);
+}
+
+/** Quick range presets — one-click ranges so no typing is needed. */
+const RANGE_PRESETS: { label: string; range: () => { start: string; end: string } }[] = [
+  { label: "7d", range: () => rangeDaysBack(7) },
+  { label: "30d", range: () => rangeDaysBack(30) },
+  { label: "90d", range: () => rangeDaysBack(90) },
+  {
+    label: "This month",
+    range: () => {
+      const now = new Date();
+      return { start: formatDateInput(new Date(now.getFullYear(), now.getMonth(), 1)), end: formatDateInput(now) };
+    },
+  },
+];
+function rangeDaysBack(days: number): { start: string; end: string } {
+  const end = new Date();
+  const start = new Date();
+  start.setDate(end.getDate() - days);
+  return { start: formatDateInput(start), end: formatDateInput(end) };
 }
 function usd(n: number): string {
   return `$${(n || 0).toFixed(n < 1 ? 4 : 2)}`;
@@ -464,15 +495,15 @@ export default function UsageCostByUserTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const loadAggregation = async () => {
+  const loadAggregation = async (s: string = start, e: string = end) => {
     setLoading(true);
     setError(null);
     try {
       const response = await axios.get<CostAggregation>(
         buildApiUrl(
           `/api/admin/usage/cost-aggregation?start=${encodeURIComponent(
-            start
-          )}&end=${encodeURIComponent(end)}&topUsers=100`
+            s
+          )}&end=${encodeURIComponent(e)}&topUsers=100`
         ),
         { headers: { Authorization: `Bearer ${token}` } }
       );
@@ -520,7 +551,7 @@ export default function UsageCostByUserTab() {
             over the selected range.
           </Typography>
         </Box>
-        <Button startIcon={<RefreshIcon />} variant="outlined" onClick={loadAggregation} disabled={loading}>
+        <Button startIcon={<RefreshIcon />} variant="outlined" onClick={() => loadAggregation()} disabled={loading}>
           Refresh
         </Button>
       </Box>
@@ -528,25 +559,21 @@ export default function UsageCostByUserTab() {
       <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
         <Grid container spacing={2} alignItems="center">
           <Grid item xs={12} md={3}>
-            <TextField
-              fullWidth
-              size="small"
+            <DatePicker
               label="Start"
-              type="date"
-              value={start}
-              onChange={(e) => setStart(e.target.value)}
-              InputLabelProps={{ shrink: true }}
+              value={parseDateInput(start)}
+              maxDate={parseDateInput(end) ?? undefined}
+              onChange={(d: Date | null) => d && setStart(formatDateInput(d))}
+              slotProps={{ textField: { fullWidth: true, size: "small" } }}
             />
           </Grid>
           <Grid item xs={12} md={3}>
-            <TextField
-              fullWidth
-              size="small"
+            <DatePicker
               label="End"
-              type="date"
-              value={end}
-              onChange={(e) => setEnd(e.target.value)}
-              InputLabelProps={{ shrink: true }}
+              value={parseDateInput(end)}
+              minDate={parseDateInput(start) ?? undefined}
+              onChange={(d: Date | null) => d && setEnd(formatDateInput(d))}
+              slotProps={{ textField: { fullWidth: true, size: "small" } }}
             />
           </Grid>
           <Grid item xs={12} md={3}>
@@ -566,9 +593,32 @@ export default function UsageCostByUserTab() {
             </TextField>
           </Grid>
           <Grid item xs={12} md={3}>
-            <Button fullWidth variant="contained" onClick={loadAggregation} disabled={loading}>
+            <Button fullWidth variant="contained" onClick={() => loadAggregation()} disabled={loading}>
               Apply range
             </Button>
+          </Grid>
+          <Grid item xs={12}>
+            <Box sx={{ display: "flex", gap: 1, flexWrap: "wrap", alignItems: "center" }}>
+              <Typography variant="caption" color="text.secondary" sx={{ mr: 0.5 }}>
+                Quick range:
+              </Typography>
+              {RANGE_PRESETS.map((p) => (
+                <Button
+                  key={p.label}
+                  size="small"
+                  variant="outlined"
+                  disabled={loading}
+                  onClick={() => {
+                    const r = p.range();
+                    setStart(r.start);
+                    setEnd(r.end);
+                    void loadAggregation(r.start, r.end);
+                  }}
+                >
+                  {p.label}
+                </Button>
+              ))}
+            </Box>
           </Grid>
         </Grid>
       </Paper>

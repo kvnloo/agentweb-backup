@@ -1,7 +1,14 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import React from "react";
+import { render as rtlRender, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom";
+import { LocalizationProvider } from "@mui/x-date-pickers";
+import { AdapterDateFns } from "@mui/x-date-pickers/AdapterDateFns";
 import axios from "axios";
+
+// The date pickers need the localization context the app provides at its root.
+const render = (ui: React.ReactElement) =>
+  rtlRender(<LocalizationProvider dateAdapter={AdapterDateFns}>{ui}</LocalizationProvider>);
 import UsageCostByUserTab, {
   providerOfModel,
   providersInData,
@@ -189,6 +196,22 @@ describe("UsageCostByUserTab rendering", () => {
     expect(err).toHaveTextContent(/bearer token/i);
     // The rest of the tab still renders.
     expect(screen.getByTestId("total-cost")).toBeInTheDocument();
+  });
+
+  it("a quick-range preset reloads the aggregation with a new range", async () => {
+    routeAxios();
+    render(<UsageCostByUserTab />);
+    await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+
+    const aggCalls = () =>
+      mockedAxios.get.mock.calls.filter(([u]) => (u as string).includes("/cost-aggregation")).length;
+    const before = aggCalls();
+
+    await userEvent.click(screen.getByRole("button", { name: "30d" }));
+
+    await waitFor(() => expect(aggCalls()).toBe(before + 1));
+    const lastAgg = mockedAxios.get.mock.calls.filter(([u]) => (u as string).includes("/cost-aggregation")).pop();
+    expect(lastAgg?.[0]).toMatch(/start=\d{4}-\d{2}-\d{2}&end=\d{4}-\d{2}-\d{2}/);
   });
 
   it("surfaces a load error for the main aggregation", async () => {
