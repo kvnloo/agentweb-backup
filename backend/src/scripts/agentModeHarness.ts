@@ -48,20 +48,33 @@ const WILDCARD_PREFIX = "ENG204-harness-wildcard";
 const WILDCARD_SUB = `${WILDCARD_PREFIX}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 
 /**
- * Atomically set the wildcard AND return the value it overwrote (ReturnValues:
- * ALL_OLD). Capturing the prior value in the SAME write as the overwrite closes
- * the read-then-write window a concurrent webhook/admin change could slip
- * through — the returned value is exactly what was present at the instant we
- * replaced it, which is the only safe basis for the cleanup restore.
+ * Atomically ACQUIRE the wildcard grant AND capture the prior value (ALL_OLD) in a
+ * single conditional write. The condition — grant only when subscriptionType is
+ * absent OR is not a harness sentinel — makes this one op do three things safely:
+ *  - closes the read-then-write window (capture happens IN the write, so a
+ *    concurrent webhook/admin change can't make the captured prior stale);
+ *  - detects an overlapping harness run — if another run already holds the grant
+ *    the condition fails, NOTHING is written, and we abort without touching the
+ *    field (the other run is completely unaffected — no clobber, no data loss);
+ *  - guarantees the captured prior is a REAL tier (or absent), never another
+ *    run's sentinel, so the cleanup restore is unambiguous.
+ * Returns { acquired: false } when another harness run holds the grant.
  */
-async function setWildcardCapturingPrev(email: string): Promise<string | undefined> {
-  const r = await ddb.update({
-    TableName: USERS_TABLE, Key: { email },
-    UpdateExpression: "SET subscriptionType = :v",
-    ExpressionAttributeValues: { ":v": WILDCARD_SUB },
-    ReturnValues: "ALL_OLD",
-  }).promise();
-  return r.Attributes?.subscriptionType;
+async function acquireWildcard(email: string): Promise<{ acquired: boolean; prev?: string }> {
+  try {
+    const r = await ddb.update({
+      TableName: USERS_TABLE, Key: { email },
+      ConditionExpression:
+        "attribute_not_exists(subscriptionType) OR NOT begins_with(subscriptionType, :prefix)",
+      UpdateExpression: "SET subscriptionType = :v",
+      ExpressionAttributeValues: { ":v": WILDCARD_SUB, ":prefix": WILDCARD_PREFIX },
+      ReturnValues: "ALL_OLD",
+    }).promise();
+    return { acquired: true, prev: r.Attributes?.subscriptionType };
+  } catch (e: any) {
+    if (e.code === "ConditionalCheckFailedException") return { acquired: false };
+    throw e;
+  }
 }
 
 /**
@@ -87,26 +100,23 @@ async function waitForWildcardVisible(userId: string): Promise<void> {
 /**
  * Restore the pre-run subscription, guarded so we only ever act on OUR OWN grant:
  * - Condition `subscriptionType = <this run's unique sentinel>` means a change
- *   made during the run (webhook/admin) OR another overlapping run's grant is
- *   left untouched (ConditionalCheckFailed → skip).
- * - If the captured prior is itself a harness sentinel (e.g. we overwrote an
- *   overlapping run's grant), it is NOT a real tier — remove the attribute rather
- *   than persist a bogus wildcard.
+ *   made during the run (webhook/admin) OR another run's grant is left untouched
+ *   (ConditionalCheckFailed → skip). `prev` is guaranteed a REAL tier (or absent)
+ *   because acquireWildcard refuses to grant over an existing harness sentinel, so
+ *   restoring it can never persist a bogus wildcard or erase a paid tier.
  * - Transient failures (throttling/network) are retried; if they exhaust, we flag
  *   LOUDLY and mark the run failed (exit != 0) so the elevated grant is repaired,
  *   never left silent.
  */
 async function restoreSubscription(email: string, prev: string | undefined): Promise<void> {
-  const effectivePrev =
-    typeof prev === "string" && prev.startsWith(WILDCARD_PREFIX) ? undefined : prev;
   const req: any = {
     TableName: USERS_TABLE, Key: { email },
     ConditionExpression: "subscriptionType = :w",
     ExpressionAttributeValues: { ":w": WILDCARD_SUB } as any,
   };
-  if (effectivePrev !== undefined) {
+  if (prev !== undefined) {
     req.UpdateExpression = "SET subscriptionType = :v";
-    req.ExpressionAttributeValues[":v"] = effectivePrev;
+    req.ExpressionAttributeValues[":v"] = prev;
   } else {
     req.UpdateExpression = "REMOVE subscriptionType";
   }
@@ -115,8 +125,8 @@ async function restoreSubscription(email: string, prev: string | undefined): Pro
     try {
       await ddb.update(req).promise();
       console.log(
-        effectivePrev !== undefined
-          ? `\n(subscription restored: ${effectivePrev})`
+        prev !== undefined
+          ? `\n(subscription restored: ${prev})`
           : `\n(subscription attribute removed)`,
       );
       return;
@@ -171,12 +181,21 @@ async function main() {
 
   // Grant wildcard skill access for the run so gated dev skills can install;
   // restored in finally. (A hard crash would leave it set — restore manually.)
-  // hadSub is captured atomically WITH the wildcard write below (ALL_OLD), so no
-  // read-then-write window exists for a concurrent change to slip through.
+  // acquireWildcard captures the prior tier atomically and refuses to grant over
+  // another run's active grant, so overlapping runs never corrupt each other.
   let hadSub: string | undefined = undefined;
+  let acquired = false;
   try {
     if (skillIds.length) {
-      hadSub = await setWildcardCapturingPrev(EMAIL);
+      const grant = await acquireWildcard(EMAIL);
+      if (!grant.acquired) {
+        throw new Error(
+          `Another harness run appears active on ${EMAIL} (subscriptionType holds a harness grant). ` +
+            `Run harness invocations sequentially against the same test account.`,
+        );
+      }
+      acquired = true;
+      hadSub = grant.prev;
       await waitForWildcardVisible(userId);
       const sessionId = await post("/api/agent-mode/sessions", token, { title: "ENG-204 harness" }).then((s) => s.sessionId || s.id);
       const inst = await agentModeService.installSkills(skillIds, userId, sessionId);
@@ -210,9 +229,10 @@ async function main() {
       await runTurns(token, sessionId, messages, model);
     }
   } finally {
-    // Undo the wildcard we set — but only if it's still ours (compare-and-swap),
-    // so a subscription change made during the run isn't clobbered by a stale value.
-    if (skillIds.length) {
+    // Restore only if WE acquired the grant (if acquire failed on an overlap we
+    // wrote nothing, so there is nothing to undo). Restore is a compare-and-swap
+    // on our own sentinel, so it never clobbers a change made during the run.
+    if (acquired) {
       await restoreSubscription(EMAIL, hadSub);
     }
   }
