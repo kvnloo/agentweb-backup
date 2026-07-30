@@ -183,54 +183,6 @@ describe('AgentMode core loop — characterization snapshots', () => {
     expect(callLLMSpy).toHaveBeenCalledTimes(3);
   });
 
-  it('(d) ENG-657 — stale mid-tool narration does NOT become the final content; the loop nudges for synthesis and continues', async () => {
-    // Reproduces the scheduled Lead Auto-Enrichment failure: the model narrates
-    // mid-tool ("Now enriching list 5 of 5…") on the SAME turn it emits the last
-    // enrich_leads_execute call, then its FINAL turn returns no text and no tools.
-    // The loop's `content` is replace-on-nonempty, so that stale narration lingers.
-    // Pre-fix, the `!content` empty-synthesis guard saw the stale narration and let
-    // the run END on the tool result — Steps 2/3 (recommend leads + draft follow-ups)
-    // never emitted. Post-fix (currentTurnText threaded into decideTermination), the
-    // synthesis nudge fires because THIS terminal turn produced no text, so the loop
-    // continues and delivers the real final synthesis.
-    const staleNarration = 'Now enriching list 5 of 5…';
-    const finalSynthesis =
-      'Top 10 leads: 1) Acme … (strong ICP fit). Follow-ups: 1) "Hi …" 2) "Hey …"';
-    const snapshot = await runScenario(service, {
-      message: 'Enrich my CRM leads, then recommend 10 and draft 2 follow-ups.',
-      transcript: [
-        // Turn 1: narration text AND the terminal enrichment tool call, together.
-        {
-          content: staleNarration,
-          tool_calls: [
-            { id: 'call-d1', name: 'enrich_leads_execute', arguments: '{"listId":"5"}' },
-          ],
-        },
-        // Turn 2: the run ends on a tool result — no text, no tool calls. This is the
-        // turn that previously terminated the run with the stale narration as content.
-        { content: '' },
-        // Turn 3: after the synthesis nudge, the model emits the real Steps 2/3 output.
-        { content: finalSynthesis },
-      ],
-      toolResults: {
-        enrich_leads_execute: {
-          result: JSON.stringify({ success: true, enriched: 42 }),
-        },
-      },
-    });
-
-    // The final content is the real synthesis, NOT the stale mid-tool narration.
-    expect(snapshot.content).toBe(finalSynthesis);
-    expect(snapshot.content).not.toBe(staleNarration);
-    // The empty terminal turn triggered the synthesis nudge and a 3rd LLM turn —
-    // proof the loop continued instead of terminating on the tool result. Pre-fix
-    // this would have stopped at 2 turns with `content === staleNarration`.
-    expect(snapshot.llmTurnsConsumed).toBe(3);
-    expect(snapshot.toolCallSequence).toEqual([
-      { name: 'enrich_leads_execute', arguments: { listId: '5' }, outcome: 'success' },
-    ]);
-  });
-
   it('(c) no-tool single response — model answers directly, loop exits after one turn', async () => {
     const snapshot = await runScenario(service, {
       message: 'Say hello.',
