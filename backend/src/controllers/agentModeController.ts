@@ -2068,52 +2068,94 @@ export async function runScheduledChat(
         ? schedule.pendingResumeSessionId
         : undefined;
     if (pendingResumeSessionId) {
-      // Atomically CLAIM the marker (single-consumer): only the dispatcher that wins
-      // the conditional clear proceeds to resume, so two concurrent dispatchers can
-      // never continue the same session in parallel. A lost claim falls through to a
-      // normal fresh run below (never a second resume of the same session).
-      let claimedResume = false;
+      // A benign "deferred" result for the bow-out paths below. The resume-marker path
+      // is resume-OR-BOW-OUT: it must NEVER fall through to a fresh restart, because a
+      // restart re-runs the whole task — duplicating the already-completed CRM writes /
+      // emails the marker exists to continue past. When we can't resume, we defer:
+      // recovery is left to the claim winner or the reconciler. Records no run result
+      // (returns before addRunResult) and no sessionId (no email/scoring of a non-run);
+      // the in-flight lease is released by the `finally` on return.
+      const deferredResumeResult = (reason: string) => ({
+        scheduleId: schedule.scheduleId,
+        runId: leaseRunId,
+        status: 'success' as const, // no error occurred — recovery is simply deferred
+        passed: false,
+        actualResponse: `Scheduled run deferred (${reason}): resume of the abandoned session is being handled by the claim winner or the reconciler; no duplicate execution was performed.`,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      });
+
+      // Load + validate BEFORE claiming, so a transient read failure never consumes
+      // the marker or triggers a restart — the marker persists and a later fire retries.
+      let resumeSession: any;
+      let loadThrew = false;
       try {
-        claimedResume = await scheduleDb.claimPendingResume(schedule.scheduleId, pendingResumeSessionId);
-      } catch (clearError) {
-        console.error(`Failed to claim pending resume marker for schedule ${schedule.scheduleId}:`, clearError);
+        resumeSession = await chatbotDb.getChatSession(pendingResumeSessionId);
+      } catch (resumeError) {
+        loadThrew = true;
+        console.error(`runScheduledChat: failed to load resume session ${pendingResumeSessionId}; leaving the marker for a later retry (no restart):`, resumeError);
       }
-      if (claimedResume) {
-       try {
-        const resumeSession = await chatbotDb.getChatSession(pendingResumeSessionId);
-        if (
-          resumeSession &&
-          resumeSession.userId === userId &&
-          planScheduledRunResume((resumeSession.messages || []) as any).resumable
-        ) {
-          // NOTE: the reconciler does not append a jobIncomplete placeholder on the
-          // resumable path, and buildMarketingContext() drops any assistant message
-          // flagged metadata.isErrorMessage (covers both jobIncomplete and
-          // isRunFailureNotice), so no run-failure placeholder reaches the model on
-          // resume even though the worker reloads the full transcript from the DB.
-          isResumeRun = true;
-          sessionId = pendingResumeSessionId;
-          // Collect the tool calls already made before the interruption so the
-          // resumed run's verification counts them (top-level or metadata-mirrored).
-          resumePriorToolCalls = (resumeSession.messages || []).flatMap((m: any) => {
-            const calls = (Array.isArray(m?.tool_calls) && m.tool_calls.length)
-              ? m.tool_calls
-              : (Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : []);
-            return calls
-              .map((tc: any) => tc?.function?.name || tc?.name)
-              .filter(Boolean)
-              .map((name: string) => ({ name }));
-          });
-          console.log(`runScheduledChat: RESUMING abandoned session ${sessionId} for schedule ${schedule.scheduleId} (${schedule.scheduleName}); ${resumePriorToolCalls.length} prior tool call(s) carried into verification`);
-        } else {
-          console.warn(`runScheduledChat: resume marker for session ${pendingResumeSessionId} no longer resumable (missing/owner-mismatch/unsafe boundary); starting a fresh run.`);
-        }
-       } catch (resumeError) {
-        console.error(`runScheduledChat: failed to load resume session ${pendingResumeSessionId}, starting fresh:`, resumeError);
-       }
-      } else {
-        console.warn(`runScheduledChat: lost the resume claim for session ${pendingResumeSessionId} on schedule ${schedule.scheduleId} (another dispatcher claimed it or the marker changed); starting a fresh run.`);
+
+      if (loadThrew) {
+        // Transient load failure: marker left intact for the next fire; do not restart.
+        return deferredResumeResult('load-error');
       }
+
+      const canResume =
+        !!resumeSession &&
+        resumeSession.userId === userId &&
+        planScheduledRunResume((resumeSession.messages || []) as any).resumable;
+
+      if (!canResume) {
+        // Marker present but the session can't be safely resumed now (missing / owner
+        // mismatch / no-longer-safe boundary — a rare race, since the reconciler only
+        // marks resumable sessions). Consume the marker to avoid a stuck loop, and
+        // DEFER — never fresh-restart (that would re-run completed side effects).
+        await scheduleDb.claimPendingResume(schedule.scheduleId, pendingResumeSessionId).catch(() => {});
+        console.warn(`runScheduledChat: resume marker for session ${pendingResumeSessionId} no longer resumable; deferring (no fresh restart, to avoid duplicate side effects).`);
+        return deferredResumeResult('not-resumable');
+      }
+
+      // Atomically CLAIM: exactly one dispatcher wins and resumes this session; any
+      // concurrent dispatcher loses and bows out (never a parallel resume or a restart).
+      let won = false;
+      try {
+        won = await scheduleDb.claimPendingResume(schedule.scheduleId, pendingResumeSessionId);
+      } catch (claimError) {
+        console.error(`runScheduledChat: resume claim error for session ${pendingResumeSessionId}; deferring:`, claimError);
+        return deferredResumeResult('claim-error');
+      }
+      if (!won) {
+        console.warn(`runScheduledChat: lost the resume claim for session ${pendingResumeSessionId} on schedule ${schedule.scheduleId} (another dispatcher is resuming it); deferring — no fresh restart.`);
+        return deferredResumeResult('lost-claim');
+      }
+
+      // Won the claim on a validated, resumable session — continue it.
+      // NOTE: the reconciler does not append a jobIncomplete placeholder on the
+      // resumable path, and buildMarketingContext() drops any assistant message flagged
+      // metadata.isErrorMessage (covers both jobIncomplete and isRunFailureNotice), so
+      // no run-failure placeholder reaches the model on resume even though the worker
+      // reloads the full transcript from the DB.
+      isResumeRun = true;
+      sessionId = pendingResumeSessionId;
+      // Credit the abandoned portion's tool calls to this run's verification.
+      resumePriorToolCalls = (resumeSession.messages || []).flatMap((m: any) => {
+        const calls = (Array.isArray(m?.tool_calls) && m.tool_calls.length)
+          ? m.tool_calls
+          : (Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : []);
+        return calls
+          .map((tc: any) => tc?.function?.name || tc?.name)
+          .filter(Boolean)
+          .map((name: string) => ({ name }));
+      });
+      console.log(`runScheduledChat: RESUMING abandoned session ${sessionId} for schedule ${schedule.scheduleId} (${schedule.scheduleName}); ${resumePriorToolCalls.length} prior tool call(s) carried into verification`);
     }
 
     // Create a session for the run (skipped when resuming an existing one).

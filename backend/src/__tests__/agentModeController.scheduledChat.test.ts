@@ -285,8 +285,10 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(workerArg.messageContent).not.toBe(baseSchedule.startingMessage);
       });
 
-      it('falls back to a fresh run when the resume session is no longer safely resumable', async () => {
-        // Dangling tool_use → planScheduledRunResume refuses → restart from scratch.
+      it('DEFERS (never fresh-restarts) when the resume session is no longer safely resumable', async () => {
+        // Dangling tool_use → planScheduledRunResume refuses. A fresh restart would
+        // re-run the whole task and duplicate the already-completed side effects, so
+        // the resume-marker path must bow out instead — no createChatSession, no run.
         mockChatbotDb.getChatSession.mockResolvedValue({
           ...mockSession,
           sessionId: resumeSessionId,
@@ -301,12 +303,24 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
 
-        // Unsafe boundary → normal fresh session is created, marker still consumed.
-        expect(mockChatbotDb.createChatSession).toHaveBeenCalledTimes(1);
+        // No fresh session, no worker run — deferred, marker consumed to avoid a loop.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
         expect(mockScheduleDb.claimPendingResume).toHaveBeenCalledWith(mockScheduleId, resumeSessionId);
-        expect(result.sessionId).toBe(mockSession.sessionId);
-        const workerArg = (mockGenerateMarketingResponseWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
-        expect(workerArg.messageContent).toBe(baseSchedule.startingMessage);
+        expect(result.sessionId).toBe('');
+      });
+
+      it('DEFERS on a transient session-load failure, leaving the marker intact (no restart)', async () => {
+        (mockChatbotDb.getChatSession as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB timeout'));
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        // Transient read failure → no restart, and the marker is NOT consumed so a
+        // later fire can retry the resume.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+        expect(mockScheduleDb.claimPendingResume).not.toHaveBeenCalled();
+        expect(result.sessionId).toBe('');
       });
 
       it('counts the abandoned portion\'s required function calls so a resume is not falsely failed (ENG-657)', async () => {
@@ -344,7 +358,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
       });
 
-      it('does NOT resume when it loses the atomic claim (another dispatcher won) — starts fresh, no double resume', async () => {
+      it('DEFERS when it loses the atomic claim (another dispatcher won) — no resume AND no fresh restart', async () => {
         (mockScheduleDb.claimPendingResume as jest.Mock).mockResolvedValue(false);
         mockChatbotDb.getChatSession.mockResolvedValue({
           ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
@@ -352,10 +366,11 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
         const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
 
-        // Lost claim → never continue the same session; do a normal fresh run instead.
-        expect(mockChatbotDb.createChatSession).toHaveBeenCalledTimes(1);
-        expect(result.sessionId).toBe(mockSession.sessionId);
-        expect(result.sessionId).not.toBe(resumeSessionId);
+        // Lost claim → the winner handles this fire. This dispatcher must NOT resume
+        // (parallel) and must NOT fresh-restart (duplicate side effects) — it bows out.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+        expect(result.sessionId).toBe('');
       });
 
       it('ignores the resume marker for a manual test run (never resumes)', async () => {
