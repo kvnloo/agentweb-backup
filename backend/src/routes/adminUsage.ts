@@ -22,6 +22,7 @@ import {
   getXAllocatedTotals,
   currentXBillingCycle,
   getUserXBreakdown,
+  getUserXOrgRollup,
 } from "../services/usageAnalyticsService";
 import { twitterService } from "../services/twitterService";
 
@@ -150,6 +151,39 @@ router.get(
       console.error("[adminUsage] x-breakdown failed:", error);
       return res.status(500).json({
         message: "Failed to load X breakdown",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+/**
+ * Org-aware X (Twitter) rollup for the admin per-user X-cost modal (ENG-664) —
+ * the X sibling of /usage/org-rollup. Rolls allocated X spend across all org
+ * members (owner + members) with a per-member breakdown. Solo users get a
+ * single-member rollup. X is observe-only, so there is no quota reconciliation.
+ */
+router.get(
+  "/users/:userId/usage/x-org-rollup",
+  authenticateToken,
+  isAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const { userId } = req.params as { userId: string };
+      const month = String(req.query.month || "");
+
+      if (!MONTH_RE.test(month)) {
+        return res
+          .status(400)
+          .json({ message: "month query param is required (YYYY-MM)" });
+      }
+
+      const result = await getUserXOrgRollup(userId, month);
+      return res.json(result);
+    } catch (error) {
+      console.error("[adminUsage] x-org-rollup failed:", error);
+      return res.status(500).json({
+        message: "Failed to load X org rollup",
         error: error instanceof Error ? error.message : "Unknown error",
       });
     }

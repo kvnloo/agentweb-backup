@@ -836,6 +836,134 @@ export async function getUserXBreakdown(
   return { userId, start, end, costUsd, callCount, byOperation };
 }
 
+// ── ENG-664: org-aware X (Twitter) rollup ────────────────────────────────────
+//
+// The X-cost sibling of getUserOrgUsageRollup. Same org resolution (owner + all
+// members) and same fail-loud per-member semantics, so the admin X-cost modal
+// answers "what did this whole ORG spend on X", not just the clicked user — the
+// parity the LLM cost modal already has.
+//
+// Two deliberate differences from the LLM rollup:
+//   1. Rows are filtered to twitter:* (the INVERSE of the LLM rollup's
+//      !isVendorEntry filter), so the two rollups partition the ledger and never
+//      double-count.
+//   2. There is NO counted/coverage/quota block: X spend is observe-only and
+//      never deducts from any cap (ENG-664/703), so there is no counter to
+//      reconcile against. Cost is purely the allocated rate-card figure.
+
+export interface XOrgRollupMember {
+  userId: string;
+  email: string | null;
+  orgRole: "owner" | "member" | null;
+  /** The user the admin actually clicked (highlighted in the UI). */
+  isSelected: boolean;
+  costUsd: number;
+  callCount: number;
+  byOperation: XAllocatedOperationRow[];
+}
+
+export interface XOrgUsageRollup {
+  /** The clicked user. */
+  userId: string;
+  month: string;
+  /** True when the user belongs to a resolvable org (owner + members rolled up). */
+  isOrg: boolean;
+  ownerUserId: string;
+  ownerEmail: string | null;
+  selectedIsOwner: boolean;
+  selectedRole: "owner" | "member" | null;
+  /** Total allocated X $ across ALL org members. */
+  totalCostUsd: number;
+  totalCallCount: number;
+  /** Per-member X spend, sorted by spend desc. */
+  members: XOrgRollupMember[];
+  /** Org-wide per-tool X spend, sorted by spend desc. */
+  byOperation: XAllocatedOperationRow[];
+}
+
+export async function getUserXOrgRollup(
+  userId: string,
+  month: string
+): Promise<XOrgUsageRollup> {
+  if (!MONTH_RE.test(month)) {
+    throw new Error("month must be YYYY-MM");
+  }
+
+  const user = (await userDb.getUserById(userId)) as User | undefined;
+  if (!user) throw new Error(`User not found: ${userId}`);
+
+  const start = `${month}-01`;
+  // '31' always sorts at/after the real month end; non-existent days have no rows.
+  const end = `${month}-31`;
+
+  // Resolve org context exactly as the LLM rollup does. getOrgMembers includes
+  // the owner; a solo user rolls up as a single member.
+  let isOrg = false;
+  let ownerUser: User = user;
+  let memberUsers: User[] = [user];
+
+  if (user.orgId) {
+    const org = await orgDb.getOrgById(user.orgId).catch(() => null);
+    if (org) {
+      isOrg = true;
+      const members = await orgDb.getOrgMembers(user.orgId).catch(() => [] as User[]);
+      memberUsers = members.length ? members : [user];
+      ownerUser =
+        memberUsers.find((m) => m.userId === org.ownerUserId) ??
+        (org.ownerUserId === user.userId
+          ? user
+          : ((await userDb.getUserById(org.ownerUserId).catch(() => null)) as User | null) ??
+            user);
+    }
+  }
+
+  // Per-member X spend (parallel). Like the LLM rollup, a per-member query failure
+  // must NOT be swallowed into empty rows (that would silently understate org
+  // spend) — let it reject so the whole rollup fails loud and the route 500s.
+  const perMember = await Promise.all(
+    memberUsers.map(async (m) => {
+      const rows = await usageRecordDb.queryByUserDateRange(m.userId, start, end);
+      // groupTwitterRows already keeps only model "twitter:*" rows and reads the
+      // stored costMicroUsd/quantity — never re-derives cost.
+      return { user: m, rows, agg: groupTwitterRows(rows) };
+    })
+  );
+
+  // Org-wide aggregate from ALL rows (microdollar-exact — no per-member rounding).
+  const orgAgg = groupTwitterRows(perMember.flatMap((pm) => pm.rows));
+
+  const members: XOrgRollupMember[] = perMember
+    .map((pm) => ({
+      userId: pm.user.userId,
+      email: pm.user.email ?? null,
+      orgRole:
+        pm.user.orgRole ?? (pm.user.userId === ownerUser.userId ? ("owner" as const) : null),
+      isSelected: pm.user.userId === userId,
+      costUsd: pm.agg.costUsd,
+      callCount: pm.agg.callCount,
+      byOperation: pm.agg.byOperation,
+    }))
+    .sort((a, b) => b.costUsd - a.costUsd || a.userId.localeCompare(b.userId));
+
+  const selectedIsOwner = user.userId === ownerUser.userId;
+  const selectedRole: "owner" | "member" | null =
+    user.orgRole ?? (selectedIsOwner ? "owner" : null);
+
+  return {
+    userId,
+    month,
+    isOrg,
+    ownerUserId: ownerUser.userId,
+    ownerEmail: ownerUser.email ?? null,
+    selectedIsOwner,
+    selectedRole,
+    totalCostUsd: orgAgg.costUsd,
+    totalCallCount: orgAgg.callCount,
+    members,
+    byOperation: orgAgg.byOperation,
+  };
+}
+
 /**
  * The current X billing-cycle window [start, end] (UTC) given the cycle's
  * reset day-of-month. X's GET /2/usage/tweets reports usage for the cycle to
