@@ -44,6 +44,7 @@ async function runBugs(queue, width = Math.max(1, config.maxConcurrent || 1)) {
 
 async function processNewBugs() {
   const known = new Set(Object.values(loadState()).filter((e) => e && e.identifier).map((e) => e.identifier));
+  let eligibleCount = 0; // # new+forced bugs SEEN this cycle before the WIP cap trims how many we take
 
   // 0) Forced pickups. A human tagged these with `forceLabel` ("autofix") to demand an immediate fix —
   //    run them right away, bypassing the WIP cap AND the one-per-cycle pacing. Skip any that already
@@ -52,6 +53,7 @@ async function processNewBugs() {
   try {
     const forced = (await listForcedBugs()).filter((b) => !known.has(b.identifier));
     forcedIds = new Set(forced.map((b) => b.identifier));
+    eligibleCount += forced.length;
     if (forced.length) {
       forced.sort(byPriority);
       // Urgent → no concurrency cap: run ALL forced bugs at once (or `maxForcedConcurrent` if set > 0).
@@ -68,7 +70,7 @@ async function processNewBugs() {
   //    only way in is the `forceLabel` ("autofix") path above, i.e. a human explicitly labelling the issue.
   if (config.requireForceLabel) {
     log(`${new Date().toISOString()} — requireForceLabel is on: only "${config.forceLabel}"-labelled issues are picked; no autonomous pickup this cycle`);
-    return;
+    return eligibleCount; // only forced bugs were eligible; new backlog is never listed in this mode
   }
   const cap = Math.max(0, config.maxOpenBugs ?? 15);
   const perCycle = Math.max(1, config.maxPicksPerCycle || 1);
@@ -76,16 +78,18 @@ async function processNewBugs() {
   const slots = Math.max(0, cap - open);
   if (slots === 0) {
     log(`${new Date().toISOString()} — ${open}/${cap} bug(s) already in the list; picking no new (unforced) bugs this cycle`);
-    return;
+    return eligibleCount; // cap is full — we didn't fetch the backlog, so only forced count as seen
   }
 
   const bugs = (await listNewBugs()).filter((b) => !forcedIds.has(b.identifier)); // don't double-pick a forced one
+  eligibleCount += bugs.length; // every eligible new bug we saw, before the cap trims to `take`
   bugs.sort(byPriority);
   const take = Math.min(slots, perCycle, bugs.length);
   log(`${new Date().toISOString()} — ${bugs.length} new bug(s); ${open}/${cap} in the list, ${slots} slot(s) free → picking ${take} this cycle`);
-  if (!take) return;
+  if (!take) return eligibleCount;
 
   await runBugs(bugs.slice(0, take)); // highest-priority first; the rest wait for a future cycle
+  return eligibleCount;
 }
 
 // A crashed autofix run leaves its issue In Progress with a 'started' record and no final
@@ -179,10 +183,16 @@ async function main() {
     console.error('[poll] refusing to run: AUTOFIX_RUN_ENABLED != 1 (fixes are EC2-only; set it in .linear-autofix/.env on the designated runner)');
     process.exit(2);
   }
-  await processNewBugs();
+  const eligibleCount = await processNewBugs();
   await recoverStale();
   await scanRevisions();
   await refreshFromLinear();
+  // End of a successful cycle: stamp the health record that GET /api/metrics reads. __meta is NOT a
+  // tracked issue — it has no `identifier`, so every issue count (poll's cap, gc's reap, the chat list)
+  // already skips it. RMW against a fresh read so we don't clobber entries touched above.
+  const fresh = loadState();
+  fresh.__meta = { lastPollAt: new Date().toISOString(), eligibleCount: eligibleCount ?? 0 };
+  saveState(fresh);
 }
 
 main().catch((e) => { console.error('[poll] fatal:', e); process.exit(1); });
