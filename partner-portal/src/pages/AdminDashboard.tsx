@@ -295,6 +295,8 @@ interface User {
     totalCost: number;
   }>;
   tokenAllowanceBonus?: number;
+  /** Allocated X (Twitter) API $ spend this calendar month (ENG-664). */
+  xCostThisMonth?: number;
   extraCostUsage?: {
     month: string;
     totalCost: number;
@@ -4983,7 +4985,9 @@ export default function AdminDashboard() {
                                       help="Allocated $ cost of this user's X/Twitter API calls this month — X's pay-per-use rate card applied to their call counts. Observe-only: X spend is NOT deducted from any cap. Open the breakdown for per-tool cost."
                                     />
                                     <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
-                                      <Typography variant="body2" color="text.secondary">allocated</Typography>
+                                      <Typography variant="body2">
+                                        ${(user.xCostThisMonth ?? 0).toFixed(4)} this month
+                                      </Typography>
                                       <Tooltip title="View per-tool X (Twitter) cost breakdown">
                                         <IconButton size="small" onClick={() => openXBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
                                       </Tooltip>
