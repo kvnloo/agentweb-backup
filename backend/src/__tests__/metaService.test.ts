@@ -708,7 +708,14 @@ describe('MetaService', () => {
             expect(result).toEqual(mockAudienceData);
         });
 
-        it('should create a lookalike audience', async () => {
+        // ENG-600 live-test finding: Meta's current (v25) create API rejects
+        // lookalike_spec.origin entirely — "(#2654) ... No custom_audience ID
+        // given for lookalike cluster" — even with a well-formed
+        // {id, type: 'custom_audience'} entry. Per Meta's Lookalike Audiences
+        // guide, the seed is supplied via a separate top-level
+        // origin_audience_id param; lookalike_spec itself only carries
+        // type/country/ratio (origin only ever appears in READ responses).
+        it('translates lookalike_spec.origin into a top-level origin_audience_id (Meta v25 create shape)', async () => {
             const mockAudienceData = { id: 'audience_lookalike', name: 'Lookalike Audience' };
             const mockCreateCustomAudience = jest.fn().mockResolvedValue({ _data: mockAudienceData });
             (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
@@ -721,20 +728,20 @@ describe('MetaService', () => {
                 description: 'Lookalike test',
                 lookalike_spec: {
                     ratio: 0.01,
-                    origin: [{ id: 'source_audience_123' }],
+                    origin: [{ id: 'source_audience_123', type: 'custom_audience' }],
                     country: 'US'
                 },
             };
 
             const result = await service.createCustomAudience(mockAdAccountId, mockAccessToken, params);
 
-            expect(mockCreateCustomAudience).toHaveBeenCalledWith([], expect.objectContaining({
-                name: 'Lookalike Audience',
-                subtype: 'LOOKALIKE',
-                lookalike_spec: expect.objectContaining({
-                    ratio: 0.01,
-                    country: 'US',
-                }),
+            const [, calledParams] = mockCreateCustomAudience.mock.calls[0];
+            expect(calledParams.origin_audience_id).toBe('source_audience_123');
+            expect(calledParams.lookalike_spec.origin).toBeUndefined();
+            expect(calledParams.lookalike_spec).toEqual(expect.objectContaining({
+                type: 'similarity',
+                ratio: 0.01,
+                country: 'US',
             }));
             expect(result).toEqual(mockAudienceData);
         });

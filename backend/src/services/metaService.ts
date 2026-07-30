@@ -1842,8 +1842,22 @@ export class MetaService {
       if (params.subtype === 'CUSTOM') {
           audienceParams.customer_file_source = params.customer_file_source || 'USER_PROVIDED_ONLY';
       } else if (params.subtype === 'LOOKALIKE') {
-          audienceParams.lookalike_spec = params.lookalike_spec; 
-          // { ratio: 0.01, origin: [{id: '...'}], country: 'US' }
+          // Meta's current create API takes the seed via a top-level
+          // origin_audience_id param, not a lookalike_spec.origin array —
+          // that shape only appears when READING a lookalike back (confirmed
+          // live: "(#2654) ... No custom_audience ID given for lookalike
+          // cluster" when origin was sent inside lookalike_spec). Callers
+          // still pass the seed as lookalike_spec.origin[0].id (our public
+          // shape, unchanged) — translated here at the Graph API boundary.
+          const { origin, ...lookalikeSpecRest } = params.lookalike_spec || {};
+          const originAudienceId = Array.isArray(origin) ? origin[0]?.id : undefined;
+          if (originAudienceId) {
+            audienceParams.origin_audience_id = originAudienceId;
+          }
+          audienceParams.lookalike_spec = {
+            type: 'similarity',
+            ...lookalikeSpecRest,
+          };
       }
 
       this.log(`Creating custom audience in account: ${adAccountId}`, audienceParams);
