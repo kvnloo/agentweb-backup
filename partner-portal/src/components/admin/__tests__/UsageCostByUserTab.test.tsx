@@ -161,7 +161,9 @@ describe("UsageCostByUserTab rendering", () => {
 
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
     expect(screen.getByText("(no email on file)")).toBeInTheDocument();
-    expect(screen.getByTestId("total-cost")).toHaveTextContent("$1.24");
+    // X-only tab: total is the twitter spend across users ($0.10 + $0.20), not the
+    // all-providers sum — LLM spend is excluded by the fixed twitter filter.
+    expect(screen.getByTestId("total-cost")).toHaveTextContent("$0.30");
 
     // by-account cut — shows the enriched @handle (with the raw id alongside)
     const acctTable = await screen.findByTestId("x-account-table");
@@ -175,16 +177,17 @@ describe("UsageCostByUserTab rendering", () => {
     expect(screen.getByTestId("x-recon-dedup")).toHaveTextContent("859");
   });
 
-  it("filtering to X recomputes totals and shows the allocated caveat", async () => {
+  it("is X-only by default: allocated caveat shown, no provider selector", async () => {
     routeAxios();
     render(<UsageCostByUserTab />);
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
 
-    await userEvent.click(screen.getByLabelText("Provider"));
-    await userEvent.click(await screen.findByRole("option", { name: "X (Twitter)" }));
-
-    await waitFor(() => expect(screen.getByTestId("total-cost")).toHaveTextContent("$0.30"));
+    // Twitter is fixed (ENG-664, X-only for now) — total reflects X spend only and
+    // the allocated caveat renders without any filtering.
+    expect(screen.getByTestId("total-cost")).toHaveTextContent("$0.30");
     expect(screen.getAllByText(/allocated/i).length).toBeGreaterThan(0);
+    // The provider selector is removed while the tab is X-only.
+    expect(screen.queryByLabelText("Provider")).not.toBeInTheDocument();
   });
 
   it("degrades gracefully when X reconciliation is unavailable (502)", async () => {
