@@ -12,7 +12,7 @@
  */
 
 import { getModelPrice } from "../utils/llmPricing";
-import { usageRecordDb } from "./usageRecordDb";
+import { usageRecordDb, CostSource } from "./usageRecordDb";
 // tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
 // it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
 // (via llmClients). A static import would drag that whole graph into every consumer's
@@ -40,9 +40,47 @@ export interface RecordUsageContext {
   costUsdOverride?: number;
 }
 
+/**
+ * A spend entry for a vendor billed per unit rather than per token (v0 renders,
+ * You.com queries, ElevenLabs characters, …).
+ *
+ * Note what is NOT here: any rate table. This entry point records the dollar
+ * figure its caller hands it and states, via `costSource`, where that figure came
+ * from. Choosing the allocated rate is a pricing decision owned by ENG-703.
+ */
+export interface RecordVendorUsageContext {
+  userId?: string;
+  billingUserId?: string;
+  onBehalfOf?: string;
+  sessionId?: string;
+  /** Vendor id: "v0", "you.com", "remotion", "elevenlabs", … */
+  provider: string;
+  /** What was bought from that vendor: "generate", "search", "render", … */
+  operation: string;
+  feature: string;
+  /** The thing being counted: "render", "query", "character", … */
+  unit: string;
+  quantity: number;
+  costSource: CostSource;
+  /** Dollar cost of this call. Omitted means 0 — ENG-700 makes an unpriced unit loud. */
+  costUsd?: number;
+}
+
 /** Log at most one recorder failure per minute to avoid log spam on outages. */
 const ERROR_LOG_INTERVAL_MS = 60_000;
 let lastErrorLogAt = 0;
+
+/** Swallow-and-throttle: metering must never fail or slow the caller's operation. */
+function logRecorderFailure(error: unknown): void {
+  const now = Date.now();
+  if (now - lastErrorLogAt >= ERROR_LOG_INTERVAL_MS) {
+    lastErrorLogAt = now;
+    console.error(
+      "[usageRecorder] Failed to record usage (further failures suppressed for 60s):",
+      error instanceof Error ? error.message : error
+    );
+  }
+}
 
 /**
  * Compute cost in INTEGER microdollars for a call.
@@ -106,17 +144,56 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
       cacheWriteTokens,
       costMicroUsd,
       billingUserId,
+      // Every dollar on this path is derived from our own price table
+      // (utils/llmPricing) or an explicit override — never vendor-reported.
+      costSource: "allocated",
       ...(ctx.onBehalfOf ? { onBehalfOf: ctx.onBehalfOf } : {}),
+      ...(ctx.provider ? { provider: ctx.provider } : {}),
+      ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
     });
   } catch (error) {
-    const now = Date.now();
-    if (now - lastErrorLogAt >= ERROR_LOG_INTERVAL_MS) {
-      lastErrorLogAt = now;
-      console.error(
-        "[usageRecorder] Failed to record usage (further failures suppressed for 60s):",
-        error instanceof Error ? error.message : error
-      );
-    }
+    logRecorderFailure(error);
+  }
+}
+
+/**
+ * Record one per-unit vendor call into the SAME ledger `recordUsage` writes to.
+ *
+ * Fire-and-forget with identical guarantees: the returned promise always
+ * resolves, and a recording failure can never fail or slow the caller.
+ *
+ * The row's model slot is namespaced `{provider}:{operation}`. The sort key
+ * format stays `{date}#{model}#{feature}` (changing it is out of scope and would
+ * be a real key change) — namespacing the model component is what guarantees two
+ * different vendors can never aggregate into one row and overwrite each other's
+ * `provider`. For token-priced LLM rows that ambiguity is ENG-700's job.
+ */
+export async function recordVendorUsage(ctx: RecordVendorUsageContext): Promise<void> {
+  try {
+    const userId = ctx.userId || "system";
+    const billingUserId = ctx.billingUserId || userId;
+    const date = new Date().toISOString().slice(0, 10);
+
+    await usageRecordDb.incrementUsage({
+      userId,
+      date,
+      model: `${ctx.provider}:${ctx.operation}`,
+      feature: ctx.feature || "unknown",
+      // Token counters are meaningless here; the adapter omits them entirely
+      // because `unit` is set, so these three are never written.
+      inputTokens: 0,
+      outputTokens: 0,
+      costMicroUsd: Math.max(0, Math.round((ctx.costUsd || 0) * 1e6)),
+      billingUserId,
+      provider: ctx.provider,
+      unit: ctx.unit,
+      quantity: ctx.quantity,
+      costSource: ctx.costSource,
+      ...(ctx.onBehalfOf ? { onBehalfOf: ctx.onBehalfOf } : {}),
+      ...(ctx.sessionId ? { sessionId: ctx.sessionId } : {}),
+    });
+  } catch (error) {
+    logRecorderFailure(error);
   }
 }
 

@@ -68,6 +68,7 @@ import AlertEmailsTab from "../components/admin/AlertEmailsTab";
 import OnboardingTab from "../components/admin/OnboardingTab";
 import ConnectedAccountsTab from "../components/admin/ConnectedAccountsTab";
 import ContractorsTab from "../components/admin/ContractorsTab";
+import CostDashboardTab from "../components/admin/CostDashboardTab";
 import {
   UserGrowthChart,
   TaskGrowthChart,
@@ -783,6 +784,7 @@ export default function AdminDashboard() {
     'connected-accounts': 21,
     'contractors': 22,
     'emma-mcp': 23,
+    'costs': 24,
   };
   
   // Get initial tab value from URL or default to Users
@@ -3362,6 +3364,7 @@ export default function AdminDashboard() {
             <Tab label="Connected Accounts" {...a11yProps(21)} />
             <Tab label="Contractors" {...a11yProps(22)} />
             <Tab label="Emma MCP" {...a11yProps(23)} />
+            <Tab label="LLM Costs" {...a11yProps(24)} />
           </Tabs>
         </Box>
 
@@ -6558,6 +6561,10 @@ export default function AdminDashboard() {
           <EmmaMcpUsageTab />
         </TabPanel>
 
+        <TabPanel value={tabValue} index={24}>
+          <CostDashboardTab />
+        </TabPanel>
+
       </Paper>
 
       {/* Satisfaction Score Override Popover */}
@@ -8372,13 +8379,13 @@ const AgentModeSettings = () => {
     } catch (error) {
       console.error('Error loading supported models:', error);
     }
-    const fallbackModels = [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const fallbackModels = [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     setSupportedModels(fallbackModels);
     return fallbackModels;
   };
 
   const loadDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       try {
         const response = await axios.get(buildApiUrl('/api/settings/agent_mode_default_model'), {
@@ -8547,7 +8554,7 @@ const AgentModeSettings = () => {
   };
 
   const loadScheduledChatsDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -8599,7 +8606,7 @@ const AgentModeSettings = () => {
   };
 
   const loadReportGenerationDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_report_generation_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -8649,7 +8656,7 @@ const AgentModeSettings = () => {
   };
 
   const loadImageGenerationDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_image_generation_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -8797,7 +8804,7 @@ const AgentModeSettings = () => {
   };
 
   const loadVideoGenerationDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_video_generation_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -8847,7 +8854,7 @@ const AgentModeSettings = () => {
   };
 
   const loadCustomerSupportDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_customer_support_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -8897,7 +8904,7 @@ const AgentModeSettings = () => {
   };
 
   const loadCodingAgentDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -9016,7 +9023,7 @@ const AgentModeSettings = () => {
   };
 
   const loadBackupModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_backup_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -9397,7 +9404,7 @@ const AgentModeSettings = () => {
             >
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model} disabled={model === backupModel}>
                   {model}{model === backupModel ? ' (used as backup model)' : ''}
@@ -9449,7 +9456,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model} disabled={model === defaultModel}>
                   {model}{model === defaultModel ? ' (current default model)' : ''}
@@ -9501,7 +9508,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}
@@ -9553,7 +9560,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}
@@ -9605,7 +9612,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}
@@ -9755,7 +9762,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}
@@ -9807,7 +9814,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}

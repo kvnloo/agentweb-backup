@@ -79,6 +79,11 @@ describe('runHumanEvalFeedbackAction', () => {
       startingMessage: expect.stringContaining('https://example.com/image.png'),
       requiredFunctions: [{ functionName: 'generate_image', minCount: 1 }],
     }));
+    // ENG-634 (narrowed): a single-purpose image-revision flow does NOT enable the
+    // completion gate — a free-text "shall I proceed?" halt doesn't occur here, and
+    // structured questions are still handled by the park/auto-take path. The gate is
+    // reserved for resultEndpoint (arbitrary configured prompts).
+    expect((runVerifiedChat as jest.Mock).mock.calls[0][0].completionGate).toBeUndefined();
   });
 
   it('iterates and deploys landing pages from Matt feedback', async () => {
