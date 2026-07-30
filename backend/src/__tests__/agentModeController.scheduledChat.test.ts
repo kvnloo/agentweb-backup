@@ -69,6 +69,7 @@ jest.mock('../services/db', () => ({
     clearRunInFlight: jest.fn().mockResolvedValue(true),
     getInFlightSchedules: jest.fn().mockResolvedValue([]),
     claimAbandonedRun: jest.fn().mockResolvedValue(true),
+    clearPendingResume: jest.fn().mockResolvedValue(undefined),
     updateSchedule: jest.fn(),
     getSchedulesByUserId: jest.fn(),
   },
@@ -242,6 +243,83 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           functionCallMisses: [],
         })
       );
+    });
+
+    // ENG-657: resume an abandoned run whose instance was terminated mid-flight
+    // (e.g. by a deploy) instead of restarting the whole task in a fresh session.
+    describe('resume of an abandoned run (ENG-657)', () => {
+      const resumeSessionId = 'resume-sess-1';
+      const resumableMessages = [
+        { role: 'system', content: 'automated run' },
+        { role: 'user', content: 'Enrich the CRM leads and recommend the top 10.' },
+        { role: 'assistant', content: 'Firing enrichment.', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: '{"mode":"enrich","processedCount":5}' },
+      ];
+      const resumeSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        pendingResumeSessionId: resumeSessionId,
+      };
+
+      it('continues the existing session (no new session) and injects a continuation directive', async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: resumableMessages,
+        } as any);
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        // Reuses the abandoned session — does NOT create a fresh one.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(result.sessionId).toBe(resumeSessionId);
+        // The resume marker is consumed (at-most-once resume).
+        expect(mockScheduleDb.clearPendingResume).toHaveBeenCalledWith(mockScheduleId);
+        // The model turn is driven against the existing session with a CONTINUATION
+        // directive, not the original task prompt (which would restart the task).
+        const workerArg = (mockGenerateMarketingResponseWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
+        expect(workerArg.sessionId).toBe(resumeSessionId);
+        expect(workerArg.messageContent).toMatch(/Continue from exactly where you left off/i);
+        expect(workerArg.messageContent).not.toBe(baseSchedule.startingMessage);
+      });
+
+      it('falls back to a fresh run when the resume session is no longer safely resumable', async () => {
+        // Dangling tool_use → planScheduledRunResume refuses → restart from scratch.
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'x' },
+            { role: 'user', content: 'Enrich.' },
+            { role: 'assistant', content: '…', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }, { id: 'c2', function: { name: 'enrich_leads_execute' } }] },
+            { role: 'tool', tool_call_id: 'c1', content: '{}' },
+          ],
+        } as any);
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        // Unsafe boundary → normal fresh session is created, marker still consumed.
+        expect(mockChatbotDb.createChatSession).toHaveBeenCalledTimes(1);
+        expect(mockScheduleDb.clearPendingResume).toHaveBeenCalledWith(mockScheduleId);
+        expect(result.sessionId).toBe(mockSession.sessionId);
+        const workerArg = (mockGenerateMarketingResponseWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
+        expect(workerArg.messageContent).toBe(baseSchedule.startingMessage);
+      });
+
+      it('ignores the resume marker for a manual test run (never resumes)', async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
+        } as any);
+
+        await runScheduledChat(resumeSchedule as any, mockUserId, true);
+
+        // isTest=true → resume path is skipped entirely; a fresh session is created.
+        expect(mockChatbotDb.createChatSession).toHaveBeenCalledTimes(1);
+        expect(mockScheduleDb.clearPendingResume).not.toHaveBeenCalled();
+      });
     });
 
     it('stamps an in-flight lease on a production run and releases it when the run settles (ENG-324)', async () => {
