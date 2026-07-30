@@ -75,10 +75,7 @@ export const XCostBreakdown: React.FC<{
               </Tooltip>
             </Box>
             <Typography variant="h6" data-testid="x-breakdown-total" sx={{ fontVariantNumeric: "tabular-nums" }}>
-              {usd(data.costUsd)}{" "}
-              <Typography component="span" variant="caption" color="text.secondary">
-                allocated
-              </Typography>
+              {usd(data.costUsd)}
             </Typography>
           </Paper>
         </Grid>

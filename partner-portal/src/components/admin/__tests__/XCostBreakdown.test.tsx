@@ -29,10 +29,12 @@ describe("XCostBreakdown", () => {
     expect(screen.getAllByTestId("x-breakdown-empty").length).toBeGreaterThan(0);
   });
 
-  it("renders the allocated total and a per-tool table", () => {
+  it("renders the total (value-forward, no 'allocated' badge) and a per-tool table", () => {
     render(<XCostBreakdown data={DATA} view="table" />);
     expect(screen.getByTestId("x-breakdown-total")).toHaveTextContent("$0.0650");
-    expect(screen.getByText("allocated")).toBeInTheDocument();
+    // The dollar figure leads; "allocated" is no longer stamped on the number
+    // (it lives in the hover tooltip / the tab footnote instead).
+    expect(screen.queryByText("allocated")).not.toBeInTheDocument();
     const table = screen.getByTestId("x-breakdown-table");
     expect(table).toHaveTextContent("search tweets");
     expect(table).toHaveTextContent("post");

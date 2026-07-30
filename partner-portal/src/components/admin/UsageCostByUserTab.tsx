@@ -295,16 +295,6 @@ const UserUsageRow: React.FC<{ rank: number; row: UserRowView; provider: string 
         </TableCell>
         <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
           {usd(row.costUsd)}
-          {providerIsAllocatedEstimate(provider) && (
-            <Typography
-              component="span"
-              variant="caption"
-              color="text.secondary"
-              sx={{ ml: 0.75 }}
-            >
-              allocated
-            </Typography>
-          )}
         </TableCell>
       </TableRow>
       <TableRow>
@@ -463,7 +453,7 @@ const XAccountTable: React.FC<{ accounts: XAccountRow[] }> = ({ accounts }) => {
             <TableRow>
               <TableCell>Connected account</TableCell>
               <TableCell align="right">Calls</TableCell>
-              <TableCell align="right">Cost (allocated)</TableCell>
+              <TableCell align="right">Cost</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
