@@ -33,6 +33,9 @@ import {
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
+// ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
+// on existing report/run envelopes. No surface parses or re-ranks on its own.
+import { MarketingActionCarrier, normalizeMarketingActions } from '../services/marketingActionEnvelope';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
@@ -1761,12 +1764,17 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
 }
 
 // Common function to run a scheduled chat (used by both test and actual execution)
+//
+// ENG-446: the run result IS the run envelope. It carries the canonical
+// marketing-action payload (MarketingActionCarrier — optional, because legacy
+// runs carry none) alongside the existing output, and is persisted verbatim by
+// scheduleDb.addRunResult, so no separate action storage path exists.
 export async function runScheduledChat(
   schedule: any,
   userId: string,
   isTest: boolean = false,
   preGeneratedRunId?: string
-): Promise<{
+): Promise<MarketingActionCarrier & {
   scheduleId: string;
   runId: string;
   // ENG-396: 'pending_user_input' when the run parked on a blocking AskUserQuestion.
@@ -2946,7 +2954,19 @@ export async function generateSessionResponse(
           if (scheduleIdMatch) {
             systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
           }
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType);
+          // Resolve the schedule owner's admin status so the directive only
+          // injects its admin-only (get_chat_history / list_all_clients) identity
+          // slice for admin-owned scheduled runs. Scoped to the scheduled branch,
+          // so this is one extra read only on scheduled runs. A prompt-enrichment
+          // lookup must never break the run, so a failed read degrades to the safe
+          // default (treat as non-admin → omit the admin-only slice).
+          let ownerIsAdmin = false;
+          try {
+            ownerIsAdmin = (await userDb.getUserById(session.userId))?.isAdmin === true;
+          } catch (adminLookupError) {
+            console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
+          }
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
@@ -4557,6 +4577,25 @@ export const agentModeController = {
       }
 
       try {
+
+      // ENG-705: this route is registered before `router.use(authenticateToken)`,
+      // so the caller is anonymous — but the spend is not. Gate on the share
+      // OWNER's allowance (the account `generateSessionResponse` already bills
+      // via incrementUserTokenUsage) so an unauthenticated visitor can never
+      // cause more vendor spend than the owner could cause themselves. This runs
+      // before any LLM call: refuse loudly, never a degraded-but-billed path.
+      const usageStatus = await checkTokenUsage(session.userId);
+      if (!usageStatus.allowed) {
+        // The caller is anonymous, so the denial carries the message ONLY.
+        // `usageStatus` is the owner's billing record (allowance, bonus, dollar
+        // spend, cost cap, enforcement state); echoing it here would turn this
+        // public route into a read side-channel on the owner's account for
+        // anyone holding the share link. Authenticated owners still read their
+        // usage through the subscription-usage endpoint.
+        return res.status(429).json({
+          error: 'Monthly token limit reached for this shared session. Please contact the owner of this link.',
+        });
+      }
 
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
@@ -6465,7 +6504,19 @@ export const agentModeController = {
       // Get test history
       const testHistory = await scheduleDb.getRunResults(scheduleId);
 
-      res.json(testHistory);
+      // ENG-446: hand every consumer the canonical marketing-action list the run
+      // itself selected — same ids, same order, empty for legacy runs that carry
+      // none. Consumers render this; they never re-rank or regenerate it.
+      // Arrays are excluded deliberately: spreading one into an object literal
+      // would silently turn it into {0: …, 1: …}. A malformed entry passes
+      // through untouched rather than being corrupted into a wrong answer.
+      const historyWithActions = (testHistory || []).map((run: any) =>
+        run !== null && typeof run === 'object' && !Array.isArray(run)
+          ? normalizeMarketingActions(run)
+          : run
+      );
+
+      res.json(historyWithActions);
     } catch (error) {
       console.error('AgentMode: Get test history error:', error);
       res.status(500).json({ error: 'Failed to get test history' });

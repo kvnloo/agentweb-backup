@@ -560,8 +560,18 @@ export function getScheduledSessionOverride(sessionType?: string): string {
 // Self-guards on sessionType (like getScheduledSessionOverride) so it is safe to
 // call unconditionally and never leaks the unattended block into a non-scheduled
 // session, even if a future caller omits the call-site guard.
-export function getUnattendedExecutionDirective(sessionType?: string): string {
+export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean): string {
   if (sessionType !== 'scheduled') return '';
+  // The userId→identity mapping and its data-minimization guard reference two
+  // admin-only tools (get_chat_history, list_all_clients). Inject this slice
+  // ONLY for admin schedule owners — a non-admin scheduled run cannot call
+  // either tool (both return 403 at the service layer), so the guidance would
+  // be dead weight for them. Gating it on the runtime isAdmin signal keeps the
+  // authorization decision deterministic (never inferred by the model) and
+  // keeps non-admin scheduled prompts lean.
+  const identityResolutionGuidance = isAdmin
+    ? `\n- IDENTITY RESOLUTION is a DATA-MINIMIZATION guard, NOT a new stop-case: turning a userId (e.g. from get_chat_history) into a human-readable email/displayName is just one instance of the single-supported-call rule above — a single list_all_clients call already returns the userId→email/displayName mapping, so map the identities and deliver; it is never a reason to stop and ask. Use list_all_clients ONLY to build that userId→email/displayName lookup. It also returns sensitive account data (roles, subscription_type, monthly_amount_cents, has_payment_method, stripe_customer_id, current_period_end) — NEVER copy those roles/subscription/Stripe/billing/payment or period/renewal fields into the report or any other output, even if the task asks for them. Scheduled reports are auto-emailed to subscribers and posted to Slack with no human review and no recipient-level authorization, so a recipient who is NOT authorized to see another account's billing could receive it — so those fields must never leave this session. If a scheduled task genuinely needs per-account billing/revenue data, surface that it requires a proper access-controlled report rather than emitting the fields here.`
+    : '';
   return `\n\n[AUTOMATED UNATTENDED EXECUTION]
 This is a scheduled, automated run. No human is present. You MUST:
 - Execute the complete task in a single run without stopping to ask for confirmation, approval, or clarification at any point.
@@ -578,7 +588,7 @@ BEST-EFFORT WHEN THE REQUESTED APPROACH IS INFEASIBLE (CRITICAL):
 PRESCRIBED PER-ITEM CALL PATTERNS ARE INTENT, NOT LITERAL LAW (CRITICAL — applies to READING/GATHERING data for a report or analysis, NOT to per-entity actions):
 - This rule is ONLY about how you FETCH the data a report needs. When a task prescribes a specific execution mechanic for GATHERING data — e.g. "make one tool call per session", "never batch", "do a SEPARATE lookup for each userId", or "gather at MAXIMUM granularity, one call per item" — that language describes the DATA the deliverable needs, not a literal requirement that a matching per-item tool must exist.
 - If a single available tool ALREADY returns that per-item data, calling it once and reading the per-item data out of its response IS the correct and COMPLETE way to satisfy the request. For example, get_chat_history returns every session's details and satisfaction score in one response, and there is no separate per-session transcript tool or per-userId profile lookup — so a single get_chat_history call already gives you the per-session and per-user data such a prompt asks for. Using that efficient supported path is NOT skipping, refusing, deviating from, or violating the "one call per item" instruction — it fulfils it. Never frame it as a refusal, a shortcut, or a constraint you chose to break.
-- So never stop, refuse, or abandon the deliverable because the literal per-item mechanic is unsupported. Get the same data the efficient supported way and ALWAYS produce the requested deliverable in full. If useful, note in one factual line that the granular per-item calls were unnecessary because the data was already available in a single call — stated as a fact, not an apology and not a request to change the instructions.
+- So never stop, refuse, or abandon the deliverable because the literal per-item mechanic is unsupported. Get the same data the efficient supported way and ALWAYS produce the requested deliverable in full. If useful, note in one factual line that the granular per-item calls were unnecessary because the data was already available in a single call — stated as a fact, not an apology and not a request to change the instructions.${identityResolutionGuidance}
 - Do NOT stop to ask the user to pin down an ambiguous scope parameter either (a date range, time window, count, or target). Pick the obvious default — for a "daily" report that is the last 24 hours ending now — proceed immediately, produce the deliverable, and state the assumption you made. Asking "what time window do you want?" or "reply 'last 24h' and I'll generate it" is just another banned confirmation prompt: no one will answer, so answer it yourself and deliver.
 - CARVE-OUT — this does NOT loosen per-entity ACTIONS. When the per-item work is a real side effect for each entity (send a message, post, draft, submit a request, run an approval check), a single batched or summarizing call does NOT satisfy it: you MUST still perform that action for EVERY entity, per the PER-ENTITY COMPLETION LOOP below. The efficient-single-call reframing is strictly about fetching per-item DATA, never about collapsing per-item actions.
 

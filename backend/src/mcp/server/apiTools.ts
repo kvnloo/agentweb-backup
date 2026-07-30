@@ -2314,7 +2314,8 @@ mcpToolRegistry.register({
     description: `List all client accounts (including admins) with quick health indicators. Admin-only tool.
 
 Returns for each client:
-- Name, email, roles
+- userId: internal account id — use this to map a userId (e.g. from get_chat_history) back to a human-readable email/displayName
+- displayName, email, roles
 - has_ads: whether they have a Meta ad account connected
 - has_lander: whether they have landing pages (productDomain or seoDomains)
 - has_crm: whether they have CRM integrations (email domain, LinkedIn)
