@@ -24,6 +24,7 @@ import { acquireLock, releaseLock } from '../lock.mjs';
 import { transcriptContextUsed, pickResumeBase } from './context-usage.mjs';
 import { usageSnapshot } from './usage.mjs';
 import { makeEditableDecision, buildEditableBranch, promotedOutcome } from './editable.mjs';
+import { computeMetrics } from './metrics.mjs';
 import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
   headShas, resetTo, ensureOpenPrs, touchedPreviewFiles, commitsDropped, assigneeBranchPrefix, kebab,
@@ -1895,6 +1896,12 @@ async function route(req, res) {
   if (req.method === 'GET' && p === '/api/usage') { json(res, 200, await fetchOauthUsage()); return; }
   if (req.method === 'GET' && p === '/api/members') { json(res, 200, { members: chatMembers() }); return; }
   if (req.method === 'GET' && p === '/api/previews') { json(res, 200, { previews: listPreviews(), cap: config.maxConcurrentPreviews ?? 0 }); return; }
+  if (req.method === 'GET' && p === '/api/metrics') {
+    const state = loadState();
+    const watches = Object.values(state).filter((e) => e && e.identifier && e.watch); // entries with an armed watch
+    json(res, 200, computeMetrics(state, watches, config, Date.now()));
+    return;
+  }
   if (req.method === 'POST' && p === '/api/chats') { const r = createChat((await readBody(req))?.email); json(res, r.code, r.body || { error: r.error }); return; }
 
   const m = p.match(/^\/api\/issues\/([A-Za-z]+-\d+)(\/events|\/attach|\/chat\/abort|\/chat\/edit|\/chat\/delete|\/chat\/polish|\/chat\/merge|\/chat\/compact|\/chat\/btw|\/chat\/make-editable|\/chat\/rename|\/chat\/owner|\/chat\/close|\/chat|\/preview)?$/);
