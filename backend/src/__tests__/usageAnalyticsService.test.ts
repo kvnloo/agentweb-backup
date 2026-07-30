@@ -7,6 +7,8 @@ jest.mock('../services/usageRecordDb', () => ({
     queryByUserDateRange: jest.fn(),
     scanByDateRange: jest.fn(),
   },
+  // Real semantics: a per-unit vendor row has BOTH provider and unit.
+  isVendorEntry: (r: any) => !!(r && r.provider && r.unit),
 }));
 
 jest.mock('../services/db', () => ({
@@ -28,6 +30,7 @@ import {
   getCostAggregation,
   getXAllocatedTotals,
   currentXBillingCycle,
+  getUserXBreakdown,
 } from '../services/usageAnalyticsService';
 
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
@@ -716,5 +719,43 @@ describe('getCostAggregation — byXAccount (@handle enrichment, ENG-664)', () =
     const result = await getCostAggregation('2026-07-01', '2026-07-31');
     expect(result.byXAccount).toEqual([]);
     expect(mockGetAccountById).not.toHaveBeenCalled();
+  });
+});
+
+describe('getUserXBreakdown (per-user X cost by tool, ENG-664)', () => {
+  const txr = (op: string, costMicroUsd: number, callCount = 1, quantity = callCount) => ({
+    userId: 'u1',
+    sk: `2026-07-10#twitter:${op}#x-account:acc-1`,
+    date: '2026-07-10',
+    model: `twitter:${op}`,
+    feature: 'x-account:acc-1',
+    callCount,
+    quantity,
+    costMicroUsd,
+  });
+
+  it('groups a user\'s twitter rows by tool, sorted by spend, ignoring non-twitter rows', async () => {
+    mockQuery.mockResolvedValue([
+      txr('search_tweets', 50_000, 5, 10),
+      txr('post', 15_000, 1),
+      { ...txr('post', 999_000), model: 'gpt-5-chat-2', feature: 'agent-chat' }, // non-X, ignored
+    ]);
+    const r = await getUserXBreakdown('u1', '2026-07-01', '2026-07-31');
+    expect(mockQuery).toHaveBeenCalledWith('u1', '2026-07-01', '2026-07-31');
+    expect(r.costUsd).toBeCloseTo(0.065, 6); // 0.05 + 0.015
+    expect(r.callCount).toBe(6);
+    expect(r.byOperation.map((o) => o.operation)).toEqual(['search_tweets', 'post']); // spend desc
+    expect(r.byOperation[0].costUsd).toBeCloseTo(0.05, 6);
+  });
+
+  it('returns empty for a user with no X usage', async () => {
+    mockQuery.mockResolvedValue([]);
+    const r = await getUserXBreakdown('u1', '2026-07-01', '2026-07-31');
+    expect(r).toEqual({ userId: 'u1', start: '2026-07-01', end: '2026-07-31', costUsd: 0, callCount: 0, byOperation: [] });
+  });
+
+  it('rejects a malformed or inverted range', async () => {
+    await expect(getUserXBreakdown('u1', 'x', '2026-07-31')).rejects.toThrow(/YYYY-MM-DD/);
+    await expect(getUserXBreakdown('u1', '2026-07-31', '2026-07-01')).rejects.toThrow(/<=/);
   });
 });
