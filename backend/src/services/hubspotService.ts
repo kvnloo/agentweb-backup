@@ -1407,6 +1407,76 @@ export class HubSpotService {
     );
   }
 
+  /**
+   * Fetches one page of a list's membership record IDs, ordered by recordId.
+   * GET /crm/lists/2026-03/{listId}/memberships — confirmed against the
+   * 2026-03 Lists API reference (default limit 100, max 250; next-page
+   * cursor in paging.next.after).
+   */
+  async getListMembershipContactIds(
+    listId: string,
+    opts?: { cursor?: string; limit?: number }
+  ): Promise<{ contactIds: string[]; nextCursor?: string }> {
+    if (!listId?.trim()) throw new Error('listId is required');
+    let url = `${HUBSPOT_API_BASE}/crm/lists/2026-03/${listId}/memberships?limit=${opts?.limit ?? 100}`;
+    if (opts?.cursor) url += `&after=${encodeURIComponent(opts.cursor)}`;
+    const res = await axiosInstance.get(url, { headers: await this.authHeaders() });
+    return {
+      contactIds: ((res.data as any)?.results ?? []).map((r: any) => String(r.recordId)),
+      nextCursor: (res.data as any)?.paging?.next?.after,
+    };
+  }
+
+  /**
+   * Resolves all members of a HubSpot list into contact property records
+   * (default: email/firstname/lastname/phone) by paginating membership IDs
+   * then batch-reading properties in chunks of 100, mirroring the chunking
+   * pattern used by getContactEmailsByIds/getContactLifecycleStages above.
+   * Partial chunk failures are logged and skipped, same as those methods.
+   */
+  async getContactsForList(
+    listId: string,
+    properties: string[] = ['email', 'firstname', 'lastname', 'phone']
+  ): Promise<Array<{ contactId: string; email?: string; firstname?: string; lastname?: string; phone?: string }>> {
+    if (!listId?.trim()) throw new Error('listId is required');
+
+    const allContactIds: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.getListMembershipContactIds(listId, { cursor });
+      allContactIds.push(...page.contactIds);
+      cursor = page.nextCursor;
+    } while (cursor);
+
+    if (allContactIds.length === 0) return [];
+
+    const CHUNK_SIZE = 100;
+    const contacts: Array<{ contactId: string; email?: string; firstname?: string; lastname?: string; phone?: string }> = [];
+    for (let i = 0; i < allContactIds.length; i += CHUNK_SIZE) {
+      const chunk = allContactIds.slice(i, i + CHUNK_SIZE);
+      try {
+        const res = await axiosInstance.post(
+          `${HUBSPOT_API_BASE}/crm/v3/objects/contacts/batch/read`,
+          { properties, inputs: chunk.map((id) => ({ id })) },
+          { headers: await this.authHeaders() },
+        );
+        for (const contact of (res.data as any)?.results ?? []) {
+          const props = contact?.properties ?? {};
+          contacts.push({
+            contactId: String(contact.id),
+            email: props.email,
+            firstname: props.firstname,
+            lastname: props.lastname,
+            phone: props.phone,
+          });
+        }
+      } catch (e: any) {
+        console.warn(`[HubSpot] getContactsForList batch/read failed for chunk starting at ${i}:`, e?.message);
+      }
+    }
+    return contacts;
+  }
+
   async deleteEmail(emailId: string): Promise<void> {
     if (!emailId?.trim()) throw new Error('emailId is required');
     await axiosInstance.delete(
