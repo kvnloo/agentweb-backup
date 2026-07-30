@@ -2,6 +2,7 @@
 import asyncio
 import boto3
 import os
+import sys
 import json
 import uuid
 import logging
@@ -793,7 +794,16 @@ async def run_web_agent_cli(user_id: str, llm_name: str, prompt: str, execution_
         
         # Build command with logging redirection
         cmd = [
-            'python3', '-u',  # -u for unbuffered output
+            # sys.executable, not a bare 'python3' — 'python3' resolves via
+            # PATH at the time this subprocess spawns, which under systemd
+            # (no shell init / conda activation) may not be the same
+            # interpreter running this process at all. Observed live during
+            # ENG-389 testing: bare 'python3' resolved to a pre-3.12 system
+            # interpreter, and web_agent.py's f-string syntax (PEP 701,
+            # backslash inside an expression part) only parses on 3.12+ —
+            # every single web_agent.py invocation failed with a
+            # SyntaxError at parse time, for every LLM in the fallback list.
+            sys.executable, '-u',  # -u for unbuffered output
             'web_agent.py',
             '--user_id', user_id,
             '--llm_name', llm_name,
