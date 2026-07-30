@@ -33,6 +33,18 @@ already-existing `GET /api/admin/usage/cost-aggregation` `topUsers` breakdown as
 a provider filter (All / LLM / X / other vendors) and an expandable per-tool breakdown. X spend flows
 into it automatically because it lands in the same ledger — no backend aggregation change was needed.
 
+**Handle-resolution sub-calls are metered too (AC1).** Several ops (`follow`/`unfollow`/`block`/`mute`
+family, `send_dm`, `get_user_tweets`, `get_dm_conversation`, and `list_followers`/`list_following` when
+a handle is passed) make an internal `userByUsername` handle→id lookup — a separate billable **user-read**
+($0.010). The meter spec carries `extraUserReads`, and `meterCall` records a companion `resolve_handle`
+row so no billable sub-call is left unattributed. `list_followers`/`list_following` for the OWN account
+(no handle) resolve nothing, so `extraUserReads` is 0 there.
+
+**Billing-cycle month math.** `currentXBillingCycle` clamps the reset day to the target month's real
+length (a `cap_reset_day` of 29–31 must not overflow a short prior month, e.g. Feb 31 → Feb 28) and rolls
+the year back at January. Without the clamp the derived allocated window could invert (start>end) and 500
+the reconciliation panel for any account whose reset day ≥ 29 early in a month.
+
 **Typed X 402 (credit exhaustion).** X errors carry the HTTP status on `.code`, and the tool taxonomy
 only knew `.status`/`.statusCode` and had no 402 branch — so a depleted-wallet 402 (ENG-604/633/662)
 classified as a generic `Error` and a mid-run 402 could read as success. Fixed end to end:
