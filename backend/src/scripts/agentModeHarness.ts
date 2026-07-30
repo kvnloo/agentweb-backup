@@ -39,6 +39,8 @@ const get = (path: string, token: string | null) =>
     headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
   }).then(j);
 
+const WILDCARD_SUB = "ENG204-harness-wildcard";
+
 async function getSubscription(email: string): Promise<string | undefined> {
   const r = await ddb.get({ TableName: USERS_TABLE, Key: { email } }).promise();
   return r.Item?.subscriptionType;
@@ -50,11 +52,40 @@ async function setSubscription(email: string, value: string): Promise<void> {
     ExpressionAttributeValues: { ":v": value },
   }).promise();
 }
-async function removeSubscription(email: string): Promise<void> {
-  await ddb.update({
+/**
+ * Best-effort restore, guarded so we never clobber a change made DURING the run:
+ * only write back if subscriptionType is still the wildcard we set. If a
+ * webhook/admin changed it meanwhile, leave the newer value in place.
+ */
+async function restoreSubscription(email: string, prev: string | undefined): Promise<void> {
+  const guard = {
     TableName: USERS_TABLE, Key: { email },
-    UpdateExpression: "REMOVE subscriptionType",
-  }).promise();
+    ConditionExpression: "subscriptionType = :w",
+  };
+  try {
+    if (prev !== undefined) {
+      await ddb.update({
+        ...guard,
+        UpdateExpression: "SET subscriptionType = :v",
+        ExpressionAttributeValues: { ":w": WILDCARD_SUB, ":v": prev },
+      }).promise();
+      console.log(`\n(subscription restored: ${prev})`);
+    } else {
+      await ddb.update({
+        ...guard,
+        UpdateExpression: "REMOVE subscriptionType",
+        ExpressionAttributeValues: { ":w": WILDCARD_SUB },
+      }).promise();
+      console.log(`\n(subscription attribute removed — was absent before the run)`);
+    }
+  } catch (e: any) {
+    if (e.code === "ConditionalCheckFailedException") {
+      console.log(`\n(subscription changed during the run — left as-is, not restoring the stale value)`);
+    } else {
+      // Cleanup is best-effort: log, don't mask any primary error from the run.
+      console.warn(`\n(could not restore subscription: ${e.message || e})`);
+    }
+  }
 }
 const isLocalApi = /(^|\/\/)(localhost|127\.0\.0\.1)(:|\/|$)/.test(API);
 
@@ -91,7 +122,7 @@ async function main() {
   const hadSub = skillIds.length ? await getSubscription(EMAIL) : undefined;
   try {
     if (skillIds.length) {
-      await setSubscription(EMAIL, "ENG204-harness-wildcard");
+      await setSubscription(EMAIL, WILDCARD_SUB);
       const sessionId = await post("/api/agent-mode/sessions", token, { title: "ENG-204 harness" }).then((s) => s.sessionId || s.id);
       const inst = await agentModeService.installSkills(skillIds, userId, sessionId);
       console.log("installed:", JSON.stringify(inst.installedSkills || inst.message));
@@ -124,11 +155,10 @@ async function main() {
       await runTurns(token, sessionId, messages, model);
     }
   } finally {
-    // Always undo the wildcard we set: restore the prior value, or REMOVE the
-    // attribute if the user had none (else the account stays elevated).
+    // Undo the wildcard we set — but only if it's still ours (compare-and-swap),
+    // so a subscription change made during the run isn't clobbered by a stale value.
     if (skillIds.length) {
-      if (hadSub !== undefined) { await setSubscription(EMAIL, hadSub); console.log(`\n(subscription restored: ${hadSub})`); }
-      else { await removeSubscription(EMAIL); console.log(`\n(subscription attribute removed — was absent before the run)`); }
+      await restoreSubscription(EMAIL, hadSub);
     }
   }
   process.exit(0);
