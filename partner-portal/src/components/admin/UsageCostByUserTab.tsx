@@ -54,6 +54,13 @@ export interface CostByFeatureRow {
   totalTokens: number;
 }
 
+export interface CostByXAccountRow {
+  accountId: string;
+  handle: string | null;
+  costUsd: number;
+  callCount: number;
+}
+
 export interface CostAggregation {
   start: string;
   end: string;
@@ -61,6 +68,8 @@ export interface CostAggregation {
   byModel: CostByModelRow[];
   byFeature: CostByFeatureRow[];
   topUsers: CostTopUser[];
+  /** Per-X-account spend with @handle enrichment (ENG-664). */
+  byXAccount?: CostByXAccountRow[];
 }
 
 // ── X reconciliation, mirroring GET /api/admin/usage/x-reconciliation ─────────
@@ -84,6 +93,7 @@ export interface XReconciliation {
 
 export interface XAccountRow {
   accountId: string;
+  handle: string | null;
   costUsd: number;
   callCount: number;
 }
@@ -92,13 +102,38 @@ export interface XAccountRow {
  * Per-X-account rollup from the feature dimension. X rows are stored with
  * feature "x-account:{id}" (twitterService), so filtering that prefix yields
  * per-account totals; every other feature (LLM session types) is skipped.
+ * Handle is null here — this is the fallback when the server did not send the
+ * enriched byXAccount cut.
  */
 export function xAccountsFromFeatures(byFeature: CostByFeatureRow[] | undefined): XAccountRow[] {
   const prefix = "x-account:";
   return (byFeature || [])
     .filter((f) => f.feature.startsWith(prefix))
-    .map((f) => ({ accountId: f.feature.slice(prefix.length), costUsd: f.costUsd, callCount: f.callCount }))
+    .map((f) => ({
+      accountId: f.feature.slice(prefix.length),
+      handle: null,
+      costUsd: f.costUsd,
+      callCount: f.callCount,
+    }))
     .sort((a, b) => b.costUsd - a.costUsd || a.accountId.localeCompare(b.accountId));
+}
+
+/**
+ * Prefer the server-enriched per-account cut (carries @handle); fall back to the
+ * client-side feature derivation (handle=null → raw accountId shown) when absent.
+ */
+export function xAccountRows(agg: CostAggregation | null): XAccountRow[] {
+  if (agg?.byXAccount) {
+    return [...agg.byXAccount].sort(
+      (a, b) => b.costUsd - a.costUsd || a.accountId.localeCompare(b.accountId)
+    );
+  }
+  return xAccountsFromFeatures(agg?.byFeature);
+}
+
+/** Display label for an X account: @handle when known, else the raw id. */
+export function xAccountLabel(row: XAccountRow): string {
+  return row.handle ? `@${row.handle}` : row.accountId;
 }
 
 // ── Pure helpers (exported for unit tests) ────────────────────────────────────
@@ -382,7 +417,14 @@ const XAccountTable: React.FC<{ accounts: XAccountRow[] }> = ({ accounts }) => {
           <TableBody>
             {accounts.map((a) => (
               <TableRow key={a.accountId} hover>
-                <TableCell>{a.accountId}</TableCell>
+                <TableCell>
+                  {xAccountLabel(a)}
+                  {a.handle && (
+                    <Typography variant="caption" color="text.secondary" sx={{ ml: 1 }}>
+                      {a.accountId}
+                    </Typography>
+                  )}
+                </TableCell>
                 <TableCell align="right" sx={{ fontVariantNumeric: "tabular-nums" }}>
                   {a.callCount.toLocaleString()}
                 </TableCell>
@@ -439,7 +481,7 @@ export default function UsageCostByUserTab() {
 
   const providers = useMemo(() => providersInData(agg), [agg]);
   const rows = useMemo(() => rankedUserRows(agg, provider), [agg, provider]);
-  const xAccounts = useMemo(() => xAccountsFromFeatures(agg?.byFeature), [agg]);
+  const xAccounts = useMemo(() => xAccountRows(agg), [agg]);
   const filteredTotals = useMemo(
     () =>
       rows.reduce(
