@@ -231,8 +231,44 @@ if [ "${returned_count}" -eq 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Was this a draft-time run?
+# 3. Classify every check-run at this head
 # ---------------------------------------------------------------------------
+#
+# Computed before the draft check because the draft verdict needs to know
+# whether a run is currently executing — see the note in section 4.
+
+classified="$(printf '%s' "${runs_json}" | jq -r '
+    def bad: ["failure","cancelled","timed_out","action_required","stale"];
+    [ ([ .check_runs[] | select(.status != "completed") ] | length),
+      ([ .check_runs[] | select(.conclusion as $c | bad | index($c)) ] | length),
+      ([ .check_runs[] | select(.conclusion == "success") ] | length),
+      ([ .check_runs[] | select(.status != "completed") | .name ] | join(", ")),
+      ([ .check_runs[] | select(.conclusion as $c | bad | index($c)) | "\(.name) (\(.conclusion))" ] | join(", ")),
+      ([ .check_runs[] | select(.conclusion == "skipped") | .name ] | join(", ")),
+      ([ .check_runs[] | select(.conclusion == "success") | .name ] | join(", "))
+    ] | map(tostring) | join("")' 2>/dev/null)"
+jq_exit=$?
+
+if [ "${jq_exit}" -ne 0 ] || [ -z "${classified}" ]; then
+  surface 'check-runs response (raw)' "${runs_json}"
+  hard_fail "unparseable check-runs payload while classifying job conclusions at ${head_sha}"
+fi
+
+IFS="${SEP}" read -r n_pending n_bad n_success pending_names bad_names skipped_names success_names <<<"${classified}"
+
+# ---------------------------------------------------------------------------
+# 4. Was this a draft-time run?
+# ---------------------------------------------------------------------------
+#
+# A ready-flip creates a window where the check-runs at this head are a MIX: the
+# new run's early jobs are in flight, while the draft run's `skipped` results are
+# still the latest entry for every job the new run has not reached yet. The
+# discriminator therefore reads `skipped` from the OLD run while a real one is
+# genuinely starting. Reporting NO_EVIDENCE there is safe but wrong in its
+# reasoning — it would send an agent hunting for a conflict that does not exist.
+# Observed live on this PR immediately after its own ready-flip. When something
+# is executing, the honest answer is PENDING; neither is a pass, so the ENG-757
+# guarantee is untouched.
 
 discriminator="$(printf '%s' "${runs_json}" | jq -r --arg job "${DRAFT_JOB}" '
     [ .check_runs[] | select(.name == $job) ]
@@ -246,39 +282,32 @@ if [ "${jq_exit}" -ne 0 ] || [ -z "${discriminator}" ]; then
 fi
 
 if [ "${discriminator}" = "ABSENT" ]; then
-  verdict 'NO_EVIDENCE' "the draft discriminator job '${DRAFT_JOB}' is not present among the ${returned_count} check-runs at ${head_sha}. Without it a draft-time run cannot be told apart from a real one, so this gate fails closed. If that job was renamed, set MERGE_EVIDENCE_DRAFT_JOB."
+  if [ "${n_pending}" -gt 0 ]; then
+    verdict 'PENDING' "'${DRAFT_JOB}' has not reported at head ${head_sha} yet, but a run is executing (${pending_names}). Re-run once it settles."
+    exit 2
+  fi
+  verdict 'NO_EVIDENCE' "the draft discriminator job '${DRAFT_JOB}' is not present among the ${returned_count} check-runs at ${head_sha}, and nothing is currently executing. Without it a draft-time run cannot be told apart from a real one, so this gate fails closed. If that job was renamed, set MERGE_EVIDENCE_DRAFT_JOB."
   exit 3
 fi
 
 if [ "${discriminator}" = "skipped" ]; then
+  if [ "${n_pending}" -gt 0 ]; then
+    # The ready-flip window: the skipped result is the previous run's, and a
+    # real one is already executing. Still not a pass — but it is pending, not
+    # evidence-less, and saying so stops an agent hunting a phantom conflict.
+    verdict 'PENDING' "'${DRAFT_JOB}' is skipped at head ${head_sha} from a previous draft-time run, but a real run is executing now (${pending_names}). Re-run once it settles."
+    exit 2
+  fi
   # Acceptance criterion 3. The exact ENG-757 shape: the PR is ready and
-  # mergeable, but the only run at its head is the stale draft-time one.
-  verdict 'NO_EVIDENCE' "the only run at head ${head_sha} is a draft-time run: '${DRAFT_JOB}' is skipped, and that job is gated on draft state alone, so every draft-gated job skipped for the same reason. Nothing was actually tested. A ready-flip normally schedules a real run — if it has not, the PR is likely conflicted or the run was cancelled."
+  # mergeable, nothing is executing, and the only run at its head is the stale
+  # draft-time one.
+  verdict 'NO_EVIDENCE' "the only run at head ${head_sha} is a draft-time run: '${DRAFT_JOB}' is skipped, that job is gated on draft state alone, so every draft-gated job skipped for the same reason, and nothing is executing now. Nothing was actually tested. A ready-flip normally schedules a real run — if it has not, the PR is likely conflicted or the run was cancelled."
   exit 3
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Ordinary reporting, now that the run is known to be real
+# 5. Ordinary reporting, now that the run is known to be real
 # ---------------------------------------------------------------------------
-
-classified="$(printf '%s' "${runs_json}" | jq -r '
-    def bad: ["failure","cancelled","timed_out","action_required","stale"];
-    [ ([ .check_runs[] | select(.status != "completed") ] | length),
-      ([ .check_runs[] | select(.conclusion as $c | bad | index($c)) ] | length),
-      ([ .check_runs[] | select(.conclusion == "success") ] | length),
-      ([ .check_runs[] | select(.status != "completed") | .name ] | join(", ")),
-      ([ .check_runs[] | select(.conclusion as $c | bad | index($c)) | "\(.name) (\(.conclusion))" ] | join(", ")),
-      ([ .check_runs[] | select(.conclusion == "skipped") | .name ] | join(", ")),
-      ([ .check_runs[] | select(.conclusion == "success") | .name ] | join(", "))
-    ] | map(tostring) | join("\u001f")' 2>/dev/null)"
-jq_exit=$?
-
-if [ "${jq_exit}" -ne 0 ] || [ -z "${classified}" ]; then
-  surface 'check-runs response (raw)' "${runs_json}"
-  hard_fail "unparseable check-runs payload while classifying job conclusions at ${head_sha}"
-fi
-
-IFS="${SEP}" read -r n_pending n_bad n_success pending_names bad_names skipped_names success_names <<<"${classified}"
 
 if [ "${n_bad}" -gt 0 ]; then
   verdict 'FAIL' "${n_bad} check(s) failed against head ${head_sha}: ${bad_names}"

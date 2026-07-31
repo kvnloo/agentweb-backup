@@ -220,6 +220,35 @@ checkruns "${d}" "${DRAFT_RUN_RUNS}"
 run_gate "${d}"
 check 'AC3: an actually-draft PR is NO_EVIDENCE' 3 'draft'
 
+# The ready-flip window, observed live on agentweb#2236 right after its own
+# ready-flip: the new run's early jobs are in flight while the draft run's
+# `skipped` entries are still the latest for every job it has not reached. The
+# honest verdict is PENDING — but it must NEVER become a pass, which is what the
+# second case here pins.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Require Greptile Review","status":"completed","conclusion":"skipped"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped"},
+  {"name":"Detect changed projects","status":"in_progress","conclusion":null}
+]'
+run_gate "${d}"
+check 'ready-flip window: a real run executing makes it PENDING, not NO_EVIDENCE' 2 'PENDING'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${DRAFT_RUN_RUNS}"
+run_gate "${d}"
+check 'ready-flip window: with nothing executing it is still NO_EVIDENCE' 3 'NO_EVIDENCE'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"in_progress","conclusion":null}
+]'
+run_gate "${d}"
+check 'discriminator absent but a run executing is PENDING, not NO_EVIDENCE' 2 'PENDING'
+
 # ---------------------------------------------------------------------------
 # AC4 — "no check has ever run against this head" is distinguishable from green
 # ---------------------------------------------------------------------------
