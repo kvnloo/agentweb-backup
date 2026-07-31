@@ -4552,6 +4552,10 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     const noteDropped = !!(inviteResult && (inviteResult as any).note_dropped);
 
     const sentAt = new Date().toISOString();
+    // Unipile's own id for this invitation — the stable identity the CRM mirror and
+    // the pending-invite cache both key on, so a later re-mirror of the same still
+    // pending invite is recognised rather than logged again.
+    const sentInvitationId = (inviteResult && (inviteResult.invitation_id || inviteResult.id)) || '';
     // ENG-787: mirror the invite back into the CRM as a lead-level record — mark the
     // lead 'contacted', stamp linkedInInviteSentAt, and log a linkedin.invite.sent
     // engagement so contact volume is attributed and follow-up cadence can fire.
@@ -4569,6 +4573,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
         title: lead.title as string | undefined,
         note: noteDropped ? undefined : note,
         accountId,
+        invitationId: sentInvitationId,
         sentAt,
       });
     } catch (mirrorErr) {
@@ -4589,7 +4594,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
         accountId,
         invitedUserPublicId: publicId,
         publicProfileUrl: normalized,
-        invitationId: '',
+        invitationId: sentInvitationId,
         invitedUserName: [lead.firstName, lead.lastName].filter(Boolean).join(' ') || '',
         invitationText: noteDropped ? '' : (note ?? ''),
         sentAt,
