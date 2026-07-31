@@ -12,7 +12,6 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
-import { isReasoningLeak } from './agentMode/core/reasoningLeak';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import {
   downloadBrandLogoToS3,
@@ -1563,12 +1562,13 @@ export class AgentModeService {
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
 
-  // ENG-737: native @google/genai adapter (leak-free) + its kill-switch cache.
+  // ENG-737: native @google/genai adapter — the only Gemini transport agent-mode
+  // calls use. It filters chain-of-thought at the source (thinkingConfig.
+  // includeThoughts=false + part.thought), so no reasoning leak is possible by
+  // construction — no heuristic, no fallback transport that could reintroduce it.
   private gemini_native_client: any | null = null;
   private gemini_native_sdk_promise: Promise<any> | null = null;
   private gemini_api_key_promise: Promise<string> | null = null;
-  private geminiNativeFlagCache: { value: boolean; expiresAt: number } | null = null;
-  private static readonly GEMINI_NATIVE_FLAG_TTL_MS = 60_000;
 
   /** Resolve the Gemini API key from env or secrets (cached; shared by both clients). */
   private async getGeminiApiKey(): Promise<string> {
@@ -1637,7 +1637,11 @@ export class AgentModeService {
    * ENG-737: native @google/genai client wrapper for gemini agent calls, presenting
    * the same OpenAI-shaped `chat.completions.create` surface as getGeminiClient.
    * Unlike the compat endpoint, this filters chain-of-thought natively
-   * (thinkingConfig.includeThoughts=false + part.thought), so no reasoning leaks.
+   * (thinkingConfig.includeThoughts=false + part.thought), so no reasoning leaks —
+   * structurally, not via a heuristic. This is the only transport agent-mode
+   * Gemini calls use; there is deliberately no fallback to the OpenAI-compat
+   * endpoint, because that endpoint flattens thought parts into plain text and
+   * reintroduces the exact leak this client exists to prevent.
    */
   public getGeminiNativeClient(): any {
     if (this.gemini_native_client) return this.gemini_native_client;
@@ -1660,48 +1664,6 @@ export class AgentModeService {
       },
     });
     return this.gemini_native_client;
-  }
-
-  /**
-   * Kill-switch for the native gemini adapter (ENG-737). Reads env override first,
-   * then the AW-Settings row `gemini_native_adapter_enabled`, TTL-cached ~60s so a
-   * prod flip takes effect without redeploy. Defaults ON. When OFF, gemini falls
-   * back to the OpenAI-compat client (and the isReasoningLeak heuristic still guards
-   * leaks on that path). Fail-open to the default on any read error.
-   */
-  private async isGeminiNativeAdapterEnabled(): Promise<boolean> {
-    const envOverride = process.env.GEMINI_NATIVE_ADAPTER;
-    if (envOverride === '0' || envOverride === 'false') return false;
-    if (envOverride === '1' || envOverride === 'true') return true;
-
-    const now = Date.now();
-    if (this.geminiNativeFlagCache && this.geminiNativeFlagCache.expiresAt > now) {
-      return this.geminiNativeFlagCache.value;
-    }
-    let value = true; // default ON
-    try {
-      const setting = await settingsService.getSetting('gemini_native_adapter_enabled');
-      const raw = setting?.settingValue?.trim().toLowerCase();
-      if (raw === '0' || raw === 'false' || raw === 'off') value = false;
-      else if (raw === '1' || raw === 'true' || raw === 'on') value = true;
-    } catch (error) {
-      console.error('AgentMode: Error reading gemini_native_adapter_enabled setting; defaulting ON:', error);
-      value = true;
-    }
-    this.geminiNativeFlagCache = { value, expiresAt: now + AgentModeService.GEMINI_NATIVE_FLAG_TTL_MS };
-    return value;
-  }
-
-  /**
-   * Route gemini agent calls to the native adapter (ENG-737) or the compat client
-   * per the kill-switch. Resolved per-call (not cached on the model registry) so the
-   * flag can flip without a restart.
-   */
-  public async getGeminiAgentClient(): Promise<any> {
-    if (await this.isGeminiNativeAdapterEnabled()) {
-      return this.getGeminiNativeClient();
-    }
-    return this.getGeminiClient();
   }
 
   public async getVertexClient(modelId: string): Promise<any> {
@@ -2663,9 +2625,9 @@ export class AgentModeService {
     // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
     let client = this.llmModels[model].client;
     if (model.startsWith('gemini-')) {
-      // ENG-737: resolve gemini per-call (native adapter vs compat) so the
-      // kill-switch flips without a restart — never cache on the registry.
-      client = await this.getGeminiAgentClient();
+      // ENG-737: always the native adapter — no fallback transport, resolved
+      // per-call (not cached on the registry).
+      client = this.getGeminiNativeClient();
     } else if (!client) {
       if (model.startsWith('anthropic.')) {
         client = await this.getBedrockClient(model);
@@ -3225,15 +3187,6 @@ export class AgentModeService {
       // partial text. The completion gate consumes this flag directly rather than
       // pattern-matching the response text.
       let truncatedByStepBudget = false;
-      // ENG-737: set true whenever a leaked-reasoning fragment was suppressed
-      // (blanked to '') on a truncated Gemini turn. The suppression can exhaust the
-      // max-tokens continuation ladder while `content` is still empty and no tool
-      // ran (so the empty-synthesis nudge — which requires toolCallsSoFar>0 — never
-      // fires either), which would otherwise break the loop with an empty response
-      // at iteration<maxIterations, delivering a silent zero-output turn. We use
-      // this flag to backfill a neutral message so the user is never left with an
-      // empty reply (the ENG-324/473/657 silent-failure class).
-      let suppressedReasoningLeak = false;
       while (iteration < maxIterations) {
         // Check for cancellation before each iteration
         if (isCancelled?.()) {
@@ -3448,30 +3401,6 @@ export class AgentModeService {
           responseContent = (responseMessage.content as any).text || '';
         }
 
-        // ENG-737: Gemini thinking models (e.g. gemini-3.5-flash) leak their raw
-        // chain-of-thought into `content` when a turn is truncated by the token
-        // limit WHILE still reasoning — the OpenAI-compat endpoint returns the
-        // partial thought, prefixed with a bare lowercase `thought` part marker, as
-        // the assistant message (session d103071a). Such a fragment would otherwise
-        // be persisted as a visible assistant message AND re-fed through the
-        // max-tokens continuation loop, leaking internal reasoning into the chat.
-        // Suppress it; the continuation loop still delivers the model's real
-        // synthesized answer on the final (non-truncated) turn. Deliberately narrow
-        // (finish_reason=length + lowercase `thought` marker only) so a COMPLETED or
-        // legitimately-repetitive answer is never blanked.
-        const isLeakFragment = isReasoningLeak({
-          finishReason: response.choices[0]?.finish_reason,
-          content: responseContent,
-          hasThoughtSignature: !!(responseMessage as any)?.extra_content?.google?.thought_signature,
-          model: llmModel,
-        });
-        if (isLeakFragment) {
-          console.warn(`AgentMode: Suppressing leaked Gemini reasoning fragment (finish_reason=${response.choices[0]?.finish_reason}) in session ${sessionId}`);
-          responseContent = '';
-          responseMessage.content = '';
-          suppressedReasoningLeak = true;
-        }
-
         // Update content with LLM's response
         if (responseContent) {
           content = responseContent;
@@ -3565,19 +3494,6 @@ export class AgentModeService {
             console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
             (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
-          }
-
-          // ENG-737: the loop is about to terminate. If every turn's content was a
-          // suppressed reasoning leak and the continuation/synthesis ladder is now
-          // exhausted with no real content, `content` is empty and iteration is below
-          // maxIterations, so the maxIterations backfill below never runs — the user
-          // would receive a silent zero-output turn (a regression from the previously
-          // corrupted-but-visible output). Backfill the neutral apology so there is
-          // always a non-empty reply; keep the persisted assistant message in sync.
-          if (!content && suppressedReasoningLeak) {
-            console.warn(`AgentMode: Backfilling neutral response after suppressed reasoning leak left content empty in session ${sessionId}`);
-            content = "I've reached the maximum number of processing steps for this request. Here's what was completed so far — please review and let me know if you'd like me to continue with any remaining items.";
-            responseMessage.content = content;
           }
 
           // Log the stop reason for debugging
