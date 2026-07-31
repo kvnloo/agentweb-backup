@@ -13274,7 +13274,9 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         status: 'active',
         emailNotification: templateData.isDeepResearch || false,
         isInteractive: templateData.isInteractive || false,
-        isDeepResearch: templateData.isDeepResearch || false,
+        // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
+        // never persist true, even from an older template that still has it.
+        isDeepResearch: false,
         isComplexTask: templateData.isComplexTask || false,
         extractPageContent: false,
         outputAsJson: templateData.outputAsJson || false,

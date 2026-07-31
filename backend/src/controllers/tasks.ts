@@ -96,7 +96,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           status: 'active',
           emailNotification: finalEmailNotification,
           isInteractive: isInteractive !== undefined ? Boolean(isInteractive) : template.isInteractive,
-          isDeepResearch: isDeepResearch !== undefined ? Boolean(isDeepResearch) : template.isDeepResearch,
+          // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
+          // never persist true, even if an older template still has it set.
+          isDeepResearch: false,
           isComplexTask: isComplexTask !== undefined ? Boolean(isComplexTask) : template.isComplexTask,
           extractPageContent: extractPageContent !== undefined ? Boolean(extractPageContent) : template.extractPageContent, // Uses template.extractPageContent if extractPageContent is undefined in req.body
           outputAsJson: outputAsJson !== undefined ? Boolean(outputAsJson) : template.outputAsJson,
@@ -143,7 +145,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       status: 'active',
       emailNotification: emailNotification ?? isDeepResearch,  // Use provided value or default to isDeepResearch
       isInteractive: Boolean(isInteractive),  // Convert to boolean
-      isDeepResearch: Boolean(isDeepResearch),  // Convert to boolean
+      // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
+      // never persist true.
+      isDeepResearch: false,
       isComplexTask: Boolean(isComplexTask),  // Convert to boolean
       extractPageContent: extractPageContent ?? isDeepResearch,  // Convert to boolean
       outputAsJson: Boolean(outputAsJson),
@@ -329,7 +333,9 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     }
 
     if (req.body.isDeepResearch !== undefined) {
-      updates.isDeepResearch = Boolean(req.body.isDeepResearch);
+      // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
+      // never allow it to be turned back on, only ever off.
+      updates.isDeepResearch = false;
     }
 
     if (req.body.isComplexTask !== undefined) {
