@@ -278,6 +278,17 @@ router.get(
       const POST_READ_USD = 0.005;
       const measuredReadCostUsd = measured.projectUsage * POST_READ_USD;
       const allocatedNonReadCostUsd = Math.max(0, allocated.costUsd - allocated.postReadUnits * POST_READ_USD);
+      // Allocated is an upper bound: >= measured, because allocated counts every
+      // read while X dedups repeats within a UTC day. If measured EXCEEDS allocated,
+      // our best-effort metering missed successful X calls — an attribution gap.
+      // Surface it explicitly (AC3: attribution is never silently dropped) instead
+      // of letting the dedup clamp swallow the negative and read as "0 deduped".
+      const attributionGapUnits = Math.max(0, measured.projectUsage - allocated.postReadUnits);
+      if (attributionGapUnits > 0) {
+        console.warn(
+          `[adminUsage] x-reconciliation: measured reads (${measured.projectUsage}) exceed allocated (${allocated.postReadUnits}) by ${attributionGapUnits} — X metering attribution gap (missed instrumentation).`
+        );
+      }
       return res.json({
         cycle,
         measured,
@@ -287,6 +298,9 @@ router.get(
           measuredPostReadUnits: measured.projectUsage,
           // >= 0 — allocated over-counts reads X deduped within a UTC day.
           dedupSavingsUnits: Math.max(0, allocated.postReadUnits - measured.projectUsage),
+          // >= 0 — nonzero means we under-recorded (measured > allocated), i.e. an
+          // internal attribution gap operators should see, not hidden by the clamp.
+          attributionGapUnits,
           capUsedPct: measured.projectCap > 0 ? (measured.projectUsage / measured.projectCap) * 100 : null,
           measuredDerivedCostUsd: measuredReadCostUsd + allocatedNonReadCostUsd,
         },
