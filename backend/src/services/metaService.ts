@@ -1985,6 +1985,61 @@ export class MetaService {
     }
   }
 
+  /**
+   * Atomically replace a Custom Audience's entire membership with the given
+   * payload (Meta's /usersreplace edge). Used when reusing an audience with
+   * no locally-saved membership snapshot to diff against (first sync since
+   * ENG-600's stale-member sync shipped, or an audience created outside this
+   * flow) — an add-only upload would never be able to remove members already
+   * in the audience that aren't in the current source, whereas a replace
+   * needs no diff/baseline at all: it sets membership to exactly this
+   * payload in one operation. Chunking/session protocol mirrors
+   * uploadCustomAudienceUsers/deleteCustomAudienceUsers.
+   */
+  public async replaceCustomAudienceUsers(adAccountId: string, accessToken: string, audienceId: string, schema: string[], payload: string | string[][]) {
+    try {
+      this.initApi(accessToken);
+      const audience = new CustomAudience(audienceId);
+
+      this.log(`Replacing users in custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
+
+      const rows = payload;
+      if (!Array.isArray(rows) || rows.length <= MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE) {
+        const result = await audience.createUsersReplace([], { payload: { schema, data: payload } });
+        return result._data || result;
+      }
+
+      const sessionId = Math.floor(Math.random() * 1_000_000_000);
+      const totalBatches = Math.ceil(rows.length / MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE);
+      let lastResult: any;
+      for (let i = 0; i < totalBatches; i++) {
+        const chunk = rows.slice(
+          i * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE,
+          (i + 1) * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE
+        );
+        const batchSeq = i + 1;
+        const isLastBatch = batchSeq === totalBatches;
+        this.log(`Replacing batch ${batchSeq}/${totalBatches} in custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
+        const result = await audience.createUsersReplace([], {
+          payload: {
+            schema,
+            data: chunk,
+            session: {
+              session_id: sessionId,
+              batch_seq: batchSeq,
+              last_batch_flag: isLastBatch,
+              estimated_num_total: rows.length,
+            },
+          },
+        });
+        lastResult = result._data || result;
+      }
+      return lastResult;
+    } catch (error) {
+      return this.handleError(error, 'replaceCustomAudienceUsers');
+    }
+  }
+
   // Geolocation search types must go through the top-level /search endpoint,
   // NOT the ad account 'targetingsearch' edge (which only resolves interests/
   // behaviors/demographics and silently returns interest-style results for
