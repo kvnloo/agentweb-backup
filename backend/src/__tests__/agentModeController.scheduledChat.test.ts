@@ -325,6 +325,33 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(retryCall).toBeUndefined();
       });
 
+      it('does NOT pause the schedule when another dispatcher already owns the not-resumable claim (ENG-657/Greptile)', async () => {
+        // If claimPendingResume returns false here, another dispatcher won it first —
+        // it, not us, owns this recovery decision. Pausing anyway would suppress the
+        // winner's future scheduled runs for no reason.
+        (mockScheduleDb.claimPendingResume as jest.Mock).mockResolvedValueOnce(false);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'x' },
+            { role: 'user', content: 'Enrich.' },
+            { role: 'assistant', content: '…', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }, { id: 'c2', function: { name: 'enrich_leads_execute' } }] },
+            { role: 'tool', tool_call_id: 'c1', content: '{}' },
+          ],
+        } as any);
+        (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        expect(result.sessionId).toBe('');
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        // No pause, no retry — we don't have standing to touch this schedule at all.
+        const anyUpdateCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
+        expect(anyUpdateCall).toBeUndefined();
+      });
+
       it('DEFERS on a transient session-load failure, leaving the marker intact (no restart)', async () => {
         (mockChatbotDb.getChatSession as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB timeout'));
 

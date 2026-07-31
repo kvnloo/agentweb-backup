@@ -2187,14 +2187,38 @@ export async function runScheduledChat(
         // Auto-restart is not a safe recovery for this one; PAUSE the schedule and
         // alert oncall instead, so a human decides rather than an automatic retry
         // silently duplicating real-world side effects.
-        await scheduleDb.claimPendingResume(schedule.scheduleId, pendingResumeSessionId).catch(() => {});
+        // Only THIS dispatcher's own successful claim gives it standing to pause the
+        // schedule (Greptile). If another dispatcher already claimed the marker first,
+        // it — not us — owns this recovery decision; barging in and pausing the
+        // shared schedule out from under it would suppress its future runs for no
+        // reason. A claim error is treated the same way: we can't prove we own this,
+        // so don't act on a schedule we might not actually control.
+        const wonNotResumableClaim = await scheduleDb.claimPendingResume(schedule.scheduleId, pendingResumeSessionId).catch(() => false);
+        if (!wonNotResumableClaim) {
+          console.warn(`runScheduledChat: lost the claim while marking session ${pendingResumeSessionId} unresumable; another dispatcher owns this schedule's recovery — not pausing.`);
+          return deferredResumeResult('not-resumable-unowned');
+        }
         console.warn(`runScheduledChat: resume marker for session ${pendingResumeSessionId} no longer resumable; pausing schedule (no auto-restart, to avoid duplicate side effects) and alerting oncall.`);
-        await scheduleDb.updateSchedule(schedule.scheduleId, {
-          status: 'paused',
-          updatedAt: new Date().toISOString(),
-        }).catch(pauseError => {
-          console.error(`runScheduledChat: failed to pause schedule ${schedule.scheduleId} after an unresumable abandoned session:`, pauseError);
-        });
+        // The marker is already consumed at this point — if the pause write itself
+        // fails, the schedule stays active with no resume identity, and a later fresh
+        // run would duplicate the abandoned session's side effects blind. Retry a
+        // couple of times before giving up; this can't be made airtight (the marker
+        // can't be un-consumed), but it closes the common transient-failure case.
+        let paused = false;
+        for (let attempt = 0; attempt < 3 && !paused; attempt++) {
+          try {
+            await scheduleDb.updateSchedule(schedule.scheduleId, {
+              status: 'paused',
+              updatedAt: new Date().toISOString(),
+            });
+            paused = true;
+          } catch (pauseError) {
+            console.error(`runScheduledChat: failed to pause schedule ${schedule.scheduleId} after an unresumable abandoned session (attempt ${attempt + 1}/3):`, pauseError);
+          }
+        }
+        if (!paused) {
+          console.error(`runScheduledChat: giving up pausing schedule ${schedule.scheduleId} after 3 attempts; it remains active with no resume identity — filing an issue regardless so this doesn't go unnoticed.`);
+        }
         void fileAutoIssue({
           title: `Scheduled Chat auto-paused: ${schedule.scheduleName}`,
           description: `Schedule "${schedule.scheduleName}" had an abandoned run (session ${pendingResumeSessionId}) that the reconciler marked resumable, but it was no longer safely resumable by the time this dispatch ran. Auto-restarting would risk re-running the abandoned session's already-completed side effects (e.g. CRM writes, emails), so the schedule has been paused instead of auto-retried. Review the session and re-enable the schedule manually.`,
