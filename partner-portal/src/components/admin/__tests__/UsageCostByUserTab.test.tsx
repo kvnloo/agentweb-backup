@@ -196,7 +196,7 @@ describe("UsageCostByUserTab rendering", () => {
 
     await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
     const err = await screen.findByTestId("x-recon-error");
-    expect(err).toHaveTextContent(/bearer token/i);
+    expect(err).toHaveTextContent("bearer token");
     // The rest of the tab still renders.
     expect(screen.getByTestId("total-cost")).toBeInTheDocument();
   });
