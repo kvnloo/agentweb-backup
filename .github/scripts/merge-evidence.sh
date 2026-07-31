@@ -237,16 +237,33 @@ fi
 # Computed before the draft check because the draft verdict needs to know
 # whether a run is currently executing — see the note in section 4.
 
+# The classification is EXHAUSTIVE: every completed check-run lands in exactly
+# one of success / skipped / bad / unclassified. That last bucket is the point.
+#
+# The first version had `bad` as a fixed list and simply ignored anything not in
+# it, so a `neutral` check sitting beside one success produced PASS with the
+# neutral silently dropped (caught by Greptile on this PR). That is the exact
+# defect this script exists to eliminate: a conclusion the control cannot
+# account for, omitted, yielding a green.
+#
+# Adding "neutral" to the list would fix that one value and leave the shape
+# intact for the next conclusion GitHub introduces. Instead anything outside the
+# known sets is counted, named, and blocks. Unknown is not benign.
 classified="$(printf '%s' "${runs_json}" | jq -r '
-    def bad: ["failure","cancelled","timed_out","action_required","stale"];
+    def bad: ["failure","neutral","cancelled","timed_out","action_required","stale"];
+    def known: bad + ["success","skipped"];
+    def done_: select(.status == "completed");
+    def unknown_: done_ | select(.conclusion as $c | known | index($c) | not);
     [ ([ .check_runs[] | select(.status != "completed") ] | length),
-      ([ .check_runs[] | select(.conclusion as $c | bad | index($c)) ] | length),
+      ([ .check_runs[] | done_ | select(.conclusion as $c | bad | index($c)) ] | length),
       ([ .check_runs[] | select(.conclusion == "success") ] | length),
+      ([ .check_runs[] | unknown_ ] | length),
       ([ .check_runs[] | select(.status != "completed") | .name ] | join(", ")),
-      ([ .check_runs[] | select(.conclusion as $c | bad | index($c)) | "\(.name) (\(.conclusion))" ] | join(", ")),
+      ([ .check_runs[] | done_ | select(.conclusion as $c | bad | index($c)) | "\(.name) (\(.conclusion))" ] | join(", ")),
       ([ .check_runs[] | select(.conclusion == "skipped") | .name ] | join(", ")),
-      ([ .check_runs[] | select(.conclusion == "success") | .name ] | join(", "))
-    ] | map(tostring) | join("")' 2>/dev/null)"
+      ([ .check_runs[] | select(.conclusion == "success") | .name ] | join(", ")),
+      ([ .check_runs[] | unknown_ | "\(.name) (\(.conclusion // "null"))" ] | join(", "))
+    ] | map(tostring) | join("\u001f")' 2>/dev/null)"
 jq_exit=$?
 
 if [ "${jq_exit}" -ne 0 ] || [ -z "${classified}" ]; then
@@ -254,7 +271,8 @@ if [ "${jq_exit}" -ne 0 ] || [ -z "${classified}" ]; then
   hard_fail "unparseable check-runs payload while classifying job conclusions at ${head_sha}"
 fi
 
-IFS="${SEP}" read -r n_pending n_bad n_success pending_names bad_names skipped_names success_names <<<"${classified}"
+IFS="${SEP}" read -r n_pending n_bad n_success n_unknown \
+  pending_names bad_names skipped_names success_names unknown_names <<<"${classified}"
 
 # ---------------------------------------------------------------------------
 # 4. Was this a draft-time run?
@@ -311,6 +329,14 @@ fi
 
 if [ "${n_bad}" -gt 0 ]; then
   verdict 'FAIL' "${n_bad} check(s) failed against head ${head_sha}: ${bad_names}"
+  exit 1
+fi
+
+# A conclusion this script does not recognise cannot be reasoned about, so it
+# blocks rather than being dropped. Reported separately from FAIL because the
+# remedy is different: teach the classifier what the value means.
+if [ "${n_unknown}" -gt 0 ]; then
+  verdict 'FAIL' "${n_unknown} check(s) at head ${head_sha} completed with a conclusion this gate does not recognise: ${unknown_names}. Refusing to ignore it. Classify the value in merge-evidence.sh before merging."
   exit 1
 fi
 

@@ -348,6 +348,40 @@ checkruns "${d}" '[
 run_gate "${d}"
 check 'a cancelled check is FAIL, not a pass' 1 'VERDICT: FAIL'
 
+# Greptile's finding on this PR: a `neutral` check sitting beside a success was
+# excluded from every count, so the gate emitted PASS and silently dropped it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"neutral"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+]'
+run_gate "${d}"
+check 'a neutral check beside a success does NOT pass' 1 'VERDICT: FAIL'
+
+# The generalisation: hard-coding "neutral" would leave the same hole open for
+# the next conclusion GitHub adds. Anything outside the known sets must block.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Some Future Check","status":"completed","conclusion":"quarantined"},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+]'
+run_gate "${d}"
+check 'an unrecognised conclusion beside a success does NOT pass' 1 'does not recognise'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Odd Check","status":"completed","conclusion":null},
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"}
+]'
+run_gate "${d}"
+check 'a completed check with a null conclusion does NOT pass' 1 'does not recognise'
+
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE' 'false' 'MERGED'
 checkruns "${d}" "${HEALTHY_RUNS}"
