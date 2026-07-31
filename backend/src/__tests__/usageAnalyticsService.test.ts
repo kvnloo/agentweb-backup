@@ -446,6 +446,10 @@ describe('usageAnalyticsService', () => {
       expect(result.totals.costMicroUsd).toBe(15_000_000);
       expect(result.totals.costUsd).toBe(15);
       expect(result.totals.callCount).toBe(6);
+
+      // userCount is the distinct-user count over the FULL set (user-1, user-2),
+      // independent of the topUsers cap — 3 rows across 2 users → 2.
+      expect(result.userCount).toBe(2);
     });
 
     it('sums stored costMicroUsd only — tolerates rows with missing counters (no re-pricing)', async () => {
@@ -611,6 +615,7 @@ describe('usageAnalyticsService', () => {
         series: [],
         byFeature: [],
         topUsers: [],
+        userCount: 0,
         byXAccount: [],
       });
       expect(mockGetUser).not.toHaveBeenCalled();

@@ -80,13 +80,24 @@ const RECON = {
   },
 };
 
+// The tab requests provider=twitter, so a faithful backend response is already
+// X-scoped: totals reflect ONLY X spend across ALL users ($0.10 + $0.20), and
+// userCount is the true distinct-user count (not the capped topUsers slice).
+const AGG_XSCOPED: CostAggregation = {
+  ...AGG,
+  totals: { costUsd: 0.3, callCount: 18, totalTokens: 0 },
+  userCount: 2,
+};
+
 // Route axios by endpoint — the tab fetches cost-aggregation AND x-reconciliation.
-function routeAxios(opts?: { reconError?: any }) {
+function routeAxios(opts?: { reconError?: any; agg?: CostAggregation; recon?: any }) {
   mockedAxios.get.mockImplementation((url: string) => {
     if (url.includes("/x-reconciliation")) {
-      return opts?.reconError ? Promise.reject(opts.reconError) : Promise.resolve({ data: RECON });
+      return opts?.reconError
+        ? Promise.reject(opts.reconError)
+        : Promise.resolve({ data: opts?.recon ?? RECON });
     }
-    return Promise.resolve({ data: AGG });
+    return Promise.resolve({ data: opts?.agg ?? AGG_XSCOPED });
   });
 }
 
@@ -188,6 +199,42 @@ describe("UsageCostByUserTab rendering", () => {
     expect(screen.getAllByText(/allocated/i).length).toBeGreaterThan(0);
     // The provider selector is removed while the tab is X-only.
     expect(screen.queryByLabelText("Provider")).not.toBeInTheDocument();
+  });
+
+  it("uses the complete aggregation totals, not the capped top-users slice", async () => {
+    // Server caps topUsers (here 2 rows) but reports the full totals + userCount.
+    // The headline must reflect the complete figures, not a sum over the 2 rows.
+    const agg: CostAggregation = {
+      ...AGG_XSCOPED,
+      totals: { costUsd: 42.5, callCount: 9999, totalTokens: 0 },
+      userCount: 137,
+    };
+    routeAxios({ agg });
+    render(<UsageCostByUserTab />);
+    await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+
+    // $0.30 would be the sum of the 2 visible rows; the complete total is $42.50.
+    expect(screen.getByTestId("total-cost")).toHaveTextContent("$42.50");
+    expect(screen.getByTestId("users-with-spend")).toHaveTextContent("137");
+  });
+
+  it("surfaces an attribution gap when measured reads exceed allocated", async () => {
+    const recon = {
+      ...RECON,
+      allocated: { ...RECON.allocated, postReadUnits: 4000 },
+      reconciliation: {
+        ...RECON.reconciliation,
+        allocatedPostReadUnits: 4000,
+        dedupSavingsUnits: 0,
+        attributionGapUnits: 141, // measured 4141 - allocated 4000
+      },
+    };
+    routeAxios({ recon });
+    render(<UsageCostByUserTab />);
+    await waitFor(() => expect(screen.getByText("a@example.com")).toBeInTheDocument());
+
+    const gap = await screen.findByTestId("x-recon-gap");
+    expect(gap).toHaveTextContent("141");
   });
 
   it("degrades gracefully when X reconciliation is unavailable (502)", async () => {

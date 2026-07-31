@@ -75,8 +75,34 @@ describe("GET /api/admin/usage/x-reconciliation", () => {
     expect(res.status).toBe(200);
     expect(res.body.measured.projectUsage).toBe(4141);
     expect(res.body.reconciliation.dedupSavingsUnits).toBe(859); // 5000 - 4141
+    // allocated (5000) >= measured (4141): no under-recording, so no gap.
+    expect(res.body.reconciliation.attributionGapUnits).toBe(0);
     expect(res.body.reconciliation.capUsedPct).toBeCloseTo((4141 / 2_000_000) * 100, 6);
     expect(mockAllocated).toHaveBeenCalledWith("2026-07-03", "2026-07-20");
+  });
+
+  it("surfaces an attribution gap when measured reads exceed allocated (under-recording)", async () => {
+    const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+    mockUsage.mockResolvedValue({ projectId: "p1", projectCap: 2_000_000, projectUsage: 4141, capResetDay: 3 });
+    mockAllocated.mockResolvedValue({
+      start: "2026-07-03",
+      end: "2026-07-20",
+      costUsd: 0.02,
+      callCount: 1,
+      postReadUnits: 4000, // fewer than measured 4141 → we missed 141 calls
+      byOperation: [],
+    });
+
+    const res = await request(app)
+      .get("/api/admin/usage/x-reconciliation")
+      .set("Authorization", `Bearer ${adminToken}`);
+
+    expect(res.status).toBe(200);
+    // The dedup clamp stays >= 0, but the deficit is NOT hidden — it surfaces as a gap.
+    expect(res.body.reconciliation.dedupSavingsUnits).toBe(0);
+    expect(res.body.reconciliation.attributionGapUnits).toBe(141); // 4141 - 4000
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("attribution gap"));
+    warnSpy.mockRestore();
   });
 
   it("surfaces an X-unreachable failure as 502", async () => {
