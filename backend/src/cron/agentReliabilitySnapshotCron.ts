@@ -196,10 +196,15 @@ export async function writeReliabilitySnapshots(
   const written: ReliabilitySnapshot[] = [];
   // Oldest-first so the trend line reads naturally as it is built.
   for (let back = catchUpDays - 1; back >= 0; back--) {
-    // The day's window ends at "now" for today, and at that day's UTC midnight
-    // boundary for a completed past day.
-    const dayEnd = back === 0 ? now : new Date(now.getTime() - back * MS_PER_DAY);
-    const date = utcDateString(dayEnd);
+    const date = utcDateString(new Date(now.getTime() - back * MS_PER_DAY));
+    // A completed day must close on its own UTC boundary, NOT at "now minus N
+    // days" — the latter preserves the time of day, so a row labelled for one
+    // date would carry hours belonging to the previous one and drop hours of
+    // its own. Burn-in classifies rows as pre- or post-release purely by this
+    // label, so a mislabelled window could put pre-release events in a
+    // "post-release" snapshot and produce a wrong verdict. Today is the one
+    // window that legitimately ends at `now`, because it is still moving.
+    const dayEnd = back === 0 ? now : new Date(`${date}T23:59:59.999Z`);
 
     for (const w of windows) {
       const sk = snapshotSortKey(date, w.label);
@@ -255,8 +260,11 @@ export async function readReliabilityTrend(
  * one run populates the whole trend the endpoint will return. */
 export const DEFAULT_CATCH_UP_DAYS = 14;
 
-/** Catch-up horizon from env, clamped to a sane range. */
+/** Catch-up horizon from env, clamped to a sane range. An unset or blank value
+ * means "use the default" — note `Number('')` is 0, not NaN, so the emptiness
+ * check has to come first or a blank variable would silently mean 1 day. */
 export function resolveCatchUpDays(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_CATCH_UP_DAYS;
   const n = Number(raw);
   if (!Number.isFinite(n)) return DEFAULT_CATCH_UP_DAYS;
   return Math.max(1, Math.min(90, Math.floor(n)));

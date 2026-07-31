@@ -17,7 +17,11 @@ import express, { Request, Response } from 'express';
 import { getLoopHealthReport } from '../loops/health/loopHealthService';
 import { awsDynamoAdapter } from '../loops/adapters/awsAdapters';
 import { readReliabilityTrend } from '../cron/agentReliabilitySnapshotCron';
-import { evaluateBurnIn } from '../cron/burnInEvaluation';
+import {
+  evaluateBurnIn,
+  BURN_IN_DEFAULT_MIN_RUN_COUNT,
+  BURN_IN_DEFAULT_TOLERANCE,
+} from '../cron/burnInEvaluation';
 
 const router = express.Router();
 
@@ -74,11 +78,18 @@ router.get('/reliability-trend', async (req: Request, res: Response) => {
  * a 400 that still carries `passesClosureCheck4: false`, so no error path can be
  * mistaken for approval.
  *
+ * The evidence policy is FIXED, not requester-selected. `minRuns` may only be
+ * raised above the default and `tolerance` may only be lowered below it, so a
+ * caller can ask for a STRICTER check but can never weaken one — otherwise
+ * `?minRuns=0&tolerance=1` would turn any zero-run window, or a 0%-to-100%
+ * regression, into `passesClosureCheck4: true`, which is precisely the
+ * false-green this endpoint exists to prevent.
+ *
  *   ?releaseAt=<ISO>  — required; when the change reached production
  *   ?window=7d        — '24h' (default) or '7d'
  *   ?days=30          — how much trend history to consider (default 30)
- *   ?minRuns=10       — override the minimum runs a window needs to count
- *   ?tolerance=0.05   — override the allowed rate increase (0–1)
+ *   ?minRuns=10       — raise the minimum runs a window needs (stricter only)
+ *   ?tolerance=0.005  — lower the allowed rate increase (stricter only)
  */
 router.get('/burn-in', async (req: Request, res: Response) => {
   try {
@@ -106,13 +117,17 @@ router.get('/burn-in', async (req: Request, res: Response) => {
     const windowLabel = req.query.window === '7d' ? '7d' : '24h';
     const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
 
+    // Stricter-only clamps. A request can demand more evidence or less slack;
+    // it can never ask for less evidence or more slack.
     const minRunsRaw = Number(req.query.minRuns);
     const minRunCount =
-      Number.isFinite(minRunsRaw) && minRunsRaw >= 0 ? Math.floor(minRunsRaw) : undefined;
+      Number.isFinite(minRunsRaw) && minRunsRaw > BURN_IN_DEFAULT_MIN_RUN_COUNT
+        ? Math.floor(minRunsRaw)
+        : undefined;
 
     const toleranceRaw = Number(req.query.tolerance);
     const tolerance =
-      Number.isFinite(toleranceRaw) && toleranceRaw >= 0 && toleranceRaw <= 1
+      Number.isFinite(toleranceRaw) && toleranceRaw >= 0 && toleranceRaw < BURN_IN_DEFAULT_TOLERANCE
         ? toleranceRaw
         : undefined;
 
