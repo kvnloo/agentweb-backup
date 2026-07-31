@@ -42,6 +42,14 @@ export interface GeminiRequestOptions {
  * `$schema`, `$ref`, `$defs`, and `additionalProperties` cause a 400. Applied
  * recursively; everything else (type/properties/items/required/enum/description/
  * anyOf/nullable) is preserved.
+ *
+ * Also drops any `x-*` vendor-extension keyword (e.g. `x-aliases`, used across
+ * many tool schemas — search_tool_response, read_tool_response, etc. — to let
+ * the model call a param by an alternate name). Gemini's schema validator
+ * rejects unknown properties outright, so every tool carrying one 400s the
+ * whole request the moment tools are attached — this broke 100% of real
+ * gemini-3.5-flash tool-calling turns in prod (never caught by unit tests,
+ * whose fixture schemas didn't happen to use an x-* keyword).
  */
 export function sanitizeGeminiSchema(schema: any): any {
   if (Array.isArray(schema)) return schema.map(sanitizeGeminiSchema);
@@ -52,7 +60,7 @@ export function sanitizeGeminiSchema(schema: any): any {
   ]);
   const out: any = {};
   for (const [key, value] of Object.entries(schema)) {
-    if (DROP.has(key)) continue;
+    if (DROP.has(key) || key.startsWith('x-')) continue;
     out[key] = sanitizeGeminiSchema(value);
   }
   return out;

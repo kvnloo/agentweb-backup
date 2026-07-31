@@ -383,6 +383,30 @@ describe('sanitizeGeminiSchema', () => {
       required: ['nested'],
     });
   });
+
+  it('strips x-* vendor-extension keywords (e.g. x-aliases) Gemini 400s on', () => {
+    // Real prod shape from search_tool_response / read_tool_response: every
+    // gemini-3.5-flash tool-calling turn 400'd in production until this was
+    // stripped, because Gemini rejects unknown schema properties outright.
+    const input = {
+      type: 'object',
+      properties: {
+        s3_key: {
+          type: 'string',
+          'x-aliases': ['s3Key', 'key', 'file_key', 'storage_key', 'object_key'],
+          description: 'The S3 key',
+        },
+      },
+      required: ['s3_key'],
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        s3_key: { type: 'string', description: 'The S3 key' },
+      },
+      required: ['s3_key'],
+    });
+  });
 });
 
 describe('createGeminiNativeClient (end-to-end wiring)', () => {
