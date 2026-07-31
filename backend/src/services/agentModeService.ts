@@ -14703,20 +14703,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       switch (action) {
         case 'LIST': {
-          // List all pixels, then list datasets for each pixel
+          // Meta unified pixels and datasets in Graph v25 — a pixel IS its own dataset, and the
+          // per-pixel `/<pixel_id>/datasets` edge was removed. Querying it returns
+          // `(#100) Tried accessing nonexisting field (datasets)`, and because metaService's
+          // error handler rethrows, that one dead edge failed the entire LIST — making pixel
+          // discovery impossible in-product (ENG-399). The pixel id is the dataset id that
+          // GET_MATCH_QUALITY consumes, so derive it directly and issue no per-pixel call at all.
+          // Same conclusion the lander pixel resolver already reached (metaService.ts).
           const pixels = await metaService.listPixels(accountId, accessToken);
-          const results: any[] = [];
-          for (const pixel of pixels) {
-            const datasets = await metaService.listDatasets(pixel.id, accessToken);
-            results.push({
-              pixel_id: pixel.id,
-              pixel_name: pixel.name,
-              datasets: datasets
-            });
-          }
+          const results = pixels.map((pixel: any) => ({
+            pixel_id: pixel.id,
+            pixel_name: pixel.name,
+            last_fired_time: pixel.last_fired_time,
+            dataset_id: pixel.id,
+            datasets: [{ id: pixel.id, name: pixel.name }]
+          }));
           return {
             success: true,
-            message: `Found ${pixels.length} pixel(s) with ${results.reduce((sum: number, p: any) => sum + (p.datasets?.length || 0), 0)} dataset(s)`,
+            message: `Found ${pixels.length} pixel(s); each pixel id doubles as its dataset id for GET_MATCH_QUALITY`,
             pixels: results
           };
         }

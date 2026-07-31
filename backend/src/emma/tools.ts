@@ -907,7 +907,7 @@ READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimiz
   Optional params.fields (comma-separated) narrows the read to specific supported fields. Requesting an unsupported field returns a loud error — it is never silently dropped.
 
 DATASET USAGE:
-  LIST              → Returns all pixels and their associated datasets (server event data sources) for the ad account
+  LIST              → Returns every pixel on the ad account with its id, name and last_fired_time. Meta unified pixels and datasets, so each pixel id IS its dataset id (returned as dataset_id).
   GET_MATCH_QUALITY → Returns Event Match Quality (EMQ) scores per event type for a specific dataset. Requires params.dataset_id.
   WORKFLOW: First LIST to discover pixel/dataset IDs, then GET_MATCH_QUALITY with the dataset_id.
   NOTE: Match quality data is only available if the advertiser has Conversions API (CAPI) set up.
