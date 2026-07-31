@@ -522,6 +522,17 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
   });
 
   describe('Gemini client lazy-loading', () => {
+    // ENG-737: gemini calls now resolve per-call via getGeminiAgentClient (native
+    // adapter vs compat, kill-switch gated) instead of caching on llmModels[model].client
+    // — that cache was removed deliberately so the flag can flip without a restart.
+    // Force the compat path here since these tests mock the OpenAI-compat client shape.
+    beforeEach(() => {
+      process.env.GEMINI_NATIVE_ADAPTER = '0';
+    });
+    afterEach(() => {
+      delete process.env.GEMINI_NATIVE_ADAPTER;
+    });
+
     it('should lazy-load Gemini client for gemini-3.1-pro-preview on first callLLM', async () => {
       const mockCreate = jest.fn().mockResolvedValue({
         choices: [{ message: { content: 'test response' } }],
@@ -541,10 +552,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       // getGeminiClient should have been called
       expect((agentModeService as any).getGeminiClient).toHaveBeenCalled();
-
-      // After calling, the client should be cached (no longer null)
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.1-pro-preview'].client).toBe(mockGeminiClient);
+      // ... and actually used to make the call
+      expect(mockCreate).toHaveBeenCalled();
     });
 
     it('should lazy-load Gemini client for gemini-3.1-flash-lite on first callLLM', async () => {
@@ -564,9 +573,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       await (agentModeService as any).callLLM('gemini-3.1-flash-lite', messages);
 
       expect((agentModeService as any).getGeminiClient).toHaveBeenCalled();
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.1-flash-lite'].client).toBe(mockGeminiClient);
+      expect(mockCreate).toHaveBeenCalled();
     });
 
     it('should lazy-load Gemini client for gemini-3.5-flash on first callLLM', async () => {
@@ -586,9 +593,7 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       await (agentModeService as any).callLLM('gemini-3.5-flash', messages);
 
       expect((agentModeService as any).getGeminiClient).toHaveBeenCalled();
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.5-flash'].client).toBe(mockGeminiClient);
+      expect(mockCreate).toHaveBeenCalled();
     });
   });
 
