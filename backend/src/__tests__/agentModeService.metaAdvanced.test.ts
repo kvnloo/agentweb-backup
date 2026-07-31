@@ -22,6 +22,7 @@ jest.mock('../services/metaService', () => ({
     listCustomAudiences: jest.fn(),
     createCustomAudience: jest.fn(),
     uploadCustomAudienceUsers: jest.fn(),
+    replaceCustomAudienceUsers: jest.fn(),
     searchTargeting: jest.fn()
   }
 }));
@@ -421,6 +422,38 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
             expect.arrayContaining([expect.any(String)])
           ])
         );
+      });
+
+      // ENG-600 Greptile finding: REPLACE_USERS (Meta's atomic usersreplace,
+      // used when reusing an audience with no snapshot baseline to diff
+      // against) must hash raw rows exactly like UPLOAD_USERS does — it's
+      // fed the same raw row array from resolveOrCreateSeedAudience.
+      it('hashes a raw array payload before calling metaService.replaceCustomAudienceUsers', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.replaceCustomAudienceUsers as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.manageMetaCustomAudiences(
+          'user123',
+          'REPLACE_USERS',
+          '123456789',
+          { id: 'audience_123', schema: ['EMAIL'], payload: [['email1@example.com'], ['email2@example.com']] }
+        );
+
+        expect(result.success).toBe(true);
+        expect(metaService.replaceCustomAudienceUsers).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          'audience_123',
+          ['EMAIL'],
+          expect.arrayContaining([
+            expect.arrayContaining([expect.any(String)]),
+            expect.arrayContaining([expect.any(String)])
+          ])
+        );
+        // Confirms it's actually hashed, not passed through raw.
+        const [, , , , hashedPayload] = (metaService.replaceCustomAudienceUsers as jest.Mock).mock.calls[0];
+        expect(hashedPayload[0][0]).not.toBe('email1@example.com');
+        expect(hashedPayload[0][0]).toMatch(/^[a-f0-9]{64}$/);
       });
 
       // ENG-600: the two new HubSpot/CSV audience-sourcing workflows pass an

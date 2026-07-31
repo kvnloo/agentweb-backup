@@ -16830,7 +16830,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    */
   public async manageMetaCustomAudiences(
     userId: string,
-    action: 'LIST' | 'CREATE' | 'UPLOAD_USERS' | 'DELETE_USERS',
+    action: 'LIST' | 'CREATE' | 'UPLOAD_USERS' | 'DELETE_USERS' | 'REPLACE_USERS',
     account_id: string,
     params: any
   ): Promise<MetaApiResult> {
@@ -16989,6 +16989,36 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             result: result
           };
         }
+        case 'REPLACE_USERS': {
+          // Used by resolveOrCreateSeedAudience when reusing an audience with
+          // no locally-saved membership snapshot to diff against — there's no
+          // baseline to know what's stale, so membership is atomically set to
+          // exactly the current source instead of add-only uploading (which
+          // would leave any pre-existing members that aren't in the current
+          // source stuck in the audience forever). Payload is the same raw
+          // (unhashed) row array UPLOAD_USERS receives from resolveOrCreateSeedAudience
+          // — hashed here the same way, via the shared hashAudienceRows helper
+          // (which passes already-hashed 64-hex values through unchanged).
+          if (!params.id || !params.payload || !params.schema) {
+            throw new Error('REPLACE_USERS requires "id", "schema", and "payload".');
+          }
+          if (!Array.isArray(params.payload) || params.payload.length === 0) {
+            throw new Error('REPLACE_USERS payload must be a non-empty array of rows.');
+          }
+          const hashedReplacePayload = this.hashAudienceRows(params.schema, params.payload);
+          const result = await metaService.replaceCustomAudienceUsers(
+            accountId,
+            accessToken,
+            params.id,
+            params.schema,
+            hashedReplacePayload
+          );
+          return {
+            success: true,
+            message: `Successfully replaced audience ${params.id} membership with ${params.payload.length} user(s)`,
+            result: result
+          };
+        }
         default:
           throw new Error(`Action ${action} is not supported for CUSTOM_AUDIENCE.`);
       }
@@ -17084,7 +17114,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // endpoints, RFC1918/internal hosts, loopback). Reuses the repo's existing
     // guard rather than reinventing IP-range checks.
     await assertPublicHostname(csvUrl);
-    const response = await axios.get(csvUrl);
+    // SSRF defence-in-depth: refuse to follow redirects. assertPublicHostname
+    // only validates the user-supplied URL; if axios followed a redirect to
+    // e.g. http://169.254.169.254/, the guard would be bypassed entirely.
+    // maxRedirects:0 makes axios surface a redirect as an error instead —
+    // same defense already used by routes/crm.ts's load-from-url path.
+    const response = await axios.get(csvUrl, { maxRedirects: 0 } as any);
     if (Array.isArray(response.data)) {
       return response.data;
     }
@@ -17227,6 +17262,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // folded back into what gets saved so the next sync sees them as stale
     // again and retries.
     const unremovedStaleRowKeys: string[] = [];
+    // Greptile finding: reusing an audience with NO prior snapshot (first
+    // sync since stale-member sync shipped, or an audience created outside
+    // this flow) had no baseline to diff against, so add-only uploads could
+    // never remove any pre-existing members not in the current source — they
+    // stayed forever. Tracked here so the write below uses Meta's atomic
+    // usersreplace instead of an add-only upload in exactly this case; once a
+    // snapshot exists, reuse goes back to the normal diff-and-delete-then-add
+    // path (cheaper, and avoids replacing the whole set every sync).
+    let noBaselineReuse = false;
     if (plannedAction === 'reuse') {
       try {
         const previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
@@ -17246,20 +17290,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               unremovedStaleRowKeys.push(...staleRowKeys);
             }
           }
+        } else {
+          noBaselineReuse = true;
         }
       } catch (e: any) {
         failures.push(`Could not check for stale members on audience ${audienceId}: ${e.message}`);
       }
     }
 
-    const uploadResult = await this.manageMetaCustomAudiences(userId, 'UPLOAD_USERS', accountId, {
+    const uploadResult = await this.manageMetaCustomAudiences(userId, noBaselineReuse ? 'REPLACE_USERS' : 'UPLOAD_USERS', accountId, {
       id: audienceId,
       schema,
       payload,
       confirm: true,
     });
     if (!uploadResult.success) {
-      throw new Error(uploadResult.message || 'Failed to upload users to Meta custom audience.');
+      throw new Error(uploadResult.message || (noBaselineReuse ? 'Failed to replace users in Meta custom audience.' : 'Failed to upload users to Meta custom audience.'));
     }
 
     // Greptile finding: exhausting all retries here used to be treated as

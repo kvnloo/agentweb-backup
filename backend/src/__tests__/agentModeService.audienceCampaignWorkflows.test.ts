@@ -161,6 +161,31 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(spy).toHaveBeenCalledTimes(1);
     });
 
+    // Greptile finding: assertPublicHostname only validates the user-supplied
+    // URL — if axios follows a redirect (e.g. a 302 to
+    // http://169.254.169.254/), the guard is bypassed entirely since the
+    // redirect target is never checked. Matches the existing redirect-bypass
+    // defense already used in routes/crm.ts's load-from-url path:
+    // maxRedirects:0 makes axios surface a redirect as an error instead of
+    // silently following it.
+    it('disables redirects on the CSV fetch so a redirect cannot bypass the SSRF guard', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_x', name: 'RankAI Warm List' } } as any); // CREATE
+      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
+      (axios.get as jest.Mock).mockResolvedValueOnce({ data: 'test@example.com,1234567890' });
+
+      await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'RankAI Warm List',
+        { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' },
+        { dryRun: false }
+      );
+
+      expect(axios.get).toHaveBeenCalledWith('https://s3.example.com/audience.csv', expect.objectContaining({
+        maxRedirects: 0,
+      }));
+    });
+
     it('fails fast (does not attempt CREATE/UPLOAD_USERS) when the CSV fetch itself fails', async () => {
       const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
       spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST
@@ -175,10 +200,10 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(spy).toHaveBeenCalledTimes(1);
     });
 
-    it('reuses an existing audience by id and still refreshes it with fresh source data', async () => {
+    it('reuses an existing audience by id with no prior snapshot — uses REPLACE_USERS (no baseline to diff against)', async () => {
       const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
       spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_existing_1', name: 'RankAI Warm List' }] } as any); // LIST
-      spy.mockResolvedValueOnce({ success: true, message: 'uploaded' } as any); // UPLOAD_USERS
+      spy.mockResolvedValueOnce({ success: true, message: 'replaced' } as any); // REPLACE_USERS
 
       const result = await callResolveOrCreateSeedAudience(
         USER_ID, ACCOUNT_ID, 'RankAI Warm List',
@@ -186,7 +211,27 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         { dryRun: false }
       );
 
-      // No CREATE call — only LIST then UPLOAD_USERS against the existing id.
+      // No CREATE call — only LIST then REPLACE_USERS against the existing id.
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(spy).toHaveBeenNthCalledWith(2, USER_ID, 'REPLACE_USERS', ACCOUNT_ID, expect.objectContaining({
+        id: 'aud_existing_1',
+      }));
+      expect(result.created).toBe(false);
+      expect(result.audience).toEqual({ id: 'aud_existing_1', name: 'RankAI Warm List' });
+    });
+
+    it('reuses an existing audience by id WITH a prior snapshot — uses UPLOAD_USERS (diff-and-delete already handled removals)', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_existing_1', name: 'RankAI Warm List' }] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: true, message: 'uploaded' } as any); // UPLOAD_USERS
+      (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValueOnce([]);
+
+      const result = await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'RankAI Warm List',
+        { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' },
+        { dryRun: false }
+      );
+
       expect(spy).toHaveBeenCalledTimes(2);
       expect(spy).toHaveBeenNthCalledWith(2, USER_ID, 'UPLOAD_USERS', ACCOUNT_ID, expect.objectContaining({
         id: 'aud_existing_1',
@@ -385,10 +430,16 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(saveAudienceSnapshotRowKeys).toHaveBeenCalledWith(USER_ID, 'aud_1', [rowKeyFor('a@example.com', '111')]);
     });
 
-    it('does not call DELETE_USERS when there is no prior snapshot (first sync of a reused audience)', async () => {
+    // Greptile finding: with no prior snapshot there's no baseline to diff
+    // against, so an add-only upload could never remove any pre-existing
+    // members not in the current source — they'd stay in the audience
+    // forever. REPLACE_USERS (Meta's atomic usersreplace) sidesteps the need
+    // for a baseline entirely by setting membership to exactly the current
+    // source in one operation.
+    it('uses REPLACE_USERS (not UPLOAD_USERS/DELETE_USERS) when there is no prior snapshot (first sync of a reused audience)', async () => {
       const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
       spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_2', name: 'X' }] } as any); // LIST
-      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
+      spy.mockResolvedValueOnce({ success: true } as any); // REPLACE_USERS
 
       jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
         mockHubSpotContact('a@example.com', '111')
@@ -403,6 +454,10 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
       expect(spy).toHaveBeenCalledTimes(2);
       expect(spy).not.toHaveBeenCalledWith(USER_ID, 'DELETE_USERS', expect.anything(), expect.anything());
+      expect(spy).not.toHaveBeenCalledWith(USER_ID, 'UPLOAD_USERS', expect.anything(), expect.anything());
+      expect(spy).toHaveBeenNthCalledWith(2, USER_ID, 'REPLACE_USERS', ACCOUNT_ID, expect.objectContaining({
+        id: 'aud_2', schema: ['EMAIL', 'PHONE'],
+      }));
     });
 
     it('does not call DELETE_USERS when creating a brand-new audience, but still saves a baseline snapshot', async () => {
