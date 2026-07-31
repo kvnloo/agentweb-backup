@@ -93,16 +93,17 @@ describe('toGeminiRequest', () => {
         {
           role: 'assistant',
           content: 'let me look',
-          tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'web_search', arguments: '{"q":"wa legislature"}' } }],
+          tool_calls: [{ id: 'call_1', type: 'function', thought_signature: 'SIG1', function: { name: 'web_search', arguments: '{"q":"wa legislature"}' } }],
         },
       ],
     };
     const req = toGeminiRequest(params, OPTS);
+    // A signed tool call echoes its thoughtSignature (required by the thinking model).
     expect(req.contents[1]).toEqual({
       role: 'model',
       parts: [
         { text: 'let me look' },
-        { functionCall: { name: 'web_search', args: { q: 'wa legislature' } } },
+        { functionCall: { name: 'web_search', args: { q: 'wa legislature' } }, thoughtSignature: 'SIG1' },
       ],
     });
   });
@@ -112,7 +113,7 @@ describe('toGeminiRequest', () => {
       model: 'gemini-3.5-flash',
       messages: [
         { role: 'user', content: 'search' },
-        { role: 'assistant', content: '', tool_calls: [{ id: 'call_abc', type: 'function', function: { name: 'web_search', arguments: '{}' } }] },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_abc', type: 'function', thought_signature: 'S', function: { name: 'web_search', arguments: '{}' } }] },
         { role: 'tool', tool_call_id: 'call_abc', content: '{"results":["a","b"]}' },
       ],
     };
@@ -128,7 +129,7 @@ describe('toGeminiRequest', () => {
     const params: OpenAIChatParams = {
       model: 'gemini-3.5-flash',
       messages: [
-        { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_time', arguments: '{}' } }] },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'c1', type: 'function', thought_signature: 'S', function: { name: 'get_time', arguments: '{}' } }] },
         { role: 'tool', tool_call_id: 'c1', content: 'plain text output' },
       ],
     };
@@ -145,8 +146,8 @@ describe('toGeminiRequest', () => {
           role: 'assistant',
           content: '',
           tool_calls: [
-            { id: 'c1', type: 'function', function: { name: 'search_a', arguments: '{"x":1}' } },
-            { id: 'c2', type: 'function', function: { name: 'search_b', arguments: '{"y":2}' } },
+            { id: 'c1', type: 'function', thought_signature: 'A', function: { name: 'search_a', arguments: '{"x":1}' } },
+            { id: 'c2', type: 'function', thought_signature: 'B', function: { name: 'search_b', arguments: '{"y":2}' } },
           ],
         },
         { role: 'tool', tool_call_id: 'c1', content: '{"ok":"a"}' },
@@ -154,12 +155,12 @@ describe('toGeminiRequest', () => {
       ],
     };
     const req = toGeminiRequest(params, OPTS);
-    // assistant model turn carries BOTH functionCall parts
+    // assistant model turn carries BOTH functionCall parts, each with its signature
     expect(req.contents[0]).toEqual({
       role: 'model',
       parts: [
-        { functionCall: { name: 'search_a', args: { x: 1 } } },
-        { functionCall: { name: 'search_b', args: { y: 2 } } },
+        { functionCall: { name: 'search_a', args: { x: 1 } }, thoughtSignature: 'A' },
+        { functionCall: { name: 'search_b', args: { y: 2 } }, thoughtSignature: 'B' },
       ],
     });
     // both tool results merge into a single user turn, each keyed by name
@@ -169,6 +170,25 @@ describe('toGeminiRequest', () => {
       { functionResponse: { name: 'search_a', response: { ok: 'a' } } },
       { functionResponse: { name: 'search_b', response: { ok: 'b' } } },
     ]);
+  });
+
+  it('degrades an UNSIGNED (legacy/compat) tool call AND its result to text (no 400)', () => {
+    const params: OpenAIChatParams = {
+      model: 'gemini-3.5-flash',
+      messages: [
+        { role: 'user', content: 'weather?' },
+        { role: 'assistant', content: '', tool_calls: [{ id: 'call_x', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Boston"}' } }] },
+        { role: 'tool', tool_call_id: 'call_x', content: '{"tempF":41}' },
+        { role: 'user', content: 'umbrella?' },
+      ],
+    };
+    const req = toGeminiRequest(params, OPTS);
+    // no functionCall / functionResponse parts anywhere — all degraded to text
+    const allParts = req.contents.flatMap((c: any) => c.parts);
+    expect(allParts.some((p: any) => 'functionCall' in p || 'functionResponse' in p)).toBe(false);
+    const texts = allParts.map((p: any) => p.text);
+    expect(texts).toContain('[Previously called get_weather({"city":"Boston"})]');
+    expect(texts).toContain('[Result of get_weather: {"tempF":41}]');
   });
 
   it('translates tools to functionDeclarations with sanitized schemas', () => {
@@ -285,6 +305,31 @@ describe('fromGeminiResponse', () => {
     expect(out.choices[0].message.tool_calls).toEqual([
       { id: 'call_web_search_0', type: 'function', function: { name: 'web_search', arguments: '{"q":"wa"}' } },
     ]);
+  });
+
+  it('captures a functionCall thoughtSignature so it round-trips', () => {
+    const resp = {
+      candidates: [{
+        finishReason: 'STOP',
+        content: { parts: [{ functionCall: { name: 'web_search', args: { q: 'wa' } }, thoughtSignature: 'ErYCsig==' }] },
+      }],
+    };
+    const out = fromGeminiResponse(resp);
+    expect(out.choices[0].message.tool_calls[0].thought_signature).toBe('ErYCsig==');
+  });
+
+  it('maps MALFORMED_FUNCTION_CALL (budget spent thinking) to length, not an empty stop', () => {
+    const resp = {
+      candidates: [{ finishReason: 'MALFORMED_FUNCTION_CALL', content: { parts: [] } }],
+      usageMetadata: { promptTokenCount: 42, candidatesTokenCount: 0, thoughtsTokenCount: 305, totalTokenCount: 410 },
+    };
+    const out = fromGeminiResponse(resp);
+    // 'length' routes the loop into its bounded continuation path instead of
+    // ending the turn on an empty answer (ENG-324/473/657 silent-zero class).
+    expect(out.choices[0].finish_reason).toBe('length');
+    expect(out.choices[0].message).not.toHaveProperty('tool_calls');
+    // thinking tokens still billed as output
+    expect(out.usage.completion_tokens).toBe(305);
   });
 
   it('reports MAX_TOKENS as finish_reason=length and content when no tool call', () => {

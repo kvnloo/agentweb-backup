@@ -108,12 +108,20 @@ export function toGeminiRequest(
   opts: GeminiRequestOptions,
 ): { model: string; contents: any[]; config: any } {
   // Gemini matches function results to calls by NAME, not id, so pre-map every
-  // assistant tool_call id -> function name to resolve later `tool` messages.
-  const toolCallIdToName = new Map<string, string>();
+  // assistant tool_call id -> {name, signed}. `signed` = the call carries a Gemini
+  // thoughtSignature: gemini-3.5-flash (a thinking model) REQUIRES that signature to
+  // be echoed back on the functionCall part, or the next turn 400s
+  // ("Function call is missing a thought_signature"). Unsigned calls — from the
+  // compat path or a pre-fix session — are degraded to text so no unsigned
+  // functionCall part is ever sent (and their results are degraded to text too, to
+  // keep functionResponse paired with a functionCall).
+  const toolCallInfo = new Map<string, { name: string; signed: boolean }>();
   for (const msg of params.messages) {
     if (msg?.role === 'assistant' && Array.isArray(msg.tool_calls)) {
       for (const tc of msg.tool_calls) {
-        if (tc?.id && tc?.function?.name) toolCallIdToName.set(tc.id, tc.function.name);
+        if (tc?.id && tc?.function?.name) {
+          toolCallInfo.set(tc.id, { name: tc.function.name, signed: !!tc.thought_signature });
+        }
       }
     }
   }
@@ -145,15 +153,30 @@ export function toGeminiRequest(
         for (const tc of msg.tool_calls) {
           let args: any = {};
           try { args = JSON.parse(tc.function?.arguments || '{}'); } catch { args = {}; }
-          parts.push({ functionCall: { name: tc.function?.name, args } });
+          if (tc.thought_signature) {
+            // Echo the thoughtSignature back — required for a thinking-model tool turn.
+            parts.push({ functionCall: { name: tc.function?.name, args }, thoughtSignature: tc.thought_signature });
+          } else {
+            // No signature (legacy/compat history) → degrade to text; an unsigned
+            // functionCall part would 400 the whole request.
+            parts.push({ text: `[Previously called ${tc.function?.name}(${tc.function?.arguments || '{}'})]` });
+          }
         }
       }
       pushContent('model', parts);
     } else if (msg.role === 'tool') {
-      const name = toolCallIdToName.get(msg.tool_call_id) || msg.name || 'tool';
-      pushContent('user', [{
-        functionResponse: { name, response: toFunctionResponseObject(msg.content) },
-      }]);
+      const info = toolCallInfo.get(msg.tool_call_id);
+      const name = info?.name || msg.name || 'tool';
+      if (info && !info.signed) {
+        // Its call was degraded to text above, so pair the result as text too
+        // (a functionResponse with no matching functionCall part would 400).
+        const resultText = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '');
+        pushContent('user', [{ text: `[Result of ${name}: ${resultText}]` }]);
+      } else {
+        pushContent('user', [{
+          functionResponse: { name, response: toFunctionResponseObject(msg.content) },
+        }]);
+      }
     }
   }
 
@@ -212,29 +235,42 @@ export function fromGeminiResponse(resp: any): any {
     // let a thought part reach the chat surface (the ENG-737 leak).
     if (part.thought === true) continue;
     if (part.functionCall) {
-      toolCalls.push({
+      const toolCall: any = {
         id: `call_${part.functionCall.name || 'fn'}_${toolCalls.length}`,
         type: 'function',
         function: {
           name: part.functionCall.name,
           arguments: JSON.stringify(part.functionCall.args ?? {}),
         },
-      });
+      };
+      // Preserve the thoughtSignature so it round-trips back on the next turn —
+      // gemini-3.5-flash 400s a functionCall history that drops it.
+      if (part.thoughtSignature) toolCall.thought_signature = part.thoughtSignature;
+      toolCalls.push(toolCall);
     } else if (typeof part.text === 'string') {
       textParts.push(part.text);
     }
   }
 
   const geminiFinish: string = candidate?.finishReason || '';
+  // Gemini stops that mean "cut off mid-work, ask me to continue" rather than a
+  // real end-of-turn. MAX_TOKENS is the output-token limit. MALFORMED_FUNCTION_CALL
+  // is observed on long gemini-3.5-flash turns that spend the whole budget thinking
+  // (thoughtsTokenCount high, includeThoughts=false so nothing leaks) and dead-end
+  // with empty text — mapping it to 'stop' would end the turn on an EMPTY answer
+  // (the ENG-324/473/657 silent-zero class), so route it to the loop's bounded
+  // max-tokens continuation instead.
+  const CONTINUATION_FINISHES = new Set(['MAX_TOKENS', 'MALFORMED_FUNCTION_CALL']);
+  const isContinuation = CONTINUATION_FINISHES.has(geminiFinish);
   const hasToolCalls = toolCalls.length > 0;
-  // A MAX_TOKENS stop with a tool call means the call was truncated mid-argument,
+  // A continuation stop with a tool call means the call was truncated mid-argument,
   // so its JSON is incomplete — do NOT surface it as a completed tool_calls turn.
   // Report finish_reason='length' with no tool_calls so the loop's max-tokens
   // continuation path asks the model to continue (matches Vertex/Bedrock, ENG-403).
-  const truncatedToolCall = geminiFinish === 'MAX_TOKENS' && hasToolCalls;
+  const truncatedToolCall = isContinuation && hasToolCalls;
 
   let finishReason: string;
-  if (geminiFinish === 'MAX_TOKENS') finishReason = 'length';
+  if (isContinuation) finishReason = 'length';
   else if (hasToolCalls) finishReason = 'tool_calls';
   else finishReason = 'stop';
 
