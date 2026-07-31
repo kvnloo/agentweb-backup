@@ -1904,19 +1904,25 @@ async def monitor_executions():
             if pending_executions:
                 for execution in pending_executions:
                     user_id = execution['userId']
-                    
-                    if running_task_count < MAX_CONCURRENT:
-                        # Increment the counter to reserve the slot
-                        running_task_count += 1
-                        running_user_ids.add(user_id)
-                        logger.info(f"Running task count: {running_task_count}, user_id: {user_id}")
 
-                        task = asyncio.create_task(execute_task(execution))
-
-                        executed_count += 1
-                    else:
+                    if running_task_count >= MAX_CONCURRENT:
                         # If we can't start more tasks, break out of the loop
                         break
+
+                    if user_id in running_user_ids:
+                        # This user already has a task running - skip for now,
+                        # try the next pending execution instead of starving
+                        # everyone behind them this cycle (ENG-798).
+                        continue
+
+                    # Increment the counter to reserve the slot
+                    running_task_count += 1
+                    running_user_ids.add(user_id)
+                    logger.info(f"Running task count: {running_task_count}, user_id: {user_id}")
+
+                    task = asyncio.create_task(execute_task(execution))
+
+                    executed_count += 1
                 
                 # Only update last_execution_time if we executed all pending executions
                 if executed_count == len(pending_executions):
