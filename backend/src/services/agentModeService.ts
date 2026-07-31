@@ -17208,6 +17208,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const hashedRows = this.hashAudienceRows(schema, payload);
     const newRowKeys = hashedRows.map((row) => this.audienceRowKey(row));
 
+    // Greptile P1 finding: a failed DELETE_USERS must not be forgotten. If the
+    // snapshot saved below only reflected the current source (newRowKeys), a
+    // stale member whose removal failed would simply disappear from tracking
+    // — the next sync would see no prior record of it and never retry the
+    // removal, leaving it targetable in Meta permanently. Un-removed keys are
+    // folded back into what gets saved so the next sync sees them as stale
+    // again and retries.
+    const unremovedStaleRowKeys: string[] = [];
     if (plannedAction === 'reuse') {
       try {
         const previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
@@ -17224,6 +17232,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             });
             if (!deleteResult.success) {
               failures.push(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
+              unremovedStaleRowKeys.push(...staleRowKeys);
             }
           }
         }
@@ -17243,7 +17252,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     try {
-      await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
+      await saveAudienceSnapshotRowKeys(userId, audienceId, [...newRowKeys, ...unremovedStaleRowKeys]);
     } catch (e: any) {
       failures.push(`Uploaded successfully, but failed to save the membership snapshot for future stale-member sync: ${e.message}`);
     }

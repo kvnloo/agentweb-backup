@@ -416,6 +416,15 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         expect.arrayContaining([expect.stringContaining('Failed to remove 1 stale member')])
       );
       expect(spy).toHaveBeenNthCalledWith(3, USER_ID, 'UPLOAD_USERS', ACCOUNT_ID, expect.any(Object));
+
+      // Greptile P1 finding: a failed removal must NOT be forgotten — if the
+      // snapshot saved afterward drops the un-removed key just because it's
+      // not in the current source, the next sync will see no prior record of
+      // it and never retry the removal, leaving it targetable in Meta forever.
+      expect(saveAudienceSnapshotRowKeys).toHaveBeenCalledWith(
+        USER_ID, 'aud_3',
+        expect.arrayContaining([rowKeyFor('a@example.com', '111'), rowKeyFor('old@example.com', '999')])
+      );
     });
 
     it('reports a snapshot-save failure as non-fatal after a successful upload', async () => {
