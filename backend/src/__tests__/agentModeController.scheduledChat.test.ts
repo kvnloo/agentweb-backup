@@ -285,6 +285,31 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(workerArg.messageContent).not.toBe(baseSchedule.startingMessage);
       });
 
+      it('strips a stale jobIncomplete/isRunFailureNotice placeholder from the history actually sent to the worker (Greptile)', async () => {
+        // The resume planner computes a placeholder-free resumeHistory, but the
+        // worker call reloads the session fresh from the DB (to pick up the just-
+        // saved continuation message) — that reload must not silently re-introduce
+        // a stale crash placeholder the planner already decided to drop, or the
+        // model reads back "the assistant already gave up" mid-continuation.
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: [
+            ...resumableMessages,
+            { role: 'assistant', content: 'please retry', metadata: { isRunFailureNotice: true } },
+          ],
+        } as any);
+
+        await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        const workerArg = (mockGenerateMarketingResponseWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
+        const hasPlaceholder = (workerArg.sessionHistory || []).some(
+          (m: any) => m?.metadata?.isRunFailureNotice === true || m?.metadata?.jobIncomplete === true
+        );
+        expect(hasPlaceholder).toBe(false);
+      });
+
       it('PAUSES the schedule (never fresh-restarts) when the resume session is no longer safely resumable', async () => {
         // Dangling tool_use → planScheduledRunResume refuses. A fresh restart (now or
         // on a later retry) would re-run the whole task and duplicate the already-

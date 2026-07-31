@@ -61,7 +61,7 @@ export interface ResumePlan {
 }
 
 /** A harness-written crash/abandon placeholder, not a genuine assistant turn. */
-function isRunFailurePlaceholder(m: ResumeMessage): boolean {
+export function isRunFailurePlaceholder(m: ResumeMessage): boolean {
   return m?.metadata?.jobIncomplete === true || m?.metadata?.isRunFailureNotice === true;
 }
 

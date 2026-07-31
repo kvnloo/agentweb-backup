@@ -14,7 +14,7 @@ import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
-import { planScheduledRunResume } from '../services/agentMode/core/resumePlan';
+import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
@@ -3364,6 +3364,17 @@ export async function generateSessionResponse(
     throw new Error('Session not found after update');
   }
 
+  // Strip any harness crash/abandon placeholders (ENG-324 jobIncomplete, ENG-473
+  // isRunFailureNotice) from the history fed to the model — they are not real
+  // turns and reading one back would look like the assistant already gave up
+  // (Greptile, ENG-657: the resume planner already computes a placeholder-free
+  // resumeHistory, but the reload above re-fetches raw persisted messages,
+  // discarding that cleanup). Safe for every session, not just resumed ones —
+  // these placeholders are never meant to be replayed to the model as prior turns.
+  const sessionHistoryForWorker = (updatedSession.messages || []).filter(
+    (m: any) => !isRunFailurePlaceholder(m)
+  );
+
   // If this session is linked to a GTM work item, update status to agent_in_progress
   if (updatedSession.gtmWorkItem) {
     try {
@@ -3400,7 +3411,7 @@ export async function generateSessionResponse(
   const response = await generateMarketingResponseWorkerService.runInWorker(
     {
       messageContent,
-      sessionHistory: updatedSession.messages,
+      sessionHistory: sessionHistoryForWorker,
       userId,
       llmModel,
       sessionId,
