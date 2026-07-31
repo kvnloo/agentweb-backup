@@ -455,6 +455,15 @@ http://localhost:3000/tasks/123456
 - `AZURE_OPENAI_MODEL`: Model to use (defaults to 'gpt-4o')
 - `AZURE_OPENAI_DEPLOYMENT`: Optional deployment name (if not set, uses 'agentweb')
 
+### Azure image generation (ENG-410)
+- `AZURE_IMAGE_ENDPOINT`: **Required** for the Azure image models (`gpt-image-1`,
+  `FLUX.1-Kontext-pro`). Base URL of the AgentWeb-owned Azure AI Services resource, e.g.
+  `https://agentweb-imagegen-prod.services.ai.azure.com` (trailing slashes are stripped).
+  There is no hardcoded default — if this is unset, image generation for those models
+  returns an error naming this variable instead of falling back to another account's
+  resource. Set it on every deploy of this service.
+- `AZURE_OPENAI_API_KEY2`: API key for that same resource.
+
 ## Database Schema
 
 ### AW-TaskExecutions
