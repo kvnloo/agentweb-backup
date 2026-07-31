@@ -1,3 +1,34 @@
+## ENG-281: the Unipile liveness probe existed but was skipped on the path that mattered (2026-07-30)
+
+Sue Xu's LinkedIn Outreach account reported connected while its Unipile session was dead, and every
+`linkedin_outreach` action failed with the same opaque disconnect error. The state-surfacing half of
+the report was already fixed (`eea9e4604`, 2026-07-01: `list_connected_accounts` derives `is_active`
+from a live probe rather than from a `Number.MAX_SAFE_INTEGER` token expiry that never expired, and
+the portal renders a Reconnect action off the same source). What remained was the second ask —
+fail fast rather than late. Investigation findings:
+
+- **Detection was purely reactive.** `linkedinOutreach` fired the real Unipile call, waited for a
+  401, and translated the error. So every action on a dead account burned a full round-trip before
+  failing, and a scheduled/automated run repeated that per recipient — which is what made the
+  reported session look like a hang rather than a config problem.
+- **The probe already existed and was already used — just not on this path.** `isAccountConnected`
+  (10-minute cached, timeout-bounded, two Unipile calls) is applied inside `resolveAccountId`, so
+  the *fallback* resolution path was covered. It was never applied when the caller passed an
+  explicit `account_id` — which is the normal path, because the agent gets that id from
+  `list_connected_accounts`, the very tool that already knows the account is dead. The check and
+  the knowledge were one function call apart and never met.
+- **Write actions were weaker than read actions, which is backwards.** `send-invite` /
+  `send-message` / `send-inmail` got an ownership check but no liveness check, while
+  `search-people` at least got one via the fallback path. The more consequential action had the
+  weaker preflight.
+- **The 10-minute probe cache needed an invalidation edge.** A session can die inside the cache
+  window, so preflight alone would keep waving it through until expiry. The reactive 401 handler
+  is retained as the backstop and now calls `clearStatusCache`, so the next attempt re-probes
+  instead of trusting a stale positive.
+- **Two copies of the disconnect guidance were about to exist.** Both paths now return one shared
+  helper, so the preflight and the reactive handler cannot drift into telling the user two
+  different stories about the same account.
+
 ## ENG-399: DATASET LIST was broken by the per-pixel edge, not the account-level one (2026-07-30)
 
 `call_meta_marketing_api { entity_type: DATASET, action: LIST }` failed every time with

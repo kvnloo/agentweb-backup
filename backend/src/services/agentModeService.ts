@@ -27586,6 +27586,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * Perform LinkedIn outreach actions using Unipile API.
    * URL-vs-provider_id resolution is handled inside LinkedInOutreachService.
    */
+  /**
+   * The single definition of "this LinkedIn account is dead, here is how to fix it".
+   * Returned both by the preflight below and by the reactive 401 handler, so the two
+   * paths can never drift into telling the user two different stories (ENG-281).
+   */
+  private linkedInDisconnectedResponse() {
+    return {
+      success: false,
+      message: 'LinkedIn account disconnected',
+      error: [
+        'The LinkedIn account is disconnected from Unipile and cannot be used for outreach.',
+        '',
+        'Common reasons a connected account becomes disconnected:',
+        '1. LinkedIn detected automation activity and revoked the session',
+        '2. You logged into LinkedIn from another browser or device, invalidating the session held by Unipile',
+        '3. The LinkedIn session cookie expired (typically every 30–90 days)',
+        '4. Unipile lost the session internally and requires a manual reconnect',
+        '',
+        'Next steps:',
+        '1. Go to Settings > Connected Accounts and click Reconnect on your LinkedIn account.',
+        '2. If reconnect does not work, remove the connection entirely and add it again as a new connection.',
+      ].join('\n')
+    };
+  }
+
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
@@ -27625,6 +27650,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         success: false,
         error: 'No LinkedIn account is connected. To use LinkedIn Outreach, please connect your LinkedIn account in Settings → Connected Accounts.',
       };
+    }
+
+    // Preflight the session before spending a call on it (ENG-281). A Unipile
+    // LinkedIn session can die while the connection record still exists, and every
+    // action on that account then fails with the same 401 — but only AFTER a full
+    // round-trip. A scheduled run repeats that per recipient, burning attempts and
+    // reporting a late, opaque failure instead of a reconnect prompt.
+    //
+    // resolveAccountId already filters on this exact probe, so the fallback path was
+    // covered; an explicitly-passed account_id — the normal path after
+    // list_connected_accounts, which itself reports is_active from the same source —
+    // was not. isAccountConnected is 10-minute cached and timeout-bounded, so a live
+    // account pays at most one probe per account per 10 minutes, and a dead account
+    // now costs nothing at all.
+    // Block ONLY on a proven-dead session. An indeterminate probe (timeout, 5xx,
+    // network) says nothing about session validity, and blocking on it would
+    // suppress a healthy account behind a false reconnect prompt for the probe's
+    // full 10-minute cache window — a worse failure than the late 401 this
+    // preflight exists to avoid. On 'unknown' we fall through to the real call and
+    // let the reactive 401 handler below stay the backstop, i.e. exactly today's
+    // behaviour.
+    const sessionState = await linkedInOutreachService.probeAccountSession(account_id);
+    if (sessionState === 'disconnected') {
+      console.log(`[AgentMode] linkedinOutreach: account ${account_id} failed preflight — disconnected Unipile session`);
+      return this.linkedInDisconnectedResponse();
+    }
+    if (sessionState === 'unknown') {
+      console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
     }
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
@@ -28132,23 +28185,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       const structuredError = (error as any).structuredError;
       if (structuredError?.code === 'errors/disconnected_account' || structuredError?.classification === 'AUTH_ERROR') {
-        return {
-          success: false,
-          message: 'LinkedIn account disconnected',
-          error: [
-            'The LinkedIn account is disconnected from Unipile and cannot be used for outreach.',
-            '',
-            'Common reasons a connected account becomes disconnected:',
-            '1. LinkedIn detected automation activity and revoked the session',
-            '2. You logged into LinkedIn from another browser or device, invalidating the session held by Unipile',
-            '3. The LinkedIn session cookie expired (typically every 30–90 days)',
-            '4. Unipile lost the session internally and requires a manual reconnect',
-            '',
-            'Next steps:',
-            '1. Go to Settings > Connected Accounts and click Reconnect on your LinkedIn account.',
-            '2. If reconnect does not work, remove the connection entirely and add it again as a new connection.',
-          ].join('\n')
-        };
+        // A session can die between the preflight above and this call (or inside the
+        // probe's 10-minute cache window), so the reactive path stays as the backstop.
+        // Both return the identical response via one helper.
+        linkedInOutreachService.clearStatusCache(account_id);
+        return this.linkedInDisconnectedResponse();
       }
 
       // Account-level invitation throttle (ENG-126). Once a LinkedIn account hits
