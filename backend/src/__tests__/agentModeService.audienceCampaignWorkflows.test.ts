@@ -31,10 +31,15 @@ jest.mock('../services/metaAudienceSnapshotStore', () => ({
   getAudienceSnapshotRowKeys: jest.fn().mockResolvedValue(null),
   saveAudienceSnapshotRowKeys: jest.fn().mockResolvedValue(undefined),
 }));
+jest.mock('../services/metaAudienceCampaignTokenStore', () => ({
+  isPreviewTokenConsumed: jest.fn().mockResolvedValue(false),
+  markPreviewTokenConsumed: jest.fn().mockResolvedValue(undefined),
+}));
 
 import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from '../services/metaAudienceSnapshotStore';
+import { isPreviewTokenConsumed, markPreviewTokenConsumed } from '../services/metaAudienceCampaignTokenStore';
 
 describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
   let agentModeService: AgentModeService;
@@ -45,6 +50,8 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     (axios.get as jest.Mock).mockResolvedValue({ data: 'email,phone\n' });
     (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(null);
     (saveAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(undefined);
+    (isPreviewTokenConsumed as jest.Mock).mockResolvedValue(false);
+    (markPreviewTokenConsumed as jest.Mock).mockResolvedValue(undefined);
   });
 
   const ACCOUNT_ID = '922903076601160';
@@ -587,6 +594,27 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       const adSetCallArgs = (agentModeService.createMetaAdsAdSet as jest.Mock).mock.calls[0][1];
       expect(adSetCallArgs.targeting.custom_audiences).toEqual([{ id: 'aud_seed_1' }]);
       expect(adSetCallArgs.targeting.excluded_custom_audiences).toBeUndefined();
+
+      // Greptile P1 finding: a valid preview token was never consumed/invalidated
+      // after use, so replaying the exact same confirmed call would silently
+      // re-execute (e.g. a second ad set under the same campaign) with no new
+      // user confirmation. The token must be marked consumed on success.
+      expect(markPreviewTokenConsumed).toHaveBeenCalledWith(USER_ID, expect.any(String));
+    });
+
+    it('rejects a replay of an already-consumed preview token, returning a fresh preview instead of re-executing', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      (isPreviewTokenConsumed as jest.Mock).mockResolvedValueOnce(true);
+      const resolveSpy = jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'create', audience: undefined, created: false, sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
+
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(createAdSetSpy).not.toHaveBeenCalled();
+      expect(resolveSpy).toHaveBeenCalledWith(USER_ID, ACCOUNT_ID, 'RankAI Warm List', { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' }, { dryRun: true });
     });
 
     it('creates a Lookalike Audience and attaches it (not the seed) when use_lookalike=true', async () => {

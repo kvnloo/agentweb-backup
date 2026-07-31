@@ -186,6 +186,7 @@ import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from './metaAudienceSnapshotStore';
+import { isPreviewTokenConsumed, markPreviewTokenConsumed } from './metaAudienceCampaignTokenStore';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -17388,16 +17389,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const expectedPreviewToken = this.computeAudienceCampaignArgsDigest(args);
       const confirmAttempted = args.confirm === true;
       const tokenValid = args.preview_token === expectedPreviewToken;
-      const confirmed = confirmAttempted && tokenValid;
+      const tokenMatches = confirmAttempted && tokenValid;
+      // Greptile P1 finding: an HMAC-valid token was never consumed/invalidated
+      // after use — replaying the exact same confirmed call would silently
+      // re-execute (e.g. create a second ad set under the same campaign) with
+      // no new user confirmation. A token is only "confirmed" the first time
+      // it's presented; any repeat use is treated the same as a missing/stale
+      // token and falls back into a fresh preview instead of executing again.
+      const alreadyConsumed = tokenMatches ? await isPreviewTokenConsumed(userId, args.preview_token) : false;
+      const confirmed = tokenMatches && !alreadyConsumed;
 
       if (!confirmed) {
         const plan = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: true });
         const summary = this.buildAudienceCampaignConfirmationSummary(workflow, args, plan);
         // Distinguish "first preview, nothing attempted yet" from "confirm was
-        // attempted but the token was missing/stale" — the latter means either
-        // the model tried to self-approve without a real preview, or the
-        // arguments changed since the last preview was shown.
-        const staleNotice = confirmAttempted
+        // attempted but the token was missing/stale" from "confirm was
+        // attempted with a token that was already used once" — each needs a
+        // different explanation for why this falls back to a fresh preview.
+        const staleNotice = alreadyConsumed
+          ? 'This confirmation token was already used for a previous launch and cannot be reused — here is a fresh plan to confirm again. '
+          : confirmAttempted
           ? 'The confirmation token was missing or no longer matches these arguments (they may have changed since the last preview), so this cannot execute yet — here is the CURRENT plan to confirm instead. '
           : '';
         return {
@@ -17416,6 +17427,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             `and preview_token="${expectedPreviewToken}" (copy it verbatim from this response — it will not match if you retype it or change any argument).`,
         };
       }
+
+      // Mark the token consumed before doing any real work, minimizing the
+      // window for a concurrent duplicate request to also pass the check above.
+      await markPreviewTokenConsumed(userId, args.preview_token);
 
       const seed = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: false });
 
