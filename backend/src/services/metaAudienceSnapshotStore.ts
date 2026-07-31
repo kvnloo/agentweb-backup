@@ -70,7 +70,15 @@ export async function getAudienceSnapshotRowKeys(userId: string, audienceId: str
   return rowKeys;
 }
 
-export async function saveAudienceSnapshotRowKeys(userId: string, audienceId: string, rowKeys: string[]): Promise<void> {
+// Greptile P1 finding: a save failure was purely non-fatal with no retry — the
+// next sync would find no prior snapshot at all and silently skip stale-member
+// reconciliation entirely. Retrying covers the common transient-failure case
+// (e.g. a throughput-exceeded blip) without a bigger atomic-rewrite of the
+// sharded storage format.
+const SAVE_RETRY_ATTEMPTS = 3;
+const SAVE_RETRY_DELAY_MS = 200;
+
+async function saveAudienceSnapshotRowKeysOnce(userId: string, audienceId: string, rowKeys: string[]): Promise<void> {
   const dynamodb = new AWS.DynamoDB.DocumentClient();
 
   const chunks: string[][] = [];
@@ -97,4 +105,20 @@ export async function saveAudienceSnapshotRowKeys(userId: string, audienceId: st
       updatedAt: new Date().toISOString(),
     },
   }).promise();
+}
+
+export async function saveAudienceSnapshotRowKeys(userId: string, audienceId: string, rowKeys: string[]): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= SAVE_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await saveAudienceSnapshotRowKeysOnce(userId, audienceId, rowKeys);
+      return;
+    } catch (e) {
+      lastError = e;
+      if (attempt < SAVE_RETRY_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, SAVE_RETRY_DELAY_MS));
+      }
+    }
+  }
+  throw lastError;
 }

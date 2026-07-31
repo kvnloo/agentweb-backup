@@ -170,5 +170,30 @@ describe('metaAudienceSnapshotStore', () => {
         Item: expect.objectContaining({ configId: 'metaAudienceSnapshot:aud_123', chunkCount: 1 }),
       }));
     });
+
+    // Greptile P1 finding: a snapshot-save failure was purely non-fatal with
+    // no retry — the next sync would see no prior baseline at all, silently
+    // abandoning stale-member reconciliation. Retrying a few times covers the
+    // common transient-failure case without a bigger atomic-rewrite of the
+    // storage format.
+    it('retries and succeeds if an earlier attempt fails', async () => {
+      mockPut
+        .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'))
+        .mockResolvedValue({});
+
+      await saveAudienceSnapshotRowKeys('user1', 'aud_123', ['abc|def']);
+
+      // 1 failed chunk write (attempt 1) + 1 successful chunk write + 1 successful index write (attempt 2)
+      expect(mockPut).toHaveBeenCalledTimes(3);
+    });
+
+    it('throws only after exhausting all retry attempts', async () => {
+      mockPut.mockRejectedValue(new Error('ProvisionedThroughputExceededException'));
+
+      await expect(saveAudienceSnapshotRowKeys('user1', 'aud_123', ['abc|def'])).rejects.toThrow(
+        'ProvisionedThroughputExceededException'
+      );
+      expect(mockPut.mock.calls.length).toBeGreaterThan(1);
+    });
   });
 });
