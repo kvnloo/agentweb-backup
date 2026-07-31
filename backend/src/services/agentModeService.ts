@@ -28942,19 +28942,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // provider_id send (no profile URL) has no key to reconcile on.
             if (args.list_id && isUrl && profile_url) {
               try {
-                const { mirrorLinkedInInviteToCrm } = await import('./linkedInInviteCrmMirror');
-                await mirrorLinkedInInviteToCrm({
-                  userId,
-                  listId: args.list_id,
-                  linkedinUrl: profile_url,
-                  leadId: args.lead_id,
-                  firstName: args.first_name,
-                  lastName: args.last_name,
-                  company: args.company,
-                  title: args.title,
-                  note: message ?? undefined,
-                  accountId: account_id,
-                });
+                // Access guard (ENG-787): args.list_id is LLM-controlled and this mirror
+                // CREATES leads + engagement, so verify the caller can access the target
+                // list before writing — matching add_leads/update_lead_status and crm.ts.
+                // A foreign or missing list is skipped (non-fatal), never written to.
+                const { crmDb } = await import('./db');
+                const mirrorList = await crmDb.getLeadListById(args.list_id);
+                if (!mirrorList || !(await crmDb.canOrgMemberAccessList(userId, mirrorList))) {
+                  console.warn(`[AgentMode] send-invite: skipping CRM mirror — list ${args.list_id} not accessible to user ${userId}`);
+                } else {
+                  const { mirrorLinkedInInviteToCrm } = await import('./linkedInInviteCrmMirror');
+                  await mirrorLinkedInInviteToCrm({
+                    userId,
+                    listId: args.list_id,
+                    linkedinUrl: profile_url,
+                    leadId: args.lead_id,
+                    firstName: args.first_name,
+                    lastName: args.last_name,
+                    company: args.company,
+                    title: args.title,
+                    note: message ?? undefined,
+                    accountId: account_id,
+                  });
+                }
               } catch (mirrorErr) {
                 console.warn('[AgentMode] send-invite: failed to mirror invite to CRM (non-fatal):', mirrorErr);
               }
