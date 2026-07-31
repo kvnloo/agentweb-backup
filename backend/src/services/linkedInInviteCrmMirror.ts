@@ -57,25 +57,6 @@ function hasInviteEngagement(
   });
 }
 
-/**
- * Confirm a caller-supplied lead that carries no LinkedIn URL, by name.
- *
- * Used only when the lead cannot be matched on URL. Both names must be present on
- * both sides — a partial or absent name is not evidence of identity.
- */
-function namesMatch(
-  lead: any,
-  firstName?: string,
-  lastName?: string,
-): boolean {
-  const norm = (v: unknown) => String(v ?? '').trim().toLowerCase();
-  const leadFirst = norm(lead?.firstName);
-  const leadLast = norm(lead?.lastName);
-  const first = norm(firstName);
-  const last = norm(lastName);
-  if (!leadFirst || !leadLast || !first || !last) return false;
-  return leadFirst === first && leadLast === last;
-}
 
 export interface MirrorInviteParams {
   /** List-owner userId — stamped on newly-created leads for audit (CRM-history Tier 0). */
@@ -203,27 +184,26 @@ export async function mirrorLinkedInInviteToCrm(
   let leadId = params.leadId;
   let listId = params.listId;
   let existing: any = null;
-  // True when the resolved lead carries no LinkedIn URL of its own, so the mirror
-  // should stamp one and make it keyable next time.
-  let needsLinkedinStamp = false;
   if (leadId) {
     const candidate = await crmDb.getLeadById(listId, leadId);
-    // A caller-supplied leadId is only trusted when identity can be confirmed. On
-    // the outreach path lead_id and profile_url are two independent LLM-supplied
-    // values, so a stale or mismatched lead_id would otherwise mark the WRONG
-    // person contacted and attach this invitee's engagement to them. The URL is
-    // the strong signal; for a lead that has no URL yet, a full first+last name
-    // match is accepted and the URL is written on so the next call can key on it.
+    // A caller-supplied leadId is trusted ONLY when the lead's own LinkedIn URL
+    // canonically matches the invitee. On the outreach path lead_id and profile_url
+    // are two independent LLM-supplied values, so a stale or mismatched lead_id
+    // would otherwise mark the WRONG person contacted and attach this invitee's
+    // engagement to them.
+    //
+    // A lead with no URL is deliberately NOT accepted on a name match. Names are not
+    // identity — namesakes exist — and accepting one would also stamp the invitee's
+    // URL onto that lead, turning a wrong guess into permanently corrupted identity.
+    // Falling through to the URL lookup may instead create an extra lead, which is
+    // visible in the list and mergeable; a silent mis-attribution is neither.
     const candidateUrl = candidate ? normalizeLinkedInUrl(candidate.linkedin) : '';
     if (candidate && candidateUrl === normalized) {
       existing = candidate;
-    } else if (candidate && !candidateUrl && namesMatch(candidate, params.firstName, params.lastName)) {
-      existing = candidate;
-      needsLinkedinStamp = true;
     } else {
       if (candidate) {
         console.warn(
-          `[mirrorLinkedInInvite] ignoring leadId ${leadId} in list ${listId} — neither its LinkedIn URL nor its name confirms the invitee; resolving by profile URL instead`,
+          `[mirrorLinkedInInvite] ignoring leadId ${leadId} in list ${listId} — its LinkedIn URL does not confirm the invitee; resolving by profile URL instead`,
         );
       }
       leadId = undefined;
@@ -284,27 +264,19 @@ export async function mirrorLinkedInInviteToCrm(
   // Advance status to 'contacted' only when the lead has no meaningful status yet.
   // Always stamp the invite timestamp so the UI reflects the send.
   const currentStatus = String(existing?.status ?? '').trim().toLowerCase();
-  const leadUpdate: { status?: string; linkedInInviteSentAt: string; linkedin?: string } = {
+  const leadUpdate: { status?: string; linkedInInviteSentAt: string } = {
     linkedInInviteSentAt: sentAt,
   };
   if (!created && UNCONTACTED_STATUSES.has(currentStatus)) {
     leadUpdate.status = 'contacted';
   }
-  // A name-confirmed lead had no URL of its own; write it so the next mirror can
-  // key on the URL instead of relying on the name again.
-  if (needsLinkedinStamp) {
-    leadUpdate.linkedin = normalized;
-  }
   await crmDb.updateLead(listId, leadId, leadUpdate);
 
   // Lead-level engagement record — provenance + so follow-up cadence can fire.
-  // Skipped when this exact invitation is already on the lead, so re-mirroring a
+  // Skipped when this invitation is already on the lead, so re-mirroring a
   // still-pending invite (or re-running the reconciliation) stays idempotent.
   const accountId = params.accountId || '';
-  if (!created && hasInviteEngagement(existing, { linkedin: normalized, accountId, invitationId })) {
-    return { leadId, listId, created, engagementLogged: false };
-  }
-  await crmDb.addLeadEngagement(listId, leadId, {
+  const engagement = {
     eventType: INVITE_SENT_EVENT,
     eventData: {
       note: params.note || '',
@@ -313,9 +285,50 @@ export async function mirrorLinkedInInviteToCrm(
       invitationId,
     },
     createdAt: sentAt,
-  });
+  };
 
-  return { leadId, listId, created, engagementLogged: true };
+  // A brand-new lead has no engagements and nothing else can be racing it yet.
+  if (created) {
+    await crmDb.addLeadEngagement(listId, leadId, engagement);
+    return { leadId, listId, created, engagementLogged: true };
+  }
+
+  // "Is it already recorded?" is a read and the append is a write, so on their own
+  // two overlapping mirrors — the sync cron reconciling while an outreach run sends,
+  // say — can both read "not present" and both append. Guard the append on the lead
+  // being unchanged since the read that decided it, and on a lost race re-read and
+  // re-decide: the loser then sees the winner's engagement and skips.
+  const MAX_ATTEMPTS = 3;
+  let snapshot: any = existing;
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    if (hasInviteEngagement(snapshot, { linkedin: normalized, accountId, invitationId })) {
+      return { leadId, listId, created, engagementLogged: false };
+    }
+    // A lead with no updatedAt cannot be compared against; append unguarded rather
+    // than CAS against '' and fail every retry, which would drop the attribution
+    // entirely. The guard is hardening — losing the record is the worse outcome.
+    const expectedUpdatedAt = snapshot?.updatedAt ? String(snapshot.updatedAt) : undefined;
+    try {
+      await crmDb.addLeadEngagement(
+        listId, leadId, engagement,
+        expectedUpdatedAt === undefined ? {} : { expectedUpdatedAt },
+      );
+      return { leadId, listId, created, engagementLogged: true };
+    } catch (err: any) {
+      if (!err?.preconditionFailed) throw err;
+      // Someone wrote to the lead in between — including, possibly, this same
+      // invitation. Re-read and let the loop re-decide.
+      snapshot = await crmDb.getLeadById(listId, leadId);
+      if (!snapshot) return { leadId, listId, created, engagementLogged: false };
+    }
+  }
+
+  // Contention that outlives the retries: skip rather than append blind, because an
+  // unguarded append is exactly the duplicate this guard exists to prevent.
+  console.warn(
+    `[mirrorLinkedInInvite] gave up appending the invite engagement for lead ${listId}/${leadId} after ${MAX_ATTEMPTS} contended attempts`,
+  );
+  return { leadId, listId, created, engagementLogged: false };
 }
 
 /** Split a LinkedIn display name ("Bala S.", "泓杰 虞") into best-effort first/last. */
