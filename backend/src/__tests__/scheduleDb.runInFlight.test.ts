@@ -71,14 +71,19 @@ describe('scheduleDb.attachSessionToRunInFlight (ENG-479)', () => {
     expect(params.ExpressionAttributeValues[':runId']).toBe('run-1');
   });
 
-  it('never rejects — swallows a stale-lease condition failure', async () => {
+  it('never rejects — swallows a stale-lease condition failure, and reports it as false (ENG-657)', async () => {
     mockDynamoDB.update.mockReturnValue(conditionalFail());
-    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBeUndefined();
+    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBe(false);
   });
 
-  it('never rejects — swallows an unexpected error', async () => {
+  it('never rejects — swallows an unexpected error, and reports it as false (ENG-657)', async () => {
     mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('throttled')) });
-    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBeUndefined();
+    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBe(false);
+  });
+
+  it('reports success as true so the resume path can require a confirmed attach (ENG-657)', async () => {
+    mockDynamoDB.update.mockReturnValue(ok());
+    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBe(true);
   });
 });
 

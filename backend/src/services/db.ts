@@ -3240,8 +3240,11 @@ export const scheduleDb = {
   // sessionId; this fills it in once createChatSession returns, so the reconciler's
   // recovery can annotate the right session. Conditional on runId (like the
   // heartbeat) so it can never resurrect a lease a reconciler already reaped or a
-  // newer run replaced. Best-effort: a failed condition just means the lease moved on.
-  async attachSessionToRunInFlight(scheduleId: string, runId: string, sessionId: string): Promise<void> {
+  // newer run replaced. Returns whether the write actually landed — ENG-657's resume
+  // path needs to know this (a failed attach must abort the resume rather than
+  // proceed on an unconfirmed lease), while the fresh-session path can still treat
+  // it as best-effort (a fresh session has nothing to duplicate if attach fails).
+  async attachSessionToRunInFlight(scheduleId: string, runId: string, sessionId: string): Promise<boolean> {
     try {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
@@ -3250,10 +3253,12 @@ export const scheduleDb = {
         ConditionExpression: 'runInFlight.runId = :runId',
         ExpressionAttributeValues: { ':sid': sessionId, ':runId': runId },
       }).promise();
+      return true;
     } catch (error: any) {
       if (error?.code !== 'ConditionalCheckFailedException') {
         console.error('DynamoDB attachSessionToRunInFlight error:', error);
       }
+      return false;
     }
   },
 
