@@ -20,16 +20,18 @@
  */
 
 const mockPut = jest.fn();
+const mockDelete = jest.fn();
 
 jest.mock('aws-sdk', () => ({
   DynamoDB: {
     DocumentClient: jest.fn().mockImplementation(() => ({
       put: (params: any) => ({ promise: () => mockPut(params) }),
+      delete: (params: any) => ({ promise: () => mockDelete(params) }),
     })),
   },
 }));
 
-import { claimPreviewToken } from '../services/metaAudienceCampaignTokenStore';
+import { claimPreviewToken, releasePreviewToken } from '../services/metaAudienceCampaignTokenStore';
 
 describe('metaAudienceCampaignTokenStore', () => {
   beforeEach(() => {
@@ -80,6 +82,34 @@ describe('metaAudienceCampaignTokenStore', () => {
       expect(mockPut).toHaveBeenCalledWith(
         expect.objectContaining({ Item: expect.objectContaining({ userId: 'user2' }) })
       );
+    });
+  });
+
+  // Greptile finding: once a token is claimed, a failure anywhere in the
+  // actual launch (reconciliation, lookalike, ad-set creation) left it
+  // permanently consumed — since the digest is deterministic given the same
+  // args, re-previewing unchanged arguments produces the SAME token, which
+  // is already claimed forever, so the user could never retry the exact
+  // approved arguments. releasePreviewToken lets a failed launch free the
+  // claim so a legitimate retry works, while the atomic claim itself still
+  // fully prevents concurrent double-execution.
+  describe('releasePreviewToken', () => {
+    it('deletes the claim record for this user + token', async () => {
+      mockDelete.mockResolvedValueOnce({});
+
+      await releasePreviewToken('user1', 'abc123token');
+
+      expect(mockDelete).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Key: { userId: 'user1', configId: 'metaAudienceCampaignConfirmToken:abc123token' },
+        })
+      );
+    });
+
+    it('does not throw if the delete itself fails (best-effort release)', async () => {
+      mockDelete.mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+
+      await expect(releasePreviewToken('user1', 'abc123token')).resolves.toBeUndefined();
     });
   });
 });

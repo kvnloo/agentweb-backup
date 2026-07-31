@@ -61,3 +61,23 @@ export async function claimPreviewToken(userId: string, token: string): Promise<
     throw e;
   }
 }
+
+/**
+ * Releases a claimed token after a failed launch, so a legitimate retry with
+ * the exact same (unchanged) arguments — which produces the same
+ * deterministic HMAC digest — can claim it again instead of being
+ * permanently locked out. Best-effort: a failure to release just means the
+ * caller needs a fresh preview to get a new token, so it's swallowed rather
+ * than compounding the original launch failure with a second error.
+ */
+export async function releasePreviewToken(userId: string, token: string): Promise<void> {
+  const dynamodb = new AWS.DynamoDB.DocumentClient();
+  try {
+    await dynamodb.delete({
+      TableName: CONFIGS_TABLE,
+      Key: { userId, configId: tokenConfigId(token) },
+    }).promise();
+  } catch {
+    // Best-effort — see docstring.
+  }
+}
