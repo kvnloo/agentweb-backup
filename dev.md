@@ -1,3 +1,37 @@
+## ENG-399: DATASET LIST was broken by the per-pixel edge, not the account-level one (2026-07-30)
+
+`call_meta_marketing_api { entity_type: DATASET, action: LIST }` failed every time with
+`(#100) Tried accessing nonexisting field (datasets)`, making Meta pixel discovery impossible
+in-product. The ticket's stated hypothesis — account-level entry point broken, per-pixel edge fine —
+was **exactly inverted**. Investigation findings:
+
+- **`listPixels` was already correct.** It calls `GET /act_<id>/adspixels` (`metaService.ts`) and had
+  a test asserting that URL. The failure was one layer down: `manageMetaDatasets` LIST then looped
+  **per pixel** calling `listDatasets(pixel.id)` → `GET /<pixel_id>/datasets`, an edge Graph v25
+  removed when Meta unified pixels and datasets. A pixel now IS its own dataset.
+- **One dead edge killed the whole call because `handleError` rethrows.** `metaService.handleError`
+  ends in `throw enhancedError`, so the first per-pixel rejection propagated out of the `for` loop to
+  `manageMetaDatasets`'s catch and returned `success: false`. An account with N pixels also issued
+  N doomed round-trips before failing. The fix removes the loop entirely: zero per-pixel calls.
+- **This codebase had already reached the right answer elsewhere and never back-ported it.** The
+  lander pixel resolver (`resolveMetaPixelForUser`) documents "Meta unified pixel + dataset in Graph
+  v25, so the per-pixel `listDatasets` edge (broken, see ENG-399) is never called at all", and
+  `metaService.pixelResolution.test.ts` pins that workaround. The tool path just never adopted it.
+  Worth checking for this shape generally: a known-broken dependency routed around in one call site
+  while every other caller keeps hitting it.
+- **Both existing test suites passed while the feature was 100% broken in production**, which is why
+  this survived from the 2026-07-19 RankAI incident. `agentModeService.metaDatasets.test.ts` mocked
+  `metaService.listDatasets` wholesale, so it asserted against a fabricated success the real edge
+  could never return. Worse, `metaService.test.ts` asserted the request URL contained
+  `pixel_1/datasets` — a test whose only content was **pinning the bug**. Both were agent-written
+  against the implementation rather than against a behavioral contract; this is the exact failure
+  mode `loop-acceptance-tests.md` exists to prevent, and the reason the new regression test asserts
+  the dead edge is *never called* rather than asserting its mocked return value.
+- **The tool description was also lying**, promising "all pixels and their associated datasets
+  (server event data sources)" — an entity relationship that no longer exists. Corrected to state
+  that each pixel id doubles as its `dataset_id`, since a description that describes a removed
+  Graph shape sends Emma looking for a second identifier that is never coming.
+
 ## ENG-664: per-user X cost breakdown on the admin user card + LLM-only fix (2026-07-30)
 
 **LLM-only fix.** The user card's "LLM Cost" 📊 opens `getUserOrgUsageRollup` (gross burn vs the LLM
