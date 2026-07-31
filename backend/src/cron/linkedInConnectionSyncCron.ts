@@ -57,9 +57,28 @@ const TAG = '[linkedInConnectionSync]';
 const isNotifyEnabled = (): boolean => process.env.LINKEDIN_CONNECTION_NOTIFY === 'true';
 const isEnrollEnabled = (): boolean => process.env.LINKEDIN_CONNECTION_ENROLL === 'true';
 
-/** Returns all Unipile account IDs to sync: site-wide settings + all per-user connected accounts. */
-async function getAllUnipileAccountIds(): Promise<string[]> {
+/**
+ * Kill-switch for mirroring pending invitations into the CRM on every sync.
+ * Muted by default: it performs bulk writes into customers' lead lists
+ * unattended, so switching it on is a data-plane decision. Set
+ * LINKEDIN_INVITE_CRM_RECONCILE=true to enable.
+ */
+const isInviteReconcileEnabled = (): boolean => process.env.LINKEDIN_INVITE_CRM_RECONCILE === 'true';
+
+/**
+ * All Unipile account IDs to sync: site-wide settings + every per-user connected
+ * account, plus the owner of each per-user account.
+ *
+ * Site-wide accounts are deliberately absent from `ownerByAccountId` — they belong
+ * to no single customer, so nothing that writes into a customer's CRM may act on
+ * them.
+ */
+async function getAllUnipileAccountIds(): Promise<{
+  ids: string[];
+  ownerByAccountId: Map<string, string>;
+}> {
   const ids = new Set<string>();
+  const ownerByAccountId = new Map<string, string>();
 
   // Site-wide accounts
   try {
@@ -81,13 +100,20 @@ async function getAllUnipileAccountIds(): Promise<string[]> {
       for (const acct of user.connected_accounts as any[]) {
         if (acct.platform === 'unipile') {
           const accountId = acct.config?.unipile_account_id || acct.account_id;
-          if (accountId) ids.add(accountId);
+          if (accountId) {
+            ids.add(accountId);
+            // First owner wins; an account shared across users has no single owner
+            // to attribute to, and overwriting would make the choice arbitrary.
+            if (user.userId && !ownerByAccountId.has(accountId)) {
+              ownerByAccountId.set(accountId, String(user.userId));
+            }
+          }
         }
       }
     }
   } catch { /* ignore */ }
 
-  return Array.from(ids);
+  return { ids: Array.from(ids), ownerByAccountId };
 }
 
 // ─── Core sync logic ──────────────────────────────────────────────────────────
@@ -250,6 +276,51 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
 
   console.log(`${TAG} account=${accountId} pending invitations: ${toUpsert.length} upserted, ${pruned} pruned (pages=${page})`);
   return toUpsert.length;
+}
+
+/**
+ * Mirror one account's PENDING sent-invitations into the CRM list bound to it (ENG-787).
+ *
+ * The per-send mirror covers invites that go through this product's send path, but
+ * an invite still escapes it when the model omits `list_id` and no list is bound,
+ * when the profile cannot be resolved, when the CRM write fails (the mirror is
+ * best-effort and never retries), or when the invite was sent directly on LinkedIn
+ * and never touched our code at all. Every one of those is only recoverable while
+ * the invitation is still pending — acceptance drops it from Unipile's feed and the
+ * prune removes it. Reconciling on each sync closes that window to ~10 minutes
+ * instead of "whenever someone remembers to run the backfill".
+ *
+ * Idempotent by construction: the mirror skips an invitation already recorded, so
+ * the steady state is a no-op that reports everything as alreadyRecorded.
+ *
+ * Requires a known owner AND a list bound to the account — a site-wide/shared
+ * account belongs to no single customer and must never write into one's CRM.
+ * Muted behind LINKEDIN_INVITE_CRM_RECONCILE because it is a bulk unattended write.
+ */
+async function reconcileInvitesToCrmForAccount(accountId: string, userId?: string): Promise<void> {
+  if (!isInviteReconcileEnabled() || !userId) return;
+  try {
+    const { resolveListIdForAccount, reconcileSentInvitationsToCrm } =
+      await import('../services/linkedInInviteCrmMirror');
+    const listId = await resolveListIdForAccount(userId, accountId);
+    if (!listId) return;
+    const result = await reconcileSentInvitationsToCrm({
+      accountId,
+      listId,
+      userId,
+      // The cache was just refreshed above — re-pulling the live feed would double
+      // every sync's Unipile calls for no new data.
+      refreshFromLive: false,
+    });
+    if (result.created > 0 || result.updated > result.alreadyRecorded) {
+      console.log(
+        `${TAG} account=${accountId} mirrored invitations into list ${listId}: created=${result.created} updated=${result.updated} (alreadyRecorded=${result.alreadyRecorded})`,
+      );
+    }
+  } catch (err) {
+    // Attribution must never take down the sync.
+    console.error(`${TAG} Invite→CRM reconciliation failed for account ${accountId}:`, err);
+  }
 }
 
 /**
@@ -513,7 +584,7 @@ export async function runLinkedInConnectionSync(): Promise<void> {
   isRunning = true;
 
   try {
-    const accountIds = await getAllUnipileAccountIds();
+    const { ids: accountIds, ownerByAccountId } = await getAllUnipileAccountIds();
 
     if (accountIds.length === 0) {
       console.log(`${TAG} No accounts to sync`);
@@ -552,6 +623,13 @@ export async function runLinkedInConnectionSync(): Promise<void> {
       } catch (err) {
         console.error(`${TAG} Sent-invitation sync failed for account ${accountId}:`, err);
       }
+      // Then mirror those pending invitations into the CRM (ENG-787). Runs here, right
+      // after the refresh, because a pending invitation is the ONLY window in which an
+      // invite is recoverable: once it is accepted or withdrawn it drops off Unipile's
+      // feed and is pruned from the cache. Attribution that depends on a manual backfill
+      // therefore races acceptance, and loses for invites sent outside this product,
+      // sent without a resolvable list, or whose send-time mirror write failed.
+      await reconcileInvitesToCrmForAccount(accountId, ownerByAccountId.get(accountId));
     }
 
     // Auto-enroll leads and send email notifications for newly accepted connections
