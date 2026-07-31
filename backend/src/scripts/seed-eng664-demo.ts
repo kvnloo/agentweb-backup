@@ -278,8 +278,12 @@ async function clean() {
 }
 
 async function main() {
-  if (process.env.NODE_ENV === "production") {
-    console.error("Refusing to run against production. Set NODE_ENV=development.");
+  // Require development explicitly: the DynamoDB table-prefix logic only uses the
+  // `Dev-` prefix when NODE_ENV === "development"; ANY other value (unset, "test",
+  // "staging", …) resolves to the UNPREFIXED production tables. Guarding only
+  // against "production" would let those cases seed/clean prod data.
+  if (process.env.NODE_ENV !== "development") {
+    console.error("Refusing to run outside development. Set NODE_ENV=development.");
     process.exit(1);
   }
   const mode = process.argv.includes("--clean") ? "clean" : "seed";
