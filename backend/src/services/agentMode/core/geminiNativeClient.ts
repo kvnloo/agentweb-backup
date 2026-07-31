@@ -285,11 +285,6 @@ export function fromGeminiResponse(resp: any): any {
   // continuation path asks the model to continue (matches Vertex/Bedrock, ENG-403).
   const truncatedToolCall = isContinuation && hasToolCalls;
 
-  let finishReason: string;
-  if (isContinuation) finishReason = 'length';
-  else if (hasToolCalls) finishReason = 'tool_calls';
-  else finishReason = 'stop';
-
   // Gemini's block/filter finishes — content generated up to the point of the
   // block is NOT a complete answer, even when non-empty (e.g. the model started
   // answering, then got cut off by a safety filter partway through).
@@ -297,18 +292,29 @@ export function fromGeminiResponse(resp: any): any {
     'SAFETY', 'RECITATION', 'LANGUAGE', 'OTHER', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII', 'IMAGE_SAFETY',
   ]);
   const blockReason = resp?.promptFeedback?.blockReason || (BLOCK_FINISHES.has(geminiFinish) ? geminiFinish : undefined);
+  const isBlocked = !!blockReason && !isContinuation;
+
+  let finishReason: string;
+  if (isContinuation) finishReason = 'length';
+  // 'content_filter' is the SAME finish_reason Azure OpenAI already reports for a
+  // blocked completion, and agentModeService.ts already has dedicated handling for
+  // it (line ~3481) — reusing it here (instead of an ordinary 'stop') lets the
+  // agent loop's termination layer recognize this is a content-filtered turn, not
+  // a normal complete answer, even though any partial text is still surfaced with
+  // the notice below.
+  else if (isBlocked) finishReason = 'content_filter';
+  else if (hasToolCalls) finishReason = 'tool_calls';
+  else finishReason = 'stop';
 
   const hasText = textParts.length > 0;
   let content: string | null = textParts.join('') || null;
-  if (blockReason && !isContinuation) {
+  if (isBlocked) {
     // A block finish means whatever text made it out (if any) is a PARTIAL
-    // answer cut off mid-generation, not a complete response — reporting it as
-    // an ordinary finish_reason='stop' would let the agent loop treat a partial,
-    // possibly-misleading fragment as the final answer. And if there's no text
-    // at all (or candidates are empty entirely — resp.promptFeedback.blockReason
-    // — the turn can be fully blocked before any candidate exists), leaving
-    // content null would end the whole agent turn on a silent blank reply (the
-    // ENG-324/473/657 class). The loop's own backfill only covers the
+    // answer cut off mid-generation, not a complete response. And if there's no
+    // text at all (or candidates are empty entirely — resp.promptFeedback.
+    // blockReason — the turn can be fully blocked before any candidate exists),
+    // leaving content null would end the whole agent turn on a silent blank
+    // reply (the ENG-324/473/657 class). The loop's own backfill only covers the
     // reasoning-leak suppression path, not this, so both cases are handled here.
     const notice = `[Response cut short by Gemini content filtering (${blockReason})]`;
     content = hasText ? `${content}\n\n${notice}` : `I wasn't able to generate a response for this turn (Gemini: ${blockReason}). Please try rephrasing your request.`;

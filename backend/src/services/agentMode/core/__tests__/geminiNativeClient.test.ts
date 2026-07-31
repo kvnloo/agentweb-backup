@@ -360,20 +360,25 @@ describe('fromGeminiResponse', () => {
     const out = fromGeminiResponse(resp);
     expect(out.choices[0].message.content).toEqual(expect.stringContaining('SAFETY'));
     expect(out.choices[0].message).not.toHaveProperty('tool_calls');
-    expect(out.choices[0].finish_reason).toBe('stop');
+    // 'content_filter' (not 'stop') — the SAME finish_reason Azure OpenAI already
+    // reports for a blocked completion, which agentModeService.ts's termination
+    // layer already has dedicated handling for, so this is recognized as a
+    // content-filtered turn rather than an ordinary complete answer.
+    expect(out.choices[0].finish_reason).toBe('content_filter');
   });
 
   it('backfills a neutral message on a prompt-level block (no candidates at all)', () => {
     const resp = { candidates: [], promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } };
     const out = fromGeminiResponse(resp);
     expect(out.choices[0].message.content).toEqual(expect.stringContaining('PROHIBITED_CONTENT'));
-    expect(out.choices[0].finish_reason).toBe('stop');
+    expect(out.choices[0].finish_reason).toBe('content_filter');
   });
 
   it('flags PARTIAL text cut short by a block finish, not a silent complete answer (Greptile P1)', () => {
     // The model started answering, then got cut off by a safety filter partway
     // through. Reporting this as an ordinary finish_reason='stop' would let the
-    // agent loop present the partial fragment as a complete final answer.
+    // agent loop's termination layer treat the partial fragment as a normal
+    // complete answer instead of recognizing the content-filter condition.
     const resp = {
       candidates: [{
         finishReason: 'SAFETY',
@@ -384,7 +389,7 @@ describe('fromGeminiResponse', () => {
     expect(out.choices[0].message.content).toContain('Here is the beginning of the answer, but then');
     expect(out.choices[0].message.content).toEqual(expect.stringContaining('SAFETY'));
     expect(out.choices[0].message.content).toEqual(expect.stringContaining('cut short'));
-    expect(out.choices[0].finish_reason).toBe('stop');
+    expect(out.choices[0].finish_reason).toBe('content_filter');
   });
 });
 
