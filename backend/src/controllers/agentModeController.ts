@@ -2140,6 +2140,21 @@ export async function runScheduledChat(
         }
       };
 
+      // Require a durable lease before ever touching the resume marker (Greptile).
+      // If setRunInFlight threw (transient DynamoDB error, not a lost race — that
+      // case already returned above) leaseAcquired stays false and execution would
+      // otherwise fall through to claiming the marker and starting the worker with
+      // NO lease at all: a kill during that run would leave neither a reconcilable
+      // lease nor a resume marker (already consumed), so nothing could ever detect
+      // or retry it — a later, unrelated fire would duplicate its work blind. Defer
+      // without touching the marker; a later fire (hopefully with a working lease)
+      // retries the same resume.
+      if (!leaseAcquired) {
+        console.warn(`runScheduledChat: no durable lease for schedule ${schedule.scheduleId}; deferring resume of session ${pendingResumeSessionId} rather than proceeding without one (marker left intact).`);
+        await scheduleRetrySoon();
+        return deferredResumeResult('no-lease');
+      }
+
       // Load + validate BEFORE claiming, so a transient read failure never consumes
       // the marker or triggers a restart — the marker persists and a later fire retries.
       let resumeSession: any;

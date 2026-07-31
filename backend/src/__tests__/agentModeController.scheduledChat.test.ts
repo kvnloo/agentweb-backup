@@ -455,6 +455,27 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         const updateCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
         expect(updateCall).toBeUndefined();
       });
+
+      it('DEFERS without touching the marker when no durable lease could be established (ENG-657/Greptile)', async () => {
+        // If setRunInFlight throws (transient error, not a lost race — that path
+        // returns earlier), leaseAcquired stays false. Without this guard, execution
+        // would fall through to claiming the marker and starting the worker with NO
+        // lease at all — a kill during that run would leave neither a reconcilable
+        // lease nor a resume marker (already consumed), so nothing could ever detect
+        // or retry it.
+        (mockScheduleDb.setRunInFlight as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
+        } as any);
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        expect(result.sessionId).toBe('');
+        // The marker must NOT be consumed — a later, properly-leased dispatch retries it.
+        expect(mockScheduleDb.claimPendingResume).not.toHaveBeenCalled();
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+      });
     });
 
     it('stamps an in-flight lease on a production run and releases it when the run settles (ENG-324)', async () => {
