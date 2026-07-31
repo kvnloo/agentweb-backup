@@ -28883,11 +28883,50 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // deduped; a raw provider_id invite falls through to the live send unchanged.
           const invitePublicId = isUrl && profile_url ? linkedInPublicIdFromUrl(profile_url) : null;
           const inviteCanonicalUrl = invitePublicId ? `https://www.linkedin.com/in/${invitePublicId}/` : null;
+
+          // ENG-787: mirror this invite into the CRM lead list so the invitee is attributed
+          // (created if absent, marked 'contacted', logged with a linkedin.invite.sent
+          // engagement). Shared by the "already pending" skip branch and the live-send branch
+          // so a person the dedup guard skips STILL gets a CRM record. Requires a target
+          // list_id (the outreach caller passes the list it is working from) and a profile
+          // URL to key on. Best-effort: a CRM write must never fail/branch an invite Unipile
+          // already accepted, and the list_id is LLM-controlled so access is verified first.
+          const mirrorInviteToCrm = async (opts?: { note?: string; sentAt?: string }): Promise<void> => {
+            if (!args.list_id || !isUrl || !profile_url) return;
+            try {
+              const { crmDb } = await import('./db');
+              const mirrorList = await crmDb.getLeadListById(args.list_id);
+              if (!mirrorList || !(await crmDb.canOrgMemberAccessList(userId, mirrorList))) {
+                console.warn(`[AgentMode] send-invite: skipping CRM mirror — list ${args.list_id} not accessible to user ${userId}`);
+                return;
+              }
+              const { mirrorLinkedInInviteToCrm } = await import('./linkedInInviteCrmMirror');
+              await mirrorLinkedInInviteToCrm({
+                userId,
+                listId: args.list_id,
+                linkedinUrl: profile_url,
+                leadId: args.lead_id,
+                firstName: args.first_name,
+                lastName: args.last_name,
+                company: args.company,
+                title: args.title,
+                note: opts?.note ?? message ?? undefined,
+                accountId: account_id,
+                sentAt: opts?.sentAt,
+              });
+            } catch (mirrorErr) {
+              console.warn('[AgentMode] send-invite: failed to mirror invite to CRM (non-fatal):', mirrorErr);
+            }
+          };
+
           if (inviteCanonicalUrl) {
             const { getSentInvitationByProfileUrlAndAccount } = await import('./unipileSentInvitationsDb');
             const pending = await getSentInvitationByProfileUrlAndAccount(inviteCanonicalUrl, account_id).catch(() => null);
             if (pending) {
               console.log(`[AgentMode] send-invite: skipping ${profile_url} — invitation already pending (sent ${pending.sentAt ?? 'previously'})`);
+              // ENG-787: still mirror the already-pending invite so the CRM records the
+              // touch even though we skip the (quota-wasting) resend.
+              await mirrorInviteToCrm({ note: pending.invitationText, sentAt: pending.sentAt });
               return {
                 success: true,
                 alreadyInvited: true,
@@ -28934,41 +28973,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               }
             }
 
-            // ENG-787: mirror the invite into the CRM lead list so the invitee is
-            // attributed (created if absent, marked 'contacted', logged with a
-            // linkedin.invite.sent engagement). Requires a target list_id — the
-            // outreach caller passes the list it is working from. Best-effort: a CRM
-            // write must never fail an invite Unipile already accepted, and a raw
-            // provider_id send (no profile URL) has no key to reconcile on.
-            if (args.list_id && isUrl && profile_url) {
-              try {
-                // Access guard (ENG-787): args.list_id is LLM-controlled and this mirror
-                // CREATES leads + engagement, so verify the caller can access the target
-                // list before writing — matching add_leads/update_lead_status and crm.ts.
-                // A foreign or missing list is skipped (non-fatal), never written to.
-                const { crmDb } = await import('./db');
-                const mirrorList = await crmDb.getLeadListById(args.list_id);
-                if (!mirrorList || !(await crmDb.canOrgMemberAccessList(userId, mirrorList))) {
-                  console.warn(`[AgentMode] send-invite: skipping CRM mirror — list ${args.list_id} not accessible to user ${userId}`);
-                } else {
-                  const { mirrorLinkedInInviteToCrm } = await import('./linkedInInviteCrmMirror');
-                  await mirrorLinkedInInviteToCrm({
-                    userId,
-                    listId: args.list_id,
-                    linkedinUrl: profile_url,
-                    leadId: args.lead_id,
-                    firstName: args.first_name,
-                    lastName: args.last_name,
-                    company: args.company,
-                    title: args.title,
-                    note: message ?? undefined,
-                    accountId: account_id,
-                  });
-                }
-              } catch (mirrorErr) {
-                console.warn('[AgentMode] send-invite: failed to mirror invite to CRM (non-fatal):', mirrorErr);
-              }
-            }
+            // ENG-787: mirror the freshly-sent invite into the CRM lead list (see the
+            // shared mirrorInviteToCrm helper above).
+            await mirrorInviteToCrm();
 
             return { success: true, data: inviteResult };
           } catch (inviteErr: any) {
