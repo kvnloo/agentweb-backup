@@ -117,3 +117,111 @@ export async function mirrorLinkedInInviteToCrm(
 
   return { leadId, created };
 }
+
+/** Split a LinkedIn display name ("Bala S.", "泓杰 虞") into best-effort first/last. */
+function splitInvitedUserName(name?: string): { firstName?: string; lastName?: string } {
+  const trimmed = (name || '').trim().replace(/\s+/g, ' ');
+  if (!trimmed) return {};
+  const parts = trimmed.split(' ');
+  if (parts.length === 1) return { firstName: parts[0] };
+  return { firstName: parts[0], lastName: parts.slice(1).join(' ') };
+}
+
+export interface ReconcileInvitationsParams {
+  /** Unipile account whose pending sent-invitations should be reconciled into the CRM. */
+  accountId: string;
+  /** Target CRM lead list to reconcile the pending invitees into. */
+  listId: string;
+  /** List-owner userId — stamped on newly-created leads for audit. */
+  userId?: string;
+  /**
+   * When true, refresh the AW-UnipileSentInvitations cache from Unipile's live feed
+   * before reconciling, so invites sent since the last ~10-min sync are included.
+   * Defaults to true — a reconciliation should reflect the live LinkedIn state.
+   */
+  refreshFromLive?: boolean;
+}
+
+export interface ReconcileInvitationsResult {
+  /** Total pending invitations considered. */
+  total: number;
+  /** Leads newly created by the reconciliation. */
+  created: number;
+  /** Existing leads updated (contacted/timestamp/engagement). */
+  updated: number;
+  /** Invitations skipped (no usable /in/ URL, or a per-item error). */
+  skipped: number;
+}
+
+/**
+ * Reconcile an account's PENDING LinkedIn sent-invitations into a CRM lead list (ENG-787).
+ *
+ * This is the one-way sync / backfill the issue asked for: it closes the CRM↔LinkedIn
+ * attribution gap for invitations that the per-send mirror missed —
+ *   • historical invites sent before the mirror shipped,
+ *   • invites the outreach agent sent without a list_id,
+ *   • invites the send-time dedup guard skipped (already pending).
+ *
+ * It reuses ENG-182's live pending-invitation cache (AW-UnipileSentInvitations) as the
+ * authoritative source of "who has an outstanding invite" and mirrors each one via
+ * {@link mirrorLinkedInInviteToCrm}. Per-item best-effort: one bad invite never aborts
+ * the batch. The caller supplies the account→list mapping (there is no stored binding).
+ *
+ * NOTE: this performs BULK CRM writes (create/update leads + engagement). Running it
+ * against a production list is a data-plane operation — gate it accordingly.
+ */
+export async function reconcileSentInvitationsToCrm(
+  params: ReconcileInvitationsParams,
+): Promise<ReconcileInvitationsResult> {
+  const { accountId, listId, userId } = params;
+  const result: ReconcileInvitationsResult = { total: 0, created: 0, updated: 0, skipped: 0 };
+  if (!accountId || !listId) return result;
+
+  // Refresh the cache from Unipile's live sent feed first (default on) so the
+  // reconciliation reflects invites sent since the last ~10-min sync cron.
+  if (params.refreshFromLive !== false) {
+    try {
+      const { syncSentInvitationsForAccount } = await import('../cron/linkedInConnectionSyncCron');
+      await syncSentInvitationsForAccount(accountId);
+    } catch (syncErr) {
+      // Non-fatal: reconcile against whatever the cache already holds.
+      console.warn(`[reconcileSentInvitations] live refresh failed for account ${accountId} (using cache):`, syncErr);
+    }
+  }
+
+  const { getAllSentInvitationsByAccount } = await import('./unipileSentInvitationsDb');
+  const pending = await getAllSentInvitationsByAccount(accountId);
+  result.total = pending.length;
+
+  for (const inv of pending) {
+    try {
+      const { firstName, lastName } = splitInvitedUserName(inv.invitedUserName);
+      const mirror = await mirrorLinkedInInviteToCrm({
+        userId,
+        listId,
+        linkedinUrl: inv.publicProfileUrl,
+        firstName,
+        lastName,
+        note: inv.invitationText,
+        accountId,
+        sentAt: inv.sentAt,
+      });
+      if (!mirror) {
+        result.skipped++;
+      } else if (mirror.created) {
+        result.created++;
+      } else {
+        result.updated++;
+      }
+    } catch (itemErr) {
+      // One malformed/racey invite must never abort the whole reconciliation.
+      console.warn(`[reconcileSentInvitations] failed to mirror ${inv.invitedUserPublicId} (skipped):`, itemErr);
+      result.skipped++;
+    }
+  }
+
+  console.log(
+    `[reconcileSentInvitations] account=${accountId} list=${listId} total=${result.total} created=${result.created} updated=${result.updated} skipped=${result.skipped}`,
+  );
+  return result;
+}
