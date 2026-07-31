@@ -37,6 +37,7 @@ jest.mock('../services/metaAudienceCampaignTokenStore', () => ({
 }));
 jest.mock('../utils/ssrfGuard', () => ({
   assertPublicHostname: jest.fn().mockResolvedValue(undefined),
+  resolvePinnedPublicAddress: jest.fn().mockResolvedValue({ hostname: 's3.example.com', address: '93.184.216.34', family: 4 }),
   SsrfBlockedError: class SsrfBlockedError extends Error {},
 }));
 
@@ -44,7 +45,7 @@ import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from '../services/metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken } from '../services/metaAudienceCampaignTokenStore';
-import { assertPublicHostname } from '../utils/ssrfGuard';
+import { assertPublicHostname, resolvePinnedPublicAddress } from '../utils/ssrfGuard';
 
 describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
   let agentModeService: AgentModeService;
@@ -58,6 +59,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     (claimPreviewToken as jest.Mock).mockResolvedValue(true);
     (releasePreviewToken as jest.Mock).mockResolvedValue(undefined);
     (assertPublicHostname as jest.Mock).mockResolvedValue(undefined);
+    (resolvePinnedPublicAddress as jest.Mock).mockResolvedValue({ hostname: 's3.example.com', address: '93.184.216.34', family: 4 });
   });
 
   const ACCOUNT_ID = '922903076601160';
@@ -151,7 +153,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
       spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST
       const { SsrfBlockedError } = require('../utils/ssrfGuard');
-      (assertPublicHostname as jest.Mock).mockRejectedValueOnce(new SsrfBlockedError());
+      (resolvePinnedPublicAddress as jest.Mock).mockRejectedValueOnce(new SsrfBlockedError());
 
       await expect(callResolveOrCreateSeedAudience(
         USER_ID, ACCOUNT_ID, 'RankAI Warm List',
@@ -186,6 +188,34 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(axios.get).toHaveBeenCalledWith('https://s3.example.com/audience.csv', expect.objectContaining({
         maxRedirects: 0,
       }));
+    });
+
+    // Greptile finding: resolvePinnedPublicAddress validates one DNS answer,
+    // but a caller that does its own SEPARATE lookup afterward (axios.get's
+    // default behavior) is vulnerable to DNS rebinding — an attacker DNS
+    // server can answer a public IP for validation and a private IP for the
+    // actual connection, since they're two independent queries. Pinning
+    // axios's connection to the exact address that was validated (via a
+    // custom `lookup` function) eliminates the second, unvalidated lookup.
+    it('pins the CSV fetch to the exact address validated by the SSRF guard (DNS-rebinding defense)', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_y', name: 'RankAI Warm List' } } as any); // CREATE
+      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
+      (resolvePinnedPublicAddress as jest.Mock).mockResolvedValueOnce({ hostname: 's3.example.com', address: '203.0.113.7', family: 4 });
+      (axios.get as jest.Mock).mockResolvedValueOnce({ data: 'test@example.com,1234567890' });
+
+      await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'RankAI Warm List',
+        { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' },
+        { dryRun: false }
+      );
+
+      const [, config] = (axios.get as jest.Mock).mock.calls[0];
+      expect(typeof config.lookup).toBe('function');
+      const callback = jest.fn();
+      config.lookup('s3.example.com', {}, callback);
+      expect(callback).toHaveBeenCalledWith(null, '203.0.113.7', 4);
     });
 
     it('fails fast (does not attempt CREATE/UPLOAD_USERS) when the CSV fetch itself fails', async () => {

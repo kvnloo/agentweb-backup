@@ -187,7 +187,7 @@ import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken } from './metaAudienceCampaignTokenStore';
-import { assertPublicHostname } from '../utils/ssrfGuard';
+import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -17113,13 +17113,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // with no destination restriction — a classic SSRF vector (cloud metadata
     // endpoints, RFC1918/internal hosts, loopback). Reuses the repo's existing
     // guard rather than reinventing IP-range checks.
-    await assertPublicHostname(csvUrl);
-    // SSRF defence-in-depth: refuse to follow redirects. assertPublicHostname
-    // only validates the user-supplied URL; if axios followed a redirect to
+    //
+    // Greptile follow-up finding (DNS rebinding): validating the hostname
+    // alone isn't enough if axios then does its own SEPARATE DNS lookup to
+    // actually connect — an attacker-controlled DNS server can answer a
+    // public IP for the validation query and a private IP for the
+    // connection query. Pinning the connection to the exact address that
+    // was validated (via a custom `lookup`) eliminates the second,
+    // unvalidated lookup entirely.
+    const { address, family } = await resolvePinnedPublicAddress(csvUrl);
+    // SSRF defence-in-depth: refuse to follow redirects. Validation only
+    // covers the user-supplied URL itself; if axios followed a redirect to
     // e.g. http://169.254.169.254/, the guard would be bypassed entirely.
     // maxRedirects:0 makes axios surface a redirect as an error instead —
     // same defense already used by routes/crm.ts's load-from-url path.
-    const response = await axios.get(csvUrl, { maxRedirects: 0 } as any);
+    const response = await axios.get(csvUrl, {
+      maxRedirects: 0,
+      lookup: (_hostname: string, options: any, callback: any) => {
+        if (typeof options === 'function') callback = options;
+        callback(null, address, family);
+      },
+    } as any);
     if (Array.isArray(response.data)) {
       return response.data;
     }

@@ -130,10 +130,20 @@ export class SsrfBlockedError extends Error {
 }
 
 /**
- * Throws SsrfBlockedError if the URL's hostname is internal or resolves to
- * a private/internal IP. Returns void on success.
+ * Validates a URL's hostname is not internal and resolves only to public
+ * IPs, and returns the validated hostname plus ONE resolved address/family.
+ *
+ * Greptile finding: assertPublicHostname alone validates one DNS answer, but
+ * a caller that does its own SEPARATE lookup afterward to actually connect
+ * (e.g. axios.get without pinning) is vulnerable to DNS rebinding — an
+ * attacker-controlled DNS server can return a public IP for the validation
+ * lookup and a private IP for the connection lookup, since they're two
+ * independent queries. Callers that need to be rebinding-safe should use
+ * this function and pin their connection to the returned address (see
+ * agentModeService.fetchAndParseCsvRows) instead of re-resolving the
+ * hostname a second time.
  */
-export async function assertPublicHostname(rawUrl: string): Promise<void> {
+export async function resolvePinnedPublicAddress(rawUrl: string): Promise<{ hostname: string; address: string; family: number }> {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
@@ -157,7 +167,7 @@ export async function assertPublicHostname(rawUrl: string): Promise<void> {
     if (isPrivateIP(hostname)) {
       throw new SsrfBlockedError();
     }
-    return;
+    return { hostname, address: hostname, family: isIPv4(hostname) ? 4 : 6 };
   }
 
   // Otherwise resolve via DNS (`all: true` returns every A/AAAA record).
@@ -178,4 +188,16 @@ export async function assertPublicHostname(rawUrl: string): Promise<void> {
       throw new SsrfBlockedError();
     }
   }
+
+  return { hostname, address: addresses[0].address, family: addresses[0].family };
+}
+
+/**
+ * Throws SsrfBlockedError if the URL's hostname is internal or resolves to
+ * a private/internal IP. Returns void on success. Callers that then connect
+ * with a SEPARATE DNS lookup (rather than pinning to the address this
+ * validated) remain exposed to DNS rebinding — see resolvePinnedPublicAddress.
+ */
+export async function assertPublicHostname(rawUrl: string): Promise<void> {
+  await resolvePinnedPublicAddress(rawUrl);
 }
