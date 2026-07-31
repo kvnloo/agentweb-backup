@@ -831,6 +831,76 @@ describe('MetaService', () => {
                 expect(mockCreateUser).toHaveBeenCalledTimes(2);
             });
         });
+
+        // ENG-600 Greptile finding: reusing an existing audience for a fresh
+        // source upload never removed members no longer present in the new
+        // source — a contact removed from a HubSpot list (or dropped from a
+        // refreshed CSV) stayed in the Meta audience forever. deleteCustomAudienceUsers
+        // is the removal counterpart to uploadCustomAudienceUsers, used by
+        // agentModeService to sync stale members out before/after re-upload.
+        describe('deleteCustomAudienceUsers', () => {
+            it('sends a single request with no session object when the payload is <= 10,000 rows', async () => {
+                const mockDeleteUsers = jest.fn().mockResolvedValue({ _data: { num_received: 2 } });
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    deleteUsers: mockDeleteUsers,
+                }));
+
+                const payload = [['hash1', 'hash2'], ['hash3', 'hash4']];
+                const result = await service.deleteCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL', 'PHONE'], payload
+                );
+
+                expect(mockDeleteUsers).toHaveBeenCalledTimes(1);
+                const [, calledParams] = mockDeleteUsers.mock.calls[0];
+                expect(calledParams.payload.schema).toEqual(['EMAIL', 'PHONE']);
+                expect(calledParams.payload.data).toEqual(payload);
+                expect(calledParams.payload.session).toBeUndefined();
+                expect(result).toEqual({ num_received: 2 });
+            });
+
+            it('chunks a payload over 10,000 rows into sequential session-batched requests', async () => {
+                const mockDeleteUsers = jest.fn()
+                    .mockResolvedValueOnce({ _data: { num_received: 10000 } })
+                    .mockResolvedValueOnce({ _data: { num_received: 500 } });
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    deleteUsers: mockDeleteUsers,
+                }));
+
+                const payload = Array.from({ length: 10500 }, (_, i) => [`hash${i}`]);
+                await service.deleteCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL'], payload
+                );
+
+                expect(mockDeleteUsers).toHaveBeenCalledTimes(2);
+                const [, firstParams] = mockDeleteUsers.mock.calls[0];
+                expect(firstParams.payload.data).toHaveLength(10000);
+                expect(firstParams.payload.session.batch_seq).toBe(1);
+                expect(firstParams.payload.session.last_batch_flag).toBe(false);
+
+                const [, secondParams] = mockDeleteUsers.mock.calls[1];
+                expect(secondParams.payload.data).toHaveLength(500);
+                expect(secondParams.payload.session.batch_seq).toBe(2);
+                expect(secondParams.payload.session.last_batch_flag).toBe(true);
+                expect(secondParams.payload.session.session_id).toBe(firstParams.payload.session.session_id);
+            });
+
+            it('surfaces a mid-delete batch failure (throws) without silently dropping it', async () => {
+                const mockDeleteUsers = jest.fn()
+                    .mockResolvedValueOnce({ _data: { num_received: 10000 } })
+                    .mockRejectedValueOnce(new Error('Batch 2 rejected'));
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    deleteUsers: mockDeleteUsers,
+                }));
+
+                const payload = Array.from({ length: 10500 }, (_, i) => [`hash${i}`]);
+
+                await expect(service.deleteCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL'], payload
+                )).rejects.toThrow('Batch 2 rejected');
+
+                expect(mockDeleteUsers).toHaveBeenCalledTimes(2);
+            });
+        });
     });
 
     describe('Targeting Operations', () => {

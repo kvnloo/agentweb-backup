@@ -1929,6 +1929,56 @@ export class MetaService {
     }
   }
 
+  /**
+   * Remove users from a Custom Audience (the sync-to-remove counterpart of
+   * uploadCustomAudienceUsers). Chunking/session protocol mirrors the upload
+   * method exactly — Meta's 10,000-record cap and session_id/batch_seq/
+   * last_batch_flag batching apply to /users deletes the same way.
+   */
+  public async deleteCustomAudienceUsers(adAccountId: string, accessToken: string, audienceId: string, schema: string[], payload: string | string[][]) {
+    try {
+      this.initApi(accessToken);
+      const audience = new CustomAudience(audienceId);
+
+      this.log(`Deleting users from custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
+
+      const rows = payload;
+      if (!Array.isArray(rows) || rows.length <= MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE) {
+        const result = await audience.deleteUsers([], { payload: { schema, data: payload } });
+        return result._data || result;
+      }
+
+      const sessionId = Math.floor(Math.random() * 1_000_000_000);
+      const totalBatches = Math.ceil(rows.length / MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE);
+      let lastResult: any;
+      for (let i = 0; i < totalBatches; i++) {
+        const chunk = rows.slice(
+          i * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE,
+          (i + 1) * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE
+        );
+        const batchSeq = i + 1;
+        const isLastBatch = batchSeq === totalBatches;
+        this.log(`Deleting batch ${batchSeq}/${totalBatches} from custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
+        const result = await audience.deleteUsers([], {
+          payload: {
+            schema,
+            data: chunk,
+            session: {
+              session_id: sessionId,
+              batch_seq: batchSeq,
+              last_batch_flag: isLastBatch,
+              estimated_num_total: rows.length,
+            },
+          },
+        });
+        lastResult = result._data || result;
+      }
+      return lastResult;
+    } catch (error) {
+      return this.handleError(error, 'deleteCustomAudienceUsers');
+    }
+  }
+
   // Geolocation search types must go through the top-level /search endpoint,
   // NOT the ad account 'targetingsearch' edge (which only resolves interests/
   // behaviors/demographics and silently returns interest-style results for
