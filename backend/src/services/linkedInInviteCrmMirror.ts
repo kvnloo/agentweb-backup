@@ -22,30 +22,59 @@ const INVITE_SENT_EVENT = 'linkedin.invite.sent';
  * designed to be re-run as a backstop. That would turn the ENG-787 under-count
  * into an over-count and inflate follow-up cadence.
  *
- * Identity is (event type, sending account, invitee) — deliberately NOT the send
- * time. A single invitation carries different timestamps at different points in
- * its life: the fresh send stamps locally, the cache row is later overwritten by
- * the sync cron with Unipile's own parsed_datetime, and the reconciliation reads
- * that. Keying on the timestamp would let one invitation be logged twice as it
- * moved between those sources.
+ * Identity is Unipile's own `invitationId` — stable for the life of one invitation
+ * and the only value every path agrees on. It is deliberately NOT the send time:
+ * one invitation carries several timestamps over its life (the fresh send stamps
+ * locally, the sync cron then overwrites the cache row with Unipile's
+ * parsed_datetime, and the reconciliation reads that), so a time-keyed identity
+ * logged the same invitation once per source.
  *
- * Trade-off: a person genuinely re-invited later (the first invite accepted or
- * withdrawn, then a new one sent) does not get a second engagement row — their
- * `linkedInInviteSentAt` still advances. Under-counting a rare re-invite is much
- * cheaper than the per-run over-count this prevents, and re-invites are already
- * suppressed by the send-time pending guard.
+ * A different `invitationId` means a genuinely new invitation — the invitee was
+ * re-invited after the first was accepted or withdrawn — and is recorded. Rows
+ * written before ids were carried have no `invitationId`; they match anything for
+ * the same account and invitee, which errs toward not duplicating.
+ *
+ * With no `invitationId` on the incoming side either, any prior invite-sent
+ * engagement for this account and invitee counts as already recorded.
  */
 function hasInviteEngagement(
   lead: any,
-  opts: { linkedin: string; accountId: string },
+  opts: { linkedin: string; accountId: string; invitationId?: string },
 ): boolean {
   const engagements = Array.isArray(lead?.engagements) ? lead.engagements : [];
-  return engagements.some(
+  const candidates = engagements.filter(
     (e: any) =>
       String(e?.eventType ?? '') === INVITE_SENT_EVENT &&
       String(e?.eventData?.linkedin ?? '') === opts.linkedin &&
       String(e?.eventData?.accountId ?? '') === opts.accountId,
   );
+  if (candidates.length === 0) return false;
+  const incomingId = (opts.invitationId ?? '').trim();
+  if (!incomingId) return true;
+  return candidates.some((e: any) => {
+    const recordedId = String(e?.eventData?.invitationId ?? '').trim();
+    return recordedId === incomingId || recordedId === '';
+  });
+}
+
+/**
+ * Confirm a caller-supplied lead that carries no LinkedIn URL, by name.
+ *
+ * Used only when the lead cannot be matched on URL. Both names must be present on
+ * both sides — a partial or absent name is not evidence of identity.
+ */
+function namesMatch(
+  lead: any,
+  firstName?: string,
+  lastName?: string,
+): boolean {
+  const norm = (v: unknown) => String(v ?? '').trim().toLowerCase();
+  const leadFirst = norm(lead?.firstName);
+  const leadLast = norm(lead?.lastName);
+  const first = norm(firstName);
+  const last = norm(lastName);
+  if (!leadFirst || !leadLast || !first || !last) return false;
+  return leadFirst === first && leadLast === last;
 }
 
 export interface MirrorInviteParams {
@@ -65,8 +94,21 @@ export interface MirrorInviteParams {
   note?: string;
   /** The Unipile account that sent the invite, recorded on the engagement. */
   accountId?: string;
+  /**
+   * Unipile's invitation id — the stable identity of this invitation. Supply it
+   * wherever it is available so a re-mirror is recognised as the same invitation
+   * and a genuine re-invite is recognised as a different one.
+   */
+  invitationId?: string;
   /** ISO timestamp of the send; defaults to now. */
   sentAt?: string;
+  /**
+   * Other lists belonging to the same owner to check before creating in `listId`.
+   * One LinkedIn account can drive outreach for several lists, so an invitee may
+   * already be a lead somewhere other than the caller's default target; mirroring
+   * onto that existing lead is more faithful than duplicating them into this one.
+   */
+  searchListIds?: string[];
   /**
    * Read-only preview: resolve whether the invitee WOULD be created vs updated, but
    * write nothing (no createLead/updateLead/addLeadEngagement). Used by the
@@ -78,6 +120,9 @@ export interface MirrorInviteParams {
 export interface MirrorInviteResult {
   /** Resolved lead id ('' for a would-be create under dryRun). */
   leadId: string;
+  /** The list the lead actually lives in — may differ from the requested `listId`
+   *  when the invitee was already a lead in another of the owner's lists. */
+  listId: string;
   /** True when a new lead was (or would be) created; false when an existing lead matched. */
   created: boolean;
   /**
@@ -86,6 +131,44 @@ export interface MirrorInviteResult {
    * or a repeat reconciliation run) and the append was skipped.
    */
   engagementLogged: boolean;
+}
+
+/** Bound the cross-list search so a large account cannot turn one mirror into many reads. */
+const MAX_SEARCH_LISTS = 25;
+
+/**
+ * Resolve the CRM lead list a Unipile account sends for, from the stored binding.
+ *
+ * A lead list can be assigned a `linkedInAccountId` (see the CRM list settings), so
+ * the account→list mapping does exist in data — it just was not being used. This
+ * makes attribution work when the outreach agent omits `list_id`, which is
+ * otherwise the one place the mirror depends on the model remembering to pass an
+ * argument.
+ *
+ * Returns null unless EXACTLY one of the owner's lists is bound to the account —
+ * with several bound lists there is no non-arbitrary choice, and guessing would
+ * attribute invites to the wrong list.
+ */
+export async function resolveListIdForAccount(
+  userId: string,
+  accountId: string,
+): Promise<string | null> {
+  if (!userId || !accountId) return null;
+  try {
+    const { crmDb } = await import('./db');
+    const lists = (await crmDb.getLeadListsByUserId(userId)) as any[];
+    const bound = (lists || []).filter((l) => String(l?.linkedInAccountId ?? '') === accountId);
+    if (bound.length === 1) return String(bound[0].listId);
+    if (bound.length > 1) {
+      console.warn(
+        `[mirrorLinkedInInvite] ${bound.length} lists are bound to account ${accountId} for user ${userId} — cannot pick one, skipping ambient attribution`,
+      );
+    }
+    return null;
+  } catch (err) {
+    console.warn(`[mirrorLinkedInInvite] failed to resolve list for account ${accountId}:`, err);
+    return null;
+  }
 }
 
 /**
@@ -118,48 +201,72 @@ export async function mirrorLinkedInInviteToCrm(
   // (a same-URL match in another list is a different lead and must not be reused) and
   // pages past the 10-item ceiling that would otherwise hide the match.
   let leadId = params.leadId;
+  let listId = params.listId;
   let existing: any = null;
+  // True when the resolved lead carries no LinkedIn URL of its own, so the mirror
+  // should stamp one and make it keyable next time.
+  let needsLinkedinStamp = false;
   if (leadId) {
-    const candidate = await crmDb.getLeadById(params.listId, leadId);
-    // A caller-supplied leadId is only trusted when the lead's own LinkedIn URL
-    // canonically matches the invitee. On the outreach path lead_id and
-    // profile_url are two independent LLM-supplied values, so a stale or
-    // mismatched lead_id would otherwise mark the WRONG person contacted and
-    // attach this invitee's engagement to them. A lead with no stored URL cannot
-    // confirm identity either, so it is not trusted — resolving by URL instead
-    // may create an extra lead, which is visible and mergeable, where a silent
-    // mis-attribution is neither.
+    const candidate = await crmDb.getLeadById(listId, leadId);
+    // A caller-supplied leadId is only trusted when identity can be confirmed. On
+    // the outreach path lead_id and profile_url are two independent LLM-supplied
+    // values, so a stale or mismatched lead_id would otherwise mark the WRONG
+    // person contacted and attach this invitee's engagement to them. The URL is
+    // the strong signal; for a lead that has no URL yet, a full first+last name
+    // match is accepted and the URL is written on so the next call can key on it.
     const candidateUrl = candidate ? normalizeLinkedInUrl(candidate.linkedin) : '';
     if (candidate && candidateUrl === normalized) {
       existing = candidate;
+    } else if (candidate && !candidateUrl && namesMatch(candidate, params.firstName, params.lastName)) {
+      existing = candidate;
+      needsLinkedinStamp = true;
     } else {
       if (candidate) {
         console.warn(
-          `[mirrorLinkedInInvite] ignoring leadId ${leadId} in list ${params.listId} — its LinkedIn URL does not match the invitee; resolving by profile URL instead`,
+          `[mirrorLinkedInInvite] ignoring leadId ${leadId} in list ${listId} — neither its LinkedIn URL nor its name confirms the invitee; resolving by profile URL instead`,
         );
       }
       leadId = undefined;
     }
   }
   if (!leadId) {
-    existing = await crmDb.findLeadByLinkedinInList(params.listId, normalized);
+    existing = await crmDb.findLeadByLinkedinInList(listId, normalized);
     if (existing) leadId = existing.leadId as string;
   }
+  // Still absent from the caller's target list: before creating a duplicate, look
+  // in the owner's other lists. One LinkedIn account commonly drives outreach for
+  // several lists, so the invitee may already be a lead elsewhere — mirroring onto
+  // that lead attributes the invite where the CRM already tracks the person.
+  if (!leadId && params.searchListIds?.length) {
+    for (const candidateListId of params.searchListIds.slice(0, MAX_SEARCH_LISTS)) {
+      if (candidateListId === listId) continue;
+      const hit = await crmDb.findLeadByLinkedinInList(candidateListId, normalized);
+      if (hit) {
+        existing = hit;
+        leadId = hit.leadId as string;
+        listId = candidateListId;
+        break;
+      }
+    }
+  }
+
+  const invitationId = (params.invitationId ?? '').trim();
 
   // Read-only preview: report whether this invitee would be created vs updated, no writes.
   if (params.dryRun) {
     const alreadyLogged = !!existing && hasInviteEngagement(existing, {
       linkedin: normalized,
       accountId: params.accountId || '',
+      invitationId,
     });
-    return { leadId: leadId ?? '', created: !leadId, engagementLogged: !alreadyLogged };
+    return { leadId: leadId ?? '', listId, created: !leadId, engagementLogged: !alreadyLogged };
   }
 
   let created = false;
   if (!leadId) {
     // createLead stores the LinkedIn URL verbatim, so pass the already-normalized value
     // to keep it consistent with the LinkedinLookupIndex GSI reads above.
-    const newLead = await crmDb.createLead(params.listId, {
+    const newLead = await crmDb.createLead(listId, {
       linkedin: normalized,
       firstName: params.firstName,
       lastName: params.lastName,
@@ -177,32 +284,38 @@ export async function mirrorLinkedInInviteToCrm(
   // Advance status to 'contacted' only when the lead has no meaningful status yet.
   // Always stamp the invite timestamp so the UI reflects the send.
   const currentStatus = String(existing?.status ?? '').trim().toLowerCase();
-  const leadUpdate: { status?: string; linkedInInviteSentAt: string } = {
+  const leadUpdate: { status?: string; linkedInInviteSentAt: string; linkedin?: string } = {
     linkedInInviteSentAt: sentAt,
   };
   if (!created && UNCONTACTED_STATUSES.has(currentStatus)) {
     leadUpdate.status = 'contacted';
   }
-  await crmDb.updateLead(params.listId, leadId, leadUpdate);
+  // A name-confirmed lead had no URL of its own; write it so the next mirror can
+  // key on the URL instead of relying on the name again.
+  if (needsLinkedinStamp) {
+    leadUpdate.linkedin = normalized;
+  }
+  await crmDb.updateLead(listId, leadId, leadUpdate);
 
   // Lead-level engagement record — provenance + so follow-up cadence can fire.
   // Skipped when this exact invitation is already on the lead, so re-mirroring a
   // still-pending invite (or re-running the reconciliation) stays idempotent.
   const accountId = params.accountId || '';
-  if (!created && hasInviteEngagement(existing, { linkedin: normalized, accountId })) {
-    return { leadId, created, engagementLogged: false };
+  if (!created && hasInviteEngagement(existing, { linkedin: normalized, accountId, invitationId })) {
+    return { leadId, listId, created, engagementLogged: false };
   }
-  await crmDb.addLeadEngagement(params.listId, leadId, {
+  await crmDb.addLeadEngagement(listId, leadId, {
     eventType: INVITE_SENT_EVENT,
     eventData: {
       note: params.note || '',
       accountId,
       linkedin: normalized,
+      invitationId,
     },
     createdAt: sentAt,
   });
 
-  return { leadId, created, engagementLogged: true };
+  return { leadId, listId, created, engagementLogged: true };
 }
 
 /** Split a LinkedIn display name ("Bala S.", "泓杰 虞") into best-effort first/last. */
@@ -228,6 +341,13 @@ export interface ReconcileInvitationsParams {
    */
   refreshFromLive?: boolean;
   /**
+   * Also look for each invitee in the owner's OTHER lists before creating them in
+   * `listId`. One LinkedIn account frequently drives outreach for several lists, so
+   * a blind backfill into one list duplicates people the CRM already tracks
+   * elsewhere. Defaults to true when `userId` is supplied.
+   */
+  searchOwnerLists?: boolean;
+  /**
    * Read-only preview: compute the created/updated/skipped counts without writing any
    * lead or engagement. Validates a backfill before the real (data-plane) run.
    */
@@ -250,6 +370,12 @@ export interface ReconcileInvitationsResult {
    * invitations arrived since.
    */
   alreadyRecorded: number;
+  /**
+   * Of `updated`, how many were matched in one of the owner's OTHER lists rather
+   * than the target list. A high number means the account→list mapping supplied is
+   * not the whole picture — worth checking before trusting a blind backfill.
+   */
+  matchedInOtherList: number;
 }
 
 /**
@@ -274,7 +400,7 @@ export async function reconcileSentInvitationsToCrm(
 ): Promise<ReconcileInvitationsResult> {
   const { accountId, listId, userId } = params;
   const result: ReconcileInvitationsResult = {
-    total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0,
+    total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0, matchedInOtherList: 0,
   };
   if (!accountId || !listId) return result;
 
@@ -287,6 +413,20 @@ export async function reconcileSentInvitationsToCrm(
     } catch (syncErr) {
       // Non-fatal: reconcile against whatever the cache already holds.
       console.warn(`[reconcileSentInvitations] live refresh failed for account ${accountId} (using cache):`, syncErr);
+    }
+  }
+
+  // The owner's other lists, so an invitee already tracked elsewhere is attributed
+  // to that lead instead of being duplicated into the target list.
+  let searchListIds: string[] | undefined;
+  if (userId && params.searchOwnerLists !== false) {
+    try {
+      const { crmDb } = await import('./db');
+      const lists = (await crmDb.getLeadListsByUserId(userId)) as any[];
+      searchListIds = lists.map((l) => String(l.listId)).filter((id) => id && id !== listId);
+    } catch (listErr) {
+      // Non-fatal: fall back to target-list-only resolution.
+      console.warn(`[reconcileSentInvitations] could not load other lists for user ${userId}:`, listErr);
     }
   }
 
@@ -305,7 +445,9 @@ export async function reconcileSentInvitationsToCrm(
         lastName,
         note: inv.invitationText,
         accountId,
+        invitationId: inv.invitationId,
         sentAt: inv.sentAt,
+        searchListIds,
         dryRun: params.dryRun,
       });
       if (!mirror) {
@@ -315,6 +457,7 @@ export async function reconcileSentInvitationsToCrm(
       } else {
         result.updated++;
         if (!mirror.engagementLogged) result.alreadyRecorded++;
+        if (mirror.listId !== listId) result.matchedInOtherList++;
       }
     } catch (itemErr) {
       // One malformed/racey invite must never abort the whole reconciliation.
@@ -324,7 +467,7 @@ export async function reconcileSentInvitationsToCrm(
   }
 
   console.log(
-    `[reconcileSentInvitations]${params.dryRun ? ' (DRY-RUN, no writes)' : ''} account=${accountId} list=${listId} total=${result.total} created=${result.created} updated=${result.updated} (alreadyRecorded=${result.alreadyRecorded}) skipped=${result.skipped}`,
+    `[reconcileSentInvitations]${params.dryRun ? ' (DRY-RUN, no writes)' : ''} account=${accountId} list=${listId} total=${result.total} created=${result.created} updated=${result.updated} (alreadyRecorded=${result.alreadyRecorded}, matchedInOtherList=${result.matchedInOtherList}) skipped=${result.skipped}`,
   );
   return result;
 }
