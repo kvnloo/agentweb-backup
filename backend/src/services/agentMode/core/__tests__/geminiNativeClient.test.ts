@@ -369,6 +369,23 @@ describe('fromGeminiResponse', () => {
     expect(out.choices[0].message.content).toEqual(expect.stringContaining('PROHIBITED_CONTENT'));
     expect(out.choices[0].finish_reason).toBe('stop');
   });
+
+  it('flags PARTIAL text cut short by a block finish, not a silent complete answer (Greptile P1)', () => {
+    // The model started answering, then got cut off by a safety filter partway
+    // through. Reporting this as an ordinary finish_reason='stop' would let the
+    // agent loop present the partial fragment as a complete final answer.
+    const resp = {
+      candidates: [{
+        finishReason: 'SAFETY',
+        content: { parts: [{ text: 'Here is the beginning of the answer, but then' }] },
+      }],
+    };
+    const out = fromGeminiResponse(resp);
+    expect(out.choices[0].message.content).toContain('Here is the beginning of the answer, but then');
+    expect(out.choices[0].message.content).toEqual(expect.stringContaining('SAFETY'));
+    expect(out.choices[0].message.content).toEqual(expect.stringContaining('cut short'));
+    expect(out.choices[0].finish_reason).toBe('stop');
+  });
 });
 
 describe('sanitizeGeminiSchema', () => {
