@@ -2074,6 +2074,10 @@ export async function runScheduledChat(
           if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
         }
       } catch (leaseError) {
+        // leaseAcquired stays false here — this is NOT swallowed as a tolerable
+        // no-lease continuation. The guard immediately below refuses to run this
+        // dispatch at all without a durable lease (Greptile: a lease failure must
+        // not let a session run untracked).
         console.error(`Failed to set in-flight lease for schedule ${schedule.scheduleId}:`, leaseError);
       }
     }
