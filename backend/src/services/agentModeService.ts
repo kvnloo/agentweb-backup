@@ -187,6 +187,7 @@ import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from './metaAudienceSnapshotStore';
 import { claimPreviewToken } from './metaAudienceCampaignTokenStore';
+import { assertPublicHostname } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -17078,6 +17079,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * diff against what was actually uploaded.
    */
   private async fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
+    // Greptile finding: this is a server-side fetch of a caller-supplied URL
+    // with no destination restriction — a classic SSRF vector (cloud metadata
+    // endpoints, RFC1918/internal hosts, loopback). Reuses the repo's existing
+    // guard rather than reinventing IP-range checks.
+    await assertPublicHostname(csvUrl);
     const response = await axios.get(csvUrl);
     if (Array.isArray(response.data)) {
       return response.data;
@@ -17163,11 +17169,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         failures.push(`${skipped} of ${contacts.length} HubSpot contacts had neither email nor phone, skipped.`);
       }
       // Greptile P1 finding: a failed batch/read chunk was previously silently
-      // dropped — the audience would upload short with no failure surfaced
-      // anywhere. Report it explicitly so AC5's "any operations that failed"
-      // requirement holds even when the HubSpot side partially fails.
+      // dropped, then (after an earlier fix) merely reported as a non-fatal
+      // ledger entry while the campaign still launched against a known-
+      // incomplete audience. A HubSpot read failure means we cannot say what
+      // the correct audience actually is, so this now blocks the whole launch
+      // rather than proceeding on a partial/wrong segment — the caller must
+      // retry once HubSpot is reachable again.
       if (failedChunkContactCount > 0) {
-        failures.push(`${failedChunkContactCount} of ${totalFound} HubSpot contacts could not be read (batch/read failure) and were NOT included in this audience.`);
+        throw new Error(`${failedChunkContactCount} of ${totalFound} HubSpot contacts could not be read (batch/read failure) — refusing to launch against a known-incomplete audience. Retry once HubSpot is reachable again.`);
       }
       payload = rows;
       recordsFound = totalFound;
@@ -17253,11 +17262,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       throw new Error(uploadResult.message || 'Failed to upload users to Meta custom audience.');
     }
 
-    try {
-      await saveAudienceSnapshotRowKeys(userId, audienceId, [...newRowKeys, ...unremovedStaleRowKeys]);
-    } catch (e: any) {
-      failures.push(`Uploaded successfully, but failed to save the membership snapshot for future stale-member sync: ${e.message}`);
-    }
+    // Greptile finding: exhausting all retries here used to be treated as
+    // non-fatal, so the campaign would still launch with no reconciliation
+    // baseline for the next sync — a future resync would have no prior
+    // snapshot to diff against and silently skip stale-member removal
+    // entirely. Blocking the launch here means the (already-succeeded) Meta
+    // upload isn't rolled back, but the ad set is never created — consistent
+    // with every other hard-failure step in this method (LIST/CREATE/
+    // UPLOAD_USERS), all of which abort the whole launch rather than proceed
+    // in a state the code can't reason about.
+    await saveAudienceSnapshotRowKeys(userId, audienceId, [...newRowKeys, ...unremovedStaleRowKeys]);
 
     return {
       plannedAction,

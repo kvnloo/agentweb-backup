@@ -34,11 +34,16 @@ jest.mock('../services/metaAudienceSnapshotStore', () => ({
 jest.mock('../services/metaAudienceCampaignTokenStore', () => ({
   claimPreviewToken: jest.fn().mockResolvedValue(true),
 }));
+jest.mock('../utils/ssrfGuard', () => ({
+  assertPublicHostname: jest.fn().mockResolvedValue(undefined),
+  SsrfBlockedError: class SsrfBlockedError extends Error {},
+}));
 
 import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from '../services/metaAudienceSnapshotStore';
 import { claimPreviewToken } from '../services/metaAudienceCampaignTokenStore';
+import { assertPublicHostname } from '../utils/ssrfGuard';
 
 describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
   let agentModeService: AgentModeService;
@@ -50,6 +55,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(null);
     (saveAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(undefined);
     (claimPreviewToken as jest.Mock).mockResolvedValue(true);
+    (assertPublicHostname as jest.Mock).mockResolvedValue(undefined);
   });
 
   const ACCOUNT_ID = '922903076601160';
@@ -132,6 +138,29 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(result.failures).toEqual([]);
     });
 
+    // Greptile finding: the CSV source URL was fetched server-side with no
+    // restriction on destination — a caller could point it at an internal/
+    // private address (cloud metadata, RFC1918 hosts, loopback) and exfiltrate
+    // internal data through the parsed "CSV" response (classic SSRF). Reuses
+    // the repo's existing assertPublicHostname guard (utils/ssrfGuard.ts,
+    // already used by routes/crm.ts's load-from-url path) rather than
+    // reinventing IP-range checks.
+    it('rejects a CSV source URL that resolves to a private/internal address (SSRF guard) before attempting CREATE/UPLOAD_USERS', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST
+      const { SsrfBlockedError } = require('../utils/ssrfGuard');
+      (assertPublicHostname as jest.Mock).mockRejectedValueOnce(new SsrfBlockedError());
+
+      await expect(callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'RankAI Warm List',
+        { type: 'csv', csvUrl: 'http://169.254.169.254/latest/meta-data/' },
+        { dryRun: false }
+      )).rejects.toThrow();
+
+      expect(axios.get).not.toHaveBeenCalled();
+      expect(spy).toHaveBeenCalledTimes(1);
+    });
+
     it('fails fast (does not attempt CREATE/UPLOAD_USERS) when the CSV fetch itself fails', async () => {
       const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
       spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST
@@ -205,14 +234,17 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(result.recordsUsable).toBe(3);
     });
 
-    // Greptile P1 finding: a failed HubSpot batch/read chunk used to be
-    // silently dropped, so the caller reported the partial contact list as
-    // complete and the ledger never reflected the missing members.
-    it('reports failedChunkContactCount as a non-fatal failure, not a silent under-count', async () => {
+    // Greptile P1 finding history: a failed HubSpot batch/read chunk used to
+    // be silently dropped (the caller reported the partial contact list as
+    // complete); a follow-up fix surfaced it as a non-fatal ledger entry, but
+    // Greptile's overall confidence assessment flagged that the campaign
+    // still launched against a known-incomplete audience either way. This
+    // now blocks the whole launch — we cannot say what the correct audience
+    // is when part of it failed to read, so proceeding on a partial/wrong
+    // segment is worse than requiring a retry.
+    it('blocks the launch (throws) when a HubSpot batch/read chunk fails, rather than uploading a known-incomplete audience', async () => {
       const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
       spy.mockResolvedValueOnce({ success: true, audiences: [] } as any);
-      spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_new_5', name: 'X' } } as any);
-      spy.mockResolvedValueOnce({ success: true } as any);
 
       jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue({
         getContactsForList: jest.fn().mockResolvedValue({
@@ -221,17 +253,14 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         }),
       });
 
-      const result = await callResolveOrCreateSeedAudience(
+      await expect(callResolveOrCreateSeedAudience(
         USER_ID, ACCOUNT_ID, 'X',
         { type: 'hubspot_list', listId: 'list-42' },
         { dryRun: false }
-      );
+      )).rejects.toThrow('100 of 101 HubSpot contacts could not be read');
 
-      expect(result.failures).toEqual([
-        '100 of 101 HubSpot contacts could not be read (batch/read failure) and were NOT included in this audience.',
-      ]);
-      expect(result.recordsFound).toBe(101);
-      expect(result.recordsUsable).toBe(1);
+      // Only LIST was attempted — no CREATE/UPLOAD_USERS against a partial audience.
+      expect(spy).toHaveBeenCalledTimes(1);
     });
 
     // ENG-600 live-test finding: a user with 2+ connected HubSpot accounts has
@@ -432,7 +461,12 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       );
     });
 
-    it('reports a snapshot-save failure as non-fatal after a successful upload', async () => {
+    // Greptile finding history: a snapshot-save failure (after retries were
+    // exhausted) used to be non-fatal, so the campaign still launched with no
+    // reconciliation baseline for the next sync — a future resync would have
+    // no prior snapshot to diff against and silently skip stale-member
+    // removal entirely. This now blocks the launch instead.
+    it('blocks the launch (throws) when the snapshot save fails after exhausting retries', async () => {
       const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
       spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_4', name: 'X' }] } as any); // LIST
       spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
@@ -443,15 +477,11 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(null);
       (saveAudienceSnapshotRowKeys as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB unavailable'));
 
-      const result = await callResolveOrCreateSeedAudience(
+      await expect(callResolveOrCreateSeedAudience(
         USER_ID, ACCOUNT_ID, 'X',
         { type: 'hubspot_list', listId: 'list-1' },
         { dryRun: false }
-      );
-
-      expect(result.failures).toEqual(
-        expect.arrayContaining([expect.stringContaining('failed to save the membership snapshot')])
-      );
+      )).rejects.toThrow('DynamoDB unavailable');
     });
   });
 
