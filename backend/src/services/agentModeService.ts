@@ -185,6 +185,7 @@ import {
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
+import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from './metaAudienceSnapshotStore';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
@@ -16826,7 +16827,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    */
   public async manageMetaCustomAudiences(
     userId: string,
-    action: 'LIST' | 'CREATE' | 'UPLOAD_USERS',
+    action: 'LIST' | 'CREATE' | 'UPLOAD_USERS' | 'DELETE_USERS',
     account_id: string,
     params: any
   ): Promise<MetaApiResult> {
@@ -16940,45 +16941,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             }
           }
 
-          // SHA256 Hashing logic
-          // Iterating through parsed payload and hashing fields based on schema
-
-          const hashedPayload = parsedPayload.map((row: string[]) => {
-            return row.map((cell: string, index: number) => {
-              const fieldType = (params.schema && params.schema[index]) ? params.schema[index].toUpperCase() : '';
-              let value = cell ? cell.trim() : '';
-
-              if (!value) return '';
-
-              // Pass through if already a SHA256 hash (64 hex chars)
-              if (/^[a-fA-F0-9]{64}$/.test(value)) {
-                return value;
-              }
-
-              // Normalization Rules per Meta requirements:
-              if (['EMAIL'].includes(fieldType)) {
-                value = value.toLowerCase();
-              } else if (['PHONE'].includes(fieldType)) {
-                // Standardize to digits only (strip spaces, dashes, parens)
-                value = value.toLowerCase().replace(/[^a-z0-9]/g, '');
-              } else if (['GEN'].includes(fieldType)) {
-                // Gender: 'f' or 'm'
-                value = value.toLowerCase() === 'female' ? 'f' : (value.toLowerCase() === 'male' ? 'm' : value.toLowerCase());
-              } else if (['DOBY', 'DOBM', 'DOBD'].includes(fieldType)) {
-                // Keep trimmed string
-                value = value.trim();
-              } else if (['COUNTRY'].includes(fieldType)) {
-                // Country codes must be lowercase 2-letter ISO
-                value = value.toLowerCase();
-              } else {
-                // Default: lowercase + trim
-                value = value.toLowerCase();
-              }
-
-              // Compute SHA256
-              return createHash('sha256').update(value).digest('hex');
-            });
-          });
+          // SHA256 Hashing logic (shared with resolveOrCreateSeedAudience's
+          // stale-member diff, which needs to hash rows the same way to
+          // compare against a previously saved snapshot — see hashAudienceRows).
+          const hashedPayload = this.hashAudienceRows(params.schema, parsedPayload);
 
           console.log(`[AgentMode] Hashed ${hashedPayload.length} rows for upload.`);
 
@@ -16993,6 +16959,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           return {
             success: true,
             message: `Successfully initiated user upload to audience ${params.id}`,
+            result: result
+          };
+        }
+        case 'DELETE_USERS': {
+          // Removal counterpart of UPLOAD_USERS, used by resolveOrCreateSeedAudience
+          // to sync stale members out of a reused audience. Payload here is always
+          // an already-hashed array (rows previously saved in the snapshot store),
+          // never a raw CSV/URL — no fetch/parse/hash step needed.
+          if (!params.id || !params.payload || !params.schema) {
+            throw new Error('DELETE_USERS requires "id", "schema", and "payload".');
+          }
+          if (!Array.isArray(params.payload) || params.payload.length === 0) {
+            throw new Error('DELETE_USERS payload must be a non-empty array of rows.');
+          }
+          const result = await metaService.deleteCustomAudienceUsers(
+            accountId,
+            accessToken,
+            params.id,
+            params.schema,
+            params.payload
+          );
+          return {
+            success: true,
+            message: `Successfully initiated removal of ${params.payload.length} stale user(s) from audience ${params.id}`,
             result: result
           };
         }
@@ -17024,6 +17014,74 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // ENG-600: fixed EMAIL/PHONE schema for the HubSpot/CSV audience-sourcing
   // workflows — ticket scope is email/phone seed data, not arbitrary schemas.
   private static AUDIENCE_SOURCE_SCHEMA = ['EMAIL', 'PHONE'];
+
+  /**
+   * Hashes raw row data per Meta's Custom Audience field-normalization rules
+   * (lowercased email, digits-only phone, etc.), passing through values that
+   * are already a 64-hex-char SHA256 hash unchanged. Shared by UPLOAD_USERS
+   * (manageMetaCustomAudiences) and resolveOrCreateSeedAudience's stale-member
+   * diff, which both need identical hashing so the same contact hashes to the
+   * same row-key regardless of which path produced it.
+   */
+  private hashAudienceRows(schema: string[], rows: string[][]): string[][] {
+    return rows.map((row: string[]) => {
+      return row.map((cell: string, index: number) => {
+        const fieldType = (schema && schema[index]) ? schema[index].toUpperCase() : '';
+        let value = cell ? cell.trim() : '';
+
+        if (!value) return '';
+
+        // Pass through if already a SHA256 hash (64 hex chars)
+        if (/^[a-fA-F0-9]{64}$/.test(value)) {
+          return value;
+        }
+
+        // Normalization Rules per Meta requirements:
+        if (['EMAIL'].includes(fieldType)) {
+          value = value.toLowerCase();
+        } else if (['PHONE'].includes(fieldType)) {
+          // Standardize to digits only (strip spaces, dashes, parens)
+          value = value.toLowerCase().replace(/[^a-z0-9]/g, '');
+        } else if (['GEN'].includes(fieldType)) {
+          // Gender: 'f' or 'm'
+          value = value.toLowerCase() === 'female' ? 'f' : (value.toLowerCase() === 'male' ? 'm' : value.toLowerCase());
+        } else if (['DOBY', 'DOBM', 'DOBD'].includes(fieldType)) {
+          // Keep trimmed string
+          value = value.trim();
+        } else if (['COUNTRY'].includes(fieldType)) {
+          // Country codes must be lowercase 2-letter ISO
+          value = value.toLowerCase();
+        } else {
+          // Default: lowercase + trim
+          value = value.toLowerCase();
+        }
+
+        // Compute SHA256
+        return createHash('sha256').update(value).digest('hex');
+      });
+    });
+  }
+
+  /** Deterministic row-key for a hashed row, used to diff audience snapshots. */
+  private audienceRowKey(hashedRow: string[]): string {
+    return hashedRow.join('|');
+  }
+
+  /**
+   * Fetches and parses a CSV URL into raw rows, purely for the stale-member
+   * hash diff in resolveOrCreateSeedAudience — kept separate from the fetch
+   * inside UPLOAD_USERS (manageMetaCustomAudiences) so a failure here can be
+   * treated as "skip stale-member removal this run" without blocking the
+   * (separately-validated) real upload.
+   */
+  private async fetchAndParseCsvRowsForDiff(csvUrl: string): Promise<string[][]> {
+    const response = await axios.get(csvUrl);
+    if (Array.isArray(response.data)) {
+      return response.data;
+    }
+    const str: string = typeof response.data === 'object' ? JSON.stringify(response.data) : String(response.data ?? '');
+    return parseCsv(str, { skip_empty_lines: true, trim: true, relax_column_count: true });
+  }
 
   /**
    * Resolves the Meta Custom Audience that a targeted/retargeting campaign
@@ -17135,6 +17193,54 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       audienceLabel = existing.name;
     }
 
+    // Greptile P1 finding: reusing an existing audience for a fresh source
+    // upload never removed members no longer present in the new source — a
+    // contact removed from the HubSpot list (or dropped from a refreshed CSV)
+    // stayed in the Meta audience forever. Diff the current source's hashed
+    // rows against the last-synced snapshot and remove anything stale before
+    // uploading the new set. Only meaningful on reuse — a brand-new audience
+    // has no prior snapshot to diff against.
+    let currentRows: string[][] | null = null;
+    if (source.type === 'hubspot_list') {
+      currentRows = payload as string[][];
+    } else {
+      try {
+        currentRows = await this.fetchAndParseCsvRowsForDiff(source.csvUrl);
+      } catch (e: any) {
+        failures.push(`Could not fetch CSV for stale-member comparison (${e.message}); skipping stale-member removal this run.`);
+      }
+    }
+
+    let newRowKeys: string[] | null = null;
+    if (currentRows) {
+      const hashedRows = this.hashAudienceRows(schema, currentRows);
+      newRowKeys = hashedRows.map((row) => this.audienceRowKey(row));
+
+      if (plannedAction === 'reuse') {
+        try {
+          const previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
+          if (previousRowKeys) {
+            const currentKeySet = new Set(newRowKeys);
+            const staleRowKeys = previousRowKeys.filter((k) => !currentKeySet.has(k));
+            if (staleRowKeys.length > 0) {
+              const staleRows = staleRowKeys.map((k) => k.split('|'));
+              const deleteResult = await this.manageMetaCustomAudiences(userId, 'DELETE_USERS', accountId, {
+                id: audienceId,
+                schema,
+                payload: staleRows,
+                confirm: true,
+              });
+              if (!deleteResult.success) {
+                failures.push(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
+              }
+            }
+          }
+        } catch (e: any) {
+          failures.push(`Could not check for stale members on audience ${audienceId}: ${e.message}`);
+        }
+      }
+    }
+
     const uploadResult = await this.manageMetaCustomAudiences(userId, 'UPLOAD_USERS', accountId, {
       id: audienceId,
       schema,
@@ -17143,6 +17249,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     });
     if (!uploadResult.success) {
       throw new Error(uploadResult.message || 'Failed to upload users to Meta custom audience.');
+    }
+
+    if (newRowKeys) {
+      try {
+        await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
+      } catch (e: any) {
+        failures.push(`Uploaded successfully, but failed to save the membership snapshot for future stale-member sync: ${e.message}`);
+      }
     }
 
     return {

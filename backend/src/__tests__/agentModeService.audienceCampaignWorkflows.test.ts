@@ -22,7 +22,19 @@ jest.mock('../utils/secretsManager', () => ({
   getMetaAccessToken: jest.fn().mockResolvedValue('mock-access-token')
 }));
 
+// resolveOrCreateSeedAudience's stale-member diff fetches the CSV itself
+// (separately from UPLOAD_USERS's own fetch) purely to compute hashes to
+// compare against the last-synced snapshot. Mocked here so CSV-source tests
+// that don't care about stale-member sync don't hit the network.
+jest.mock('axios');
+jest.mock('../services/metaAudienceSnapshotStore', () => ({
+  getAudienceSnapshotRowKeys: jest.fn().mockResolvedValue(null),
+  saveAudienceSnapshotRowKeys: jest.fn().mockResolvedValue(undefined),
+}));
+
+import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
+import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from '../services/metaAudienceSnapshotStore';
 
 describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
   let agentModeService: AgentModeService;
@@ -30,6 +42,9 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
   beforeEach(() => {
     agentModeService = new AgentModeService();
     jest.clearAllMocks();
+    (axios.get as jest.Mock).mockResolvedValue({ data: 'email,phone\n' });
+    (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(null);
+    (saveAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(undefined);
   });
 
   const ACCOUNT_ID = '922903076601160';
@@ -258,6 +273,152 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         { type: 'csv', csvUrl: 'https://s3.example.com/empty.csv' },
         { dryRun: false }
       )).rejects.toThrow('Payload is empty');
+    });
+  });
+
+  // ENG-600 Greptile finding (block-merge): reusing an existing audience for
+  // a fresh source upload never removed members no longer present in the new
+  // source — a contact removed from a HubSpot list (or dropped from a
+  // refreshed CSV) stayed in the Meta audience forever. resolveOrCreateSeedAudience
+  // now diffs the current source's hashed rows against a snapshot of the last
+  // sync (metaAudienceSnapshotStore) and issues a DELETE_USERS removal for
+  // anything stale before uploading the fresh set.
+  describe('resolveOrCreateSeedAudience — stale-member sync-to-remove', () => {
+    const crypto = require('crypto');
+    const hashCell = (fieldType: string, value: string): string => {
+      let v = value.trim();
+      if (!v) return '';
+      if (fieldType === 'EMAIL') v = v.toLowerCase();
+      else if (fieldType === 'PHONE') v = v.toLowerCase().replace(/[^a-z0-9]/g, '');
+      else v = v.toLowerCase();
+      return crypto.createHash('sha256').update(v).digest('hex');
+    };
+    const rowKeyFor = (email: string, phone: string): string =>
+      [hashCell('EMAIL', email), hashCell('PHONE', phone)].join('|');
+
+    const mockHubSpotContact = (email: string, phone: string) => ({
+      getContactsForList: jest.fn().mockResolvedValue({
+        contacts: [{ contactId: '1', email, phone }],
+        failedChunkContactCount: 0,
+      }),
+    });
+
+    it('removes stale members (present in the last snapshot, absent from the current source) before re-uploading, on reuse', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_1', name: 'X' }] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: true } as any); // DELETE_USERS
+      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
+
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
+        mockHubSpotContact('a@example.com', '111')
+      );
+      (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue([
+        rowKeyFor('a@example.com', '111'),
+        rowKeyFor('old@example.com', '999'),
+      ]);
+
+      await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-1' },
+        { dryRun: false }
+      );
+
+      expect(spy).toHaveBeenNthCalledWith(2, USER_ID, 'DELETE_USERS', ACCOUNT_ID, expect.objectContaining({
+        id: 'aud_1',
+        schema: ['EMAIL', 'PHONE'],
+        payload: [[hashCell('EMAIL', 'old@example.com'), hashCell('PHONE', '999')]],
+      }));
+      expect(spy).toHaveBeenNthCalledWith(3, USER_ID, 'UPLOAD_USERS', ACCOUNT_ID, expect.any(Object));
+      expect(saveAudienceSnapshotRowKeys).toHaveBeenCalledWith(USER_ID, 'aud_1', [rowKeyFor('a@example.com', '111')]);
+    });
+
+    it('does not call DELETE_USERS when there is no prior snapshot (first sync of a reused audience)', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_2', name: 'X' }] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
+
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
+        mockHubSpotContact('a@example.com', '111')
+      );
+      (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(null);
+
+      await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-1' },
+        { dryRun: false }
+      );
+
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(spy).not.toHaveBeenCalledWith(USER_ID, 'DELETE_USERS', expect.anything(), expect.anything());
+    });
+
+    it('does not call DELETE_USERS when creating a brand-new audience, but still saves a baseline snapshot', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_new', name: 'X' } } as any); // CREATE
+      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
+
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
+        mockHubSpotContact('a@example.com', '111')
+      );
+
+      await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-1' },
+        { dryRun: false }
+      );
+
+      expect(spy).toHaveBeenCalledTimes(3);
+      expect(getAudienceSnapshotRowKeys).not.toHaveBeenCalled();
+      expect(saveAudienceSnapshotRowKeys).toHaveBeenCalledWith(USER_ID, 'aud_new', [rowKeyFor('a@example.com', '111')]);
+    });
+
+    it('reports a DELETE_USERS failure as a non-fatal failure, without blocking the upload', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_3', name: 'X' }] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: false, message: 'Meta rate limited' } as any); // DELETE_USERS
+      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
+
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
+        mockHubSpotContact('a@example.com', '111')
+      );
+      (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue([
+        rowKeyFor('a@example.com', '111'),
+        rowKeyFor('old@example.com', '999'),
+      ]);
+
+      const result = await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-1' },
+        { dryRun: false }
+      );
+
+      expect(result.failures).toEqual(
+        expect.arrayContaining([expect.stringContaining('Failed to remove 1 stale member')])
+      );
+      expect(spy).toHaveBeenNthCalledWith(3, USER_ID, 'UPLOAD_USERS', ACCOUNT_ID, expect.any(Object));
+    });
+
+    it('reports a snapshot-save failure as non-fatal after a successful upload', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_4', name: 'X' }] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
+
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
+        mockHubSpotContact('a@example.com', '111')
+      );
+      (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(null);
+      (saveAudienceSnapshotRowKeys as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+
+      const result = await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-1' },
+        { dryRun: false }
+      );
+
+      expect(result.failures).toEqual(
+        expect.arrayContaining([expect.stringContaining('failed to save the membership snapshot')])
+      );
     });
   });
 
