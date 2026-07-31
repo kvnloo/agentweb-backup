@@ -38,7 +38,8 @@ describe('ImageService - Likeness Fixes', () => {
     });
 
     it('should accept valid imageModel: gpt-image-1', async () => {
-      const mockApiKey = 'test-api-key';
+      // ENG-410: the Azure image secret is JSON {apiKey, endpoint}; the raw-key format is rejected.
+      const mockApiKey = JSON.stringify({ apiKey: 'test-api-key', endpoint: 'https://agentweb-imagegen-prod.services.ai.azure.com' });
       (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
 
       const mockOpenAI = require('openai');
@@ -64,7 +65,8 @@ describe('ImageService - Likeness Fixes', () => {
     });
 
     it('should accept valid imageModel: gemini-3-pro-image-preview', async () => {
-      const mockApiKey = 'test-api-key';
+      // ENG-410: the Azure image secret is JSON {apiKey, endpoint}; the raw-key format is rejected.
+      const mockApiKey = JSON.stringify({ apiKey: 'test-api-key', endpoint: 'https://agentweb-imagegen-prod.services.ai.azure.com' });
       (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
 
       const result = await imageService.generateImage({
@@ -81,7 +83,8 @@ describe('ImageService - Likeness Fixes', () => {
     });
 
     it('should accept valid imageModel: gen4_image', async () => {
-      const mockApiKey = 'test-api-key';
+      // ENG-410: the Azure image secret is JSON {apiKey, endpoint}; the raw-key format is rejected.
+      const mockApiKey = JSON.stringify({ apiKey: 'test-api-key', endpoint: 'https://agentweb-imagegen-prod.services.ai.azure.com' });
       (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
 
       const result = await imageService.generateImage({
@@ -98,7 +101,8 @@ describe('ImageService - Likeness Fixes', () => {
     });
 
     it('should default to gemini-3-pro-image-preview when no model specified', async () => {
-      const mockApiKey = 'test-api-key';
+      // ENG-410: the Azure image secret is JSON {apiKey, endpoint}; the raw-key format is rejected.
+      const mockApiKey = JSON.stringify({ apiKey: 'test-api-key', endpoint: 'https://agentweb-imagegen-prod.services.ai.azure.com' });
       (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
 
       const result = await imageService.generateImage({
@@ -123,7 +127,8 @@ describe('ImageService - Likeness Fixes', () => {
       // Access private property for testing - we'll override it
       (testImageService as any).IMAGE_GENERATION_TIMEOUT_MS = 1000; // 1 second for testing
 
-      const mockApiKey = 'test-api-key';
+      // ENG-410: the Azure image secret is JSON {apiKey, endpoint}; the raw-key format is rejected.
+      const mockApiKey = JSON.stringify({ apiKey: 'test-api-key', endpoint: 'https://agentweb-imagegen-prod.services.ai.azure.com' });
       (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
 
       // Mock axios for form-data POST (used by Azure AI)
@@ -154,7 +159,8 @@ describe('ImageService - Likeness Fixes', () => {
     }, 5000); // Set Jest timeout to 5 seconds
 
     it('should complete successfully if generation finishes within timeout', async () => {
-      const mockApiKey = 'test-api-key';
+      // ENG-410: the Azure image secret is JSON {apiKey, endpoint}; the raw-key format is rejected.
+      const mockApiKey = JSON.stringify({ apiKey: 'test-api-key', endpoint: 'https://agentweb-imagegen-prod.services.ai.azure.com' });
       (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
       (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
         success: true,
