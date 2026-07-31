@@ -61,6 +61,34 @@ describe('mirrorLinkedInInviteToCrm', () => {
     expect(createLead).not.toHaveBeenCalled();
   });
 
+  // ---- dry-run (preview counts, no writes) ----
+
+  it('dryRun reports created=true for an absent invitee without writing', async () => {
+    findLeadsByLinkedin.mockResolvedValue([]);
+    const res = await mirrorLinkedInInviteToCrm({
+      listId: LIST,
+      linkedinUrl: 'https://www.linkedin.com/in/new-person',
+      dryRun: true,
+    });
+    expect(res).toEqual({ leadId: '', created: true });
+    expect(createLead).not.toHaveBeenCalled();
+    expect(updateLead).not.toHaveBeenCalled();
+    expect(addLeadEngagement).not.toHaveBeenCalled();
+  });
+
+  it('dryRun reports created=false with the existing leadId for a matched invitee, no writes', async () => {
+    findLeadsByLinkedin.mockResolvedValue([{ leadId: 'lead_existing', listId: LIST, status: 'new' }]);
+    const res = await mirrorLinkedInInviteToCrm({
+      listId: LIST,
+      linkedinUrl: 'https://www.linkedin.com/in/existing',
+      dryRun: true,
+    });
+    expect(res).toEqual({ leadId: 'lead_existing', created: false });
+    expect(createLead).not.toHaveBeenCalled();
+    expect(updateLead).not.toHaveBeenCalled();
+    expect(addLeadEngagement).not.toHaveBeenCalled();
+  });
+
   // ---- create path (invitee not yet in CRM — the reporter's disjoint set) ----
 
   it('creates a contacted lead + engagement when the invitee is not in the list', async () => {

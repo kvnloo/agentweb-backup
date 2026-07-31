@@ -139,6 +139,28 @@ describe('reconcileSentInvitationsToCrm', () => {
     expect(syncSentInvitationsForAccount).not.toHaveBeenCalled();
   });
 
+  it('dry-run computes created/updated counts but writes nothing', async () => {
+    getAllSentInvitationsByAccount.mockResolvedValue([
+      invite('new-person', 'New Person'),  // absent → would create
+      invite('existing', 'Existing Lead'), // present → would update
+    ]);
+    findLeadsByLinkedin.mockImplementation(async (url: string) =>
+      url.includes('/in/existing')
+        ? [{ leadId: 'lead_existing', listId: LIST, status: 'new' }]
+        : [],
+    );
+
+    const res = await reconcileSentInvitationsToCrm({
+      accountId: ACCOUNT, listId: LIST, refreshFromLive: false, dryRun: true,
+    });
+
+    expect(res).toEqual({ total: 2, created: 1, updated: 1, skipped: 0 });
+    // No writes whatsoever.
+    expect(createLead).not.toHaveBeenCalled();
+    expect(updateLead).not.toHaveBeenCalled();
+    expect(addLeadEngagement).not.toHaveBeenCalled();
+  });
+
   it('still reconciles from cache when the live refresh throws', async () => {
     syncSentInvitationsForAccount.mockRejectedValue(new Error('unipile down'));
     getAllSentInvitationsByAccount.mockResolvedValue([invite('carol', 'Carol C.')]);
