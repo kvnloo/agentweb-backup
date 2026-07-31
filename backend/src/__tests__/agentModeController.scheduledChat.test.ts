@@ -572,6 +572,28 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(result.status).toBe('success');
     });
 
+    it('DEFERS a normal (non-resume) run instead of creating an untracked session when no durable lease could be established (ENG-657/Greptile)', async () => {
+      // Not resume-specific: if setRunInFlight throws (transient error, not a lost
+      // race — that path returns earlier), leaseAcquired stays false. Without this
+      // guard, a FRESH session would still get created and run with no lease at
+      // all — a kill during that run would be invisible to the reconciler (nothing
+      // to find), so its final deliverable would simply never arrive.
+      (mockScheduleDb.setRunInFlight as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+      (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
+
+      const result = await runScheduledChat(baseSchedule, mockUserId, false);
+
+      expect(result.sessionId).toBe('');
+      expect(result.status).toBe('success');
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+      // Retries shortly rather than waiting a full cadence — same short backoff as
+      // the resume-side no-lease case.
+      const retryCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
+      expect(retryCall).toBeDefined();
+      expect(retryCall[1]).toEqual(expect.objectContaining({ zeroAssistantRetryCount: 1, nextRunTime: expect.any(String) }));
+    });
+
     it('should require canonical you_search_web for You.com web search', async () => {
       const scheduleWithSearchWeb = {
         ...baseSchedule,

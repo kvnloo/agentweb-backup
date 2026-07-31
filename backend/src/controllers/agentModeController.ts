@@ -2078,6 +2078,56 @@ export async function runScheduledChat(
       }
     }
 
+    // A deferred fire returns cleanly (no exception), so it does NOT leave a stale
+    // lease for the reconciler to catch — unlike a crash, nothing will retry it soon
+    // on its own. And the dispatch loop already advanced nextRunTime to the FULL next
+    // cadence *before* calling into this run (to prevent double-dispatch), so without
+    // this, a defer would silently wait a full cycle instead of retrying shortly —
+    // worse than the crash case it exists to avoid (Greptile). Mirror the
+    // reconciler's own short, bounded backoff so a defer gets another attempt soon,
+    // capped by the same requeue limit so a persistently un-resumable schedule still
+    // eventually falls back to its normal cadence instead of retrying forever.
+    const scheduleRetrySoon = async () => {
+      const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+      if (nextRetryCount > ZERO_ASSISTANT_MAX_REQUEUES) return;
+      try {
+        await scheduleDb.updateSchedule(schedule.scheduleId, {
+          nextRunTime: new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString(),
+          zeroAssistantRetryCount: nextRetryCount,
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (retryScheduleError) {
+        console.error(`runScheduledChat: failed to schedule a short retry after a no-lease defer for ${schedule.scheduleId}:`, retryScheduleError);
+      }
+    };
+
+    // Require a durable lease before running ANY non-test scheduled dispatch, not
+    // just resume (Greptile). Without this, a lease-establishment failure let a
+    // FRESH session get created and run untracked: a kill during that run would be
+    // invisible to the reconciler (no lease to find), so the abandoned session's
+    // final deliverable would just never arrive, with nothing to auto-heal it.
+    // Defer and retry shortly instead of running blind.
+    if (!isTest && !leaseAcquired) {
+      console.warn(`runScheduledChat: no durable lease for schedule ${schedule.scheduleId}; skipping this dispatch rather than running untracked.`);
+      await scheduleRetrySoon();
+      return {
+        scheduleId: schedule.scheduleId,
+        runId: leaseRunId,
+        status: 'success' as const,
+        passed: false,
+        actualResponse: 'Scheduled run deferred (no-lease): could not establish a durable in-flight lease; will retry shortly rather than run untracked.',
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+    }
+
     // ENG-657: resume path. When the reconciler marked this schedule to resume an
     // abandoned session (it ended on a safe boundary), CONTINUE that session from
     // its last completed step instead of creating a fresh one and re-running the
@@ -2117,43 +2167,9 @@ export async function runScheduledChat(
         createdAt: new Date().toISOString(),
       });
 
-      // A deferred fire returns cleanly (no exception), so it does NOT leave a stale
-      // lease for the reconciler to catch — unlike a crash, nothing will retry it soon
-      // on its own. And the dispatch loop already advanced nextRunTime to the FULL next
-      // cadence *before* calling into this run (to prevent double-dispatch), so without
-      // this, a defer would silently wait a full cycle instead of retrying shortly —
-      // worse than the crash case it exists to avoid (Greptile). Mirror the
-      // reconciler's own short, bounded backoff so a defer gets another attempt soon,
-      // capped by the same requeue limit so a persistently un-resumable schedule still
-      // eventually falls back to its normal cadence instead of retrying forever.
-      const scheduleRetrySoon = async () => {
-        const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
-        if (nextRetryCount > ZERO_ASSISTANT_MAX_REQUEUES) return;
-        try {
-          await scheduleDb.updateSchedule(schedule.scheduleId, {
-            nextRunTime: new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString(),
-            zeroAssistantRetryCount: nextRetryCount,
-            updatedAt: new Date().toISOString(),
-          });
-        } catch (retryScheduleError) {
-          console.error(`runScheduledChat: failed to schedule a short retry after resume defer for ${schedule.scheduleId}:`, retryScheduleError);
-        }
-      };
-
-      // Require a durable lease before ever touching the resume marker (Greptile).
-      // If setRunInFlight threw (transient DynamoDB error, not a lost race — that
-      // case already returned above) leaseAcquired stays false and execution would
-      // otherwise fall through to claiming the marker and starting the worker with
-      // NO lease at all: a kill during that run would leave neither a reconcilable
-      // lease nor a resume marker (already consumed), so nothing could ever detect
-      // or retry it — a later, unrelated fire would duplicate its work blind. Defer
-      // without touching the marker; a later fire (hopefully with a working lease)
-      // retries the same resume.
-      if (!leaseAcquired) {
-        console.warn(`runScheduledChat: no durable lease for schedule ${schedule.scheduleId}; deferring resume of session ${pendingResumeSessionId} rather than proceeding without one (marker left intact).`);
-        await scheduleRetrySoon();
-        return deferredResumeResult('no-lease');
-      }
+      // scheduleRetrySoon is defined above (shared with the general no-lease bail-out)
+      // and a durable lease is already guaranteed by this point — the no-lease case
+      // returns before ever reaching pendingResumeSessionId, above.
 
       // Load + validate BEFORE claiming, so a transient read failure never consumes
       // the marker or triggers a restart — the marker persists and a later fire retries.
