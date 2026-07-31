@@ -384,6 +384,27 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(mockChatbotDb.createChatSession).toHaveBeenCalledTimes(1);
         expect(mockScheduleDb.claimPendingResume).not.toHaveBeenCalled();
       });
+
+      it('attaches the resumed session to the lease BEFORE claiming the marker (closes the empty-sessionId-abandon race)', async () => {
+        // If a kill lands between claimPendingResume succeeding and the lease being
+        // annotated with the resumed sessionId, the reconciler sees an empty-session
+        // abandonment and requeues a blind fresh restart — re-running this session's
+        // already-completed side effects. Attaching first closes that window: the
+        // lease already names the right session no matter when a kill lands after.
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
+        } as any);
+
+        await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        const attachCalls = (mockScheduleDb.attachSessionToRunInFlight as jest.Mock).mock.calls;
+        const claimOrder = (mockScheduleDb.claimPendingResume as jest.Mock).mock.invocationCallOrder[0];
+        const firstAttachOrder = (mockScheduleDb.attachSessionToRunInFlight as jest.Mock).mock.invocationCallOrder[0];
+
+        // At least one attach call names the resumed session, and it happens before the claim.
+        expect(attachCalls.some(call => call[2] === resumeSessionId)).toBe(true);
+        expect(firstAttachOrder).toBeLessThan(claimOrder);
+      });
     });
 
     it('stamps an in-flight lease on a production run and releases it when the run settles (ENG-324)', async () => {

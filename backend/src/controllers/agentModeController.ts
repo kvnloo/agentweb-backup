@@ -2123,6 +2123,19 @@ export async function runScheduledChat(
         return deferredResumeResult('not-resumable');
       }
 
+      // Attach the resumed session to the lease BEFORE claiming the marker, not after.
+      // Closes a race Greptile flagged: a kill landing between claimPendingResume
+      // succeeding and the (formerly later) attach call left the lease's sessionId
+      // empty, so the reconciler saw an empty-session abandonment and requeued a
+      // fresh restart — re-running this session's already-completed side effects.
+      // Attaching first means the lease already names the right session no matter
+      // when a kill lands after this point.
+      if (leaseAcquired) {
+        await scheduleDb.attachSessionToRunInFlight(schedule.scheduleId, leaseRunId, pendingResumeSessionId).catch(attachError => {
+          console.error(`Failed to attach resume session to in-flight lease for schedule ${schedule.scheduleId}:`, attachError);
+        });
+      }
+
       // Atomically CLAIM: exactly one dispatcher wins and resumes this session; any
       // concurrent dispatcher loses and bows out (never a parallel resume or a restart).
       let won = false;
