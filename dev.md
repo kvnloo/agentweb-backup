@@ -32,6 +32,140 @@ was **exactly inverted**. Investigation findings:
   that each pixel id doubles as its `dataset_id`, since a description that describes a removed
   Graph shape sends Emma looking for a second identifier that is never coming.
 
+## ENG-664: per-user X cost breakdown on the admin user card + LLM-only fix (2026-07-30)
+
+**LLM-only fix.** The user card's "LLM Cost" 📊 opens `getUserOrgUsageRollup` (gross burn vs the LLM
+quota counter). Because X writes to the same ledger, X rows were leaking into that rollup — inflating
+gross burn and depressing "charged coverage" (X never deducts from the quota counter). Fixed by filtering
+`!isVendorEntry(row)` at the query, so gross burn / byModel / members are purely LLM. Per-unit vendor
+rows (X/Twitter, v0, …) are excluded; token-priced image/video (recordUsage, no `unit`) stay in — they
+DO count toward the cap.
+
+**Per-user X breakdown (Option A).** New `getUserXBreakdown(userId, start, end)` (shares
+`groupTwitterRows` with `getXAllocatedTotals`) → `GET /api/admin/users/:userId/usage/x-breakdown`. A new
+"X (Twitter) Cost" stat + 📊 on the user card opens a modal (`XCostBreakdown`, bars + table, reusing the
+LLM modal's table/bars toggle) showing that user's X spend by tool, labelled **allocated** and noting it
+is observe-only (not deducted from any cap). Mirrors the LLM Cost affordance without borrowing its
+quota framing.
+
+## ENG-664 (Option B): attribute X ledger to the acting user, bill the owner (2026-07-30)
+
+Aligns X metering with the LLM rail. Previously the X shadow ledger keyed on the account OWNER
+(`ownerUserId` is all `twitterService` receives, so token refreshes write back to the owner). The LLM
+rail instead records the ACTING user in the shadow ledger and rolls billing to the org owner. For an org
+where several members share one X account, owner-keying collapsed all their spend onto the owner — you
+couldn't see which member drove it.
+
+Option B records `userId = acting member` and `billingUserId = account owner`, matching LLM. Since
+`twitterService` methods only receive `ownerUserId`, the acting user is carried via an
+`AsyncLocalStorage` (`runWithXActingUser`) that the two Emma dispatchers (`twitterManagePost`,
+`twitterOutreach`) and the `TwitterAdapter` (createPost/listPosts) bind. `meterCall` reads it:
+`userId = actingUserId ?? ownerUserId`, `billingUserId = ownerUserId`. An UNWRAPPED path (some future
+caller) has no acting user in context and safely falls back to owner-attribution — never an error.
+
+Knock-on: `@handle` enrichment must resolve through the OWNER, so `buildXAccountBreakdown` now enriches
+via the row's `billingUserId` (owner), not `userId` (acting member). Pre-Option-B rows have
+`billingUserId === userId`, so it still works. This also pre-wires ENG-703 drawdown, which will charge
+`billingUserId` (the owner), exactly like the LLM cap already does via `resolveBillingUserId`.
+
+## ENG-664: meter X (Twitter) API usage + cost per account and per tool (2026-07-29)
+
+Builds directly on the [[ENG-693]] vendor dimension — no new table, no new pipeline.
+
+**Metering.** `twitterService.withRetryOn401` is the single chokepoint every data-plane
+X call already funnels through (it has `ownerUserId` + `accountId` in scope). It now takes a
+**required** `meter: TwitterMeterSpec` arg (`operation`, optional `requiredScope`, `units(result)`,
+`text`). On each successful call `meterCall()` fires `recordVendorUsage()` into `AW-UsageRecords`:
+- `userId  = ownerUserId`            → per-USER cut ("who spent our X budget")
+- `model   = "twitter:{operation}"`  → per-TOOL cut (recordVendorUsage namespaces the model slot)
+- `feature = "x-account:{accountId}"`→ per-ACCOUNT cut (the connected account)
+
+Making `operation` a required parameter means an uninstrumented call path **fails to compile**
+(acceptance criterion 3 — attribution is never silently dropped). Metering is fully guarded and
+fire-and-forget: it never fails or slows an X call (the units/pricing computation is wrapped, and
+`recordVendorUsage` swallows its own errors).
+
+**Cost is ALLOCATED, never measured.** X exposes no per-call price at runtime (the rate-limit
+headers `twitter-api-v2` returns carry quota, not dollars), so `utils/twitterPricing.ts` applies X's
+published pay-per-use rate card (docs.x.com, effective Apr 2026): post-create $0.015 ($0.200 with a
+link), post-read $0.005/resource, user-read $0.010, owned-read $0.001, DM-read $0.010, DM-create
+$0.015; interaction writes (like/follow/retweet/block/mute/delete) are recorded at $0 since X
+publishes no price. Rows carry `costSource: "allocated"`.
+
+**Reconciliation caveat (acceptance criterion 2).** X charges a repeat read of the SAME resource
+within a UTC day only once; we do not track resource ids, so a computed total is an allocated
+UPPER BOUND — it reconciles as `>=` the X console's billed usage, not to the cent. Exact
+reconciliation would need per-resource-id dedup (follow-up, not this PR). The partner-portal view
+labels X figures "allocated" and shows the dedup caveat so the number never reads as measured.
+
+**Surface.** New admin **Usage & Cost** tab (`partner-portal/.../UsageCostByUserTab.tsx`) renders the
+already-existing `GET /api/admin/usage/cost-aggregation` `topUsers` breakdown as a per-user table with
+a provider filter (All / LLM / X / other vendors) and an expandable per-tool breakdown. X spend flows
+into it automatically because it lands in the same ledger — no backend aggregation change was needed.
+
+**Handle-resolution sub-calls are metered too (AC1).** Several ops (`follow`/`unfollow`/`block`/`mute`
+family, `send_dm`, `get_user_tweets`, `get_dm_conversation`, and `list_followers`/`list_following` when
+a handle is passed) make an internal `userByUsername` handle→id lookup — a separate billable **user-read**
+($0.010). The meter spec carries `extraUserReads`, and `meterCall` records a companion `resolve_handle`
+row so no billable sub-call is left unattributed. `list_followers`/`list_following` for the OWN account
+(no handle) resolve nothing, so `extraUserReads` is 0 there.
+
+**Billing-cycle month math.** `currentXBillingCycle` clamps the reset day to the target month's real
+length (a `cap_reset_day` of 29–31 must not overflow a short prior month, e.g. Feb 31 → Feb 28) and rolls
+the year back at January. Without the clamp the derived allocated window could invert (start>end) and 500
+the reconciliation panel for any account whose reset day ≥ 29 early in a month.
+
+**Typed X 402 (credit exhaustion).** X errors carry the HTTP status on `.code`, and the tool taxonomy
+only knew `.status`/`.statusCode` and had no 402 branch — so a depleted-wallet 402 (ENG-604/633/662)
+classified as a generic `Error` and a mid-run 402 could read as success. Fixed end to end:
+- `withRetryOn401` converts any X 402 into a typed `XCreditsExhaustedError` (name stable, `code=402`) at
+  the single chokepoint, logging an `X_CREDITS_EXHAUSTED` marker for ops alerting. It is non-retryable and
+  never metered (the call did not succeed).
+- `classifyToolErrorClass` gains a stable `payment_required` class, reached three ways: status 402 (now
+  also reads `.code`, guarded to the 100–599 HTTP range), the typed error's name, and "HTTP 402" in text.
+- `classifyToolFailureType` maps `payment_required → config` — a billing/quota gap, excluded from the
+  tool-bug rate but visible and clustered, never silently a success.
+
+**Reconciliation (AC #2) — built (on-demand).** X's dedup ("same resource once per UTC day") is
+**app-wide** (the credit pool is AgentWeb's one Developer App), so per-user cost can only ever be
+*allocated* load attribution, not a fair split of the billed figure. So reconciliation is two numbers,
+never conflated: **allocated** (our ledger, above, an upper bound) for "who drives spend", and
+**measured** pulled live from X's own `GET /2/usage/tweets`. The shared app's Bearer token lives in the
+`{dev,prod}/AgentWeb/Twitter` secret (now exposed on `TwitterCredentials.bearerToken`);
+`twitterService.getXProjectUsage()` fetches app-only (never metered — not a user call) and returns
+`projectUsage`/`projectCap`/`capResetDay`. `GET /api/admin/usage/x-reconciliation` derives the current
+billing cycle from `capResetDay` (`currentXBillingCycle`), sums our allocated X ledger over that same
+window (`getXAllocatedTotals`, filtered to `twitter:*`), and returns measured beside allocated + the
+dedup delta + a cap gauge. Rendered as the "X API reconciliation" panel in the admin tab; an
+X-unreachable failure degrades to a warning (502) without breaking the tab.
+
+Note what `/2/usage/tweets` covers: **post-read consumption against the 2M cap** — X's authoritative,
+deduped count. It does NOT report writes or dollars, so `measuredDerivedCostUsd = measured reads × $0.005
++ our directly-counted non-read allocated`; that's a *tighter* dollar figure than allocated-from-log
+because the read count is already deduped. A `(utcDay, resourceId)` dedup table would give exact per-user
+*billed* numbers but costs one write per resource read — deferred unless finance needs per-user billed
+(not load) figures. A scheduled poller for historical snapshots + low-credit alerting is the next step.
+
+**By-account cut + @handle enrichment.** Each X call records `feature = x-account:{accountId}`, so the
+cost aggregation groups those rows into `byXAccount`. There is **no global GSI on account_id** (connected
+accounts are nested in the User record), so a scan-free handle lookup needs the owning userId — which the
+ledger row's partition key already carries. `buildXAccountBreakdown` groups by accountId, tracks per-user
+spend, and best-effort resolves the @handle via `getAccountById(accountId, heaviestSpenderUserId,
+'twitter')` (the heaviest spender is the owner in the common case) → `config.username`. This mirrors the
+existing `topUsers` email enrichment: a miss (e.g. an org-shared account the heaviest caller doesn't own)
+yields `handle: null` and the UI falls back to the raw accountId. Never fails the aggregation. The admin
+tab renders `@handle` (raw id alongside) via `xAccountRows`/`xAccountLabel`, falling back to the
+client-side `byFeature` derivation if the server omits the enriched cut.
+
+**Fair per-user drawdown (the ENG-664 "eventually" goal) — design only.** Because dedup is app-wide,
+enforcing a cap on raw allocated numbers over-bills shared reads. The right mechanism is **proportional
+settlement**: keep the live ledger allocated, then a periodic settlement pulls the measured app total,
+computes `factor = measured / allocated`, and charges each org owner their allocated-weighted share so
+`Σ charged = measured` exactly (reconciles) and each pays in proportion to load (fair). Applied at the
+org-owner level (`resolveBillingUserId`, as LLM already does) and kept behind `ENFORCE_COST_CAP=false`
+(observe-only) until ENG-703 defines Emma-Credit pricing. `recordVendorUsage` deliberately does NOT call
+`incrementUserTokenUsage` today — X spend is visible but does not draw down any cap yet.
+
 ## ENG-746: the closure gate was blocked by an env var nobody set (2026-07-31)
 
 `GET /api/admin/loops/reliability-trend` returned `{count: 0, snapshots: []}` on every window, so

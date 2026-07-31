@@ -172,7 +172,7 @@ export function isCompleteHtmlDocument(draft: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
-import { twitterService } from './twitterService';
+import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
 import * as linkedInAdsService from './linkedInAdsService';
@@ -28197,7 +28197,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * written back to the owner's record. When list_id/lead_id/lead_email are
    * supplied, sent tweets and DMs are logged to AW-EmailEvents for CRM parity.
    */
+  // Public entry: bind the acting user into the X metering context so every X
+  // call this dispatch makes attributes the shadow ledger to the ACTING user and
+  // bills the account owner (ENG-664 Option B, matching the LLM rail).
   async twitterManagePost(userId: string, args: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args));
+  }
+
+  private async _twitterManagePostImpl(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
@@ -28368,7 +28375,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  // Public entry: bind the acting user into the X metering context (see twitterManagePost).
   async twitterOutreach(userId: string, args: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterOutreachImpl(userId, args));
+  }
+
+  private async _twitterOutreachImpl(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, handle, recipient_handle, query, max_results, tweet_id, x_list_id, list_name, list_id, lead_id, lead_email } = args;

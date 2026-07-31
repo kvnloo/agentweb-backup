@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'async_hooks';
 import { TwitterApi } from 'twitter-api-v2';
 import { getTwitterCredentials } from '../utils/secretsManager';
 import {
@@ -6,6 +7,66 @@ import {
   updateAccountConfig,
   TwitterXConfig,
 } from './connectedAccountsDb';
+import { recordVendorUsage } from './usageRecorderService';
+import {
+  describeXApiError,
+  isXApiCreditsError,
+  XCreditsExhaustedError,
+} from '../utils/twitterErrors';
+import {
+  TWITTER_PROVIDER,
+  TwitterOperation,
+  computeTwitterCost,
+  textContainsLink,
+} from '../utils/twitterPricing';
+
+/**
+ * Attribution + billing descriptor every X API call must carry (ENG-664).
+ *
+ * `operation` is a REQUIRED arg of withRetryOn401, so an uninstrumented call
+ * path cannot compile — attribution is never silently dropped (acceptance
+ * criterion 3). `units` derives the billable resource count from the successful
+ * result; `text` lets a post-create pick the $0.200 link rate.
+ */
+interface TwitterMeterSpec {
+  operation: TwitterOperation;
+  /** OAuth2 write scope this action needs (pre-write capability guard). */
+  requiredScope?: string;
+  /**
+   * Billable resource count from the result; defaults to 1 (single write/lookup).
+   * Typed `any` deliberately so it never constrains withRetryOn401's return-type
+   * inference — the operation's result type is fixed by `fn`, not by this reader.
+   */
+  units?: (result: any) => number;
+  /** Post-create body — a contained link selects the $0.200 rate over $0.015. */
+  text?: string;
+  /**
+   * Number of internal handle→id resolutions (userByUsername) this op makes
+   * before its main call. Each is a separate billable user-read ($0.010),
+   * recorded as its own "resolve_handle" row so no billable sub-call is left
+   * unattributed (acceptance criterion 1). 0/undefined = none.
+   */
+  extraUserReads?: number;
+}
+
+/** Count the resources in an X read result (array of items), defensively. */
+const arrayLen = (r: unknown): number => (Array.isArray(r) ? r.length : 0);
+
+/**
+ * Request-scoped acting user for X metering (ENG-664, Option B).
+ *
+ * twitterService methods only receive the account OWNER's `ownerUserId` (so token
+ * refreshes write back to the owner). To match the LLM rail — where the shadow
+ * ledger records the ACTING user and billing rolls to the org owner — a caller
+ * (the Emma dispatchers / the adapter) wraps its X calls in `runWithXActingUser`.
+ * `meterCall` then records `userId = acting user` and `billingUserId = owner`.
+ * An unwrapped call path safely falls back to owner-attribution (old behavior).
+ */
+const xActingUserStore = new AsyncLocalStorage<{ actingUserId?: string }>();
+
+export function runWithXActingUser<T>(actingUserId: string | undefined, fn: () => T): T {
+  return xActingUserStore.run({ actingUserId }, fn);
+}
 
 /**
  * TwitterService — official X API v2 integration (twitter-api-v2).
@@ -26,6 +87,22 @@ const TOKEN_REFRESH_SKEW_MS = 60 * 1000;
 export interface TweetResult {
   id: string;
   text: string;
+}
+
+/**
+ * App-level billed consumption from GET /2/usage/tweets (ENG-664 reconciliation).
+ * These are X's OWN numbers for the shared Developer App — the authoritative,
+ * app-wide-deduped read consumption against the pay-per-use cap. This is the
+ * "measured" side that the per-user allocated ledger reconciles against.
+ */
+export interface XProjectUsage {
+  projectId: string | null;
+  /** Monthly post-read cap (2,000,000 on pay-per-use). */
+  projectCap: number;
+  /** Post reads consumed this billing cycle — X's deduped, measured count. */
+  projectUsage: number;
+  /** Day of month the cycle resets, or null if X did not return it. */
+  capResetDay: number | null;
 }
 
 export class TwitterService {
@@ -291,15 +368,22 @@ export class TwitterService {
     ownerUserId: string,
     accountId: string,
     fn: (client: TwitterApi) => Promise<T>,
-    requiredScope?: string
+    meter: TwitterMeterSpec
   ): Promise<T> {
-    const client = await this.getClient(ownerUserId, accountId, requiredScope);
+    const client = await this.getClient(ownerUserId, accountId, meter.requiredScope);
     const isXAuthError = (e: unknown): boolean =>
       typeof e === 'object' && e !== null && (e as any).code === 401;
 
     try {
-      return await fn(client);
+      const result = await fn(client);
+      this.meterCall(ownerUserId, accountId, meter, result);
+      return result;
     } catch (err) {
+      // X 402 = AgentWeb's shared X wallet is out of credits (ENG-604/633/662).
+      // A hard, non-retryable, platform-side stop — convert it to a typed,
+      // clusterable error at this single chokepoint so it never reads as success
+      // and a retry never masks it. Not an auth error, so short-circuit here.
+      if (isXApiCreditsError(err)) throw this.asCreditsExhausted(err, accountId);
       if (!isXAuthError(err)) throw err;
 
       this.log(`Got 401 for account ${accountId} — force-refreshing and retrying`);
@@ -319,8 +403,11 @@ export class TwitterService {
       }
 
       try {
-        return await fn(freshClient);
+        const result = await fn(freshClient);
+        this.meterCall(ownerUserId, accountId, meter, result);
+        return result;
       } catch (retryErr) {
+        if (isXApiCreditsError(retryErr)) throw this.asCreditsExhausted(retryErr, accountId);
         if (isXAuthError(retryErr)) {
           await this.markNeedsReconnect(ownerUserId, accountId);
           throw new Error(
@@ -330,6 +417,134 @@ export class TwitterService {
         throw retryErr;
       }
     }
+  }
+
+  /**
+   * Convert a raw X 402 into the typed, clusterable XCreditsExhaustedError
+   * (ENG-664). Already-typed errors pass through unchanged. Logs a single
+   * machine-detectable marker so ops alerting can key on X wallet depletion
+   * (the OPS-78 top-up signal) instead of digging it out of prose.
+   */
+  private asCreditsExhausted(err: unknown, accountId: string): XCreditsExhaustedError {
+    if (err instanceof XCreditsExhaustedError) return err;
+    console.error(
+      `[TwitterService] X_CREDITS_EXHAUSTED account=${accountId} — shared X API wallet is out of credits (HTTP 402)`
+    );
+    return new XCreditsExhaustedError(describeXApiError(err));
+  }
+
+  /**
+   * Attribute one successful X API call into the shared usage ledger (ENG-664).
+   *
+   * Recorded via recordVendorUsage into {Dev-}AW-UsageRecords under:
+   *   - userId  = ownerUserId          → per-USER cut (who spent our X budget)
+   *   - model   = "twitter:{operation}" → per-TOOL cut (recordVendorUsage namespaces it)
+   *   - feature = "x-account:{accountId}" → per-ACCOUNT cut (the connected account)
+   * costSource is always "allocated" (see twitterPricing — X reports no per-call price).
+   *
+   * Fire-and-forget and fully guarded: metering must NEVER fail or slow an X call.
+   * recordVendorUsage swallows its own errors; this try/catch guards the
+   * units()/pricing computation on top.
+   */
+  private meterCall<T>(
+    ownerUserId: string,
+    accountId: string,
+    meter: TwitterMeterSpec,
+    result: T
+  ): void {
+    try {
+      // Attribution (Option B, matches the LLM rail): the shadow-ledger subject is
+      // the ACTING user (the member who triggered it, from the request context);
+      // billing rolls to the account OWNER (ownerUserId). Unwrapped paths have no
+      // acting user in context → attribute to the owner (prior behavior).
+      const actingUserId = xActingUserStore.getStore()?.actingUserId;
+      const userId = actingUserId || ownerUserId;
+
+      const units = meter.units ? meter.units(result) : 1;
+      const cost = computeTwitterCost(meter.operation, units, {
+        hasLink: textContainsLink(meter.text),
+      });
+      void recordVendorUsage({
+        userId,
+        billingUserId: ownerUserId,
+        provider: TWITTER_PROVIDER,
+        operation: meter.operation,
+        feature: `x-account:${accountId}`,
+        unit: cost.unit,
+        quantity: cost.quantity,
+        costUsd: cost.costUsd,
+        costSource: 'allocated',
+      });
+      // Companion charge: internal handle→id resolutions are separate billable
+      // user-reads (ENG-664 AC1 — no billable sub-call left unattributed).
+      if (meter.extraUserReads && meter.extraUserReads > 0) {
+        const resolveCost = computeTwitterCost('resolve_handle', meter.extraUserReads);
+        void recordVendorUsage({
+          userId,
+          billingUserId: ownerUserId,
+          provider: TWITTER_PROVIDER,
+          operation: 'resolve_handle',
+          feature: `x-account:${accountId}`,
+          unit: resolveCost.unit,
+          quantity: resolveCost.quantity,
+          costUsd: resolveCost.costUsd,
+          costSource: 'allocated',
+        });
+      }
+    } catch (err) {
+      this.log(
+        `usage metering failed for ${meter.operation} (non-fatal)`,
+        err instanceof Error ? err.message : err
+      );
+    }
+  }
+
+  // ─── App-level usage (reconciliation) ─────────────────────────────────────────
+
+  private cachedBearerToken: string | null = null;
+
+  /** App-only OAuth2 Bearer for app-level endpoints (GET /2/usage/tweets). */
+  private async getBearerToken(): Promise<string> {
+    if (!this.cachedBearerToken) {
+      const creds = await getTwitterCredentials();
+      if (!creds.bearerToken) {
+        throw new Error(
+          'X app bearer token is not configured — the Twitter secret is missing "bearerToken", ' +
+          'so app-level usage (GET /2/usage/tweets) cannot be read.'
+        );
+      }
+      this.cachedBearerToken = creds.bearerToken;
+    }
+    return this.cachedBearerToken;
+  }
+
+  /**
+   * Fetch the shared X Developer App's own billed consumption (ENG-664).
+   * App-only Bearer auth — NOT a per-user call, so it is not metered/attributed.
+   * This is the "measured" reconciliation anchor: X's deduped read count against
+   * the pay-per-use cap. Throws a surfaced error (describeXApiError) on failure.
+   */
+  async getXProjectUsage(): Promise<XProjectUsage> {
+    const bearer = await this.getBearerToken();
+    const client = new TwitterApi(bearer);
+    let res: any;
+    try {
+      res = await client.v2.get('usage/tweets');
+    } catch (err) {
+      throw new Error(describeXApiError(err));
+    }
+    const d = res?.data ?? res ?? {};
+    const toNum = (v: unknown): number => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const resetDay = Number(d.cap_reset_day);
+    return {
+      projectId: typeof d.project_id === 'string' ? d.project_id : null,
+      projectCap: toNum(d.project_cap),
+      projectUsage: toNum(d.project_usage),
+      capResetDay: Number.isFinite(resetDay) ? resetDay : null,
+    };
   }
 
   // ─── Connectivity ─────────────────────────────────────────────────────────────
@@ -353,11 +568,14 @@ export class TwitterService {
       throw new Error('Tweet text cannot be empty');
     }
     const finalText = this.trimToLimit(text.trim(), TWEET_CHAR_LIMIT);
-    return this.withRetryOn401(ownerUserId, accountId, (client) =>
-      opts?.inReplyToTweetId
-        ? client.v2.reply(finalText, opts.inReplyToTweetId!).then((r: any) => ({ id: r.data.id, text: r.data.text }))
-        : client.v2.tweet(finalText).then((r: any) => ({ id: r.data.id, text: r.data.text })),
-      'tweet.write'
+    return this.withRetryOn401(
+      ownerUserId,
+      accountId,
+      (client) =>
+        opts?.inReplyToTweetId
+          ? client.v2.reply(finalText, opts.inReplyToTweetId!).then((r: any) => ({ id: r.data.id, text: r.data.text }))
+          : client.v2.tweet(finalText).then((r: any) => ({ id: r.data.id, text: r.data.text })),
+      { operation: opts?.inReplyToTweetId ? 'reply' : 'post', requiredScope: 'tweet.write', text: finalText }
     );
   }
 
@@ -407,7 +625,7 @@ export class TwitterService {
         throw new Error(`Could not resolve X handle "@${handle}"`);
       }
       return client.v2.sendDmToParticipant(user.data.id, { text: finalText });
-    }, 'dm.write');
+    }, { operation: 'send_dm', requiredScope: 'dm.write', extraUserReads: 1 });
   }
 
   /**
@@ -417,7 +635,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.listDmEvents();
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'list_dms', units: arrayLen });
   }
 
   /**
@@ -432,7 +650,7 @@ export class TwitterService {
         'user.fields': ['public_metrics', 'description', 'verified', 'location', 'url', 'profile_image_url', 'created_at'],
       });
       return res.data;
-    });
+    }, { operation: 'get_profile', units: (r) => (r ? 1 : 0) });
   }
 
   /**
@@ -445,7 +663,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.deleteTweet(tweetId.trim());
       return { deleted: res?.data?.deleted ?? false };
-    }, 'tweet.write');
+    }, { operation: 'delete_tweet', requiredScope: 'tweet.write' });
   }
 
   // ─── Private helpers for actions that need the authed user's own Twitter ID ──
@@ -482,7 +700,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.follow(myId, targetId);
       return res?.data ?? res;
-    }, 'follows.write');
+    }, { operation: 'follow', requiredScope: 'follows.write', extraUserReads: 1 });
   }
 
   /**
@@ -495,7 +713,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unfollow(myId, targetId);
       return res?.data ?? res;
-    }, 'follows.write');
+    }, { operation: 'unfollow', requiredScope: 'follows.write', extraUserReads: 1 });
   }
 
   // ─── List followers / following ───────────────────────────────────────────────
@@ -510,7 +728,7 @@ export class TwitterService {
       const targetId = handle ? await this.resolveHandleToUserId(client, handle) : myId;
       const res: any = await client.v2.followers(targetId);
       return res?.data ?? [];
-    });
+    }, { operation: 'list_followers', units: arrayLen, extraUserReads: handle ? 1 : 0 });
   }
 
   /**
@@ -522,7 +740,7 @@ export class TwitterService {
       const targetId = handle ? await this.resolveHandleToUserId(client, handle) : myId;
       const res: any = await client.v2.following(targetId);
       return res?.data ?? [];
-    });
+    }, { operation: 'list_following', units: arrayLen, extraUserReads: handle ? 1 : 0 });
   }
 
   // ─── Search tweets ────────────────────────────────────────────────────────────
@@ -538,7 +756,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'search_tweets', units: arrayLen });
   }
 
   // ─── DM conversation ─────────────────────────────────────────────────────────
@@ -553,7 +771,7 @@ export class TwitterService {
       const participantId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.listDmEventsWithParticipant(participantId);
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'get_dm_conversation', units: arrayLen, extraUserReads: 1 });
   }
 
   // ─── Like / unlike ────────────────────────────────────────────────────────────
@@ -565,7 +783,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.like(myId, tweetId.trim());
       return res?.data ?? res;
-    }, 'like.write');
+    }, { operation: 'like', requiredScope: 'like.write' });
   }
 
   /** Unlike a tweet. */
@@ -575,7 +793,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.unlike(myId, tweetId.trim());
       return res?.data ?? res;
-    }, 'like.write');
+    }, { operation: 'unlike', requiredScope: 'like.write' });
   }
 
   // ─── Retweet / unretweet ─────────────────────────────────────────────────────
@@ -587,7 +805,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.retweet(myId, tweetId.trim());
       return res?.data ?? res;
-    }, 'tweet.write');
+    }, { operation: 'retweet', requiredScope: 'tweet.write' });
   }
 
   /** Undo a retweet. */
@@ -597,7 +815,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.unretweet(myId, tweetId.trim());
       return res?.data ?? res;
-    }, 'tweet.write');
+    }, { operation: 'unretweet', requiredScope: 'tweet.write' });
   }
 
   // ─── User tweets timeline ────────────────────────────────────────────────────
@@ -614,7 +832,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'get_user_tweets', units: arrayLen, extraUserReads: 1 });
   }
 
   // ─── Bookmarks ────────────────────────────────────────────────────────────────
@@ -625,7 +843,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.bookmark(tweetId.trim());
       return res?.data ?? res;
-    }, 'bookmark.write');
+    }, { operation: 'bookmark', requiredScope: 'bookmark.write' });
   }
 
   /** Retrieve the authed user's bookmarked tweets. */
@@ -633,7 +851,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.bookmarks();
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'get_bookmarks', units: arrayLen });
   }
 
   // ─── X Lists (read) ────────────────────────────────────────────────────────────
@@ -665,7 +883,7 @@ export class TwitterService {
           'list.fields': ['member_count', 'follower_count', 'private', 'description'],
         });
         return res?.data?.data ?? res?.data ?? [];
-      });
+      }, { operation: 'get_owned_lists', units: arrayLen });
     } catch (err) {
       return this.mapListScopeError(err);
     }
@@ -683,7 +901,7 @@ export class TwitterService {
           'user.fields': ['username', 'name', 'description', 'public_metrics'],
         });
         return res?.data?.data ?? res?.data ?? [];
-      });
+      }, { operation: 'get_list_members', units: arrayLen });
     } catch (err) {
       return this.mapListScopeError(err);
     }
@@ -716,7 +934,7 @@ export class TwitterService {
           created_at: t.created_at ?? null,
           public_metrics: t.public_metrics ?? null,
         }));
-      });
+      }, { operation: 'get_list_tweets', units: arrayLen });
     } catch (err) {
       return this.mapListScopeError(err);
     }
@@ -749,7 +967,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.quote(finalText, quotedTweetId.trim());
       return { id: res.data.id, text: res.data.text };
-    }, 'tweet.write');
+    }, { operation: 'quote', requiredScope: 'tweet.write', text: finalText });
   }
 
   // ─── Engagement lookup ────────────────────────────────────────────────────────
@@ -760,7 +978,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.tweetRetweetedBy(tweetId.trim());
       return res?.data ?? [];
-    });
+    }, { operation: 'get_retweeters', units: arrayLen });
   }
 
   /** List users who liked a tweet. */
@@ -769,7 +987,7 @@ export class TwitterService {
     return this.withRetryOn401(ownerUserId, accountId, async (client) => {
       const res: any = await client.v2.tweetLikedBy(tweetId.trim());
       return res?.data ?? [];
-    });
+    }, { operation: 'get_liking_users', units: arrayLen });
   }
 
   /** List quote tweets of a tweet. */
@@ -781,7 +999,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'get_quote_tweets', units: arrayLen });
   }
 
   // ─── Block / unblock ─────────────────────────────────────────────────────────
@@ -794,7 +1012,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.block(myId, targetId);
       return res?.data ?? res;
-    }, 'block.write');
+    }, { operation: 'block', requiredScope: 'block.write', extraUserReads: 1 });
   }
 
   /** Unblock a user by handle. Requires block.write scope. */
@@ -805,7 +1023,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unblock(myId, targetId);
       return res?.data ?? res;
-    }, 'block.write');
+    }, { operation: 'unblock', requiredScope: 'block.write', extraUserReads: 1 });
   }
 
   // ─── Mute / unmute ───────────────────────────────────────────────────────────
@@ -818,7 +1036,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.mute(myId, targetId);
       return res?.data ?? res;
-    }, 'mute.write');
+    }, { operation: 'mute', requiredScope: 'mute.write', extraUserReads: 1 });
   }
 
   /** Unmute a user by handle. Requires mute.write scope. */
@@ -829,7 +1047,7 @@ export class TwitterService {
       const targetId = await this.resolveHandleToUserId(client, handle);
       const res: any = await client.v2.unmute(myId, targetId);
       return res?.data ?? res;
-    }, 'mute.write');
+    }, { operation: 'unmute', requiredScope: 'mute.write', extraUserReads: 1 });
   }
 
   // ─── Tweet metrics ───────────────────────────────────────────────────────────
@@ -842,7 +1060,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at', 'text'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'get_tweet_metrics', units: arrayLen });
   }
 
   // ─── List replies ────────────────────────────────────────────────────────────
@@ -856,7 +1074,7 @@ export class TwitterService {
         'tweet.fields': ['public_metrics', 'created_at', 'author_id'],
       });
       return res?.data?.data ?? res?.data ?? [];
-    });
+    }, { operation: 'list_replies', units: arrayLen });
   }
 }
 
