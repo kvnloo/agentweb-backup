@@ -4,7 +4,7 @@
 // list_id-less, and dedup-skipped invites.
 
 const getLeadById = jest.fn();
-const findLeadsByLinkedin = jest.fn();
+const findLeadByLinkedinInList = jest.fn();
 const createLead = jest.fn();
 const updateLead = jest.fn();
 const addLeadEngagement = jest.fn();
@@ -14,7 +14,7 @@ const syncSentInvitationsForAccount = jest.fn();
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadById: (...a: any[]) => getLeadById(...a),
-    findLeadsByLinkedin: (...a: any[]) => findLeadsByLinkedin(...a),
+    findLeadByLinkedinInList: (...a: any[]) => findLeadByLinkedinInList(...a),
     createLead: (...a: any[]) => createLead(...a),
     updateLead: (...a: any[]) => updateLead(...a),
     addLeadEngagement: (...a: any[]) => addLeadEngagement(...a),
@@ -51,7 +51,7 @@ function invite(publicId: string, name: string, extra: any = {}) {
 describe('reconcileSentInvitationsToCrm', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    findLeadsByLinkedin.mockResolvedValue([]);
+    findLeadByLinkedinInList.mockResolvedValue(null);
     createLead.mockResolvedValue({ leadId: 'lead_new' });
     updateLead.mockResolvedValue({});
     addLeadEngagement.mockResolvedValue({});
@@ -64,10 +64,10 @@ describe('reconcileSentInvitationsToCrm', () => {
 
   it('returns zeros and touches nothing when accountId or listId is missing', async () => {
     expect(await reconcileSentInvitationsToCrm({ accountId: '', listId: LIST })).toEqual({
-      total: 0, created: 0, updated: 0, skipped: 0,
+      total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0,
     });
     expect(await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: '' })).toEqual({
-      total: 0, created: 0, updated: 0, skipped: 0,
+      total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0,
     });
     expect(getAllSentInvitationsByAccount).not.toHaveBeenCalled();
     expect(createLead).not.toHaveBeenCalled();
@@ -76,7 +76,7 @@ describe('reconcileSentInvitationsToCrm', () => {
   it('reports zeros when there are no pending invitations', async () => {
     getAllSentInvitationsByAccount.mockResolvedValue([]);
     const res = await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST });
-    expect(res).toEqual({ total: 0, created: 0, updated: 0, skipped: 0 });
+    expect(res).toEqual({ total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0 });
   });
 
   it('does not abort the batch when one invite fails to mirror', async () => {
@@ -103,10 +103,10 @@ describe('reconcileSentInvitationsToCrm', () => {
       invite('', 'No Id'),                 // no /in/ URL keyable → skipped
     ]);
     // 'existing' already lives in the target list.
-    findLeadsByLinkedin.mockImplementation(async (url: string) =>
+    findLeadByLinkedinInList.mockImplementation(async (_listId: string, url: string) =>
       url.includes('/in/existing')
-        ? [{ leadId: 'lead_existing', listId: LIST, status: 'new' }]
-        : [],
+        ? { leadId: 'lead_existing', listId: LIST, status: 'new' }
+        : null,
     );
 
     const res = await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST, refreshFromLive: false });
@@ -144,20 +144,42 @@ describe('reconcileSentInvitationsToCrm', () => {
       invite('new-person', 'New Person'),  // absent → would create
       invite('existing', 'Existing Lead'), // present → would update
     ]);
-    findLeadsByLinkedin.mockImplementation(async (url: string) =>
+    findLeadByLinkedinInList.mockImplementation(async (_listId: string, url: string) =>
       url.includes('/in/existing')
-        ? [{ leadId: 'lead_existing', listId: LIST, status: 'new' }]
-        : [],
+        ? { leadId: 'lead_existing', listId: LIST, status: 'new' }
+        : null,
     );
 
     const res = await reconcileSentInvitationsToCrm({
       accountId: ACCOUNT, listId: LIST, refreshFromLive: false, dryRun: true,
     });
 
-    expect(res).toEqual({ total: 2, created: 1, updated: 1, skipped: 0 });
+    expect(res).toEqual({ total: 2, created: 1, updated: 1, skipped: 0, alreadyRecorded: 0 });
     // No writes whatsoever.
     expect(createLead).not.toHaveBeenCalled();
     expect(updateLead).not.toHaveBeenCalled();
+    expect(addLeadEngagement).not.toHaveBeenCalled();
+  });
+
+  it('is re-runnable: a second pass over the same backlog logs no duplicate engagements', async () => {
+    // The script is documented as a repeatable backstop, so a repeat run must not
+    // re-append linkedin.invite.sent to every already-mirrored lead (ENG-787).
+    const pending = invite('existing', 'Existing Lead');
+    getAllSentInvitationsByAccount.mockResolvedValue([pending]);
+    findLeadByLinkedinInList.mockResolvedValue({
+      leadId: 'lead_existing',
+      listId: LIST,
+      status: 'contacted',
+      engagements: [{
+        eventType: 'linkedin.invite.sent',
+        createdAt: pending.sentAt,
+        eventData: { note: '', accountId: ACCOUNT, linkedin: 'https://www.linkedin.com/in/existing' },
+      }],
+    });
+
+    const res = await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST, refreshFromLive: false });
+
+    expect(res).toEqual({ total: 1, created: 0, updated: 1, skipped: 0, alreadyRecorded: 1 });
     expect(addLeadEngagement).not.toHaveBeenCalled();
   });
 

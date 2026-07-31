@@ -1889,4 +1889,65 @@ describe('CRM Database Service', () => {
       expect(await crmDb.canOrgMemberAccessList('ghost-5', list)).toBe(false);
     });
   });
+  // ENG-787: findLeadsByLinkedin caps at 10 items across ALL tenants, so a profile
+  // present in many lists could page past the caller's list and be reported absent —
+  // which makes the invite mirror create a duplicate lead. findLeadByLinkedinInList
+  // filters server-side and pages until it finds the match.
+  describe('findLeadByLinkedinInList', () => {
+    const LIST = 'list_target';
+    const URL = 'https://www.linkedin.com/in/david-yao';
+
+    it('returns null without querying when listId or linkedin is blank', async () => {
+      expect(await crmDb.findLeadByLinkedinInList('', URL)).toBeNull();
+      expect(await crmDb.findLeadByLinkedinInList(LIST, '   ')).toBeNull();
+      expect(mockDocumentClientMethods.query).not.toHaveBeenCalled();
+    });
+
+    it('filters on listId server-side rather than post-filtering a capped page', async () => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [{ leadId: 'lead_1', listId: LIST }] }),
+      });
+      const hit = await crmDb.findLeadByLinkedinInList(LIST, URL);
+      expect(hit).toEqual({ leadId: 'lead_1', listId: LIST });
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledWith(expect.objectContaining({
+        IndexName: 'LinkedinLookupIndex',
+        KeyConditionExpression: 'linkedin = :linkedin',
+        FilterExpression: 'listId = :listId',
+        ExpressionAttributeValues: { ':linkedin': URL, ':listId': LIST },
+      }));
+      // No Limit — a cap is exactly what hid the match before.
+      expect(mockDocumentClientMethods.query.mock.calls[0][0]).not.toHaveProperty('Limit');
+    });
+
+    it('pages past filtered-out matches instead of giving up on the first page', async () => {
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { k: 1 } }),
+        })
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({ Items: [{ leadId: 'lead_deep', listId: LIST }] }),
+        });
+      const hit = await crmDb.findLeadByLinkedinInList(LIST, URL);
+      expect(hit).toEqual({ leadId: 'lead_deep', listId: LIST });
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(2);
+      expect(mockDocumentClientMethods.query.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ ExclusiveStartKey: { k: 1 } }),
+      );
+    });
+
+    it('returns null when the profile exists only in other lists', async () => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [] }),
+      });
+      expect(await crmDb.findLeadByLinkedinInList(LIST, URL)).toBeNull();
+    });
+
+    it('stops paging at the bound instead of spinning forever', async () => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { k: 1 } }),
+      });
+      expect(await crmDb.findLeadByLinkedinInList(LIST, URL)).toBeNull();
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(20);
+    });
+  });
 });
