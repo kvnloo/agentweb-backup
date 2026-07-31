@@ -25,6 +25,42 @@ interface XApiErrorLike {
 }
 
 /**
+ * Typed, machine-detectable X credit-exhaustion condition (ENG-664).
+ *
+ * A raw X 402 only carries the status on `.code`, so downstream telemetry and
+ * the tool-error classifier had nothing structural to key on — a mid-run 402
+ * (ENG-604/633/662) classified as a generic `Error` and could read as success.
+ * `withRetryOn401` converts every X 402 into this at the single chokepoint so a
+ * depleted wallet is a hard, non-retryable, clusterable failure. `name` is
+ * stable ('XCreditsExhaustedError') so classifyToolErrorClass maps it by name
+ * even across module/mock boundaries, and `code` stays 402 for status-based
+ * classification.
+ */
+export class XCreditsExhaustedError extends Error {
+  /** HTTP status kept so status-based classification still works. */
+  readonly code = 402 as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'XCreditsExhaustedError';
+  }
+}
+
+/**
+ * True when an error is an X credit-exhaustion (HTTP 402) — either a raw
+ * twitter-api-v2 ApiResponseError (status on `.code`) or the typed
+ * XCreditsExhaustedError. Duck-typed so it works regardless of how the error
+ * crossed a module/mock boundary.
+ */
+export function isXApiCreditsError(error: unknown): boolean {
+  if (error instanceof XCreditsExhaustedError) return true;
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as XApiErrorLike).code === 402
+  );
+}
+
+/**
  * Build a human-readable message from an error thrown by an X API call.
  * When the error carries X's structured payload (title/detail/errors), those are
  * surfaced (with the HTTP status). Otherwise falls back to the error's own

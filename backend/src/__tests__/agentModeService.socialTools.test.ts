@@ -53,6 +53,20 @@ describe('AgentModeService - Social Media Tools', () => {
     updated_at: new Date().toISOString(),
   };
 
+  const mockPersonalLinkedInAccount = {
+    account_id: 'urn:li:person:ilhAte8iXG',
+    account_name: 'Kevin Rajan',
+    platform: 'linkedin',
+    config: {
+      account_type: 'personal',
+      access_token: 'personal-access-token',
+      token_expires_at: Date.now() + 3600000,
+      scopes: ['w_member_social'],
+    },
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+
   const mockTwitterAccount = {
     account_id: 'twitter-user-123',
     account_name: '@testuser',
@@ -483,6 +497,88 @@ describe('AgentModeService - Social Media Tools', () => {
       expect(result.success).toBe(true);
       expect(result.posts).toEqual([]);
       expect(result.message).toContain('Successfully loaded 0 posts');
+    });
+
+    // ENG-660: for a personal LinkedIn account, AgentWeb only surfaces posts it
+    // created itself — it does not read a profile's other existing posts.
+    // Reporting a bare "Successfully loaded 0 posts" here led the model to claim
+    // the fetch succeeded / that it had read the user's LinkedIn, which reads as
+    // a tool-success hallucination. Zero posts on a personal account must be
+    // flagged as an explicitly-unsupported read (organicReadUnsupported) that
+    // owns the AgentWeb-only behavior — while keeping success:true, because the
+    // account is connected and nothing failed, so it must NOT render as a tool
+    // "failure" in the UI.
+    it('flags an unsupported read (not a bare empty success) but keeps success:true when a personal LinkedIn account has 0 posts', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([mockPersonalLinkedInAccount as any]);
+      mockAdapter.listPosts.mockResolvedValue([]);
+
+      const result = await service.loadConnectedAccountPosts(
+        'user-123',
+        'urn:li:person:ilhAte8iXG'
+      );
+
+      // success stays true: the account is connected and healthy — nothing
+      // failed — so the UI must not badge this by-design empty read as a failure.
+      expect(result.success).toBe(true);
+      expect(result.posts).toEqual([]);
+      expect(result.organicReadUnsupported).toBe(true);
+      // Must NOT frame it as a successful read of the user's posts.
+      expect(result.message).not.toContain('Successfully loaded');
+      // Owns it as AgentWeb's own behavior, framed positively (what AgentWeb
+      // DOES) — never as a weakness/"limitation", and steers the model away from
+      // blaming an external platform.
+      expect(result.message.toLowerCase()).toContain('agentweb');
+      expect(result.message.toLowerCase()).not.toContain('limitation');
+      expect(result.message.toLowerCase()).toContain('do not blame any external platform');
+      expect(result.message.toLowerCase()).toContain('do not claim');
+      // State-based ("none on file"), not a publish-history claim ("hasn't
+      // published yet") — the latter would be wrong if posts were published then
+      // all deleted, which also reaches this branch (0 rows, no error).
+      expect(result.message.toLowerCase()).toContain('on file');
+    });
+
+    // ENG-660 precedence guard: when a PERSONAL LinkedIn account's adapter
+    // errors (e.g. expired token) and there are 0 cached posts, the pre-existing
+    // error branch must win — the read failed, so it must return success:false
+    // with the real error, NOT be swallowed by the organicReadUnsupported branch
+    // (which shares the posts.length===0 condition and would otherwise mask a
+    // genuine failure as a benign "unsupported read"). Ordering guarantees this;
+    // this test locks it in for the personal path.
+    it('surfaces the real adapter error (not the unsupported-read message) when a personal LinkedIn account errors with 0 posts', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([mockPersonalLinkedInAccount as any]);
+      mockAdapter.listPosts.mockRejectedValue(new Error('LinkedIn access token expired. Please reconnect your account.'));
+
+      const result = await service.loadConnectedAccountPosts(
+        'user-123',
+        'urn:li:person:ilhAte8iXG'
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('LinkedIn access token expired');
+      // Must NOT be masked as a benign unsupported read (the error branch wins,
+      // so the personal unsupported-read message/flag must not leak through).
+      expect(result.organicReadUnsupported).toBeUndefined();
+      expect(result.message).not.toContain('AgentWeb works from the LinkedIn posts');
+    });
+
+    // Regression guard: a personal LinkedIn account that DOES have stored
+    // AgentWeb-published posts still reports a normal successful load.
+    it('still reports a normal load when a personal LinkedIn account has stored posts', async () => {
+      mockGetAccountsByUserId.mockResolvedValue([mockPersonalLinkedInAccount as any]);
+      mockAdapter.listPosts.mockResolvedValue([
+        { id: 'urn:li:share:p1', commentary: 'A post AgentWeb published', author: 'urn:li:person:ilhAte8iXG' },
+      ]);
+
+      const result = await service.loadConnectedAccountPosts(
+        'user-123',
+        'urn:li:person:ilhAte8iXG',
+        { include_metrics: false }
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.posts).toHaveLength(1);
+      expect(result.organicReadUnsupported).toBeUndefined();
+      expect(result.message).toContain('Successfully loaded 1 posts');
     });
   });
 

@@ -113,6 +113,113 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
       expect(llmModels['anthropic.claude-opus-4-8'].client).toBeNull();
     });
 
+    /*
+     * ENG-744 — the Claude 5 generation is offered alongside the existing entries.
+     * AC #1 is the getSupportedModels() assertions; AC #5 (nothing re-routed) is
+     * covered by the "default model unchanged" test further down.
+     */
+    describe('ENG-744 — Claude 5 generation', () => {
+      const CLAUDE_5 = [
+        'anthropic.claude-opus-5',
+        'anthropic.claude-sonnet-5',
+        'anthropic.claude-haiku-4-5-20251001-v1:0',
+      ];
+
+      it.each(CLAUDE_5)('offers %s to non-admins (AC #1 — added, not admin-gated)', async (id) => {
+        const models = await agentModeService.getSupportedModels(false);
+        expect(models).toContain(id);
+      });
+
+      it.each(CLAUDE_5)('offers %s to admins', async (id) => {
+        const models = await agentModeService.getSupportedModels(true);
+        expect(models).toContain(id);
+      });
+
+      it.each(CLAUDE_5)('lazy-loads the client for %s', (id) => {
+        expect((agentModeService as any).llmModels[id].client).toBeNull();
+      });
+
+      /*
+       * Verified against live Bedrock, not assumed: Opus 5 and Sonnet 5 both
+       * return HTTP 400 "`temperature` is deprecated for this model", so sending
+       * temperature would break every call. Haiku 4.5 accepts it.
+       */
+      it('marks Opus 5 and Sonnet 5 as rejecting temperature (live-verified 400)', () => {
+        const llmModels = (agentModeService as any).llmModels;
+        expect(llmModels['anthropic.claude-opus-5'].supportsTemperature).toBe(false);
+        expect(llmModels['anthropic.claude-sonnet-5'].supportsTemperature).toBe(false);
+      });
+
+      it('keeps temperature enabled for Haiku 4.5, which still accepts it', () => {
+        const llmModels = (agentModeService as any).llmModels;
+        expect(llmModels['anthropic.claude-haiku-4-5-20251001-v1:0'].supportsTemperature).toBe(true);
+      });
+
+      it.each(CLAUDE_5)('marks %s as vision-capable', (id) => {
+        expect((agentModeService as any).llmModels[id].supportsVision).toBe(true);
+      });
+
+      /*
+       * SUPERSEDED by ENG-759 (approved by Harsha 2026-07-30: "opus 5 as default
+       * is fine"). ENG-744's AC #5 was "merely ADDING the Claude 5 family must not
+       * re-route the default" — that guard was correct for ENG-744 and is still
+       * the intent here: the default only moves by an explicit, approved decision.
+       * ENG-759 is that decision, so the expected value changes from 'gpt-5.5' to
+       * Opus 5 while the guard itself is kept (it would still catch an accidental
+       * re-route caused by a future catalog addition).
+       */
+      it('AC #5 — default model only moves by explicit decision (now Opus 5, ENG-759)', async () => {
+        expect((agentModeService as any).default_model).toBe('anthropic.claude-opus-5');
+      });
+
+      it('AC #6 — leaves the live voice model untouched', () => {
+        const live = (agentModeService as any).llmModels['gemini-3.1-flash-live-preview'];
+        expect(live).toEqual({ client: null, supportsTemperature: false, isLive: true });
+      });
+    });
+
+    /*
+     * ENG-744 — gemini-3-pro-preview was shut down by Google on 2026-03-09 and
+     * returns a hard 404 ("This model ... is no longer available") on a real
+     * generateContent call, yet it stayed in the registry and was still offered
+     * by GET /public/llm-models. Selecting it was a guaranteed user-facing
+     * failure for ~4.5 months. llmPricing.ts:94 already carried a DEPRECATED
+     * 2026-03-09 note — pricing knew; the registry never caught up.
+     *
+     * NOTE: the issue's AC #7 says withdrawn models are "reported rather than
+     * silently removed". This removal is deliberate and explicitly authorized
+     * (PM tick, recorded on ENG-744 and in the PR body) — i.e. reported, not
+     * silent. Migration target is gemini-3.1-pro-preview.
+     *
+     * It also stands as the reason AC #3 is verified by invoking rather than by
+     * listing: this model still appears in Google's ListModels while 404ing on
+     * the actual call, so a discovery-endpoint check proves nothing.
+     */
+    describe('ENG-744 — withdrawn model removal', () => {
+      it('no longer offers the shut-down gemini-3-pro-preview to anyone', async () => {
+        for (const isAdmin of [true, false]) {
+          const models = await agentModeService.getSupportedModels(isAdmin);
+          expect(models).not.toContain('gemini-3-pro-preview');
+        }
+      });
+
+      it('drops it from the registry entirely, not just from the served list', () => {
+        expect((agentModeService as any).llmModels['gemini-3-pro-preview']).toBeUndefined();
+      });
+
+      it('keeps the still-live Gemini models it sat next to', async () => {
+        const models = await agentModeService.getSupportedModels(false);
+        for (const id of [
+          'gemini-3-flash-preview',
+          'gemini-3.1-pro-preview',
+          'gemini-3.1-flash-lite',
+          'gemini-3.5-flash',
+        ]) {
+          expect(models).toContain(id);
+        }
+      });
+    });
+
     it('should have temperature support enabled for Sonnet 4.5', async () => {
       const llmModels = (agentModeService as any).llmModels;
       expect(llmModels['anthropic.claude-sonnet-4-5-20250929-v1:0'].supportsTemperature).toBe(true);

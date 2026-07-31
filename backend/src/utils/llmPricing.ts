@@ -67,6 +67,19 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   'anthropic.claude-fable-5': FABLE_5_PRICE,
   'claude-haiku-4-5': HAIKU_4_5_PRICE,
   'anthropic.claude-haiku-4-5': HAIKU_4_5_PRICE,
+  // ENG-744 — Claude 5 generation, priced under the exact id the registry
+  // invokes so the ENG-693 usage ledger books real cost instead of $0.
+  // Rates are Anthropic's published list prices, the same convention every
+  // Bedrock Anthropic row above already uses (Opus 4.8 = $5/$25 here too).
+  'anthropic.claude-opus-5': withDerivedCache(5, 25),
+  // Sonnet 5 standard rate. Anthropic also runs a $2/$10 introductory rate
+  // through 2026-08-31, but that is first-party-API only and temporary —
+  // metering at the standard rate cannot under-bill when it lapses.
+  'anthropic.claude-sonnet-5': withDerivedCache(3, 15),
+  // The bare 'anthropic.claude-haiku-4-5' key above does NOT cover this id:
+  // canonicalModelId strips only a trailing bare -YYYY-MM-DD, and this one ends
+  // in '-20251001-v1:0'. Without its own key the lookup misses and records $0.
+  'anthropic.claude-haiku-4-5-20251001-v1:0': HAIKU_4_5_PRICE,
 
   // ── Azure OpenAI chat deployments ───────────────────────────────────────────
   'gpt-5-chat-2': withDerivedCache(2.5, 10), // ported from estimateCost

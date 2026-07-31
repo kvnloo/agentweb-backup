@@ -7,6 +7,8 @@ jest.mock('../services/usageRecordDb', () => ({
     queryByUserDateRange: jest.fn(),
     scanByDateRange: jest.fn(),
   },
+  // Real semantics: a per-unit vendor row has BOTH provider and unit.
+  isVendorEntry: (r: any) => !!(r && r.provider && r.unit),
 }));
 
 jest.mock('../services/db', () => ({
@@ -15,17 +17,26 @@ jest.mock('../services/db', () => ({
   },
 }));
 
+const mockGetAccountById = jest.fn();
+jest.mock('../services/connectedAccountsDb', () => ({
+  getAccountById: (...a: any[]) => mockGetAccountById(...a),
+}));
+
 import { usageRecordDb } from '../services/usageRecordDb';
 import { userDb } from '../services/db';
 import {
   getUserUsageByModelDay,
   getUsageComparison,
   getCostAggregation,
+  getXAllocatedTotals,
+  currentXBillingCycle,
+  getUserXBreakdown,
 } from '../services/usageAnalyticsService';
 
 const mockQuery = usageRecordDb.queryByUserDateRange as jest.Mock;
 const mockScan = usageRecordDb.scanByDateRange as jest.Mock;
 const mockGetUser = userDb.getUserById as jest.Mock;
+beforeEach(() => mockGetAccountById.mockReset());
 
 const row = (overrides: any = {}) => ({
   userId: 'user-1',
@@ -348,6 +359,50 @@ describe('usageAnalyticsService', () => {
       expect(mockScan).toHaveBeenCalledWith('2026-06-01', '2026-06-30');
     });
 
+    it('provider scope: default "llm" excludes vendor rows; "twitter" keeps only X; "all" keeps both', async () => {
+      // A realistic mixed ledger: one LLM row and one X vendor row (provider+unit,
+      // as recordVendorUsage writes) — so the LLM Costs tab (default "llm") must
+      // NOT show the twitter row (ENG-664 leak fix).
+      const rows = [
+        aggRow({ costMicroUsd: 3_000_000 }), // LLM $3
+        xRow('twitter:post', { provider: 'twitter', unit: 'post', costMicroUsd: 500_000 }), // X $0.50
+      ];
+      // The X cut enriches @handles via getAccountById — return null (unresolved).
+      mockGetAccountById.mockResolvedValue(null);
+
+      mockScan.mockResolvedValue(rows);
+      const llm = await getCostAggregation('2026-06-01', '2026-06-30'); // default "llm"
+      expect(llm.byModel.some((m) => m.model.startsWith('twitter:'))).toBe(false);
+      expect(llm.totals.costUsd).toBeCloseTo(3, 6);
+
+      mockScan.mockResolvedValue(rows);
+      const x = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'twitter');
+      expect(x.byModel.length).toBeGreaterThan(0);
+      expect(x.byModel.every((m) => m.model.startsWith('twitter:'))).toBe(true);
+      expect(x.totals.costUsd).toBeCloseTo(0.5, 6);
+
+      mockScan.mockResolvedValue(rows);
+      const all = await getCostAggregation('2026-06-01', '2026-06-30', 10, 'all');
+      expect(all.totals.costUsd).toBeCloseTo(3.5, 6);
+    });
+
+    it('"llm" scope excludes a twitter:* row even if it is missing the unit field, but keeps Bedrock :0 versions', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        // A vendor row with the model namespace but NO provider/unit — the belt-and-
+        // suspenders model-prefix guard must still exclude it from the LLM view.
+        aggRow({ model: 'twitter:post', feature: 'x-account:acc-1', costMicroUsd: 500_000 }),
+        // A Bedrock model whose id ends in a numeric ":0" version tag is LLM, not a
+        // vendor — it must be KEPT.
+        aggRow({ model: 'anthropic.claude-sonnet-4-5-20250929-v1:0', costMicroUsd: 2_000_000 }),
+      ]);
+
+      const llm = await getCostAggregation('2026-06-01', '2026-06-30'); // default "llm"
+      expect(llm.byModel.some((m) => m.model.startsWith('twitter:'))).toBe(false);
+      expect(llm.byModel.some((m) => m.model === 'anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe(true);
+      expect(llm.totals.costUsd).toBeCloseTo(2, 6); // only the Bedrock row counts
+    });
+
     it('aggregates by model: totals equal the sum of underlying per-user stored costs (assertion 2)', async () => {
       mockScan.mockResolvedValue([
         aggRow({ userId: 'user-1', costMicroUsd: 3_500_000, callCount: 3 }),
@@ -391,6 +446,10 @@ describe('usageAnalyticsService', () => {
       expect(result.totals.costMicroUsd).toBe(15_000_000);
       expect(result.totals.costUsd).toBe(15);
       expect(result.totals.callCount).toBe(6);
+
+      // userCount is the distinct-user count over the FULL set (user-1, user-2),
+      // independent of the topUsers cap — 3 rows across 2 users → 2.
+      expect(result.userCount).toBe(2);
     });
 
     it('sums stored costMicroUsd only — tolerates rows with missing counters (no re-pricing)', async () => {
@@ -556,8 +615,202 @@ describe('usageAnalyticsService', () => {
         series: [],
         byFeature: [],
         topUsers: [],
+        userCount: 0,
+        byXAccount: [],
       });
       expect(mockGetUser).not.toHaveBeenCalled();
     });
+  });
+});
+
+// ── ENG-664: X allocated totals + billing-cycle window ────────────────────────
+
+const xRow = (model: string, over: any = {}) => ({
+  userId: over.userId ?? 'user-1',
+  sk: `2026-07-10#${model}#x-account:acc-1`,
+  date: '2026-07-10',
+  model,
+  feature: 'x-account:acc-1',
+  callCount: 1,
+  quantity: 1,
+  costMicroUsd: 0,
+  ...over,
+});
+
+describe('getXAllocatedTotals', () => {
+  it('sums only twitter:* rows and counts post-read units separately', async () => {
+    mockScan.mockResolvedValue([
+      xRow('twitter:search_tweets', { quantity: 10, callCount: 1, costMicroUsd: 50_000 }), // $0.05, 10 post-reads
+      xRow('twitter:get_profile', { quantity: 1, callCount: 1, costMicroUsd: 10_000 }),     // $0.01, user read (not post-read)
+      xRow('twitter:post', { quantity: 1, callCount: 1, costMicroUsd: 15_000 }),            // $0.015 write
+      // Non-twitter rows must be ignored entirely.
+      { ...xRow('gpt-5-chat-2'), model: 'gpt-5-chat-2', costMicroUsd: 999_000 },
+    ]);
+
+    const t = await getXAllocatedTotals('2026-07-03', '2026-07-31');
+    expect(t.costUsd).toBeCloseTo(0.075, 6); // 0.05 + 0.01 + 0.015 — the LLM row excluded
+    expect(t.callCount).toBe(3);
+    expect(t.postReadUnits).toBe(10); // only search_tweets counts
+    expect(t.byOperation.map((r) => r.operation)).toContain('search_tweets');
+    expect(t.byOperation[0].operation).toBe('search_tweets'); // sorted by spend desc
+  });
+
+  it('returns zeros for an empty window', async () => {
+    mockScan.mockResolvedValue([]);
+    const t = await getXAllocatedTotals('2026-07-01', '2026-07-02');
+    expect(t.costUsd).toBe(0);
+    expect(t.callCount).toBe(0);
+    expect(t.postReadUnits).toBe(0);
+    expect(t.byOperation).toEqual([]);
+  });
+
+  it('rejects a malformed or inverted range', async () => {
+    await expect(getXAllocatedTotals('nope', '2026-07-02')).rejects.toThrow(/YYYY-MM-DD/);
+    await expect(getXAllocatedTotals('2026-07-05', '2026-07-01')).rejects.toThrow(/<=/);
+  });
+});
+
+describe('currentXBillingCycle', () => {
+  it('starts on the reset day this month when today is past it', () => {
+    const c = currentXBillingCycle(3, new Date('2026-07-20T12:00:00Z'));
+    expect(c.start).toBe('2026-07-03');
+    expect(c.end).toBe('2026-07-20');
+  });
+
+  it('rolls back to last month when today is before the reset day', () => {
+    const c = currentXBillingCycle(15, new Date('2026-07-05T00:00:00Z'));
+    expect(c.start).toBe('2026-06-15');
+    expect(c.end).toBe('2026-07-05');
+  });
+
+  it('falls back to day 1 when the reset day is null/invalid', () => {
+    expect(currentXBillingCycle(null, new Date('2026-07-20T00:00:00Z')).start).toBe('2026-07-01');
+    expect(currentXBillingCycle(99, new Date('2026-07-20T00:00:00Z')).start).toBe('2026-07-01');
+  });
+
+  it('rolls the year back at the January boundary', () => {
+    const c = currentXBillingCycle(15, new Date('2026-01-05T00:00:00Z'));
+    expect(c.start).toBe('2025-12-15');
+    expect(c.end).toBe('2026-01-05');
+  });
+
+  it('clamps a 29-31 reset day to a short prior month (no month overflow, never start>end)', () => {
+    // Feb 2026 (28 days): reset day 31 early in March must clamp to Feb 28, not spill to Mar 3.
+    const c = currentXBillingCycle(31, new Date('2026-03-01T00:00:00Z'));
+    expect(c.start).toBe('2026-02-28');
+    expect(c.end).toBe('2026-03-01');
+    expect(c.start <= c.end).toBe(true);
+    // April (30 days): reset day 31 mid-May clamps to Apr 30.
+    expect(currentXBillingCycle(31, new Date('2026-05-10T00:00:00Z')).start).toBe('2026-04-30');
+  });
+});
+
+describe('getCostAggregation — byXAccount (@handle enrichment, ENG-664)', () => {
+  // Option B: userId = acting member; billingUserId = account owner. Enrichment
+  // resolves the handle through the OWNER (billingUserId).
+  const xr = (accountId: string, actingUserId: string, owner: string, costMicroUsd: number, callCount = 1) => ({
+    userId: actingUserId,
+    billingUserId: owner,
+    sk: `2026-07-10#twitter:search_tweets#x-account:${accountId}`,
+    date: '2026-07-10',
+    model: 'twitter:search_tweets',
+    feature: `x-account:${accountId}`,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    callCount,
+    quantity: callCount,
+    costMicroUsd,
+  });
+
+  it('groups X rows by account and enriches the handle via the OWNER (billingUserId), across acting members', async () => {
+    mockScan.mockResolvedValue([
+      // acc-1 owned by owner-1, but the calls were made by two different members.
+      xr('acc-1', 'member-a', 'owner-1', 90_000, 9),
+      xr('acc-1', 'member-b', 'owner-1', 10_000, 1),
+      xr('acc-2', 'owner-3', 'owner-3', 5_000, 1),
+      // a non-X row must not appear as an account
+      { ...xr('acc-1', 'member-a', 'owner-1', 999_000), model: 'gpt-5-chat-2', feature: 'agent-chat' },
+    ]);
+    mockGetUser.mockResolvedValue(null);
+    mockGetAccountById.mockImplementation((accountId: string, userId: string) => {
+      if (accountId === 'acc-1' && userId === 'owner-1') return Promise.resolve({ account_name: '@a', config: { username: 'alice' } });
+      if (accountId === 'acc-2') return Promise.resolve({ account_name: 'Bob', config: {} });
+      return Promise.resolve(null);
+    });
+
+    // provider="twitter": byXAccount is an X-only cut, so it's populated only when
+    // X rows are in scope (the Usage & Cost tab requests exactly this).
+    const result = await getCostAggregation('2026-07-01', '2026-07-31', 10, 'twitter');
+
+    expect(result.byXAccount.map((a) => a.accountId)).toEqual(['acc-1', 'acc-2']); // sorted by spend
+    expect(result.byXAccount[0]).toMatchObject({ accountId: 'acc-1', handle: 'alice', callCount: 10 });
+    expect(result.byXAccount[0].costUsd).toBeCloseTo(0.1, 6); // (90000+10000)/1e6, both members
+    // Handle resolved via the OWNER (billingUserId), NOT either acting member.
+    expect(mockGetAccountById).toHaveBeenCalledWith('acc-1', 'owner-1', 'twitter');
+    expect(mockGetAccountById).not.toHaveBeenCalledWith('acc-1', 'member-a', 'twitter');
+    // acc-2 config has no username → falls back to account_name.
+    expect(result.byXAccount[1]).toMatchObject({ accountId: 'acc-2', handle: 'Bob' });
+  });
+
+  it('yields handle=null when the account cannot be resolved (fallback to raw id)', async () => {
+    mockScan.mockResolvedValue([xr('acc-x', 'u1', 'u1', 5_000)]);
+    mockGetUser.mockResolvedValue(null);
+    mockGetAccountById.mockResolvedValue(null);
+
+    // provider="twitter": byXAccount is an X-only cut, so it's populated only when
+    // X rows are in scope (the Usage & Cost tab requests exactly this).
+    const result = await getCostAggregation('2026-07-01', '2026-07-31', 10, 'twitter');
+    expect(result.byXAccount).toEqual([
+      { accountId: 'acc-x', handle: null, costMicroUsd: 5_000, costUsd: 0.005, callCount: 1 },
+    ]);
+  });
+
+  it('is empty when there are no X rows', async () => {
+    mockScan.mockResolvedValue([]);
+    mockGetUser.mockResolvedValue(null);
+    // provider="twitter": byXAccount is an X-only cut, so it's populated only when
+    // X rows are in scope (the Usage & Cost tab requests exactly this).
+    const result = await getCostAggregation('2026-07-01', '2026-07-31', 10, 'twitter');
+    expect(result.byXAccount).toEqual([]);
+    expect(mockGetAccountById).not.toHaveBeenCalled();
+  });
+});
+
+describe('getUserXBreakdown (per-user X cost by tool, ENG-664)', () => {
+  const txr = (op: string, costMicroUsd: number, callCount = 1, quantity = callCount) => ({
+    userId: 'u1',
+    sk: `2026-07-10#twitter:${op}#x-account:acc-1`,
+    date: '2026-07-10',
+    model: `twitter:${op}`,
+    feature: 'x-account:acc-1',
+    callCount,
+    quantity,
+    costMicroUsd,
+  });
+
+  it('groups a user\'s twitter rows by tool, sorted by spend, ignoring non-twitter rows', async () => {
+    mockQuery.mockResolvedValue([
+      txr('search_tweets', 50_000, 5, 10),
+      txr('post', 15_000, 1),
+      { ...txr('post', 999_000), model: 'gpt-5-chat-2', feature: 'agent-chat' }, // non-X, ignored
+    ]);
+    const r = await getUserXBreakdown('u1', '2026-07-01', '2026-07-31');
+    expect(mockQuery).toHaveBeenCalledWith('u1', '2026-07-01', '2026-07-31');
+    expect(r.costUsd).toBeCloseTo(0.065, 6); // 0.05 + 0.015
+    expect(r.callCount).toBe(6);
+    expect(r.byOperation.map((o) => o.operation)).toEqual(['search_tweets', 'post']); // spend desc
+    expect(r.byOperation[0].costUsd).toBeCloseTo(0.05, 6);
+  });
+
+  it('returns empty for a user with no X usage', async () => {
+    mockQuery.mockResolvedValue([]);
+    const r = await getUserXBreakdown('u1', '2026-07-01', '2026-07-31');
+    expect(r).toEqual({ userId: 'u1', start: '2026-07-01', end: '2026-07-31', costUsd: 0, callCount: 0, byOperation: [] });
+  });
+
+  it('rejects a malformed or inverted range', async () => {
+    await expect(getUserXBreakdown('u1', 'x', '2026-07-31')).rejects.toThrow(/YYYY-MM-DD/);
+    await expect(getUserXBreakdown('u1', '2026-07-31', '2026-07-01')).rejects.toThrow(/<=/);
   });
 });

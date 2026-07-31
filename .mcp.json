@@ -20,16 +20,20 @@
         "@notionhq/notion-mcp-server"
       ],
       "env": {
-        "OPENAPI_MCP_HEADERS": "{\"Authorization\":\"Bearer ntn_b24541781292QM42dt5JIipWlMH0gNSNNoCE19O4ZG893T\",\"Notion-Version\":\"2025-09-03\"}"
+        "OPENAPI_MCP_HEADERS": "${NOTION_MCP_HEADERS}"
       }
     },
     "okareo": {
       "command": "uvx",
       "args": [
+        "--with",
+        "mcp[cli]<2",
+        "--from",
+        "okareo-mcp==0.0.43",
         "okareo-mcp"
       ],
       "env": {
-        "OKAREO_API_KEY": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IjYyNDNmYWY3In0.eyJzdWIiOiJkMjFhN2RhZS0xODAwLTRhMzUtYTQzMy0wZGYyMzJlOTNjN2IiLCJ0eXBlIjoidGVuYW50QWNjZXNzVG9rZW4iLCJ0ZW5hbnRJZCI6Ijg0YjdjOWIwLTY5ZDUtNDJjZi05YmVhLWYzYTkwMjdhZDNjYSIsImFwcGxpY2F0aW9uSWQiOiJmY2Q3ZGQzNy0yZjgxLTQ5YTAtOGI0My1kZTQxZTZjODA5Y2YiLCJyb2xlcyI6WyJGRVRDSC1ST0xFUy1CWS1BUEkiXSwicGVybWlzc2lvbnMiOlsiRkVUQ0gtUEVSTUlTU0lPTlMtQlktQVBJIl0sImF1ZCI6IjYyNDNmYWY3LTk2YzYtNDgxNS1iOTMzLWNlZGY5ZGY1Yjg5MCIsImlzcyI6Imh0dHBzOi8vYXV0aC5va2FyZW8uY29tIiwiaWF0IjoxNzcyOTQ0Njk0LCJleHAiOjE4MDQ0ODA2OTR9.y5UbNjobrqehjRVza3Zxp1NmQZc0iSuk5-PxN1j6zHPuO_xjD27VoXYQfLgnAg4kYF-_To47OsUJvBbog-ebV2yZl4TJyZ-AmpYg_Ff8Y8E_-EW48YuS6e9QBZ4evmYbuIpeEhQYQ07gWrC0qhNDCyXaNxRC5OyTsxU__psMBelxjI05H6C4ypo2THe_6HH-WQeWve-5FTa1UEqb6CXCmx1JQyh8LFjQX-ncYDUqRcPdV1xHHeWv8wNF3gMBu0HKzxpza5PVou6FZZaKcbav5Vc55QDOgP9VtpbyKrHb9tWhutto0GdZqqO8KfCeoMSqiUNZAtrP-JPGsUGgsMT31A"
+        "OKAREO_API_KEY": "${OKAREO_API_KEY}"
       }
     }
   }

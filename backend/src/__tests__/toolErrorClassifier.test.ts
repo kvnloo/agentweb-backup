@@ -153,3 +153,29 @@ describe('classifyToolErrorClass', () => {
     expect(classifyToolErrorClass(err('Replacement 1 failed: File hash mismatch.'))).toBe('Error');
   });
 });
+
+/**
+ * ENG-664 — X 402 (shared X wallet out of credits) must classify to a stable,
+ * distinct class so it clusters in telemetry and a mid-run 402 never reads as a
+ * generic 'Error'/bug. X errors carry the HTTP status on `.code` (not `.status`).
+ */
+describe('payment_required — X credit exhaustion (402)', () => {
+  it('classifies an X ApiResponseError 402 (status on .code)', () => {
+    const err = Object.assign(new Error('Request failed with code 402'), { code: 402 });
+    expect(classifyToolErrorClass(err)).toBe('payment_required');
+  });
+
+  it('classifies a typed XCreditsExhaustedError by name (crosses module boundaries)', () => {
+    const err = Object.assign(new Error('out of credits'), { name: 'XCreditsExhaustedError' });
+    expect(classifyToolErrorClass(err)).toBe('payment_required');
+  });
+
+  it('classifies a 402 embedded in the message text', () => {
+    expect(classifyToolErrorClass('X API error (HTTP 402): credits depleted')).toBe('payment_required');
+  });
+
+  it('does not misclassify a 403 as payment_required', () => {
+    const err = Object.assign(new Error('Request failed with code 403'), { code: 403 });
+    expect(classifyToolErrorClass(err)).toBe('auth');
+  });
+});

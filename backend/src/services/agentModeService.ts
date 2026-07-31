@@ -51,6 +51,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
+import { BEDROCK_BEARER_TOKEN_MODELS, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
   imageGenerationCostUsd,
@@ -171,8 +172,9 @@ export function isCompleteHtmlDocument(draft: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
-import { twitterService } from './twitterService';
+import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
+import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
 import {
@@ -710,10 +712,6 @@ const DATA_ANALYSIS_FILE_END_MARKER = '<<<AGENTWEB_FILE_END>>>';
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
 
-// Models served from the separate Bedrock account (231030591963) reached via a
-// long-term API key (bearer token) rather than the app's default SigV4 creds.
-const BEARER_TOKEN_MODELS = new Set(['anthropic.claude-opus-4-8']);
-
 // Legacy model ids persisted by sessions/schedules created before a model was
 // renamed. Maps the old id to its current registry key so old sessions keep
 // working instead of throwing "Invalid model". Opus 4.8 was renamed from the
@@ -790,7 +788,15 @@ export class AgentModeService {
   private readonly FILE_CACHE_MAX_SIZE = 1000; // Max 1000 cached files
   private readonly FILE_CACHE_MAX_AGE_MS = 3600000; // 1 hour TTL
   private readonly FILE_CACHE_CLEANUP_INTERVAL_MS = 600000; // Cleanup every 10 minutes
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5.5';
+  // ENG-759: the default chat model. Opus 5 and Opus 4.8 are both $5/$25, so this
+  // is a capability upgrade at no cost change. Opus 5 is AccessDenied on our
+  // default AWS account and reachable ONLY through the bearer-token account, so it
+  // MUST stay in BEDROCK_BEARER_TOKEN_MODELS — see utils/bedrockInferenceProfiles.
+  // This literal is the last-resort fallback; the effective default is the
+  // `agent_mode_default_model` setting when one is configured (getDefaultModel).
+  // It previously read 'gpt-5.5', which meant a missing/invalid setting silently
+  // dropped every chat onto an Azure GPT deployment instead of the intended Claude.
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'anthropic.claude-opus-5';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -1816,7 +1822,9 @@ export class AgentModeService {
     // default IAM credentials (992382574572) cannot reach. Authenticate that model
     // with a long-term Bedrock API key (bearer token) instead of SigV4, scoped to a
     // dedicated client so all other models keep using the default credential chain.
-    const usesBearerToken = BEARER_TOKEN_MODELS.has(modelId);
+    // Models served from the separate Bedrock account (231030591963) reached via
+    // a long-term API key (bearer token) rather than the app's default SigV4 creds.
+    const usesBearerToken = BEDROCK_BEARER_TOKEN_MODELS.has(modelId);
     let bedrockClient: any;
     if (usesBearerToken) {
       const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
@@ -1852,14 +1860,7 @@ export class AgentModeService {
 
     // Map certain model IDs to their corresponding inference profile ARNs
     // Note: Newer Claude models require using inference profiles for cross-region access
-    const inferenceProfileMap: Record<string, string> = {
-      'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-      'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
-      'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
-      // Opus 4.8 lives in account 231030591963 (reached via bearer token above).
-      'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
-    };
-    const actualModelId = inferenceProfileMap[modelId] || modelId;
+    const actualModelId = resolveBedrockModelId(modelId);
 
     // Create OpenAI-compatible wrapper using direct Converse API
     return {
@@ -2392,8 +2393,13 @@ export class AgentModeService {
     'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
     'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     // List gemini models - client will be lazy-loaded
-    // gemini-3-pro-preview omitted from vision: the Gemini API returns 404 for this id (not served).
-    'gemini-3-pro-preview': { client: null, supportsTemperature: true },
+    // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
+    // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
+    // so picking it was a guaranteed failure. llmPricing.ts already carried the
+    // DEPRECATED 2026-03-09 note; only the registry had not caught up. Migrate to
+    // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
+    // Its price entry is intentionally left in place — a rate for a removed model is
+    // harmless, a missing rate for a live one is not.
     'gemini-3-flash-preview': { client: null, supportsTemperature: true, supportsVision: true },
     'gemini-3.1-pro-preview': { client: null, supportsTemperature: true, supportsVision: true },
     'gemini-3.1-flash-lite': { client: null, supportsTemperature: true, supportsVision: true },
@@ -2407,6 +2413,15 @@ export class AgentModeService {
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
     'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
+    // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
+    // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
+    // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
+    // deprecated for this model") — verified against live Bedrock, not assumed.
+    'anthropic.claude-opus-5': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-sonnet-5': { client: null, supportsTemperature: false, supportsVision: true },
+    // Haiku 4.5 still accepts temperature (also live-verified).
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -2424,7 +2439,7 @@ export class AgentModeService {
   }
   /**
    * Make an LLM call with the specified model and parameters
-   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3-pro-preview')
+   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3.1-pro-preview')
    * @param messages - Array of chat messages
    * @param options - Optional parameters for the LLM call
    * @returns The LLM response
@@ -13863,6 +13878,81 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Fail closed before spending a Meta API call we can prove will be refused.
+   *
+   * Only an authoritative 'missing' (recorded `granted_scopes` that contain no
+   * ads scope) blocks here. A legacy record with no `granted_scopes` reads as
+   * 'unknown' and is allowed through — its `scopes` field holds the scopes we
+   * *requested*, not what Meta granted, so refusing on it would lock out
+   * connections that actually work. Those are caught after the fact by
+   * normalizeMetaAdsReadError. (ENG-629)
+   */
+  private async assertMetaAdsScope(selected: any): Promise<void> {
+    const { getMetaAdsScopeState, buildMetaAdsScopeError } = await import('../utils/metaAdsScope');
+    if (getMetaAdsScopeState(selected?.config) !== 'missing') return;
+
+    const label = selected?.account_id || selected?.config?.ad_account_id;
+    throw buildMetaAdsScopeError({ accountLabel: label ? `act_${String(label).replace('act_', '')}` : undefined });
+  }
+
+  /**
+   * Turn Meta's authoritative "you never granted ads permission" refusal into the
+   * single actionable re-consent error, and record what we just learned.
+   *
+   * Two jobs, both required by ENG-629:
+   *  - Throw (not return a soft `{ success:false }`). The soft shape is what let
+   *    an unattended run render an empty report as though metrics came back.
+   *  - Persist the now-known grant so the next read fails at the pre-flight gate
+   *    instead of hitting Meta again with the same impossible request. The write
+   *    is best-effort: a persistence failure must never mask the user-facing error.
+   *
+   * Returns normally when the error is NOT a scope problem, so callers keep their
+   * existing handling for rate limits, validation errors (ENG-630), etc.
+   */
+  private async normalizeMetaAdsReadError(
+    error: any,
+    userId: string,
+    connection?: { platform?: string; account_id?: string; config?: any }
+  ): Promise<void> {
+    const {
+      isMetaAdsScopeRefusal,
+      buildMetaAdsScopeError,
+      META_ADS_READ_SCOPES,
+    } = await import('../utils/metaAdsScope');
+
+    // Strictly an Ads-scope refusal. A generic permission error must fall
+    // through untouched — narrowing a grant on that evidence would brick a
+    // connection that actually has ads access (Greptile P1-2).
+    if (!isMetaAdsScopeRefusal(error)) return;
+
+    if (connection?.account_id && connection?.platform) {
+      try {
+        const previous: unknown = connection.config?.granted_scopes;
+        const retained = (Array.isArray(previous) ? previous : [])
+          .filter((s: unknown) => typeof s === 'string')
+          .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+
+        const { updateAccountConfig } = await import('./connectedAccountsDb');
+        await updateAccountConfig(userId, connection.platform as any, connection.account_id, {
+          // Meta just told us authoritatively that no ads scope is granted.
+          // Recording it converts every subsequent attempt into a pre-flight refusal.
+          granted_scopes: retained,
+          ads_scope_revoked_at: new Date().toISOString(),
+        });
+      } catch (persistError: any) {
+        console.warn(
+          `[AgentMode] ENG-629: could not persist missing Meta ads scope for user ${userId}: ${persistError?.message ?? persistError}`
+        );
+      }
+    }
+
+    throw buildMetaAdsScopeError({
+      accountLabel: connection?.account_id ? `act_${String(connection.account_id).replace('act_', '')}` : undefined,
+      cause: error,
+    });
+  }
+
+  /**
    * Ensure the selected Meta ad-account token is usable, refreshing it inline
    * if it is expired or close to expiry. Meta has no refresh tokens, so we
    * re-exchange the still-valid (or recently-expired-but-exchangeable) token
@@ -13933,10 +14023,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       await this.ensureUsableMetaToken(selected, selected.userId || userId);
+      await this.assertMetaAdsScope(selected);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
-        accessToken: selected.config.access_token
+        accessToken: selected.config.access_token,
+        connection: selected
       };
     }
 
@@ -13955,12 +14047,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const selected = fbAccounts[0];
 
     await this.ensureUsableMetaToken(selected, selected.userId || userId);
+    await this.assertMetaAdsScope(selected);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 
     return {
       accountId: clean(selected.account_id || selected.config?.ad_account_id),
-      accessToken: selected.config.access_token
+      accessToken: selected.config.access_token,
+      connection: selected
     };
   }
 
@@ -14091,6 +14185,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      // Meta requires `filtering` to be a LIST. The model supplies it as a bare
+      // object or as pre-serialized JSON often enough that both shapes reached
+      // production: the string produced `(#100) param filtering must be an
+      // array`, and the object was silently dropped by the old `?.length` guard,
+      // widening the query to the whole account. Normalize both, and reject
+      // anything unhonourable here — before we spend a credential or an API
+      // call — rather than quietly answering a different question (ENG-630).
+      const normalizedFiltering = normalizeMetaInsightsFiltering(filtering);
+
       const { accountId, accessToken } =
         await this.getMetaCredentials(userId, account_id);
 
@@ -14121,7 +14224,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(action_breakdowns?.length && {
           action_breakdowns: action_breakdowns.join(","),
         }),
-        ...(filtering?.length && { filtering }),
+        ...(normalizedFiltering && { filtering: normalizedFiltering }),
       };
 
       // ENG-511: Run the full report (submit → poll → fetch) as one unit. Meta
@@ -14297,9 +14400,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error("Error in callMetaAdsInsightsApiWrapper:", error);
+      // An axios rejection stringifies to "Request failed with status code 400",
+      // which tells the model nothing it can act on and reads as an opaque
+      // outage. Meta's actual explanation lives in response.data.error — surface
+      // it, minus the credential material Meta echoes back (ENG-630).
       return {
         success: false,
-        error: error.message,
+        error: describeMetaGraphApiError(error) || error.message,
       };
     }
   }
@@ -14643,8 +14750,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     account_id?: string,
     options: { campaignId?: string; fields?: string | string[] } = {}
   ): Promise<any> {
+    let connection: any;
     try {
-      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      const credentials = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = credentials;
+      connection = (credentials as any).connection;
       // Only forward the read-options bag when the caller supplied a campaign_id filter or
       // an explicit fields selection; otherwise call listCampaigns the same 2-arg way as
       // before. This preserves the CALL CONVENTION for a plain list-all — it does NOT keep
@@ -14666,6 +14776,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
+      // A permission refusal from Meta is not a "no campaigns" result — throw the
+      // actionable re-consent error and record the grant we just learned (ENG-629).
+      await this.normalizeMetaAdsReadError(error, connection?.userId || userId, connection);
       console.error('AgentMode: Error fetching Meta ad campaigns:', error);
       return {
         success: false,
@@ -26770,6 +26883,26 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // List connected accounts helper
+  /**
+   * Capability annotation for a Meta ad account in list_connected_accounts.
+   *
+   * Returns `{}` for non-Meta accounts and for Meta records whose grant we cannot
+   * prove either way, so the payload only ever carries facts. (ENG-629 AC1)
+   */
+  private async describeMetaAdsCapability(acc: any): Promise<Record<string, any>> {
+    if (acc?.platform !== 'meta' && acc?.platform !== 'facebook') return {};
+    if (acc?.config?.account_type !== 'ad_account') return {};
+
+    const { getMetaAdsScopeState, META_ADS_RECONSENT_MESSAGE } = await import('../utils/metaAdsScope');
+    const state = getMetaAdsScopeState(acc.config);
+
+    if (state === 'granted') return { ads_capable: true };
+    if (state === 'missing') {
+      return { ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE };
+    }
+    return {};
+  }
+
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
     try {
       const { getAccountsByUserIdIncludingOrgShared, isTokenValid } = await import('./connectedAccountsDb');
@@ -26836,6 +26969,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 currency: (acc.config as { currency?: string }).currency || 'USD',
               }
             : {}),
+          // A Meta ad account can be connected and unexpired yet unable to read ads
+          // data because the owner never granted ads_read/ads_management. Without
+          // this, `is_active: true` alone reads as "fully capable" and the model
+          // plans work it cannot complete (ENG-629). Only emitted when we actually
+          // know — an unknown legacy record stays silent rather than crying wolf.
+          ...(await this.describeMetaAdsCapability(acc)),
         })))
       };
     } catch (error) {
@@ -27291,6 +27430,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           success: false,
           message: `Failed to load posts: ${accountResult.error}`,
           error: accountResult.error,
+        };
+      }
+
+      // ENG-660: for a personal LinkedIn account, AgentWeb works from the posts
+      // created through AgentWeb itself (personal profiles have no organic post
+      // ingestion — only AgentWeb-published posts are ever on file). When none
+      // are on file, a bare "Successfully loaded 0 posts" led the model to claim
+      // the fetch of the
+      // user's posts succeeded (a tool-success hallucination). Signal this as an
+      // explicitly-unsupported read via organicReadUnsupported + the message so
+      // the model states the truth instead of implying it read the user's
+      // LinkedIn. success stays true on purpose: nothing failed (the account is
+      // connected and healthy), so this must NOT render as a tool "failure" in
+      // the UI. The message leads with what AgentWeb DOES (positive, ownership
+      // framing) so the model doesn't present this as a weakness/"limitation".
+      const accountType = (matchingAccount.config as any)?.account_type;
+      if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
+        return {
+          success: true,
+          organicReadUnsupported: true,
+          posts: [],
+          message:
+            'AgentWeb works from the LinkedIn posts you create with it, and there aren\'t any AgentWeb-created posts on file for this personal account — so there\'s nothing here to analyze for writing voice. Frame this as normal AgentWeb behavior and keep the focus on the constructive next step — do not describe it as a shortcoming and do not blame any external platform. Do NOT claim you have read or analyzed the user\'s existing LinkedIn posts, and there\'s no need to retry. The best next step: invite the user to paste or upload a few of their recent posts, then build their writing-voice profile from those — and offer to save it so future posts match their style.',
         };
       }
 
@@ -28031,7 +28193,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * written back to the owner's record. When list_id/lead_id/lead_email are
    * supplied, sent tweets and DMs are logged to AW-EmailEvents for CRM parity.
    */
+  // Public entry: bind the acting user into the X metering context so every X
+  // call this dispatch makes attributes the shadow ledger to the ACTING user and
+  // bills the account owner (ENG-664 Option B, matching the LLM rail).
   async twitterManagePost(userId: string, args: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args));
+  }
+
+  private async _twitterManagePostImpl(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
@@ -28202,7 +28371,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  // Public entry: bind the acting user into the X metering context (see twitterManagePost).
   async twitterOutreach(userId: string, args: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterOutreachImpl(userId, args));
+  }
+
+  private async _twitterOutreachImpl(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, handle, recipient_handle, query, max_results, tweet_id, x_list_id, list_name, list_id, lead_id, lead_email } = args;

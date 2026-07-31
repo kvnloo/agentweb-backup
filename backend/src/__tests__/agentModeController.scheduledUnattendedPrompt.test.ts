@@ -23,6 +23,7 @@ import { Request, Response } from 'express';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
+import { userDb } from '../services/db';
 
 // ── Mocks (mirror agentModeController.errorHandling.test.ts) ──────────────────
 jest.mock('../services/chatbotService', () => ({
@@ -136,6 +137,9 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     mockChatbotDb.getChatSession.mockResolvedValue(scheduledSession as any);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.addMessageToSession.mockResolvedValue(scheduledSession as any);
+    // Default owner-admin lookup to a deterministic non-admin so the base suite
+    // never makes a real DB call; admin-gating cases below override this per-test.
+    jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: USER_ID, isAdmin: false } as any);
     // Worker returns a normal success so generateResponse completes without error.
     mockWorker.runInWorker.mockResolvedValue({
       content: 'Report delivered.',
@@ -238,5 +242,40 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     const sp = capturedSystemPrompt()!;
     expect(sp).not.toContain('[AUTOMATED UNATTENDED EXECUTION]');
     expect(sp).not.toContain('[Schedule Context]');
+  });
+
+  // ── Admin-gating of the identity-resolution slice (ENG-500 / Greptile P2) ─────
+  // The controller resolves the schedule owner's admin status via userDb and
+  // passes it to getUnattendedExecutionDirective. Cover all three branches of
+  // that lookup end-to-end (admin, non-admin, lookup failure) so a regression in
+  // the wiring can't silently drop the identity guidance from admin runs or leak
+  // it into non-admin ones.
+  it('injects the identity-resolution slice for an ADMIN schedule owner', async () => {
+    jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: USER_ID, isAdmin: true } as any);
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('[AUTOMATED UNATTENDED EXECUTION]');
+    expect(sp).toContain('IDENTITY RESOLUTION');
+    expect(sp).toContain('list_all_clients');
+  });
+
+  it('OMITS the identity-resolution slice for a NON-ADMIN owner (general directive still present)', async () => {
+    jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: USER_ID, isAdmin: false } as any);
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('[AUTOMATED UNATTENDED EXECUTION]');
+    expect(sp).toContain('PER-ENTITY COMPLETION LOOP');
+    expect(sp).not.toContain('IDENTITY RESOLUTION');
+    expect(sp).not.toContain('list_all_clients');
+  });
+
+  it('degrades to non-admin (omits the slice) and still assembles the prompt when the owner lookup THROWS', async () => {
+    jest.spyOn(userDb, 'getUserById').mockRejectedValue(new Error('DynamoDB throttled'));
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt();
+    // safe fallback: prompt still assembled, general directive present, admin-only slice omitted, no throw
+    expect(sp).toBeDefined();
+    expect(sp!).toContain('[AUTOMATED UNATTENDED EXECUTION]');
+    expect(sp!).not.toContain('IDENTITY RESOLUTION');
   });
 });
