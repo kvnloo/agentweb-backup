@@ -28,6 +28,7 @@ import {
   upsertSentInvitations,
   pruneStaleSentInvitations,
   profileUrlFromPublicId,
+  getAllSentInvitationsByAccount,
   UnipileSentInvitation,
 } from '../services/unipileSentInvitationsDb';
 
@@ -195,6 +196,21 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
   const stillPendingPublicIds = new Set<string>();
   const now = new Date().toISOString();
 
+  // Unipile occasionally omits parsed_datetime. Stamping `now` in that case would
+  // move sentAt on every ~10-min sync, so downstream consumers keyed on it (the
+  // CRM invite mirror dedupes an engagement by send time) would see the same
+  // invitation as a new one each run. Carry the first-observed value forward
+  // instead — a pending invitation's send time never legitimately changes.
+  const knownSentAt = new Map<string, string>();
+  try {
+    for (const inv of await getAllSentInvitationsByAccount(accountId)) {
+      if (inv.sentAt) knownSentAt.set(inv.invitedUserPublicId, inv.sentAt);
+    }
+  } catch (err) {
+    // Non-fatal — worst case a timestamp-less invitation re-stamps to now.
+    console.warn(`${TAG} could not preload cached sentAt for account ${accountId}:`, err);
+  }
+
   let cursor: string | undefined;
   let page = 0;
   const MAX_PAGES = 50; // 50 × 100 = 5000 pending invites — well above LinkedIn's limits
@@ -220,7 +236,7 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
         invitationId: item.id ?? '',
         invitedUserName: item.invited_user ?? '',
         invitationText: item.invitation_text ?? '',
-        sentAt: item.parsed_datetime ?? now,
+        sentAt: item.parsed_datetime ?? knownSentAt.get(publicId) ?? now,
         syncedAt: now,
       });
     }
