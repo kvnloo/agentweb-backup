@@ -386,6 +386,23 @@ describe('usageAnalyticsService', () => {
       expect(all.totals.costUsd).toBeCloseTo(3.5, 6);
     });
 
+    it('"llm" scope excludes a twitter:* row even if it is missing the unit field, but keeps Bedrock :0 versions', async () => {
+      mockGetAccountById.mockResolvedValue(null);
+      mockScan.mockResolvedValue([
+        // A vendor row with the model namespace but NO provider/unit — the belt-and-
+        // suspenders model-prefix guard must still exclude it from the LLM view.
+        aggRow({ model: 'twitter:post', feature: 'x-account:acc-1', costMicroUsd: 500_000 }),
+        // A Bedrock model whose id ends in a numeric ":0" version tag is LLM, not a
+        // vendor — it must be KEPT.
+        aggRow({ model: 'anthropic.claude-sonnet-4-5-20250929-v1:0', costMicroUsd: 2_000_000 }),
+      ]);
+
+      const llm = await getCostAggregation('2026-06-01', '2026-06-30'); // default "llm"
+      expect(llm.byModel.some((m) => m.model.startsWith('twitter:'))).toBe(false);
+      expect(llm.byModel.some((m) => m.model === 'anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe(true);
+      expect(llm.totals.costUsd).toBeCloseTo(2, 6); // only the Bedrock row counts
+    });
+
     it('aggregates by model: totals equal the sum of underlying per-user stored costs (assertion 2)', async () => {
       mockScan.mockResolvedValue([
         aggRow({ userId: 'user-1', costMicroUsd: 3_500_000, callCount: 3 }),
@@ -717,7 +734,9 @@ describe('getCostAggregation — byXAccount (@handle enrichment, ENG-664)', () =
       return Promise.resolve(null);
     });
 
-    const result = await getCostAggregation('2026-07-01', '2026-07-31');
+    // provider="twitter": byXAccount is an X-only cut, so it's populated only when
+    // X rows are in scope (the Usage & Cost tab requests exactly this).
+    const result = await getCostAggregation('2026-07-01', '2026-07-31', 10, 'twitter');
 
     expect(result.byXAccount.map((a) => a.accountId)).toEqual(['acc-1', 'acc-2']); // sorted by spend
     expect(result.byXAccount[0]).toMatchObject({ accountId: 'acc-1', handle: 'alice', callCount: 10 });
@@ -734,7 +753,9 @@ describe('getCostAggregation — byXAccount (@handle enrichment, ENG-664)', () =
     mockGetUser.mockResolvedValue(null);
     mockGetAccountById.mockResolvedValue(null);
 
-    const result = await getCostAggregation('2026-07-01', '2026-07-31');
+    // provider="twitter": byXAccount is an X-only cut, so it's populated only when
+    // X rows are in scope (the Usage & Cost tab requests exactly this).
+    const result = await getCostAggregation('2026-07-01', '2026-07-31', 10, 'twitter');
     expect(result.byXAccount).toEqual([
       { accountId: 'acc-x', handle: null, costMicroUsd: 5_000, costUsd: 0.005, callCount: 1 },
     ]);
@@ -743,7 +764,9 @@ describe('getCostAggregation — byXAccount (@handle enrichment, ENG-664)', () =
   it('is empty when there are no X rows', async () => {
     mockScan.mockResolvedValue([]);
     mockGetUser.mockResolvedValue(null);
-    const result = await getCostAggregation('2026-07-01', '2026-07-31');
+    // provider="twitter": byXAccount is an X-only cut, so it's populated only when
+    // X rows are in scope (the Usage & Cost tab requests exactly this).
+    const result = await getCostAggregation('2026-07-01', '2026-07-31', 10, 'twitter');
     expect(result.byXAccount).toEqual([]);
     expect(mockGetAccountById).not.toHaveBeenCalled();
   });

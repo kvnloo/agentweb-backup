@@ -299,6 +299,19 @@ function bucketByModel(items: UsageRecordRow[]): CostByModelRow[] {
 }
 
 /**
+ * True when a ledger `model` is a per-vendor namespaced id ("twitter:post",
+ * "v0:generate") rather than an LLM model. Mirrors the frontend `providerOfModel`:
+ * a colon followed by a WORD is a vendor namespace; a colon followed by only DIGITS
+ * is a Bedrock version tag (e.g. "...-v1:0") and stays LLM; no colon is LLM.
+ */
+function isVendorNamespacedModel(model: string | undefined): boolean {
+  const m = model || "";
+  const i = m.indexOf(":");
+  if (i <= 0) return false;
+  return !/^\d+$/.test(m.slice(i + 1));
+}
+
+/**
  * Aggregate spend across ALL users for an inclusive date window, for the admin
  * cost dashboard (ENG-353). Window filtering happens in the data layer
  * (usageRecordDb.scanByDateRange) so out-of-window records never reach any of
@@ -336,9 +349,11 @@ export async function getCostAggregation(
     provider === "all"
       ? allItems
       : provider === "llm"
-      ? // LLM = everything that is NOT a per-unit vendor row (isVendorEntry needs
-        // both provider+unit, so pre-ENG-693 LLM rows correctly stay in).
-        allItems.filter((r) => !isVendorEntry(r))
+      ? // LLM = anything that is NOT a vendor row by EITHER signal: a per-unit entry
+        // (isVendorEntry needs provider+unit) OR a "{vendor}:{op}" model namespace.
+        // Belt-and-suspenders: even a vendor row somehow missing `unit` still can't
+        // reach the LLM Costs tab, because its model namespace catches it.
+        allItems.filter((r) => !isVendorEntry(r) && !isVendorNamespacedModel(r.model))
       : // A specific vendor: match the provider field or the "{provider}:" model
         // namespace (recordVendorUsage writes both).
         allItems.filter(
