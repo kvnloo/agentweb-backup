@@ -478,6 +478,40 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       preview_token: (agentModeService as any).computeAudienceCampaignArgsDigest(args),
     });
 
+    // Greptile P1 finding: computeAudienceCampaignArgsDigest was a plain
+    // SHA256 hash of the args with no server secret — any caller (including
+    // the model itself) could independently compute the exact same digest
+    // from the args alone and pass confirm=true on the very first call,
+    // never having gone through an actual preview. The digest must be
+    // non-forgeable without the server's secret (HMAC-signed), not just
+    // internally consistent with the args.
+    it('rejects a self-computed plain-hash token that was never actually issued by a preview call', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      const resolveSpy = jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValue({
+        plannedAction: 'create', audience: undefined, created: false, sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      const args = baseArgs();
+      const canonical = {
+        account_id: args.account_id,
+        campaign_id: args.campaign_id,
+        audience_name: args.audience_name,
+        audience_source: args.audience_source,
+        use_lookalike: false,
+        lookalike_ratio: undefined,
+        lookalike_country: undefined,
+        exclude_audience_id: undefined,
+        ad_set_params: args.ad_set_params,
+      };
+      const forgedToken = require('crypto').createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, {
+        ...args, confirm: true, preview_token: forgedToken,
+      });
+
+      expect(result.awaitingUserConfirmation).toBe(true);
+      expect(resolveSpy).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), expect.anything(), { dryRun: false });
+    });
+
     it('returns a preview (awaitingUserConfirmation) without executing anything when confirm is not set', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
       const resolveSpy = jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({

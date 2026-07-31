@@ -4,7 +4,7 @@ import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
-import { createHash, randomUUID } from 'crypto';
+import { createHash, createHmac, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
@@ -186,6 +186,7 @@ import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from './metaAudienceSnapshotStore';
+import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
@@ -17308,13 +17309,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * actually previewed — a model could set confirm=true on the very first
    * call (skipping the preview entirely) or change arguments between the
    * preview and confirm calls, and the tool would execute on the unverified/
-   * changed arguments with no way to detect it. This computes a deterministic
-   * digest over every argument that defines WHAT gets created/changed;
-   * launchAudienceCampaign only treats a call as genuinely confirmed when
-   * args.preview_token matches the digest recomputed from the CURRENT args —
-   * so a first-call confirm=true (no token yet) or a changed argument after
-   * preview both fail the check and fall back into a fresh preview instead
-   * of executing.
+   * changed arguments with no way to detect it. This computes a digest over
+   * every argument that defines WHAT gets created/changed; launchAudienceCampaign
+   * only treats a call as genuinely confirmed when args.preview_token matches
+   * the digest recomputed from the CURRENT args — so a first-call confirm=true
+   * (no token yet) or a changed argument after preview both fail the check
+   * and fall back into a fresh preview instead of executing.
+   *
+   * Greptile follow-up finding: a plain hash of the args is NOT sufficient —
+   * it's a pure function of caller-supplied data with no server secret, so
+   * any caller (including the model itself) can independently compute the
+   * exact same value and pass confirm=true on the very first call, without
+   * ever having gone through an actual preview. HMAC-signing with the
+   * server-only JWT secret (never exposed to the model/caller) makes the
+   * token non-forgeable: only a value this method itself produced can match.
    */
   private computeAudienceCampaignArgsDigest(args: any): string {
     const canonical = {
@@ -17328,7 +17336,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       exclude_audience_id: args.exclude_audience_id,
       ad_set_params: args.ad_set_params,
     };
-    return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+    return createHmac('sha256', getJwtSecret()).update(JSON.stringify(canonical)).digest('hex');
   }
 
   /**
