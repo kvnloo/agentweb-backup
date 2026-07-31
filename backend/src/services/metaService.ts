@@ -1944,7 +1944,13 @@ export class MetaService {
 
       const rows = payload;
       if (!Array.isArray(rows) || rows.length <= MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE) {
-        const result = await audience.deleteUsers([], { payload: { schema, data: payload } });
+        // ENG-600 live-test finding: unlike createUser(fields, params),
+        // CustomAudience.deleteUsers takes a SINGLE params argument — calling
+        // it deleteUsers([], {...}) silently discards the real params object
+        // (the SDK reads only arguments[0], which was the empty fields array),
+        // so Meta received no payload at all: "(#100) Missing required
+        // parameter: payload".
+        const result = await audience.deleteUsers({ payload: { schema, data: payload } });
         return result._data || result;
       }
 
@@ -1959,7 +1965,7 @@ export class MetaService {
         const batchSeq = i + 1;
         const isLastBatch = batchSeq === totalBatches;
         this.log(`Deleting batch ${batchSeq}/${totalBatches} from custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
-        const result = await audience.deleteUsers([], {
+        const result = await audience.deleteUsers({
           payload: {
             schema,
             data: chunk,

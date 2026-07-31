@@ -851,11 +851,18 @@ describe('MetaService', () => {
                 );
 
                 expect(mockDeleteUsers).toHaveBeenCalledTimes(1);
-                const [, calledParams] = mockDeleteUsers.mock.calls[0];
+                // ENG-600 live-test finding: CustomAudience.deleteUsers takes a
+                // SINGLE params argument (unlike createUser(fields, params)) —
+                // asserting on mock.calls[0][0] (not [1]) locks in the call
+                // shape that actually reaches Meta, since a two-argument call
+                // silently drops the real params and Meta rejects it with
+                // "(#100) Missing required parameter: payload".
+                const [calledParams] = mockDeleteUsers.mock.calls[0];
                 expect(calledParams.payload.schema).toEqual(['EMAIL', 'PHONE']);
                 expect(calledParams.payload.data).toEqual(payload);
                 expect(calledParams.payload.session).toBeUndefined();
                 expect(result).toEqual({ num_received: 2 });
+                expect(mockDeleteUsers.mock.calls[0]).toHaveLength(1);
             });
 
             it('chunks a payload over 10,000 rows into sequential session-batched requests', async () => {
@@ -872,12 +879,12 @@ describe('MetaService', () => {
                 );
 
                 expect(mockDeleteUsers).toHaveBeenCalledTimes(2);
-                const [, firstParams] = mockDeleteUsers.mock.calls[0];
+                const [firstParams] = mockDeleteUsers.mock.calls[0];
                 expect(firstParams.payload.data).toHaveLength(10000);
                 expect(firstParams.payload.session.batch_seq).toBe(1);
                 expect(firstParams.payload.session.last_batch_flag).toBe(false);
 
-                const [, secondParams] = mockDeleteUsers.mock.calls[1];
+                const [secondParams] = mockDeleteUsers.mock.calls[1];
                 expect(secondParams.payload.data).toHaveLength(500);
                 expect(secondParams.payload.session.batch_seq).toBe(2);
                 expect(secondParams.payload.session.last_batch_flag).toBe(true);
