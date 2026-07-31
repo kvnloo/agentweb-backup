@@ -159,8 +159,17 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect((agentModeService as any).llmModels[id].supportsVision).toBe(true);
       });
 
-      it('AC #5 — does not change the default model', async () => {
-        expect((agentModeService as any).default_model).toBe('gpt-5.5');
+      /*
+       * SUPERSEDED by ENG-759 (approved by Harsha 2026-07-30: "opus 5 as default
+       * is fine"). ENG-744's AC #5 was "merely ADDING the Claude 5 family must not
+       * re-route the default" — that guard was correct for ENG-744 and is still
+       * the intent here: the default only moves by an explicit, approved decision.
+       * ENG-759 is that decision, so the expected value changes from 'gpt-5.5' to
+       * Opus 5 while the guard itself is kept (it would still catch an accidental
+       * re-route caused by a future catalog addition).
+       */
+      it('AC #5 — default model only moves by explicit decision (now Opus 5, ENG-759)', async () => {
+        expect((agentModeService as any).default_model).toBe('anthropic.claude-opus-5');
       });
 
       it('AC #6 — leaves the live voice model untouched', () => {
