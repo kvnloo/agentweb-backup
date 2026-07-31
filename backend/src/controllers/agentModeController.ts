@@ -2140,12 +2140,47 @@ export async function runScheduledChat(
       if (!canResume) {
         // Marker present but the session can't be safely resumed now (missing / owner
         // mismatch / no-longer-safe boundary — a rare race, since the reconciler only
-        // marks resumable sessions). Consume the marker to avoid a stuck loop, and
-        // DEFER — never fresh-restart (that would re-run completed side effects).
+        // marks resumable sessions). Consume the marker to avoid a stuck loop. A
+        // retry-soon here would eventually land a fresh restart of the same task,
+        // re-running the abandoned session's already-completed side effects — the
+        // exact thing this whole resume-or-bow-out path exists to prevent (Greptile).
+        // Auto-restart is not a safe recovery for this one; PAUSE the schedule and
+        // alert oncall instead, so a human decides rather than an automatic retry
+        // silently duplicating real-world side effects.
         await scheduleDb.claimPendingResume(schedule.scheduleId, pendingResumeSessionId).catch(() => {});
-        console.warn(`runScheduledChat: resume marker for session ${pendingResumeSessionId} no longer resumable; deferring (no fresh restart, to avoid duplicate side effects).`);
-        await scheduleRetrySoon();
-        return deferredResumeResult('not-resumable');
+        console.warn(`runScheduledChat: resume marker for session ${pendingResumeSessionId} no longer resumable; pausing schedule (no auto-restart, to avoid duplicate side effects) and alerting oncall.`);
+        await scheduleDb.updateSchedule(schedule.scheduleId, {
+          status: 'paused',
+          updatedAt: new Date().toISOString(),
+        }).catch(pauseError => {
+          console.error(`runScheduledChat: failed to pause schedule ${schedule.scheduleId} after an unresumable abandoned session:`, pauseError);
+        });
+        void fileAutoIssue({
+          title: `Scheduled Chat auto-paused: ${schedule.scheduleName}`,
+          description: `Schedule "${schedule.scheduleName}" had an abandoned run (session ${pendingResumeSessionId}) that the reconciler marked resumable, but it was no longer safely resumable by the time this dispatch ran. Auto-restarting would risk re-running the abandoned session's already-completed side effects (e.g. CRM writes, emails), so the schedule has been paused instead of auto-retried. Review the session and re-enable the schedule manually.`,
+          source: 'Scheduled chat (resume)',
+          extraLabels: ['Scheduled Chat'],
+          notionTags: ['Scheduled Chat'],
+          notionContext: {
+            'Schedule ID': schedule.scheduleId,
+            'User ID': userId,
+            'Abandoned Session ID': pendingResumeSessionId,
+          },
+        })
+          .catch(err => console.error('Failed to file auto-pause issue for unresumable abandoned session:', err))
+          .then(() => sendAgentModeOncallAlert({
+            subject: `Scheduled Chat auto-paused: ${schedule.scheduleName}`,
+            message: `Abandoned session ${pendingResumeSessionId} was marked resumable by the reconciler but was no longer safely resumable at dispatch time. Paused the schedule rather than auto-restart (which would risk duplicate side effects). Needs manual review.`,
+            sessionId: pendingResumeSessionId,
+            context: {
+              'Schedule ID': schedule.scheduleId,
+              'Schedule Name': schedule.scheduleName,
+              'User ID': userId,
+              'Abandoned Session ID': pendingResumeSessionId,
+            },
+          }))
+          .catch(err => console.error('Failed to send oncall alert for auto-paused schedule:', err));
+        return deferredResumeResult('not-resumable-paused');
       }
 
       // Attach the resumed session to the lease BEFORE claiming the marker, not after.

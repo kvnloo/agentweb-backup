@@ -285,10 +285,14 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(workerArg.messageContent).not.toBe(baseSchedule.startingMessage);
       });
 
-      it('DEFERS (never fresh-restarts) when the resume session is no longer safely resumable', async () => {
-        // Dangling tool_use → planScheduledRunResume refuses. A fresh restart would
-        // re-run the whole task and duplicate the already-completed side effects, so
-        // the resume-marker path must bow out instead — no createChatSession, no run.
+      it('PAUSES the schedule (never fresh-restarts) when the resume session is no longer safely resumable', async () => {
+        // Dangling tool_use → planScheduledRunResume refuses. A fresh restart (now or
+        // on a later retry) would re-run the whole task and duplicate the already-
+        // completed side effects — the exact thing this path exists to prevent
+        // (Greptile: "deferral only delays fresh restart"). So this case does NOT
+        // schedule a retry at all; it pauses the schedule and alerts oncall so a
+        // human decides, rather than an automatic restart silently duplicating
+        // real-world side effects.
         mockChatbotDb.getChatSession.mockResolvedValue({
           ...mockSession,
           sessionId: resumeSessionId,
@@ -300,6 +304,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
             { role: 'tool', tool_call_id: 'c1', content: '{}' },
           ],
         } as any);
+        (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
 
         const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
 
@@ -308,6 +313,16 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
         expect(mockScheduleDb.claimPendingResume).toHaveBeenCalledWith(mockScheduleId, resumeSessionId);
         expect(result.sessionId).toBe('');
+
+        // Paused, not requeued — no auto-restart path exists for this case.
+        const pauseCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(
+          call => call[0] === mockScheduleId && call[1]?.status === 'paused'
+        );
+        expect(pauseCall).toBeDefined();
+        const retryCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(
+          call => call[0] === mockScheduleId && call[1]?.nextRunTime
+        );
+        expect(retryCall).toBeUndefined();
       });
 
       it('DEFERS on a transient session-load failure, leaving the marker intact (no restart)', async () => {
@@ -406,23 +421,22 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(firstAttachOrder).toBeLessThan(claimOrder);
       });
 
-      it('schedules a short retry on a deferred fire instead of silently waiting for the next full cadence (ENG-657)', async () => {
+      it('schedules a short retry on a genuinely-retryable deferred fire (claim-error) instead of silently waiting for the next full cadence (ENG-657)', async () => {
         // A deferred fire returns cleanly — it does NOT leave a stale lease for the
         // reconciler to catch the way a crash would, and the dispatch loop already
         // advanced nextRunTime to the full next cadence before this run started.
         // Without an explicit short retry, a defer would silently wait a full cycle.
+        // Unlike the "no longer resumable" case, a transient claim error carries no
+        // duplicate-effect risk on retry — the session is still genuinely resumable,
+        // so retrying soon (rather than pausing) is correct here.
         mockChatbotDb.getChatSession.mockResolvedValue({
-          ...mockSession, sessionId: resumeSessionId, userId: mockUserId,
-          messages: [
-            { role: 'system', content: 'x' },
-            { role: 'user', content: 'Enrich.' },
-            { role: 'assistant', content: '…', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } } ] },
-          ],
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
         } as any);
+        (mockScheduleDb.claimPendingResume as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
 
         const result = await runScheduledChat({ ...resumeSchedule, zeroAssistantRetryCount: 0 } as any, mockUserId, false);
 
-        expect(result.sessionId).toBe(''); // deferred (not-resumable)
+        expect(result.sessionId).toBe(''); // deferred (claim-error)
         const updateCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
         expect(updateCall).toBeDefined();
         expect(updateCall[1]).toEqual(expect.objectContaining({ zeroAssistantRetryCount: 1, nextRunTime: expect.any(String) }));
@@ -430,13 +444,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       it('does NOT schedule another retry once the requeue cap is already exhausted (ENG-657)', async () => {
         mockChatbotDb.getChatSession.mockResolvedValue({
-          ...mockSession, sessionId: resumeSessionId, userId: mockUserId,
-          messages: [
-            { role: 'system', content: 'x' },
-            { role: 'user', content: 'Enrich.' },
-            { role: 'assistant', content: '…', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } } ] },
-          ],
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
         } as any);
+        (mockScheduleDb.claimPendingResume as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
         (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
 
         await runScheduledChat({ ...resumeSchedule, zeroAssistantRetryCount: 3 } as any, mockUserId, false);
