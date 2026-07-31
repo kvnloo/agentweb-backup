@@ -175,14 +175,22 @@ describe('AgentModeService - Gemini reasoning-leak suppression (ENG-737)', () =>
     }
   });
 
-  it('suppresses a MARKERLESS continuation fragment that follows a suppressed marker leak', async () => {
+  // The detector is deliberately marker-only now (see reasoningLeak.ts header):
+  // this is the compat-path FALLBACK ONLY (the native adapter, default ON,
+  // prevents the leak structurally), and the prior degenerate-loop/chain-state
+  // signal that also caught a markerless continuation was removed — it
+  // re-litigated an unsatisfiable leak-vs-legitimate-repeated-content ambiguity
+  // across a 4-cycle review. This documents the resulting, disclosed tradeoff:
+  // the marker fragment is still suppressed, but a markerless continuation now
+  // passes through on this fallback path.
+  it('suppresses only the marker leak; a markerless continuation now passes through (disclosed fallback-path tradeoff)', async () => {
     mockDeps();
 
     const REAL_ANSWER = 'The Washington State Legislature is in regular session; here is the 2026 agenda.';
     jest
       .spyOn(agentModeService as any, 'callLLM')
       .mockResolvedValueOnce(makeLeakedReasoningResponse()) // iter 1: marker leak (finish_reason=length) -> suppressed
-      .mockResolvedValueOnce(makeMarkerlessLoopResponse())  // iter 2: markerless loop continuation -> suppressed via chain state
+      .mockResolvedValueOnce(makeMarkerlessLoopResponse())  // iter 2: markerless loop continuation -> NOT suppressed
       .mockResolvedValueOnce(makeTextResponse(REAL_ANSWER)); // iter 3: real answer
 
     const result = await agentModeService.generateMarketingResponse(
@@ -193,17 +201,11 @@ describe('AgentModeService - Gemini reasoning-leak suppression (ENG-737)', () =>
       'test-session'
     );
 
-    expect(result.content).toBe(REAL_ANSWER);
-    // Neither the marker leak nor the markerless continuation may reach the user.
-    expect(result.content).not.toContain(LEAKED_QUERY);
     const assistantMsgs = (result.responseMessages as any[]).filter((m) => m.role === 'assistant');
     expect(assistantMsgs).toHaveLength(3);
     expect(assistantMsgs[0].content).toBe(''); // marker leak suppressed
-    expect(assistantMsgs[1].content).toBe(''); // markerless continuation suppressed
+    expect(assistantMsgs[1].content).toContain(LEAKED_QUERY); // markerless continuation now passes through
     expect(assistantMsgs[2].content).toBe(REAL_ANSWER);
-    for (const m of assistantMsgs) {
-      expect(typeof m.content === 'string' ? m.content : '').not.toContain(LEAKED_QUERY);
-    }
   });
 
   it('does NOT suppress a legitimate truncated Gemini answer (negative case)', async () => {

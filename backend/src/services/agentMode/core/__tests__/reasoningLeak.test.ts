@@ -1,21 +1,21 @@
 /**
  * Unit tests for the PURE Gemini reasoning-leak detector (ENG-737).
  *
- * The shapes below mirror the production session d103071a-…-f118f50eb366:
- * gemini-3.5-flash truncated its answer mid-reasoning; fragments 29/30 opened with
- * a lowercase `thought` marker, and their continuation 31 was a MARKERLESS repeated
- * query loop — all leaked into the chat. No real customer data is embedded here.
+ * This is the compat-path FALLBACK ONLY — the primary path (native @google/genai
+ * adapter, default ON) prevents the leak structurally. The shapes below mirror
+ * production session d103071a-…-f118f50eb366: gemini-3.5-flash truncated its
+ * answer mid-reasoning; fragments 29/30 opened with a lowercase `thought` marker.
+ * No real customer data is embedded here.
  *
- * The detector fires ONLY on a TRUNCATED (finish_reason='length') Gemini turn, and
- * only via (1) a lowercase `thought` marker, or (2) a degenerate loop that directly
- * continues an already-suppressed leak. So a COMPLETED answer, a truncated real
- * prose answer, and standalone repetitive content are all left untouched.
+ * The detector fires ONLY on a TRUNCATED (finish_reason='length') Gemini turn
+ * whose content opens with a lowercase `thought` marker. So a COMPLETED answer, a
+ * truncated real prose answer, and standalone repetitive content are all left
+ * untouched.
  */
 
 import {
   isReasoningLeak,
   hasLeadingThoughtMarker,
-  hasDegenerateRepeatedLine,
   type LeakedReasoningInput,
 } from '../reasoningLeak';
 
@@ -25,12 +25,6 @@ const REPEATED_QUERY =
 const LEAKED_THOUGHT =
   'thought\nWait, the search results are looping. Let\'s look at what we found.\n' +
   Array(6).fill(REPEATED_QUERY).join('\n');
-
-// The markerless continuation fragment (session d103071a fragment 31): no leading
-// `thought` marker, but a degenerate repeated-query loop.
-const MARKERLESS_LOOP =
-  '\n*   Wait, let\'s look at the search results we got:\n' +
-  Array(6).fill('    - ' + REPEATED_QUERY).join('\n');
 
 const CLEAN_ANSWER =
   "\nI've gathered the public background information you asked for.\n\n" +
@@ -64,21 +58,6 @@ describe('hasLeadingThoughtMarker', () => {
   });
 });
 
-describe('hasDegenerateRepeatedLine', () => {
-  it('detects a long line repeated 4+ times consecutively', () => {
-    expect(hasDegenerateRepeatedLine(Array(4).fill(REPEATED_QUERY).join('\n'))).toBe(true);
-  });
-
-  it('does not fire on 3 repeats (below threshold)', () => {
-    expect(hasDegenerateRepeatedLine(Array(3).fill(REPEATED_QUERY).join('\n'))).toBe(false);
-  });
-
-  it('ignores short/trivial repeated lines and does not treat spaced duplicates as a loop', () => {
-    expect(hasDegenerateRepeatedLine('---\n---\n---\n---\n---')).toBe(false);
-    expect(hasDegenerateRepeatedLine([REPEATED_QUERY, 'unique line', REPEATED_QUERY, 'other'].join('\n'))).toBe(false);
-  });
-});
-
 describe('isReasoningLeak', () => {
   it('suppresses a truncated gemini turn that leaked its chain-of-thought (thought marker)', () => {
     expect(isReasoningLeak(base)).toBe(true);
@@ -88,7 +67,7 @@ describe('isReasoningLeak', () => {
     expect(isReasoningLeak({ ...base, finishReason: 'stop', content: CLEAN_ANSWER })).toBe(false);
   });
 
-  it('does NOT suppress a normal truncated answer fragment (no thought marker, not a leak continuation)', () => {
+  it('does NOT suppress a normal truncated answer fragment (no thought marker)', () => {
     expect(
       isReasoningLeak({
         ...base,
@@ -97,37 +76,14 @@ describe('isReasoningLeak', () => {
     ).toBe(false);
   });
 
-  // The markerless continuation (fragment 31): a degenerate loop that directly
-  // follows an already-suppressed leak IS caught.
-  it('suppresses a markerless degenerate loop that continues a just-suppressed leak', () => {
-    expect(
-      isReasoningLeak({ ...base, content: MARKERLESS_LOOP, precededBySuppressedLeak: true }),
-    ).toBe(true);
-  });
-
-  // But the SAME degenerate-loop content standalone (not continuing a leak) is NOT
-  // suppressed — this is what protects legitimate repeated data / template / code.
-  it('does NOT suppress a standalone degenerate loop that does not follow a suppressed leak', () => {
-    expect(
-      isReasoningLeak({ ...base, content: MARKERLESS_LOOP, precededBySuppressedLeak: false }),
-    ).toBe(false);
-  });
-
-  // A truncated REAL prose answer following a leak (no degenerate loop) is NOT
-  // suppressed even mid-chain — protects a genuine partial answer.
-  it('does NOT suppress a truncated real prose answer even when it follows a suppressed leak', () => {
+  // Standalone repetitive content (template rows, repeated data, code) is never
+  // suppressed — the detector only looks at the leading marker, never at shape.
+  it('does NOT suppress standalone repeated/degenerate-looking content (no thought marker)', () => {
     expect(
       isReasoningLeak({
         ...base,
-        content: 'Here is the first half of the real answer, which simply ran out of tokens mid-sentence',
-        precededBySuppressedLeak: true,
+        content: Array(6).fill(REPEATED_QUERY).join('\n'),
       }),
-    ).toBe(false);
-  });
-
-  it('does NOT suppress a leak-continuation loop once the turn completes (finish_reason=stop)', () => {
-    expect(
-      isReasoningLeak({ ...base, content: MARKERLESS_LOOP, finishReason: 'stop', precededBySuppressedLeak: true }),
     ).toBe(false);
   });
 
