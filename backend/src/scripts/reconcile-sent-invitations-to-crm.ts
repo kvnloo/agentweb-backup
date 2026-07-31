@@ -14,6 +14,12 @@
  *
  * The account→list mapping has no stored binding, so YOU supply it explicitly.
  *
+ * ⚠️ RUN `normalize-lead-linkedin-urls.ts <listId>` FIRST. Invitees are matched to
+ * existing leads by canonical LinkedIn URL through an exact-match GSI. Leads added
+ * before ENG-787 were stored with the URL the user pasted (mixed case, no `www.`,
+ * trailing slash), so they will NOT match and this job would create a duplicate lead
+ * for someone the list already has.
+ *
  * ⚠️ DATA-PLANE: this performs BULK CRM writes (create/update leads + engagement)
  * into a customer's list. Confirm the account↔list mapping and get data-plane
  * sign-off before running against production.
@@ -49,7 +55,8 @@ async function main() {
   const result = await reconcileSentInvitationsToCrm({ accountId, listId, userId, dryRun });
   console.log(
     `Done in ${Math.round((Date.now() - before) / 1000)}s — ` +
-      `total=${result.total} created=${result.created} updated=${result.updated} skipped=${result.skipped}`,
+      `total=${result.total} created=${result.created} updated=${result.updated} ` +
+      `(alreadyRecorded=${result.alreadyRecorded}) skipped=${result.skipped}`,
   );
 }
 
