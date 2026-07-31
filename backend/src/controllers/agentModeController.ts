@@ -2092,6 +2092,29 @@ export async function runScheduledChat(
         createdAt: new Date().toISOString(),
       });
 
+      // A deferred fire returns cleanly (no exception), so it does NOT leave a stale
+      // lease for the reconciler to catch — unlike a crash, nothing will retry it soon
+      // on its own. And the dispatch loop already advanced nextRunTime to the FULL next
+      // cadence *before* calling into this run (to prevent double-dispatch), so without
+      // this, a defer would silently wait a full cycle instead of retrying shortly —
+      // worse than the crash case it exists to avoid (Greptile). Mirror the
+      // reconciler's own short, bounded backoff so a defer gets another attempt soon,
+      // capped by the same requeue limit so a persistently un-resumable schedule still
+      // eventually falls back to its normal cadence instead of retrying forever.
+      const scheduleRetrySoon = async () => {
+        const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+        if (nextRetryCount > ZERO_ASSISTANT_MAX_REQUEUES) return;
+        try {
+          await scheduleDb.updateSchedule(schedule.scheduleId, {
+            nextRunTime: new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString(),
+            zeroAssistantRetryCount: nextRetryCount,
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (retryScheduleError) {
+          console.error(`runScheduledChat: failed to schedule a short retry after resume defer for ${schedule.scheduleId}:`, retryScheduleError);
+        }
+      };
+
       // Load + validate BEFORE claiming, so a transient read failure never consumes
       // the marker or triggers a restart — the marker persists and a later fire retries.
       let resumeSession: any;
@@ -2105,6 +2128,7 @@ export async function runScheduledChat(
 
       if (loadThrew) {
         // Transient load failure: marker left intact for the next fire; do not restart.
+        await scheduleRetrySoon();
         return deferredResumeResult('load-error');
       }
 
@@ -2120,6 +2144,7 @@ export async function runScheduledChat(
         // DEFER — never fresh-restart (that would re-run completed side effects).
         await scheduleDb.claimPendingResume(schedule.scheduleId, pendingResumeSessionId).catch(() => {});
         console.warn(`runScheduledChat: resume marker for session ${pendingResumeSessionId} no longer resumable; deferring (no fresh restart, to avoid duplicate side effects).`);
+        await scheduleRetrySoon();
         return deferredResumeResult('not-resumable');
       }
 
@@ -2129,11 +2154,21 @@ export async function runScheduledChat(
       // empty, so the reconciler saw an empty-session abandonment and requeued a
       // fresh restart — re-running this session's already-completed side effects.
       // Attaching first means the lease already names the right session no matter
-      // when a kill lands after this point.
+      // when a kill lands after this point — PROVIDED the attach itself lands. If it
+      // doesn't (Greptile, round 2), the marker is still intact (not yet claimed), so
+      // defer rather than proceed on an unconfirmed lease — a later fire retries.
       if (leaseAcquired) {
-        await scheduleDb.attachSessionToRunInFlight(schedule.scheduleId, leaseRunId, pendingResumeSessionId).catch(attachError => {
+        let attached = false;
+        try {
+          attached = await scheduleDb.attachSessionToRunInFlight(schedule.scheduleId, leaseRunId, pendingResumeSessionId);
+        } catch (attachError) {
           console.error(`Failed to attach resume session to in-flight lease for schedule ${schedule.scheduleId}:`, attachError);
-        });
+        }
+        if (!attached) {
+          console.warn(`runScheduledChat: could not attach resume session ${pendingResumeSessionId} to lease for schedule ${schedule.scheduleId}; deferring (marker left intact for a later retry).`);
+          await scheduleRetrySoon();
+          return deferredResumeResult('attach-error');
+        }
       }
 
       // Atomically CLAIM: exactly one dispatcher wins and resumes this session; any
@@ -2143,10 +2178,13 @@ export async function runScheduledChat(
         won = await scheduleDb.claimPendingResume(schedule.scheduleId, pendingResumeSessionId);
       } catch (claimError) {
         console.error(`runScheduledChat: resume claim error for session ${pendingResumeSessionId}; deferring:`, claimError);
+        await scheduleRetrySoon();
         return deferredResumeResult('claim-error');
       }
       if (!won) {
         console.warn(`runScheduledChat: lost the resume claim for session ${pendingResumeSessionId} on schedule ${schedule.scheduleId} (another dispatcher is resuming it); deferring — no fresh restart.`);
+        // No retry-soon here: the winner is actively resuming this same schedule's
+        // session right now — a fast re-fire would just lose the claim again.
         return deferredResumeResult('lost-claim');
       }
 

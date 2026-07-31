@@ -64,7 +64,7 @@ jest.mock('../services/db', () => ({
     getSchedulesReadyToRun: jest.fn(),
     updateScheduleAfterRun: jest.fn(),
     setRunInFlight: jest.fn().mockResolvedValue(undefined),
-    attachSessionToRunInFlight: jest.fn().mockResolvedValue(undefined),
+    attachSessionToRunInFlight: jest.fn().mockResolvedValue(true),
     heartbeatRunInFlight: jest.fn().mockResolvedValue(undefined),
     clearRunInFlight: jest.fn().mockResolvedValue(true),
     getInFlightSchedules: jest.fn().mockResolvedValue([]),
@@ -404,6 +404,46 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         // At least one attach call names the resumed session, and it happens before the claim.
         expect(attachCalls.some(call => call[2] === resumeSessionId)).toBe(true);
         expect(firstAttachOrder).toBeLessThan(claimOrder);
+      });
+
+      it('schedules a short retry on a deferred fire instead of silently waiting for the next full cadence (ENG-657)', async () => {
+        // A deferred fire returns cleanly — it does NOT leave a stale lease for the
+        // reconciler to catch the way a crash would, and the dispatch loop already
+        // advanced nextRunTime to the full next cadence before this run started.
+        // Without an explicit short retry, a defer would silently wait a full cycle.
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'x' },
+            { role: 'user', content: 'Enrich.' },
+            { role: 'assistant', content: '…', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } } ] },
+          ],
+        } as any);
+
+        const result = await runScheduledChat({ ...resumeSchedule, zeroAssistantRetryCount: 0 } as any, mockUserId, false);
+
+        expect(result.sessionId).toBe(''); // deferred (not-resumable)
+        const updateCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
+        expect(updateCall).toBeDefined();
+        expect(updateCall[1]).toEqual(expect.objectContaining({ zeroAssistantRetryCount: 1, nextRunTime: expect.any(String) }));
+      });
+
+      it('does NOT schedule another retry once the requeue cap is already exhausted (ENG-657)', async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'x' },
+            { role: 'user', content: 'Enrich.' },
+            { role: 'assistant', content: '…', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } } ] },
+          ],
+        } as any);
+        (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
+
+        await runScheduledChat({ ...resumeSchedule, zeroAssistantRetryCount: 3 } as any, mockUserId, false);
+
+        // ZERO_ASSISTANT_MAX_REQUEUES is 3 — a 4th retry is over cap, so no reschedule.
+        const updateCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
+        expect(updateCall).toBeUndefined();
       });
     });
 
