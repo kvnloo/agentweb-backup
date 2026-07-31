@@ -28891,20 +28891,43 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // list_id (the outreach caller passes the list it is working from) and a profile
           // URL to key on. Best-effort: a CRM write must never fail/branch an invite Unipile
           // already accepted, and the list_id is LLM-controlled so access is verified first.
-          const mirrorInviteToCrm = async (opts?: { note?: string; sentAt?: string }): Promise<void> => {
-            if (!args.list_id || !isUrl || !profile_url) return;
+          const mirrorInviteToCrm = async (opts?: { note?: string; sentAt?: string; invitationId?: string }): Promise<void> => {
+            // EVERYTHING here is inside the try: this is best-effort attribution and must
+            // never fail, or branch, an invite Unipile has already accepted.
             try {
+              // Resolve the invitee's profile URL. A provider_id-only invite has no /in/
+              // URL to key a lead on, so ask Unipile for the profile rather than dropping
+              // the attribution — that path was previously invisible to the CRM entirely.
+              let mirrorProfileUrl: string | null = isUrl && profile_url ? profile_url : null;
+              if (!mirrorProfileUrl && provider_id) {
+                try {
+                  const profile = await linkedInOutreachService.getProfile(provider_id, account_id);
+                  const publicId = profile?.public_id || profile?.public_identifier || profile?.rawData?.public_identifier;
+                  if (publicId) mirrorProfileUrl = `https://www.linkedin.com/in/${publicId}/`;
+                } catch (profileErr) {
+                  console.warn('[AgentMode] send-invite: could not resolve provider_id to a profile URL for CRM mirror:', profileErr);
+                }
+              }
+              if (!mirrorProfileUrl) return;
+
+              // The list the invite belongs to. The model should pass list_id, but when it
+              // does not, fall back to the list bound to this sending account so
+              // attribution does not hinge on the model remembering an argument.
+              const { resolveListIdForAccount } = await import('./linkedInInviteCrmMirror');
+              const mirrorListId = args.list_id || (await resolveListIdForAccount(userId, account_id));
+              if (!mirrorListId) return;
+
               const { crmDb } = await import('./db');
-              const mirrorList = await crmDb.getLeadListById(args.list_id);
+              const mirrorList = await crmDb.getLeadListById(mirrorListId);
               if (!mirrorList || !(await crmDb.canOrgMemberAccessList(userId, mirrorList))) {
-                console.warn(`[AgentMode] send-invite: skipping CRM mirror — list ${args.list_id} not accessible to user ${userId}`);
+                console.warn(`[AgentMode] send-invite: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
                 return;
               }
               const { mirrorLinkedInInviteToCrm } = await import('./linkedInInviteCrmMirror');
               await mirrorLinkedInInviteToCrm({
                 userId,
-                listId: args.list_id,
-                linkedinUrl: profile_url,
+                listId: mirrorListId,
+                linkedinUrl: mirrorProfileUrl,
                 leadId: args.lead_id,
                 firstName: args.first_name,
                 lastName: args.last_name,
@@ -28912,6 +28935,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 title: args.title,
                 note: opts?.note ?? message ?? undefined,
                 accountId: account_id,
+                invitationId: opts?.invitationId,
                 sentAt: opts?.sentAt,
               });
             } catch (mirrorErr) {
@@ -28926,7 +28950,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               console.log(`[AgentMode] send-invite: skipping ${profile_url} — invitation already pending (sent ${pending.sentAt ?? 'previously'})`);
               // ENG-787: still mirror the already-pending invite so the CRM records the
               // touch even though we skip the (quota-wasting) resend.
-              await mirrorInviteToCrm({ note: pending.invitationText, sentAt: pending.sentAt });
+              await mirrorInviteToCrm({
+                note: pending.invitationText,
+                sentAt: pending.sentAt,
+                invitationId: pending.invitationId,
+              });
               return {
                 success: true,
                 alreadyInvited: true,
@@ -28978,7 +29006,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // ENG-787: mirror the freshly-sent invite into the CRM lead list (see the
             // shared mirrorInviteToCrm helper above), stamped with the same instant the
             // pending-invite cache row carries.
-            await mirrorInviteToCrm({ sentAt: nowIso });
+            await mirrorInviteToCrm({
+              sentAt: nowIso,
+              invitationId: (inviteResult && (inviteResult.invitation_id || inviteResult.id)) || undefined,
+            });
 
             return { success: true, data: inviteResult };
           } catch (inviteErr: any) {
