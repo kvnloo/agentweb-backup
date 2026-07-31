@@ -938,11 +938,27 @@ createTestAccount().then(async () => {
       // agent-mode learning loop (17:30) and generic attribution (18:00) so it
       // doesn't race them. Telemetry-only: reads the agent-mode events the
       // recorder already wrote and persists a dated trend-line snapshot. Never
-      // touches the chat path. Gated by AGENT_RELIABILITY_SNAPSHOT_ENABLED.
-      if (process.env.AGENT_RELIABILITY_SNAPSHOT_ENABLED === 'true') {
+      // touches the chat path.
+      //
+      // ON BY DEFAULT (ENG-746). This was opt-in via
+      // AGENT_RELIABILITY_SNAPSHOT_ENABLED=true, that variable was never added
+      // to the production environment, and the cron consequently never ran — so
+      // GET /api/admin/loops/reliability-trend returned {count: 0} forever and
+      // closure-gate check 4 could not be satisfied for any issue. A telemetry
+      // job whose absence silently disables a control should not depend on
+      // someone remembering a variable. Set the flag to 'false' to opt out.
+      if (process.env.AGENT_RELIABILITY_SNAPSHOT_ENABLED !== 'false') {
         try {
           const SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
-          const { runAgentReliabilitySnapshot } = await import('./cron/agentReliabilitySnapshotCron');
+          const { runAgentReliabilitySnapshot, seedReliabilitySnapshotsIfEmpty } =
+            await import('./cron/agentReliabilitySnapshotCron');
+
+          // One-shot seed so the trend is readable immediately rather than
+          // after the next 17:45 UTC tick. No-ops once any snapshot exists.
+          if (isCronEnabled()) {
+            cronJobRegistry.track('AgentReliabilitySnapshotSeed', seedReliabilitySnapshotsIfEmpty())
+              .catch(e => console.error('[AgentReliabilitySnapshot] Seed error:', e));
+          }
 
           const nowForSnapshot = new Date();
           const nextSnapshotRun = new Date(nowForSnapshot);
@@ -969,7 +985,7 @@ createTestAccount().then(async () => {
           console.error('[AgentReliabilitySnapshot] Failed to initialize:', error);
         }
       } else {
-        console.log('[AgentReliabilitySnapshot] Disabled (set AGENT_RELIABILITY_SNAPSHOT_ENABLED=true to enable)');
+        console.log('[AgentReliabilitySnapshot] Disabled (AGENT_RELIABILITY_SNAPSHOT_ENABLED=false)');
       }
 
       // Weekly Engineering Scoreboard — read-only backend replacement for the

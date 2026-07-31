@@ -29,6 +29,49 @@ fail fast rather than late. Investigation findings:
   helper, so the preflight and the reactive handler cannot drift into telling the user two
   different stories about the same account.
 
+## ENG-746: the closure gate was blocked by an env var nobody set (2026-07-31)
+
+`GET /api/admin/loops/reliability-trend` returned `{count: 0, snapshots: []}` on every window, so
+closure-gate check 4 ("burn-in clean, `failedRunRate`/`degradedRunRate` no worse than the
+pre-release snapshot") failed for every issue and nothing on the board could close. Fourteen items
+were queued behind it. Investigation findings:
+
+- **It is NOT the ENG-593/CaptureGate problem, despite looking like one.** Worth stating because
+  the two are easy to conflate: both are "the loop never reaches a verdict". The reliability trend
+  is written by `runAgentReliabilitySnapshot` (`backend/src/cron/agentReliabilitySnapshotCron.ts`),
+  which is pure telemetry — it reads raw `agent-mode` events from `Dev-AW-LoopEvents` and aggregates
+  them under `loopId='agent-reliability-daily'`. It never calls `pollDecision()`, never touches
+  `CaptureGate`/`ApprovalGate`, and never reads the `LearningStore`. ENG-593 governs the *learning*
+  verdict, which is what makes `/loops/health` report `pending_approval` — a different pipeline.
+  Fixing this needed no ApprovalGate flip.
+- **The writer had never run, once, ever.** `server.ts` gated the cron behind
+  `AGENT_RELIABILITY_SNAPSHOT_ENABLED === 'true'`, and that variable is absent from
+  `Agentweb-backend-env-prod-3` while `AGENT_MODE_LOOP_ENABLED`, `AGENT_RUNTIME_SPINE_ENABLED`,
+  `AI_EVAL_LOOP_ENABLED`, `AI_READINESS_LOOP_ENABLED` and `ONBOARDING_LOOP_*` are all `true`. It was
+  simply missed when the feature shipped. Measured live: **121,389** raw `agent-mode` events,
+  **0** rows in the `agent-reliability-daily` partition. The source data was never the problem.
+  A 7-day window reading `count: 0` meant "never written", not "quiet week" — as suspected.
+- **The zero-denominator guard is a false-green generator.** `computeReliabilitySnapshot` returns
+  `degradedRunRate: 0` and `failedRunRate: 0` when `totalVerdicts === 0`. A window in which *nothing
+  ran* therefore renders as a flawless 0% failure rate — strictly better than any real baseline, so
+  a naive comparison reads a dead window as the best possible result. This sat directly in check 4's
+  path. `evaluateBurnIn` rejects a sub-`minRunCount` window on **both** sides of the comparison
+  rather than comparing its rates. Same family as ENG-734/743/754/777: a control reporting a value
+  it cannot substantiate.
+- **Turning the cron on is necessary but not sufficient.** Writing only "today" leaves one snapshot
+  with no pre-release baseline, so check 4 stays `insufficient_data` for another day; and the cron
+  first fires at the next 17:45 UTC, so a fresh deploy reads empty until then. Hence `catchUpDays`
+  (fills recent dateless days from events already stored, one event-partition read regardless of
+  span) plus a boot seed that runs if and only if the partition is empty.
+- **`passesClosureCheck4 === (verdict === 'clean')` is the whole safety property.** Every failure
+  path — no snapshots, no baseline, no post-release reading, too few runs, unparseable `releaseAt`,
+  a 500 — returns `insufficient_data`/`false`. There is deliberately no boolean-only form of the
+  result and no fourth "unknown" state a caller could coerce.
+- **Tolerance is a deliberate 2 points, not a weakening.** Daily rates move a point or two on
+  ordinary variance, and a zero-tolerance `<=` would mark healthy days `regressed` and rebuild this
+  same deadlock in a new shape. It only ever decides `clean` vs `regressed`; it cannot turn missing
+  data into a pass, because the run-count gate runs before any comparison.
+
 ## ENG-754: the Greptile 5/5 bar is now a check, not a habit (2026-07-29)
 
 `Require Greptile Review` used to poll Greptile's own `Greptile Review` check-run and pass on
