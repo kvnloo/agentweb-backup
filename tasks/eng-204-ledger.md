@@ -81,10 +81,30 @@ structural presence ≠ compliance) → promote to prod → re-verify.
 > override; re-verified behaviorally. Every send/publish skill is behaviorally
 > tested via `scripts/agentModeHarness.ts`.
 
-## PR 3 — structural (ENG-612/613/614) — not started
-Luma de-hardcode + dedup (3→1) · Inbound Website de-hardcode · Video Production
-split · LinkedIn Post Writing dedup (delete 1). Needs your content calls (Luma
-keeper, generic Video Production copy).
+## PR 3 — structural (ENG-612/613/614) — in progress
+
+### ENG-613 — Inbound Website Lead Engagement de-hardcode (Blindspot 3)
+| Skill | change | dev | verified | promoted |
+|---|---|---|---|---|
+| Inbound Website Lead Engagement Logic (`92ed7c80`) | de-hardcode → runtime ICP/lists per requesting org + CONTEXT+SAFETY+FAILURE | ✅ | ✅ beh (loads read_market_strategy/read_brand_guidelines + get_lead_lists at runtime; discovers lists dynamically; verifies account, refuses inactive-account send; no hallucination) | ✅ **prod-verified 07-30** (4773→7549 chars, 3 blocks, 0 leaks) |
+
+Reproducible artifact: `backend/src/scripts/dehardenInboundWebsite.ts` (+ `inboundWebsite.dehardened.md`). Prompt 4777→7551 chars, 0 hardcoded leaks. **Prod promotion pending developer review of the new prompt + admin token.**
+
+### ENG-612 — Luma de-hardcode (dev-done; dedup blocked)
+| Skill | change | dev | verified | promoted |
+|---|---|---|---|---|
+| Luma Event Lead Engagement Engine (`a831f5c8`) | strip departing-employee (Rui Wang) name + CONTEXT+SAFETY+FAILURE | ✅ | ✅ beh (**STOPS on the past June-18 event**; derives owners at runtime + queues inactive; loads read_market_strategy; ledger, no fabrication) | ✅ **prod-verified 07-30** (8140→10228, Rui Wang removed; rollback snapshot kept) |
+
+Conservative de-hardcode: the CONTEXT block behaviorally neutralizes the past event + departing-owner without gutting the user's bespoke event logic. Prompt 8140→10228, Rui Wang removed. The other 2 Luma rows (`eab2ba45` near-clean, `a80b5360` clean) left untouched.
+
+### ENG-614 — Video Production split: MOOT (premise stale)
+The published `Video Production` (`8714d8c5`, public, 13.3KB) is **already generic** (brand-agnostic cinematic video-ad pipeline; brand loaded via you_search_web at runtime). Scanned all dev+prod skills for "Scrollbook"/children's-book content → **zero hits**. Nothing to split → drop.
+
+### ENG-624 / ENG-626 dedup deletes → recommend **Option C (drop)**
+Both hard-deletes are **droppable** (Option C needs no data-plane action, so no Harsha gate):
+- **Luma** (ENG-624): 3 rows are 3 DIFFERENT users' *private* skills → deleting destroys user data, not catalog hygiene.
+- **LinkedIn Post Writing** (ENG-626): `aabe2602` is another user's *private draft*, near-identical to the public keeper `23c80388` → no public-catalog drift; low-value delete.
+Video split (ENG-626's other half) is moot (above). → close both as C; no deletions.
 
 ## PR 4 / PR 5 — new skills (ENG-615…618) — not started
 10 new skills; #1/#3/#5/#6 ship hardened; #7 blocked on privacy review.
