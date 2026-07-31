@@ -9,11 +9,13 @@
  * before merge" gate, this is a new logical use of an existing table/schema,
  * not a schema change.
  *
- * Note: rowKeys are stored as a flat string array in one item. DynamoDB caps
- * a single item at 400KB, which bounds this to roughly a few thousand rows
- * per audience before it would need to shard across multiple items — fine
- * for this ticket's HubSpot-list/CSV seed-audience scope, but a real
- * follow-up if this store is ever reused for much larger audiences.
+ * Sharded across an index item (`metaAudienceSnapshot:<audienceId>`, holding
+ * `chunkCount`) plus N chunk items (`metaAudienceSnapshot:<audienceId>:chunk:<i>`,
+ * each holding up to MAX_KEYS_PER_CHUNK rowKeys) rather than one flat array in
+ * one item — DynamoDB caps a single item at 400KB, which a large audience's
+ * row-keys array could exceed if stored as one array. Chunk items are written
+ * before the index item so a partial write failure never leaves the index
+ * pointing at a chunk that was never saved.
  */
 
 import AWS from 'aws-sdk';
@@ -21,30 +23,77 @@ import AWS from 'aws-sdk';
 const TABLE_PREFIX = process.env.NODE_ENV === 'production' ? '' : 'Dev-';
 const CONFIGS_TABLE = `${TABLE_PREFIX}AW-Configs`;
 
-function snapshotConfigId(audienceId: string): string {
+// ~130 bytes per row-key (two 64-char hex hashes + separator) * 2000 ≈ 260KB,
+// comfortably under the 400KB DynamoDB item cap with room for item overhead.
+const MAX_KEYS_PER_CHUNK = 2000;
+
+function indexConfigId(audienceId: string): string {
   return `metaAudienceSnapshot:${audienceId}`;
+}
+
+function chunkConfigId(audienceId: string, index: number): string {
+  return `metaAudienceSnapshot:${audienceId}:chunk:${index}`;
 }
 
 export async function getAudienceSnapshotRowKeys(userId: string, audienceId: string): Promise<string[] | null> {
   const dynamodb = new AWS.DynamoDB.DocumentClient();
-  const result = await dynamodb.get({
+  const indexResult = await dynamodb.get({
     TableName: CONFIGS_TABLE,
-    Key: { userId, configId: snapshotConfigId(audienceId) },
+    Key: { userId, configId: indexConfigId(audienceId) },
   }).promise();
 
-  const rowKeys = result.Item?.rowKeys;
-  if (!Array.isArray(rowKeys)) return null;
+  const item = indexResult.Item;
+  if (!item) return null;
+
+  // Backward-compat: an index item that stores rowKeys directly (pre-sharding
+  // format, or a hand-written test fixture) — return as-is.
+  if (Array.isArray(item.rowKeys)) return item.rowKeys;
+
+  const chunkCount = typeof item.chunkCount === 'number' ? item.chunkCount : 0;
+  if (chunkCount === 0) return null;
+
+  const chunkResults = await Promise.all(
+    Array.from({ length: chunkCount }, (_, i) =>
+      dynamodb.get({
+        TableName: CONFIGS_TABLE,
+        Key: { userId, configId: chunkConfigId(audienceId, i) },
+      }).promise()
+    )
+  );
+
+  const rowKeys: string[] = [];
+  for (const result of chunkResults) {
+    if (Array.isArray(result.Item?.rowKeys)) {
+      rowKeys.push(...result.Item.rowKeys);
+    }
+  }
   return rowKeys;
 }
 
 export async function saveAudienceSnapshotRowKeys(userId: string, audienceId: string, rowKeys: string[]): Promise<void> {
   const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+  const chunks: string[][] = [];
+  for (let i = 0; i < rowKeys.length; i += MAX_KEYS_PER_CHUNK) {
+    chunks.push(rowKeys.slice(i, i + MAX_KEYS_PER_CHUNK));
+  }
+  if (chunks.length === 0) chunks.push([]); // zero-member audience still gets a baseline snapshot
+
+  await Promise.all(
+    chunks.map((chunk, i) =>
+      dynamodb.put({
+        TableName: CONFIGS_TABLE,
+        Item: { userId, configId: chunkConfigId(audienceId, i), rowKeys: chunk },
+      }).promise()
+    )
+  );
+
   await dynamodb.put({
     TableName: CONFIGS_TABLE,
     Item: {
       userId,
-      configId: snapshotConfigId(audienceId),
-      rowKeys,
+      configId: indexConfigId(audienceId),
+      chunkCount: chunks.length,
       updatedAt: new Date().toISOString(),
     },
   }).promise();
