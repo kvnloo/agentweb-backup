@@ -186,7 +186,7 @@ import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from './metaAudienceSnapshotStore';
-import { claimPreviewToken } from './metaAudienceCampaignTokenStore';
+import { claimPreviewToken, releasePreviewToken } from './metaAudienceCampaignTokenStore';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
@@ -17497,6 +17497,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // Greptile finding: once claimed, a failure anywhere below (reconciliation,
+      // lookalike, ad-set creation) left the token permanently consumed — since
+      // the digest is deterministic given the same args, re-previewing
+      // unchanged arguments produces the SAME token, already claimed forever,
+      // so the user could never retry the exact approved arguments. Releasing
+      // the claim on failure lets a legitimate retry work, while the atomic
+      // claim above still fully prevents concurrent double-execution.
+      try {
+        return await this.executeAudienceCampaignLaunch(userId, args, workflow, source);
+      } catch (e) {
+        await releasePreviewToken(userId, args.preview_token);
+        throw e;
+      }
+    } catch (error: any) {
+      return {
+        success: false,
+        workflow,
+        ledger: { failures: [{ step: 'launch', message: error.message }] },
+        message: error.message || `Failed to launch ${workflow} campaign.`,
+      };
+    }
+  }
+
+  private async executeAudienceCampaignLaunch(
+    userId: string,
+    args: any,
+    workflow: 'targeted_audience' | 'retargeting',
+    source: { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string }
+  ): Promise<any> {
       const seed = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: false });
 
       let attachAudienceId = seed.audience!.id;
@@ -17568,14 +17597,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         message: `Launched ${workflow} campaign: audience "${ledger.audience.name}" (${seed.created ? 'created' : 'reused'})` +
           `${lookalike ? `, lookalike "${lookalike.name}"` : ''} attached to ad set "${ledger.adSet.name}".`,
       };
-    } catch (error: any) {
-      return {
-        success: false,
-        workflow,
-        ledger: { failures: [{ step: 'launch', message: error.message }] },
-        message: error.message || `Failed to launch ${workflow} campaign.`,
-      };
-    }
   }
 
   /**

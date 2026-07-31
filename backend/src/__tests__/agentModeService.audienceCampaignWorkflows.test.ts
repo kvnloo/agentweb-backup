@@ -33,6 +33,7 @@ jest.mock('../services/metaAudienceSnapshotStore', () => ({
 }));
 jest.mock('../services/metaAudienceCampaignTokenStore', () => ({
   claimPreviewToken: jest.fn().mockResolvedValue(true),
+  releasePreviewToken: jest.fn().mockResolvedValue(undefined),
 }));
 jest.mock('../utils/ssrfGuard', () => ({
   assertPublicHostname: jest.fn().mockResolvedValue(undefined),
@@ -42,7 +43,7 @@ jest.mock('../utils/ssrfGuard', () => ({
 import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from '../services/metaAudienceSnapshotStore';
-import { claimPreviewToken } from '../services/metaAudienceCampaignTokenStore';
+import { claimPreviewToken, releasePreviewToken } from '../services/metaAudienceCampaignTokenStore';
 import { assertPublicHostname } from '../utils/ssrfGuard';
 
 describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
@@ -55,6 +56,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(null);
     (saveAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(undefined);
     (claimPreviewToken as jest.Mock).mockResolvedValue(true);
+    (releasePreviewToken as jest.Mock).mockResolvedValue(undefined);
     (assertPublicHostname as jest.Mock).mockResolvedValue(undefined);
   });
 
@@ -808,6 +810,14 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(result.success).toBe(false);
       expect(result.ledger.failures).toEqual([{ step: 'launch', message: 'Payload is empty — no user rows to upload.' }]);
       expect(createAdSetSpy).not.toHaveBeenCalled();
+
+      // Greptile finding: once claimed, a failure below (here: seed
+      // resolution) left the token permanently consumed — since the digest
+      // is deterministic given the same args, re-previewing unchanged
+      // arguments would produce the SAME token, already claimed forever.
+      // Releasing on failure lets the user retry the exact approved
+      // arguments after fixing the underlying problem.
+      expect(releasePreviewToken).toHaveBeenCalledWith(USER_ID, expect.any(String));
     });
 
     it('fails the whole launch when ad set creation fails', async () => {
