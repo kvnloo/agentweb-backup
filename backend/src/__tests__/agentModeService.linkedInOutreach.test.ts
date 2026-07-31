@@ -1258,6 +1258,32 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.success).toBe(true);
       expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
     });
+
+    // ENG-787 gap-2: a person the ENG-182 dedup guard SKIPS (already pending) must
+    // still be mirrored into the CRM — otherwise pending invitees keep getting no
+    // lead/engagement record. The mirror runs even though no quota-spending send happens.
+    it('mirrors an already-pending invite even though the send is skipped', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+      mockCanOrgMemberAccessList.mockResolvedValue(true);
+      mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValueOnce({
+        invitedUserPublicId: 'jane-doe',
+        invitationText: 'earlier note',
+        sentAt: '2026-07-01T00:00:00.000Z',
+      });
+
+      const result = await service.linkedinOutreach('user-1', mirrorArgs);
+
+      expect(result.alreadyInvited).toBe(true);
+      expect(mockSendInvitation).not.toHaveBeenCalled();
+      // Still mirrored, carrying the original send timestamp for provenance.
+      expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+        expect.objectContaining({
+          listId: 'list_owned',
+          linkedinUrl: 'https://www.linkedin.com/in/jane-doe/',
+          sentAt: '2026-07-01T00:00:00.000Z',
+        }),
+      );
+    });
   });
 
   describe('formatToolError — linkedin_outreach char limit guidance', () => {
