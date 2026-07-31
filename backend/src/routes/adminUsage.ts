@@ -19,7 +19,12 @@ import {
   getUsageComparison,
   getCostAggregation,
   getUserOrgUsageRollup,
+  getXAllocatedTotals,
+  currentXBillingCycle,
+  getUserXBreakdown,
+  getUserXOrgRollup,
 } from "../services/usageAnalyticsService";
+import { twitterService } from "../services/twitterService";
 
 const router = express.Router();
 
@@ -118,6 +123,74 @@ router.get(
 );
 
 /**
+ * One user's X (Twitter) spend by tool over a date range (ENG-664) — powers the
+ * per-user "X Cost" breakdown on the admin user card.
+ */
+router.get(
+  "/users/:userId/usage/x-breakdown",
+  authenticateToken,
+  isAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const { userId } = req.params as { userId: string };
+      const start = String(req.query.start || "");
+      const end = String(req.query.end || "");
+
+      if (!DATE_RE.test(start) || !DATE_RE.test(end)) {
+        return res
+          .status(400)
+          .json({ message: "start and end query params are required (YYYY-MM-DD)" });
+      }
+      if (start > end) {
+        return res.status(400).json({ message: "start must be <= end" });
+      }
+
+      const result = await getUserXBreakdown(userId, start, end);
+      return res.json(result);
+    } catch (error) {
+      console.error("[adminUsage] x-breakdown failed:", error);
+      return res.status(500).json({
+        message: "Failed to load X breakdown",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+/**
+ * Org-aware X (Twitter) rollup for the admin per-user X-cost modal (ENG-664) —
+ * the X sibling of /usage/org-rollup. Rolls allocated X spend across all org
+ * members (owner + members) with a per-member breakdown. Solo users get a
+ * single-member rollup. X is observe-only, so there is no quota reconciliation.
+ */
+router.get(
+  "/users/:userId/usage/x-org-rollup",
+  authenticateToken,
+  isAdmin,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const { userId } = req.params as { userId: string };
+      const month = String(req.query.month || "");
+
+      if (!MONTH_RE.test(month)) {
+        return res
+          .status(400)
+          .json({ message: "month query param is required (YYYY-MM)" });
+      }
+
+      const result = await getUserXOrgRollup(userId, month);
+      return res.json(result);
+    } catch (error) {
+      console.error("[adminUsage] x-org-rollup failed:", error);
+      return res.status(500).json({
+        message: "Failed to load X org rollup",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+/**
  * Cross-user cost aggregation for the admin cost dashboard (ENG-366 / ENG-353).
  * The 7d/30d presets are expressed by the caller as explicit start/end dates —
  * the API takes only the custom-range form.
@@ -150,12 +223,92 @@ router.get(
         }
       }
 
-      const result = await getCostAggregation(start, end, topUsersLimit);
+      // Provider scope (ENG-664): absent → "llm" (the LLM Costs tab sends no
+      // provider param and must never show vendor rows); "twitter"/vendor or "all"
+      // are opt-in. Validated to a safe token so it can't inject anything downstream.
+      const provider = String(req.query.provider || "llm");
+      if (!/^[a-z0-9._-]+$/.test(provider)) {
+        return res.status(400).json({ message: "provider must be a simple token (a-z0-9._-)" });
+      }
+
+      const result = await getCostAggregation(start, end, topUsersLimit, provider);
       return res.json(result);
     } catch (error) {
       console.error("[adminUsage] cost-aggregation failed:", error);
       return res.status(500).json({
         message: "Failed to load cost aggregation",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+/**
+ * X (Twitter) usage reconciliation (ENG-664, acceptance criterion 2).
+ *
+ * Returns X's OWN measured consumption (GET /2/usage/tweets — app-wide, deduped)
+ * beside our allocated ledger totals for the SAME billing cycle, so an admin can
+ * see how our allocated upper bound tracks the figure X actually bills. The
+ * allocated window is derived from X's cap_reset_day so the two are comparable.
+ * A failure to reach X (e.g. bearer not configured) is surfaced as 502 without
+ * taking down the rest of the usage tab, which loads this panel separately.
+ */
+router.get(
+  "/usage/x-reconciliation",
+  authenticateToken,
+  isAdmin,
+  async (_req: AuthRequest, res: Response) => {
+    let measured;
+    try {
+      measured = await twitterService.getXProjectUsage();
+    } catch (error) {
+      console.error("[adminUsage] x-reconciliation: X usage fetch failed:", error);
+      return res.status(502).json({
+        message: "Failed to read X app usage",
+        error: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+
+    try {
+      const cycle = currentXBillingCycle(measured.capResetDay);
+      const allocated = await getXAllocatedTotals(cycle.start, cycle.end);
+      // Tighter dollar estimate: X's deduped read count × the post-read rate,
+      // plus our directly-counted (non-read) allocated spend. Reads are the only
+      // dimension X's measured number covers; writes/DMs stay allocated-only.
+      const POST_READ_USD = 0.005;
+      const measuredReadCostUsd = measured.projectUsage * POST_READ_USD;
+      const allocatedNonReadCostUsd = Math.max(0, allocated.costUsd - allocated.postReadUnits * POST_READ_USD);
+      // Allocated is an upper bound: >= measured, because allocated counts every
+      // read while X dedups repeats within a UTC day. If measured EXCEEDS allocated,
+      // our best-effort metering missed successful X calls — an attribution gap.
+      // Surface it explicitly (AC3: attribution is never silently dropped) instead
+      // of letting the dedup clamp swallow the negative and read as "0 deduped".
+      const attributionGapUnits = Math.max(0, measured.projectUsage - allocated.postReadUnits);
+      if (attributionGapUnits > 0) {
+        console.warn(
+          `[adminUsage] x-reconciliation: measured reads (${measured.projectUsage}) exceed allocated (${allocated.postReadUnits}) by ${attributionGapUnits} — X metering attribution gap (missed instrumentation).`
+        );
+      }
+      return res.json({
+        cycle,
+        measured,
+        allocated,
+        reconciliation: {
+          allocatedPostReadUnits: allocated.postReadUnits,
+          measuredPostReadUnits: measured.projectUsage,
+          // >= 0 — allocated over-counts reads X deduped within a UTC day.
+          dedupSavingsUnits: Math.max(0, allocated.postReadUnits - measured.projectUsage),
+          // >= 0 — nonzero means we under-recorded (measured > allocated), i.e. an
+          // internal attribution gap operators should see, not hidden by the clamp.
+          attributionGapUnits,
+          capUsedPct: measured.projectCap > 0 ? (measured.projectUsage / measured.projectCap) * 100 : null,
+          measuredDerivedCostUsd: measuredReadCostUsd + allocatedNonReadCostUsd,
+        },
+      });
+    } catch (error) {
+      console.error("[adminUsage] x-reconciliation: allocated totals failed:", error);
+      return res.status(500).json({
+        message: "Failed to compute X reconciliation",
         error: error instanceof Error ? error.message : "Unknown error",
       });
     }

@@ -172,7 +172,7 @@ export function isCompleteHtmlDocument(draft: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
-import { twitterService } from './twitterService';
+import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
 import * as linkedInAdsService from './linkedInAdsService';
@@ -14703,20 +14703,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       switch (action) {
         case 'LIST': {
-          // List all pixels, then list datasets for each pixel
+          // Meta unified pixels and datasets in Graph v25 — a pixel IS its own dataset, and the
+          // per-pixel `/<pixel_id>/datasets` edge was removed. Querying it returns
+          // `(#100) Tried accessing nonexisting field (datasets)`, and because metaService's
+          // error handler rethrows, that one dead edge failed the entire LIST — making pixel
+          // discovery impossible in-product (ENG-399). The pixel id is the dataset id that
+          // GET_MATCH_QUALITY consumes, so derive it directly and issue no per-pixel call at all.
+          // Same conclusion the lander pixel resolver already reached (metaService.ts).
           const pixels = await metaService.listPixels(accountId, accessToken);
-          const results: any[] = [];
-          for (const pixel of pixels) {
-            const datasets = await metaService.listDatasets(pixel.id, accessToken);
-            results.push({
-              pixel_id: pixel.id,
-              pixel_name: pixel.name,
-              datasets: datasets
-            });
-          }
+          const results = pixels.map((pixel: any) => ({
+            pixel_id: pixel.id,
+            pixel_name: pixel.name,
+            last_fired_time: pixel.last_fired_time,
+            dataset_id: pixel.id,
+            datasets: [{ id: pixel.id, name: pixel.name }]
+          }));
           return {
             success: true,
-            message: `Found ${pixels.length} pixel(s) with ${results.reduce((sum: number, p: any) => sum + (p.datasets?.length || 0), 0)} dataset(s)`,
+            message: `Found ${pixels.length} pixel(s); each pixel id doubles as its dataset id for GET_MATCH_QUALITY`,
             pixels: results
           };
         }
@@ -28224,7 +28228,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * written back to the owner's record. When list_id/lead_id/lead_email are
    * supplied, sent tweets and DMs are logged to AW-EmailEvents for CRM parity.
    */
+  // Public entry: bind the acting user into the X metering context so every X
+  // call this dispatch makes attributes the shadow ledger to the ACTING user and
+  // bills the account owner (ENG-664 Option B, matching the LLM rail).
   async twitterManagePost(userId: string, args: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args));
+  }
+
+  private async _twitterManagePostImpl(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
@@ -28395,7 +28406,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  // Public entry: bind the acting user into the X metering context (see twitterManagePost).
   async twitterOutreach(userId: string, args: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterOutreachImpl(userId, args));
+  }
+
+  private async _twitterOutreachImpl(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, handle, recipient_handle, query, max_results, tweet_id, x_list_id, list_name, list_id, lead_id, lead_email } = args;
