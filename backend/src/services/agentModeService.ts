@@ -28934,6 +28934,32 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
               }
             }
 
+            // ENG-787: mirror the invite into the CRM lead list so the invitee is
+            // attributed (created if absent, marked 'contacted', logged with a
+            // linkedin.invite.sent engagement). Requires a target list_id — the
+            // outreach caller passes the list it is working from. Best-effort: a CRM
+            // write must never fail an invite Unipile already accepted, and a raw
+            // provider_id send (no profile URL) has no key to reconcile on.
+            if (args.list_id && isUrl && profile_url) {
+              try {
+                const { mirrorLinkedInInviteToCrm } = await import('./linkedInInviteCrmMirror');
+                await mirrorLinkedInInviteToCrm({
+                  userId,
+                  listId: args.list_id,
+                  linkedinUrl: profile_url,
+                  leadId: args.lead_id,
+                  firstName: args.first_name,
+                  lastName: args.last_name,
+                  company: args.company,
+                  title: args.title,
+                  note: message ?? undefined,
+                  accountId: account_id,
+                });
+              } catch (mirrorErr) {
+                console.warn('[AgentMode] send-invite: failed to mirror invite to CRM (non-fatal):', mirrorErr);
+              }
+            }
+
             return { success: true, data: inviteResult };
           } catch (inviteErr: any) {
             if (inviteErr?.noteQuotaExceeded) {

@@ -4552,7 +4552,30 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     const noteDropped = !!(inviteResult && (inviteResult as any).note_dropped);
 
     const sentAt = new Date().toISOString();
-    await crmDb.updateLead(listId, leadId, { linkedInInviteSentAt: sentAt });
+    // ENG-787: mirror the invite back into the CRM as a lead-level record — mark the
+    // lead 'contacted', stamp linkedInInviteSentAt, and log a linkedin.invite.sent
+    // engagement so contact volume is attributed and follow-up cadence can fire.
+    // Best-effort: a CRM write must never fail an invite Unipile already accepted.
+    try {
+      const { mirrorLinkedInInviteToCrm } = await import('../services/linkedInInviteCrmMirror');
+      await mirrorLinkedInInviteToCrm({
+        userId,
+        listId,
+        leadId,
+        linkedinUrl: leadLinkedIn,
+        firstName: lead.firstName as string | undefined,
+        lastName: lead.lastName as string | undefined,
+        company: lead.company as string | undefined,
+        title: lead.title as string | undefined,
+        note: noteDropped ? undefined : note,
+        accountId,
+        sentAt,
+      });
+    } catch (mirrorErr) {
+      console.warn('Failed to mirror LinkedIn invite to CRM (non-fatal):', mirrorErr);
+      // Fall back to at least stamping the timestamp so the UI still shows "invite sent".
+      await crmDb.updateLead(listId, leadId, { linkedInInviteSentAt: sentAt }).catch(() => {});
+    }
 
     // Record the pending invitation in the cache immediately so the UI shows
     // "Invitation pending" and suppresses re-inviting without waiting for the
