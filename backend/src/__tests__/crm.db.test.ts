@@ -1915,8 +1915,9 @@ describe('CRM Database Service', () => {
         FilterExpression: 'listId = :listId',
         ExpressionAttributeValues: { ':linkedin': URL, ':listId': LIST },
       }));
-      // No Limit — a cap is exactly what hid the match before.
-      expect(mockDocumentClientMethods.query.mock.calls[0][0]).not.toHaveProperty('Limit');
+      // A per-page Limit bounds read units, but unlike the old fixed cap of 10 it
+      // does not bound the search — pagination below walks the rest of the partition.
+      expect(mockDocumentClientMethods.query.mock.calls[0][0]).toHaveProperty('Limit', 100);
     });
 
     it('pages past filtered-out matches instead of giving up on the first page', async () => {
@@ -1948,6 +1949,108 @@ describe('CRM Database Service', () => {
       });
       expect(await crmDb.findLeadByLinkedinInList(LIST, URL)).toBeNull();
       expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(20);
+    });
+  });
+  // ENG-787 hardening: addLeadEngagement used to read-modify-write the whole
+  // engagements array, so two concurrent appends both read the same base and the
+  // second silently dropped the first.
+  describe('addLeadEngagement', () => {
+    const LIST = 'list_1';
+    const LEAD = 'lead_1';
+    const ev = { eventType: 'linkedin.invite.sent', eventData: { linkedin: 'x' }, createdAt: '2026-07-31T00:00:00.000Z' };
+
+    it('appends server-side with list_append instead of rewriting the array', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { engagements: [ev] } }),
+      });
+
+      await crmDb.addLeadEngagement(LIST, LEAD, ev);
+
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toContain('list_append(if_not_exists(engagements, :empty), :new)');
+      expect(params.ExpressionAttributeValues[':new']).toHaveLength(1);
+      expect(params.ExpressionAttributeValues[':new'][0]).toEqual(expect.objectContaining({
+        eventType: 'linkedin.invite.sent',
+        eventId: expect.any(String),
+      }));
+      // No pre-read of the lead — existence is enforced by the condition instead.
+      expect(params.ConditionExpression).toBe('attribute_exists(leadId)');
+      expect(mockDocumentClientMethods.get).not.toHaveBeenCalled();
+    });
+
+    it('raises isEngaged for a matching event', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, { ...ev, eventType: 'email.replied' });
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toContain('isEngaged = :isEngaged');
+      expect(params.ExpressionAttributeValues[':isEngaged']).toBe(1);
+    });
+
+    it('never lowers isEngaged for a non-matching event', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev);
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.UpdateExpression).not.toContain('isEngaged');
+      expect(params.ExpressionAttributeValues).not.toHaveProperty(':isEngaged');
+    });
+
+    it('reports a missing lead when the condition fails', async () => {
+      const err: any = new Error('conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(err),
+      });
+      await expect(crmDb.addLeadEngagement(LIST, LEAD, ev)).rejects.toThrow('Lead not found');
+    });
+
+    it('warns when the engagements array approaches the item-size ceiling', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { engagements: new Array(500).fill(ev) } }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('approaching the DynamoDB item-size ceiling'));
+      warn.mockRestore();
+    });
+  });
+
+  // ENG-787 hardening: canonicalization must never discard a value it cannot
+  // canonicalize — normalizeLinkedInUrl returns '' for non-personal URLs.
+  describe('LinkedIn canonicalization preserves un-canonicalizable values', () => {
+    it('createLead keeps a company URL rather than dropping the field', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      mockDocumentClientMethods.get.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Item: null }) });
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Attributes: {} }) });
+
+      await crmDb.createLead('list_1', { linkedin: '  https://www.linkedin.com/company/acme  ' });
+
+      const item = mockDocumentClientMethods.put.mock.calls[0][0].Item;
+      expect(item.linkedin).toBe('https://www.linkedin.com/company/acme');
+    });
+
+    it('updateLead keeps a company URL rather than REMOVEing it', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Attributes: {} }) });
+
+      await crmDb.updateLead('list_1', 'lead_1', { linkedin: 'https://www.linkedin.com/company/acme' });
+
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toContain('linkedin = :linkedin');
+      expect(params.UpdateExpression).not.toMatch(/REMOVE[^A-Za-z]*linkedin/);
+      expect(params.ExpressionAttributeValues[':linkedin']).toBe('https://www.linkedin.com/company/acme');
+    });
+
+    it('updateLead still REMOVEs linkedin when the caller sends an empty value', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Attributes: {} }) });
+
+      await crmDb.updateLead('list_1', 'lead_1', { linkedin: '   ' });
+
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toMatch(/REMOVE/);
+      expect(params.ExpressionAttributeValues).not.toHaveProperty(':linkedin');
     });
   });
 });

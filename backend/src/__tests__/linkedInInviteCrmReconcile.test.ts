@@ -8,6 +8,7 @@ const findLeadByLinkedinInList = jest.fn();
 const createLead = jest.fn();
 const updateLead = jest.fn();
 const addLeadEngagement = jest.fn();
+const getLeadListsByUserId = jest.fn();
 const getAllSentInvitationsByAccount = jest.fn();
 const syncSentInvitationsForAccount = jest.fn();
 
@@ -18,6 +19,7 @@ jest.mock('../services/db', () => ({
     createLead: (...a: any[]) => createLead(...a),
     updateLead: (...a: any[]) => updateLead(...a),
     addLeadEngagement: (...a: any[]) => addLeadEngagement(...a),
+    getLeadListsByUserId: (...a: any[]) => getLeadListsByUserId(...a),
   },
 }));
 
@@ -29,7 +31,7 @@ jest.mock('../cron/linkedInConnectionSyncCron', () => ({
   syncSentInvitationsForAccount: (...a: any[]) => syncSentInvitationsForAccount(...a),
 }));
 
-import { reconcileSentInvitationsToCrm } from '../services/linkedInInviteCrmMirror';
+import { reconcileSentInvitationsToCrm, resolveListIdForAccount } from '../services/linkedInInviteCrmMirror';
 
 const ACCOUNT = 'tMgX8uZJTZWTG_mFY1aI2A';
 const LIST = 'list_1782945941846_b0ptvsguv';
@@ -58,16 +60,17 @@ describe('reconcileSentInvitationsToCrm', () => {
     getLeadById.mockResolvedValue(null);
     syncSentInvitationsForAccount.mockResolvedValue(0);
     getAllSentInvitationsByAccount.mockResolvedValue([]);
+    getLeadListsByUserId.mockResolvedValue([]);
   });
 
   // ---- FAIL / no-op guards ----
 
   it('returns zeros and touches nothing when accountId or listId is missing', async () => {
     expect(await reconcileSentInvitationsToCrm({ accountId: '', listId: LIST })).toEqual({
-      total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0,
+      total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0, matchedInOtherList: 0,
     });
     expect(await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: '' })).toEqual({
-      total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0,
+      total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0, matchedInOtherList: 0,
     });
     expect(getAllSentInvitationsByAccount).not.toHaveBeenCalled();
     expect(createLead).not.toHaveBeenCalled();
@@ -76,7 +79,7 @@ describe('reconcileSentInvitationsToCrm', () => {
   it('reports zeros when there are no pending invitations', async () => {
     getAllSentInvitationsByAccount.mockResolvedValue([]);
     const res = await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST });
-    expect(res).toEqual({ total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0 });
+    expect(res).toEqual({ total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0, matchedInOtherList: 0 });
   });
 
   it('does not abort the batch when one invite fails to mirror', async () => {
@@ -154,7 +157,7 @@ describe('reconcileSentInvitationsToCrm', () => {
       accountId: ACCOUNT, listId: LIST, refreshFromLive: false, dryRun: true,
     });
 
-    expect(res).toEqual({ total: 2, created: 1, updated: 1, skipped: 0, alreadyRecorded: 0 });
+    expect(res).toEqual({ total: 2, created: 1, updated: 1, skipped: 0, alreadyRecorded: 0, matchedInOtherList: 0 });
     // No writes whatsoever.
     expect(createLead).not.toHaveBeenCalled();
     expect(updateLead).not.toHaveBeenCalled();
@@ -179,7 +182,7 @@ describe('reconcileSentInvitationsToCrm', () => {
 
     const res = await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST, refreshFromLive: false });
 
-    expect(res).toEqual({ total: 1, created: 0, updated: 1, skipped: 0, alreadyRecorded: 1 });
+    expect(res).toEqual({ total: 1, created: 0, updated: 1, skipped: 0, alreadyRecorded: 1, matchedInOtherList: 0 });
     expect(addLeadEngagement).not.toHaveBeenCalled();
   });
 
@@ -189,5 +192,87 @@ describe('reconcileSentInvitationsToCrm', () => {
     const res = await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST });
     expect(res.total).toBe(1);
     expect(res.created).toBe(1);
+  });
+  it('attributes an invitee already tracked in another of the owner lists to that list', async () => {
+    // One LinkedIn account often drives outreach for several lists; a blind backfill
+    // into the supplied list would duplicate people the CRM already tracks elsewhere.
+    const OTHER = 'list_other';
+    getLeadListsByUserId.mockResolvedValue([{ listId: LIST }, { listId: OTHER }]);
+    getAllSentInvitationsByAccount.mockResolvedValue([invite('elsewhere', 'Else Where')]);
+    findLeadByLinkedinInList.mockImplementation(async (listId: string) =>
+      listId === OTHER ? { leadId: 'lead_elsewhere', listId: OTHER, status: 'new' } : null,
+    );
+
+    const res = await reconcileSentInvitationsToCrm({
+      accountId: ACCOUNT, listId: LIST, userId: 'user_1', refreshFromLive: false,
+    });
+
+    expect(res.created).toBe(0);
+    expect(res.updated).toBe(1);
+    expect(res.matchedInOtherList).toBe(1);
+    expect(createLead).not.toHaveBeenCalled();
+    expect(addLeadEngagement).toHaveBeenCalledWith(OTHER, 'lead_elsewhere', expect.anything());
+  });
+
+  it('reconciles into the target list only when searchOwnerLists is disabled', async () => {
+    getLeadListsByUserId.mockResolvedValue([{ listId: LIST }, { listId: 'list_other' }]);
+    getAllSentInvitationsByAccount.mockResolvedValue([invite('elsewhere', 'Else Where')]);
+    findLeadByLinkedinInList.mockResolvedValue(null);
+
+    await reconcileSentInvitationsToCrm({
+      accountId: ACCOUNT, listId: LIST, userId: 'user_1', refreshFromLive: false, searchOwnerLists: false,
+    });
+
+    expect(getLeadListsByUserId).not.toHaveBeenCalled();
+    expect(createLead).toHaveBeenCalledWith(LIST, expect.anything());
+  });
+
+  it('still reconciles when the owner list lookup fails', async () => {
+    getLeadListsByUserId.mockRejectedValue(new Error('dynamo down'));
+    getAllSentInvitationsByAccount.mockResolvedValue([invite('carol', 'Carol C.')]);
+    const res = await reconcileSentInvitationsToCrm({
+      accountId: ACCOUNT, listId: LIST, userId: 'user_1', refreshFromLive: false,
+    });
+    expect(res.created).toBe(1);
+  });
+});
+
+describe('resolveListIdForAccount', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    getLeadListsByUserId.mockResolvedValue([]);
+  });
+
+  it('returns null without a userId or accountId', async () => {
+    expect(await resolveListIdForAccount('', 'acct')).toBeNull();
+    expect(await resolveListIdForAccount('user_1', '')).toBeNull();
+    expect(getLeadListsByUserId).not.toHaveBeenCalled();
+  });
+
+  it('returns null when no list is bound to the account', async () => {
+    getLeadListsByUserId.mockResolvedValue([{ listId: 'a' }, { listId: 'b', linkedInAccountId: 'other' }]);
+    expect(await resolveListIdForAccount('user_1', ACCOUNT)).toBeNull();
+  });
+
+  it('returns null when several lists are bound — guessing would mis-attribute', async () => {
+    getLeadListsByUserId.mockResolvedValue([
+      { listId: 'a', linkedInAccountId: ACCOUNT },
+      { listId: 'b', linkedInAccountId: ACCOUNT },
+    ]);
+    expect(await resolveListIdForAccount('user_1', ACCOUNT)).toBeNull();
+  });
+
+  it('returns null when the lookup fails rather than throwing into the send path', async () => {
+    getLeadListsByUserId.mockRejectedValue(new Error('dynamo down'));
+    expect(await resolveListIdForAccount('user_1', ACCOUNT)).toBeNull();
+  });
+
+  it('resolves the single list bound to the account', async () => {
+    getLeadListsByUserId.mockResolvedValue([
+      { listId: 'unbound' },
+      { listId: 'bound', linkedInAccountId: ACCOUNT },
+      { listId: 'other', linkedInAccountId: 'acct_2' },
+    ]);
+    expect(await resolveListIdForAccount('user_1', ACCOUNT)).toBe('bound');
   });
 });

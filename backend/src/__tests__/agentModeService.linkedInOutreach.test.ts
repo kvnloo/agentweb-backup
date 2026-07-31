@@ -79,9 +79,11 @@ jest.mock('../services/db', () => ({
 
 // Mock the CRM invite mirror (ENG-787) so we can assert whether the send-invite
 // path reconciles the invitee — gated on the list-access check below.
-const mockMirrorLinkedInInviteToCrm = jest.fn().mockResolvedValue({ leadId: 'lead_x', created: true });
+const mockMirrorLinkedInInviteToCrm = jest.fn().mockResolvedValue({ leadId: 'lead_x', listId: 'list_owned', created: true, engagementLogged: true });
+const mockResolveListIdForAccount = jest.fn().mockResolvedValue(null);
 jest.mock('../services/linkedInInviteCrmMirror', () => ({
   mirrorLinkedInInviteToCrm: (...args: any[]) => mockMirrorLinkedInInviteToCrm(...args),
+  resolveListIdForAccount: (...args: any[]) => mockResolveListIdForAccount(...args),
 }));
 
 // Mock unipileSentInvitationsDb (ENG-182 pre-invite dedup cache). The pre-check
@@ -1250,6 +1252,43 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
         expect.objectContaining({ sentAt: cached.sentAt }),
       );
+    });
+
+    it('never fails the invite when the CRM mirror path throws', async () => {
+      // The mirror is best-effort attribution running AFTER Unipile accepted the
+      // invite — anything it throws must stay contained, or a CRM hiccup surfaces
+      // to the user as a failed invite that actually went out.
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+      mockCanOrgMemberAccessList.mockResolvedValue(true);
+      mockMirrorLinkedInInviteToCrm.mockRejectedValueOnce(new Error('dynamo down'));
+
+      const result = await service.linkedinOutreach('user-1', mirrorArgs);
+
+      expect(result.success).toBe(true);
+    });
+
+    it('falls back to the list bound to the sending account when the model omits list_id', async () => {
+      const { list_id, ...withoutListId } = mirrorArgs as any;
+      mockResolveListIdForAccount.mockResolvedValue('list_bound');
+      mockGetLeadListById.mockResolvedValue({ id: 'list_bound', userId: 'user-1' });
+      mockCanOrgMemberAccessList.mockResolvedValue(true);
+
+      await service.linkedinOutreach('user-1', withoutListId);
+
+      expect(mockResolveListIdForAccount).toHaveBeenCalledWith('user-1', 'test-account-id');
+      expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+        expect.objectContaining({ listId: 'list_bound' }),
+      );
+    });
+
+    it('skips the mirror when neither list_id nor an account-bound list resolves', async () => {
+      const { list_id, ...withoutListId } = mirrorArgs as any;
+      mockResolveListIdForAccount.mockResolvedValue(null);
+
+      const result = await service.linkedinOutreach('user-1', withoutListId);
+
+      expect(result.success).toBe(true);
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
     });
 
     it('skips the mirror (no cross-tenant write) when the list is foreign / inaccessible', async () => {
