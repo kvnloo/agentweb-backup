@@ -98,6 +98,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST
       spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_new_1', name: 'RankAI Warm List' } } as any); // CREATE
       spy.mockResolvedValueOnce({ success: true, message: 'uploaded' } as any); // UPLOAD_USERS
+      (axios.get as jest.Mock).mockResolvedValueOnce({ data: 'test@example.com,1234567890' });
 
       const result = await callResolveOrCreateSeedAudience(
         USER_ID, ACCOUNT_ID, 'RankAI Warm List',
@@ -111,15 +112,33 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         subtype: 'CUSTOM',
         confirm: true,
       }));
+      // CSV is fetched/parsed exactly once (here) and that same parsed array
+      // is what gets uploaded — not the raw URL — so the stale-member hash
+      // diff and the actual upload can never see two different snapshots of
+      // the same URL's content.
       expect(spy).toHaveBeenNthCalledWith(3, USER_ID, 'UPLOAD_USERS', ACCOUNT_ID, expect.objectContaining({
         id: 'aud_new_1',
         schema: ['EMAIL', 'PHONE'],
-        payload: 'https://s3.example.com/audience.csv',
+        payload: [['test@example.com', '1234567890']],
         confirm: true,
       }));
       expect(result.created).toBe(true);
       expect(result.audience).toEqual({ id: 'aud_new_1', name: 'RankAI Warm List' });
       expect(result.failures).toEqual([]);
+    });
+
+    it('fails fast (does not attempt CREATE/UPLOAD_USERS) when the CSV fetch itself fails', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST
+      (axios.get as jest.Mock).mockRejectedValueOnce(new Error('getaddrinfo ENOTFOUND'));
+
+      await expect(callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'RankAI Warm List',
+        { type: 'csv', csvUrl: 'https://s3.example.com/audience.csv' },
+        { dryRun: false }
+      )).rejects.toThrow('ENOTFOUND');
+
+      expect(spy).toHaveBeenCalledTimes(1);
     });
 
     it('reuses an existing audience by id and still refreshes it with fresh source data', async () => {

@@ -17068,13 +17068,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
-   * Fetches and parses a CSV URL into raw rows, purely for the stale-member
-   * hash diff in resolveOrCreateSeedAudience — kept separate from the fetch
-   * inside UPLOAD_USERS (manageMetaCustomAudiences) so a failure here can be
-   * treated as "skip stale-member removal this run" without blocking the
-   * (separately-validated) real upload.
+   * Fetches and parses a CSV URL into raw rows for resolveOrCreateSeedAudience's
+   * CSV source path. Fetched exactly once and reused as both the upload
+   * payload and the basis for the stale-member hash diff — fetching twice
+   * (e.g. once to diff, once inside UPLOAD_USERS) would let the two see
+   * different content if the URL's data changed in between, corrupting the
+   * diff against what was actually uploaded.
    */
-  private async fetchAndParseCsvRowsForDiff(csvUrl: string): Promise<string[][]> {
+  private async fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
     const response = await axios.get(csvUrl);
     if (Array.isArray(response.data)) {
       return response.data;
@@ -17139,7 +17140,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     const failures: string[] = [];
     let schema: string[] = AgentModeService.AUDIENCE_SOURCE_SCHEMA;
-    let payload: string[][] | string;
+    let payload: string[][];
     let recordsFound: number | undefined;
     let recordsUsable: number | undefined;
 
@@ -17170,8 +17171,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       recordsFound = totalFound;
       recordsUsable = rows.length;
     } else {
-      // CSV URL passed straight through — UPLOAD_USERS already fetches/parses it.
-      payload = source.csvUrl;
+      // Fetched/parsed once here (not left as a URL for UPLOAD_USERS to fetch
+      // separately) — a second independent fetch would let the stale-member
+      // diff and the actual upload see two different snapshots of the same
+      // URL if its content changed in between, corrupting the diff. One fetch
+      // is also the source of truth for both the hash diff and the upload.
+      payload = await this.fetchAndParseCsvRows(source.csvUrl);
     }
 
     let audienceId: string;
@@ -17200,44 +17205,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // rows against the last-synced snapshot and remove anything stale before
     // uploading the new set. Only meaningful on reuse — a brand-new audience
     // has no prior snapshot to diff against.
-    let currentRows: string[][] | null = null;
-    if (source.type === 'hubspot_list') {
-      currentRows = payload as string[][];
-    } else {
+    const hashedRows = this.hashAudienceRows(schema, payload);
+    const newRowKeys = hashedRows.map((row) => this.audienceRowKey(row));
+
+    if (plannedAction === 'reuse') {
       try {
-        currentRows = await this.fetchAndParseCsvRowsForDiff(source.csvUrl);
-      } catch (e: any) {
-        failures.push(`Could not fetch CSV for stale-member comparison (${e.message}); skipping stale-member removal this run.`);
-      }
-    }
-
-    let newRowKeys: string[] | null = null;
-    if (currentRows) {
-      const hashedRows = this.hashAudienceRows(schema, currentRows);
-      newRowKeys = hashedRows.map((row) => this.audienceRowKey(row));
-
-      if (plannedAction === 'reuse') {
-        try {
-          const previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
-          if (previousRowKeys) {
-            const currentKeySet = new Set(newRowKeys);
-            const staleRowKeys = previousRowKeys.filter((k) => !currentKeySet.has(k));
-            if (staleRowKeys.length > 0) {
-              const staleRows = staleRowKeys.map((k) => k.split('|'));
-              const deleteResult = await this.manageMetaCustomAudiences(userId, 'DELETE_USERS', accountId, {
-                id: audienceId,
-                schema,
-                payload: staleRows,
-                confirm: true,
-              });
-              if (!deleteResult.success) {
-                failures.push(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
-              }
+        const previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
+        if (previousRowKeys) {
+          const currentKeySet = new Set(newRowKeys);
+          const staleRowKeys = previousRowKeys.filter((k) => !currentKeySet.has(k));
+          if (staleRowKeys.length > 0) {
+            const staleRows = staleRowKeys.map((k) => k.split('|'));
+            const deleteResult = await this.manageMetaCustomAudiences(userId, 'DELETE_USERS', accountId, {
+              id: audienceId,
+              schema,
+              payload: staleRows,
+              confirm: true,
+            });
+            if (!deleteResult.success) {
+              failures.push(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
             }
           }
-        } catch (e: any) {
-          failures.push(`Could not check for stale members on audience ${audienceId}: ${e.message}`);
         }
+      } catch (e: any) {
+        failures.push(`Could not check for stale members on audience ${audienceId}: ${e.message}`);
       }
     }
 
@@ -17251,12 +17242,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       throw new Error(uploadResult.message || 'Failed to upload users to Meta custom audience.');
     }
 
-    if (newRowKeys) {
-      try {
-        await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
-      } catch (e: any) {
-        failures.push(`Uploaded successfully, but failed to save the membership snapshot for future stale-member sync: ${e.message}`);
-      }
+    try {
+      await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
+    } catch (e: any) {
+      failures.push(`Uploaded successfully, but failed to save the membership snapshot for future stale-member sync: ${e.message}`);
     }
 
     return {
