@@ -18,7 +18,15 @@ jest.mock('../services/unipileConnectionsDb', () => ({
 }));
 
 jest.mock('../services/linkedInOutreachService', () => ({
-  linkedInOutreachService: { resolveAccountId: jest.fn() },
+  linkedInOutreachService: {
+    resolveAccountId: jest.fn(),
+    // linkedinOutreach preflights the Unipile session before every action (ENG-281).
+    // These tests exercise the connection overlay on a live account, so the probe
+    // reports connected; the disconnected path is covered in
+    // agentModeService.linkedInOutreach.test.ts.
+    isAccountConnected: jest.fn().mockResolvedValue(true),
+    clearStatusCache: jest.fn(),
+  },
 }));
 
 // Minimal stubs for transitive dependencies pulled in by agentModeService
