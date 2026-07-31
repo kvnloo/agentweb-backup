@@ -42,10 +42,12 @@ export function dedupeTargets(targets: SkillHardeningTarget[]): SkillHardeningTa
     if (!cur) {
       byId.set(t.skillId, {
         skillId: t.skillId,
+        setPrompt: t.setPrompt,
         blocks: [...(t.blocks || [])],
         addTools: [...(t.addTools || [])],
       });
     } else {
+      if (t.setPrompt && !cur.setPrompt) cur.setPrompt = t.setPrompt;
       cur.blocks = [...new Set([...(cur.blocks || []), ...(t.blocks || [])])];
       cur.addTools = [...new Set([...(cur.addTools || []), ...(t.addTools || [])])];
     }
@@ -82,6 +84,7 @@ async function main(): Promise<void> {
       continue;
     }
     console.log(`${apply ? "→" : "·"} ${target.skillId} ${skill.name}`);
+    if (plan.promptSet) console.log(`    + prompt: set min-prompt (${target.setPrompt})`);
     if (plan.appended.length) console.log(`    + blocks: ${plan.appended.join(", ")}`);
     if (plan.addedTools.length) console.log(`    + tools:  ${plan.addedTools.join(", ")}`);
 
