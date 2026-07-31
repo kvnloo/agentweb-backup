@@ -63,7 +63,7 @@ jest.mock('../services/db', () => ({
     getScheduleById: jest.fn(),
     getSchedulesReadyToRun: jest.fn(),
     updateScheduleAfterRun: jest.fn(),
-    setRunInFlight: jest.fn().mockResolvedValue(undefined),
+    setRunInFlight: jest.fn().mockResolvedValue('acquired'),
     attachSessionToRunInFlight: jest.fn().mockResolvedValue(true),
     heartbeatRunInFlight: jest.fn().mockResolvedValue(undefined),
     clearRunInFlight: jest.fn().mockResolvedValue(true),
@@ -505,6 +505,23 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await runScheduledChat(baseSchedule, mockUserId, true);
       expect(mockScheduleDb.setRunInFlight).not.toHaveBeenCalled();
       expect(mockScheduleDb.clearRunInFlight).not.toHaveBeenCalled();
+    });
+
+    it('bails out entirely — no session, no clear — when another dispatcher already holds the lease (ENG-657/Greptile)', async () => {
+      // A real cross-instance race: two dispatchers pick up the same due schedule.
+      // The loser must not touch anything — not create a session, not clear any
+      // lease in its `finally` (which would tear down the winner's real lease and
+      // make its still-running attempt invisible to the reconciler).
+      (mockScheduleDb.setRunInFlight as jest.Mock).mockResolvedValueOnce('already_in_flight');
+
+      const result = await runScheduledChat(baseSchedule, mockUserId, false);
+
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+      expect(mockScheduleDb.clearRunInFlight).not.toHaveBeenCalled();
+      expect(mockScheduleDb.attachSessionToRunInFlight).not.toHaveBeenCalled();
+      expect(result.sessionId).toBe('');
+      expect(result.status).toBe('success');
     });
 
     it('should require canonical you_search_web for You.com web search', async () => {

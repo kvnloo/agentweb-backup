@@ -2037,17 +2037,42 @@ export async function runScheduledChat(
     // annotation, but still requeues the run).
     if (!isTest) {
       try {
-        await scheduleDb.setRunInFlight(schedule.scheduleId, {
+        const leaseOutcome = await scheduleDb.setRunInFlight(schedule.scheduleId, {
           runId: leaseRunId,
           sessionId: '',
           startedAt: new Date().toISOString(),
           instanceId: SCHEDULED_RUN_INSTANCE_ID,
         });
-        leaseAcquired = true;
-        heartbeatTimer = setInterval(() => {
-          void scheduleDb.heartbeatRunInFlight(schedule.scheduleId, leaseRunId);
-        }, HEARTBEAT_INTERVAL_MS);
-        if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+        if (leaseOutcome === 'already_in_flight') {
+          // Another dispatcher already owns this schedule's run right now (a real
+          // cross-instance race, not hypothetical). Bail out completely — no session,
+          // no resume check, nothing — rather than proceed alongside it and risk
+          // clobbering its lease later via our own (conditional-on-our-runId) clear.
+          console.warn(`runScheduledChat: schedule ${schedule.scheduleId} already has an active in-flight run on another dispatcher; skipping this concurrent dispatch.`);
+          return {
+            scheduleId: schedule.scheduleId,
+            runId: leaseRunId,
+            status: 'success' as const,
+            passed: false,
+            actualResponse: 'Scheduled run skipped: this schedule is already being run by another dispatcher.',
+            actualFunctionCalls: [],
+            keywordMatches: [],
+            keywordMisses: schedule.keywords || [],
+            functionCallMatches: [],
+            functionCallMisses: schedule.requiredFunctionCalls || [],
+            executionTime: 0,
+            sessionId: '',
+            attempt: 0,
+            createdAt: new Date().toISOString(),
+          };
+        }
+        leaseAcquired = leaseOutcome === 'acquired';
+        if (leaseAcquired) {
+          heartbeatTimer = setInterval(() => {
+            void scheduleDb.heartbeatRunInFlight(schedule.scheduleId, leaseRunId);
+          }, HEARTBEAT_INTERVAL_MS);
+          if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+        }
       } catch (leaseError) {
         console.error(`Failed to set in-flight lease for schedule ${schedule.scheduleId}:`, leaseError);
       }

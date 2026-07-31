@@ -3216,21 +3216,34 @@ export const scheduleDb = {
   // session at messageCount=2 with no run result. These helpers stamp a lease on
   // dispatch, heartbeat it while the run is alive, and let a surviving instance
   // reconcile (requeue) any lease whose heartbeat has gone stale.
+  // ENG-657 (Greptile): conditional on no existing lease, so two dispatchers that
+  // both pick up the same due schedule (a genuine cross-instance race, not
+  // hypothetical — the whole reconciler exists because instances come and go
+  // under deploy) can't blindly clobber each other's runInFlight. The old
+  // unconditional SET let a second caller overwrite the first's lease, and later
+  // clear it out from under the still-running first attempt via its own
+  // conditional-on-runId clearRunInFlight — leaving the real run invisible to
+  // reconciliation. Returns which happened so the caller can bail out entirely
+  // (not touch anything) rather than proceed alongside an already-running attempt.
   async setRunInFlight(
     scheduleId: string,
     lease: { runId: string; sessionId: string; startedAt: string; instanceId: string }
-  ): Promise<void> {
+  ): Promise<'acquired' | 'already_in_flight' | 'unknown'> {
     try {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: { scheduleId },
         UpdateExpression: 'SET runInFlight = :lease',
+        ConditionExpression: 'attribute_not_exists(runInFlight)',
         ExpressionAttributeValues: {
           ':lease': { ...lease, heartbeatAt: lease.startedAt },
         },
       }).promise();
-    } catch (error) {
+      return 'acquired';
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return 'already_in_flight';
       handleDynamoDbError(error, 'setRunInFlight');
+      return 'unknown';
     }
   },
 
