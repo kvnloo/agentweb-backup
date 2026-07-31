@@ -38,76 +38,7 @@
  */
 
 import { crmDb } from '../services/db';
-import { normalizeLinkedInUrl } from '../services/enrichmentGroups';
-
-interface NormalizeResult {
-  /** Leads scanned. */
-  total: number;
-  /** Leads carrying a non-empty `linkedin` value. */
-  withLinkedin: number;
-  /** Already canonical — untouched. */
-  alreadyCanonical: number;
-  /** Rewritten to canonical form (or that would be, under --dry-run). */
-  normalized: number;
-  /** Not a personal /in/ profile — left untouched, needs a human. */
-  unsupported: number;
-  /** Canonical URLs that more than one lead in this list resolves to. */
-  collisions: number;
-}
-
-async function normalizeListLinkedinUrls(listId: string, dryRun: boolean): Promise<NormalizeResult> {
-  const result: NormalizeResult = {
-    total: 0, withLinkedin: 0, alreadyCanonical: 0, normalized: 0, unsupported: 0, collisions: 0,
-  };
-
-  // canonical URL -> leadIds that resolve to it, for duplicate detection.
-  const canonicalOwners = new Map<string, string[]>();
-
-  let lastKey: any = undefined;
-  do {
-    const page = await crmDb.getLeadsByListId(listId, 100, lastKey);
-    for (const lead of page.items as any[]) {
-      result.total++;
-      const raw = typeof lead.linkedin === 'string' ? lead.linkedin.trim() : '';
-      if (!raw) continue;
-      result.withLinkedin++;
-
-      const canonical = normalizeLinkedInUrl(raw);
-      if (!canonical) {
-        // Not a personal profile. updateLead would REMOVE the attribute — never
-        // silently drop customer data; surface it and move on.
-        result.unsupported++;
-        console.warn(`  [unsupported] ${lead.leadId}: ${JSON.stringify(raw)} — not a personal /in/ URL, left unchanged`);
-        continue;
-      }
-
-      const owners = canonicalOwners.get(canonical) ?? [];
-      owners.push(lead.leadId);
-      canonicalOwners.set(canonical, owners);
-
-      if (canonical === raw) {
-        result.alreadyCanonical++;
-        continue;
-      }
-
-      console.log(`  [normalize] ${lead.leadId}: ${raw} -> ${canonical}`);
-      if (!dryRun) {
-        await crmDb.updateLead(listId, lead.leadId, { linkedin: canonical });
-      }
-      result.normalized++;
-    }
-    lastKey = page.lastEvaluatedKey;
-  } while (lastKey);
-
-  for (const [canonical, owners] of canonicalOwners) {
-    if (owners.length > 1) {
-      result.collisions++;
-      console.warn(`  [duplicate] ${canonical} is held by ${owners.length} leads: ${owners.join(', ')} — merge manually`);
-    }
-  }
-
-  return result;
-}
+import { normalizeListLinkedinUrls } from '../services/leadLinkedinCanonicalizer';
 
 async function main() {
   const argv = process.argv.slice(2);
@@ -127,7 +58,7 @@ async function main() {
   console.log(`=== Normalize lead LinkedIn URLs ${dryRun ? '(DRY-RUN, no writes) ' : ''}===`);
   console.log(`list=${listId} name=${JSON.stringify((list as any).name ?? '')}`);
   const before = Date.now();
-  const result = await normalizeListLinkedinUrls(listId, dryRun);
+  const result = await normalizeListLinkedinUrls(listId, { dryRun });
   console.log(
     `Done in ${Math.round((Date.now() - before) / 1000)}s — ` +
       `total=${result.total} withLinkedin=${result.withLinkedin} ` +
@@ -135,7 +66,7 @@ async function main() {
       `unsupported=${result.unsupported} collisions=${result.collisions}`,
   );
   if (result.collisions > 0) {
-    console.warn(`⚠️  ${result.collisions} canonical URL(s) map to more than one lead — merge them before reconciling.`);
+    console.warn(`\u26a0\ufe0f  ${result.collisions} canonical URL(s) map to more than one lead — merge them before reconciling.`);
   }
 }
 
