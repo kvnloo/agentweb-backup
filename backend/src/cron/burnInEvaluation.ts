@@ -63,6 +63,8 @@ export const BURN_IN_DEFAULT_TOLERANCE = 0.02;
 export interface BurnInRates {
   date: string;
   windowLabel: string;
+  windowStart: string;
+  windowEnd: string;
   failedRunRate: number;
   degradedRunRate: number;
   runCount: number;
@@ -100,10 +102,18 @@ function toRates(s: ReliabilitySnapshot): BurnInRates {
   return {
     date: s.date,
     windowLabel: s.windowLabel,
+    windowStart: s.windowStart,
+    windowEnd: s.windowEnd,
     failedRunRate: s.failedRunRate,
     degradedRunRate: s.degradedRunRate,
     runCount: s.runCount,
   };
+}
+
+/** Epoch ms of a snapshot boundary, or NaN if the row is malformed. */
+function boundaryMs(iso: string | undefined): number {
+  if (typeof iso !== 'string') return NaN;
+  return new Date(iso).getTime();
 }
 
 function fmtPct(rate: number): string {
@@ -140,10 +150,14 @@ function insufficient(
  * Decide whether a release's burn-in window is clean, regressed, or simply not
  * evidenced yet.
  *
- * The baseline is the LATEST snapshot strictly before the release's UTC
- * calendar day; the post-release reading is the LATEST snapshot on or after it.
- * Using the nearest pre-release day (rather than the oldest available) keeps the
- * comparison against how the system actually behaved just before shipping.
+ * Both sides are chosen by the snapshot's real window boundaries, never by its
+ * date label. The baseline is the LATEST snapshot whose window CLOSED at or
+ * before `releaseAt`; the post-release reading is the LATEST snapshot whose
+ * window OPENED at or after it. A window straddling the release contains both
+ * pre- and post-release traffic and is used as neither side.
+ *
+ * Using the nearest pre-release window (rather than the oldest available) keeps
+ * the comparison against how the system actually behaved just before shipping.
  */
 export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
   const windowLabel = input.windowLabel ?? '24h';
@@ -159,7 +173,6 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
   }
   const releaseAtIso = input.releaseAt.toISOString();
   const ctx = { releaseAt: releaseAtIso, windowLabel, minRunCount, tolerance };
-  const releaseDate = releaseAtIso.slice(0, 10);
 
   const relevant = input.snapshots
     .filter((s) => s.windowLabel === windowLabel)
@@ -174,8 +187,22 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
     );
   }
 
-  const priorAll = relevant.filter((s) => s.date < releaseDate);
-  const afterAll = relevant.filter((s) => s.date >= releaseDate);
+  // Select on the snapshot's ACTUAL window, not its date label. A snapshot
+  // dated the release day spans hours either side of the release, so treating
+  // the whole row as post-release lets pre-release traffic dilute or inflate
+  // the measured rates — a false clean or a false regression. A window is
+  // usable as evidence only when it lies wholly on one side of the release;
+  // anything straddling it is contaminated and is used as neither. The cost is
+  // that check 4 needs one full window after the release, which is what
+  // "burned in" is supposed to mean.
+  const priorAll = relevant.filter((s) => {
+    const end = boundaryMs(s.windowEnd);
+    return Number.isFinite(end) && end <= releaseMs;
+  });
+  const afterAll = relevant.filter((s) => {
+    const start = boundaryMs(s.windowStart);
+    return Number.isFinite(start) && start >= releaseMs;
+  });
 
   // Baseline: nearest qualifying day before the release.
   const baselineSnap = [...priorAll].reverse().find((s) => s.runCount >= minRunCount);
@@ -183,9 +210,9 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
     const nearest = priorAll.length > 0 ? toRates(priorAll[priorAll.length - 1]) : null;
     return insufficient(
       priorAll.length === 0
-        ? `Cannot evaluate burn-in: no pre-release baseline snapshot exists before ${releaseDate}, ` +
-            'so "no worse than the pre-release snapshot" has nothing to compare against.'
-        : `Cannot evaluate burn-in: every pre-release baseline snapshot before ${releaseDate} recorded ` +
+        ? `Cannot evaluate burn-in: no pre-release baseline window closes at or before ${releaseAtIso}, ` +
+            'so "no worse than the pre-release snapshot" has nothing uncontaminated to compare against.'
+        : `Cannot evaluate burn-in: every pre-release snapshot window closing before ${releaseAtIso} recorded ` +
             `fewer than ${minRunCount} runs, so its rates are not evidence of anything.`,
       { ...ctx, baseline: nearest },
     );
@@ -195,8 +222,9 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
   const latestAfter = afterAll.length > 0 ? toRates(afterAll[afterAll.length - 1]) : null;
   if (afterAll.length === 0) {
     return insufficient(
-      `Cannot evaluate burn-in: no snapshot has been recorded since the release (${releaseDate}). ` +
-        'The burn-in window has not produced a reading yet.',
+      `Cannot evaluate burn-in: no snapshot window begins at or after the release (${releaseAtIso}). ` +
+        'A window straddling the release mixes pre- and post-release traffic, so it is not burn-in ' +
+        'evidence; the first clean post-release window has not closed yet.',
       { ...ctx, baseline: toRates(baselineSnap) },
     );
   }

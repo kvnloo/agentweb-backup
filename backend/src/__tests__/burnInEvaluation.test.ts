@@ -232,14 +232,56 @@ describe('evaluateBurnIn — real comparison against the pre-release baseline (A
     expect(a.verdict).toBe('clean');
   });
 
-  it('treats a snapshot dated the release day as post-release, not baseline', () => {
+  // The release-day window straddles releaseAt (00:00 → 23:59 around a 12:00
+  // release), so it holds both pre- and post-release traffic. Counting it as
+  // post-release evidence lets pre-release traffic dilute or inflate the rates
+  // and produce a false clean or a false regression.
+  it('refuses a straddling release-day window as post-release evidence', () => {
     const a = evaluateBurnIn({
       snapshots: [snap('2026-07-19'), snap('2026-07-20')],
       releaseAt: RELEASE_AT,
     });
 
     expect(a.baseline?.date).toBe('2026-07-19');
-    expect(a.postRelease?.date).toBe('2026-07-20');
+    expect(a.postRelease).toBeNull();
+    expect(a.verdict).toBe('insufficient_data');
+    expect(a.passesClosureCheck4).toBe(false);
+  });
+
+  it('refuses a straddling window as the baseline either', () => {
+    // Only the release-day row exists before the first clean post-release day.
+    const a = evaluateBurnIn({
+      snapshots: [snap('2026-07-20'), snap('2026-07-21')],
+      releaseAt: RELEASE_AT,
+    });
+
+    expect(a.baseline).toBeNull();
+    expect(a.verdict).toBe('insufficient_data');
+    expect(a.passesClosureCheck4).toBe(false);
+  });
+
+  it('accepts the first window that opens after the release', () => {
+    const a = evaluateBurnIn({
+      snapshots: [snap('2026-07-19'), snap('2026-07-20'), snap('2026-07-21')],
+      releaseAt: RELEASE_AT,
+    });
+
+    expect(a.baseline?.date).toBe('2026-07-19');
+    expect(a.postRelease?.date).toBe('2026-07-21');
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+  });
+
+  it('reports the window boundaries it selected, so the choice is auditable', () => {
+    const a = evaluateBurnIn({
+      snapshots: [snap('2026-07-19'), snap('2026-07-21')],
+      releaseAt: RELEASE_AT,
+    });
+
+    expect(new Date(a.baseline!.windowEnd).getTime()).toBeLessThanOrEqual(RELEASE_AT.getTime());
+    expect(new Date(a.postRelease!.windowStart).getTime()).toBeGreaterThanOrEqual(
+      RELEASE_AT.getTime(),
+    );
   });
 
   it('is order-independent (input need not be sorted)', () => {
