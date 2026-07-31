@@ -121,7 +121,7 @@ describe('crmDb.createLead — userId + nameCompanyKey', () => {
     expect(lastPutItem().userId).toBe('user-explicit');
   });
 
-  it('keeps linkedin sparse: writes only when non-empty after trim', async () => {
+  it('keeps linkedin sparse and canonical: writes only a normalized non-empty value', async () => {
     getPromiseMock
       .mockResolvedValueOnce({ Item: { listId: 'list-1', userId: 'user-1' } })
       .mockResolvedValue({ Item: null });
@@ -140,6 +140,8 @@ describe('crmDb.createLead — userId + nameCompanyKey', () => {
       company: 'Acme',
       linkedin: 'https://linkedin.com/in/jane',
     });
-    expect(lastPutItem().linkedin).toBe('https://linkedin.com/in/jane');
+    // ENG-787: createLead now canonicalizes via normalizeLinkedInUrl (scheme + www)
+    // so the LinkedinLookupIndex GSI stays canonical and dedup reads match.
+    expect(lastPutItem().linkedin).toBe('https://www.linkedin.com/in/jane');
   });
 });
