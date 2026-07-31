@@ -50,6 +50,13 @@ export interface GeminiRequestOptions {
  * whole request the moment tools are attached — this broke 100% of real
  * gemini-3.5-flash tool-calling turns in prod (never caught by unit tests,
  * whose fixture schemas didn't happen to use an x-* keyword).
+ *
+ * Also drops `oneOf`/`allOf`/`const` — confirmed absent from the `@google/genai`
+ * `Schema` type (only `anyOf` is supported), same class of bug as `x-aliases`.
+ * Bedrock already needed an equivalent sanitizer (sanitizeSchemaForBedrock in
+ * agentModeService.ts) for these exact keywords, because dynamically-discovered
+ * MCP tool schemas (GitHub, etc. — arbitrary, not authored in this repo) can
+ * carry them even though no hand-written tool here currently does.
  */
 export function sanitizeGeminiSchema(schema: any): any {
   if (Array.isArray(schema)) return schema.map(sanitizeGeminiSchema);
@@ -57,6 +64,7 @@ export function sanitizeGeminiSchema(schema: any): any {
   const DROP = new Set([
     '$schema', '$id', '$ref', '$defs', 'definitions',
     'additionalProperties', 'unevaluatedProperties', 'patternProperties',
+    'oneOf', 'allOf', 'const',
   ]);
   const out: any = {};
   for (const [key, value] of Object.entries(schema)) {
@@ -282,7 +290,21 @@ export function fromGeminiResponse(resp: any): any {
   else if (hasToolCalls) finishReason = 'tool_calls';
   else finishReason = 'stop';
 
-  const message: any = { role: 'assistant', content: textParts.join('') || null };
+  const hasText = textParts.length > 0;
+  let content: string | null = textParts.join('') || null;
+  if (!hasText && !hasToolCalls && !isContinuation) {
+    // Gemini ended the turn with nothing to show: an explicit block
+    // (SAFETY/RECITATION/PROHIBITED_CONTENT/etc. on candidate.finishReason) or a
+    // prompt-level block (candidates can be empty entirely; see
+    // resp.promptFeedback.blockReason). Left as null this reports
+    // finish_reason='stop' with no content — ending the whole agent turn on a
+    // silent blank reply (the ENG-324/473/657 class). The loop's own backfill
+    // only covers the reasoning-leak suppression path, not this, so it must be
+    // handled here.
+    const blockReason = resp?.promptFeedback?.blockReason || geminiFinish || 'unknown';
+    content = `I wasn't able to generate a response for this turn (Gemini: ${blockReason}). Please try rephrasing your request.`;
+  }
+  const message: any = { role: 'assistant', content };
   if (hasToolCalls && !truncatedToolCall) message.tool_calls = toolCalls;
 
   const usage = resp?.usageMetadata || {};

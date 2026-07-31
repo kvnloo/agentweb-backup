@@ -353,11 +353,20 @@ describe('fromGeminiResponse', () => {
     expect(out.choices[0].message.tool_calls).toBeUndefined();
   });
 
-  it('returns null content (not empty tool_calls) on an empty/safety candidate', () => {
+  it('backfills a neutral message (not a silent blank) on a SAFETY-blocked candidate', () => {
+    // A null/empty content here would report finish_reason='stop' with nothing
+    // to show — ending the whole agent turn on a silent blank reply (ENG-324/473/657).
     const resp = { candidates: [{ finishReason: 'SAFETY', content: { parts: [] } }] };
     const out = fromGeminiResponse(resp);
-    expect(out.choices[0].message.content).toBeNull();
+    expect(out.choices[0].message.content).toEqual(expect.stringContaining('SAFETY'));
     expect(out.choices[0].message).not.toHaveProperty('tool_calls');
+    expect(out.choices[0].finish_reason).toBe('stop');
+  });
+
+  it('backfills a neutral message on a prompt-level block (no candidates at all)', () => {
+    const resp = { candidates: [], promptFeedback: { blockReason: 'PROHIBITED_CONTENT' } };
+    const out = fromGeminiResponse(resp);
+    expect(out.choices[0].message.content).toEqual(expect.stringContaining('PROHIBITED_CONTENT'));
     expect(out.choices[0].finish_reason).toBe('stop');
   });
 });
@@ -405,6 +414,23 @@ describe('sanitizeGeminiSchema', () => {
         s3_key: { type: 'string', description: 'The S3 key' },
       },
       required: ['s3_key'],
+    });
+  });
+
+  it('drops oneOf/allOf/const (absent from the genai Schema type, e.g. dynamic MCP tool schemas)', () => {
+    const input = {
+      type: 'object',
+      properties: {
+        mode: { oneOf: [{ const: 'fast' }, { const: 'slow' }] },
+        combined: { allOf: [{ type: 'string' }, { minLength: 1 }] },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        mode: {},
+        combined: {},
+      },
     });
   });
 });
