@@ -66,6 +66,12 @@ export interface CostAggregation {
   byModel: CostByModelRow[];
   byFeature: CostByFeatureRow[];
   topUsers: CostTopUser[];
+  /**
+   * Distinct users with spend over the FULL range — not just topUsers, which is
+   * capped server-side. Use this for the headline user count so it isn't
+   * truncated to the top-N. Optional for back-compat with older payloads.
+   */
+  userCount?: number;
   /** Per-X-account spend with @handle enrichment (ENG-664). */
   byXAccount?: CostByXAccountRow[];
 }
@@ -84,6 +90,8 @@ export interface XReconciliation {
     allocatedPostReadUnits: number;
     measuredPostReadUnits: number;
     dedupSavingsUnits: number;
+    /** >0 means measured reads exceeded allocated — an internal metering gap. */
+    attributionGapUnits?: number;
     capUsedPct: number | null;
     measuredDerivedCostUsd: number;
   };
@@ -413,6 +421,11 @@ const XReconciliationPanel: React.FC = () => {
           <Typography variant="caption" color="text.secondary" data-testid="x-recon-dedup">
             {r.dedupSavingsUnits.toLocaleString()} deduped by X
           </Typography>
+          {(r.attributionGapUnits ?? 0) > 0 && (
+            <Typography variant="caption" color="error.main" display="block" data-testid="x-recon-gap">
+              ⚠ {r.attributionGapUnits!.toLocaleString()} reads unattributed (measured &gt; allocated — metering gap)
+            </Typography>
+          )}
         </Grid>
         <Grid item xs={12} md={3}>
           <Typography variant="caption" color="text.secondary">
@@ -526,17 +539,13 @@ export default function UsageCostByUserTab() {
 
   const rows = useMemo(() => rankedUserRows(agg, provider), [agg, provider]);
   const xAccounts = useMemo(() => xAccountRows(agg), [agg]);
+  // Headline totals come from the server's COMPLETE aggregation (agg.totals),
+  // not a sum over `rows` — `rows` is the capped topUsers slice and would
+  // understate cost/calls once spenders exceed the server's topUsers limit.
+  // The tab requests provider=twitter, so agg.totals is already X-scoped.
   const filteredTotals = useMemo(
-    () =>
-      rows.reduce(
-        (acc, r) => {
-          acc.costUsd += r.costUsd;
-          acc.callCount += r.callCount;
-          return acc;
-        },
-        { costUsd: 0, callCount: 0 }
-      ),
-    [rows]
+    () => ({ costUsd: agg?.totals.costUsd ?? 0, callCount: agg?.totals.callCount ?? 0 }),
+    [agg]
   );
 
   return (
@@ -653,8 +662,8 @@ export default function UsageCostByUserTab() {
                 <Typography variant="caption" color="text.secondary">
                   Users with spend
                 </Typography>
-                <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }}>
-                  {rows.length.toLocaleString()}
+                <Typography variant="h6" sx={{ fontVariantNumeric: "tabular-nums" }} data-testid="users-with-spend">
+                  {(agg?.userCount ?? rows.length).toLocaleString()}
                 </Typography>
               </Paper>
             </Grid>

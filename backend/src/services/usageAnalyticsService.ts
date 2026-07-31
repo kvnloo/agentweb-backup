@@ -248,6 +248,12 @@ export interface CostAggregation {
   byFeature: CostByFeatureRow[];
   /** Sorted by spend, highest first, limited to topUsersLimit. */
   topUsers: CostTopUser[];
+  /**
+   * Distinct users with spend over the FULL filtered set — not the topUsers
+   * slice. Lets the UI show a true user count even when spenders exceed
+   * topUsersLimit (topUsers is capped, this is not).
+   */
+  userCount: number;
   /** Per-X-account spend with @handle enrichment, sorted by spend. */
   byXAccount: CostByXAccountRow[];
 }
@@ -451,7 +457,7 @@ export async function getCostAggregation(
   // the scoped lookup that avoids a full-table scan (there is no accountId GSI).
   const byXAccount = await buildXAccountBreakdown(items);
 
-  return { start, end, totals, byModel, series, byFeature, topUsers, byXAccount };
+  return { start, end, totals, byModel, series, byFeature, topUsers, userCount: userItems.size, byXAccount };
 }
 
 const X_FEATURE_PREFIX = "x-account:";
