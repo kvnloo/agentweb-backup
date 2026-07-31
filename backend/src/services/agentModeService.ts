@@ -27664,10 +27664,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     // was not. isAccountConnected is 10-minute cached and timeout-bounded, so a live
     // account pays at most one probe per account per 10 minutes, and a dead account
     // now costs nothing at all.
-    const sessionLive = await linkedInOutreachService.isAccountConnected(account_id);
-    if (!sessionLive) {
+    // Block ONLY on a proven-dead session. An indeterminate probe (timeout, 5xx,
+    // network) says nothing about session validity, and blocking on it would
+    // suppress a healthy account behind a false reconnect prompt for the probe's
+    // full 10-minute cache window — a worse failure than the late 401 this
+    // preflight exists to avoid. On 'unknown' we fall through to the real call and
+    // let the reactive 401 handler below stay the backstop, i.e. exactly today's
+    // behaviour.
+    const sessionState = await linkedInOutreachService.probeAccountSession(account_id);
+    if (sessionState === 'disconnected') {
       console.log(`[AgentMode] linkedinOutreach: account ${account_id} failed preflight — disconnected Unipile session`);
       return this.linkedInDisconnectedResponse();
+    }
+    if (sessionState === 'unknown') {
+      console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
     }
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
