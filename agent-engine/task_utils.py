@@ -378,6 +378,13 @@ def get_openai_llm(model_name: str):
         api_key = secrets_manager.get_openai_api_key()
         if not api_key:
             raise ValueError('OPENAI_API_KEY is not set')
+        # browser-use's own preflight check reads OPENAI_API_KEY directly
+        # from os.environ (browser_use/agent/views.py's REQUIRED_LLM_API_ENV_VARS),
+        # independent of the api_key passed to ChatOpenAI below. Without this,
+        # every openai->openai-> task fails with "The api_key client option
+        # must be set..." even though the secret itself is fine - found via
+        # ENG-389 live testing (2026-08-01).
+        os.environ['OPENAI_API_KEY'] = api_key
 
         return ChatOpenAI(
             model=model_name,
@@ -396,7 +403,9 @@ def get_openai_llm_think(model_name: str):
         api_key = secrets_manager.get_openai_api_key()
         if not api_key:
             raise ValueError('OPENAI_API_KEY is not set')
-            
+        # See get_openai_llm() above for why this is needed.
+        os.environ['OPENAI_API_KEY'] = api_key
+
         # For think model such as o3-mini, we disable vision: https://github.com/browser-use/browser-use/issues/283
         global_use_vision = False
         logger.warning(f"Vision is disabled for {model_name}. Execution details in gif will not be available.")
