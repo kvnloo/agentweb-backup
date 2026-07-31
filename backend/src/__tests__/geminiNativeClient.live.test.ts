@@ -114,4 +114,58 @@ describeLive('ENG-737 live native gemini adapter', () => {
     expect(r2.choices[0].finish_reason).toBe('stop');
     expect(r2.choices[0].message.content).toMatch(/58|rain/i);
   });
+
+  // NOTE: a live test attempting to force a real SAFETY-blocked candidate (max
+  // strictness on all 4 harm categories against a graphic prompt) was tried and
+  // removed — the real API still answered normally (finishReason=STOP, all
+  // safetyRatings NEGLIGIBLE) even at BLOCK_LOW_AND_ABOVE. Forcing a genuine block
+  // deterministically isn't practical without escalating prompt content, which
+  // isn't the right way to get this proof. The SAFETY/promptFeedback-block
+  // backfill is covered at the unit level (geminiNativeClient.test.ts) against
+  // Gemini's documented real finishReason/promptFeedback shapes instead.
+
+  it('round-trips a real tool call whose schema carries x-aliases/oneOf/const (no 400)', async () => {
+    // Proves sanitizeGeminiSchema's output is actually ACCEPTED by the real API,
+    // not just structurally plausible against the mocked unit tests. Mirrors the
+    // real prod shape (search_tool_response's x-aliases) plus the oneOf/const/allOf
+    // shape a dynamically-discovered MCP tool schema could carry.
+    const client = makeClient();
+    const res: any = await client.chat.completions.create({
+      model: MODEL,
+      messages: [
+        { role: 'user', content: 'Use the lookup_record tool to look up record "abc123" in mode "fast".' },
+      ],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'lookup_record',
+          description: 'Look up a record by id',
+          parameters: {
+            type: 'object',
+            properties: {
+              record_id: {
+                type: 'string',
+                'x-aliases': ['id', 'recordId', 'key'],
+                description: 'The record id',
+              },
+              mode: {
+                oneOf: [{ const: 'fast' }, { const: 'slow' }],
+                description: 'Lookup mode',
+              },
+            },
+            required: ['record_id'],
+          },
+        },
+      }],
+      tool_choice: 'auto',
+    });
+    // No ApiError thrown = the sanitized schema was accepted. Either a tool call
+    // or a direct answer is fine; the only failure mode this guards is a 400.
+    const choice = res.choices[0];
+    if (choice.message.tool_calls) {
+      expect(choice.message.tool_calls[0].function.name).toBe('lookup_record');
+    } else {
+      expect(typeof choice.message.content).toBe('string');
+    }
+  });
 });
