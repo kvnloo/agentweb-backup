@@ -25,6 +25,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     // reports connected; the disconnected path is covered in
     // agentModeService.linkedInOutreach.test.ts.
     isAccountConnected: jest.fn().mockResolvedValue(true),
+    probeAccountSession: jest.fn().mockResolvedValue('connected'),
     clearStatusCache: jest.fn(),
   },
 }));

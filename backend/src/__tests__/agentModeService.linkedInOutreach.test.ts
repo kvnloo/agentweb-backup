@@ -32,6 +32,7 @@ const mockSearchPeople = jest.fn();
 const mockResolveAccountId = jest.fn();
 const mockGetInviteCharLimitForAccount = jest.fn().mockResolvedValue(200);
 const mockIsAccountConnected = jest.fn().mockResolvedValue(true);
+const mockProbeAccountSession = jest.fn().mockResolvedValue('connected');
 const mockClearStatusCache = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
@@ -44,6 +45,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
     getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
     isAccountConnected: (...args: any[]) => mockIsAccountConnected(...args),
+    probeAccountSession: (...args: any[]) => mockProbeAccountSession(...args),
     clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
   },
 }));
@@ -103,6 +105,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     // implementations, so re-assert it here or a test that simulates a dead
     // session would leak that state into every test after it.
     mockIsAccountConnected.mockResolvedValue(true);
+    mockProbeAccountSession.mockResolvedValue('connected');
   });
 
   describe('send-message', () => {
@@ -657,7 +660,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
   // an explicit account_id, which is the normal path after list_connected_accounts.
   describe('ENG-281: disconnected-account preflight', () => {
     it('fails fast on a read action without calling Unipile at all', async () => {
-      mockIsAccountConnected.mockResolvedValue(false);
+      mockProbeAccountSession.mockResolvedValue('disconnected');
 
       const result = await service.linkedinOutreach('user-1', {
         action: 'search-people',
@@ -667,13 +670,13 @@ describe('AgentModeService - LinkedIn Outreach', () => {
 
       expect(result.success).toBe(false);
       expect(result.message).toBe('LinkedIn account disconnected');
-      expect(mockIsAccountConnected).toHaveBeenCalledWith('test-account-id');
+      expect(mockProbeAccountSession).toHaveBeenCalledWith('test-account-id');
       // The whole point: the doomed outbound call is never made.
       expect(mockSearchPeople).not.toHaveBeenCalled();
     });
 
     it('fails fast on a write action before any invite is attempted', async () => {
-      mockIsAccountConnected.mockResolvedValue(false);
+      mockProbeAccountSession.mockResolvedValue('disconnected');
 
       const result = await service.linkedinOutreach('user-1', {
         action: 'send-invite',
@@ -688,7 +691,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     });
 
     it('gives the same actionable reconnect guidance as the reactive path', async () => {
-      mockIsAccountConnected.mockResolvedValue(false);
+      mockProbeAccountSession.mockResolvedValue('disconnected');
 
       const result = await service.linkedinOutreach('user-1', {
         action: 'search-people',
@@ -702,8 +705,55 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.error).toContain('remove the connection');
     });
 
+    // Greptile P1 on 4b933aeec: the preflight originally blocked on
+    // `!isAccountConnected`, which is false for ANY probe failure — including a
+    // timeout or a 5xx that says nothing about session validity. Because the probe
+    // result is cached for 10 minutes, one blip would suppress a HEALTHY account
+    // behind a false "reconnect your LinkedIn" prompt for the whole window. That is
+    // a worse failure than the late 401 this preflight exists to remove, so an
+    // indeterminate probe must fall through to the real call.
+    it('does NOT block when the probe is indeterminate (transient failure, not a dead session)', async () => {
+      mockProbeAccountSession.mockResolvedValue('unknown');
+      mockSearchPeople.mockResolvedValue({ items: [] });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      // The real call happened; no disconnect response was substituted.
+      expect(mockSearchPeople).toHaveBeenCalled();
+      expect(result.message).not.toBe('LinkedIn account disconnected');
+    });
+
+    it('still surfaces a genuine 401 via the reactive handler when the preflight was indeterminate', async () => {
+      mockProbeAccountSession.mockResolvedValue('unknown');
+      const err = new Error('Disconnected account');
+      (err as any).structuredError = {
+        message: 'Disconnected account',
+        code: 'errors/disconnected_account',
+        status: 401,
+        classification: 'AUTH_ERROR',
+      };
+      mockSearchPeople.mockRejectedValue(err);
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'stealth founder',
+      });
+
+      // Proceeding on 'unknown' does not lose the disconnect signal — the reactive
+      // path remains the backstop and returns the identical guidance.
+      expect(mockSearchPeople).toHaveBeenCalled();
+      expect(result.message).toBe('LinkedIn account disconnected');
+      expect(result.error).toContain('disconnected from Unipile');
+    });
+
     it('does not interfere with a live account', async () => {
       mockIsAccountConnected.mockResolvedValue(true);
+      mockProbeAccountSession.mockResolvedValue('connected');
       mockSearchPeople.mockResolvedValue({ items: [] });
 
       const result = await service.linkedinOutreach('user-1', {
@@ -727,7 +777,7 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.success).toBe(false);
       expect(result.error).toContain('No LinkedIn account is connected');
       // No account id to probe — the probe must not run at all.
-      expect(mockIsAccountConnected).not.toHaveBeenCalled();
+      expect(mockProbeAccountSession).not.toHaveBeenCalled();
     });
   });
 
