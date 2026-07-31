@@ -17260,8 +17260,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // — the next sync would see no prior record of it and never retry the
     // removal, leaving it targetable in Meta permanently. Un-removed keys are
     // folded back into what gets saved so the next sync sees them as stale
-    // again and retries.
-    const unremovedStaleRowKeys: string[] = [];
+    // again and retries. Greptile follow-up: a failed removal must not just
+    // be tracked for next time — it means this launch would proceed against
+    // an audience known to still contain removed contacts, so it now blocks
+    // the whole launch (thrown), consistent with every other hard-failure
+    // step here (LIST/CREATE/UPLOAD_USERS/snapshot save).
     // Greptile finding: reusing an audience with NO prior snapshot (first
     // sync since stale-member sync shipped, or an audience created outside
     // this flow) had no baseline to diff against, so add-only uploads could
@@ -17272,8 +17275,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // path (cheaper, and avoids replacing the whole set every sync).
     let noBaselineReuse = false;
     if (plannedAction === 'reuse') {
+      // Reading the prior snapshot is kept non-fatal (a transient DynamoDB
+      // read failure here shouldn't block a launch) — but a DELETE_USERS
+      // failure below is a hard failure, not caught by this block, since it
+      // means known-stale members would remain in the audience if the launch
+      // proceeded.
+      let previousRowKeys: string[] | null = null;
+      let readFailed = false;
       try {
-        const previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
+        previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
+      } catch (e: any) {
+        failures.push(`Could not check for stale members on audience ${audienceId}: ${e.message}`);
+        readFailed = true;
+      }
+      if (!readFailed) {
         if (previousRowKeys) {
           const currentKeySet = new Set(newRowKeys);
           const staleRowKeys = previousRowKeys.filter((k) => !currentKeySet.has(k));
@@ -17286,15 +17301,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               confirm: true,
             });
             if (!deleteResult.success) {
-              failures.push(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
-              unremovedStaleRowKeys.push(...staleRowKeys);
+              throw new Error(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
             }
           }
         } else {
           noBaselineReuse = true;
         }
-      } catch (e: any) {
-        failures.push(`Could not check for stale members on audience ${audienceId}: ${e.message}`);
       }
     }
 
@@ -17317,7 +17329,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // with every other hard-failure step in this method (LIST/CREATE/
     // UPLOAD_USERS), all of which abort the whole launch rather than proceed
     // in a state the code can't reason about.
-    await saveAudienceSnapshotRowKeys(userId, audienceId, [...newRowKeys, ...unremovedStaleRowKeys]);
+    await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
 
     return {
       plannedAction,

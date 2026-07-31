@@ -481,11 +481,15 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(saveAudienceSnapshotRowKeys).toHaveBeenCalledWith(USER_ID, 'aud_new', [rowKeyFor('a@example.com', '111')]);
     });
 
-    it('reports a DELETE_USERS failure as a non-fatal failure, without blocking the upload', async () => {
+    // Greptile finding: DELETE_USERS failure used to be non-fatal, letting
+    // the launch proceed against an audience known to still contain removed
+    // contacts. Matches the same "block on known-incomplete data" decision
+    // already applied to HubSpot chunk failures and exhausted snapshot
+    // saves — throw instead of continuing.
+    it('blocks the launch (throws) when DELETE_USERS fails, rather than launching against a known-stale audience', async () => {
       const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
       spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_3', name: 'X' }] } as any); // LIST
       spy.mockResolvedValueOnce({ success: false, message: 'Meta rate limited' } as any); // DELETE_USERS
-      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
 
       jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
         mockHubSpotContact('a@example.com', '111')
@@ -495,25 +499,17 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         rowKeyFor('old@example.com', '999'),
       ]);
 
-      const result = await callResolveOrCreateSeedAudience(
+      await expect(callResolveOrCreateSeedAudience(
         USER_ID, ACCOUNT_ID, 'X',
         { type: 'hubspot_list', listId: 'list-1' },
         { dryRun: false }
-      );
+      )).rejects.toThrow('Failed to remove 1 stale member');
 
-      expect(result.failures).toEqual(
-        expect.arrayContaining([expect.stringContaining('Failed to remove 1 stale member')])
-      );
-      expect(spy).toHaveBeenNthCalledWith(3, USER_ID, 'UPLOAD_USERS', ACCOUNT_ID, expect.any(Object));
-
-      // Greptile P1 finding: a failed removal must NOT be forgotten — if the
-      // snapshot saved afterward drops the un-removed key just because it's
-      // not in the current source, the next sync will see no prior record of
-      // it and never retry the removal, leaving it targetable in Meta forever.
-      expect(saveAudienceSnapshotRowKeys).toHaveBeenCalledWith(
-        USER_ID, 'aud_3',
-        expect.arrayContaining([rowKeyFor('a@example.com', '111'), rowKeyFor('old@example.com', '999')])
-      );
+      // Only LIST + DELETE_USERS attempted — no UPLOAD_USERS against a
+      // known-stale audience, and no snapshot saved reflecting a launch that
+      // never happened.
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(saveAudienceSnapshotRowKeys).not.toHaveBeenCalled();
     });
 
     // Greptile finding history: a snapshot-save failure (after retries were
