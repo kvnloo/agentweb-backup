@@ -460,6 +460,29 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       }));
     });
 
+    // Greptile finding: a snapshot READ failure (distinct from a snapshot
+    // SAVE failure, already blocking) fell through to an add-only upload
+    // with noBaselineReuse left false — same "launch against unreconciled
+    // data" category as the other blocking fixes, just via a different path.
+    it('blocks the launch (throws) when reading the prior snapshot fails, rather than add-only uploading against unknown state', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_2b', name: 'X' }] } as any); // LIST
+
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
+        mockHubSpotContact('a@example.com', '111')
+      );
+      (getAudienceSnapshotRowKeys as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+
+      await expect(callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-1' },
+        { dryRun: false }
+      )).rejects.toThrow('DynamoDB unavailable');
+
+      // Only LIST attempted — no UPLOAD_USERS/REPLACE_USERS against unknown state.
+      expect(spy).toHaveBeenCalledTimes(1);
+    });
+
     it('does not call DELETE_USERS when creating a brand-new audience, but still saves a baseline snapshot', async () => {
       const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
       spy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST

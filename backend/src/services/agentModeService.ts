@@ -17275,38 +17275,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // path (cheaper, and avoids replacing the whole set every sync).
     let noBaselineReuse = false;
     if (plannedAction === 'reuse') {
-      // Reading the prior snapshot is kept non-fatal (a transient DynamoDB
-      // read failure here shouldn't block a launch) — but a DELETE_USERS
-      // failure below is a hard failure, not caught by this block, since it
-      // means known-stale members would remain in the audience if the launch
-      // proceeded.
-      let previousRowKeys: string[] | null = null;
-      let readFailed = false;
-      try {
-        previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
-      } catch (e: any) {
-        failures.push(`Could not check for stale members on audience ${audienceId}: ${e.message}`);
-        readFailed = true;
-      }
-      if (!readFailed) {
-        if (previousRowKeys) {
-          const currentKeySet = new Set(newRowKeys);
-          const staleRowKeys = previousRowKeys.filter((k) => !currentKeySet.has(k));
-          if (staleRowKeys.length > 0) {
-            const staleRows = staleRowKeys.map((k) => k.split('|'));
-            const deleteResult = await this.manageMetaCustomAudiences(userId, 'DELETE_USERS', accountId, {
-              id: audienceId,
-              schema,
-              payload: staleRows,
-              confirm: true,
-            });
-            if (!deleteResult.success) {
-              throw new Error(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
-            }
+      // Greptile finding: a snapshot READ failure was previously swallowed
+      // as non-fatal, leaving noBaselineReuse false — which fell through to
+      // an add-only upload against unknown state (we can't tell "no prior
+      // snapshot" from "couldn't read it"), the same "launch against
+      // unreconciled data" problem as the other blocking fixes here. Not
+      // caught: propagates like every other hard-failure step in this method.
+      const previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
+      if (previousRowKeys) {
+        const currentKeySet = new Set(newRowKeys);
+        const staleRowKeys = previousRowKeys.filter((k) => !currentKeySet.has(k));
+        if (staleRowKeys.length > 0) {
+          const staleRows = staleRowKeys.map((k) => k.split('|'));
+          const deleteResult = await this.manageMetaCustomAudiences(userId, 'DELETE_USERS', accountId, {
+            id: audienceId,
+            schema,
+            payload: staleRows,
+            confirm: true,
+          });
+          if (!deleteResult.success) {
+            throw new Error(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
           }
-        } else {
-          noBaselineReuse = true;
         }
+      } else {
+        noBaselineReuse = true;
       }
     }
 
