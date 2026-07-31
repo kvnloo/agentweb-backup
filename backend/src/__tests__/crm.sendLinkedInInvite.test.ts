@@ -327,7 +327,7 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
         note: 'Hi John',
         linkedin: LEAD_WITH_LINKEDIN.linkedin,
       }),
-    }));
+    }), expect.anything());
     expect(mockUpdateLead).toHaveBeenCalledWith('list-123', 'lead-456', expect.objectContaining({
       status: 'contacted',
       linkedInInviteSentAt: expect.any(String),

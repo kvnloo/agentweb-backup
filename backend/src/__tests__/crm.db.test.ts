@@ -2007,6 +2007,40 @@ describe('CRM Database Service', () => {
       await expect(crmDb.addLeadEngagement(LIST, LEAD, ev)).rejects.toThrow('Lead not found');
     });
 
+    it('adds no CAS condition when no expectedUpdatedAt is given', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev);
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.ConditionExpression).toBe('attribute_exists(leadId)');
+      expect(params.ExpressionAttributeValues).not.toHaveProperty(':expectedUpdatedAt');
+    });
+
+    it('guards on updatedAt when the caller passes expectedUpdatedAt', async () => {
+      // Callers that decide whether to append by inspecting current engagements need
+      // this: the read and the append are separate, so two of them could otherwise
+      // both see "not present" and both append.
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev, { expectedUpdatedAt: '2026-07-31T10:00:00.000Z' });
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.ConditionExpression).toBe('attribute_exists(leadId) AND updatedAt = :expectedUpdatedAt');
+      expect(params.ExpressionAttributeValues[':expectedUpdatedAt']).toBe('2026-07-31T10:00:00.000Z');
+    });
+
+    it('flags a lost CAS race distinctly from a missing lead', async () => {
+      const err: any = new Error('conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(err),
+      });
+      await expect(
+        crmDb.addLeadEngagement(LIST, LEAD, ev, { expectedUpdatedAt: 'x' }),
+      ).rejects.toMatchObject({ preconditionFailed: true });
+    });
+
     it('warns when the engagements array approaches the item-size ceiling', async () => {
       const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
       mockDocumentClientMethods.update.mockReturnValue({

@@ -165,7 +165,9 @@ describe('mirrorLinkedInInviteToCrm', () => {
   // ---- update path (invitee already a lead) ----
 
   it('marks an existing uncontacted lead as contacted and logs the invite', async () => {
-    findLeadByLinkedinInList.mockResolvedValue({ leadId: 'lead_existing', listId: LIST, status: 'new' });
+    findLeadByLinkedinInList.mockResolvedValue({
+      leadId: 'lead_existing', listId: LIST, status: 'new', updatedAt: '2026-07-31T10:00:00.000Z',
+    });
     const res = await mirrorLinkedInInviteToCrm({
       listId: LIST,
       linkedinUrl: 'https://www.linkedin.com/in/david-yao',
@@ -178,7 +180,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
     }));
     expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_existing', expect.objectContaining({
       eventType: 'linkedin.invite.sent',
-    }));
+    }), expect.objectContaining({ expectedUpdatedAt: expect.any(String) }));
   });
 
   it('never regresses a lead already further along the funnel', async () => {
@@ -197,6 +199,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
     getLeadById.mockResolvedValue({
       leadId: 'lead_known', listId: LIST, status: '',
       linkedin: 'https://www.linkedin.com/in/jane-doe',
+      updatedAt: '2026-07-31T10:00:00.000Z',
     });
     const res = await mirrorLinkedInInviteToCrm({
       listId: LIST,
@@ -214,7 +217,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
     expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_known', expect.objectContaining({
       eventType: 'linkedin.invite.sent',
       createdAt: '2026-07-31T00:00:00.000Z',
-    }));
+    }), expect.objectContaining({ expectedUpdatedAt: expect.any(String) }));
   });
 
   // ---- caller-supplied leadId must match the invitee (Greptile P1) ----
@@ -368,6 +371,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
     const PROFILE = 'https://www.linkedin.com/in/david-yao';
     const leadWith = (invitationId?: string) => ({
       leadId: 'lead_existing', listId: LIST, status: 'contacted', linkedin: PROFILE,
+      updatedAt: '2026-07-31T10:00:00.000Z',
       engagements: [{
         eventType: 'linkedin.invite.sent',
         createdAt: '2026-07-01T00:00:00.000Z',
@@ -403,7 +407,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
       expect(res?.engagementLogged).toBe(true);
       expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_existing', expect.objectContaining({
         eventData: expect.objectContaining({ invitationId: 'inv_2' }),
-      }));
+      }), expect.objectContaining({ expectedUpdatedAt: expect.any(String) }));
     });
 
     it('treats an id-less legacy row as the same invitation rather than duplicating', async () => {
@@ -434,7 +438,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
       expect(createLead).not.toHaveBeenCalled();
       // Every write lands on the list the lead actually lives in.
       expect(updateLead).toHaveBeenCalledWith(OTHER, 'lead_elsewhere', expect.anything());
-      expect(addLeadEngagement).toHaveBeenCalledWith(OTHER, 'lead_elsewhere', expect.anything());
+      expect(addLeadEngagement).toHaveBeenCalledWith(OTHER, 'lead_elsewhere', expect.anything(), expect.anything());
     });
 
     it('creates in the target list when no other list has the invitee', async () => {
@@ -455,44 +459,169 @@ describe('mirrorLinkedInInviteToCrm', () => {
     });
   });
 
-  // ---- name-confirmed leadId for a lead with no stored URL ----
+  // ---- a URL-less leadId is never trusted (Greptile: namesake mutation) ----
 
-  describe('name-confirmed leadId', () => {
+  describe('URL-less leadId', () => {
     const PROFILE = 'https://www.linkedin.com/in/david-yao';
 
-    it('accepts a URL-less lead when both names match, and stamps the URL on it', async () => {
-      getLeadById.mockResolvedValue({ leadId: 'lead_no_url', listId: LIST, status: 'new', firstName: 'David', lastName: 'Yao' });
+    it('does not accept a URL-less lead even when both names match', async () => {
+      // Names are not identity — namesakes exist — and accepting one would also
+      // stamp the invitee's URL onto that lead, making a wrong guess permanent.
+      getLeadById.mockResolvedValue({
+        leadId: 'lead_no_url', listId: LIST, status: 'new', firstName: 'David', lastName: 'Yao',
+      });
+      findLeadByLinkedinInList.mockResolvedValue(null);
+
       const res = await mirrorLinkedInInviteToCrm({
         listId: LIST, leadId: 'lead_no_url', linkedinUrl: PROFILE, firstName: 'David', lastName: 'Yao',
       });
-      expect(res?.leadId).toBe('lead_no_url');
+
+      expect(res?.created).toBe(true);
+      expect(updateLead).not.toHaveBeenCalledWith(LIST, 'lead_no_url', expect.anything());
+      expect(addLeadEngagement).not.toHaveBeenCalledWith(LIST, 'lead_no_url', expect.anything());
+    });
+
+    it('never writes a linkedin URL onto a lead it did not match on URL', async () => {
+      getLeadById.mockResolvedValue({
+        leadId: 'lead_no_url', listId: LIST, status: 'new', firstName: 'David', lastName: 'Yao',
+      });
+      findLeadByLinkedinInList.mockResolvedValue(null);
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST, leadId: 'lead_no_url', linkedinUrl: PROFILE, firstName: 'David', lastName: 'Yao',
+      });
+      for (const call of updateLead.mock.calls) {
+        expect(call[2]).not.toHaveProperty('linkedin');
+      }
+    });
+
+    it('still accepts a leadId whose URL matches only after canonicalization', async () => {
+      getLeadById.mockResolvedValue({
+        leadId: 'lead_known', listId: LIST, status: 'new', linkedin: 'http://linkedin.com/in/David-Yao/',
+      });
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, leadId: 'lead_known', linkedinUrl: PROFILE,
+      });
+      expect(res?.leadId).toBe('lead_known');
       expect(createLead).not.toHaveBeenCalled();
-      // The URL is written on so the next mirror keys on it rather than the name.
-      expect(updateLead).toHaveBeenCalledWith(LIST, 'lead_no_url', expect.objectContaining({ linkedin: PROFILE }));
     });
+  });
 
-    it('rejects a URL-less lead whose name differs', async () => {
-      getLeadById.mockResolvedValue({ leadId: 'lead_no_url', listId: LIST, status: 'new', firstName: 'Someone', lastName: 'Else' });
-      findLeadByLinkedinInList.mockResolvedValue(null);
-      const res = await mirrorLinkedInInviteToCrm({
-        listId: LIST, leadId: 'lead_no_url', linkedinUrl: PROFILE, firstName: 'David', lastName: 'Yao',
+  // ---- concurrent mirrors must not both append (Greptile: check/append race) ----
+
+  describe('concurrent append guard', () => {
+    const PROFILE = 'https://www.linkedin.com/in/david-yao';
+    const lead = (engagements: any[] = []) => ({
+      leadId: 'lead_existing', listId: LIST, status: 'contacted', linkedin: PROFILE,
+      updatedAt: '2026-07-31T10:00:00.000Z', engagements,
+    });
+    const recorded = {
+      eventType: 'linkedin.invite.sent',
+      createdAt: '2026-07-31T09:00:00.000Z',
+      eventData: { accountId: 'acct_1', linkedin: PROFILE, invitationId: 'inv_1' },
+    };
+
+    it('guards the append on the lead being unchanged since the check', async () => {
+      findLeadByLinkedinInList.mockResolvedValue(lead());
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
       });
-      expect(res?.created).toBe(true);
+      expect(addLeadEngagement).toHaveBeenCalledWith(
+        LIST, 'lead_existing', expect.anything(),
+        { expectedUpdatedAt: '2026-07-31T10:00:00.000Z' },
+      );
     });
 
-    it('rejects a URL-less lead when only a partial name is known — that is not identity', async () => {
-      getLeadById.mockResolvedValue({ leadId: 'lead_no_url', listId: LIST, status: 'new', firstName: 'David' });
-      findLeadByLinkedinInList.mockResolvedValue(null);
+    it('skips when the racing writer already recorded this invitation', async () => {
+      findLeadByLinkedinInList.mockResolvedValue(lead());
+      const raced: any = new Error('precondition failed');
+      raced.preconditionFailed = true;
+      addLeadEngagement.mockRejectedValueOnce(raced);
+      // Re-read shows the winner's engagement.
+      getLeadById.mockResolvedValue(lead([recorded]));
+
       const res = await mirrorLinkedInInviteToCrm({
-        listId: LIST, leadId: 'lead_no_url', linkedinUrl: PROFILE, firstName: 'David',
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
       });
-      expect(res?.created).toBe(true);
+
+      expect(res?.engagementLogged).toBe(false);
+      expect(addLeadEngagement).toHaveBeenCalledTimes(1);
     });
 
-    it('does not stamp a URL when the lead already matched on URL', async () => {
-      getLeadById.mockResolvedValue({ leadId: 'lead_known', listId: LIST, status: 'new', linkedin: PROFILE });
-      await mirrorLinkedInInviteToCrm({ listId: LIST, leadId: 'lead_known', linkedinUrl: PROFILE });
-      expect(updateLead).toHaveBeenCalledWith(LIST, 'lead_known', expect.not.objectContaining({ linkedin: expect.anything() }));
+    it('retries against the fresh snapshot when the race was an unrelated write', async () => {
+      findLeadByLinkedinInList.mockResolvedValue(lead());
+      const raced: any = new Error('precondition failed');
+      raced.preconditionFailed = true;
+      addLeadEngagement.mockRejectedValueOnce(raced).mockResolvedValueOnce({});
+      // Lead changed, but not by another invite mirror.
+      getLeadById.mockResolvedValue({ ...lead(), updatedAt: '2026-07-31T11:00:00.000Z' });
+
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
+      });
+
+      expect(res?.engagementLogged).toBe(true);
+      expect(addLeadEngagement).toHaveBeenLastCalledWith(
+        LIST, 'lead_existing', expect.anything(),
+        { expectedUpdatedAt: '2026-07-31T11:00:00.000Z' },
+      );
+    });
+
+    it('gives up rather than appending blind under sustained contention', async () => {
+      findLeadByLinkedinInList.mockResolvedValue(lead());
+      const raced: any = new Error('precondition failed');
+      raced.preconditionFailed = true;
+      addLeadEngagement.mockRejectedValue(raced);
+      getLeadById.mockResolvedValue(lead());
+
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
+      });
+
+      expect(res?.engagementLogged).toBe(false);
+      expect(addLeadEngagement).toHaveBeenCalledTimes(3);
+    });
+
+    it('stops if the lead disappears mid-race', async () => {
+      findLeadByLinkedinInList.mockResolvedValue(lead());
+      const raced: any = new Error('precondition failed');
+      raced.preconditionFailed = true;
+      addLeadEngagement.mockRejectedValueOnce(raced);
+      getLeadById.mockResolvedValue(null);
+
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
+      });
+
+      expect(res?.engagementLogged).toBe(false);
+    });
+
+    it('appends a brand-new lead unguarded — nothing can be racing it yet', async () => {
+      findLeadByLinkedinInList.mockResolvedValue(null);
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
+      });
+      expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_new_1', expect.anything());
+    });
+
+    it('appends unguarded when the lead has no updatedAt to compare against', async () => {
+      // CAS against '' would fail every retry and drop the attribution entirely;
+      // the guard is hardening, so losing the record is the worse outcome.
+      findLeadByLinkedinInList.mockResolvedValue({
+        leadId: 'lead_existing', listId: LIST, status: 'contacted', linkedin: PROFILE,
+      });
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
+      });
+      expect(res?.engagementLogged).toBe(true);
+      expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_existing', expect.anything(), {});
+    });
+
+    it('propagates a non-race error instead of silently dropping the engagement', async () => {
+      findLeadByLinkedinInList.mockResolvedValue(lead());
+      addLeadEngagement.mockRejectedValue(new Error('dynamo down'));
+      await expect(mirrorLinkedInInviteToCrm({
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
+      })).rejects.toThrow('dynamo down');
     });
   });
 });

@@ -211,7 +211,7 @@ describe('reconcileSentInvitationsToCrm', () => {
     expect(res.updated).toBe(1);
     expect(res.matchedInOtherList).toBe(1);
     expect(createLead).not.toHaveBeenCalled();
-    expect(addLeadEngagement).toHaveBeenCalledWith(OTHER, 'lead_elsewhere', expect.anything());
+    expect(addLeadEngagement).toHaveBeenCalledWith(OTHER, 'lead_elsewhere', expect.anything(), expect.anything());
   });
 
   it('reconciles into the target list only when searchOwnerLists is disabled', async () => {
