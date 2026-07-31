@@ -1,4 +1,4 @@
-import { twitterService } from '../twitterService';
+import { twitterService, runWithXActingUser } from '../twitterService';
 import { ConnectedAccount, TwitterXConfig } from '../connectedAccountsDb';
 import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics } from './socialPlatformTypes';
 
@@ -8,7 +8,11 @@ export class TwitterAdapter implements SocialPlatformAdapter {
     // account.userId is the token owner (differs from userId for org-shared accounts).
     const ownerUserId = (account as any).userId || userId;
     if (!ownerUserId) throw new Error('userId is required to post on X');
-    const result = await twitterService.postTweet(ownerUserId, account.account_id, content);
+    // Acting user = the poster (userId); owner = ownerUserId. Metering attributes
+    // the ledger to the acting user and bills the owner (ENG-664 Option B).
+    const result = await runWithXActingUser(userId, () =>
+      twitterService.postTweet(ownerUserId, account.account_id, content)
+    );
     return {
       success: true,
       message: 'Posted successfully on X (Twitter)',
@@ -21,7 +25,9 @@ export class TwitterAdapter implements SocialPlatformAdapter {
     if (!userId) return [];
     const config = account.config as TwitterXConfig;
     const handle = config.username || account.account_name.replace(/^@/, '');
-    return twitterService.getUserTweets(userId, account.account_id, handle, options?.limit);
+    return runWithXActingUser(userId, () =>
+      twitterService.getUserTweets(userId, account.account_id, handle, options?.limit)
+    );
   }
 
   async getPostMetrics(account: ConnectedAccount, postIds: string[], userId?: string): Promise<PostMetric[]> {

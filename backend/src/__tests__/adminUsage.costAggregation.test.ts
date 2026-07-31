@@ -123,7 +123,8 @@ describe("GET /api/admin/usage/cost-aggregation", () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual(payload);
-    expect(mockGetCostAggregation).toHaveBeenCalledWith("2026-06-01", "2026-06-30", 10);
+    // No provider param → defaults to "llm" (the LLM Costs tab must be LLM-only).
+    expect(mockGetCostAggregation).toHaveBeenCalledWith("2026-06-01", "2026-06-30", 10, "llm");
   });
 
   test("admin caller with an empty window → 200 with explicit zeros (assertion 4, API half)", async () => {
@@ -180,7 +181,24 @@ describe("GET /api/admin/usage/cost-aggregation", () => {
       .set("Authorization", `Bearer ${adminToken}`)
       .query({ start: "2026-06-01", end: "2026-06-30", topUsers: "5" });
     expect(ok.status).toBe(200);
-    expect(mockGetCostAggregation).toHaveBeenCalledWith("2026-06-01", "2026-06-30", 5);
+    expect(mockGetCostAggregation).toHaveBeenCalledWith("2026-06-01", "2026-06-30", 5, "llm");
+  });
+
+  test("provider param is passed through; a bad provider token → 400", async () => {
+    const ok = await request(app)
+      .get(url)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ start: "2026-06-01", end: "2026-06-30", provider: "twitter" });
+    expect(ok.status).toBe(200);
+    expect(mockGetCostAggregation).toHaveBeenCalledWith("2026-06-01", "2026-06-30", 10, "twitter");
+
+    mockGetCostAggregation.mockClear();
+    const bad = await request(app)
+      .get(url)
+      .set("Authorization", `Bearer ${adminToken}`)
+      .query({ start: "2026-06-01", end: "2026-06-30", provider: "DROP;TABLE" });
+    expect(bad.status).toBe(400);
+    expect(mockGetCostAggregation).not.toHaveBeenCalled();
   });
 
   test("service failure → 500 with a clear error, not a hang or empty 200", async () => {

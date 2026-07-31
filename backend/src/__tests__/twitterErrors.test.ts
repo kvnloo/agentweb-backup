@@ -1,4 +1,8 @@
-import { describeXApiError } from '../utils/twitterErrors';
+import {
+  describeXApiError,
+  isXApiCreditsError,
+  XCreditsExhaustedError,
+} from '../utils/twitterErrors';
 
 /**
  * Unit tests for describeXApiError — the AC#3 error-surfacing helper.
@@ -120,5 +124,40 @@ describe('describeXApiError', () => {
     const msg = describeXApiError(err);
     expect(msg).not.toMatch(/AgentWeb's X \(Twitter\) API plan/);
     expect(msg).not.toMatch(/contact AgentWeb support/i);
+  });
+});
+
+/**
+ * ENG-664 — X 402 (credit exhaustion) must be a typed, machine-detectable
+ * condition, not just prose inside a message. A depleted shared X wallet
+ * (ENG-604/633/662) is a hard, non-retryable, platform-side stop.
+ */
+describe('isXApiCreditsError', () => {
+  const xError = (code: number) => Object.assign(new Error(`Request failed with code ${code}`), { code });
+
+  it('is true only for an X 402', () => {
+    expect(isXApiCreditsError(xError(402))).toBe(true);
+    expect(isXApiCreditsError(xError(403))).toBe(false);
+    expect(isXApiCreditsError(xError(429))).toBe(false);
+  });
+
+  it('detects a wrapped XCreditsExhaustedError', () => {
+    expect(isXApiCreditsError(new XCreditsExhaustedError('X API error (HTTP 402): ...'))).toBe(true);
+  });
+
+  it('is false for non-X errors and non-objects', () => {
+    expect(isXApiCreditsError(new Error('boom'))).toBe(false);
+    expect(isXApiCreditsError(undefined)).toBe(false);
+    expect(isXApiCreditsError('402')).toBe(false);
+  });
+});
+
+describe('XCreditsExhaustedError', () => {
+  it('carries a stable name and HTTP 402 code so it classifies structurally', () => {
+    const e = new XCreditsExhaustedError('out of credits');
+    expect(e).toBeInstanceOf(Error);
+    expect(e.name).toBe('XCreditsExhaustedError');
+    expect(e.code).toBe(402);
+    expect(e.message).toBe('out of credits');
   });
 });
