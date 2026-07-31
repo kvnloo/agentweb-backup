@@ -1,3 +1,53 @@
+## ENG-757: the stale run was at the current head SHA, so SHA-binding would have confirmed the false green (2026-07-31)
+
+agentweb#2221 spent ~30 minutes displaying "checks passing" while no check could run against it at
+all. The obvious reading — "stale evidence, so bind evidence to the head SHA" — is wrong, and
+building that would have shipped a gate that endorsed the exact bug it was written to catch.
+Investigation findings:
+
+- **The head SHA never changed, so the misleading run was at the current head.** The conflict on
+  #2221 was created by the *base* moving (#2220 merged, colliding on `dev.md`), not by anything
+  happening on the PR branch. A head-SHA staleness check compares the run's `head_sha` to the PR's
+  `headRefOid`; here they matched. The check would have passed and reported "verified at current
+  head". SHA-binding is necessary but nowhere near sufficient.
+- **The real defect is the question `gh pr checks` answers.** It answers "did anything fail?" A
+  skipped job has not failed, so an all-skipped run is green. Verified live 2026-07-31:
+  `gh pr checks 2231` exits **0** on a draft PR whose seven check-runs are six `skipped` plus one
+  `success`, and exits **0** on #1814, which is non-draft and `CONFLICTING` right now. Both were
+  read as green by the merge procedure in `AGENTS.md`.
+- **A conflicted PR cannot schedule a run, which is why the window persists.** GitHub cannot build
+  `refs/pull/N/merge` without a mergeable ref, so neither `ready_for_review` nor `synchronize` can
+  start a workflow. The ENG-361 fix (`tests.yml` re-runs on `ready_for_review`) is real but cannot
+  fire here — there is nothing for it to schedule. The PR keeps displaying whatever ran last.
+- **The fix is to invert the question, not to add a third special case.** Requiring positive proof
+  that something *executed* against this exact head collapses conflicted / no-run / draft-run /
+  unreadable-payload into one rule, because none of them can produce execution proof. Absence of
+  failure is not evidence of success. `.github/scripts/merge-evidence.sh` exits 0 PASS, 1 FAIL,
+  2 PENDING, 3 NO_EVIDENCE, 4 unreadable.
+- **`Require Greptile Review` is the only job that can tell a draft skip from a path-filter skip.**
+  `tests.yml` gates the backend jobs on `backend == 'true' && draft == false`, collapsing both
+  reasons into one `if`, so both render as `conclusion: skipped`. That one job is gated on
+  `draft == false` alone. Discriminator skipped means a draft run; discriminator executed means
+  every other skip is a path filter working correctly. The invariant is now asserted against
+  `tests.yml` by `merge-evidence.test.sh`, so adding a path filter to that job fails loudly rather
+  than silently disarming the distinction.
+- **The gate has to live outside CI.** A check-run cannot report on the absence of check-runs, and
+  the conflicted PR that most needs reporting on is precisely the one that cannot schedule the job
+  that would report it. This is why ENG-757 is a CLI an agent runs, not another required check —
+  the same reason ENG-734/743 could not be fixed from inside the deploy job's own success signal.
+- **Two bugs in this gate's own first draft were caught by its tests, both false greens.** Using a
+  tab as the `read` field separator collapses runs of tabs (tab is IFS whitespace), so two
+  consecutive empty fields shifted every later field left and the reason strings described the wrong
+  jobs; and one `join` separator was left empty, concatenating the counts so every numeric
+  comparison silently failed and the verdict came out `PASS`. Both are why the suite asserts on
+  reason-string *content*, not just exit codes. Fields are joined on US (0x1f) now, which is not
+  IFS whitespace, so empty fields survive.
+- **Live divergence measured across 8 open PRs:** three disagreed with `gh pr checks`, all in the
+  safe direction — #1814 (non-draft, CONFLICTING) green to NO_EVIDENCE, #2231 (draft) green to
+  NO_EVIDENCE, #1790 green to NO_EVIDENCE (its last run predates the `Require Greptile Review` job,
+  so it has no comparable evidence and fails closed). #2233/#2227 PASS with path-filter skips named,
+  #2234/#2226 FAIL, #2235 PENDING — all matching the old signal where the old signal was right.
+
 ## ENG-399: DATASET LIST was broken by the per-pixel edge, not the account-level one (2026-07-30)
 
 `call_meta_marketing_api { entity_type: DATASET, action: LIST }` failed every time with
