@@ -48,17 +48,30 @@ load_dotenv()
 # Get table prefix based on NODE_ENV
 TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 
-# Azure AI Services endpoint used for image generation/editing (gpt-image-*, FLUX.*).
+# Azure AI Services credentials used for image generation/editing (gpt-image-*, FLUX.*).
 # Sourced from the environment so the resource can be rotated without a code change.
-# There is deliberately NO hardcoded default: an unset value must fail loudly rather
-# than silently routing production image generation at some other account's resource.
+#
+# These are deliberately SEPARATE from the AZURE_OPENAI_*2 pair used by the chat client in
+# task_utils.get_azure_openai_llm2(). Image generation and chat historically shared
+# AZURE_OPENAI_API_KEY2 while pointing at different resources, so repointing the image
+# endpoint alone would authenticate the new endpoint with the old resource's key (401).
+# Endpoint and key move together as a pair.
+#
+# There is deliberately NO hardcoded default for either: an unset value must fail loudly
+# rather than silently routing production image generation at some other account's resource.
 AZURE_IMAGE_ENDPOINT_ENV = 'AZURE_IMAGE_ENDPOINT'
+AZURE_IMAGE_API_KEY_ENV = 'AZURE_IMAGE_API_KEY'
 
 
 def get_azure_image_endpoint() -> Optional[str]:
     """Return the configured Azure image endpoint (no trailing slash), or None if unset."""
     endpoint = (os.getenv(AZURE_IMAGE_ENDPOINT_ENV) or '').strip()
     return endpoint.rstrip('/') or None
+
+
+def get_azure_image_api_key() -> Optional[str]:
+    """Return the configured Azure image API key, or None if unset."""
+    return (os.getenv(AZURE_IMAGE_API_KEY_ENV) or '').strip() or None
 
 # Initialize DynamoDB client
 dynamodb = get_dynamodb_resource()
@@ -3189,9 +3202,9 @@ class WebAgent:
                 
                 if model_to_use == "FLUX.1-Kontext-pro":
                     # Use Azure AI Services for FLUX model with direct HTTP requests
-                    api_key = os.getenv('AZURE_OPENAI_API_KEY2')
+                    api_key = get_azure_image_api_key()
                     if not api_key:
-                        return ActionResult(error="AZURE_OPENAI_API_KEY2 environment variable is not set for FLUX.1-Kontext-pro model")
+                        return ActionResult(error=f"{AZURE_IMAGE_API_KEY_ENV} environment variable is not set for FLUX.1-Kontext-pro model")
                     
                     logger.info(f"Using Azure AI Services FLUX model with direct HTTP requests")
 
@@ -3221,9 +3234,9 @@ class WebAgent:
                     google_model_name = "gemini-2.5-flash-image"
                 elif model_to_use == "gpt-image-1":
                     # Use Azure AI Services for gpt-image-1 model (same as FLUX)
-                    api_key = os.getenv('AZURE_OPENAI_API_KEY2')
+                    api_key = get_azure_image_api_key()
                     if not api_key:
-                        return ActionResult(error="AZURE_OPENAI_API_KEY2 environment variable is not set for gpt-image-1 model")
+                        return ActionResult(error=f"{AZURE_IMAGE_API_KEY_ENV} environment variable is not set for gpt-image-1 model")
                     
                     logger.info("Using Azure AI Services for gpt-image-1 model")
 

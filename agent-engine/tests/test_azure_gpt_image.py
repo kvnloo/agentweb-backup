@@ -36,9 +36,9 @@ def test_azure_gpt_image_generation():
     load_dotenv()
     
     # Azure AI Services configuration (same as FLUX)
-    api_key = os.getenv('AZURE_OPENAI_API_KEY2')
+    api_key = os.getenv('AZURE_IMAGE_API_KEY')
     if not api_key:
-        logger.error("AZURE_OPENAI_API_KEY2 environment variable is not set")
+        logger.error("AZURE_IMAGE_API_KEY environment variable is not set")
         return False
     
     azure_endpoint = (os.getenv('AZURE_IMAGE_ENDPOINT') or '').strip().rstrip('/')

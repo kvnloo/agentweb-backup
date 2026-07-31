@@ -80,6 +80,25 @@ class TestAzureImageEndpointConfig(unittest.TestCase):
             src.count(f"{{AZURE_IMAGE_ENDPOINT_ENV}} environment variable is not set"), 2
         )
 
+    def test_image_credentials_are_decoupled_from_the_chat_client_key(self):
+        """Image gen must not reuse AZURE_OPENAI_API_KEY2.
+
+        That variable is paired with AZURE_OPENAI_ENDPOINT2 for the chat client in
+        task_utils.get_azure_openai_llm2(). Sharing it meant repointing the image
+        endpoint alone would authenticate the new resource with the old one's key.
+        """
+        src = WEB_AGENT.read_text()
+        # Assert on executable code, not prose: the explanatory comment above the helpers
+        # legitimately names the old variable.
+        code = "\n".join(
+            line for line in src.splitlines() if not line.lstrip().startswith("#")
+        )
+        self.assertNotIn("AZURE_OPENAI_API_KEY2", code)
+        self.assertEqual(src.count("api_key = get_azure_image_api_key()"), 2)
+        self.assertEqual(
+            src.count(f"{{AZURE_IMAGE_API_KEY_ENV}} environment variable is not set"), 2
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
