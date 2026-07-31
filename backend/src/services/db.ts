@@ -7065,7 +7065,20 @@ export const crmDb = {
     eventType: string;
     eventData: any;
     createdAt: string;
-  }) {
+  }, opts: {
+    /**
+     * Compare-and-swap guard. When supplied, the append only lands if the lead's
+     * `updatedAt` still equals this value — i.e. nothing has written to the lead
+     * since the caller read it. Callers that decide whether to append by INSPECTING
+     * the current engagements need this: the read and the append are otherwise two
+     * separate operations, so two of them can both observe "not present" and both
+     * append. On a lost race the thrown error carries `preconditionFailed` so the
+     * caller can re-read and re-decide.
+     *
+     * Omit it for unconditional appends (the common case) — behaviour is unchanged.
+     */
+    expectedUpdatedAt?: string;
+  } = {}) {
     try {
       // Generate a unique eventId for this engagement
       const eventId = `custom_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -7101,6 +7114,12 @@ export const crmDb = {
         expressionAttributeValues[':isEngaged'] = 1;
       }
 
+      const conditions = ['attribute_exists(leadId)'];
+      if (opts.expectedUpdatedAt !== undefined) {
+        conditions.push('updatedAt = :expectedUpdatedAt');
+        expressionAttributeValues[':expectedUpdatedAt'] = opts.expectedUpdatedAt;
+      }
+
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: {
@@ -7108,7 +7127,7 @@ export const crmDb = {
           leadId,
         },
         UpdateExpression: `SET ${setClauses.join(', ')}`,
-        ConditionExpression: 'attribute_exists(leadId)',
+        ConditionExpression: conditions.join(' AND '),
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: 'ALL_NEW',
       };
@@ -7117,8 +7136,16 @@ export const crmDb = {
       try {
         result = await dynamodb.update(params).promise();
       } catch (updateError: any) {
-        // Preserve the pre-existing contract for a missing lead.
         if (updateError?.code === 'ConditionalCheckFailedException') {
+          // With a CAS guard the failure is ambiguous — the lead may be gone OR it
+          // may have changed under the caller. Flag it so the caller can re-read
+          // and re-decide instead of treating a lost race as a missing lead.
+          if (opts.expectedUpdatedAt !== undefined) {
+            const raceError: any = new Error('Lead engagement precondition failed');
+            raceError.preconditionFailed = true;
+            throw raceError;
+          }
+          // Preserve the pre-existing contract for a missing lead.
           throw new Error('Lead not found');
         }
         throw updateError;
