@@ -5317,7 +5317,10 @@ export const crmDb = {
       }
 
       const emailValue = leadData.email?.trim().toLowerCase();
-      const linkedinValue = leadData.linkedin?.trim();
+      // Store LinkedIn URL in canonical form (matching batchCreateLeads) so the
+      // LinkedinLookupIndex GSI stays canonical and future dedup reads match
+      // regardless of the source's formatting (ENG-787).
+      const linkedinValue = normalizeLinkedInUrl(leadData.linkedin);
       const item: any = {
         listId,
         leadId,
@@ -5974,10 +5977,13 @@ export const crmDb = {
       }
 
       if (updates.linkedin !== undefined) {
-        const trimmedLinkedin = (updates.linkedin ?? '').trim();
-        if (trimmedLinkedin) {
+        // Canonicalize (matching batchCreateLeads / createLead) so the
+        // LinkedinLookupIndex GSI stays canonical and dedup reads match
+        // regardless of the source's formatting (ENG-787).
+        const normalizedLinkedin = normalizeLinkedInUrl(updates.linkedin);
+        if (normalizedLinkedin) {
           setExpressions.push('linkedin = :linkedin');
-          expressionAttributeValues[':linkedin'] = trimmedLinkedin;
+          expressionAttributeValues[':linkedin'] = normalizedLinkedin;
         } else {
           // Keep LinkedinLookupIndex sparse — empty/null values must not appear.
           removeExpressions.push('linkedin');
