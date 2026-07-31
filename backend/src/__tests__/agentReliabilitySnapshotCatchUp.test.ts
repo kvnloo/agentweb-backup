@@ -148,6 +148,53 @@ describe('writeReliabilitySnapshots catch-up (ENG-746)', () => {
     expect(String(RELIABILITY_SNAPSHOT_LOOP_ID)).toBe('agent-reliability-daily');
   });
 
+  // Greptile #2: subtracting whole days from `now` preserves the time of day,
+  // so a row labelled for one UTC date carried hours from the previous one.
+  // Burn-in classifies rows pre/post-release purely by that label, so a
+  // "post-release" snapshot could be full of pre-release events.
+  it('a completed day covers its own UTC date, not a now-anchored 24h slice', async () => {
+    // NOW is 18:00Z. Events at 02:00 and 22:00 on 06-13 both belong to 06-13,
+    // but a now-anchored window (06-12T18:00 → 06-13T18:00) would capture the
+    // 02:00 one and miss the 22:00 one.
+    const { port } = fakeDynamo([
+      verdict('2026-06-13T02:00:00.000Z', 'ok', 'early'),
+      verdict('2026-06-13T22:00:00.000Z', 'failed', 'late'),
+    ]);
+
+    await writeReliabilitySnapshots({ dynamo: port, clock }, { catchUpDays: 3 });
+
+    const trend = await readReliabilityTrend(port, { limit: 30, windowLabel: '24h' });
+    const day13 = trend.find((s) => s.date === '2026-06-13');
+
+    expect(day13).toBeDefined();
+    // Both of that date's runs are counted in that date's row.
+    expect(day13?.runCount).toBe(2);
+    expect(day13?.failedRuns).toBe(1);
+    expect(day13?.windowEnd).toBe('2026-06-13T23:59:59.999Z');
+  });
+
+  it('does not leak a completed day\'s events into the following day\'s row', async () => {
+    const { port } = fakeDynamo([verdict('2026-06-13T22:00:00.000Z', 'failed', 'late')]);
+
+    await writeReliabilitySnapshots({ dynamo: port, clock }, { catchUpDays: 3 });
+
+    const trend = await readReliabilityTrend(port, { limit: 30, windowLabel: '24h' });
+    const day12 = trend.find((s) => s.date === '2026-06-12');
+
+    expect(day12?.runCount).toBe(0);
+  });
+
+  it('still lets today be a partial window ending at now', async () => {
+    const { port } = fakeDynamo(seedDays(['2026-06-14']));
+
+    await writeReliabilitySnapshots({ dynamo: port, clock }, { catchUpDays: 2 });
+
+    const trend = await readReliabilityTrend(port, { limit: 30, windowLabel: '24h' });
+    const today = trend.find((s) => s.date === '2026-06-14');
+
+    expect(today?.windowEnd).toBe(NOW.toISOString());
+  });
+
   it('end-to-end: catch-up makes check 4 computable on the first run', async () => {
     // The whole point — before this, one run produced one snapshot and check 4
     // stayed insufficient_data for want of a baseline.

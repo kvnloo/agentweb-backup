@@ -139,6 +139,91 @@ describe('GET /api/admin/loops/burn-in (ENG-746 AC4)', () => {
     expect(res.body.postRelease.date).toBe('2026-07-21');
   });
 
+  // Greptile #1: query overrides let a caller manufacture a pass. The policy is
+  // fixed; a request may tighten it but never loosen it.
+  it('ignores minRuns=0 — a caller cannot buy a pass with a zero-run window', async () => {
+    // One post-release run only, and a baseline day.
+    await fake.putItem(
+      LOOP_EVENTS_TABLE,
+      verdictEvent('b0', 'ok', '2026-07-19T09:00:00.000Z'),
+    );
+    await writeReliabilitySnapshots({
+      dynamo: fake as never,
+      clock: { now: () => new Date('2026-07-19T17:45:00.000Z') },
+    });
+    await writeReliabilitySnapshots({
+      dynamo: fake as never,
+      clock: { now: () => new Date('2026-07-21T17:45:00.000Z') },
+    });
+
+    const res = await request(makeApp())
+      .get('/api/admin/loops/burn-in')
+      .query({ releaseAt: RELEASE_AT, minRuns: 0 });
+
+    expect(res.body.verdict).toBe('insufficient_data');
+    expect(res.body.passesClosureCheck4).toBe(false);
+    // The clamp held: the effective policy is still the default.
+    expect(res.body.minRunCount).toBe(5);
+  });
+
+  it('ignores tolerance=1 — a caller cannot excuse a 0%-to-100% regression', async () => {
+    const before: DynamoAttributeMap[] = [];
+    for (let i = 0; i < 20; i++) {
+      before.push(verdictEvent(`b${i}`, 'ok', `2026-07-19T09:0${i % 10}:00.000Z`));
+    }
+    // Post-release: every run failed.
+    const after: DynamoAttributeMap[] = [];
+    for (let i = 0; i < 20; i++) {
+      after.push(verdictEvent(`a${i}`, 'failed', `2026-07-21T09:0${i % 10}:00.000Z`));
+    }
+    for (const e of [...before, ...after]) await fake.putItem(LOOP_EVENTS_TABLE, e);
+
+    await writeReliabilitySnapshots({
+      dynamo: fake as never,
+      clock: { now: () => new Date('2026-07-19T17:45:00.000Z') },
+    });
+    await writeReliabilitySnapshots({
+      dynamo: fake as never,
+      clock: { now: () => new Date('2026-07-21T17:45:00.000Z') },
+    });
+
+    const res = await request(makeApp())
+      .get('/api/admin/loops/burn-in')
+      .query({ releaseAt: RELEASE_AT, tolerance: 1 });
+
+    expect(res.body.verdict).toBe('regressed');
+    expect(res.body.passesClosureCheck4).toBe(false);
+    expect(res.body.tolerance).toBe(0.02);
+  });
+
+  it('accepts a STRICTER override in both directions', async () => {
+    const events: DynamoAttributeMap[] = [];
+    for (let i = 0; i < 20; i++) {
+      events.push(verdictEvent(`b${i}`, 'ok', `2026-07-19T09:0${i % 10}:00.000Z`));
+      events.push(verdictEvent(`a${i}`, 'ok', `2026-07-21T09:0${i % 10}:00.000Z`));
+    }
+    for (const e of events) await fake.putItem(LOOP_EVENTS_TABLE, e);
+
+    await writeReliabilitySnapshots({
+      dynamo: fake as never,
+      clock: { now: () => new Date('2026-07-19T17:45:00.000Z') },
+    });
+    await writeReliabilitySnapshots({
+      dynamo: fake as never,
+      clock: { now: () => new Date('2026-07-21T17:45:00.000Z') },
+    });
+
+    // minRuns above the default is honoured...
+    const strict = await request(makeApp())
+      .get('/api/admin/loops/burn-in')
+      .query({ releaseAt: RELEASE_AT, minRuns: 5000, tolerance: 0.001 });
+
+    expect(strict.body.minRunCount).toBe(5000);
+    expect(strict.body.tolerance).toBe(0.001);
+    expect(strict.body.verdict).toBe('insufficient_data');
+    expect(strict.body.passesClosureCheck4).toBe(false);
+  });
+
   it('rejects a missing releaseAt rather than defaulting to a pass', async () => {
     const res = await request(makeApp()).get('/api/admin/loops/burn-in');
 
@@ -153,6 +238,40 @@ describe('GET /api/admin/loops/burn-in (ENG-746 AC4)', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.passesClosureCheck4).toBe(false);
+  });
+});
+
+describe('fail-closed on infrastructure failure', () => {
+  beforeEach(() => {
+    fake.rows.clear();
+    jest.restoreAllMocks();
+  });
+
+  it('burn-in returns 500 WITH passesClosureCheck4:false when the store throws', async () => {
+    jest.spyOn(fake, 'query').mockRejectedValueOnce(new Error('dynamo down'));
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const res = await request(makeApp())
+      .get('/api/admin/loops/burn-in')
+      .query({ releaseAt: RELEASE_AT });
+
+    expect(res.status).toBe(500);
+    // An error must never be mistaken for approval.
+    expect(res.body.passesClosureCheck4).toBe(false);
+    expect(res.body.verdict).toBe('insufficient_data');
+  });
+
+  it('reliability-trend returns 500 rather than an empty-looking success', async () => {
+    jest.spyOn(fake, 'query').mockRejectedValueOnce(new Error('dynamo down'));
+    jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const res = await request(makeApp()).get('/api/admin/loops/reliability-trend');
+
+    expect(res.status).toBe(500);
+    expect(res.body.error).toBe('internal_error');
+    // Critically, it does NOT report hasData:false with a 200 — that would be
+    // indistinguishable from a genuinely empty trend.
+    expect(res.body.hasData).toBeUndefined();
   });
 });
 
