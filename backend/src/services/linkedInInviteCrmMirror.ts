@@ -12,7 +12,8 @@ const UNCONTACTED_STATUSES = new Set(['', 'new', 'not_contacted', 'uncontacted',
 const INVITE_SENT_EVENT = 'linkedin.invite.sent';
 
 /**
- * True when the lead already carries an engagement for THIS exact invitation.
+ * True when the lead already carries an invite-sent engagement for this invitee
+ * from this sending account.
  *
  * `addLeadEngagement` appends unconditionally, so without this guard the same
  * real-world invitation is logged again every time it is re-mirrored — and it is
@@ -21,20 +22,27 @@ const INVITE_SENT_EVENT = 'linkedin.invite.sent';
  * designed to be re-run as a backstop. That would turn the ENG-787 under-count
  * into an over-count and inflate follow-up cadence.
  *
- * Identity is (event type, sending account, invitee, send time). `sentAt` for a
- * cached pending invitation is stable across syncs, so re-mirroring matches; a
- * genuinely new invitation (previous one accepted/withdrawn, then re-sent) carries
- * a later timestamp and is still recorded.
+ * Identity is (event type, sending account, invitee) — deliberately NOT the send
+ * time. A single invitation carries different timestamps at different points in
+ * its life: the fresh send stamps locally, the cache row is later overwritten by
+ * the sync cron with Unipile's own parsed_datetime, and the reconciliation reads
+ * that. Keying on the timestamp would let one invitation be logged twice as it
+ * moved between those sources.
+ *
+ * Trade-off: a person genuinely re-invited later (the first invite accepted or
+ * withdrawn, then a new one sent) does not get a second engagement row — their
+ * `linkedInInviteSentAt` still advances. Under-counting a rare re-invite is much
+ * cheaper than the per-run over-count this prevents, and re-invites are already
+ * suppressed by the send-time pending guard.
  */
 function hasInviteEngagement(
   lead: any,
-  opts: { linkedin: string; accountId: string; sentAt: string },
+  opts: { linkedin: string; accountId: string },
 ): boolean {
   const engagements = Array.isArray(lead?.engagements) ? lead.engagements : [];
   return engagements.some(
     (e: any) =>
       String(e?.eventType ?? '') === INVITE_SENT_EVENT &&
-      String(e?.createdAt ?? '') === opts.sentAt &&
       String(e?.eventData?.linkedin ?? '') === opts.linkedin &&
       String(e?.eventData?.accountId ?? '') === opts.accountId,
   );
@@ -112,8 +120,26 @@ export async function mirrorLinkedInInviteToCrm(
   let leadId = params.leadId;
   let existing: any = null;
   if (leadId) {
-    existing = await crmDb.getLeadById(params.listId, leadId);
-    if (!existing) leadId = undefined;
+    const candidate = await crmDb.getLeadById(params.listId, leadId);
+    // A caller-supplied leadId is only trusted when the lead's own LinkedIn URL
+    // canonically matches the invitee. On the outreach path lead_id and
+    // profile_url are two independent LLM-supplied values, so a stale or
+    // mismatched lead_id would otherwise mark the WRONG person contacted and
+    // attach this invitee's engagement to them. A lead with no stored URL cannot
+    // confirm identity either, so it is not trusted — resolving by URL instead
+    // may create an extra lead, which is visible and mergeable, where a silent
+    // mis-attribution is neither.
+    const candidateUrl = candidate ? normalizeLinkedInUrl(candidate.linkedin) : '';
+    if (candidate && candidateUrl === normalized) {
+      existing = candidate;
+    } else {
+      if (candidate) {
+        console.warn(
+          `[mirrorLinkedInInvite] ignoring leadId ${leadId} in list ${params.listId} — its LinkedIn URL does not match the invitee; resolving by profile URL instead`,
+        );
+      }
+      leadId = undefined;
+    }
   }
   if (!leadId) {
     existing = await crmDb.findLeadByLinkedinInList(params.listId, normalized);
@@ -125,7 +151,6 @@ export async function mirrorLinkedInInviteToCrm(
     const alreadyLogged = !!existing && hasInviteEngagement(existing, {
       linkedin: normalized,
       accountId: params.accountId || '',
-      sentAt,
     });
     return { leadId: leadId ?? '', created: !leadId, engagementLogged: !alreadyLogged };
   }
@@ -164,7 +189,7 @@ export async function mirrorLinkedInInviteToCrm(
   // Skipped when this exact invitation is already on the lead, so re-mirroring a
   // still-pending invite (or re-running the reconciliation) stays idempotent.
   const accountId = params.accountId || '';
-  if (!created && hasInviteEngagement(existing, { linkedin: normalized, accountId, sentAt })) {
+  if (!created && hasInviteEngagement(existing, { linkedin: normalized, accountId })) {
     return { leadId, created, engagementLogged: false };
   }
   await crmDb.addLeadEngagement(params.listId, leadId, {

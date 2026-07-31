@@ -28953,11 +28953,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // it and dedups via the check above. Best-effort: a cache write must never fail
             // an invite that Unipile already accepted. (Written with the same lowercased
             // publicProfileUrl the GSI reads, so the next lookup matches case-insensitively.)
+            // One timestamp for both the pending-invite cache and the CRM mirror, so the
+            // lead's linkedInInviteSentAt agrees with the cache row this send creates.
+            const nowIso = new Date().toISOString();
             if (invitePublicId) {
               try {
                 const { upsertSentInvitation } = await import('./unipileSentInvitationsDb');
                 const { normalizeLinkedInUrl } = await import('./unipileConnectionsDb');
-                const nowIso = new Date().toISOString();
                 await upsertSentInvitation({
                   accountId: account_id,
                   invitedUserPublicId: invitePublicId,
@@ -28974,8 +28976,9 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             }
 
             // ENG-787: mirror the freshly-sent invite into the CRM lead list (see the
-            // shared mirrorInviteToCrm helper above).
-            await mirrorInviteToCrm();
+            // shared mirrorInviteToCrm helper above), stamped with the same instant the
+            // pending-invite cache row carries.
+            await mirrorInviteToCrm({ sentAt: nowIso });
 
             return { success: true, data: inviteResult };
           } catch (inviteErr: any) {
