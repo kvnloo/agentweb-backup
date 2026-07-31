@@ -36,11 +36,11 @@ const LEGACY_IMAGE_MODEL_ALIASES: Record<string, string> = {
   "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
 };
 
-// ENG-410: the original Azure image-gen endpoint lived in departed co-founder Rui's personal
-// Microsoft account. It stays as the fallback for the legacy raw-key secret format so this
-// change is behaviour-preserving until `{env}/AgentWeb/Azure/Image` is switched to the JSON
-// `{ apiKey, endpoint }` format pointing at the AgentWeb-owned resource.
-const LEGACY_AZURE_IMAGE_ENDPOINT = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com";
+// ENG-410: the Azure image-gen endpoint is now sourced entirely from
+// `{env}/AgentWeb/Azure/Image` (JSON `{ apiKey, endpoint }`), which points at the
+// AgentWeb-owned resource. The previous hardcoded fallback endpoint lived in departed
+// co-founder Rui's personal Microsoft account and has been removed; a secret without an
+// endpoint now fails loudly instead of silently routing there.
 
 /**
  * Normalize a legacy image-model id to its canonical (GA) equivalent.
@@ -419,13 +419,20 @@ export class ImageService {
       if (!apiKey) {
         throw new Error(`${model} Azure image secret JSON is missing "apiKey"`);
       }
+      if (!parsed.endpoint || parsed.endpoint.trim() === "") {
+        throw new Error(`${model} Azure image secret JSON is missing "endpoint"`);
+      }
       // Trailing slashes are stripped so callers can safely build `${endpoint}/openai/...`.
-      const endpoint = (parsed.endpoint || LEGACY_AZURE_IMAGE_ENDPOINT).replace(/\/+$/, "");
+      const endpoint = parsed.endpoint.trim().replace(/\/+$/, "");
       return { apiKey, endpoint };
     }
 
-    // Legacy raw-key format: key from the secret, endpoint from the constant.
-    return { apiKey: trimmed, endpoint: LEGACY_AZURE_IMAGE_ENDPOINT };
+    // Raw-key secrets carry no endpoint. Fail loudly rather than silently falling back
+    // to a hardcoded endpoint (which historically pointed at a departed employee's
+    // personal Azure account). Store the secret as {"apiKey":"…","endpoint":"…"}.
+    throw new Error(
+      `${model} Azure image secret must be JSON with "apiKey" and "endpoint" (raw-key format is no longer supported)`
+    );
   }
 
   /**

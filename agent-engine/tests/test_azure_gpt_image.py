@@ -41,7 +41,11 @@ def test_azure_gpt_image_generation():
         logger.error("AZURE_OPENAI_API_KEY2 environment variable is not set")
         return False
     
-    azure_endpoint = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com"
+    azure_endpoint = (os.getenv('AZURE_IMAGE_ENDPOINT') or '').strip().rstrip('/')
+    if not azure_endpoint:
+        logger.error("AZURE_IMAGE_ENDPOINT environment variable is not set")
+        return False
+
     deployment_name = "gpt-image-1"
     api_version = "2025-04-01-preview"
     

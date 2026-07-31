@@ -48,6 +48,18 @@ load_dotenv()
 # Get table prefix based on NODE_ENV
 TABLE_PREFIX = 'Dev-' if os.getenv('NODE_ENV') == 'development' else ''
 
+# Azure AI Services endpoint used for image generation/editing (gpt-image-*, FLUX.*).
+# Sourced from the environment so the resource can be rotated without a code change.
+# There is deliberately NO hardcoded default: an unset value must fail loudly rather
+# than silently routing production image generation at some other account's resource.
+AZURE_IMAGE_ENDPOINT_ENV = 'AZURE_IMAGE_ENDPOINT'
+
+
+def get_azure_image_endpoint() -> Optional[str]:
+    """Return the configured Azure image endpoint (no trailing slash), or None if unset."""
+    endpoint = (os.getenv(AZURE_IMAGE_ENDPOINT_ENV) or '').strip()
+    return endpoint.rstrip('/') or None
+
 # Initialize DynamoDB client
 dynamodb = get_dynamodb_resource()
 
@@ -3182,9 +3194,11 @@ class WebAgent:
                         return ActionResult(error="AZURE_OPENAI_API_KEY2 environment variable is not set for FLUX.1-Kontext-pro model")
                     
                     logger.info(f"Using Azure AI Services FLUX model with direct HTTP requests")
-                    
-                    # Azure AI Services endpoint for FLUX model
-                    azure_endpoint = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com"
+
+                    # Azure AI Services endpoint for FLUX model (configured via environment)
+                    azure_endpoint = get_azure_image_endpoint()
+                    if not azure_endpoint:
+                        return ActionResult(error=f"{AZURE_IMAGE_ENDPOINT_ENV} environment variable is not set for FLUX.1-Kontext-pro model")
                     deployment_name = "FLUX.1-Kontext-pro"
                     
                     # For Azure AI Services, we'll use direct HTTP requests
@@ -3212,9 +3226,11 @@ class WebAgent:
                         return ActionResult(error="AZURE_OPENAI_API_KEY2 environment variable is not set for gpt-image-1 model")
                     
                     logger.info("Using Azure AI Services for gpt-image-1 model")
-                    
-                    # Azure AI Services endpoint for gpt-image-1 model
-                    azure_endpoint = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com"
+
+                    # Azure AI Services endpoint for gpt-image-1 model (configured via environment)
+                    azure_endpoint = get_azure_image_endpoint()
+                    if not azure_endpoint:
+                        return ActionResult(error=f"{AZURE_IMAGE_ENDPOINT_ENV} environment variable is not set for gpt-image-1 model")
                     deployment_name = "gpt-image-1"
                     azure_model_name = "gpt-image-1"
                 else:
