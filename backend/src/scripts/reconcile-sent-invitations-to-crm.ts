@@ -20,28 +20,33 @@
  *
  * Usage:
  *   NODE_ENV=production npx ts-node src/scripts/reconcile-sent-invitations-to-crm.ts \
- *     <accountId> <listId> [<userId>]
+ *     <accountId> <listId> [<userId>] [--dry-run]
  *
- * Example (ENG-787 reporter):
+ *   --dry-run   Read the live feed + resolve each lead but WRITE NOTHING; prints the
+ *               created/updated/skipped counts. ALWAYS dry-run first to validate.
+ *
+ * Example (ENG-787 reporter) — validate, then commit:
  *   NODE_ENV=production npx ts-node src/scripts/reconcile-sent-invitations-to-crm.ts \
- *     tMgX8uZJTZWTG_mFY1aI2A list_1782945941846_b0ptvsguv 3da53332-0d6b-421d-97a0-3101459aa606
+ *     tMgX8uZJTZWTG_mFY1aI2A list_1782945941846_b0ptvsguv 3da53332-0d6b-421d-97a0-3101459aa606 --dry-run
  */
 
 import { reconcileSentInvitationsToCrm } from '../services/linkedInInviteCrmMirror';
 
 async function main() {
-  const [accountId, listId, userId] = process.argv.slice(2);
+  const argv = process.argv.slice(2);
+  const dryRun = argv.includes('--dry-run');
+  const [accountId, listId, userId] = argv.filter((a) => a !== '--dry-run');
   if (!accountId || !listId) {
     console.error(
-      'Usage: reconcile-sent-invitations-to-crm.ts <accountId> <listId> [<userId>]',
+      'Usage: reconcile-sent-invitations-to-crm.ts <accountId> <listId> [<userId>] [--dry-run]',
     );
     process.exit(1);
   }
 
-  console.log(`=== Reconcile pending invitations → CRM ===`);
+  console.log(`=== Reconcile pending invitations → CRM ${dryRun ? '(DRY-RUN, no writes)' : ''}===`);
   console.log(`account=${accountId} list=${listId} user=${userId ?? '(none)'}`);
   const before = Date.now();
-  const result = await reconcileSentInvitationsToCrm({ accountId, listId, userId });
+  const result = await reconcileSentInvitationsToCrm({ accountId, listId, userId, dryRun });
   console.log(
     `Done in ${Math.round((Date.now() - before) / 1000)}s — ` +
       `total=${result.total} created=${result.created} updated=${result.updated} skipped=${result.skipped}`,

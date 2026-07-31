@@ -27,10 +27,18 @@ export interface MirrorInviteParams {
   accountId?: string;
   /** ISO timestamp of the send; defaults to now. */
   sentAt?: string;
+  /**
+   * Read-only preview: resolve whether the invitee WOULD be created vs updated, but
+   * write nothing (no createLead/updateLead/addLeadEngagement). Used by the
+   * reconciliation script's --dry-run to validate counts before a real backfill.
+   */
+  dryRun?: boolean;
 }
 
 export interface MirrorInviteResult {
+  /** Resolved lead id ('' for a would-be create under dryRun). */
   leadId: string;
+  /** True when a new lead was (or would be) created; false when an existing lead matched. */
   created: boolean;
 }
 
@@ -72,6 +80,11 @@ export async function mirrorLinkedInInviteToCrm(
     const matches = await crmDb.findLeadsByLinkedin(normalized);
     existing = (matches || []).find((l: any) => l.listId === params.listId) || null;
     if (existing) leadId = existing.leadId as string;
+  }
+
+  // Read-only preview: report whether this invitee would be created vs updated, no writes.
+  if (params.dryRun) {
+    return { leadId: leadId ?? '', created: !leadId };
   }
 
   let created = false;
@@ -140,6 +153,11 @@ export interface ReconcileInvitationsParams {
    * Defaults to true — a reconciliation should reflect the live LinkedIn state.
    */
   refreshFromLive?: boolean;
+  /**
+   * Read-only preview: compute the created/updated/skipped counts without writing any
+   * lead or engagement. Validates a backfill before the real (data-plane) run.
+   */
+  dryRun?: boolean;
 }
 
 export interface ReconcileInvitationsResult {
@@ -205,6 +223,7 @@ export async function reconcileSentInvitationsToCrm(
         note: inv.invitationText,
         accountId,
         sentAt: inv.sentAt,
+        dryRun: params.dryRun,
       });
       if (!mirror) {
         result.skipped++;
@@ -221,7 +240,7 @@ export async function reconcileSentInvitationsToCrm(
   }
 
   console.log(
-    `[reconcileSentInvitations] account=${accountId} list=${listId} total=${result.total} created=${result.created} updated=${result.updated} skipped=${result.skipped}`,
+    `[reconcileSentInvitations]${params.dryRun ? ' (DRY-RUN, no writes)' : ''} account=${accountId} list=${listId} total=${result.total} created=${result.created} updated=${result.updated} skipped=${result.skipped}`,
   );
   return result;
 }
