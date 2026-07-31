@@ -70,6 +70,7 @@ jest.mock('../services/db', () => ({
     getInFlightSchedules: jest.fn().mockResolvedValue([]),
     claimAbandonedRun: jest.fn().mockResolvedValue(true),
     claimPendingResume: jest.fn().mockResolvedValue(true),
+    claimAndPauseUnresumable: jest.fn().mockResolvedValue('paused'),
     updateSchedule: jest.fn(),
     getSchedulesByUserId: jest.fn(),
   },
@@ -329,21 +330,15 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
             { role: 'tool', tool_call_id: 'c1', content: '{}' },
           ],
         } as any);
-        (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
-
         const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
 
-        // No fresh session, no worker run — deferred, marker consumed to avoid a loop.
+        // No fresh session, no worker run — deferred, atomically claimed+paused.
         expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
         expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
-        expect(mockScheduleDb.claimPendingResume).toHaveBeenCalledWith(mockScheduleId, resumeSessionId);
+        expect(mockScheduleDb.claimAndPauseUnresumable).toHaveBeenCalledWith(mockScheduleId, resumeSessionId);
         expect(result.sessionId).toBe('');
 
-        // Paused, not requeued — no auto-restart path exists for this case.
-        const pauseCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(
-          call => call[0] === mockScheduleId && call[1]?.status === 'paused'
-        );
-        expect(pauseCall).toBeDefined();
+        // Paused via the atomic op, not a separate retry-soon reschedule.
         const retryCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(
           call => call[0] === mockScheduleId && call[1]?.nextRunTime
         );
@@ -351,10 +346,10 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       });
 
       it('does NOT pause the schedule when another dispatcher already owns the not-resumable claim (ENG-657/Greptile)', async () => {
-        // If claimPendingResume returns false here, another dispatcher won it first —
-        // it, not us, owns this recovery decision. Pausing anyway would suppress the
-        // winner's future scheduled runs for no reason.
-        (mockScheduleDb.claimPendingResume as jest.Mock).mockResolvedValueOnce(false);
+        // If the atomic claim+pause loses its condition (someone else already
+        // changed the marker), we don't own this recovery decision. Pausing anyway
+        // would suppress the winner's future scheduled runs for no reason.
+        (mockScheduleDb.claimAndPauseUnresumable as jest.Mock).mockResolvedValueOnce('lost_claim');
         mockChatbotDb.getChatSession.mockResolvedValue({
           ...mockSession,
           sessionId: resumeSessionId,
@@ -375,6 +370,34 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         // No pause, no retry — we don't have standing to touch this schedule at all.
         const anyUpdateCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
         expect(anyUpdateCall).toBeUndefined();
+      });
+
+      it('leaves the marker intact and retries soon when claim+pause fails for a transient reason (ENG-657/Greptile)', async () => {
+        // The atomic write can't partially apply — if it fails transiently (not a
+        // lost race), the marker is still there, so retrying soon is safe: no
+        // duplicate-effect risk, unlike a consumed-but-unpaused marker would carry.
+        (mockScheduleDb.claimAndPauseUnresumable as jest.Mock).mockResolvedValue('error');
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'x' },
+            { role: 'user', content: 'Enrich.' },
+            { role: 'assistant', content: '…', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }, { id: 'c2', function: { name: 'enrich_leads_execute' } }] },
+            { role: 'tool', tool_call_id: 'c1', content: '{}' },
+          ],
+        } as any);
+        (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        expect(result.sessionId).toBe('');
+        expect(mockScheduleDb.claimAndPauseUnresumable).toHaveBeenCalledTimes(3); // 3 attempts, per the retry loop
+        const retryCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(
+          call => call[0] === mockScheduleId && call[1]?.nextRunTime
+        );
+        expect(retryCall).toBeDefined();
       });
 
       it('DEFERS on a transient session-load failure, leaving the marker intact (no restart)', async () => {

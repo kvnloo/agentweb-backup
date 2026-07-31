@@ -197,3 +197,28 @@ describe('scheduleDb.getInFlightSchedules', () => {
     await expect(scheduleDb.getInFlightSchedules()).resolves.toEqual([]);
   });
 });
+
+describe('scheduleDb.claimAndPauseUnresumable (ENG-657/Greptile)', () => {
+  it('atomically pauses the schedule and removes the marker in one write', async () => {
+    mockDynamoDB.update.mockReturnValue(ok());
+    const outcome = await scheduleDb.claimAndPauseUnresumable('sched-1', 'sess-1');
+    const params = mockDynamoDB.update.mock.calls[0][0];
+    expect(params.UpdateExpression).toBe('SET #status = :paused, updatedAt = :now REMOVE pendingResumeSessionId');
+    expect(params.ConditionExpression).toBe('pendingResumeSessionId = :sid');
+    expect(params.ExpressionAttributeValues[':sid']).toBe('sess-1');
+    expect(params.ExpressionAttributeValues[':paused']).toBe('paused');
+    expect(outcome).toBe('paused');
+  });
+
+  it('reports lost_claim (never partially applies) when the marker no longer matches', async () => {
+    mockDynamoDB.update.mockReturnValue(conditionalFail());
+    const outcome = await scheduleDb.claimAndPauseUnresumable('sched-1', 'sess-1');
+    expect(outcome).toBe('lost_claim');
+  });
+
+  it('reports error (marker left untouched) on an unexpected failure', async () => {
+    mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('throttled')) });
+    const outcome = await scheduleDb.claimAndPauseUnresumable('sched-1', 'sess-1');
+    expect(outcome).toBe('error');
+  });
+});

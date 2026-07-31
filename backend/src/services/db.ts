@@ -3339,6 +3339,37 @@ export const scheduleDb = {
     }
   },
 
+  // ENG-657 (Greptile): claim the resume marker AND pause the schedule in ONE
+  // atomic conditional write, not two sequential steps. Two sequential steps
+  // (claim, then a separately-retried pause) can split: the claim succeeds,
+  // consuming the marker, but every pause-write attempt then fails — leaving an
+  // ACTIVE schedule with no resume identity, so its next natural fire restarts
+  // from scratch and duplicates the abandoned session's side effects. A single
+  // atomic write can't partially apply: it either pauses AND consumes the marker
+  // together, or (on any failure, transient or lost-race) touches nothing at
+  // all — the marker survives intact for a safe retry either way.
+  async claimAndPauseUnresumable(scheduleId: string, sessionId: string): Promise<'paused' | 'lost_claim' | 'error'> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+        UpdateExpression: 'SET #status = :paused, updatedAt = :now REMOVE pendingResumeSessionId',
+        ConditionExpression: 'pendingResumeSessionId = :sid',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':paused': 'paused',
+          ':now': new Date().toISOString(),
+          ':sid': sessionId,
+        },
+      }).promise();
+      return 'paused';
+    } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') return 'lost_claim';
+      console.error('DynamoDB claimAndPauseUnresumable error:', error);
+      return 'error';
+    }
+  },
+
   // Scheduled-chat schedules that currently hold an in-flight lease. Sparse by
   // nature — most schedules have no runInFlight. We sweep BOTH 'active' and
   // 'paused' partitions of StatusStartTimeIndex: a runCount-limited schedule
