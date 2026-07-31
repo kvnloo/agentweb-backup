@@ -133,12 +133,15 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_new_2', name: 'Every.io Segment' } } as any); // CREATE
       spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
 
-      const mockGetContactsForList = jest.fn().mockResolvedValue([
-        { contactId: '1', email: 'a@example.com', phone: '111' },
-        { contactId: '2', email: 'b@example.com', phone: '' },
-        { contactId: '3', email: '', phone: '333' },
-        { contactId: '4', email: '', phone: '' }, // neither -> skipped
-      ]);
+      const mockGetContactsForList = jest.fn().mockResolvedValue({
+        contacts: [
+          { contactId: '1', email: 'a@example.com', phone: '111' },
+          { contactId: '2', email: 'b@example.com', phone: '' },
+          { contactId: '3', email: '', phone: '333' },
+          { contactId: '4', email: '', phone: '' }, // neither -> skipped
+        ],
+        failedChunkContactCount: 0,
+      });
       jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue({
         getContactsForList: mockGetContactsForList,
       });
@@ -163,6 +166,35 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(result.recordsUsable).toBe(3);
     });
 
+    // Greptile P1 finding: a failed HubSpot batch/read chunk used to be
+    // silently dropped, so the caller reported the partial contact list as
+    // complete and the ledger never reflected the missing members.
+    it('reports failedChunkContactCount as a non-fatal failure, not a silent under-count', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [] } as any);
+      spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_new_5', name: 'X' } } as any);
+      spy.mockResolvedValueOnce({ success: true } as any);
+
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue({
+        getContactsForList: jest.fn().mockResolvedValue({
+          contacts: [{ contactId: '1', email: 'a@example.com', phone: '111' }],
+          failedChunkContactCount: 100,
+        }),
+      });
+
+      const result = await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-42' },
+        { dryRun: false }
+      );
+
+      expect(result.failures).toEqual([
+        '100 of 101 HubSpot contacts could not be read (batch/read failure) and were NOT included in this audience.',
+      ]);
+      expect(result.recordsFound).toBe(101);
+      expect(result.recordsUsable).toBe(1);
+    });
+
     // ENG-600 live-test finding: a user with 2+ connected HubSpot accounts has
     // no way to disambiguate which one owns a given list_id — resolveHubSpotService
     // throws "Multiple HubSpot accounts found" when accountId is omitted. The
@@ -174,9 +206,10 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       spy.mockResolvedValueOnce({ success: true, audience: { id: 'aud_new_4', name: 'X' } } as any);
       spy.mockResolvedValueOnce({ success: true } as any);
 
-      const mockGetContactsForList = jest.fn().mockResolvedValue([
-        { contactId: '1', email: 'a@example.com', phone: '111' },
-      ]);
+      const mockGetContactsForList = jest.fn().mockResolvedValue({
+        contacts: [{ contactId: '1', email: 'a@example.com', phone: '111' }],
+        failedChunkContactCount: 0,
+      });
       const resolveHubSpotSpy = jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue({
         getContactsForList: mockGetContactsForList,
       });

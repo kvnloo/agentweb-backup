@@ -1432,12 +1432,24 @@ export class HubSpotService {
    * (default: email/firstname/lastname/phone) by paginating membership IDs
    * then batch-reading properties in chunks of 100, mirroring the chunking
    * pattern used by getContactEmailsByIds/getContactLifecycleStages above.
-   * Partial chunk failures are logged and skipped, same as those methods.
+   *
+   * A failed chunk is logged and skipped so the rest of the list still
+   * resolves (a transient API blip on one chunk shouldn't kill the whole
+   * fetch) — but unlike getContactEmailsByIds/getContactLifecycleStages,
+   * callers here need to know if contacts were silently lost: this feeds a
+   * Meta Custom Audience upload, and a caller treating a partial result as
+   * complete would report success while uploading an audience missing
+   * members with no failure surfaced anywhere. failedChunkContactCount lets
+   * the caller (resolveOrCreateSeedAudience) report this as a non-fatal
+   * failure instead.
    */
   async getContactsForList(
     listId: string,
     properties: string[] = ['email', 'firstname', 'lastname', 'phone']
-  ): Promise<Array<{ contactId: string; email?: string; firstname?: string; lastname?: string; phone?: string }>> {
+  ): Promise<{
+    contacts: Array<{ contactId: string; email?: string; firstname?: string; lastname?: string; phone?: string }>;
+    failedChunkContactCount: number;
+  }> {
     if (!listId?.trim()) throw new Error('listId is required');
 
     const allContactIds: string[] = [];
@@ -1448,10 +1460,11 @@ export class HubSpotService {
       cursor = page.nextCursor;
     } while (cursor);
 
-    if (allContactIds.length === 0) return [];
+    if (allContactIds.length === 0) return { contacts: [], failedChunkContactCount: 0 };
 
     const CHUNK_SIZE = 100;
     const contacts: Array<{ contactId: string; email?: string; firstname?: string; lastname?: string; phone?: string }> = [];
+    let failedChunkContactCount = 0;
     for (let i = 0; i < allContactIds.length; i += CHUNK_SIZE) {
       const chunk = allContactIds.slice(i, i + CHUNK_SIZE);
       try {
@@ -1472,9 +1485,10 @@ export class HubSpotService {
         }
       } catch (e: any) {
         console.warn(`[HubSpot] getContactsForList batch/read failed for chunk starting at ${i}:`, e?.message);
+        failedChunkContactCount += chunk.length;
       }
     }
-    return contacts;
+    return { contacts, failedChunkContactCount };
   }
 
   async deleteEmail(emailId: string): Promise<void> {

@@ -93,9 +93,10 @@ describe('HubSpotService — getContactsForList', () => {
   it('returns an empty array for a list with no members', async () => {
     mockAxiosGet.mockResolvedValueOnce({ data: { results: [] } });
 
-    const contacts = await svc.getContactsForList('empty-list');
+    const result = await svc.getContactsForList('empty-list');
 
-    expect(contacts).toEqual([]);
+    expect(result.contacts).toEqual([]);
+    expect(result.failedChunkContactCount).toBe(0);
     expect(mockAxiosPost).not.toHaveBeenCalled();
   });
 
@@ -117,7 +118,7 @@ describe('HubSpotService — getContactsForList', () => {
       },
     });
 
-    const contacts = await svc.getContactsForList('list-1');
+    const result = await svc.getContactsForList('list-1');
 
     expect(mockAxiosGet).toHaveBeenCalledTimes(2);
     expect(mockAxiosPost).toHaveBeenCalledWith(
@@ -125,11 +126,12 @@ describe('HubSpotService — getContactsForList', () => {
       expect.objectContaining({ inputs: [{ id: '1' }, { id: '2' }, { id: '3' }] }),
       expect.any(Object)
     );
-    expect(contacts).toEqual([
+    expect(result.contacts).toEqual([
       { contactId: '1', email: 'a@example.com', firstname: 'A', lastname: 'One', phone: '111' },
       { contactId: '2', email: 'b@example.com', firstname: 'B', lastname: 'Two', phone: '' },
       { contactId: '3', email: '', firstname: 'C', lastname: 'Three', phone: '333' },
     ]);
+    expect(result.failedChunkContactCount).toBe(0);
   });
 
   it('chunks batch/read calls at 100 contact IDs', async () => {
@@ -146,13 +148,32 @@ describe('HubSpotService — getContactsForList', () => {
     expect((mockAxiosPost.mock.calls[1][1] as any).inputs).toHaveLength(50);
   });
 
-  it('logs and skips a failed batch/read chunk without throwing', async () => {
+  // Greptile P1 finding: a failed chunk used to be silently dropped with no
+  // signal to the caller — resolveOrCreateSeedAudience would report the
+  // partial result as if it were the complete list, uploading an audience
+  // missing up to 100 contacts per failed chunk with no failure surfaced in
+  // the completion ledger (AC5). failedChunkContactCount lets the caller
+  // report this as a non-fatal failure instead of silently under-delivering.
+  it('logs and skips a failed batch/read chunk, but reports how many contacts were lost', async () => {
     mockAxiosGet.mockResolvedValueOnce({ data: { results: [{ recordId: '1' }] } });
     mockAxiosPost.mockRejectedValueOnce(new Error('batch/read failed'));
 
-    const contacts = await svc.getContactsForList('list-1');
+    const result = await svc.getContactsForList('list-1');
 
-    expect(contacts).toEqual([]);
+    expect(result.contacts).toEqual([]);
+    expect(result.failedChunkContactCount).toBe(1);
+  });
+
+  it('sums failedChunkContactCount across multiple failed chunks', async () => {
+    const memberIds = Array.from({ length: 150 }, (_, i) => ({ recordId: String(i) }));
+    mockAxiosGet.mockResolvedValueOnce({ data: { results: memberIds } });
+    mockAxiosPost
+      .mockRejectedValueOnce(new Error('chunk 1 failed'))
+      .mockResolvedValueOnce({ data: { results: [] } });
+
+    const result = await svc.getContactsForList('big-list');
+
+    expect(result.failedChunkContactCount).toBe(100);
   });
 
   it('rejects an empty listId', async () => {

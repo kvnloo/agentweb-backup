@@ -17087,7 +17087,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (source.type === 'hubspot_list') {
       const hubspotSvc = await this.resolveHubSpotService(userId, source.hubspotAccountId);
-      const contacts = await hubspotSvc.getContactsForList(source.listId);
+      const { contacts, failedChunkContactCount } = await hubspotSvc.getContactsForList(source.listId);
       const rows: string[][] = [];
       let skipped = 0;
       for (const c of contacts) {
@@ -17097,11 +17097,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           skipped++;
         }
       }
+      const totalFound = contacts.length + failedChunkContactCount;
       if (skipped > 0) {
         failures.push(`${skipped} of ${contacts.length} HubSpot contacts had neither email nor phone, skipped.`);
       }
+      // Greptile P1 finding: a failed batch/read chunk was previously silently
+      // dropped — the audience would upload short with no failure surfaced
+      // anywhere. Report it explicitly so AC5's "any operations that failed"
+      // requirement holds even when the HubSpot side partially fails.
+      if (failedChunkContactCount > 0) {
+        failures.push(`${failedChunkContactCount} of ${totalFound} HubSpot contacts could not be read (batch/read failure) and were NOT included in this audience.`);
+      }
       payload = rows;
-      recordsFound = contacts.length;
+      recordsFound = totalFound;
       recordsUsable = rows.length;
     } else {
       // CSV URL passed straight through — UPLOAD_USERS already fetches/parses it.
