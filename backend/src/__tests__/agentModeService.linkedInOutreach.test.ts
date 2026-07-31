@@ -1238,6 +1238,20 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       );
     });
 
+    it('stamps the CRM mirror with the same instant it caches on the pending invite', async () => {
+      // The lead's linkedInInviteSentAt must agree with the cache row this send
+      // creates, rather than each being stamped from its own clock read.
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+      mockCanOrgMemberAccessList.mockResolvedValue(true);
+
+      await service.linkedinOutreach('user-1', mirrorArgs);
+
+      const cached = mockUpsertSentInvitation.mock.calls[0][0];
+      expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+        expect.objectContaining({ sentAt: cached.sentAt }),
+      );
+    });
+
     it('skips the mirror (no cross-tenant write) when the list is foreign / inaccessible', async () => {
       mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'someone-else' });
       mockCanOrgMemberAccessList.mockResolvedValue(false);

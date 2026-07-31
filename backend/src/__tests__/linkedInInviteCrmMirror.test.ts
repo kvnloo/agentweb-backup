@@ -194,7 +194,10 @@ describe('mirrorLinkedInInviteToCrm', () => {
   });
 
   it('uses the known leadId when the caller already has one (manual CRM button)', async () => {
-    getLeadById.mockResolvedValue({ leadId: 'lead_known', listId: LIST, status: '' });
+    getLeadById.mockResolvedValue({
+      leadId: 'lead_known', listId: LIST, status: '',
+      linkedin: 'https://www.linkedin.com/in/jane-doe',
+    });
     const res = await mirrorLinkedInInviteToCrm({
       listId: LIST,
       leadId: 'lead_known',
@@ -212,6 +215,70 @@ describe('mirrorLinkedInInviteToCrm', () => {
       eventType: 'linkedin.invite.sent',
       createdAt: '2026-07-31T00:00:00.000Z',
     }));
+  });
+
+  // ---- caller-supplied leadId must match the invitee (Greptile P1) ----
+
+  describe('leadId identity', () => {
+    const PROFILE = 'https://www.linkedin.com/in/david-yao';
+
+    it('ignores a leadId whose lead is a DIFFERENT person and resolves by URL', async () => {
+      // On the outreach path lead_id and profile_url are independent LLM-supplied
+      // values; a stale lead_id would otherwise mark the wrong lead contacted and
+      // attach this invitee's engagement to them.
+      getLeadById.mockResolvedValue({
+        leadId: 'lead_someone_else', listId: LIST, status: 'new',
+        linkedin: 'https://www.linkedin.com/in/someone-else',
+      });
+      findLeadByLinkedinInList.mockResolvedValue({
+        leadId: 'lead_real', listId: LIST, status: 'new', linkedin: PROFILE,
+      });
+
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, leadId: 'lead_someone_else', linkedinUrl: PROFILE,
+      });
+
+      expect(res?.leadId).toBe('lead_real');
+      expect(updateLead).not.toHaveBeenCalledWith(LIST, 'lead_someone_else', expect.anything());
+      expect(addLeadEngagement).not.toHaveBeenCalledWith(LIST, 'lead_someone_else', expect.anything());
+    });
+
+    it('creates the invitee when the mismatched leadId is the only candidate', async () => {
+      getLeadById.mockResolvedValue({
+        leadId: 'lead_someone_else', listId: LIST, status: 'won',
+        linkedin: 'https://www.linkedin.com/in/someone-else',
+      });
+      findLeadByLinkedinInList.mockResolvedValue(null);
+
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, leadId: 'lead_someone_else', linkedinUrl: PROFILE,
+      });
+
+      expect(res).toEqual({ leadId: 'lead_new_1', created: true, engagementLogged: true });
+      expect(createLead).toHaveBeenCalledWith(LIST, expect.objectContaining({ linkedin: PROFILE }));
+    });
+
+    it('accepts a leadId whose URL matches only after canonicalization', async () => {
+      getLeadById.mockResolvedValue({
+        leadId: 'lead_known', listId: LIST, status: 'new',
+        linkedin: 'http://linkedin.com/in/David-Yao/',
+      });
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, leadId: 'lead_known', linkedinUrl: PROFILE,
+      });
+      expect(res?.leadId).toBe('lead_known');
+      expect(createLead).not.toHaveBeenCalled();
+    });
+
+    it('does not trust a leadId on a lead with no stored LinkedIn URL', async () => {
+      getLeadById.mockResolvedValue({ leadId: 'lead_no_url', listId: LIST, status: 'new' });
+      findLeadByLinkedinInList.mockResolvedValue(null);
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, leadId: 'lead_no_url', linkedinUrl: PROFILE,
+      });
+      expect(res?.created).toBe(true);
+      expect(findLeadByLinkedinInList).toHaveBeenCalledWith(LIST, PROFILE);
+    });
   });
 
   // ---- engagement idempotency (ENG-787: re-mirroring must not duplicate) ----
@@ -243,7 +310,10 @@ describe('mirrorLinkedInInviteToCrm', () => {
       }));
     });
 
-    it('appends when the same invitee is re-invited later (a genuinely new send)', async () => {
+    it('does not append when only the timestamp differs — one invitation carries several', async () => {
+      // The fresh send stamps locally, the sync cron then overwrites the cache row with
+      // Unipile's parsed_datetime, and the reconciliation reads that. Keying identity on
+      // the timestamp would log the SAME invitation once per source (Greptile P1).
       findLeadByLinkedinInList.mockResolvedValue({
         leadId: 'lead_existing', listId: LIST, status: 'contacted', engagements: [recordedInvite],
       });
@@ -251,8 +321,8 @@ describe('mirrorLinkedInInviteToCrm', () => {
         listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1',
         sentAt: '2026-09-01T12:00:00.000Z',
       });
-      expect(res?.engagementLogged).toBe(true);
-      expect(addLeadEngagement).toHaveBeenCalledTimes(1);
+      expect(res?.engagementLogged).toBe(false);
+      expect(addLeadEngagement).not.toHaveBeenCalled();
     });
 
     it('appends when the same invitee is invited from a DIFFERENT sending account', async () => {
