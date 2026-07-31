@@ -493,6 +493,39 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(createAdSetSpy).not.toHaveBeenCalled();
     });
 
+    // Greptile P1 finding: createMetaAdsAdSet (pre-existing, unrelated to
+    // ENG-600) silently strips daily_budget/lifetime_budget whenever the
+    // target campaign has Advantage Campaign Budget (CBO) enabled. Only
+    // ENG-600's new confirm-token gate treats ad_set_params as something the
+    // user explicitly approved — so without this caveat, a user could
+    // "confirm" a specific budget that then silently never applies. Since
+    // fixing the pre-existing strip itself is out of scope here, the preview
+    // discloses the risk up front instead.
+    it('warns in the preview that a daily/lifetime budget may be silently stripped if the campaign uses CBO', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'create', audience: undefined, created: false, sourceSummary: 'CSV upload (...)', failures: [],
+      });
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, {
+        ...baseArgs(),
+        ad_set_params: { ...baseArgs().ad_set_params, daily_budget: 50 },
+      });
+
+      expect(result.summary).toContain('Advantage Campaign Budget');
+    });
+
+    it('does not add the CBO budget caveat when no budget is provided in ad_set_params', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'create', audience: undefined, created: false, sourceSummary: 'CSV upload (...)', failures: [],
+      });
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, baseArgs());
+
+      expect(result.summary).not.toContain('Advantage Campaign Budget');
+    });
+
     it('executes end-to-end and returns a completion ledger when confirm=true (targeted, no lookalike)', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
       jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({

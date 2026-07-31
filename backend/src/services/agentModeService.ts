@@ -17291,6 +17291,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (workflow === 'retargeting') {
       lines.push(`Exclude custom audience ${args.exclude_audience_id} so retargeting spend does not overlap the broad/prospecting audience.`);
     }
+    // Greptile P1 finding: createMetaAdsAdSet silently strips daily_budget/
+    // lifetime_budget when the target campaign has Advantage Campaign Budget
+    // (CBO) enabled — a caller-supplied budget is only preview_token-bound by
+    // this confirm gate, not guaranteed to actually apply. Disclose the risk
+    // up front rather than let the user believe a specific budget is locked
+    // in by confirming.
+    if (args.ad_set_params?.daily_budget != null || args.ad_set_params?.lifetime_budget != null) {
+      lines.push(`Note: if campaign ${args.campaign_id} has Advantage Campaign Budget (CBO) enabled, Meta requires budget to be set at the campaign level — the daily/lifetime budget above will be silently dropped from the ad set in that case.`);
+    }
     return lines.join(' ');
   }
 
