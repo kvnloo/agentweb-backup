@@ -279,6 +279,16 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       },
     });
 
+    // ENG-600 fix: confirm=true alone is no longer sufficient — it must carry
+    // the preview_token matching a digest of the current arguments. Tests
+    // that want a genuinely confirmed call compute the matching token
+    // directly rather than round-tripping through a real preview call first.
+    const withConfirm = (args: any) => ({
+      ...args,
+      confirm: true,
+      preview_token: (agentModeService as any).computeAudienceCampaignArgsDigest(args),
+    });
+
     it('returns a preview (awaitingUserConfirmation) without executing anything when confirm is not set', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
       const resolveSpy = jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
@@ -309,7 +319,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         success: true, adSet: { id: 'adset_1', name: 'Targeted Ad Set' },
       } as any);
 
-      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, { ...baseArgs(), confirm: true });
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
 
       expect(result.success).toBe(true);
       expect(result.workflow).toBe('targeted_audience');
@@ -336,9 +346,9 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         success: true, adSet: { id: 'adset_2', name: 'Targeted Ad Set' },
       } as any);
 
-      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, {
-        ...baseArgs(), confirm: true, use_lookalike: true, lookalike_ratio: 0.01, lookalike_country: 'US',
-      });
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm({
+        ...baseArgs(), use_lookalike: true, lookalike_ratio: 0.01, lookalike_country: 'US',
+      }));
 
       // ENG-600 live-test finding: Meta rejected lookalike_spec.origin entries
       // missing "type": "custom_audience" with "(#2654) ... No custom_audience
@@ -387,9 +397,9 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         success: true, adSet: { id: 'adset_3', name: 'Retargeting Ad Set' },
       } as any);
 
-      const result = await agentModeService.launchRetargetingCampaign(USER_ID, {
-        ...baseArgs(), audience_name: 'Retargeting Warm List', confirm: true, exclude_audience_id: 'aud_broad_control',
-      });
+      const result = await agentModeService.launchRetargetingCampaign(USER_ID, withConfirm({
+        ...baseArgs(), audience_name: 'Retargeting Warm List', exclude_audience_id: 'aud_broad_control',
+      }));
 
       expect(result.workflow).toBe('retargeting');
       expect(result.ledger.adSet.excludedAudienceId).toBe('aud_broad_control');
@@ -405,7 +415,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       );
       const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
 
-      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, { ...baseArgs(), confirm: true });
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
 
       expect(result.success).toBe(false);
       expect(result.ledger.failures).toEqual([{ step: 'launch', message: 'Payload is empty — no user rows to upload.' }]);
@@ -422,7 +432,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         success: false, message: 'targeting.geo_locations is required and cannot be empty.',
       } as any);
 
-      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, { ...baseArgs(), confirm: true });
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
 
       expect(result.success).toBe(false);
       expect(result.message).toContain('geo_locations');

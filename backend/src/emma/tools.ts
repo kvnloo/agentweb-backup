@@ -1197,7 +1197,8 @@ emmaToolRegistry.register({
         lookalike_ratio: { type: "number", description: "Lookalike ratio 0.01-0.20 (e.g. 0.01 = top 1% of country population). Required if use_lookalike is true — no default is applied." },
         lookalike_country: { type: "string", description: "2-letter ISO country code for the lookalike (e.g. 'US'). Required if use_lookalike is true — no default is applied." },
         ad_set_params: { type: "object", description: "Standard ad set fields (name, daily_budget/lifetime_budget, optimization_goal, billing_event, targeting.geo_locations, start_time, etc.) — same shape as call_meta_marketing_api AD_SET CREATE params, minus targeting.custom_audiences which this tool sets automatically." },
-        confirm: { type: "boolean", description: "Set true only after showing the user the resolved audience + ad set target from the preview and getting explicit approval." }
+        confirm: { type: "boolean", description: "Set true only after showing the user the resolved audience + ad set target from the preview and getting explicit approval." },
+        preview_token: { type: "string", description: "The exact previewToken value returned by the preview call (no confirm). Required alongside confirm=true — copy it verbatim, do not retype or guess it. If it's missing or the arguments changed since the preview, the call returns a fresh preview instead of executing." }
       },
       required: ["account_id", "campaign_id", "audience_name", "audience_source", "ad_set_params"]
     }
@@ -1224,7 +1225,8 @@ emmaToolRegistry.register({
         lookalike_ratio: { type: "number", description: "Lookalike ratio 0.01-0.20. Required if use_lookalike is true — no default is applied." },
         lookalike_country: { type: "string", description: "2-letter ISO country code. Required if use_lookalike is true — no default is applied." },
         ad_set_params: { type: "object", description: "Standard ad set fields — same shape as call_meta_marketing_api AD_SET CREATE params, minus targeting.custom_audiences/excluded_custom_audiences which this tool sets automatically." },
-        confirm: { type: "boolean", description: "Set true only after showing the user the resolved audience + ad set target from the preview and getting explicit approval." }
+        confirm: { type: "boolean", description: "Set true only after showing the user the resolved audience + ad set target from the preview and getting explicit approval." },
+        preview_token: { type: "string", description: "The exact previewToken value returned by the preview call (no confirm). Required alongside confirm=true — copy it verbatim, do not retype or guess it. If it's missing or the arguments changed since the preview, the call returns a fresh preview instead of executing." }
       },
       required: ["account_id", "campaign_id", "audience_name", "audience_source", "exclude_audience_id", "ad_set_params"]
     }

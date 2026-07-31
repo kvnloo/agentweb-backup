@@ -17183,6 +17183,34 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Greptile finding (PR #2234): confirm=true wasn't bound to what was
+   * actually previewed — a model could set confirm=true on the very first
+   * call (skipping the preview entirely) or change arguments between the
+   * preview and confirm calls, and the tool would execute on the unverified/
+   * changed arguments with no way to detect it. This computes a deterministic
+   * digest over every argument that defines WHAT gets created/changed;
+   * launchAudienceCampaign only treats a call as genuinely confirmed when
+   * args.preview_token matches the digest recomputed from the CURRENT args —
+   * so a first-call confirm=true (no token yet) or a changed argument after
+   * preview both fail the check and fall back into a fresh preview instead
+   * of executing.
+   */
+  private computeAudienceCampaignArgsDigest(args: any): string {
+    const canonical = {
+      account_id: args.account_id,
+      campaign_id: args.campaign_id,
+      audience_name: args.audience_name,
+      audience_source: args.audience_source,
+      use_lookalike: !!args.use_lookalike,
+      lookalike_ratio: args.lookalike_ratio,
+      lookalike_country: args.lookalike_country,
+      exclude_audience_id: args.exclude_audience_id,
+      ad_set_params: args.ad_set_params,
+    };
+    return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+  }
+
+  /**
    * Resolves args.audience_source into the discriminated union
    * resolveOrCreateSeedAudience expects. Throws if neither or both of
    * hubspot_list_id/csv_url are provided.
@@ -17228,23 +17256,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
 
       const source = this.resolveAudienceSourceArg(args.audience_source);
-      const confirmed = args.confirm === true;
+      const expectedPreviewToken = this.computeAudienceCampaignArgsDigest(args);
+      const confirmAttempted = args.confirm === true;
+      const tokenValid = args.preview_token === expectedPreviewToken;
+      const confirmed = confirmAttempted && tokenValid;
 
       if (!confirmed) {
         const plan = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: true });
         const summary = this.buildAudienceCampaignConfirmationSummary(workflow, args, plan);
+        // Distinguish "first preview, nothing attempted yet" from "confirm was
+        // attempted but the token was missing/stale" — the latter means either
+        // the model tried to self-approve without a real preview, or the
+        // arguments changed since the last preview was shown.
+        const staleNotice = confirmAttempted
+          ? 'The confirmation token was missing or no longer matches these arguments (they may have changed since the last preview), so this cannot execute yet — here is the CURRENT plan to confirm instead. '
+          : '';
         return {
           success: true,
           requiresConfirmation: true,
           awaitingUserConfirmation: true,
           summary,
+          previewToken: expectedPreviewToken,
           confirmationPrompt:
-            `Based on your request, here's the ${workflow === 'retargeting' ? 'retargeting' : 'targeted-audience'} campaign ` +
+            `${staleNotice}Based on your request, here's the ${workflow === 'retargeting' ? 'retargeting' : 'targeted-audience'} campaign ` +
             `I'm about to launch — please check it's correct before I proceed:\n\n${summary}\n\n` +
             `Reply "yes" / "confirm" if this is correct, or tell me what to change.`,
           confirmationDetail: summary,
-          message: `Confirm this ${workflow} campaign launch before it runs: ${summary} Show the user the plan above ` +
-            `and get explicit approval. Once approved, call this tool again with the same arguments plus confirm=true.`,
+          message: `${staleNotice}Confirm this ${workflow} campaign launch before it runs: ${summary} Show the user the plan above ` +
+            `and get explicit approval. Once approved, call this tool again with the EXACT SAME arguments plus confirm=true ` +
+            `and preview_token="${expectedPreviewToken}" (copy it verbatim from this response — it will not match if you retype it or change any argument).`,
         };
       }
 
