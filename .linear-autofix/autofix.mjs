@@ -17,6 +17,7 @@ import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs'
 import { evictPreviewsToFit, atConcurrentPreviewCap } from './preview/policy.mjs';
 import { acquireLock, releaseLock } from './lock.mjs';
 import { admissionWithdrawal, signalSuppressionVerdict } from './admission.mjs';
+import { isAlreadyProcessed } from './processed-gate.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..'); // the agentweb (main) repo root
@@ -266,12 +267,11 @@ async function main() {
   if (process.argv.includes('--verify-only')) { await verifyOnlyRun(issue); return; }
 
   const state = loadState();
-  // Non-final outcomes may be re-processed: 'recovered' = the stale sweep reset a crashed run;
-  // 'started' = a run that crashed before recording any outcome (or is being retried by hand);
-  // 'blocked' = the fixability gate held it — retried once the blocked label is removed
-  // (while the label is on, the poller's pickup filter never lists the issue).
-  const NON_FINAL = ['recovered', 'started', 'blocked'];
-  if (state[issue.id] && !NON_FINAL.includes(state[issue.id].outcome) && !force) { log(`Already processed (${state[issue.id].outcome}). Use --force to redo.`); return; }
+  // Skip only when the issue already carries a FINAL outcome (isAlreadyProcessed in processed-gate.mjs).
+  // A missing/empty outcome means the fix has not run yet — a fresh issue OR the ENG-654 admission stub the
+  // poller pre-writes ({ identifier, admit }) before the run — so it must fall through (ENG-787). Non-final
+  // outcomes (recovered/started/blocked) are re-processable; --force redoes anything.
+  if (isAlreadyProcessed(state[issue.id], { force })) { log(`Already processed (${state[issue.id].outcome}). Use --force to redo.`); return; }
 
   const labelNames = (issue.labels?.nodes || []).map((l) => l.name.toLowerCase());
   const model = labelNames.some((n) => config.opusLabels.includes(n)) ? config.opusModel : config.defaultModel;
