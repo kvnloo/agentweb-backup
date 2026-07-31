@@ -8,6 +8,8 @@ jest.mock('../services/twitterService', () => ({
     getUserTweets: jest.fn(),
     getClient: jest.fn(),
   },
+  // Passthrough — the adapter wraps its X calls in the acting-user context.
+  runWithXActingUser: (_id: string | undefined, fn: () => unknown) => fn(),
 }));
 
 const mockPostTweet = twitterService.postTweet as jest.Mock;

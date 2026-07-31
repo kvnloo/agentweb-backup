@@ -59,8 +59,12 @@ const SCHEMA_RE =
 // still classified — e.g. provider 429s, which would otherwise fall to 'bug'.
 // "summarizer summary" = downstream of a provider 429 (cascade). "operation was
 // aborted" = an AbortController timeout — a tunable-infra issue, not a code bug.
+// "HTTP 402" / "out of credits" / "payment required" = a metered vendor wallet
+// is depleted (X shared app, ENG-664) — a billing/quota config gap, not a tool
+// bug. The 402 alternation is anchored to an HTTP-status context (not a bare
+// "402" number, which could appear in an unrelated id/line-number message).
 const CONFIG_RE =
-  /\b429\b|too many requests|rate.?limit|quota exceeded|unauthorized|forbidden|invalid api key|missing credentials|bad credentials|authentication failed|does not exist|not configured|not a member of channel|not authorized|no secrets configured|account connected|specified bucket|job timed out|insights job|unable to retrieve a summarizer|status code 404|operation was aborted/i;
+  /\b429\b|http\s*402|status(?:\s+code)?\s+402|out of credits|payment required|too many requests|rate.?limit|quota exceeded|unauthorized|forbidden|invalid api key|missing credentials|bad credentials|authentication failed|does not exist|not configured|not a member of channel|not authorized|no secrets configured|account connected|specified bucket|job timed out|insights job|unable to retrieve a summarizer|status code 404|operation was aborted/i;
 
 /**
  * @param errorClass  output of classifyToolErrorClass (may be '', undefined)
@@ -88,8 +92,11 @@ export function classifyToolFailureType(errorClass?: string, errorMessage?: stri
   if (cls === 'invalid_args') return 'schema_reject';
   if (SCHEMA_RE.test(msg)) return 'schema_reject';
 
-  // 4. Config / environment / credentials / quota / missing resource.
-  if (cls === 'rate_limit' || cls === 'auth' || cls === 'not_found') return 'config';
+  // 4. Config / environment / credentials / quota / missing resource. Includes
+  //    'payment_required' — a metered vendor wallet out of credits (X shared app,
+  //    ENG-664) is a billing/quota gap fixable without touching tool logic, NOT a
+  //    tool bug, so it stays out of the tool-bug rate while still being visible.
+  if (cls === 'rate_limit' || cls === 'auth' || cls === 'not_found' || cls === 'payment_required') return 'config';
   if (CONFIG_RE.test(msg)) return 'config';
 
   // 5. Genuine or transient failure to investigate (network, generic timeout,
