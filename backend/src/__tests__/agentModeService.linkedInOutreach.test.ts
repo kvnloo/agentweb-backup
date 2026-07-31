@@ -63,14 +63,25 @@ jest.mock('../services/emailEventsDb', () => ({
 // Mock crmDb
 const mockGetLeadById = jest.fn();
 const mockUpdateLeadLinkedInSyncAt = jest.fn().mockResolvedValue(undefined);
+const mockGetLeadListById = jest.fn();
+const mockCanOrgMemberAccessList = jest.fn();
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadById: (...args: any[]) => mockGetLeadById(...args),
     updateLeadLinkedInSyncAt: (...args: any[]) => mockUpdateLeadLinkedInSyncAt(...args),
+    getLeadListById: (...args: any[]) => mockGetLeadListById(...args),
+    canOrgMemberAccessList: (...args: any[]) => mockCanOrgMemberAccessList(...args),
   },
   userDb: {
     getUserById: jest.fn().mockResolvedValue(null),
   },
+}));
+
+// Mock the CRM invite mirror (ENG-787) so we can assert whether the send-invite
+// path reconciles the invitee — gated on the list-access check below.
+const mockMirrorLinkedInInviteToCrm = jest.fn().mockResolvedValue({ leadId: 'lead_x', created: true });
+jest.mock('../services/linkedInInviteCrmMirror', () => ({
+  mirrorLinkedInInviteToCrm: (...args: any[]) => mockMirrorLinkedInInviteToCrm(...args),
 }));
 
 // Mock unipileSentInvitationsDb (ENG-182 pre-invite dedup cache). The pre-check
@@ -1191,6 +1202,61 @@ describe('AgentModeService - LinkedIn Outreach', () => {
         expect(result.accountThrottled).toBeUndefined();
         expect(result.error).toBe('Cannot resend yet');
       });
+    });
+  });
+
+  // ENG-787 (security): the send-invite CRM mirror creates leads + engagement in
+  // the LLM-supplied list_id, so it must verify list access before writing —
+  // otherwise a foreign list_id becomes a cross-tenant broken-access-control write.
+  describe('send-invite CRM mirror access guard', () => {
+    const mirrorArgs = {
+      action: 'send-invite',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/jane-doe/',
+      message: 'Hi Jane, let us connect!',
+      list_id: 'list_owned',
+      first_name: 'Jane',
+      last_name: 'Doe',
+    };
+
+    beforeEach(() => {
+      mockGetInviteCharLimitForAccount.mockResolvedValue(200);
+      mockSendInvitation.mockResolvedValue({ id: 'invite-777' });
+    });
+
+    it('mirrors the invite when the caller can access the target list', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'user-1' });
+      mockCanOrgMemberAccessList.mockResolvedValue(true);
+
+      const result = await service.linkedinOutreach('user-1', mirrorArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockGetLeadListById).toHaveBeenCalledWith('list_owned');
+      expect(mockCanOrgMemberAccessList).toHaveBeenCalledWith('user-1', expect.objectContaining({ id: 'list_owned' }));
+      expect(mockMirrorLinkedInInviteToCrm).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'user-1', listId: 'list_owned', linkedinUrl: 'https://www.linkedin.com/in/jane-doe/' }),
+      );
+    });
+
+    it('skips the mirror (no cross-tenant write) when the list is foreign / inaccessible', async () => {
+      mockGetLeadListById.mockResolvedValue({ id: 'list_owned', userId: 'someone-else' });
+      mockCanOrgMemberAccessList.mockResolvedValue(false);
+
+      const result = await service.linkedinOutreach('user-1', mirrorArgs);
+
+      // The invite still succeeds (Unipile accepted it); only the CRM write is skipped.
+      expect(result.success).toBe(true);
+      expect(mockCanOrgMemberAccessList).toHaveBeenCalledWith('user-1', expect.any(Object));
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
+    });
+
+    it('skips the mirror when the list does not exist', async () => {
+      mockGetLeadListById.mockResolvedValue(null);
+
+      const result = await service.linkedinOutreach('user-1', mirrorArgs);
+
+      expect(result.success).toBe(true);
+      expect(mockMirrorLinkedInInviteToCrm).not.toHaveBeenCalled();
     });
   });
 

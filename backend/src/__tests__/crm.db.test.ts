@@ -199,6 +199,30 @@ describe('CRM Database Service', () => {
       expect(result.email).toBe(leadData.email.toLowerCase());
     });
 
+    it('stores the linkedin field in canonical form so the lookup GSI stays canonical (ENG-787)', async () => {
+      const listId = 'list_123';
+      // Differently-formatted URL: http scheme, mixed case, trailing slash, tracking query.
+      const leadData = {
+        firstName: 'Jane',
+        linkedin: 'http://LinkedIn.com/in/JaneDoe/?miniProfileUrn=abc',
+      };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.Item.linkedin).toBe('https://www.linkedin.com/in/janedoe');
+    });
+
     it('should handle leads without email', async () => {
       const listId = 'list_123';
       const leadData = {
@@ -513,6 +537,25 @@ describe('CRM Database Service', () => {
       // Verify email is normalized in the update expression
       const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
       expect(updateCall.ExpressionAttributeValues[':email']).toBe('newemail@example.com');
+    });
+
+    it('canonicalizes the linkedin field so the lookup GSI stays canonical (ENG-787)', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const updates = {
+        linkedin: 'http://LinkedIn.com/in/JaneDoe/?miniProfileUrn=abc',
+      };
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: { leadId, listId },
+        }),
+      });
+
+      await crmDb.updateLead(listId, leadId, updates);
+
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(updateCall.ExpressionAttributeValues[':linkedin']).toBe('https://www.linkedin.com/in/janedoe');
     });
 
     it('should handle customFields updates', async () => {
