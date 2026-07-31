@@ -1,86 +1,84 @@
 /**
  * Unit tests for the single-use preview-token consumption store (ENG-600
- * Greptile finding: an HMAC-valid preview token was never consumed/invalidated
- * after use, so replaying the same confirmed call would silently re-execute —
- * e.g. creating a second ad set under the same campaign with no new user
- * confirmation).
+ * Greptile findings: (1) an HMAC-valid preview token was never consumed or
+ * invalidated after use, so replaying the same confirmed call would silently
+ * re-execute — e.g. creating a second ad set under the same campaign with no
+ * new user confirmation; (2) a separate check-then-mark (isConsumed, then
+ * markConsumed) was non-atomic — two concurrent requests with the same valid
+ * token could both read "not yet consumed" before either write became
+ * visible, both then executing from a single user confirmation).
+ *
+ * claimPreviewToken uses a single conditional DynamoDB put
+ * (attribute_not_exists) to claim the token atomically — only one concurrent
+ * caller can ever win, mirroring the same conditional-put pattern already
+ * used elsewhere in this codebase (see enrichSoServiceFactory.ts's
+ * safeIncrement race-safe day-rollover).
  *
  * Reuses the existing AW-Configs table (keyed userId+configId) rather than a
  * new table, per CLAUDE.md's "Database/data-plane work requires Harsha
  * before merge" gate.
  */
 
-const mockGet = jest.fn();
 const mockPut = jest.fn();
 
 jest.mock('aws-sdk', () => ({
   DynamoDB: {
     DocumentClient: jest.fn().mockImplementation(() => ({
-      get: (params: any) => ({ promise: () => mockGet(params) }),
       put: (params: any) => ({ promise: () => mockPut(params) }),
     })),
   },
 }));
 
-import {
-  isPreviewTokenConsumed,
-  markPreviewTokenConsumed,
-} from '../services/metaAudienceCampaignTokenStore';
+import { claimPreviewToken } from '../services/metaAudienceCampaignTokenStore';
 
 describe('metaAudienceCampaignTokenStore', () => {
   beforeEach(() => {
     jest.clearAllMocks();
   });
 
-  describe('isPreviewTokenConsumed', () => {
-    it('returns false when the token has never been marked consumed', async () => {
-      mockGet.mockResolvedValueOnce({});
+  describe('claimPreviewToken', () => {
+    it('returns true (claimed) when the token has never been claimed before', async () => {
+      mockPut.mockResolvedValueOnce({});
 
-      const result = await isPreviewTokenConsumed('user1', 'abc123token');
+      const result = await claimPreviewToken('user1', 'abc123token');
 
-      expect(result).toBe(false);
-      expect(mockGet).toHaveBeenCalledWith(
+      expect(result).toBe(true);
+      expect(mockPut).toHaveBeenCalledWith(
         expect.objectContaining({
-          Key: { userId: 'user1', configId: 'metaAudienceCampaignConfirmToken:abc123token' },
+          Item: expect.objectContaining({ userId: 'user1', configId: 'metaAudienceCampaignConfirmToken:abc123token' }),
+          ConditionExpression: 'attribute_not_exists(userId)',
         })
       );
     });
 
-    it('returns true when the token was previously marked consumed', async () => {
-      mockGet.mockResolvedValueOnce({ Item: { consumedAt: '2026-07-31T00:00:00.000Z' } });
+    it('returns false (already claimed) when the conditional put fails because the token was already claimed', async () => {
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPut.mockRejectedValueOnce(err);
 
-      const result = await isPreviewTokenConsumed('user1', 'abc123token');
+      const result = await claimPreviewToken('user1', 'abc123token');
 
-      expect(result).toBe(true);
+      expect(result).toBe(false);
+    });
+
+    it('propagates an unrelated DynamoDB error rather than treating it as already-claimed', async () => {
+      mockPut.mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'));
+
+      await expect(claimPreviewToken('user1', 'abc123token')).rejects.toThrow(
+        'ProvisionedThroughputExceededException'
+      );
     });
 
     // Different users confirming the exact same args (thus same digest, since
     // the digest doesn't include userId) must not collide — each user's
-    // confirm is tracked independently.
-    it('scopes consumption per userId, not just per token', async () => {
-      mockGet.mockResolvedValueOnce({});
-
-      await isPreviewTokenConsumed('user2', 'abc123token');
-
-      expect(mockGet).toHaveBeenCalledWith(
-        expect.objectContaining({ Key: { userId: 'user2', configId: 'metaAudienceCampaignConfirmToken:abc123token' } })
-      );
-    });
-  });
-
-  describe('markPreviewTokenConsumed', () => {
-    it('writes a record keyed by userId + the token', async () => {
+    // confirm is claimed independently.
+    it('scopes the claim per userId, not just per token', async () => {
       mockPut.mockResolvedValueOnce({});
 
-      await markPreviewTokenConsumed('user1', 'abc123token');
+      await claimPreviewToken('user2', 'abc123token');
 
       expect(mockPut).toHaveBeenCalledWith(
-        expect.objectContaining({
-          Item: expect.objectContaining({
-            userId: 'user1',
-            configId: 'metaAudienceCampaignConfirmToken:abc123token',
-          }),
-        })
+        expect.objectContaining({ Item: expect.objectContaining({ userId: 'user2' }) })
       );
     });
   });

@@ -1,9 +1,21 @@
 /**
- * Tracks single-use consumption of audience-campaign confirm preview tokens
- * (ENG-600 Greptile finding: an HMAC-valid preview token was never consumed
- * or invalidated after use, so replaying the same confirmed call would
- * silently re-execute — e.g. creating a second ad set under the same
- * campaign with no new user confirmation).
+ * Tracks single-use consumption of audience-campaign confirm preview tokens.
+ *
+ * ENG-600 Greptile findings:
+ * 1. An HMAC-valid preview token was never consumed or invalidated after
+ *    use, so replaying the same confirmed call would silently re-execute —
+ *    e.g. creating a second ad set under the same campaign with no new user
+ *    confirmation.
+ * 2. A separate check-then-mark (isConsumed, then markConsumed) is
+ *    non-atomic: two concurrent requests with the same valid token could
+ *    both read "not yet consumed" before either write became visible, both
+ *    then executing from a single user confirmation.
+ *
+ * claimPreviewToken closes both by using a single conditional DynamoDB put
+ * (attribute_not_exists) to claim the token atomically — only one concurrent
+ * caller can ever win. Mirrors the same conditional-put race-safety pattern
+ * already used elsewhere in this codebase (see enrichSoServiceFactory.ts's
+ * safeIncrement day-rollover claim).
  *
  * Reuses the existing AW-Configs table (keyed userId+configId) rather than a
  * new table — per CLAUDE.md's "Database/data-plane work requires Harsha
@@ -24,23 +36,28 @@ function tokenConfigId(token: string): string {
   return `metaAudienceCampaignConfirmToken:${token}`;
 }
 
-export async function isPreviewTokenConsumed(userId: string, token: string): Promise<boolean> {
+/**
+ * Attempts to atomically claim a preview token for this user. Returns true
+ * if this call won the claim (the token had never been claimed before) and
+ * false if it was already claimed (by a prior call, or a concurrent one that
+ * won the race) — the caller should treat false exactly like an invalid
+ * token and fall back to a fresh preview rather than executing.
+ */
+export async function claimPreviewToken(userId: string, token: string): Promise<boolean> {
   const dynamodb = new AWS.DynamoDB.DocumentClient();
-  const result = await dynamodb.get({
-    TableName: CONFIGS_TABLE,
-    Key: { userId, configId: tokenConfigId(token) },
-  }).promise();
-  return !!result.Item;
-}
-
-export async function markPreviewTokenConsumed(userId: string, token: string): Promise<void> {
-  const dynamodb = new AWS.DynamoDB.DocumentClient();
-  await dynamodb.put({
-    TableName: CONFIGS_TABLE,
-    Item: {
-      userId,
-      configId: tokenConfigId(token),
-      consumedAt: new Date().toISOString(),
-    },
-  }).promise();
+  try {
+    await dynamodb.put({
+      TableName: CONFIGS_TABLE,
+      Item: {
+        userId,
+        configId: tokenConfigId(token),
+        consumedAt: new Date().toISOString(),
+      },
+      ConditionExpression: 'attribute_not_exists(userId)',
+    }).promise();
+    return true;
+  } catch (e: any) {
+    if (e.code === 'ConditionalCheckFailedException') return false;
+    throw e;
+  }
 }
