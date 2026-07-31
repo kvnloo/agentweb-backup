@@ -93,6 +93,13 @@ const dedupeLinkedInMessageEvents = <T extends { eventId?: string; eventType?: s
 
 const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
 
+/**
+ * Engagement count at which a lead is logged as approaching the 400 KB DynamoDB
+ * item ceiling. The array is unbounded by design; this makes the growth visible
+ * before writes start failing.
+ */
+const ENGAGEMENT_COUNT_WARN_THRESHOLD = 500;
+
 const engagementMatchesKeyword = (engagement: any): boolean => {
   const eventType = String(engagement?.eventType || "").toLowerCase();
   const eventData = String(JSON.stringify(engagement?.eventData || {})).toLowerCase();
@@ -5320,7 +5327,17 @@ export const crmDb = {
       // Store LinkedIn URL in canonical form (matching batchCreateLeads) so the
       // LinkedinLookupIndex GSI stays canonical and future dedup reads match
       // regardless of the source's formatting (ENG-787).
-      const linkedinValue = normalizeLinkedInUrl(leadData.linkedin);
+      //
+      // normalizeLinkedInUrl returns '' for anything that is not a personal /in/
+      // profile (company page, school, free text). Falling back to the trimmed raw
+      // value keeps that content — canonicalization must never silently discard
+      // what the caller supplied, which is what dropping to '' would do.
+      // Only an actual personal /in/ profile is canonicalized. normalizeLinkedInUrl
+      // returns '' for company/school URLs and lowercases free text, so guarding on
+      // '/in/' keeps everything else byte-identical to what the caller sent.
+      const rawLinkedin = leadData.linkedin?.trim();
+      const canonicalLinkedin = normalizeLinkedInUrl(leadData.linkedin);
+      const linkedinValue = canonicalLinkedin.includes('/in/') ? canonicalLinkedin : rawLinkedin;
       const item: any = {
         listId,
         leadId,
@@ -5736,6 +5753,10 @@ export const crmDb = {
           FilterExpression: 'listId = :listId',
           ExpressionAttributeValues: { ':linkedin': value, ':listId': listId },
           ScanIndexForward: false,
+          // Bound the read units consumed per request. The filter is applied AFTER
+          // Limit, so this caps work per call without capping the search — the
+          // pagination below still walks the whole partition when it has to.
+          Limit: 100,
           ExclusiveStartKey: lastEvaluatedKey,
         }).promise();
         const hit = (result.Items || [])[0];
@@ -6022,7 +6043,14 @@ export const crmDb = {
         // Canonicalize (matching batchCreateLeads / createLead) so the
         // LinkedinLookupIndex GSI stays canonical and dedup reads match
         // regardless of the source's formatting (ENG-787).
-        const normalizedLinkedin = normalizeLinkedInUrl(updates.linkedin);
+        //
+        // A non-personal URL normalizes to '' — fall back to the trimmed raw value
+        // so the field is only REMOVED when the caller actually sent an empty
+        // value. Without this, updating a lead whose linkedin holds a company page
+        // would silently delete it.
+        const trimmedLinkedin = (updates.linkedin ?? '').trim();
+        const canonicalLinkedin = normalizeLinkedInUrl(updates.linkedin);
+        const normalizedLinkedin = canonicalLinkedin.includes('/in/') ? canonicalLinkedin : trimmedLinkedin;
         if (normalizedLinkedin) {
           setExpressions.push('linkedin = :linkedin');
           expressionAttributeValues[':linkedin'] = normalizedLinkedin;
@@ -7039,12 +7067,6 @@ export const crmDb = {
     createdAt: string;
   }) {
     try {
-      // Get the lead first to ensure it exists
-      const lead = await this.getLeadById(listId, leadId);
-      if (!lead) {
-        throw new Error('Lead not found');
-      }
-
       // Generate a unique eventId for this engagement
       const eventId = `custom_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
@@ -7054,30 +7076,64 @@ export const crmDb = {
         eventId,
       };
 
-      // Get existing engagements or initialize empty array
-      const existingEngagements = (lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || [];
+      // Append atomically. This used to read the lead, concatenate in memory and
+      // write the whole array back — two engagements landing concurrently (e.g. an
+      // outreach run and the invite reconciliation touching the same lead) would
+      // both read the same base array and the second write would silently drop the
+      // first. list_append lets DynamoDB do the concatenation server-side, and
+      // attribute_exists replaces the pre-read that enforced "lead must exist".
+      //
+      // isEngaged is only ever raised, never recomputed: it is monotonic (an
+      // engagement is never removed by this path), so a matching new event sets it
+      // and a non-matching one leaves whatever earlier events established.
+      const raisesEngaged = engagementMatchesKeyword(engagementWithId);
+      const setClauses = [
+        'engagements = list_append(if_not_exists(engagements, :empty), :new)',
+        'updatedAt = :updatedAt',
+      ];
+      const expressionAttributeValues: Record<string, any> = {
+        ':empty': [],
+        ':new': [engagementWithId],
+        ':updatedAt': new Date().toISOString(),
+      };
+      if (raisesEngaged) {
+        setClauses.push('isEngaged = :isEngaged');
+        expressionAttributeValues[':isEngaged'] = 1;
+      }
 
-      // Add the new engagement
-      const updatedEngagements = [...existingEngagements, engagementWithId];
-      const isEngaged = updatedEngagements.some(engagementMatchesKeyword) ? 1 : 0;
-
-      // Update the lead with the new engagements array
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: {
           listId,
           leadId,
         },
-        UpdateExpression: 'SET engagements = :engagements, isEngaged = :isEngaged, updatedAt = :updatedAt',
-        ExpressionAttributeValues: {
-          ':engagements': updatedEngagements,
-          ':isEngaged': isEngaged,
-          ':updatedAt': new Date().toISOString(),
-        },
+        UpdateExpression: `SET ${setClauses.join(', ')}`,
+        ConditionExpression: 'attribute_exists(leadId)',
+        ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: 'ALL_NEW',
       };
 
-      const result = await dynamodb.update(params).promise();
+      let result;
+      try {
+        result = await dynamodb.update(params).promise();
+      } catch (updateError: any) {
+        // Preserve the pre-existing contract for a missing lead.
+        if (updateError?.code === 'ConditionalCheckFailedException') {
+          throw new Error('Lead not found');
+        }
+        throw updateError;
+      }
+
+      // A DynamoDB item is capped at 400 KB and engagements are unbounded, so a
+      // very long-lived lead can eventually fail to accept writes. Surface that
+      // before it becomes a hard failure rather than discovering it in an outage.
+      const engagementCount = (result.Attributes?.engagements as any[] | undefined)?.length ?? 0;
+      if (engagementCount >= ENGAGEMENT_COUNT_WARN_THRESHOLD) {
+        console.warn(
+          `[crmDb.addLeadEngagement] lead ${listId}/${leadId} now holds ${engagementCount} engagements — approaching the DynamoDB item-size ceiling`,
+        );
+      }
+
       return result.Attributes;
     } catch (error) {
       handleDynamoDbError(error, "addLeadEngagement");
