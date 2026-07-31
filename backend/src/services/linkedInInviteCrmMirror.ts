@@ -8,6 +8,38 @@ import { normalizeLinkedInUrl } from './enrichmentGroups';
  */
 const UNCONTACTED_STATUSES = new Set(['', 'new', 'not_contacted', 'uncontacted', 'to_contact', 'none']);
 
+/** Engagement event type written for every mirrored invitation. */
+const INVITE_SENT_EVENT = 'linkedin.invite.sent';
+
+/**
+ * True when the lead already carries an engagement for THIS exact invitation.
+ *
+ * `addLeadEngagement` appends unconditionally, so without this guard the same
+ * real-world invitation is logged again every time it is re-mirrored — and it is
+ * re-mirrored often: the send-time dedup guard re-runs the mirror on every
+ * outreach run for an invite that is still pending, and the reconciliation job is
+ * designed to be re-run as a backstop. That would turn the ENG-787 under-count
+ * into an over-count and inflate follow-up cadence.
+ *
+ * Identity is (event type, sending account, invitee, send time). `sentAt` for a
+ * cached pending invitation is stable across syncs, so re-mirroring matches; a
+ * genuinely new invitation (previous one accepted/withdrawn, then re-sent) carries
+ * a later timestamp and is still recorded.
+ */
+function hasInviteEngagement(
+  lead: any,
+  opts: { linkedin: string; accountId: string; sentAt: string },
+): boolean {
+  const engagements = Array.isArray(lead?.engagements) ? lead.engagements : [];
+  return engagements.some(
+    (e: any) =>
+      String(e?.eventType ?? '') === INVITE_SENT_EVENT &&
+      String(e?.createdAt ?? '') === opts.sentAt &&
+      String(e?.eventData?.linkedin ?? '') === opts.linkedin &&
+      String(e?.eventData?.accountId ?? '') === opts.accountId,
+  );
+}
+
 export interface MirrorInviteParams {
   /** List-owner userId — stamped on newly-created leads for audit (CRM-history Tier 0). */
   userId?: string;
@@ -40,6 +72,12 @@ export interface MirrorInviteResult {
   leadId: string;
   /** True when a new lead was (or would be) created; false when an existing lead matched. */
   created: boolean;
+  /**
+   * True when a `linkedin.invite.sent` engagement was appended; false when this exact
+   * invitation was already recorded on the lead (re-mirror of a still-pending invite,
+   * or a repeat reconciliation run) and the append was skipped.
+   */
+  engagementLogged: boolean;
 }
 
 /**
@@ -67,9 +105,10 @@ export async function mirrorLinkedInInviteToCrm(
   const sentAt = params.sentAt || new Date().toISOString();
 
   // Resolve the target lead. A caller that already knows the lead (manual CRM button)
-  // passes leadId. The outreach path resolves by normalized LinkedIn URL — but
-  // findLeadsByLinkedin is a GLOBAL GSI lookup, so it must be scoped to THIS list; a
-  // same-URL match in another list is a different lead and must not be reused.
+  // passes leadId. The outreach path resolves by normalized LinkedIn URL —
+  // findLeadByLinkedinInList scopes that GLOBAL GSI lookup to THIS list server-side
+  // (a same-URL match in another list is a different lead and must not be reused) and
+  // pages past the 10-item ceiling that would otherwise hide the match.
   let leadId = params.leadId;
   let existing: any = null;
   if (leadId) {
@@ -77,14 +116,18 @@ export async function mirrorLinkedInInviteToCrm(
     if (!existing) leadId = undefined;
   }
   if (!leadId) {
-    const matches = await crmDb.findLeadsByLinkedin(normalized);
-    existing = (matches || []).find((l: any) => l.listId === params.listId) || null;
+    existing = await crmDb.findLeadByLinkedinInList(params.listId, normalized);
     if (existing) leadId = existing.leadId as string;
   }
 
   // Read-only preview: report whether this invitee would be created vs updated, no writes.
   if (params.dryRun) {
-    return { leadId: leadId ?? '', created: !leadId };
+    const alreadyLogged = !!existing && hasInviteEngagement(existing, {
+      linkedin: normalized,
+      accountId: params.accountId || '',
+      sentAt,
+    });
+    return { leadId: leadId ?? '', created: !leadId, engagementLogged: !alreadyLogged };
   }
 
   let created = false;
@@ -118,17 +161,23 @@ export async function mirrorLinkedInInviteToCrm(
   await crmDb.updateLead(params.listId, leadId, leadUpdate);
 
   // Lead-level engagement record — provenance + so follow-up cadence can fire.
+  // Skipped when this exact invitation is already on the lead, so re-mirroring a
+  // still-pending invite (or re-running the reconciliation) stays idempotent.
+  const accountId = params.accountId || '';
+  if (!created && hasInviteEngagement(existing, { linkedin: normalized, accountId, sentAt })) {
+    return { leadId, created, engagementLogged: false };
+  }
   await crmDb.addLeadEngagement(params.listId, leadId, {
-    eventType: 'linkedin.invite.sent',
+    eventType: INVITE_SENT_EVENT,
     eventData: {
       note: params.note || '',
-      accountId: params.accountId || '',
+      accountId,
       linkedin: normalized,
     },
     createdAt: sentAt,
   });
 
-  return { leadId, created };
+  return { leadId, created, engagementLogged: true };
 }
 
 /** Split a LinkedIn display name ("Bala S.", "泓杰 虞") into best-effort first/last. */
@@ -169,6 +218,13 @@ export interface ReconcileInvitationsResult {
   updated: number;
   /** Invitations skipped (no usable /in/ URL, or a per-item error). */
   skipped: number;
+  /**
+   * Of `updated`, how many already carried this invitation's engagement — i.e. were
+   * mirrored by an earlier run and needed no new engagement. A repeat run should
+   * report nearly all updates here; a non-zero `created` on a repeat run means new
+   * invitations arrived since.
+   */
+  alreadyRecorded: number;
 }
 
 /**
@@ -192,7 +248,9 @@ export async function reconcileSentInvitationsToCrm(
   params: ReconcileInvitationsParams,
 ): Promise<ReconcileInvitationsResult> {
   const { accountId, listId, userId } = params;
-  const result: ReconcileInvitationsResult = { total: 0, created: 0, updated: 0, skipped: 0 };
+  const result: ReconcileInvitationsResult = {
+    total: 0, created: 0, updated: 0, skipped: 0, alreadyRecorded: 0,
+  };
   if (!accountId || !listId) return result;
 
   // Refresh the cache from Unipile's live sent feed first (default on) so the
@@ -231,6 +289,7 @@ export async function reconcileSentInvitationsToCrm(
         result.created++;
       } else {
         result.updated++;
+        if (!mirror.engagementLogged) result.alreadyRecorded++;
       }
     } catch (itemErr) {
       // One malformed/racey invite must never abort the whole reconciliation.
@@ -240,7 +299,7 @@ export async function reconcileSentInvitationsToCrm(
   }
 
   console.log(
-    `[reconcileSentInvitations]${params.dryRun ? ' (DRY-RUN, no writes)' : ''} account=${accountId} list=${listId} total=${result.total} created=${result.created} updated=${result.updated} skipped=${result.skipped}`,
+    `[reconcileSentInvitations]${params.dryRun ? ' (DRY-RUN, no writes)' : ''} account=${accountId} list=${listId} total=${result.total} created=${result.created} updated=${result.updated} (alreadyRecorded=${result.alreadyRecorded}) skipped=${result.skipped}`,
   );
   return result;
 }

@@ -5708,6 +5708,48 @@ export const crmDb = {
     }
   },
 
+  /**
+   * Find the lead in ONE list whose linkedin matches, via LinkedinLookupIndex.
+   *
+   * findLeadsByLinkedin caps at 10 items across ALL tenants, so a profile that
+   * exists as a lead in more than 10 lists can page past the caller's list and be
+   * reported absent — which makes a caller create a duplicate lead in a list that
+   * already has that person (ENG-787). Filtering server-side on listId and paging
+   * until the match is found removes that ceiling.
+   *
+   * Returns the freshest matching lead, or null.
+   */
+  async findLeadByLinkedinInList(listId: string, linkedin: string) {
+    const value = (linkedin ?? '').trim();
+    if (!value || !listId) return null;
+    // Bounded so a pathological fan-out can never spin: 20 pages of a
+    // single-partition GSI query is far beyond any real profile's reuse.
+    const MAX_PAGES = 20;
+    try {
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      let pages = 0;
+      do {
+        const result = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          IndexName: 'LinkedinLookupIndex',
+          KeyConditionExpression: 'linkedin = :linkedin',
+          FilterExpression: 'listId = :listId',
+          ExpressionAttributeValues: { ':linkedin': value, ':listId': listId },
+          ScanIndexForward: false,
+          ExclusiveStartKey: lastEvaluatedKey,
+        }).promise();
+        const hit = (result.Items || [])[0];
+        if (hit) return hit;
+        lastEvaluatedKey = result.LastEvaluatedKey;
+        pages++;
+      } while (lastEvaluatedKey && pages < MAX_PAGES);
+      return null;
+    } catch (error) {
+      handleDynamoDbError(error, 'findLeadByLinkedinInList');
+      throw error;
+    }
+  },
+
   async findLeadsByNameCompany(firstName: string, lastName: string, company: string) {
     const key = computeNameCompanyKey(firstName, lastName, company);
     if (!key) return [];
