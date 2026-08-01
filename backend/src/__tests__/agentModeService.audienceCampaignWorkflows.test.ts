@@ -900,6 +900,44 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       });
     });
 
+    // Live-test finding against real Meta: a strict deep-equal of the full
+    // `targeting` object never matched, even for a byte-identical retry —
+    // Meta injects its own defaults on read that were never sent (age_min,
+    // age_max, user_age_unknown, targeting_relaxation_types at the top
+    // level; location_types nested inside geo_locations) and echoes back
+    // extra fields on objects we DID send (custom_audiences[].name). This
+    // must still reuse: every key/value we actually requested is present in
+    // Meta's stored value, even though Meta's stored value has many more
+    // keys than we sent.
+    it('reuses an existing ad set even when Meta echoes back extra injected targeting defaults we never sent', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_meta_defaults', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValueOnce({
+        success: true,
+        adSets: [{
+          id: 'adset_meta_defaults', name: 'Targeted Ad Set',
+          targeting: {
+            age_max: 65, age_min: 18, user_age_unknown: true,
+            targeting_relaxation_types: { lookalike: 1, custom_audience: 0 },
+            custom_audiences: [{ id: 'aud_seed_meta_defaults', name: 'RankAI Warm List' }],
+            geo_locations: { countries: ['US'], location_types: ['home', 'recent'] },
+            targeting_automation: { advantage_audience: 0 },
+          },
+          daily_budget: null, lifetime_budget: null, start_time: null, end_time: null,
+          optimization_goal: null, billing_event: null, bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
+        }],
+      } as any);
+      const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
+
+      expect(createAdSetSpy).not.toHaveBeenCalled();
+      expect(result.ledger.adSet.id).toBe('adset_meta_defaults');
+    });
+
     it('creates a new ad set (does not reuse) when a same-named one exists but targets a different audience', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
       jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
@@ -994,7 +1032,14 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // retry case this whole mechanism exists to handle. A legitimate retry
     // with unchanged args (daily_budget: 10, i.e. $10) must match an
     // existing ad set Meta reports as daily_budget: 1000 (cents).
-    it('reuses an existing ad set when the requested budget (dollars) matches Meta\'s stored value (cents)', async () => {
+    //
+    // Live-test finding against real Meta: the Graph API actually returns
+    // daily_budget/lifetime_budget/bid_amount as STRINGS ("1000"), not
+    // numbers — a strict JSON-type-sensitive compare treated that as a
+    // mismatch and always created a duplicate. Uses a string here (matching
+    // real Meta's response shape) rather than a number, specifically to
+    // regression-lock the numeric-coercion fix.
+    it('reuses an existing ad set when the requested budget (dollars) matches Meta\'s stored value (cents, returned as a string)', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
       jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_10', name: 'RankAI Warm List' }, created: false,
@@ -1008,7 +1053,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
             custom_audiences: [{ id: 'aud_seed_10' }], geo_locations: { countries: ['US'] },
             targeting_automation: { advantage_audience: 0 },
           },
-          daily_budget: 1000, // $10.00 stored as cents by Meta
+          daily_budget: '1000', // $10.00 stored as cents by Meta, returned as a string
           bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
         }],
       } as any);

@@ -17437,6 +17437,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Live-test finding (real Meta, ENG-600): a full canonicalJSON deep-equal
+   * of a requested `targeting` object against Meta's returned representation
+   * never matches, even for a byte-identical retry — Meta injects its own
+   * defaults on read that we never sent (e.g. age_min/age_max/
+   * user_age_unknown/targeting_relaxation_types at the top level, and
+   * location_types nested inside geo_locations), and echoes back extra
+   * fields on objects we DID send (e.g. custom_audiences[].name). Strict
+   * equality treated every one of those as a real difference and reuse never
+   * triggered. This instead checks that every key/value WE explicitly
+   * requested is present in Meta's stored value, ignoring any extra keys
+   * Meta added — Meta-injected defaults no longer block a legitimate reuse
+   * match, while any actual difference in a field we requested still does.
+   */
+  private isDeepSubset(requested: any, actual: any): boolean {
+    if (requested === null || typeof requested !== 'object') return requested === actual;
+    if (Array.isArray(requested)) {
+      if (!Array.isArray(actual) || requested.length !== actual.length) return false;
+      return requested.every((item, i) => this.isDeepSubset(item, actual[i]));
+    }
+    if (actual === null || typeof actual !== 'object') return false;
+    return Object.keys(requested).every((key) => this.isDeepSubset(requested[key], actual[key]));
+  }
+
+  /**
    * Greptile finding (PR #2234): confirm=true wasn't bound to what was
    * actually previewed — a model could set confirm=true on the very first
    * call (skipping the preview entirely) or change arguments between the
@@ -17756,13 +17780,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           'destination_type', 'promoted_object', 'status',
         ] as const
       ).filter((field) => field !== 'start_time' || !startTimeIsUnreproducibleAutoFill);
+      // Live-test finding against real Meta: the Graph API returns budget/bid
+      // fields as STRINGS ("500"), while our normalized requested values are
+      // numbers (500) — a strict canonicalJSON compare treated every
+      // legitimate retry as a mismatch purely from JSON type, never numeric
+      // value. Coerce these specific numeric-typed fields before comparing.
+      const NUMERIC_AD_SET_FIELDS = new Set(['daily_budget', 'lifetime_budget', 'bid_amount']);
       const existingAdSet = (existingAdSetsResult.adSets || []).find((as: any) => {
         if (String(as?.name ?? '').toLowerCase() !== String(adSetName ?? '').toLowerCase()) return false;
-        if (this.canonicalJSON(as?.targeting) !== this.canonicalJSON(targeting)) return false;
+        if (!this.isDeepSubset(targeting, as?.targeting)) return false;
         for (const field of AD_SET_REUSE_MATCH_FIELDS) {
           const requested = normalizedRequestedAdSetParams[field];
           if (requested === undefined) continue; // not explicitly requested — don't require a match on it
-          if (this.canonicalJSON(as?.[field] ?? null) !== this.canonicalJSON(requested)) return false;
+          let actual = as?.[field] ?? null;
+          if (NUMERIC_AD_SET_FIELDS.has(field) && actual !== null) actual = Number(actual);
+          if (this.canonicalJSON(actual) !== this.canonicalJSON(requested)) return false;
         }
         return true;
       });

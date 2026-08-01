@@ -917,7 +917,12 @@ describe('MetaService', () => {
         // usersreplace edge atomically sets the exact membership in one
         // operation, eliminating the need for a diff baseline in that case.
         describe('replaceCustomAudienceUsers', () => {
-            it('sends a single request with no session object when the payload is <= 10,000 rows', async () => {
+            // Live-test finding against real Meta: unlike createUser/deleteUsers
+            // (session nested inside `payload`), /usersreplace requires
+            // `session` as a TOP-LEVEL param sibling to `payload`, always —
+            // nesting it inside `payload` still produced "(#100) The
+            // parameter session is required" against the real Graph API.
+            it('sends a single request with a top-level single-batch session object when the payload is <= 10,000 rows', async () => {
                 const mockCreateUsersReplace = jest.fn().mockResolvedValue({ _data: { num_received: 2 } });
                 (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
                     createUsersReplace: mockCreateUsersReplace,
@@ -933,6 +938,12 @@ describe('MetaService', () => {
                 expect(calledParams.payload.schema).toEqual(['EMAIL', 'PHONE']);
                 expect(calledParams.payload.data).toEqual(payload);
                 expect(calledParams.payload.session).toBeUndefined();
+                expect(calledParams.session).toEqual({
+                    session_id: expect.any(Number),
+                    batch_seq: 1,
+                    last_batch_flag: true,
+                    estimated_num_total: payload.length,
+                });
                 expect(result).toEqual({ num_received: 2 });
             });
 
@@ -952,14 +963,14 @@ describe('MetaService', () => {
                 expect(mockCreateUsersReplace).toHaveBeenCalledTimes(2);
                 const [, firstParams] = mockCreateUsersReplace.mock.calls[0];
                 expect(firstParams.payload.data).toHaveLength(10000);
-                expect(firstParams.payload.session.batch_seq).toBe(1);
-                expect(firstParams.payload.session.last_batch_flag).toBe(false);
+                expect(firstParams.session.batch_seq).toBe(1);
+                expect(firstParams.session.last_batch_flag).toBe(false);
 
                 const [, secondParams] = mockCreateUsersReplace.mock.calls[1];
                 expect(secondParams.payload.data).toHaveLength(500);
-                expect(secondParams.payload.session.batch_seq).toBe(2);
-                expect(secondParams.payload.session.last_batch_flag).toBe(true);
-                expect(secondParams.payload.session.session_id).toBe(firstParams.payload.session.session_id);
+                expect(secondParams.session.batch_seq).toBe(2);
+                expect(secondParams.session.last_batch_flag).toBe(true);
+                expect(secondParams.session.session_id).toBe(firstParams.session.session_id);
             });
 
             it('surfaces a mid-replace batch failure (throws) without silently dropping it', async () => {
