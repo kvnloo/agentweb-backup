@@ -11,9 +11,13 @@
  * before merge" gate — this is a new logical use of an existing table/schema,
  * not a schema change.
  *
- * Sharded across multiple items (an index item + N chunk items) rather than
- * one flat array in one item — DynamoDB caps a single item at 400KB, which a
- * large audience's row-keys could exceed if stored as one array.
+ * Sharded across an index item (holding a per-save generationId + chunkCount)
+ * plus N chunk items namespaced under that generationId — DynamoDB caps a
+ * single item at 400KB, which a large audience's row-keys could exceed if
+ * stored as one array. The generation namespacing (Greptile finding) means a
+ * failed save's partially-written chunks are never mixed into a read: every
+ * save writes to brand-new keys, and a read only ever touches the single
+ * generation the index currently points at.
  */
 
 const mockGet = jest.fn();
@@ -32,6 +36,11 @@ import {
   getAudienceSnapshotRowKeys,
   saveAudienceSnapshotRowKeys,
 } from '../services/metaAudienceSnapshotStore';
+
+// Chunk configIds now embed a random generationId
+// (metaAudienceSnapshot:<audienceId>:gen:<generationId>:chunk:<i>), so tests
+// match by pattern rather than an exact string.
+const CHUNK_CONFIG_ID_RE = /^metaAudienceSnapshot:aud_123:gen:[^:]+:chunk:(\d+)$/;
 
 describe('metaAudienceSnapshotStore', () => {
   beforeEach(() => {
@@ -52,23 +61,23 @@ describe('metaAudienceSnapshotStore', () => {
       );
     });
 
-    it('reads a single chunk and returns its rowKeys', async () => {
+    it('reads a single chunk (at the index-recorded generation) and returns its rowKeys', async () => {
       mockGet
-        .mockResolvedValueOnce({ Item: { chunkCount: 1 } }) // index
+        .mockResolvedValueOnce({ Item: { chunkCount: 1, generationId: 'gen-A' } }) // index
         .mockResolvedValueOnce({ Item: { rowKeys: ['abc|def', 'ghi|jkl'] } }); // chunk 0
 
       const result = await getAudienceSnapshotRowKeys('user1', 'aud_123');
 
       expect(result).toEqual(['abc|def', 'ghi|jkl']);
       expect(mockGet).toHaveBeenNthCalledWith(2, expect.objectContaining({
-        Key: { userId: 'user1', configId: 'metaAudienceSnapshot:aud_123:chunk:0' },
+        Key: { userId: 'user1', configId: 'metaAudienceSnapshot:aud_123:gen:gen-A:chunk:0' },
       }));
     });
 
-    it('reads and concatenates multiple chunks in order', async () => {
+    it('reads and concatenates multiple chunks (at the index-recorded generation) in order', async () => {
       mockGet.mockImplementation((params: any) => {
         if (params.Key.configId === 'metaAudienceSnapshot:aud_123') {
-          return Promise.resolve({ Item: { chunkCount: 3 } });
+          return Promise.resolve({ Item: { chunkCount: 3, generationId: 'gen-B' } });
         }
         const idx = Number(params.Key.configId.split(':').pop());
         return Promise.resolve({ Item: { rowKeys: [`key${idx}`] } });
@@ -77,6 +86,43 @@ describe('metaAudienceSnapshotStore', () => {
       const result = await getAudienceSnapshotRowKeys('user1', 'aud_123');
 
       expect(result).toEqual(['key0', 'key1', 'key2']);
+    });
+
+    // Greptile finding: a mixed-generation read was possible when the same
+    // static chunk keys were reused across saves — a failed save could
+    // overwrite some low-numbered chunks with fresh data while the index
+    // stayed pointing at the OLD chunkCount, silently blending stale
+    // untouched high chunks with newly-overwritten low ones. Generation
+    // namespacing makes this structurally impossible: this test proves a
+    // read for generation "gen-CURRENT" never touches keys under a
+    // DIFFERENT generation ("gen-OLD"), even though both exist in the table.
+    it('never reads chunks from a different (orphaned) generation, even if they still exist in the table', async () => {
+      const requestedConfigIds: string[] = [];
+      mockGet.mockImplementation((params: any) => {
+        requestedConfigIds.push(params.Key.configId);
+        if (params.Key.configId === 'metaAudienceSnapshot:aud_123') {
+          return Promise.resolve({ Item: { chunkCount: 1, generationId: 'gen-CURRENT' } });
+        }
+        if (params.Key.configId === 'metaAudienceSnapshot:aud_123:gen:gen-CURRENT:chunk:0') {
+          return Promise.resolve({ Item: { rowKeys: ['fresh1'] } });
+        }
+        // An orphaned chunk from an earlier failed/superseded save — must never be requested.
+        if (params.Key.configId === 'metaAudienceSnapshot:aud_123:gen:gen-OLD:chunk:0') {
+          return Promise.resolve({ Item: { rowKeys: ['stale1', 'stale2'] } });
+        }
+        return Promise.resolve({});
+      });
+
+      const result = await getAudienceSnapshotRowKeys('user1', 'aud_123');
+
+      expect(result).toEqual(['fresh1']);
+      expect(requestedConfigIds).not.toContain('metaAudienceSnapshot:aud_123:gen:gen-OLD:chunk:0');
+    });
+
+    it('throws when the index has a chunkCount but no generationId (malformed index)', async () => {
+      mockGet.mockResolvedValueOnce({ Item: { chunkCount: 1 } }); // no generationId
+
+      await expect(getAudienceSnapshotRowKeys('user1', 'aud_123')).rejects.toThrow(/generationId/);
     });
 
     // Greptile finding: a missing/malformed chunk used to be silently
@@ -90,7 +136,7 @@ describe('metaAudienceSnapshotStore', () => {
     // with an incomplete baseline.
     it('throws when a chunk the index says should exist is missing or malformed, rather than silently omitting it', async () => {
       mockGet
-        .mockResolvedValueOnce({ Item: { chunkCount: 2 } }) // index
+        .mockResolvedValueOnce({ Item: { chunkCount: 2, generationId: 'gen-C' } }) // index
         .mockResolvedValueOnce({}) // chunk 0 missing
         .mockResolvedValueOnce({ Item: { rowKeys: ['key1'] } }); // chunk 1
 
@@ -99,7 +145,7 @@ describe('metaAudienceSnapshotStore', () => {
 
     it('throws when a chunk item exists but its rowKeys field is malformed (not an array)', async () => {
       mockGet
-        .mockResolvedValueOnce({ Item: { chunkCount: 1 } }) // index
+        .mockResolvedValueOnce({ Item: { chunkCount: 1, generationId: 'gen-D' } }) // index
         .mockResolvedValueOnce({ Item: { rowKeys: 'not-an-array' } }); // chunk 0 malformed
 
       await expect(getAudienceSnapshotRowKeys('user1', 'aud_123')).rejects.toThrow(/chunk 0/);
@@ -124,21 +170,38 @@ describe('metaAudienceSnapshotStore', () => {
   });
 
   describe('saveAudienceSnapshotRowKeys', () => {
-    it('writes a single chunk plus an index item with chunkCount 1 for a small rowKeys array', async () => {
+    it('writes a single chunk (namespaced under a generation id) plus an index item recording that generation and chunkCount 1', async () => {
       mockPut.mockResolvedValue({});
 
       await saveAudienceSnapshotRowKeys('user1', 'aud_123', ['abc|def']);
 
-      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
-        Item: expect.objectContaining({
-          userId: 'user1', configId: 'metaAudienceSnapshot:aud_123:chunk:0', rowKeys: ['abc|def'],
-        }),
-      }));
-      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
-        Item: expect.objectContaining({
-          userId: 'user1', configId: 'metaAudienceSnapshot:aud_123', chunkCount: 1,
-        }),
-      }));
+      const chunkPut = mockPut.mock.calls.find(([p]) => CHUNK_CONFIG_ID_RE.test(p.Item.configId));
+      expect(chunkPut).toBeDefined();
+      expect(chunkPut![0].Item.rowKeys).toEqual(['abc|def']);
+
+      const indexPut = mockPut.mock.calls.find(([p]) => p.Item.configId === 'metaAudienceSnapshot:aud_123');
+      expect(indexPut).toBeDefined();
+      expect(indexPut![0].Item.chunkCount).toBe(1);
+      expect(typeof indexPut![0].Item.generationId).toBe('string');
+      expect(indexPut![0].Item.generationId.length).toBeGreaterThan(0);
+
+      // The chunk's generation segment matches the index's recorded generationId.
+      expect(chunkPut![0].Item.configId).toBe(`metaAudienceSnapshot:aud_123:gen:${indexPut![0].Item.generationId}:chunk:0`);
+    });
+
+    it('uses a DIFFERENT generation id on each save, so consecutive saves never share (or overwrite) chunk keys', async () => {
+      mockPut.mockResolvedValue({});
+
+      await saveAudienceSnapshotRowKeys('user1', 'aud_123', ['row1']);
+      const firstIndexPut = mockPut.mock.calls.find(([p]) => p.Item.configId === 'metaAudienceSnapshot:aud_123');
+      const firstGeneration = firstIndexPut![0].Item.generationId;
+
+      mockPut.mockClear();
+      await saveAudienceSnapshotRowKeys('user1', 'aud_123', ['row2']);
+      const secondIndexPut = mockPut.mock.calls.find(([p]) => p.Item.configId === 'metaAudienceSnapshot:aud_123');
+      const secondGeneration = secondIndexPut![0].Item.generationId;
+
+      expect(secondGeneration).not.toBe(firstGeneration);
     });
 
     it('splits a large rowKeys array across multiple chunk items, capped well under the DynamoDB 400KB item limit', async () => {
@@ -147,7 +210,7 @@ describe('metaAudienceSnapshotStore', () => {
 
       await saveAudienceSnapshotRowKeys('user1', 'aud_123', rowKeys);
 
-      const chunkPuts = mockPut.mock.calls.filter(([p]) => /:chunk:\d+$/.test(p.Item.configId));
+      const chunkPuts = mockPut.mock.calls.filter(([p]) => CHUNK_CONFIG_ID_RE.test(p.Item.configId));
       expect(chunkPuts.length).toBeGreaterThan(1);
       const totalWritten = chunkPuts.reduce((sum, [p]) => sum + p.Item.rowKeys.length, 0);
       expect(totalWritten).toBe(4500);
@@ -168,9 +231,10 @@ describe('metaAudienceSnapshotStore', () => {
 
       await saveAudienceSnapshotRowKeys('user1', 'aud_123', ['abc|def']);
 
-      expect(order.indexOf('metaAudienceSnapshot:aud_123:chunk:0')).toBeLessThan(
-        order.indexOf('metaAudienceSnapshot:aud_123')
-      );
+      const chunkIdx = order.findIndex((id) => CHUNK_CONFIG_ID_RE.test(id));
+      const indexIdx = order.indexOf('metaAudienceSnapshot:aud_123');
+      expect(chunkIdx).toBeGreaterThanOrEqual(0);
+      expect(chunkIdx).toBeLessThan(indexIdx);
     });
 
     it('writes one empty chunk and chunkCount 1 for an empty rowKeys array (zero-member audience)', async () => {
@@ -178,9 +242,8 @@ describe('metaAudienceSnapshotStore', () => {
 
       await saveAudienceSnapshotRowKeys('user1', 'aud_123', []);
 
-      expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
-        Item: expect.objectContaining({ configId: 'metaAudienceSnapshot:aud_123:chunk:0', rowKeys: [] }),
-      }));
+      const chunkPut = mockPut.mock.calls.find(([p]) => CHUNK_CONFIG_ID_RE.test(p.Item.configId));
+      expect(chunkPut![0].Item.rowKeys).toEqual([]);
       expect(mockPut).toHaveBeenCalledWith(expect.objectContaining({
         Item: expect.objectContaining({ configId: 'metaAudienceSnapshot:aud_123', chunkCount: 1 }),
       }));

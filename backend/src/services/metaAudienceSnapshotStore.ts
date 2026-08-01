@@ -10,15 +10,32 @@
  * not a schema change.
  *
  * Sharded across an index item (`metaAudienceSnapshot:<audienceId>`, holding
- * `chunkCount`) plus N chunk items (`metaAudienceSnapshot:<audienceId>:chunk:<i>`,
- * each holding up to MAX_KEYS_PER_CHUNK rowKeys) rather than one flat array in
- * one item — DynamoDB caps a single item at 400KB, which a large audience's
- * row-keys array could exceed if stored as one array. Chunk items are written
- * before the index item so a partial write failure never leaves the index
- * pointing at a chunk that was never saved.
+ * `generationId` + `chunkCount`) plus N chunk items
+ * (`metaAudienceSnapshot:<audienceId>:gen:<generationId>:chunk:<i>`, each
+ * holding up to MAX_KEYS_PER_CHUNK rowKeys) rather than one flat array in one
+ * item — DynamoDB caps a single item at 400KB, which a large audience's
+ * row-keys array could exceed if stored as one array.
+ *
+ * Greptile finding: an earlier version reused the SAME static chunk keys
+ * (`...chunk:<i>`, no generation) across every save. Chunk-before-index
+ * write ordering protected against the index ever pointing at a chunk that
+ * was never written, but NOT against a "mixed generation" read: if a new
+ * save's chunk writes partially succeeded (overwriting some low-numbered
+ * chunk keys with fresh data) and then its index write failed, the OLD
+ * index — still pointing at the OLD chunkCount — would read back a mix of
+ * newly-overwritten low chunks and stale untouched high chunks, silently
+ * treating that inconsistent mash-up as one coherent baseline. Namespacing
+ * every save's chunks under a unique generationId makes this impossible: a
+ * failed save's chunks are written under keys no read ever references (the
+ * index still points at the OLD generationId until the NEW generation's
+ * index write succeeds), so a read always sees exactly one generation's
+ * chunks, never a mix. Orphaned old-generation chunks after a failed save
+ * are harmless — small, and not accumulating indefinitely in practice since
+ * each successful save's generation is what future reads/writes reference.
  */
 
 import AWS from 'aws-sdk';
+import { randomUUID } from 'crypto';
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'production' ? '' : 'Dev-';
 const CONFIGS_TABLE = `${TABLE_PREFIX}AW-Configs`;
@@ -31,8 +48,8 @@ function indexConfigId(audienceId: string): string {
   return `metaAudienceSnapshot:${audienceId}`;
 }
 
-function chunkConfigId(audienceId: string, index: number): string {
-  return `metaAudienceSnapshot:${audienceId}:chunk:${index}`;
+function chunkConfigId(audienceId: string, generationId: string, index: number): string {
+  return `metaAudienceSnapshot:${audienceId}:gen:${generationId}:chunk:${index}`;
 }
 
 export async function getAudienceSnapshotRowKeys(userId: string, audienceId: string): Promise<string[] | null> {
@@ -45,18 +62,23 @@ export async function getAudienceSnapshotRowKeys(userId: string, audienceId: str
   const item = indexResult.Item;
   if (!item) return null;
 
-  // Backward-compat: an index item that stores rowKeys directly (pre-sharding
-  // format, or a hand-written test fixture) — return as-is.
+  // Backward-compat: an index item that stores rowKeys directly (a
+  // hand-written test fixture, or a trivial/legacy shape) — return as-is.
   if (Array.isArray(item.rowKeys)) return item.rowKeys;
 
   const chunkCount = typeof item.chunkCount === 'number' ? item.chunkCount : 0;
   if (chunkCount === 0) return null;
 
+  const generationId = item.generationId;
+  if (typeof generationId !== 'string' || !generationId) {
+    throw new Error(`Snapshot index for audience ${audienceId} has chunkCount but no generationId — malformed index.`);
+  }
+
   const chunkResults = await Promise.all(
     Array.from({ length: chunkCount }, (_, i) =>
       dynamodb.get({
         TableName: CONFIGS_TABLE,
-        Key: { userId, configId: chunkConfigId(audienceId, i) },
+        Key: { userId, configId: chunkConfigId(audienceId, generationId, i) },
       }).promise()
     )
   );
@@ -72,7 +94,7 @@ export async function getAudienceSnapshotRowKeys(userId: string, audienceId: str
   for (let i = 0; i < chunkResults.length; i++) {
     const chunkRowKeys = chunkResults[i].Item?.rowKeys;
     if (!Array.isArray(chunkRowKeys)) {
-      throw new Error(`Snapshot chunk ${i} for audience ${audienceId} is missing or malformed (expected ${chunkCount} chunks).`);
+      throw new Error(`Snapshot chunk ${i} for audience ${audienceId} (generation ${generationId}) is missing or malformed (expected ${chunkCount} chunks).`);
     }
     rowKeys.push(...chunkRowKeys);
   }
@@ -96,11 +118,16 @@ async function saveAudienceSnapshotRowKeysOnce(userId: string, audienceId: strin
   }
   if (chunks.length === 0) chunks.push([]); // zero-member audience still gets a baseline snapshot
 
+  // Every save gets a fresh generation id and writes to NEW, never-before-used
+  // chunk keys — see the module docstring for why this eliminates mixed-
+  // generation reads even under a partial-write failure.
+  const generationId = randomUUID();
+
   await Promise.all(
     chunks.map((chunk, i) =>
       dynamodb.put({
         TableName: CONFIGS_TABLE,
-        Item: { userId, configId: chunkConfigId(audienceId, i), rowKeys: chunk },
+        Item: { userId, configId: chunkConfigId(audienceId, generationId, i), rowKeys: chunk },
       }).promise()
     )
   );
@@ -110,6 +137,7 @@ async function saveAudienceSnapshotRowKeysOnce(userId: string, audienceId: strin
     Item: {
       userId,
       configId: indexConfigId(audienceId),
+      generationId,
       chunkCount: chunks.length,
       updatedAt: new Date().toISOString(),
     },
