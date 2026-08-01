@@ -575,6 +575,53 @@ workflowruns "${d}" '[
 run_gate "${d}"
 check 'a re-run within one suite supersedes its earlier failure' 0 'VERDICT: PASS'
 
+# A workflow run exists before its first check-run row does. If an older run at
+# the same head is already green, looking only at check-runs false-passes during
+# that window even though GitHub still has a relevant run queued/in progress.
+COMPLETED_GREEN_RUN='[
+  {"id":1,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":100}},
+  {"id":2,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":100}}
+]'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" "${COMPLETED_GREEN_RUN}"
+workflowruns "${d}" '[
+  {"id":11,"name":"Tests","workflow_id":111,"run_number":5,"status":"completed","conclusion":"success","check_suite_id":100},
+  {"id":12,"name":"Tests","workflow_id":111,"run_number":6,"status":"queued","conclusion":null,"check_suite_id":200}
+]'
+run_gate "${d}"
+check 'a newer queued workflow with no check-run rows is PENDING, never PASS' 2 'VERDICT: PENDING'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" "${COMPLETED_GREEN_RUN}"
+workflowruns "${d}" '[
+  {"id":11,"name":"Tests","workflow_id":111,"run_number":5,"status":"completed","conclusion":"success","check_suite_id":100},
+  {"id":12,"name":"Tests","workflow_id":111,"run_number":6,"status":"queued","conclusion":null,"check_suite_id":200}
+]'
+run_gate "${d}"
+check 'the workflow-level pending verdict names the run with no check rows' 2 'Tests (run 12: queued)'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" "${COMPLETED_GREEN_RUN}"
+workflowruns "${d}" '[
+  {"id":11,"name":"Tests","workflow_id":111,"run_number":5,"status":"completed","conclusion":"success","check_suite_id":100},
+  {"id":12,"name":"Tests","workflow_id":111,"run_number":6,"status":"in_progress","conclusion":null,"check_suite_id":200}
+]'
+run_gate "${d}"
+check 'an in-progress workflow with no check-run rows is PENDING, never PASS' 2 'VERDICT: PENDING'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" "${COMPLETED_GREEN_RUN}"
+workflowruns "${d}" '[
+  {"id":11,"name":"Tests","workflow_id":111,"run_number":5,"status":"completed","conclusion":"success","check_suite_id":100}
+]'
+run_gate "${d}"
+check 'a completed workflow with green check-runs still passes' 0 'VERDICT: PASS'
+
 # Exclusion is driven by the workflow-run API alone: with no such data the gate
 # must not invent a supersession. It fails closed rather than widening.
 d="$(new_fixture_dir)"

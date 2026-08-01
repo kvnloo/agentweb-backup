@@ -243,6 +243,32 @@ if [ "${wf_returned}" -lt "${wf_total}" ]; then
   hard_fail "workflow-runs response for ${head_sha} is truncated: total_count=${wf_total} but only ${wf_returned} returned. A hidden run could be the one that supersedes another, so this is not evaluated."
 fi
 
+# A workflow run is created before its first check-run row. During that window
+# the commit endpoint can still contain a fully green older run and nothing from
+# the new one, which would otherwise produce PASS while GitHub has work queued.
+# The workflow-run endpoint is therefore evidence not only for supersession but
+# also for pending state. Any non-completed run at this head blocks until its
+# check rows and final conclusion exist.
+wf_pending_info="$(printf '%s' "${wfruns_json}" | jq -r '
+    [ ([ .workflow_runs[] | select(.status != "completed") ] | length),
+      ([ .workflow_runs[] | select(.status != "completed")
+         | "\(.name // "workflow") (run \(.id // "unknown"): \(.status // "unknown"))" ]
+       | join(", ")) ]
+    | map(tostring) | join("\u001f")' 2>/dev/null)"
+jq_exit=$?
+
+if [ "${jq_exit}" -ne 0 ] || [ -z "${wf_pending_info}" ]; then
+  surface 'workflow-runs response (raw)' "${wfruns_json}"
+  hard_fail "unparseable workflow-runs payload while classifying pending runs at ${head_sha}"
+fi
+
+IFS="${SEP}" read -r n_wf_pending wf_pending_names <<<"${wf_pending_info}"
+
+if [ "${n_wf_pending}" -gt 0 ]; then
+  verdict 'PENDING' "${n_wf_pending} workflow run(s) at head ${head_sha} have not completed: ${wf_pending_names}. A run can exist before its first check-run row, so older green rows are not current evidence yet."
+  exit 2
+fi
+
 superseded_suites="$(printf '%s' "${wfruns_json}" | jq -c '
     [ .workflow_runs[] as $r
       | select($r.conclusion == "cancelled")
