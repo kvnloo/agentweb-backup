@@ -186,7 +186,7 @@ import {
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
-import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from './metaAudienceSnapshotStore';
+import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
 import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
@@ -17381,9 +17381,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // as non-fatal, leaving noBaselineReuse false — which fell through to
       // an add-only upload against unknown state (we can't tell "no prior
       // snapshot" from "couldn't read it"), the same "launch against
-      // unreconciled data" problem as the other blocking fixes here. Not
-      // caught: propagates like every other hard-failure step in this method.
-      const previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
+      // unreconciled data" problem as the other blocking fixes here. A
+      // genuine infra failure still propagates and blocks below, same as
+      // ever.
+      //
+      // Greptile follow-up finding: a CORRUPTED snapshot (malformed index or
+      // chunk) threw the exact same generic error, permanently blocking
+      // every future launch for that audience — unlike a transient outage,
+      // corruption never resolves itself on retry. Treated the same as "no
+      // baseline exists": falls through to the self-healing REPLACE_USERS
+      // path below (never proceeds with the untrustworthy incomplete
+      // baseline) and a fresh, uncorrupted snapshot gets saved right after,
+      // fixing the corruption for good.
+      let previousRowKeys: string[] | null;
+      try {
+        previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
+      } catch (e) {
+        if (e instanceof CorruptSnapshotError) {
+          console.error(`AgentMode: Corrupt audience snapshot for ${audienceId}, treating as no baseline:`, e);
+          previousRowKeys = null;
+        } else {
+          throw e;
+        }
+      }
       if (previousRowKeys) {
         const currentKeySet = new Set(newRowKeys);
         const staleRowKeys = previousRowKeys.filter((k) => !currentKeySet.has(k));

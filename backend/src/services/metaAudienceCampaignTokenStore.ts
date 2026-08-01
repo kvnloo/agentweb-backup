@@ -95,6 +95,17 @@ export async function claimPreviewToken(userId: string, token: string): Promise<
   }
 }
 
+// Greptile finding: a single failed write here left the claim stuck
+// "in_progress" forever — which the staleness override then treats as
+// reclaimable after CLAIM_STALE_AFTER_MS, letting an already-completed
+// launch's approval be replayed even though the caller swallows this
+// specific failure (the Meta launch itself already succeeded, so it must
+// not be reported as an overall failure). Retrying — mirroring
+// releasePreviewToken's own retry contract — makes a transient blip the rare
+// case that self-resolves, rather than the common path into replayability.
+const MARK_SUCCEEDED_RETRY_ATTEMPTS = 3;
+const MARK_SUCCEEDED_RETRY_DELAY_MS = 200;
+
 /**
  * Marks a claimed token as permanently consumed after a successful launch —
  * unlike an "in_progress" claim, a "consumed" record is never eligible for
@@ -103,15 +114,25 @@ export async function claimPreviewToken(userId: string, token: string): Promise<
  */
 export async function markPreviewTokenSucceeded(userId: string, token: string): Promise<void> {
   const dynamodb = new AWS.DynamoDB.DocumentClient();
-  await dynamodb.put({
-    TableName: CONFIGS_TABLE,
-    Item: {
-      userId,
-      configId: tokenConfigId(token),
-      status: 'consumed',
-      consumedAt: new Date().toISOString(),
-    },
-  }).promise();
+  const item = {
+    userId,
+    configId: tokenConfigId(token),
+    status: 'consumed',
+    consumedAt: new Date().toISOString(),
+  };
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= MARK_SUCCEEDED_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await dynamodb.put({ TableName: CONFIGS_TABLE, Item: item }).promise();
+      return;
+    } catch (e) {
+      lastError = e;
+      if (attempt < MARK_SUCCEEDED_RETRY_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, MARK_SUCCEEDED_RETRY_DELAY_MS));
+      }
+    }
+  }
+  throw lastError;
 }
 
 // Greptile follow-up finding: swallowing a delete failure on the first

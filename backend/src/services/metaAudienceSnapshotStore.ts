@@ -52,6 +52,20 @@ function chunkConfigId(audienceId: string, generationId: string, index: number):
   return `metaAudienceSnapshot:${audienceId}:gen:${generationId}:chunk:${index}`;
 }
 
+// Greptile finding: a malformed/missing chunk or index throws to block the
+// launch (see below) so an incomplete baseline is never silently treated as
+// complete — but a generic Error looks identical to a transient DynamoDB
+// outage to the caller, which blocked EVERY future launch for that audience
+// forever, since a corrupted record never becomes readable on retry (unlike
+// a transient outage, which does). A distinct error type lets the caller
+// treat corruption specifically as "no trustworthy baseline" (falling back
+// to the same self-healing no-baseline REPLACE_USERS path already used when
+// no snapshot exists at all — still never proceeds with an incomplete
+// baseline, and a fresh, uncorrupted snapshot gets saved right after) while
+// still hard-blocking on a real infra failure, which SHOULD keep blocking
+// rather than triggering an unnecessary full resync on every attempt.
+export class CorruptSnapshotError extends Error {}
+
 export async function getAudienceSnapshotRowKeys(userId: string, audienceId: string): Promise<string[] | null> {
   const dynamodb = new AWS.DynamoDB.DocumentClient();
   const indexResult = await dynamodb.get({
@@ -71,7 +85,7 @@ export async function getAudienceSnapshotRowKeys(userId: string, audienceId: str
 
   const generationId = item.generationId;
   if (typeof generationId !== 'string' || !generationId) {
-    throw new Error(`Snapshot index for audience ${audienceId} has chunkCount but no generationId — malformed index.`);
+    throw new CorruptSnapshotError(`Snapshot index for audience ${audienceId} has chunkCount but no generationId — malformed index.`);
   }
 
   const chunkResults = await Promise.all(
@@ -94,7 +108,7 @@ export async function getAudienceSnapshotRowKeys(userId: string, audienceId: str
   for (let i = 0; i < chunkResults.length; i++) {
     const chunkRowKeys = chunkResults[i].Item?.rowKeys;
     if (!Array.isArray(chunkRowKeys)) {
-      throw new Error(`Snapshot chunk ${i} for audience ${audienceId} (generation ${generationId}) is missing or malformed (expected ${chunkCount} chunks).`);
+      throw new CorruptSnapshotError(`Snapshot chunk ${i} for audience ${audienceId} (generation ${generationId}) is missing or malformed (expected ${chunkCount} chunks).`);
     }
     rowKeys.push(...chunkRowKeys);
   }

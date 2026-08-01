@@ -30,6 +30,7 @@ jest.mock('axios');
 jest.mock('../services/metaAudienceSnapshotStore', () => ({
   getAudienceSnapshotRowKeys: jest.fn().mockResolvedValue(null),
   saveAudienceSnapshotRowKeys: jest.fn().mockResolvedValue(undefined),
+  CorruptSnapshotError: class CorruptSnapshotError extends Error {},
 }));
 jest.mock('../services/metaAudienceCampaignTokenStore', () => ({
   claimPreviewToken: jest.fn().mockResolvedValue(true),
@@ -44,7 +45,7 @@ jest.mock('../utils/ssrfGuard', () => ({
 
 import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
-import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from '../services/metaAudienceSnapshotStore';
+import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from '../services/metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from '../services/metaAudienceCampaignTokenStore';
 import { assertPublicHostname, resolvePinnedPublicAddress } from '../utils/ssrfGuard';
 
@@ -522,6 +523,38 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
       // Only LIST attempted — no UPLOAD_USERS/REPLACE_USERS against unknown state.
       expect(spy).toHaveBeenCalledTimes(1);
+    });
+
+    // Greptile follow-up finding: unlike a transient read failure (which
+    // should keep blocking, since retrying it might succeed with the real
+    // baseline intact), a CORRUPTED snapshot never becomes readable on
+    // retry — treating it identically to a generic read failure permanently
+    // disabled the audience. Falls back to the same self-healing no-baseline
+    // REPLACE_USERS path used when no snapshot exists at all, rather than
+    // blocking forever.
+    it('falls back to the no-baseline REPLACE_USERS path (does not block) when the prior snapshot is corrupted', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_2c', name: 'X' }] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: true } as any); // REPLACE_USERS
+
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
+        mockHubSpotContact('a@example.com', '111')
+      );
+      (getAudienceSnapshotRowKeys as jest.Mock).mockRejectedValueOnce(
+        new CorruptSnapshotError('Snapshot chunk 0 for audience aud_2c (generation gen-X) is missing or malformed.')
+      );
+
+      const result = await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-1' },
+        { dryRun: false }
+      );
+
+      expect(result.failures).toEqual([]);
+      expect(spy).not.toHaveBeenCalledWith(USER_ID, 'DELETE_USERS', expect.anything(), expect.anything());
+      expect(spy).toHaveBeenNthCalledWith(2, USER_ID, 'REPLACE_USERS', ACCOUNT_ID, expect.objectContaining({
+        id: 'aud_2c', schema: ['EMAIL', 'PHONE'],
+      }));
     });
 
     it('does not call DELETE_USERS when creating a brand-new audience, but still saves a baseline snapshot', async () => {

@@ -35,6 +35,7 @@ jest.mock('aws-sdk', () => ({
 import {
   getAudienceSnapshotRowKeys,
   saveAudienceSnapshotRowKeys,
+  CorruptSnapshotError,
 } from '../services/metaAudienceSnapshotStore';
 
 // Chunk configIds now embed a random generationId
@@ -119,9 +120,16 @@ describe('metaAudienceSnapshotStore', () => {
       expect(requestedConfigIds).not.toContain('metaAudienceSnapshot:aud_123:gen:gen-OLD:chunk:0');
     });
 
-    it('throws when the index has a chunkCount but no generationId (malformed index)', async () => {
-      mockGet.mockResolvedValueOnce({ Item: { chunkCount: 1 } }); // no generationId
+    // Greptile follow-up finding: a generic Error here was indistinguishable
+    // from a transient DynamoDB outage to the caller, which blocked every
+    // future launch for this audience forever — corruption never resolves
+    // on retry, unlike an outage. CorruptSnapshotError lets the caller
+    // recognize this specific case and fall back to a self-healing
+    // no-baseline path instead of hard-blocking indefinitely.
+    it('throws a CorruptSnapshotError when the index has a chunkCount but no generationId (malformed index)', async () => {
+      mockGet.mockResolvedValue({ Item: { chunkCount: 1 } }); // no generationId
 
+      await expect(getAudienceSnapshotRowKeys('user1', 'aud_123')).rejects.toThrow(CorruptSnapshotError);
       await expect(getAudienceSnapshotRowKeys('user1', 'aud_123')).rejects.toThrow(/generationId/);
     });
 
@@ -134,21 +142,21 @@ describe('metaAudienceSnapshotStore', () => {
     // agentModeService already blocks the whole launch on (Greptile's
     // earlier "snapshot READ failure" fix), rather than silently proceeding
     // with an incomplete baseline.
-    it('throws when a chunk the index says should exist is missing or malformed, rather than silently omitting it', async () => {
+    it('throws a CorruptSnapshotError when a chunk the index says should exist is missing or malformed, rather than silently omitting it', async () => {
       mockGet
         .mockResolvedValueOnce({ Item: { chunkCount: 2, generationId: 'gen-C' } }) // index
         .mockResolvedValueOnce({}) // chunk 0 missing
         .mockResolvedValueOnce({ Item: { rowKeys: ['key1'] } }); // chunk 1
 
-      await expect(getAudienceSnapshotRowKeys('user1', 'aud_123')).rejects.toThrow(/chunk 0/);
+      await expect(getAudienceSnapshotRowKeys('user1', 'aud_123')).rejects.toThrow(CorruptSnapshotError);
     });
 
-    it('throws when a chunk item exists but its rowKeys field is malformed (not an array)', async () => {
+    it('throws a CorruptSnapshotError when a chunk item exists but its rowKeys field is malformed (not an array)', async () => {
       mockGet
         .mockResolvedValueOnce({ Item: { chunkCount: 1, generationId: 'gen-D' } }) // index
         .mockResolvedValueOnce({ Item: { rowKeys: 'not-an-array' } }); // chunk 0 malformed
 
-      await expect(getAudienceSnapshotRowKeys('user1', 'aud_123')).rejects.toThrow(/chunk 0/);
+      await expect(getAudienceSnapshotRowKeys('user1', 'aud_123')).rejects.toThrow(CorruptSnapshotError);
     });
 
     it('treats an index item with neither chunkCount nor rowKeys as no snapshot', async () => {

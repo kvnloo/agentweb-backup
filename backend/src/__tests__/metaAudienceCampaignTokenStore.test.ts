@@ -146,6 +146,31 @@ describe('metaAudienceCampaignTokenStore', () => {
         })
       );
     });
+
+    // Greptile finding: a single failed write left the claim stuck
+    // "in_progress" forever, making it reclaimable (and the already-
+    // completed launch's approval replayable) after the staleness window —
+    // the caller treats this specific failure as non-fatal (the Meta launch
+    // already succeeded), so it never gets a second chance via the normal
+    // launch-failure retry path. Retrying here, mirroring
+    // releasePreviewToken's own retry contract, makes a transient blip
+    // self-resolve instead of the common path into replayability.
+    it('retries and succeeds if an earlier write attempt fails', async () => {
+      mockPut
+        .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'))
+        .mockResolvedValueOnce({});
+
+      await markPreviewTokenSucceeded('user1', 'abc123token');
+
+      expect(mockPut).toHaveBeenCalledTimes(2);
+    });
+
+    it('throws after exhausting all retry attempts, unlike releasePreviewToken\'s best-effort contract', async () => {
+      mockPut.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+      await expect(markPreviewTokenSucceeded('user1', 'abc123token')).rejects.toThrow('DynamoDB unavailable');
+      expect(mockPut.mock.calls.length).toBeGreaterThan(1);
+    });
   });
 
   // Greptile finding: once a token is claimed, a failure anywhere in the
