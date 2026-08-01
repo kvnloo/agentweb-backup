@@ -36,24 +36,40 @@ function tokenConfigId(token: string): string {
   return `metaAudienceCampaignConfirmToken:${token}`;
 }
 
+// Greptile finding: releasePreviewToken is only best-effort — if it exhausts
+// its own retries (a double failure: the launch failed AND the release
+// failed), the claim record was left in place FOREVER, since the digest is
+// deterministic and the token can never be re-claimed once taken. Allowing a
+// claim to be taken over once it's older than this window means a retry is
+// never permanently blocked purely by release having failed — worst case it
+// waits out this window. A genuinely concurrent duplicate request within the
+// window still correctly loses the race, since the DynamoDB condition (not
+// the caller) decides atomically.
+const CLAIM_STALE_AFTER_MS = 60_000;
+
 /**
  * Attempts to atomically claim a preview token for this user. Returns true
- * if this call won the claim (the token had never been claimed before) and
- * false if it was already claimed (by a prior call, or a concurrent one that
- * won the race) — the caller should treat false exactly like an invalid
- * token and fall back to a fresh preview rather than executing.
+ * if this call won the claim — the token had never been claimed before, OR
+ * the existing claim is older than CLAIM_STALE_AFTER_MS — and false if it's
+ * claimed and still fresh (by a prior call, or a concurrent one that won the
+ * race). The caller should treat false exactly like an invalid token and
+ * fall back to a fresh preview rather than executing.
  */
 export async function claimPreviewToken(userId: string, token: string): Promise<boolean> {
   const dynamodb = new AWS.DynamoDB.DocumentClient();
+  const now = Date.now();
   try {
     await dynamodb.put({
       TableName: CONFIGS_TABLE,
       Item: {
         userId,
         configId: tokenConfigId(token),
-        consumedAt: new Date().toISOString(),
+        consumedAt: new Date(now).toISOString(),
       },
-      ConditionExpression: 'attribute_not_exists(userId)',
+      ConditionExpression: 'attribute_not_exists(userId) OR consumedAt < :staleThreshold',
+      ExpressionAttributeValues: {
+        ':staleThreshold': new Date(now - CLAIM_STALE_AFTER_MS).toISOString(),
+      },
     }).promise();
     return true;
   } catch (e: any) {

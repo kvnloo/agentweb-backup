@@ -48,7 +48,7 @@ describe('metaAudienceCampaignTokenStore', () => {
       expect(mockPut).toHaveBeenCalledWith(
         expect.objectContaining({
           Item: expect.objectContaining({ userId: 'user1', configId: 'metaAudienceCampaignConfirmToken:abc123token' }),
-          ConditionExpression: 'attribute_not_exists(userId)',
+          ConditionExpression: expect.stringContaining('attribute_not_exists(userId)'),
         })
       );
     });
@@ -82,6 +82,27 @@ describe('metaAudienceCampaignTokenStore', () => {
       expect(mockPut).toHaveBeenCalledWith(
         expect.objectContaining({ Item: expect.objectContaining({ userId: 'user2' }) })
       );
+    });
+
+    // Greptile finding: releasePreviewToken is only best-effort — if it
+    // exhausts its own retries (a double failure: the launch failed AND the
+    // release failed), the claim record was left in place FOREVER, since the
+    // digest is deterministic and the token can never be re-claimed once
+    // taken. The claim condition also allows reclaiming a STALE claim (older
+    // than the staleness window) — not just an entirely unclaimed token — so
+    // a retry is never permanently blocked purely by release having failed;
+    // it just has to wait out the staleness window instead. A genuinely
+    // concurrent duplicate request (within the window) still correctly loses
+    // the race, since only the condition — not the caller — decides.
+    it('allows reclaiming a stale (past the staleness window) claim, not just an entirely unclaimed token', async () => {
+      mockPut.mockResolvedValueOnce({});
+
+      await claimPreviewToken('user1', 'abc123token');
+
+      const [params] = mockPut.mock.calls[0];
+      expect(params.ConditionExpression).toContain('attribute_not_exists(userId)');
+      expect(params.ConditionExpression).toContain(':staleThreshold');
+      expect(params.ExpressionAttributeValues[':staleThreshold']).toEqual(expect.any(String));
     });
   });
 
