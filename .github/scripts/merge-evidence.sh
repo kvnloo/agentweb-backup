@@ -230,6 +230,38 @@ if [ "${returned_count}" -eq 0 ]; then
   exit 3
 fi
 
+# The commit endpoint is a history surface, not the same rollup GitHub renders
+# on the PR. Two pull_request events can race at one head (for example,
+# ready_for_review and synchronize). Workflow concurrency cancels the older
+# suite, but both suites remain in check_runs forever. Treating the response as
+# one flat verdict then lets the superseded cancellation or its skipped draft
+# discriminator poison the successful replacement.
+#
+# A check context is its GitHub App plus name — the same identity branch
+# protection and the PR checks rollup use. Keep the newest suite/run for each
+# context. IDs are present on every real check-run response; suite ID orders
+# workflow invocations, and run ID breaks ties for retries within one suite.
+effective_runs_json="$(printf '%s' "${runs_json}" | jq '
+    .check_runs |= (
+      group_by([(.app.id // .app.slug // "unknown" | tostring), .name])
+      | map(max_by([(.check_suite.id // 0), (.id // 0)]))
+    )
+    | .total_count = (.check_runs | length)' 2>/dev/null)"
+jq_exit=$?
+
+if [ "${jq_exit}" -ne 0 ] || [ -z "${effective_runs_json}" ]; then
+  surface 'check-runs response (raw)' "${runs_json}"
+  hard_fail "unparseable check-runs payload while selecting the latest result for each check context at ${head_sha}"
+fi
+
+effective_count="$(printf '%s' "${effective_runs_json}" | jq -r '.check_runs | length')"
+superseded_count=$((returned_count - effective_count))
+runs_json="${effective_runs_json}"
+
+if [ "${superseded_count}" -gt 0 ]; then
+  log "ignored ${superseded_count} superseded check-run(s); evaluating the latest result for each GitHub App + check name"
+fi
+
 # ---------------------------------------------------------------------------
 # 3. Classify every check-run at this head
 # ---------------------------------------------------------------------------

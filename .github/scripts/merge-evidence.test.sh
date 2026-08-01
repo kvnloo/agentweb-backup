@@ -348,6 +348,49 @@ checkruns "${d}" '[
 run_gate "${d}"
 check 'a cancelled check is FAIL, not a pass' 1 'VERDICT: FAIL'
 
+# A ready flip and a synchronize event can race and schedule two workflow runs
+# for the same head. GitHub's commit check-runs endpoint returns both suites,
+# newest first. The older run is then cancelled by workflow concurrency while
+# the newer run completes successfully. Only the latest check context is live;
+# flattening both suites makes the superseded cancellation poison the verdict.
+SUPERSEDED_CANCELLED_RUN='[
+  {"id":210,"app":{"id":15368},"check_suite":{"id":20},"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"id":211,"app":{"id":15368},"check_suite":{"id":20},"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"id":110,"app":{"id":15368},"check_suite":{"id":10},"name":"Require Greptile Review","status":"completed","conclusion":"skipped"},
+  {"id":111,"app":{"id":15368},"check_suite":{"id":10},"name":"Detect changed projects","status":"completed","conclusion":"cancelled"}
+]'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${SUPERSEDED_CANCELLED_RUN}"
+run_gate "${d}"
+check 'a superseded cancelled workflow does not poison its successful replacement' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${SUPERSEDED_CANCELLED_RUN}"
+run_gate "${d}"
+check 'the stale skipped discriminator is ignored in favour of the latest suite' 0 'Require Greptile Review'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${SUPERSEDED_CANCELLED_RUN}"
+run_gate "${d}"
+check 'the verdict reports how many superseded check-runs were ignored' 0 'ignored 2 superseded check-run(s)'
+
+# The inverse guards against a cosmetic dedupe that simply prefers success:
+# the latest suite still owns the context when it is the failing one.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"id":210,"app":{"id":15368},"check_suite":{"id":20},"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"id":211,"app":{"id":15368},"check_suite":{"id":20},"name":"Detect changed projects","status":"completed","conclusion":"failure"},
+  {"id":110,"app":{"id":15368},"check_suite":{"id":10},"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"id":111,"app":{"id":15368},"check_suite":{"id":10},"name":"Detect changed projects","status":"completed","conclusion":"success"}
+]'
+run_gate "${d}"
+check 'a latest failure still blocks even when a superseded suite passed' 1 'VERDICT: FAIL'
+
 # Greptile's finding on this PR: a `neutral` check sitting beside a success was
 # excluded from every count, so the gate emitted PASS and silently dropped it.
 d="$(new_fixture_dir)"
