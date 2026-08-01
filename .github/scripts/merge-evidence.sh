@@ -468,9 +468,15 @@ IFS="${SEP}" read -r n_pending n_bad n_success n_unknown \
 # is executing, the honest answer is PENDING; neither is a pass, so the ENG-757
 # guarantee is untouched.
 
+# Picked by highest suite id rather than array position. A draft run that
+# COMPLETED (rather than being cancelled) is not superseded by rule 1, so both
+# its suite and the real run's can legitimately survive to here — and relying on
+# incidental array order to break that tie is the same mistake that produced
+# this bug in the first place. Ties (no suite id, as in the older fixtures)
+# resolve to the last element, matching the previous behaviour exactly.
 discriminator="$(printf '%s' "${runs_json}" | jq -r --arg job "${DRAFT_JOB}" '
     [ .check_runs[] | select(.name == $job) ]
-    | last
+    | max_by(.check_suite.id // 0)
     | if . == null then "ABSENT" else (.conclusion // "pending") end' 2>/dev/null)"
 jq_exit=$?
 
