@@ -17663,8 +17663,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // set's actual value blocks reuse.
       const AD_SET_REUSE_MATCH_FIELDS = [
         'daily_budget', 'lifetime_budget', 'start_time', 'end_time',
-        'optimization_goal', 'billing_event', 'bid_strategy',
-        'destination_type', 'promoted_object',
+        'optimization_goal', 'billing_event', 'bid_strategy', 'bid_amount',
+        'destination_type', 'promoted_object', 'status',
       ] as const;
       const existingAdSet = (existingAdSetsResult.adSets || []).find((as: any) => {
         if (String(as?.name ?? '').toLowerCase() !== String(adSetName ?? '').toLowerCase()) return false;

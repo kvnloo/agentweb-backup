@@ -178,7 +178,7 @@ export class MetaService {
 
   private static readonly AD_SET_READ_FIELDS = [
     'id', 'name', 'status', 'campaign_id',
-    'optimization_goal', 'billing_event', 'destination_type', 'promoted_object', 'bid_strategy',
+    'optimization_goal', 'billing_event', 'destination_type', 'promoted_object', 'bid_strategy', 'bid_amount',
     'daily_budget', 'lifetime_budget', 'start_time', 'end_time', 'targeting',
   ] as const;
 
