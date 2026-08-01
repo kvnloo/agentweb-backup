@@ -60,6 +60,10 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     (releasePreviewToken as jest.Mock).mockResolvedValue(undefined);
     (assertPublicHostname as jest.Mock).mockResolvedValue(undefined);
     (resolvePinnedPublicAddress as jest.Mock).mockResolvedValue({ hostname: 's3.example.com', address: '93.184.216.34', family: 4 });
+    // Default: no existing ad set matches (falls through to CREATE, the
+    // pre-existing behavior every test below expects unless it overrides
+    // this to specifically exercise ad-set reuse-by-name-match).
+    jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValue({ success: true, adSets: [] } as any);
   });
 
   const ACCOUNT_ID = '922903076601160';
@@ -734,6 +738,63 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       // re-execute (e.g. a second ad set under the same campaign) with no new
       // user confirmation. The token must be atomically claimed on success.
       expect(claimPreviewToken).toHaveBeenCalledWith(USER_ID, expect.any(String));
+    });
+
+    // Greptile finding: releasing the confirm token on a downstream failure
+    // means a retry could hit exactly this case — Meta creates the ad set
+    // but the response is lost/times out, the launch is reported as failed
+    // (network error, not a Meta rejection), the token is released, and a
+    // retry with the SAME approved args would call createMetaAdsAdSet AGAIN
+    // — createMetaAdsAdSet has no idempotency of its own, so an
+    // unconditional retry produces a second ad set (duplicate delivery/
+    // spend from one confirmation). Reuse-by-name-and-target-match (mirrors
+    // the lookalike fix) closes this the same way.
+    it('reuses an existing same-named ad set targeting the same audience instead of creating a duplicate', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_6', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValueOnce({
+        success: true,
+        adSets: [{
+          id: 'adset_existing', name: 'Targeted Ad Set',
+          targeting: { custom_audiences: [{ id: 'aud_seed_6' }] },
+        }],
+      } as any);
+      const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
+
+      expect(createAdSetSpy).not.toHaveBeenCalled();
+      expect(result.ledger.adSet).toEqual({
+        id: 'adset_existing', name: 'Targeted Ad Set', targetedAudienceId: 'aud_seed_6', excludedAudienceId: undefined,
+      });
+    });
+
+    it('creates a new ad set (does not reuse) when a same-named one exists but targets a different audience', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_7', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValueOnce({
+        success: true,
+        adSets: [{
+          id: 'adset_other', name: 'Targeted Ad Set',
+          targeting: { custom_audiences: [{ id: 'aud_seed_DIFFERENT' }] },
+        }],
+      } as any);
+      jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
+        success: true, adSet: { id: 'adset_new', name: 'Targeted Ad Set' },
+      } as any);
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
+
+      expect(agentModeService.createMetaAdsAdSet).toHaveBeenCalled();
+      expect(result.ledger.adSet).toEqual({
+        id: 'adset_new', name: 'Targeted Ad Set', targetedAudienceId: 'aud_seed_7', excludedAudienceId: undefined,
+      });
     });
 
     it('rejects a replay of an already-claimed preview token, returning a fresh preview instead of re-executing', async () => {

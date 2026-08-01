@@ -17614,14 +17614,42 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         targeting.excluded_custom_audiences = [{ id: args.exclude_audience_id }];
       }
 
-      const adSetResult = await this.createMetaAdsAdSet(userId, {
-        ...args.ad_set_params,
-        account_id: args.account_id,
-        campaign_id: args.campaign_id,
-        targeting,
+      // Greptile finding: releasing the confirm token on a downstream
+      // failure (e.g. Meta's ad-set-creation response lost/timed out even
+      // though the write actually completed) lets a legitimate retry reuse
+      // the same approved args — but createMetaAdsAdSet has no idempotency
+      // of its own, so an unconditional retry would create a SECOND ad set,
+      // duplicating delivery and spend from a single confirmation. Reuse an
+      // existing same-named ad set targeting the same audience under this
+      // campaign first, same reuse-by-match pattern as the lookalike fix.
+      const adSetName = args.ad_set_params?.name;
+      const existingAdSetsResult = await this.listMetaAdsAdSets(userId, args.campaign_id, args.account_id);
+      if (!existingAdSetsResult.success) {
+        throw new Error(existingAdSetsResult.message || 'Failed to list existing Meta ad sets.');
+      }
+      const existingAdSet = (existingAdSetsResult.adSets || []).find((as: any) => {
+        const targetedIds = (as?.targeting?.custom_audiences || []).map((a: any) => a?.id);
+        return (
+          String(as?.name ?? '').toLowerCase() === String(adSetName ?? '').toLowerCase() &&
+          targetedIds.length === 1 &&
+          targetedIds[0] === attachAudienceId
+        );
       });
-      if (!adSetResult.success) {
-        throw new Error(adSetResult.message || 'Failed to create ad set.');
+
+      let adSet: { id: string; name: string };
+      if (existingAdSet) {
+        adSet = { id: existingAdSet.id, name: existingAdSet.name };
+      } else {
+        const adSetResult = await this.createMetaAdsAdSet(userId, {
+          ...args.ad_set_params,
+          account_id: args.account_id,
+          campaign_id: args.campaign_id,
+          targeting,
+        });
+        if (!adSetResult.success) {
+          throw new Error(adSetResult.message || 'Failed to create ad set.');
+        }
+        adSet = adSetResult.adSet;
       }
 
       const ledger = {
@@ -17635,8 +17663,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         lookalike,
         campaign: { id: args.campaign_id },
         adSet: {
-          id: adSetResult.adSet.id,
-          name: adSetResult.adSet.name,
+          id: adSet.id,
+          name: adSet.name,
           targetedAudienceId: attachAudienceId,
           excludedAudienceId: workflow === 'retargeting' ? args.exclude_audience_id : undefined,
         },
