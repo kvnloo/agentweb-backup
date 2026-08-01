@@ -106,10 +106,27 @@ describe('metaAudienceCampaignTokenStore', () => {
       );
     });
 
-    it('does not throw if the delete itself fails (best-effort release)', async () => {
-      mockDelete.mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+    // Greptile follow-up finding: swallowing the delete failure on the FIRST
+    // attempt defeated the whole point of releasing — a transient DynamoDB
+    // blip would leave the token permanently consumed just as before this
+    // fix existed. Retries (mirroring the same pattern already used by
+    // saveAudienceSnapshotRowKeys) make that the rare case instead of the
+    // common one.
+    it('retries and succeeds if an earlier delete attempt fails', async () => {
+      mockDelete
+        .mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'))
+        .mockResolvedValueOnce({});
+
+      await releasePreviewToken('user1', 'abc123token');
+
+      expect(mockDelete).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not throw even after exhausting all retry attempts (best-effort release)', async () => {
+      mockDelete.mockRejectedValue(new Error('DynamoDB unavailable'));
 
       await expect(releasePreviewToken('user1', 'abc123token')).resolves.toBeUndefined();
+      expect(mockDelete.mock.calls.length).toBeGreaterThan(1);
     });
   });
 });

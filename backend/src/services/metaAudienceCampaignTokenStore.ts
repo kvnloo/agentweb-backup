@@ -62,22 +62,37 @@ export async function claimPreviewToken(userId: string, token: string): Promise<
   }
 }
 
+// Greptile follow-up finding: swallowing a delete failure on the first
+// attempt defeated the whole point of releasing — a transient DynamoDB blip
+// would leave the token permanently consumed just as before this fix
+// existed. Retrying (mirroring saveAudienceSnapshotRowKeys's pattern) makes
+// that the rare case rather than the common one.
+const RELEASE_RETRY_ATTEMPTS = 3;
+const RELEASE_RETRY_DELAY_MS = 200;
+
 /**
  * Releases a claimed token after a failed launch, so a legitimate retry with
  * the exact same (unchanged) arguments — which produces the same
  * deterministic HMAC digest — can claim it again instead of being
- * permanently locked out. Best-effort: a failure to release just means the
- * caller needs a fresh preview to get a new token, so it's swallowed rather
- * than compounding the original launch failure with a second error.
+ * permanently locked out. Retries a few times before giving up; even after
+ * exhausting retries this stays best-effort (swallowed) rather than
+ * compounding the original launch failure with a second thrown error — a
+ * failure to release just means the caller needs a fresh preview next time.
  */
 export async function releasePreviewToken(userId: string, token: string): Promise<void> {
   const dynamodb = new AWS.DynamoDB.DocumentClient();
-  try {
-    await dynamodb.delete({
-      TableName: CONFIGS_TABLE,
-      Key: { userId, configId: tokenConfigId(token) },
-    }).promise();
-  } catch {
-    // Best-effort — see docstring.
+  for (let attempt = 1; attempt <= RELEASE_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await dynamodb.delete({
+        TableName: CONFIGS_TABLE,
+        Key: { userId, configId: tokenConfigId(token) },
+      }).promise();
+      return;
+    } catch {
+      if (attempt < RELEASE_RETRY_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, RELEASE_RETRY_DELAY_MS));
+      }
+      // Best-effort — see docstring. Final attempt's failure is swallowed too.
+    }
   }
 }
