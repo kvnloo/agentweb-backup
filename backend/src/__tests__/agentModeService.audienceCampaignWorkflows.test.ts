@@ -64,6 +64,9 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // pre-existing behavior every test below expects unless it overrides
     // this to specifically exercise ad-set reuse-by-name-match).
     jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValue({ success: true, adSets: [] } as any);
+    // Default: campaign has no CBO (Advantage Campaign Budget), so requested
+    // budgets aren't stripped for comparison purposes — the common case.
+    jest.spyOn(agentModeService, 'getCampaignForAdSetReuseCheck').mockResolvedValue({});
   });
 
   const ACCOUNT_ID = '922903076601160';
@@ -906,6 +909,76 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
       expect(createAdSetSpy).not.toHaveBeenCalled();
       expect(result.ledger.adSet.id).toBe('adset_existing_budget');
+    });
+
+    // Greptile follow-up finding: createMetaAdsAdSet strips daily_budget/
+    // lifetime_budget entirely (not just leaves it unconverted) when the
+    // campaign has Advantage Campaign Budget (CBO). A retry requesting a
+    // budget for a CBO campaign must still match an existing ad set that
+    // (correctly) has no budget of its own — the comparison needs to know
+    // about CBO, not just blindly cents-convert whatever was requested.
+    it('reuses an existing ad set with no budget when the campaign has CBO, even though a budget was requested', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_11', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      jest.spyOn(agentModeService, 'getCampaignForAdSetReuseCheck').mockResolvedValueOnce({ daily_budget: 5000 }); // campaign has CBO
+      jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValueOnce({
+        success: true,
+        adSets: [{
+          id: 'adset_cbo', name: 'Targeted Ad Set',
+          targeting: {
+            custom_audiences: [{ id: 'aud_seed_11' }], geo_locations: { countries: ['US'] },
+            targeting_automation: { advantage_audience: 0 },
+          },
+          daily_budget: null, // CBO campaign — ad set has no budget of its own
+          bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
+        }],
+      } as any);
+      const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm({
+        ...baseArgs(), ad_set_params: { ...baseArgs().ad_set_params, daily_budget: 10 }, // would get stripped anyway
+      }));
+
+      expect(createAdSetSpy).not.toHaveBeenCalled();
+      expect(result.ledger.adSet.id).toBe('adset_cbo');
+    });
+
+    // Greptile follow-up finding: createMetaAdsAdSet auto-sets start_time to
+    // "now" at creation time for an ACTIVE ad set with no explicit
+    // start_time — a value that can never be reproduced on a later retry. A
+    // retry for an ACTIVE ad set with no start_time requested must still
+    // match an existing ACTIVE ad set regardless of its actual (unknowable)
+    // start_time.
+    it('reuses an existing ACTIVE ad set regardless of its auto-filled start_time, when none was explicitly requested', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_12', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValueOnce({
+        success: true,
+        adSets: [{
+          id: 'adset_active', name: 'Targeted Ad Set',
+          targeting: {
+            custom_audiences: [{ id: 'aud_seed_12' }], geo_locations: { countries: ['US'] },
+            targeting_automation: { advantage_audience: 0 },
+          },
+          status: 'ACTIVE',
+          start_time: '2026-01-01T00:00:00.000Z', // auto-filled at original creation — unknowable on retry
+          bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
+        }],
+      } as any);
+      const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm({
+        ...baseArgs(), ad_set_params: { ...baseArgs().ad_set_params, status: 'ACTIVE' }, // no start_time requested
+      }));
+
+      expect(createAdSetSpy).not.toHaveBeenCalled();
+      expect(result.ledger.adSet.id).toBe('adset_active');
     });
 
     it('rejects a replay of an already-claimed preview token, returning a fresh preview instead of re-executing', async () => {

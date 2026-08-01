@@ -14809,6 +14809,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  /**
+   * Thin wrapper used by executeAudienceCampaignLaunch's ad-set reuse-match
+   * check to determine whether the campaign has Advantage Campaign Budget
+   * (CBO) — needed to normalize the requested budget the same way
+   * createMetaAdsAdSet does (strips it entirely for CBO campaigns) before
+   * comparing against an existing ad set. Kept as its own method (mirroring
+   * listMetaAdsAdSets) so it can be mocked directly in tests.
+   */
+  public async getCampaignForAdSetReuseCheck(userId: string, accountId: string, campaignId: string): Promise<any> {
+    const { accountId: resolvedAccountId, accessToken } = await this.getMetaCredentials(userId, accountId);
+    return metaService.getCampaign(resolvedAccountId, accessToken, campaignId);
+  }
+
   public async listMetaAdsAdSets(
     userId: string,
     campaignId?: string,
@@ -17682,6 +17695,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // destination_type when unset before calling Meta, so an identical
       // retry's RAW args never matched the normalized values Meta actually
       // stored. Applies the same normalization here before comparing.
+      //
+      // Greptile follow-up finding: two more createMetaAdsAdSet transforms
+      // weren't mirrored — (1) daily_budget/lifetime_budget are stripped
+      // entirely (not just left unconverted) when the campaign has
+      // Advantage Campaign Budget (CBO), so a CBO retry's requested budget
+      // must also normalize to "no budget" for comparison; (2) start_time is
+      // auto-set to "now" at creation time for an ACTIVE ad set with no
+      // explicit start_time — a value that can never be reproduced on a
+      // later retry, so start_time is excluded from the comparison
+      // entirely in exactly that case (any existing ACTIVE match on every
+      // other field is accepted regardless of its actual start_time).
+      const campaign = await this.getCampaignForAdSetReuseCheck(userId, args.account_id, args.campaign_id);
+      const campaignHasBudget = !!(campaign?.daily_budget || campaign?.lifetime_budget);
+
       const toCentsForComparison = (val: number | undefined) => val !== undefined ? Math.round(val * 100) : undefined;
       const resolvedBidStrategy = args.ad_set_params?.bid_strategy || 'LOWEST_COST_WITHOUT_CAP';
       const resolvedDestinationType = args.ad_set_params?.destination_type === undefined &&
@@ -17690,17 +17717,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         : args.ad_set_params?.destination_type;
       const normalizedRequestedAdSetParams: Record<string, any> = {
         ...args.ad_set_params,
-        daily_budget: toCentsForComparison(args.ad_set_params?.daily_budget),
-        lifetime_budget: toCentsForComparison(args.ad_set_params?.lifetime_budget),
+        daily_budget: campaignHasBudget ? undefined : toCentsForComparison(args.ad_set_params?.daily_budget),
+        lifetime_budget: campaignHasBudget ? undefined : toCentsForComparison(args.ad_set_params?.lifetime_budget),
         bid_amount: toCentsForComparison(args.ad_set_params?.bid_amount),
         bid_strategy: resolvedBidStrategy,
         destination_type: resolvedDestinationType,
       };
-      const AD_SET_REUSE_MATCH_FIELDS = [
-        'daily_budget', 'lifetime_budget', 'start_time', 'end_time',
-        'optimization_goal', 'billing_event', 'bid_strategy', 'bid_amount',
-        'destination_type', 'promoted_object', 'status',
-      ] as const;
+      const startTimeIsUnreproducibleAutoFill = args.ad_set_params?.status === 'ACTIVE' && args.ad_set_params?.start_time === undefined;
+      const AD_SET_REUSE_MATCH_FIELDS = (
+        [
+          'daily_budget', 'lifetime_budget', 'start_time', 'end_time',
+          'optimization_goal', 'billing_event', 'bid_strategy', 'bid_amount',
+          'destination_type', 'promoted_object', 'status',
+        ] as const
+      ).filter((field) => field !== 'start_time' || !startTimeIsUnreproducibleAutoFill);
       const existingAdSet = (existingAdSetsResult.adSets || []).find((as: any) => {
         if (String(as?.name ?? '').toLowerCase() !== String(adSetName ?? '').toLowerCase()) return false;
         if (this.canonicalJSON(as?.targeting) !== this.canonicalJSON(targeting)) return false;
