@@ -802,7 +802,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       manageSpy.mockResolvedValueOnce({
         success: true, audiences: [{
           id: 'aud_lookalike_existing', name: 'RankAI Warm List - Lookalike',
-          lookalike_spec: { ratio: 0.01, country: 'US' },
+          lookalike_spec: { ratio: 0.01, country: 'US', origin: [{ id: 'aud_seed_3', type: 'custom_audience' }] },
         }],
       } as any); // LIST — finds the lookalike created by a prior (failed-after-this-step) attempt, same spec requested now
       jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
@@ -860,6 +860,43 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       }));
       expect(result.ledger.lookalike).toEqual({
         id: 'aud_lookalike_new', name: 'RankAI Warm List - Lookalike', ratio: 0.01, country: 'US',
+      });
+    });
+
+    // Greptile follow-up finding: matching ratio/country alone isn't
+    // enough — a same-named lookalike with the SAME ratio/country but built
+    // from a DIFFERENT seed audience must also not be reused, or the new
+    // campaign targets the old seed population entirely.
+    it('creates a new Lookalike Audience (does not reuse) when a same-named/same-spec one exists from a different seed audience', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_5', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      const manageSpy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      manageSpy.mockResolvedValueOnce({
+        success: true, audiences: [{
+          id: 'aud_lookalike_old_seed', name: 'RankAI Warm List - Lookalike',
+          lookalike_spec: { ratio: 0.01, country: 'US', origin: [{ id: 'aud_seed_OLD', type: 'custom_audience' }] },
+        }],
+      } as any); // LIST
+      manageSpy.mockResolvedValueOnce({
+        success: true, audience: { id: 'aud_lookalike_new_seed', name: 'RankAI Warm List - Lookalike' },
+      } as any); // CREATE
+      jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
+        success: true, adSet: { id: 'adset_5', name: 'Targeted Ad Set' },
+      } as any);
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm({
+        ...baseArgs(), use_lookalike: true, lookalike_ratio: 0.01, lookalike_country: 'US',
+      }));
+
+      expect(manageSpy).toHaveBeenNthCalledWith(2, USER_ID, 'CREATE', ACCOUNT_ID, expect.objectContaining({
+        subtype: 'LOOKALIKE',
+        lookalike_spec: { origin: [{ id: 'aud_seed_5', type: 'custom_audience' }], ratio: 0.01, country: 'US' },
+      }));
+      expect(result.ledger.lookalike).toEqual({
+        id: 'aud_lookalike_new_seed', name: 'RankAI Warm List - Lookalike', ratio: 0.01, country: 'US',
       });
     });
 
