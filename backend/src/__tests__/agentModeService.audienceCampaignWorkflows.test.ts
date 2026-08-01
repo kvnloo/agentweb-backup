@@ -759,9 +759,11 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         plannedAction: 'create', audience: { id: 'aud_seed_2', name: 'RankAI Warm List' }, created: true,
         sourceSummary: 'CSV upload (...)', failures: [],
       });
-      const manageSpy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences').mockResolvedValueOnce({
+      const manageSpy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      manageSpy.mockResolvedValueOnce({ success: true, audiences: [] } as any); // LIST (lookalike reuse-by-name check)
+      manageSpy.mockResolvedValueOnce({
         success: true, audience: { id: 'aud_lookalike_1', name: 'RankAI Warm List - Lookalike' },
-      } as any);
+      } as any); // CREATE
       jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
         success: true, adSet: { id: 'adset_2', name: 'Targeted Ad Set' },
       } as any);
@@ -774,13 +776,47 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       // missing "type": "custom_audience" with "(#2654) ... No custom_audience
       // ID given for lookalike cluster" — the origin entry must be fully
       // shaped, not just {id}.
-      expect(manageSpy).toHaveBeenCalledWith(USER_ID, 'CREATE', ACCOUNT_ID, expect.objectContaining({
+      expect(manageSpy).toHaveBeenNthCalledWith(2, USER_ID, 'CREATE', ACCOUNT_ID, expect.objectContaining({
         subtype: 'LOOKALIKE',
         lookalike_spec: { origin: [{ id: 'aud_seed_2', type: 'custom_audience' }], ratio: 0.01, country: 'US' },
       }));
       expect(result.ledger.lookalike).toEqual({ id: 'aud_lookalike_1', name: 'RankAI Warm List - Lookalike', ratio: 0.01, country: 'US' });
       const adSetCallArgs = (agentModeService.createMetaAdsAdSet as jest.Mock).mock.calls[0][1];
       expect(adSetCallArgs.targeting.custom_audiences).toEqual([{ id: 'aud_lookalike_1' }]);
+    });
+
+    // Greptile finding: releasing the confirm token on a downstream failure
+    // (e.g. ad-set creation) lets the user retry the SAME approved args —
+    // but if the earlier lookalike CREATE already succeeded before that
+    // failure, an unconditional retry would CREATE again (not idempotent by
+    // name), leaving a duplicate lookalike audience from a single
+    // confirmation. Reusing an existing same-named lookalike by exact match
+    // (same pattern as the seed audience) prevents the duplicate.
+    it('reuses an existing same-named Lookalike Audience instead of creating a duplicate on retry', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_3', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      const manageSpy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      manageSpy.mockResolvedValueOnce({
+        success: true, audiences: [{ id: 'aud_lookalike_existing', name: 'RankAI Warm List - Lookalike' }],
+      } as any); // LIST — finds the lookalike created by a prior (failed-after-this-step) attempt
+      jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
+        success: true, adSet: { id: 'adset_3', name: 'Targeted Ad Set' },
+      } as any);
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm({
+        ...baseArgs(), use_lookalike: true, lookalike_ratio: 0.01, lookalike_country: 'US',
+      }));
+
+      // Only LIST — no CREATE call for the lookalike, since one already exists by name.
+      expect(manageSpy).not.toHaveBeenCalledWith(USER_ID, 'CREATE', ACCOUNT_ID, expect.objectContaining({ subtype: 'LOOKALIKE' }));
+      expect(result.ledger.lookalike).toEqual({
+        id: 'aud_lookalike_existing', name: 'RankAI Warm List - Lookalike', ratio: 0.01, country: 'US',
+      });
+      const adSetCallArgs = (agentModeService.createMetaAdsAdSet as jest.Mock).mock.calls[0][1];
+      expect(adSetCallArgs.targeting.custom_audiences).toEqual([{ id: 'aud_lookalike_existing' }]);
     });
 
     it('rejects use_lookalike=true without lookalike_ratio/lookalike_country before calling anything', async () => {

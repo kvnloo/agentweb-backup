@@ -17545,23 +17545,44 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       let attachAudienceId = seed.audience!.id;
       let lookalike: { id: string; name: string; ratio: number; country: string } | null = null;
       if (args.use_lookalike) {
-        const lookalikeResult = await this.manageMetaCustomAudiences(userId, 'CREATE', args.account_id, {
-          name: `${args.audience_name} - Lookalike`,
-          subtype: 'LOOKALIKE',
-          lookalike_spec: {
-            origin: [{ id: seed.audience!.id, type: 'custom_audience' }],
-            ratio: args.lookalike_ratio,
-            country: args.lookalike_country,
-          },
-          confirm: true,
-        });
-        if (!lookalikeResult.success) {
-          throw new Error(lookalikeResult.message || 'Failed to create Lookalike Audience.');
+        // Greptile finding: releasing the confirm token on a downstream
+        // failure (e.g. ad-set creation) lets a legitimate retry reuse the
+        // same approved args — but CREATE isn't idempotent by name, so an
+        // unconditional retry after a lookalike had already been created
+        // would create ANOTHER same-named lookalike, leaving a duplicate
+        // Meta resource from a single confirmation. Reuse-by-exact-name-match
+        // first, same pattern the seed audience already uses.
+        const lookalikeName = `${args.audience_name} - Lookalike`;
+        const lookalikeListResult = await this.manageMetaCustomAudiences(userId, 'LIST', args.account_id, {});
+        if (!lookalikeListResult.success) {
+          throw new Error(lookalikeListResult.message || 'Failed to list existing Meta custom audiences.');
         }
-        attachAudienceId = lookalikeResult.audience.id;
+        const existingLookalike = (lookalikeListResult.audiences || []).find(
+          (a: any) => String(a?.name ?? '').toLowerCase() === lookalikeName.toLowerCase()
+        );
+        let lookalikeAudience: { id: string; name: string };
+        if (existingLookalike) {
+          lookalikeAudience = { id: existingLookalike.id, name: existingLookalike.name };
+        } else {
+          const lookalikeResult = await this.manageMetaCustomAudiences(userId, 'CREATE', args.account_id, {
+            name: lookalikeName,
+            subtype: 'LOOKALIKE',
+            lookalike_spec: {
+              origin: [{ id: seed.audience!.id, type: 'custom_audience' }],
+              ratio: args.lookalike_ratio,
+              country: args.lookalike_country,
+            },
+            confirm: true,
+          });
+          if (!lookalikeResult.success) {
+            throw new Error(lookalikeResult.message || 'Failed to create Lookalike Audience.');
+          }
+          lookalikeAudience = lookalikeResult.audience;
+        }
+        attachAudienceId = lookalikeAudience.id;
         lookalike = {
-          id: lookalikeResult.audience.id,
-          name: lookalikeResult.audience.name,
+          id: lookalikeAudience.id,
+          name: lookalikeAudience.name,
           ratio: args.lookalike_ratio,
           country: args.lookalike_country,
         };
