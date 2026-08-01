@@ -599,7 +599,10 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
         mockHubSpotContact('a@example.com', '111')
       );
-      (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(null);
+      // A non-null prior snapshot so this takes the normal diff-then-
+      // UPLOAD_USERS path (save-before-upload) — the no-baseline
+      // REPLACE_USERS path saves AFTER instead, covered separately below.
+      (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue([rowKeyFor('a@example.com', '111')]);
       (saveAudienceSnapshotRowKeys as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB unavailable'));
 
       await expect(callResolveOrCreateSeedAudience(
@@ -641,6 +644,62 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(callOrder.indexOf('SAVE_SNAPSHOT')).toBeGreaterThanOrEqual(0);
       expect(callOrder.indexOf('UPLOAD_USERS')).toBeGreaterThanOrEqual(0);
       expect(callOrder.indexOf('SAVE_SNAPSHOT')).toBeLessThan(callOrder.indexOf('UPLOAD_USERS'));
+    });
+
+    // Greptile follow-up finding: for the no-baseline reuse case
+    // (REPLACE_USERS), saving the snapshot BEFORE the call has the opposite
+    // problem — if REPLACE_USERS then fails, the snapshot now falsely looks
+    // like an established baseline exists, so a retry switches to additive
+    // UPLOAD_USERS instead of retrying REPLACE_USERS, and pre-existing
+    // members that should have been wiped by the replace are never removed.
+    // Unlike additive UPLOAD_USERS (which doesn't self-heal an untracked
+    // successful add), REPLACE_USERS is fully idempotent regardless of
+    // tracking history — it always sets Meta's membership to exactly the
+    // current payload — so it doesn't need the save-before reorder: saving
+    // AFTER (the original order) is correct here.
+    it('saves the snapshot AFTER calling REPLACE_USERS (no-baseline reuse), not before', async () => {
+      const callOrder: string[] = [];
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockImplementation(async (_userId: any, action: any) => {
+        callOrder.push(action);
+        if (action === 'LIST') return { success: true, audiences: [{ id: 'aud_order_2', name: 'X' }] } as any;
+        return { success: true } as any;
+      });
+      (saveAudienceSnapshotRowKeys as jest.Mock).mockImplementationOnce(async () => {
+        callOrder.push('SAVE_SNAPSHOT');
+      });
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
+        mockHubSpotContact('a@example.com', '111')
+      );
+      (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(null); // no baseline — REPLACE_USERS path
+
+      await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-1' },
+        { dryRun: false }
+      );
+
+      expect(callOrder.indexOf('REPLACE_USERS')).toBeGreaterThanOrEqual(0);
+      expect(callOrder.indexOf('SAVE_SNAPSHOT')).toBeGreaterThanOrEqual(0);
+      expect(callOrder.indexOf('REPLACE_USERS')).toBeLessThan(callOrder.indexOf('SAVE_SNAPSHOT'));
+    });
+
+    it('does NOT save the snapshot when REPLACE_USERS fails (would falsely look like an established baseline on retry)', async () => {
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_replace_fail', name: 'X' }] } as any); // LIST
+      spy.mockResolvedValueOnce({ success: false, message: 'Meta rejected the replace' } as any); // REPLACE_USERS
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
+        mockHubSpotContact('a@example.com', '111')
+      );
+      (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(null); // no baseline
+
+      await expect(callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-1' },
+        { dryRun: false }
+      )).rejects.toThrow('Meta rejected the replace');
+
+      expect(saveAudienceSnapshotRowKeys).not.toHaveBeenCalled();
     });
   });
 

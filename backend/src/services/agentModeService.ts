@@ -17334,16 +17334,26 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // any snapshot, ever — future diffs can only flag a member as stale by
     // comparing against a PRIOR snapshot that recorded it, so an untracked-
     // from-birth member could never be detected as no-longer-needed and
-    // would stay targetable in Meta forever. Uploads are idempotent-
-    // additive (a future sync just re-sends whatever's in the current
+    // would stay targetable in Meta forever. Additive UPLOAD_USERS is
+    // idempotent (a future sync just re-sends whatever's in the current
     // source, self-healing a "snapshot updated, upload not yet retried"
     // mismatch) but deletes are NOT (they depend entirely on snapshot
-    // history) — so the snapshot is saved BEFORE uploading, closing the gap
-    // without trading it for a symmetric under-targeting risk. If the save
-    // fails (even after retries), the launch aborts here with NO Meta
-    // mutation attempted at all, keeping Meta's state and our tracked state
-    // consistent (both un-updated) rather than diverging.
-    await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
+    // history) — so for that path, the snapshot is saved BEFORE uploading.
+    //
+    // Greptile follow-up finding: REPLACE_USERS (the no-baseline reuse path)
+    // is the OPPOSITE case — saving before it has the mirror problem: if
+    // REPLACE_USERS then fails, the snapshot now falsely looks like an
+    // established baseline exists, so a retry switches to additive
+    // UPLOAD_USERS instead of retrying REPLACE_USERS, and pre-existing
+    // members that should have been wiped by the replace are never removed.
+    // REPLACE_USERS doesn't need the save-before reorder at all — it's
+    // fully idempotent regardless of tracking history (always sets Meta's
+    // membership to exactly the payload), so retrying it after ANY failure
+    // — including one where the snapshot save is what actually failed — is
+    // always correct. Save stays AFTER for this path, as originally.
+    if (!noBaselineReuse) {
+      await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
+    }
 
     const uploadResult = await this.manageMetaCustomAudiences(userId, noBaselineReuse ? 'REPLACE_USERS' : 'UPLOAD_USERS', accountId, {
       id: audienceId,
@@ -17353,6 +17363,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     });
     if (!uploadResult.success) {
       throw new Error(uploadResult.message || (noBaselineReuse ? 'Failed to replace users in Meta custom audience.' : 'Failed to upload users to Meta custom audience.'));
+    }
+
+    if (noBaselineReuse) {
+      await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
     }
 
     return {
