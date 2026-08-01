@@ -394,6 +394,30 @@ describe('ENG-400: Meta campaign-objective write gate', () => {
       expect(persisted.immutable).toBe(true);
     });
 
+    // Live-test finding (2026-07-30): the card's "Traffic / Awareness" option
+    // was a single merged choice whose payload only ever set OUTCOME_TRAFFIC —
+    // a user who wanted Awareness (needed for a REACH ad set) had no real way
+    // to select it from this card, picked the mislabeled option expecting
+    // Awareness, and got an immutable OUTCOME_TRAFFIC campaign instead. Worse,
+    // when the model caught the mismatch and asked a follow-up correction via
+    // a separate ask_user_question (bare kind, not the correlator-scoped kind
+    // this gate looks up), that correction was invisible to Path 2 on retry —
+    // the original wrong Traffic answer silently won. Awareness must be its
+    // own distinct, correctly-payloaded option so this scenario can't recur.
+    it('offers Awareness as its own distinct option, separate from Traffic', async () => {
+      const result = await callApi(service, validParams({ objective: 'OUTCOME_TRAFFIC' }), 'session-1');
+
+      const awarenessOption = result.options.find((o: any) => o.id === 'awareness');
+      expect(awarenessOption).toBeDefined();
+      expect(awarenessOption.payload).toEqual({ objective: 'OUTCOME_AWARENESS' });
+      expect(awarenessOption.label.toLowerCase()).toContain('awareness');
+
+      const trafficOption = result.options.find((o: any) => o.id === 'traffic');
+      expect(trafficOption).toBeDefined();
+      expect(trafficOption.payload).toEqual({ objective: 'OUTCOME_TRAFFIC' });
+      expect(trafficOption.label.toLowerCase()).not.toContain('awareness');
+    });
+
     it('does NOT create the campaign when a question is already awaiting (one-live-question guard)', async () => {
       (chatbotDb.updateSessionAskUserQuestion as jest.Mock).mockResolvedValue(null); // refused: already awaiting
       const result = await callApi(service, validParams({ objective: 'OUTCOME_TRAFFIC' }), 'session-1');
