@@ -1413,7 +1413,16 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // as failed to the caller. The success result must still be returned,
     // the token must NOT be released, and the launch must be reported as a
     // success despite the marking failure.
-    it('still reports success and does not release the token when markPreviewTokenSucceeded fails after a successful launch', async () => {
+    // Greptile follow-up finding: leaving the token dangling "in_progress"
+    // when markPreviewTokenSucceeded exhausts its own internal retries made
+    // it reclaimable — and therefore replayable — after the staleness
+    // window, with no bound on when. Explicitly releasing the claim instead
+    // closes that limbo state immediately. Safe because a resulting retry
+    // re-enters the reuse-by-match logic (audience name-match, lookalike
+    // spec-match, ad-set full-config-match) rather than a bare
+    // re-execution, so it reuses the already-created resources instead of
+    // duplicating them.
+    it('still reports success and releases the token when markPreviewTokenSucceeded exhausts its retries after a successful launch', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
       jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
         plannedAction: 'reuse', audience: { id: 'aud_seed_marksucceed', name: 'RankAI Warm List' }, created: false,
@@ -1423,13 +1432,13 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
         success: true, adSet: { id: 'adset_marksucceed', name: 'Targeted Ad Set' },
       } as any);
-      (markPreviewTokenSucceeded as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB transient error'));
+      (markPreviewTokenSucceeded as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB unavailable (retries exhausted)'));
 
       const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
 
       expect(result.success).toBe(true);
       expect(result.ledger.adSet.id).toBe('adset_marksucceed');
-      expect(releasePreviewToken).not.toHaveBeenCalled();
+      expect(releasePreviewToken).toHaveBeenCalledWith(USER_ID, expect.any(String));
     });
 
     it('fails the whole launch when ad set creation fails', async () => {

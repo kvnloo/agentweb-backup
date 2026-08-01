@@ -17699,19 +17699,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         //
         // Greptile finding: a failure from THIS write must not be treated as
         // a launch failure — the external Meta mutations already completed
-        // by this point. Letting it propagate into the catch below would
-        // release the token (letting a retry re-execute the same mutations
-        // against Meta a second time, creating duplicate campaigns/ad sets)
-        // AND report the completed launch as failed to the caller. Marking
-        // failure is swallowed (best-effort, mirroring releasePreviewToken's
-        // own best-effort contract) — worst case the token is never
-        // promoted past "in_progress" and becomes reclaimable after the
-        // staleness window, a far smaller risk than guaranteed duplicate
-        // execution plus a false failure on an already-successful launch.
+        // by this point. Letting it propagate into the catch below via
+        // `throw` would report the completed launch as failed to the
+        // caller, which is wrong regardless of what happens to the token.
+        //
+        // Greptile follow-up finding: after markPreviewTokenSucceeded
+        // exhausts its own retries, silently leaving the claim dangling
+        // "in_progress" made it reclaimable — and therefore replayable —
+        // after the staleness window, with no bound on when that happens.
+        // Explicitly releasing the claim here (same best-effort delete
+        // releasePreviewToken already uses on a real failure) closes that
+        // limbo state immediately instead of leaving it to staleness. This
+        // is safe specifically because a resulting retry re-enters
+        // executeAudienceCampaignLaunch's reuse-by-match logic (audience
+        // name-match, lookalike spec-match, ad-set full-config-match — all
+        // live-verified against real Meta) rather than a bare unconditional
+        // re-execution: it finds and reuses the campaign/lookalike/ad set
+        // this call already created instead of duplicating them, so the
+        // worst case is a wasted extra LIST-and-compare pass, not duplicate
+        // spend.
         try {
           await markPreviewTokenSucceeded(userId, args.preview_token);
         } catch (markError) {
-          console.error('AgentMode: Failed to mark audience-campaign preview token as succeeded (launch itself succeeded):', markError);
+          console.error('AgentMode: Failed to mark audience-campaign preview token as succeeded (launch itself succeeded) — releasing the claim so a retry can safely reuse the already-created resources:', markError);
+          await releasePreviewToken(userId, args.preview_token);
         }
         return result;
       } catch (e) {
