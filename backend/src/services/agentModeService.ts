@@ -17676,7 +17676,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // token permanently consumed, the staleness override added for
         // failed-release retries also let a genuinely completed launch's
         // token be reclaimed and replayed after the staleness window.
-        await markPreviewTokenSucceeded(userId, args.preview_token);
+        //
+        // Greptile finding: a failure from THIS write must not be treated as
+        // a launch failure — the external Meta mutations already completed
+        // by this point. Letting it propagate into the catch below would
+        // release the token (letting a retry re-execute the same mutations
+        // against Meta a second time, creating duplicate campaigns/ad sets)
+        // AND report the completed launch as failed to the caller. Marking
+        // failure is swallowed (best-effort, mirroring releasePreviewToken's
+        // own best-effort contract) — worst case the token is never
+        // promoted past "in_progress" and becomes reclaimable after the
+        // staleness window, a far smaller risk than guaranteed duplicate
+        // execution plus a false failure on an already-successful launch.
+        try {
+          await markPreviewTokenSucceeded(userId, args.preview_token);
+        } catch (markError) {
+          console.error('AgentMode: Failed to mark audience-campaign preview token as succeeded (launch itself succeeded):', markError);
+        }
         return result;
       } catch (e) {
         await releasePreviewToken(userId, args.preview_token);

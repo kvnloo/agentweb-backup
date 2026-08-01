@@ -1371,6 +1371,34 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(markPreviewTokenSucceeded).not.toHaveBeenCalled();
     });
 
+    // Greptile finding: when the Meta launch itself succeeds but the
+    // subsequent markPreviewTokenSucceeded write fails (e.g. a transient
+    // DynamoDB error), that failure was caught by the SAME catch block used
+    // for real launch failures — releasing the token (letting a retry
+    // re-execute the already-completed Meta mutations a second time,
+    // duplicating the campaign/ad set) AND reporting the successful launch
+    // as failed to the caller. The success result must still be returned,
+    // the token must NOT be released, and the launch must be reported as a
+    // success despite the marking failure.
+    it('still reports success and does not release the token when markPreviewTokenSucceeded fails after a successful launch', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_marksucceed', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValueOnce({ success: true, adSets: [] } as any);
+      jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
+        success: true, adSet: { id: 'adset_marksucceed', name: 'Targeted Ad Set' },
+      } as any);
+      (markPreviewTokenSucceeded as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB transient error'));
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm(baseArgs()));
+
+      expect(result.success).toBe(true);
+      expect(result.ledger.adSet.id).toBe('adset_marksucceed');
+      expect(releasePreviewToken).not.toHaveBeenCalled();
+    });
+
     it('fails the whole launch when ad set creation fails', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
       jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
