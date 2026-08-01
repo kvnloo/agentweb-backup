@@ -2205,7 +2205,7 @@ export class MetaService {
   public async listPixels(adAccountId: string, accessToken: string) {
     try {
       const apiVersion = process.env.META_API_VERSION || 'v25.0';
-      const url = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adspixels?fields=id,name,is_created_by_business&access_token=${accessToken}`;
+      const url = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adspixels?fields=id,name,last_fired_time,is_created_by_business&access_token=${accessToken}`;
       const { fetchWithRetry } = await import('../utils/metaApiFetch');
       const response = await fetchWithRetry(url);
       const data = await response.json();
@@ -2215,25 +2215,6 @@ export class MetaService {
       return data.data || [];
     } catch (error) {
       return this.handleError(error, 'listPixels');
-    }
-  }
-
-  /**
-   * List datasets (server event data sources) linked to a pixel
-   */
-  public async listDatasets(pixelId: string, accessToken: string) {
-    try {
-      const apiVersion = process.env.META_API_VERSION || 'v25.0';
-      const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/datasets?fields=id,name&access_token=${accessToken}`;
-      const { fetchWithRetry } = await import('../utils/metaApiFetch');
-      const response = await fetchWithRetry(url);
-      const data = await response.json();
-      if (data.error) {
-        throw new Error(data.error.message || 'Failed to list datasets');
-      }
-      return data.data || [];
-    } catch (error) {
-      return this.handleError(error, 'listDatasets');
     }
   }
 
@@ -2259,8 +2240,9 @@ export class MetaService {
   /**
    * Auto-resolve which Meta pixel a lander should use, from the site owner's already-connected
    * Meta ad account. Uses `pixel.id` directly as the dataset id — Meta unified
-   * pixel + dataset in Graph v25, so the per-pixel `listDatasets` edge (broken, see ENG-399)
-   * is never called at all.
+   * pixel + dataset in Graph v25, so there is no per-pixel dataset lookup to make. (The old
+   * `listDatasets` helper hit the removed `/<pixel_id>/datasets` edge and was deleted in
+   * ENG-399, which fixed the same bug in the DATASET LIST tool path.)
    *
    * Never throws: an unconnected account, an ambiguous pixel/account set, or any Graph/
    * credential error all resolve to `{ unresolved: true, reason }` so generation can proceed

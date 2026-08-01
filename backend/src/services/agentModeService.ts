@@ -13,6 +13,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
+import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -173,7 +174,7 @@ export function isCompleteHtmlDocument(draft: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
-import { twitterService } from './twitterService';
+import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
 import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
 import * as linkedInAdsService from './linkedInAdsService';
@@ -794,7 +795,15 @@ export class AgentModeService {
   private readonly FILE_CACHE_MAX_SIZE = 1000; // Max 1000 cached files
   private readonly FILE_CACHE_MAX_AGE_MS = 3600000; // 1 hour TTL
   private readonly FILE_CACHE_CLEANUP_INTERVAL_MS = 600000; // Cleanup every 10 minutes
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5.5';
+  // ENG-759: the default chat model. Opus 5 and Opus 4.8 are both $5/$25, so this
+  // is a capability upgrade at no cost change. Opus 5 is AccessDenied on our
+  // default AWS account and reachable ONLY through the bearer-token account, so it
+  // MUST stay in BEDROCK_BEARER_TOKEN_MODELS — see utils/bedrockInferenceProfiles.
+  // This literal is the last-resort fallback; the effective default is the
+  // `agent_mode_default_model` setting when one is configured (getDefaultModel).
+  // It previously read 'gpt-5.5', which meant a missing/invalid setting silently
+  // dropped every chat onto an Azure GPT deployment instead of the intended Claude.
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'anthropic.claude-opus-5';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -1559,6 +1568,34 @@ export class AgentModeService {
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
 
+  // ENG-737: native @google/genai adapter — the only Gemini transport agent-mode
+  // calls use. It filters chain-of-thought at the source (thinkingConfig.
+  // includeThoughts=false + part.thought), so no reasoning leak is possible by
+  // construction — no heuristic, no fallback transport that could reintroduce it.
+  private gemini_native_client: any | null = null;
+  private gemini_native_sdk_promise: Promise<any> | null = null;
+  private gemini_api_key_promise: Promise<string> | null = null;
+
+  /** Resolve the Gemini API key from env or secrets (cached; shared by both clients). */
+  private async getGeminiApiKey(): Promise<string> {
+    if (this.gemini_api_key_promise) return this.gemini_api_key_promise;
+    this.gemini_api_key_promise = (async () => {
+      let geminiApiKey = process.env.GEMINI_API_KEY;
+      if (!geminiApiKey) {
+        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+        geminiApiKey = await getSecret(`${environment}/AgentWeb/GeminiAPIKey`);
+      }
+      if (!geminiApiKey || !geminiApiKey.trim()) {
+        throw new Error('Gemini API key is empty or not found in env/secrets');
+      }
+      return geminiApiKey.trim();
+    })().catch((err) => {
+      this.gemini_api_key_promise = null; // allow retry on transient secret failures
+      throw err;
+    });
+    return this.gemini_api_key_promise;
+  }
+
   // Helper method to get Gemini client (lazy-loaded from secrets manager)
   public async getGeminiClient(): Promise<OpenAI> {
     // Return cached client if available
@@ -1600,6 +1637,39 @@ export class AgentModeService {
     })();
 
     return this.gemini_client_promise;
+  }
+
+  /**
+   * ENG-737: native @google/genai client wrapper for gemini agent calls, presenting
+   * the same OpenAI-shaped `chat.completions.create` surface as getGeminiClient.
+   * Unlike the compat endpoint, this filters chain-of-thought natively
+   * (thinkingConfig.includeThoughts=false + part.thought), so no reasoning leaks —
+   * structurally, not via a heuristic. This is the only transport agent-mode
+   * Gemini calls use; there is deliberately no fallback to the OpenAI-compat
+   * endpoint, because that endpoint flattens thought parts into plain text and
+   * reintroduces the exact leak this client exists to prevent.
+   */
+  public getGeminiNativeClient(): any {
+    if (this.gemini_native_client) return this.gemini_native_client;
+    this.gemini_native_client = createGeminiNativeClient({
+      defaultMaxTokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
+      getClient: () => {
+        // Cache the SDK client so each agent turn reuses it (the key fetch is
+        // already cached); reset the promise on failure so a transient secret
+        // error can be retried.
+        if (this.gemini_native_sdk_promise) return this.gemini_native_sdk_promise;
+        this.gemini_native_sdk_promise = (async () => {
+          const { GoogleGenAI } = await import('@google/genai');
+          const apiKey = await this.getGeminiApiKey();
+          return new GoogleGenAI({ apiKey });
+        })().catch((err) => {
+          this.gemini_native_sdk_promise = null;
+          throw err;
+        });
+        return this.gemini_native_sdk_promise;
+      },
+    });
+    return this.gemini_native_client;
   }
 
   public async getVertexClient(modelId: string): Promise<any> {
@@ -2560,11 +2630,12 @@ export class AgentModeService {
 
     // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
     let client = this.llmModels[model].client;
-    if (!client) {
-      if (model.startsWith('gemini-')) {
-        client = await this.getGeminiClient();
-        this.llmModels[model].client = client;
-      } else if (model.startsWith('anthropic.')) {
+    if (model.startsWith('gemini-')) {
+      // ENG-737: always the native adapter — no fallback transport, resolved
+      // per-call (not cached on the registry).
+      client = this.getGeminiNativeClient();
+    } else if (!client) {
+      if (model.startsWith('anthropic.')) {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
       } else if (model.startsWith('claude-')) {
@@ -14701,20 +14772,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       switch (action) {
         case 'LIST': {
-          // List all pixels, then list datasets for each pixel
+          // Meta unified pixels and datasets in Graph v25 — a pixel IS its own dataset, and the
+          // per-pixel `/<pixel_id>/datasets` edge was removed. Querying it returns
+          // `(#100) Tried accessing nonexisting field (datasets)`, and because metaService's
+          // error handler rethrows, that one dead edge failed the entire LIST — making pixel
+          // discovery impossible in-product (ENG-399). The pixel id is the dataset id that
+          // GET_MATCH_QUALITY consumes, so derive it directly and issue no per-pixel call at all.
+          // Same conclusion the lander pixel resolver already reached (metaService.ts).
           const pixels = await metaService.listPixels(accountId, accessToken);
-          const results: any[] = [];
-          for (const pixel of pixels) {
-            const datasets = await metaService.listDatasets(pixel.id, accessToken);
-            results.push({
-              pixel_id: pixel.id,
-              pixel_name: pixel.name,
-              datasets: datasets
-            });
-          }
+          const results = pixels.map((pixel: any) => ({
+            pixel_id: pixel.id,
+            pixel_name: pixel.name,
+            last_fired_time: pixel.last_fired_time,
+            dataset_id: pixel.id,
+            datasets: [{ id: pixel.id, name: pixel.name }]
+          }));
           return {
             success: true,
-            message: `Found ${pixels.length} pixel(s) with ${results.reduce((sum: number, p: any) => sum + (p.datasets?.length || 0), 0)} dataset(s)`,
+            message: `Found ${pixels.length} pixel(s); each pixel id doubles as its dataset id for GET_MATCH_QUALITY`,
             pixels: results
           };
         }
@@ -28441,6 +28516,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * Perform LinkedIn outreach actions using Unipile API.
    * URL-vs-provider_id resolution is handled inside LinkedInOutreachService.
    */
+  /**
+   * The single definition of "this LinkedIn account is dead, here is how to fix it".
+   * Returned both by the preflight below and by the reactive 401 handler, so the two
+   * paths can never drift into telling the user two different stories (ENG-281).
+   */
+  private linkedInDisconnectedResponse() {
+    return {
+      success: false,
+      message: 'LinkedIn account disconnected',
+      error: [
+        'The LinkedIn account is disconnected from Unipile and cannot be used for outreach.',
+        '',
+        'Common reasons a connected account becomes disconnected:',
+        '1. LinkedIn detected automation activity and revoked the session',
+        '2. You logged into LinkedIn from another browser or device, invalidating the session held by Unipile',
+        '3. The LinkedIn session cookie expired (typically every 30–90 days)',
+        '4. Unipile lost the session internally and requires a manual reconnect',
+        '',
+        'Next steps:',
+        '1. Go to Settings > Connected Accounts and click Reconnect on your LinkedIn account.',
+        '2. If reconnect does not work, remove the connection entirely and add it again as a new connection.',
+      ].join('\n')
+    };
+  }
+
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
@@ -28480,6 +28580,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         success: false,
         error: 'No LinkedIn account is connected. To use LinkedIn Outreach, please connect your LinkedIn account in Settings → Connected Accounts.',
       };
+    }
+
+    // Preflight the session before spending a call on it (ENG-281). A Unipile
+    // LinkedIn session can die while the connection record still exists, and every
+    // action on that account then fails with the same 401 — but only AFTER a full
+    // round-trip. A scheduled run repeats that per recipient, burning attempts and
+    // reporting a late, opaque failure instead of a reconnect prompt.
+    //
+    // resolveAccountId already filters on this exact probe, so the fallback path was
+    // covered; an explicitly-passed account_id — the normal path after
+    // list_connected_accounts, which itself reports is_active from the same source —
+    // was not. isAccountConnected is 10-minute cached and timeout-bounded, so a live
+    // account pays at most one probe per account per 10 minutes, and a dead account
+    // now costs nothing at all.
+    // Block ONLY on a proven-dead session. An indeterminate probe (timeout, 5xx,
+    // network) says nothing about session validity, and blocking on it would
+    // suppress a healthy account behind a false reconnect prompt for the probe's
+    // full 10-minute cache window — a worse failure than the late 401 this
+    // preflight exists to avoid. On 'unknown' we fall through to the real call and
+    // let the reactive 401 handler below stay the backstop, i.e. exactly today's
+    // behaviour.
+    const sessionState = await linkedInOutreachService.probeAccountSession(account_id);
+    if (sessionState === 'disconnected') {
+      console.log(`[AgentMode] linkedinOutreach: account ${account_id} failed preflight — disconnected Unipile session`);
+      return this.linkedInDisconnectedResponse();
+    }
+    if (sessionState === 'unknown') {
+      console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
     }
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
@@ -28987,23 +29115,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       const structuredError = (error as any).structuredError;
       if (structuredError?.code === 'errors/disconnected_account' || structuredError?.classification === 'AUTH_ERROR') {
-        return {
-          success: false,
-          message: 'LinkedIn account disconnected',
-          error: [
-            'The LinkedIn account is disconnected from Unipile and cannot be used for outreach.',
-            '',
-            'Common reasons a connected account becomes disconnected:',
-            '1. LinkedIn detected automation activity and revoked the session',
-            '2. You logged into LinkedIn from another browser or device, invalidating the session held by Unipile',
-            '3. The LinkedIn session cookie expired (typically every 30–90 days)',
-            '4. Unipile lost the session internally and requires a manual reconnect',
-            '',
-            'Next steps:',
-            '1. Go to Settings > Connected Accounts and click Reconnect on your LinkedIn account.',
-            '2. If reconnect does not work, remove the connection entirely and add it again as a new connection.',
-          ].join('\n')
-        };
+        // A session can die between the preflight above and this call (or inside the
+        // probe's 10-minute cache window), so the reactive path stays as the backstop.
+        // Both return the identical response via one helper.
+        linkedInOutreachService.clearStatusCache(account_id);
+        return this.linkedInDisconnectedResponse();
       }
 
       // Account-level invitation throttle (ENG-126). Once a LinkedIn account hits
@@ -29052,7 +29168,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * written back to the owner's record. When list_id/lead_id/lead_email are
    * supplied, sent tweets and DMs are logged to AW-EmailEvents for CRM parity.
    */
+  // Public entry: bind the acting user into the X metering context so every X
+  // call this dispatch makes attributes the shadow ledger to the ACTING user and
+  // bills the account owner (ENG-664 Option B, matching the LLM rail).
   async twitterManagePost(userId: string, args: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args));
+  }
+
+  private async _twitterManagePostImpl(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
@@ -29223,7 +29346,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  // Public entry: bind the acting user into the X metering context (see twitterManagePost).
   async twitterOutreach(userId: string, args: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterOutreachImpl(userId, args));
+  }
+
+  private async _twitterOutreachImpl(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, handle, recipient_handle, query, max_results, tweet_id, x_list_id, list_name, list_id, lead_id, lead_email } = args;

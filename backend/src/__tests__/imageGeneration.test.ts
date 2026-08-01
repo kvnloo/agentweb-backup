@@ -1713,8 +1713,9 @@ describe('ImageService', () => {
     });
 
     it('should retry Azure AI (gpt-image-1) on 503 error', async () => {
-      const mockApiKey = 'test-api-key';
-      (secretsManager.getSecret as jest.Mock).mockResolvedValue(mockApiKey);
+      (secretsManager.getSecret as jest.Mock).mockResolvedValue(
+        JSON.stringify({ apiKey: 'test-api-key', endpoint: 'https://agentweb-imagegen-prod.services.ai.azure.com' }),
+      );
       (s3Utils.uploadFileToS3 as jest.Mock).mockResolvedValue({
         success: true,
         url: 'https://s3.amazonaws.com/bucket/image.png'
@@ -1772,8 +1773,6 @@ describe('ImageService', () => {
 });
 
 describe('ImageService.getAzureImageConfig (ENG-410 endpoint migration)', () => {
-  // The legacy endpoint lived in departed co-founder Rui's personal Azure account.
-  const LEGACY_ENDPOINT = 'https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com';
   const mockGetSecret = secretsManager.getSecret as jest.Mock;
   const ORIG_ENV = process.env.NODE_ENV;
   let svc: ImageService;
@@ -1787,11 +1786,19 @@ describe('ImageService.getAzureImageConfig (ENG-410 endpoint migration)', () => 
     process.env.NODE_ENV = ORIG_ENV;
   });
 
-  it('legacy raw-key secret → key + legacy endpoint (behaviour-preserving)', async () => {
+  it('raw-key secret → throws (no hardcoded endpoint fallback remains)', async () => {
     mockGetSecret.mockResolvedValue('rawkey123');
-    const cfg = await (svc as any).getAzureImageConfig('gpt-image-1');
-    expect(cfg).toEqual({ apiKey: 'rawkey123', endpoint: LEGACY_ENDPOINT });
+    await expect((svc as any).getAzureImageConfig('gpt-image-1')).rejects.toThrow(
+      /must be JSON with "apiKey" and "endpoint"/,
+    );
     expect(mockGetSecret).toHaveBeenCalledWith('prod/AgentWeb/Azure/Image');
+  });
+
+  it('no Rui-account endpoint can be produced by any secret shape', async () => {
+    for (const secret of ['rawkey123', JSON.stringify({ apiKey: 'k' })]) {
+      mockGetSecret.mockResolvedValue(secret);
+      await expect((svc as any).getAzureImageConfig('gpt-image-1')).rejects.toThrow();
+    }
   });
 
   it('JSON secret → apiKey + endpoint, trailing slash stripped', async () => {
@@ -1811,11 +1818,11 @@ describe('ImageService.getAzureImageConfig (ENG-410 endpoint migration)', () => 
     expect(cfg).toEqual({ apiKey: 'aliaskey', endpoint: 'https://x.azure.com' });
   });
 
-  it('JSON secret without endpoint → falls back to legacy endpoint', async () => {
+  it('JSON secret without endpoint → throws (no silent legacy fallback)', async () => {
     mockGetSecret.mockResolvedValue(JSON.stringify({ apiKey: 'k' }));
-    const cfg = await (svc as any).getAzureImageConfig('gpt-image-1');
-    expect(cfg.endpoint).toBe(LEGACY_ENDPOINT);
-    expect(cfg.apiKey).toBe('k');
+    await expect((svc as any).getAzureImageConfig('gpt-image-1')).rejects.toThrow(
+      /missing "endpoint"/,
+    );
   });
 
   it('JSON secret missing apiKey → throws', async () => {
@@ -1830,7 +1837,7 @@ describe('ImageService.getAzureImageConfig (ENG-410 endpoint migration)', () => 
 
   it('development environment uses the dev secret name', async () => {
     process.env.NODE_ENV = 'development';
-    mockGetSecret.mockResolvedValue('k');
+    mockGetSecret.mockResolvedValue(JSON.stringify({ apiKey: 'k', endpoint: 'https://x.azure.com' }));
     await (svc as any).getAzureImageConfig('gpt-image-1');
     expect(mockGetSecret).toHaveBeenCalledWith('dev/AgentWeb/Azure/Image');
   });
