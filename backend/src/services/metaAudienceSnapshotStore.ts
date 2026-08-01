@@ -61,11 +61,20 @@ export async function getAudienceSnapshotRowKeys(userId: string, audienceId: str
     )
   );
 
+  // Greptile finding: a missing/malformed chunk used to be silently treated
+  // as contributing zero rows, returning a SHORT baseline as if it were
+  // complete — reconciliation would then never issue DELETE_USERS for the
+  // stale contacts the omitted chunk actually represented, leaving them
+  // targetable forever with no signal anything was wrong. Throwing treats
+  // this as a read failure, which agentModeService already blocks the whole
+  // launch on rather than proceeding with an incomplete baseline.
   const rowKeys: string[] = [];
-  for (const result of chunkResults) {
-    if (Array.isArray(result.Item?.rowKeys)) {
-      rowKeys.push(...result.Item.rowKeys);
+  for (let i = 0; i < chunkResults.length; i++) {
+    const chunkRowKeys = chunkResults[i].Item?.rowKeys;
+    if (!Array.isArray(chunkRowKeys)) {
+      throw new Error(`Snapshot chunk ${i} for audience ${audienceId} is missing or malformed (expected ${chunkCount} chunks).`);
     }
+    rowKeys.push(...chunkRowKeys);
   }
   return rowKeys;
 }

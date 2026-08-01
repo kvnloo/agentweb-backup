@@ -79,15 +79,30 @@ describe('metaAudienceSnapshotStore', () => {
       expect(result).toEqual(['key0', 'key1', 'key2']);
     });
 
-    it('treats a missing/malformed chunk as contributing no rows rather than throwing', async () => {
+    // Greptile finding: a missing/malformed chunk used to be silently
+    // treated as contributing zero rows, returning a SHORT baseline as if
+    // it were complete — reconciliation would then never issue DELETE_USERS
+    // for the stale contacts the omitted chunk actually represented,
+    // leaving them targetable forever with no signal anything was wrong.
+    // Throws instead so this is treated as a read failure — which
+    // agentModeService already blocks the whole launch on (Greptile's
+    // earlier "snapshot READ failure" fix), rather than silently proceeding
+    // with an incomplete baseline.
+    it('throws when a chunk the index says should exist is missing or malformed, rather than silently omitting it', async () => {
       mockGet
         .mockResolvedValueOnce({ Item: { chunkCount: 2 } }) // index
         .mockResolvedValueOnce({}) // chunk 0 missing
         .mockResolvedValueOnce({ Item: { rowKeys: ['key1'] } }); // chunk 1
 
-      const result = await getAudienceSnapshotRowKeys('user1', 'aud_123');
+      await expect(getAudienceSnapshotRowKeys('user1', 'aud_123')).rejects.toThrow(/chunk 0/);
+    });
 
-      expect(result).toEqual(['key1']);
+    it('throws when a chunk item exists but its rowKeys field is malformed (not an array)', async () => {
+      mockGet
+        .mockResolvedValueOnce({ Item: { chunkCount: 1 } }) // index
+        .mockResolvedValueOnce({ Item: { rowKeys: 'not-an-array' } }); // chunk 0 malformed
+
+      await expect(getAudienceSnapshotRowKeys('user1', 'aud_123')).rejects.toThrow(/chunk 0/);
     });
 
     it('treats an index item with neither chunkCount nor rowKeys as no snapshot', async () => {
