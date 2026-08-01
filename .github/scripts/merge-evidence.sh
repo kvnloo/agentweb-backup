@@ -35,6 +35,26 @@
 # execution proof, so none of them can be green. There is no path from "I
 # measured nothing" to a pass.
 #
+# Superseded runs: why the evidence is scoped to a run, not deduped by name
+# -------------------------------------------------------------------------
+# `commits/{sha}/check-runs` is a FLATTENED UNION of every run ever scheduled at
+# that SHA. A push followed by a ready-flip leaves the superseded run's rows
+# beside the live run's under IDENTICAL job names.
+#
+# This gate's own PR hit it (agentweb#2231, captured verbatim in the tests):
+# pushed, flipped ready 13s later, `cancel-in-progress` killed run 4936 while
+# run 4937 carried the real result. Both suites came back, so `Require Greptile
+# Review` appeared twice — success from 4937, skipped from 4936 — the
+# discriminator read the superseded `skipped`, and the gate returned NO_EVIDENCE
+# for a fully green PR. A gate that rejects legitimate PRs gets switched off
+# within a week, so that false negative is as disqualifying as a false positive.
+#
+# The narrowing is deliberately NOT a dedupe-by-name over the flat list. See the
+# two-pass note in section 3: name-based dedupe infers recency from suite id and
+# will silently drop a real failure when two different workflows share a job
+# name. Supersession is read from the workflow-run API instead, so a superseded
+# run is structurally unable to reach the verdict, and everything else survives.
+#
 # Telling a draft skip from a legitimate path-filter skip (criterion 5)
 # ---------------------------------------------------------------------
 # `.github/workflows/tests.yml` gates the backend jobs on
@@ -184,7 +204,63 @@ case "${pr_mergeable}" in
 esac
 
 # ---------------------------------------------------------------------------
-# 2. Check runs, keyed on this exact head SHA
+# 2. Which check suites at this head belong to a SUPERSEDED workflow run
+# ---------------------------------------------------------------------------
+#
+# Read before the check-runs so the flattened union can be narrowed at the
+# source. A suite qualifies only if its run was cancelled AND a newer run of the
+# same workflow exists — see the long note in section 3 for why ordering alone
+# is not good enough.
+
+wfruns_json="$(gh api "repos/${REPO}/actions/runs?head_sha=${head_sha}&per_page=100" \
+  2>"${stderr_file}")"
+gh_exit=$?
+
+if [ "${gh_exit}" -ne 0 ]; then
+  hard_fail "GitHub API call failed (exit ${gh_exit}) reading workflow runs for ${head_sha}: $(tr '\n' ' ' <"${stderr_file}"). Without them a superseded run cannot be told from the live one, so this is not evaluated."
+fi
+
+wf_counts="$(printf '%s' "${wfruns_json}" | jq -r '
+    [ (.total_count // -1), (.workflow_runs | length) ]
+    | map(tostring) | join("\u001f")' 2>/dev/null)"
+jq_exit=$?
+
+if [ "${jq_exit}" -ne 0 ] || [ -z "${wf_counts}" ]; then
+  surface 'workflow-runs response (raw)' "${wfruns_json}"
+  hard_fail "unparseable response from repos/${REPO}/actions/runs?head_sha=${head_sha} — expected a JSON object with total_count and workflow_runs"
+fi
+
+IFS="${SEP}" read -r wf_total wf_returned <<<"${wf_counts}"
+
+if [ "${wf_total}" = "-1" ]; then
+  surface 'workflow-runs response (raw)' "${wfruns_json}"
+  hard_fail "workflow-runs response for ${head_sha} carries no total_count, so page completeness cannot be verified"
+fi
+
+# A hidden run could be the newer one that supersedes a poison suite. Missing it
+# silently resurrects the false negative, so refuse rather than guess.
+if [ "${wf_returned}" -lt "${wf_total}" ]; then
+  hard_fail "workflow-runs response for ${head_sha} is truncated: total_count=${wf_total} but only ${wf_returned} returned. A hidden run could be the one that supersedes another, so this is not evaluated."
+fi
+
+superseded_suites="$(printf '%s' "${wfruns_json}" | jq -c '
+    [ .workflow_runs[] as $r
+      | select($r.conclusion == "cancelled")
+      | select($r.check_suite_id != null)
+      | select([ .workflow_runs[]
+                 | select(.workflow_id == $r.workflow_id)
+                 | select(.run_number > $r.run_number) ] | length > 0)
+      | $r.check_suite_id ]
+    | unique' 2>/dev/null)"
+jq_exit=$?
+
+if [ "${jq_exit}" -ne 0 ] || [ -z "${superseded_suites}" ]; then
+  surface 'workflow-runs response (raw)' "${wfruns_json}"
+  hard_fail "unparseable workflow-runs payload while identifying superseded check suites at ${head_sha}"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Check runs, keyed on this exact head SHA
 # ---------------------------------------------------------------------------
 #
 # The endpoint is inherently SHA-scoped, which is what makes a result from a
@@ -237,33 +313,79 @@ fi
 # one flat verdict then lets the superseded cancellation or its skipped draft
 # discriminator poison the successful replacement.
 #
-# A check context is its GitHub App plus name — the same identity branch
-# protection and the PR checks rollup use. Keep the newest suite/run for each
-# context. IDs are present on every real check-run response; suite ID orders
-# workflow invocations, and run ID breaks ties for retries within one suite.
-effective_runs_json="$(printf '%s' "${runs_json}" | jq '
+# Narrowing happens in two passes, and the split is load-bearing.
+#
+# Pass 1 — DROP SUPERSEDED SUITES, proven from the workflow-run API.
+# The tempting shortcut is to dedupe by check context (App + name) and keep the
+# highest suite id. That is a recency *guess*, and it silently discards a
+# genuine failure whenever two DIFFERENT workflows at one head share a job name:
+# the older workflow's `failure` loses the group to the newer workflow's
+# `success` and the gate reports PASS. Measured on a fixture during this fix —
+# it is the one direction a merge-evidence gate must never fail in, and it is
+# pinned by a test below. So supersession is never inferred from ordering; it is
+# read from `actions/runs?head_sha=`, and only when BOTH hold:
+#
+#   1. the run's own conclusion is `cancelled` — it produced no verdict of its
+#      own, so nothing is thrown away by ignoring it; AND
+#   2. a strictly newer run of the SAME workflow_id exists at this head.
+#
+# Anything the API does not positively prove superseded stays in and can still
+# block. With no workflow-run data nothing is dropped.
+if [ "${superseded_suites}" != "[]" ]; then
+  runs_json="$(printf '%s' "${runs_json}" | jq -c \
+    --argjson superseded "${superseded_suites}" '
+      .check_runs |= map(
+        select( (.check_suite.id // null) as $id
+                | $id == null or (($superseded | index($id)) == null) ) )' 2>/dev/null)"
+  jq_exit=$?
+
+  if [ "${jq_exit}" -ne 0 ] || [ -z "${runs_json}" ]; then
+    surface 'check-runs response (raw)' "${runs_json}"
+    hard_fail "failed to exclude superseded check suites ${superseded_suites} from the check-runs payload at ${head_sha}"
+  fi
+fi
+
+# Pass 2 — WITHIN a surviving suite, keep the newest run per context.
+# Re-running a job adds a new check-run beside the old one under the same name
+# in the same suite, so without this a re-run that fixed a failure would still
+# read as failing. This is safe precisely because it never crosses a suite
+# boundary: two check-runs with one name inside one suite ARE the same job, so
+# the higher id is authoritative rather than merely newer.
+runs_json="$(printf '%s' "${runs_json}" | jq -c '
     .check_runs |= (
-      group_by([(.app.id // .app.slug // "unknown" | tostring), .name])
-      | map(max_by([(.check_suite.id // 0), (.id // 0)]))
-    )
-    | .total_count = (.check_runs | length)' 2>/dev/null)"
+      group_by([(.app.id // .app.slug // "unknown" | tostring),
+                (.check_suite.id // 0 | tostring),
+                .name])
+      | map(max_by(.id // 0))
+    )' 2>/dev/null)"
 jq_exit=$?
 
-if [ "${jq_exit}" -ne 0 ] || [ -z "${effective_runs_json}" ]; then
-  surface 'check-runs response (raw)' "${runs_json}"
+if [ "${jq_exit}" -ne 0 ] || [ -z "${runs_json}" ]; then
   hard_fail "unparseable check-runs payload while selecting the latest result for each check context at ${head_sha}"
 fi
 
-effective_count="$(printf '%s' "${effective_runs_json}" | jq -r '.check_runs | length')"
+effective_count="$(printf '%s' "${runs_json}" | jq -r '.check_runs | length' 2>/dev/null)"
+if ! printf '%s' "${effective_count}" | grep -qE '^[0-9]+$'; then
+  hard_fail "check-runs payload became unreadable after narrowing to effective runs at ${head_sha}"
+fi
+
+runs_json="$(printf '%s' "${runs_json}" | jq -c --argjson n "${effective_count}" \
+  '.total_count = $n' 2>/dev/null)"
 superseded_count=$((returned_count - effective_count))
-runs_json="${effective_runs_json}"
+returned_count="${effective_count}"
 
 if [ "${superseded_count}" -gt 0 ]; then
-  log "ignored ${superseded_count} superseded check-run(s); evaluating the latest result for each GitHub App + check name"
+  log "ignored ${superseded_count} superseded check-run(s): suites proven cancelled-and-re-run ${superseded_suites}, then the latest run per check context"
+fi
+
+# Every surviving row was dropped as superseded — nothing executed here.
+if [ "${returned_count}" -eq 0 ]; then
+  verdict 'NO_EVIDENCE' "every check-run at head ${head_sha} of ${REPO}#${PR_NUMBER} belonged to a superseded workflow run. Nothing was actually measured against this head."
+  exit 3
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Classify every check-run at this head
+# 4. Classify every check-run at this head
 # ---------------------------------------------------------------------------
 #
 # Computed before the draft check because the draft verdict needs to know
@@ -307,7 +429,7 @@ IFS="${SEP}" read -r n_pending n_bad n_success n_unknown \
   pending_names bad_names skipped_names success_names unknown_names <<<"${classified}"
 
 # ---------------------------------------------------------------------------
-# 4. Was this a draft-time run?
+# 5. Was this a draft-time run?
 # ---------------------------------------------------------------------------
 #
 # A ready-flip creates a window where the check-runs at this head are a MIX: the
@@ -356,7 +478,7 @@ if [ "${discriminator}" = "skipped" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Ordinary reporting, now that the run is known to be real
+# 6. Ordinary reporting, now that the run is known to be real
 # ---------------------------------------------------------------------------
 
 if [ "${n_bad}" -gt 0 ]; then

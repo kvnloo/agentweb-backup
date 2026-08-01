@@ -37,8 +37,10 @@ HEAD='4b933aeec6d204c9a452f9e5bdbf5a196a1cf375'
 # Fixtures live in $MERGE_EVIDENCE_MOCK_DIR:
 #   pr_view.json     body for `gh pr view --json ...`
 #   pr_view_exit     optional exit code for that call (default 0)
-#   checkruns.json   body for `gh api .../check-runs`
-#   checkruns_exit   optional exit code for that call (default 0)
+#   checkruns.json     body for `gh api .../check-runs`
+#   checkruns_exit     optional exit code for that call (default 0)
+#   workflowruns.json  body for `gh api .../actions/runs?head_sha=`
+#   workflowruns_exit  optional exit code for that call (default 0)
 #   pr_checks.txt    stdout for `gh pr checks` (regression case only)
 #   pr_checks_exit   exit code for `gh pr checks` (regression case only)
 
@@ -75,7 +77,16 @@ if [ "$sub" = "pr" ] && [ "$sub2" = "checks" ]; then
 fi
 
 if [ "$sub" = "api" ]; then
-  emit_file checkruns.json checkruns_exit '{"total_count":0,"check_runs":[]}'
+  # Dispatch on the endpoint: the gate reads workflow runs (to learn which
+  # suites are superseded) and check-runs (the evidence itself).
+  case "${sub2}" in
+    *actions/runs*)
+      emit_file workflowruns.json workflowruns_exit '{"total_count":0,"workflow_runs":[]}'
+      ;;
+    *)
+      emit_file checkruns.json checkruns_exit '{"total_count":0,"check_runs":[]}'
+      ;;
+  esac
   exit 0
 fi
 
@@ -109,6 +120,14 @@ checkruns() {
   local dir="$1" runs="$2" total
   total="$(printf '%s' "${runs}" | jq 'length')"
   printf '{"total_count":%s,"check_runs":%s}\n' "${total}" "${runs}" >"${dir}/checkruns.json"
+}
+
+# workflowruns <dir> <json array of {id,workflow_id,run_number,conclusion,check_suite_id}>
+# Supersession is proven from this endpoint, never guessed from suite ordering.
+workflowruns() {
+  local dir="$1" runs="$2" total
+  total="$(printf '%s' "${runs}" | jq 'length')"
+  printf '{"total_count":%s,"workflow_runs":%s}\n' "${total}" "${runs}" >"${dir}/workflowruns.json"
 }
 
 # The real agentweb#2231 draft run: everything draft-gated skipped, the two
@@ -360,21 +379,33 @@ SUPERSEDED_CANCELLED_RUN='[
   {"id":111,"app":{"id":15368},"check_suite":{"id":10},"name":"Detect changed projects","status":"completed","conclusion":"cancelled"}
 ]'
 
+# The workflow runs that PROVE suite 10 is superseded: same workflow, run 1
+# cancelled, run 2 newer and successful. Without this the gate must not — and
+# does not — drop anything, because supersession is never inferred from the
+# check-run list alone.
+SUPERSEDED_CANCELLED_WFRUNS='[
+  {"id":901,"workflow_id":191827888,"run_number":1,"run_attempt":1,"status":"completed","conclusion":"cancelled","check_suite_id":10},
+  {"id":902,"workflow_id":191827888,"run_number":2,"run_attempt":1,"status":"completed","conclusion":"success","check_suite_id":20}
+]'
+
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" "${SUPERSEDED_CANCELLED_RUN}"
+workflowruns "${d}" "${SUPERSEDED_CANCELLED_WFRUNS}"
 run_gate "${d}"
 check 'a superseded cancelled workflow does not poison its successful replacement' 0 'VERDICT: PASS'
 
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" "${SUPERSEDED_CANCELLED_RUN}"
+workflowruns "${d}" "${SUPERSEDED_CANCELLED_WFRUNS}"
 run_gate "${d}"
 check 'the stale skipped discriminator is ignored in favour of the latest suite' 0 'Require Greptile Review'
 
 d="$(new_fixture_dir)"
 pr_view "${d}" 'MERGEABLE'
 checkruns "${d}" "${SUPERSEDED_CANCELLED_RUN}"
+workflowruns "${d}" "${SUPERSEDED_CANCELLED_WFRUNS}"
 run_gate "${d}"
 check 'the verdict reports how many superseded check-runs were ignored' 0 'ignored 2 superseded check-run(s)'
 
@@ -460,6 +491,132 @@ pr_view "${d}" 'MERGEABLE'
 printf '{"total_count":40,"check_runs":%s}\n' "${HEALTHY_RUNS}" >"${d}/checkruns.json"
 run_gate "${d}"
 check 'a truncated check-run page fails loud, never passes' 4 'truncated'
+
+# ---------------------------------------------------------------------------
+# Superseded runs, against the verbatim payload that exposed the bug
+# ---------------------------------------------------------------------------
+#
+# agentweb#2231 at 321fbdd6, captured unmodified on 2026-07-31 — the PR was
+# pushed and flipped ready 13s later, cancel-in-progress killed run 4936
+# (suite 83144420933) and run 4937 (suite 83144461834) carried the real result.
+# Row order is the API's own, which is what made the discriminator's `last`
+# land on the superseded `skipped`. Do not sort it.
+SUPERSEDED_2231='[
+  {"id":1,"app":{"id":15368},"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
+  {"id":2,"app":{"id":15368},"name":"Partner portal tests","status":"completed","conclusion":"skipped","check_suite":{"id":83144461834}},
+  {"id":3,"app":{"id":15368},"name":"CI script tests","status":"completed","conclusion":"skipped","check_suite":{"id":83144461834}},
+  {"id":4,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
+  {"id":5,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
+  {"id":6,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
+  {"id":7,"app":{"id":15368},"name":"Backend deploy to staging (after tests pass)","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
+  {"id":8,"app":{"id":15368},"name":"Partner portal tests","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
+  {"id":9,"app":{"id":15368},"name":"CI script tests","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
+  {"id":10,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
+  {"id":11,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
+  {"id":12,"app":{"id":15368},"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped","check_suite":{"id":83144420933}},
+  {"id":13,"app":{"id":57789},"name":"Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":83144408061}},
+  {"id":14,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":83144461834}},
+  {"id":15,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"cancelled","check_suite":{"id":83144420933}}
+]'
+SUPERSEDED_2231_WFRUNS='[
+  {"id":30658029710,"workflow_id":191827888,"run_number":4936,"run_attempt":1,"status":"completed","conclusion":"cancelled","check_suite_id":83144420933},
+  {"id":30658043619,"workflow_id":191827888,"run_number":4937,"run_attempt":1,"status":"completed","conclusion":"success","check_suite_id":83144461834}
+]'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" "${SUPERSEDED_2231}"
+workflowruns "${d}" "${SUPERSEDED_2231_WFRUNS}"
+run_gate "${d}"
+check 'the verbatim agentweb#2231 payload passes, as the PR really was' 0 'VERDICT: PASS'
+
+# Greptile's suite (83144408061) has no workflow run at all, so it can never be
+# in the superseded set. Its success must survive the narrowing.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" "${SUPERSEDED_2231}"
+workflowruns "${d}" "${SUPERSEDED_2231_WFRUNS}"
+run_gate "${d}"
+check 'a third-party suite with no workflow run is never treated as superseded' 0 'Greptile Review'
+
+# THE FALSE GREEN THIS MECHANISM EXISTS TO PREVENT.
+#
+# Two DIFFERENT workflows at one head, same GitHub App, sharing a job name
+# ("test"). Neither is cancelled; both are live. The older one genuinely FAILED.
+# A dedupe that keeps the highest suite id per App+name drops that failure and
+# reports PASS — measured, not hypothesised. Supersession must come from the
+# workflow-run API, where neither run qualifies, so the failure still blocks.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" '[
+  {"id":1,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":100}},
+  {"id":2,"app":{"id":15368},"name":"test","status":"completed","conclusion":"failure","check_suite":{"id":100}},
+  {"id":3,"app":{"id":15368},"name":"test","status":"completed","conclusion":"success","check_suite":{"id":200}}
+]'
+workflowruns "${d}" '[
+  {"id":11,"workflow_id":111,"run_number":5,"run_attempt":1,"status":"completed","conclusion":"failure","check_suite_id":100},
+  {"id":12,"workflow_id":222,"run_number":9,"run_attempt":1,"status":"completed","conclusion":"success","check_suite_id":200}
+]'
+run_gate "${d}"
+check 'a live failure sharing a job name with a newer workflow still blocks' 1 'test (failure)'
+
+# A re-run WITHIN one suite is the case name-dedupe legitimately handles: same
+# job, same suite, higher check-run id wins. This must keep working.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" '[
+  {"id":1,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":100}},
+  {"id":2,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"failure","check_suite":{"id":100}},
+  {"id":3,"app":{"id":15368},"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":100}}
+]'
+workflowruns "${d}" '[
+  {"id":11,"workflow_id":111,"run_number":5,"run_attempt":2,"status":"completed","conclusion":"success","check_suite_id":100}
+]'
+run_gate "${d}"
+check 'a re-run within one suite supersedes its earlier failure' 0 'VERDICT: PASS'
+
+# Exclusion is driven by the workflow-run API alone: with no such data the gate
+# must not invent a supersession. It fails closed rather than widening.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" "${SUPERSEDED_2231}"
+workflowruns "${d}" '[]'
+run_gate "${d}"
+# Nothing is proven superseded, so the cancelled row survives and blocks. Exit 1
+# rather than 3, but the guarantee that matters holds: never green.
+check 'with no workflow-run data nothing is dropped and the cancelled row blocks' 1 'Detect changed projects (cancelled)'
+
+# A cancelled run with no newer run of the same workflow is the only evidence
+# there is, and it is bad evidence. It is not superseded.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" '[
+  {"id":1,"app":{"id":15368},"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":10}},
+  {"id":2,"app":{"id":15368},"name":"Detect changed projects","status":"completed","conclusion":"cancelled","check_suite":{"id":10}}
+]'
+workflowruns "${d}" '[
+  {"id":901,"workflow_id":191827888,"run_number":1,"run_attempt":1,"status":"completed","conclusion":"cancelled","check_suite_id":10}
+]'
+run_gate "${d}"
+check 'a lone cancelled run is not superseded and still blocks' 1 'cancelled)'
+
+# The workflow-run API being unreadable is blindness, not a pass.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" "${SUPERSEDED_2231}"
+workflowruns "${d}" "${SUPERSEDED_2231_WFRUNS}"
+printf '1' >"${d}/workflowruns_exit"
+run_gate "${d}"
+check 'an unreadable workflow-run API is ERROR, never a pass' 4 'ERROR'
+
+# A truncated workflow-run page could hide the newer run that supersedes a
+# poison suite, silently resurrecting the false negative.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' false OPEN '321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+checkruns "${d}" "${SUPERSEDED_2231}"
+printf '{"total_count":40,"workflow_runs":%s}\n' "${SUPERSEDED_2231_WFRUNS}" >"${d}/workflowruns.json"
+run_gate "${d}"
+check 'a truncated workflow-run page fails loud, never passes' 4 'truncated'
 
 # ---------------------------------------------------------------------------
 # Regression proof — the previous procedure returns a false green here
