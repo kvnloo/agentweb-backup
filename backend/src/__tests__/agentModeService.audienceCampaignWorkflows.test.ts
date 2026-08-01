@@ -834,6 +834,38 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(result.ledger.adSet.id).toBe('adset_new_budget');
     });
 
+    // Greptile follow-up finding: matching targeting/budget/schedule/
+    // optimization_goal/billing_event isn't enough either — a same-named,
+    // otherwise-matching ad set with a different bid_strategy,
+    // destination_type, or promoted_object must also not be reused, or the
+    // campaign delivers with the wrong bidding behavior, conversion
+    // destination, or promoted object.
+    it('creates a new ad set (does not reuse) when a same-named/otherwise-matching one exists with a different promoted_object', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_9', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValueOnce({
+        success: true,
+        adSets: [{
+          id: 'adset_wrong_promoted_object', name: 'Targeted Ad Set',
+          targeting: { custom_audiences: [{ id: 'aud_seed_9' }], geo_locations: { countries: ['US'] } },
+          promoted_object: { pixel_id: 'pixel_OLD' }, // different from pixel_NEW requested below
+        }],
+      } as any);
+      jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
+        success: true, adSet: { id: 'adset_new_promoted_object', name: 'Targeted Ad Set' },
+      } as any);
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm({
+        ...baseArgs(), ad_set_params: { ...baseArgs().ad_set_params, promoted_object: { pixel_id: 'pixel_NEW' } },
+      }));
+
+      expect(agentModeService.createMetaAdsAdSet).toHaveBeenCalled();
+      expect(result.ledger.adSet.id).toBe('adset_new_promoted_object');
+    });
+
     it('rejects a replay of an already-claimed preview token, returning a fresh preview instead of re-executing', async () => {
       delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
       // false = the atomic claim failed, i.e. this exact token was already claimed

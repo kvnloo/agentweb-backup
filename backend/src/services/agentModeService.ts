@@ -17648,30 +17648,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (!existingAdSetsResult.success) {
         throw new Error(existingAdSetsResult.message || 'Failed to list existing Meta ad sets.');
       }
-      // Greptile follow-up finding: name + targeted-audience alone isn't
-      // enough — a same-named ad set targeting the same audience but with a
-      // DIFFERENT budget, schedule, optimization goal, or (for retargeting)
-      // excluded audience must not be silently reused either. The launch
-      // would report success while actually applying the OLD delivery
-      // configuration instead of the one the user just confirmed. Requires
-      // the full targeting object and every explicitly-requested ad-set
-      // knob to also match, not just name+audience.
-      const requestedBudget = {
-        daily: args.ad_set_params?.daily_budget != null ? Number(args.ad_set_params.daily_budget) : undefined,
-        lifetime: args.ad_set_params?.lifetime_budget != null ? Number(args.ad_set_params.lifetime_budget) : undefined,
-      };
+      // Greptile follow-up findings: name + targeted-audience alone isn't
+      // enough — a same-named ad set targeting the same audience but with
+      // ANY different delivery knob (budget, schedule, optimization goal,
+      // billing event, bid strategy, destination type, promoted object, or
+      // — for retargeting — excluded audience, which lives inside
+      // `targeting`) must not be silently reused. The launch would report
+      // success while actually applying the OLD delivery configuration
+      // instead of the one the user just confirmed. Rather than keep
+      // special-casing individual fields one Greptile pass at a time,
+      // compares every field this method can even set on an ad set
+      // (mirroring metaService's own AD_SET_READ_FIELDS list) generically —
+      // any explicitly-requested field that differs from the existing ad
+      // set's actual value blocks reuse.
+      const AD_SET_REUSE_MATCH_FIELDS = [
+        'daily_budget', 'lifetime_budget', 'start_time', 'end_time',
+        'optimization_goal', 'billing_event', 'bid_strategy',
+        'destination_type', 'promoted_object',
+      ] as const;
       const existingAdSet = (existingAdSetsResult.adSets || []).find((as: any) => {
         if (String(as?.name ?? '').toLowerCase() !== String(adSetName ?? '').toLowerCase()) return false;
         if (this.canonicalJSON(as?.targeting) !== this.canonicalJSON(targeting)) return false;
-        const existingBudget = {
-          daily: as?.daily_budget != null ? Number(as.daily_budget) : undefined,
-          lifetime: as?.lifetime_budget != null ? Number(as.lifetime_budget) : undefined,
-        };
-        if (existingBudget.daily !== requestedBudget.daily || existingBudget.lifetime !== requestedBudget.lifetime) return false;
-        if ((as?.start_time ?? null) !== (args.ad_set_params?.start_time ?? null)) return false;
-        if ((as?.end_time ?? null) !== (args.ad_set_params?.end_time ?? null)) return false;
-        if ((as?.optimization_goal ?? null) !== (args.ad_set_params?.optimization_goal ?? null)) return false;
-        if ((as?.billing_event ?? null) !== (args.ad_set_params?.billing_event ?? null)) return false;
+        for (const field of AD_SET_REUSE_MATCH_FIELDS) {
+          const requested = (args.ad_set_params as any)?.[field];
+          if (requested === undefined) continue; // not explicitly requested — don't require a match on it
+          if (this.canonicalJSON(as?.[field] ?? null) !== this.canonicalJSON(requested)) return false;
+        }
         return true;
       });
 
