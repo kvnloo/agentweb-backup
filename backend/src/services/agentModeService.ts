@@ -17329,6 +17329,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
     }
 
+    // Greptile finding: saving the snapshot AFTER the Meta upload meant a
+    // save failure left a successfully-uploaded member with NO record in
+    // any snapshot, ever — future diffs can only flag a member as stale by
+    // comparing against a PRIOR snapshot that recorded it, so an untracked-
+    // from-birth member could never be detected as no-longer-needed and
+    // would stay targetable in Meta forever. Uploads are idempotent-
+    // additive (a future sync just re-sends whatever's in the current
+    // source, self-healing a "snapshot updated, upload not yet retried"
+    // mismatch) but deletes are NOT (they depend entirely on snapshot
+    // history) — so the snapshot is saved BEFORE uploading, closing the gap
+    // without trading it for a symmetric under-targeting risk. If the save
+    // fails (even after retries), the launch aborts here with NO Meta
+    // mutation attempted at all, keeping Meta's state and our tracked state
+    // consistent (both un-updated) rather than diverging.
+    await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
+
     const uploadResult = await this.manageMetaCustomAudiences(userId, noBaselineReuse ? 'REPLACE_USERS' : 'UPLOAD_USERS', accountId, {
       id: audienceId,
       schema,
@@ -17338,17 +17354,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (!uploadResult.success) {
       throw new Error(uploadResult.message || (noBaselineReuse ? 'Failed to replace users in Meta custom audience.' : 'Failed to upload users to Meta custom audience.'));
     }
-
-    // Greptile finding: exhausting all retries here used to be treated as
-    // non-fatal, so the campaign would still launch with no reconciliation
-    // baseline for the next sync — a future resync would have no prior
-    // snapshot to diff against and silently skip stale-member removal
-    // entirely. Blocking the launch here means the (already-succeeded) Meta
-    // upload isn't rolled back, but the ad set is never created — consistent
-    // with every other hard-failure step in this method (LIST/CREATE/
-    // UPLOAD_USERS), all of which abort the whole launch rather than proceed
-    // in a state the code can't reason about.
-    await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
 
     return {
       plannedAction,

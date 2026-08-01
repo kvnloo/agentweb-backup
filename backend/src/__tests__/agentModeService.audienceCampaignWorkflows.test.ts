@@ -579,10 +579,20 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     // reconciliation baseline for the next sync — a future resync would have
     // no prior snapshot to diff against and silently skip stale-member
     // removal entirely. This now blocks the launch instead.
-    it('blocks the launch (throws) when the snapshot save fails after exhausting retries', async () => {
+    // Greptile follow-up finding: saving the snapshot AFTER the Meta upload
+    // meant a save failure left a successfully-uploaded member with NO
+    // record in any snapshot, ever — future diffs can only flag a member as
+    // stale by comparing against a PRIOR snapshot that recorded it, so an
+    // untracked-from-birth member could never be detected as no-longer-
+    // needed and would stay targetable in Meta forever. Uploads are
+    // idempotent-additive (a future sync just re-sends whatever's in the
+    // current source, self-healing a "snapshot updated, upload not yet
+    // retried" mismatch) but deletes are NOT (they depend entirely on
+    // snapshot history) — so saving the snapshot BEFORE uploading closes the
+    // gap without trading it for a symmetric under-targeting risk.
+    it('blocks the launch (throws) when the snapshot save fails, WITHOUT ever attempting the Meta upload', async () => {
       const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
       spy.mockResolvedValueOnce({ success: true, audiences: [{ id: 'aud_4', name: 'X' }] } as any); // LIST
-      spy.mockResolvedValueOnce({ success: true } as any); // UPLOAD_USERS
 
       jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
         mockHubSpotContact('a@example.com', '111')
@@ -595,6 +605,40 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         { type: 'hubspot_list', listId: 'list-1' },
         { dryRun: false }
       )).rejects.toThrow('DynamoDB unavailable');
+
+      // Only LIST attempted — UPLOAD_USERS never called, so Meta's state and
+      // our tracked state stay consistent (both un-updated) rather than
+      // diverging.
+      expect(spy).toHaveBeenCalledTimes(1);
+    });
+
+    it('saves the snapshot BEFORE calling UPLOAD_USERS, not after', async () => {
+      const callOrder: string[] = [];
+      const spy = jest.spyOn(agentModeService, 'manageMetaCustomAudiences');
+      spy.mockImplementation(async (_userId: any, action: any) => {
+        callOrder.push(action);
+        if (action === 'LIST') return { success: true, audiences: [{ id: 'aud_order', name: 'X' }] } as any;
+        return { success: true } as any;
+      });
+      (saveAudienceSnapshotRowKeys as jest.Mock).mockImplementationOnce(async () => {
+        callOrder.push('SAVE_SNAPSHOT');
+      });
+      jest.spyOn(agentModeService as any, 'resolveHubSpotService').mockResolvedValue(
+        mockHubSpotContact('a@example.com', '111')
+      );
+      // A non-null prior snapshot so this takes the normal diff-then-
+      // UPLOAD_USERS path (not the no-baseline REPLACE_USERS path).
+      (getAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue([rowKeyFor('a@example.com', '111')]);
+
+      await callResolveOrCreateSeedAudience(
+        USER_ID, ACCOUNT_ID, 'X',
+        { type: 'hubspot_list', listId: 'list-1' },
+        { dryRun: false }
+      );
+
+      expect(callOrder.indexOf('SAVE_SNAPSHOT')).toBeGreaterThanOrEqual(0);
+      expect(callOrder.indexOf('UPLOAD_USERS')).toBeGreaterThanOrEqual(0);
+      expect(callOrder.indexOf('SAVE_SNAPSHOT')).toBeLessThan(callOrder.indexOf('UPLOAD_USERS'));
     });
   });
 
