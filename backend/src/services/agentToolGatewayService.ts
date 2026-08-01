@@ -1192,6 +1192,18 @@ function coerceJsonContainerForSchema(value: unknown, schema: any): { changed: b
 function validateJsonSchemaConstraints(name: string, value: unknown, schema: any): AgentToolContractIssue[] {
   const issues: AgentToolContractIssue[] = [];
 
+  if (
+    typeof value === 'string' &&
+    typeof schema?.maxLength === 'number' &&
+    Array.from(value).length > schema.maxLength
+  ) {
+    issues.push({
+      code: 'invalid_args',
+      path: `$.${name}`,
+      message: `Argument "${name}" must be at most ${schema.maxLength} character(s).`,
+    });
+  }
+
   if (Array.isArray(value)) {
     if (typeof schema?.minItems === 'number' && value.length < schema.minItems) {
       issues.push({
