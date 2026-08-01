@@ -17384,6 +17384,27 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Deterministic JSON serialization with object keys sorted recursively, so
+   * two structurally-equal objects compare equal regardless of key order —
+   * unlike plain JSON.stringify, which is order-sensitive. Used by
+   * executeAudienceCampaignLaunch's ad-set reuse-by-match check to compare
+   * a requested targeting object against Meta's returned representation.
+   */
+  private canonicalJSON(value: any): string {
+    const sortKeys = (v: any): any => {
+      if (Array.isArray(v)) return v.map(sortKeys);
+      if (v && typeof v === 'object') {
+        return Object.keys(v).sort().reduce((acc: any, k: string) => {
+          acc[k] = sortKeys(v[k]);
+          return acc;
+        }, {});
+      }
+      return v;
+    };
+    return JSON.stringify(sortKeys(value ?? {}));
+  }
+
+  /**
    * Greptile finding (PR #2234): confirm=true wasn't bound to what was
    * actually previewed — a model could set confirm=true on the very first
    * call (skipping the preview entirely) or change arguments between the
@@ -17627,13 +17648,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (!existingAdSetsResult.success) {
         throw new Error(existingAdSetsResult.message || 'Failed to list existing Meta ad sets.');
       }
+      // Greptile follow-up finding: name + targeted-audience alone isn't
+      // enough — a same-named ad set targeting the same audience but with a
+      // DIFFERENT budget, schedule, optimization goal, or (for retargeting)
+      // excluded audience must not be silently reused either. The launch
+      // would report success while actually applying the OLD delivery
+      // configuration instead of the one the user just confirmed. Requires
+      // the full targeting object and every explicitly-requested ad-set
+      // knob to also match, not just name+audience.
+      const requestedBudget = {
+        daily: args.ad_set_params?.daily_budget != null ? Number(args.ad_set_params.daily_budget) : undefined,
+        lifetime: args.ad_set_params?.lifetime_budget != null ? Number(args.ad_set_params.lifetime_budget) : undefined,
+      };
       const existingAdSet = (existingAdSetsResult.adSets || []).find((as: any) => {
-        const targetedIds = (as?.targeting?.custom_audiences || []).map((a: any) => a?.id);
-        return (
-          String(as?.name ?? '').toLowerCase() === String(adSetName ?? '').toLowerCase() &&
-          targetedIds.length === 1 &&
-          targetedIds[0] === attachAudienceId
-        );
+        if (String(as?.name ?? '').toLowerCase() !== String(adSetName ?? '').toLowerCase()) return false;
+        if (this.canonicalJSON(as?.targeting) !== this.canonicalJSON(targeting)) return false;
+        const existingBudget = {
+          daily: as?.daily_budget != null ? Number(as.daily_budget) : undefined,
+          lifetime: as?.lifetime_budget != null ? Number(as.lifetime_budget) : undefined,
+        };
+        if (existingBudget.daily !== requestedBudget.daily || existingBudget.lifetime !== requestedBudget.lifetime) return false;
+        if ((as?.start_time ?? null) !== (args.ad_set_params?.start_time ?? null)) return false;
+        if ((as?.end_time ?? null) !== (args.ad_set_params?.end_time ?? null)) return false;
+        if ((as?.optimization_goal ?? null) !== (args.ad_set_params?.optimization_goal ?? null)) return false;
+        if ((as?.billing_event ?? null) !== (args.ad_set_params?.billing_event ?? null)) return false;
+        return true;
       });
 
       let adSet: { id: string; name: string };

@@ -759,7 +759,13 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
         success: true,
         adSets: [{
           id: 'adset_existing', name: 'Targeted Ad Set',
-          targeting: { custom_audiences: [{ id: 'aud_seed_6' }] },
+          // Must fully match what baseArgs() would construct: geo_locations
+          // (from ad_set_params.targeting) plus custom_audiences (the
+          // resolved seed audience) — key order deliberately different from
+          // construction order to prove the comparison isn't order-sensitive.
+          targeting: { custom_audiences: [{ id: 'aud_seed_6' }], geo_locations: { countries: ['US'] } },
+          daily_budget: null, lifetime_budget: null, start_time: null, end_time: null,
+          optimization_goal: null, billing_event: null,
         }],
       } as any);
       const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
@@ -795,6 +801,37 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       expect(result.ledger.adSet).toEqual({
         id: 'adset_new', name: 'Targeted Ad Set', targetedAudienceId: 'aud_seed_7', excludedAudienceId: undefined,
       });
+    });
+
+    // Greptile follow-up finding: name + targeted-audience alone still isn't
+    // enough — a same-named ad set targeting the same audience but with a
+    // DIFFERENT budget (or any other explicitly-requested knob) must not be
+    // reused either, or the launch reports success while actually applying
+    // the OLD delivery configuration.
+    it('creates a new ad set (does not reuse) when a same-named/same-audience one exists with a different budget', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_8', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValueOnce({
+        success: true,
+        adSets: [{
+          id: 'adset_wrong_budget', name: 'Targeted Ad Set',
+          targeting: { custom_audiences: [{ id: 'aud_seed_8' }], geo_locations: { countries: ['US'] } },
+          daily_budget: 5000, lifetime_budget: null, // different from the 1000 requested below
+        }],
+      } as any);
+      jest.spyOn(agentModeService, 'createMetaAdsAdSet').mockResolvedValueOnce({
+        success: true, adSet: { id: 'adset_new_budget', name: 'Targeted Ad Set' },
+      } as any);
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm({
+        ...baseArgs(), ad_set_params: { ...baseArgs().ad_set_params, daily_budget: 1000 },
+      }));
+
+      expect(agentModeService.createMetaAdsAdSet).toHaveBeenCalled();
+      expect(result.ledger.adSet.id).toBe('adset_new_budget');
     });
 
     it('rejects a replay of an already-claimed preview token, returning a fresh preview instead of re-executing', async () => {
