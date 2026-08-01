@@ -12,6 +12,13 @@ instructions narrow and operational.
   GitHub check is green, latest-head Greptile is 5/5 with no unresolved
   actionable P1/P2, attribution is valid, rollback/post-deploy verification is
   defined, and the PR is complete against its acceptance contract.
+- Prove "every relevant GitHub check is green" with
+  `REPO=AgentWebPro/agentweb PR_NUMBER=<n> bash .github/scripts/merge-evidence.sh`
+  (exit 0), not with `gh pr checks` alone. That command answers "did anything
+  fail", and skipped is not failed, so it exits 0 both on a conflicted PR — which
+  cannot schedule a run at all — and on a stale draft-time run in which every job
+  skipped. Exit 3 is `NO_EVIDENCE`, meaning nothing has ever executed against
+  this head; it is not a pass and never satisfies the gate (ENG-757).
 - Prefer the repository's configured GitHub auto-merge mechanism. If merge is
   blocked by a stale branch, merge queue state, flaky gate, or sync issue, fix
   that condition, rerun the affected gates, and merge once the latest head is
