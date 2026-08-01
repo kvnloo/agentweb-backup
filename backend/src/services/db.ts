@@ -3216,21 +3216,34 @@ export const scheduleDb = {
   // session at messageCount=2 with no run result. These helpers stamp a lease on
   // dispatch, heartbeat it while the run is alive, and let a surviving instance
   // reconcile (requeue) any lease whose heartbeat has gone stale.
+  // ENG-657 (Greptile): conditional on no existing lease, so two dispatchers that
+  // both pick up the same due schedule (a genuine cross-instance race, not
+  // hypothetical — the whole reconciler exists because instances come and go
+  // under deploy) can't blindly clobber each other's runInFlight. The old
+  // unconditional SET let a second caller overwrite the first's lease, and later
+  // clear it out from under the still-running first attempt via its own
+  // conditional-on-runId clearRunInFlight — leaving the real run invisible to
+  // reconciliation. Returns which happened so the caller can bail out entirely
+  // (not touch anything) rather than proceed alongside an already-running attempt.
   async setRunInFlight(
     scheduleId: string,
     lease: { runId: string; sessionId: string; startedAt: string; instanceId: string }
-  ): Promise<void> {
+  ): Promise<'acquired' | 'already_in_flight' | 'unknown'> {
     try {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: { scheduleId },
         UpdateExpression: 'SET runInFlight = :lease',
+        ConditionExpression: 'attribute_not_exists(runInFlight)',
         ExpressionAttributeValues: {
           ':lease': { ...lease, heartbeatAt: lease.startedAt },
         },
       }).promise();
-    } catch (error) {
+      return 'acquired';
+    } catch (error: any) {
+      if (error?.code === 'ConditionalCheckFailedException') return 'already_in_flight';
       handleDynamoDbError(error, 'setRunInFlight');
+      return 'unknown';
     }
   },
 
@@ -3240,8 +3253,11 @@ export const scheduleDb = {
   // sessionId; this fills it in once createChatSession returns, so the reconciler's
   // recovery can annotate the right session. Conditional on runId (like the
   // heartbeat) so it can never resurrect a lease a reconciler already reaped or a
-  // newer run replaced. Best-effort: a failed condition just means the lease moved on.
-  async attachSessionToRunInFlight(scheduleId: string, runId: string, sessionId: string): Promise<void> {
+  // newer run replaced. Returns whether the write actually landed — ENG-657's resume
+  // path needs to know this (a failed attach must abort the resume rather than
+  // proceed on an unconfirmed lease), while the fresh-session path can still treat
+  // it as best-effort (a fresh session has nothing to duplicate if attach fails).
+  async attachSessionToRunInFlight(scheduleId: string, runId: string, sessionId: string): Promise<boolean> {
     try {
       await dynamodb.update({
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
@@ -3250,10 +3266,12 @@ export const scheduleDb = {
         ConditionExpression: 'runInFlight.runId = :runId',
         ExpressionAttributeValues: { ':sid': sessionId, ':runId': runId },
       }).promise();
+      return true;
     } catch (error: any) {
       if (error?.code !== 'ConditionalCheckFailedException') {
         console.error('DynamoDB attachSessionToRunInFlight error:', error);
       }
+      return false;
     }
   },
 
@@ -3298,6 +3316,60 @@ export const scheduleDb = {
     }
   },
 
+  // ENG-657: atomically CLAIM the resume marker so a session is resumed by at most
+  // one dispatcher. The conditional REMOVE succeeds for exactly one caller whose read
+  // matches the stored sessionId; any concurrent dispatcher (or a marker that changed
+  // underneath) gets ConditionalCheckFailed and returns false, and must NOT resume —
+  // preventing two workers from continuing the same session in parallel. Returns true
+  // only when THIS caller won the claim.
+  async claimPendingResume(scheduleId: string, sessionId: string): Promise<boolean> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+        UpdateExpression: 'REMOVE pendingResumeSessionId',
+        ConditionExpression: 'pendingResumeSessionId = :sid',
+        ExpressionAttributeValues: { ':sid': sessionId },
+      }).promise();
+      return true;
+    } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(error, 'claimPendingResume');
+      return false;
+    }
+  },
+
+  // ENG-657 (Greptile): claim the resume marker AND pause the schedule in ONE
+  // atomic conditional write, not two sequential steps. Two sequential steps
+  // (claim, then a separately-retried pause) can split: the claim succeeds,
+  // consuming the marker, but every pause-write attempt then fails — leaving an
+  // ACTIVE schedule with no resume identity, so its next natural fire restarts
+  // from scratch and duplicates the abandoned session's side effects. A single
+  // atomic write can't partially apply: it either pauses AND consumes the marker
+  // together, or (on any failure, transient or lost-race) touches nothing at
+  // all — the marker survives intact for a safe retry either way.
+  async claimAndPauseUnresumable(scheduleId: string, sessionId: string): Promise<'paused' | 'lost_claim' | 'error'> {
+    try {
+      await dynamodb.update({
+        TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
+        Key: { scheduleId },
+        UpdateExpression: 'SET #status = :paused, updatedAt = :now REMOVE pendingResumeSessionId',
+        ConditionExpression: 'pendingResumeSessionId = :sid',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':paused': 'paused',
+          ':now': new Date().toISOString(),
+          ':sid': sessionId,
+        },
+      }).promise();
+      return 'paused';
+    } catch (error: any) {
+      if (error.code === 'ConditionalCheckFailedException') return 'lost_claim';
+      console.error('DynamoDB claimAndPauseUnresumable error:', error);
+      return 'error';
+    }
+  },
+
   // Scheduled-chat schedules that currently hold an in-flight lease. Sparse by
   // nature — most schedules have no runInFlight. We sweep BOTH 'active' and
   // 'paused' partitions of StatusStartTimeIndex: a runCount-limited schedule
@@ -3334,28 +3406,43 @@ export const scheduleDb = {
   async claimAbandonedRun(
     scheduleId: string,
     runId: string,
-    requeue: { nextRunTime: string; retryCount: number; sessionId: string; lastAt: string } | null
+    // ENG-657: `resumeSessionId`, when set, marks the requeued run to CONTINUE the
+    // named session from its last persisted step (the reconciler decided it ended
+    // on a safe boundary) instead of restarting the task in a fresh session. The
+    // next dispatch reads `pendingResumeSessionId`; when absent we REMOVE any stale
+    // marker so a prior resume can never leak into an unrelated later run.
+    requeue: { nextRunTime: string; retryCount: number; sessionId: string; lastAt: string; resumeSessionId?: string } | null
   ): Promise<boolean> {
     const nowIso = new Date().toISOString();
     try {
       if (requeue) {
+        const setParts = [
+          '#status = :active', 'nextRunTime = :nextRunTime', 'zeroAssistantRetryCount = :n',
+          'lastZeroAssistantOutputAt = :lastAt', 'lastZeroAssistantOutputSessionId = :sid', 'updatedAt = :now',
+        ];
+        const removeParts = ['runInFlight'];
+        const values: Record<string, any> = {
+          ':active': 'active',
+          ':nextRunTime': requeue.nextRunTime,
+          ':n': requeue.retryCount,
+          ':lastAt': requeue.lastAt,
+          ':sid': requeue.sessionId,
+          ':now': nowIso,
+          ':runId': runId,
+        };
+        if (requeue.resumeSessionId) {
+          setParts.push('pendingResumeSessionId = :resumeSid');
+          values[':resumeSid'] = requeue.resumeSessionId;
+        } else {
+          removeParts.push('pendingResumeSessionId');
+        }
         await dynamodb.update({
           TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
           Key: { scheduleId },
-          UpdateExpression:
-            'SET #status = :active, nextRunTime = :nextRunTime, zeroAssistantRetryCount = :n, ' +
-            'lastZeroAssistantOutputAt = :lastAt, lastZeroAssistantOutputSessionId = :sid, updatedAt = :now REMOVE runInFlight',
+          UpdateExpression: `SET ${setParts.join(', ')} REMOVE ${removeParts.join(', ')}`,
           ConditionExpression: 'runInFlight.runId = :runId',
           ExpressionAttributeNames: { '#status': 'status' },
-          ExpressionAttributeValues: {
-            ':active': 'active',
-            ':nextRunTime': requeue.nextRunTime,
-            ':n': requeue.retryCount,
-            ':lastAt': requeue.lastAt,
-            ':sid': requeue.sessionId,
-            ':now': nowIso,
-            ':runId': runId,
-          },
+          ExpressionAttributeValues: values,
         }).promise();
       } else {
         await dynamodb.update({

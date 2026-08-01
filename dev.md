@@ -1,3 +1,295 @@
+## ENG-757: the stale run was at the current head SHA, so SHA-binding would have confirmed the false green (2026-07-31)
+
+agentweb#2221 spent ~30 minutes displaying "checks passing" while no check could run against it at
+all. The obvious reading — "stale evidence, so bind evidence to the head SHA" — is wrong, and
+building that would have shipped a gate that endorsed the exact bug it was written to catch.
+Investigation findings:
+
+- **The head SHA never changed, so the misleading run was at the current head.** The conflict on
+  #2221 was created by the *base* moving (#2220 merged, colliding on `dev.md`), not by anything
+  happening on the PR branch. A head-SHA staleness check compares the run's `head_sha` to the PR's
+  `headRefOid`; here they matched. The check would have passed and reported "verified at current
+  head". SHA-binding is necessary but nowhere near sufficient.
+- **The real defect is the question `gh pr checks` answers.** It answers "did anything fail?" A
+  skipped job has not failed, so an all-skipped run is green. Verified live 2026-07-31:
+  `gh pr checks 2231` exits **0** on a draft PR whose seven check-runs are six `skipped` plus one
+  `success`, and exits **0** on #1814, which is non-draft and `CONFLICTING` right now. Both were
+  read as green by the merge procedure in `AGENTS.md`.
+- **A conflicted PR cannot schedule a run, which is why the window persists.** GitHub cannot build
+  `refs/pull/N/merge` without a mergeable ref, so neither `ready_for_review` nor `synchronize` can
+  start a workflow. The ENG-361 fix (`tests.yml` re-runs on `ready_for_review`) is real but cannot
+  fire here — there is nothing for it to schedule. The PR keeps displaying whatever ran last.
+- **The fix is to invert the question, not to add a third special case.** Requiring positive proof
+  that something *executed* against this exact head collapses conflicted / no-run / draft-run /
+  unreadable-payload into one rule, because none of them can produce execution proof. Absence of
+  failure is not evidence of success. `.github/scripts/merge-evidence.sh` exits 0 PASS, 1 FAIL,
+  2 PENDING, 3 NO_EVIDENCE, 4 unreadable.
+- **`Require Greptile Review` is the only job that can tell a draft skip from a path-filter skip.**
+  `tests.yml` gates the backend jobs on `backend == 'true' && draft == false`, collapsing both
+  reasons into one `if`, so both render as `conclusion: skipped`. That one job is gated on
+  `draft == false` alone. Discriminator skipped means a draft run; discriminator executed means
+  every other skip is a path filter working correctly. The invariant is now asserted against
+  `tests.yml` by `merge-evidence.test.sh`, so adding a path filter to that job fails loudly rather
+  than silently disarming the distinction.
+- **The gate has to live outside CI.** A check-run cannot report on the absence of check-runs, and
+  the conflicted PR that most needs reporting on is precisely the one that cannot schedule the job
+  that would report it. This is why ENG-757 is a CLI an agent runs, not another required check —
+  the same reason ENG-734/743 could not be fixed from inside the deploy job's own success signal.
+- **Two bugs in this gate's own first draft were caught by its tests, both false greens.** Using a
+  tab as the `read` field separator collapses runs of tabs (tab is IFS whitespace), so two
+  consecutive empty fields shifted every later field left and the reason strings described the wrong
+  jobs; and one `join` separator was left empty, concatenating the counts so every numeric
+  comparison silently failed and the verdict came out `PASS`. Both are why the suite asserts on
+  reason-string *content*, not just exit codes. Fields are joined on US (0x1f) now, which is not
+  IFS whitespace, so empty fields survive.
+- **Live divergence measured across 8 open PRs:** three disagreed with `gh pr checks`, all in the
+  safe direction — #1814 (non-draft, CONFLICTING) green to NO_EVIDENCE, #2231 (draft) green to
+  NO_EVIDENCE, #1790 green to NO_EVIDENCE (its last run predates the `Require Greptile Review` job,
+  so it has no comparable evidence and fails closed). #2233/#2227 PASS with path-filter skips named,
+  #2234/#2226 FAIL, #2235 PENDING — all matching the old signal where the old signal was right.
+
+## ENG-281: the Unipile liveness probe existed but was skipped on the path that mattered (2026-07-30)
+
+Sue Xu's LinkedIn Outreach account reported connected while its Unipile session was dead, and every
+`linkedin_outreach` action failed with the same opaque disconnect error. The state-surfacing half of
+the report was already fixed (`eea9e4604`, 2026-07-01: `list_connected_accounts` derives `is_active`
+from a live probe rather than from a `Number.MAX_SAFE_INTEGER` token expiry that never expired, and
+the portal renders a Reconnect action off the same source). What remained was the second ask —
+fail fast rather than late. Investigation findings:
+
+- **Detection was purely reactive.** `linkedinOutreach` fired the real Unipile call, waited for a
+  401, and translated the error. So every action on a dead account burned a full round-trip before
+  failing, and a scheduled/automated run repeated that per recipient — which is what made the
+  reported session look like a hang rather than a config problem.
+- **The probe already existed and was already used — just not on this path.** `isAccountConnected`
+  (10-minute cached, timeout-bounded, two Unipile calls) is applied inside `resolveAccountId`, so
+  the *fallback* resolution path was covered. It was never applied when the caller passed an
+  explicit `account_id` — which is the normal path, because the agent gets that id from
+  `list_connected_accounts`, the very tool that already knows the account is dead. The check and
+  the knowledge were one function call apart and never met.
+- **Write actions were weaker than read actions, which is backwards.** `send-invite` /
+  `send-message` / `send-inmail` got an ownership check but no liveness check, while
+  `search-people` at least got one via the fallback path. The more consequential action had the
+  weaker preflight.
+- **The 10-minute probe cache needed an invalidation edge.** A session can die inside the cache
+  window, so preflight alone would keep waving it through until expiry. The reactive 401 handler
+  is retained as the backstop and now calls `clearStatusCache`, so the next attempt re-probes
+  instead of trusting a stale positive.
+- **Two copies of the disconnect guidance were about to exist.** Both paths now return one shared
+  helper, so the preflight and the reactive handler cannot drift into telling the user two
+  different stories about the same account.
+
+## ENG-399: DATASET LIST was broken by the per-pixel edge, not the account-level one (2026-07-30)
+
+`call_meta_marketing_api { entity_type: DATASET, action: LIST }` failed every time with
+`(#100) Tried accessing nonexisting field (datasets)`, making Meta pixel discovery impossible
+in-product. The ticket's stated hypothesis — account-level entry point broken, per-pixel edge fine —
+was **exactly inverted**. Investigation findings:
+
+- **`listPixels` was already correct.** It calls `GET /act_<id>/adspixels` (`metaService.ts`) and had
+  a test asserting that URL. The failure was one layer down: `manageMetaDatasets` LIST then looped
+  **per pixel** calling `listDatasets(pixel.id)` → `GET /<pixel_id>/datasets`, an edge Graph v25
+  removed when Meta unified pixels and datasets. A pixel now IS its own dataset.
+- **One dead edge killed the whole call because `handleError` rethrows.** `metaService.handleError`
+  ends in `throw enhancedError`, so the first per-pixel rejection propagated out of the `for` loop to
+  `manageMetaDatasets`'s catch and returned `success: false`. An account with N pixels also issued
+  N doomed round-trips before failing. The fix removes the loop entirely: zero per-pixel calls.
+- **This codebase had already reached the right answer elsewhere and never back-ported it.** The
+  lander pixel resolver (`resolveMetaPixelForUser`) documents "Meta unified pixel + dataset in Graph
+  v25, so the per-pixel `listDatasets` edge (broken, see ENG-399) is never called at all", and
+  `metaService.pixelResolution.test.ts` pins that workaround. The tool path just never adopted it.
+  Worth checking for this shape generally: a known-broken dependency routed around in one call site
+  while every other caller keeps hitting it.
+- **Both existing test suites passed while the feature was 100% broken in production**, which is why
+  this survived from the 2026-07-19 RankAI incident. `agentModeService.metaDatasets.test.ts` mocked
+  `metaService.listDatasets` wholesale, so it asserted against a fabricated success the real edge
+  could never return. Worse, `metaService.test.ts` asserted the request URL contained
+  `pixel_1/datasets` — a test whose only content was **pinning the bug**. Both were agent-written
+  against the implementation rather than against a behavioral contract; this is the exact failure
+  mode `loop-acceptance-tests.md` exists to prevent, and the reason the new regression test asserts
+  the dead edge is *never called* rather than asserting its mocked return value.
+- **The tool description was also lying**, promising "all pixels and their associated datasets
+  (server event data sources)" — an entity relationship that no longer exists. Corrected to state
+  that each pixel id doubles as its `dataset_id`, since a description that describes a removed
+  Graph shape sends Emma looking for a second identifier that is never coming.
+
+## ENG-664: per-user X cost breakdown on the admin user card + LLM-only fix (2026-07-30)
+
+**LLM-only fix.** The user card's "LLM Cost" 📊 opens `getUserOrgUsageRollup` (gross burn vs the LLM
+quota counter). Because X writes to the same ledger, X rows were leaking into that rollup — inflating
+gross burn and depressing "charged coverage" (X never deducts from the quota counter). Fixed by filtering
+`!isVendorEntry(row)` at the query, so gross burn / byModel / members are purely LLM. Per-unit vendor
+rows (X/Twitter, v0, …) are excluded; token-priced image/video (recordUsage, no `unit`) stay in — they
+DO count toward the cap.
+
+**Per-user X breakdown (Option A).** New `getUserXBreakdown(userId, start, end)` (shares
+`groupTwitterRows` with `getXAllocatedTotals`) → `GET /api/admin/users/:userId/usage/x-breakdown`. A new
+"X (Twitter) Cost" stat + 📊 on the user card opens a modal (`XCostBreakdown`, bars + table, reusing the
+LLM modal's table/bars toggle) showing that user's X spend by tool, labelled **allocated** and noting it
+is observe-only (not deducted from any cap). Mirrors the LLM Cost affordance without borrowing its
+quota framing.
+
+## ENG-664 (Option B): attribute X ledger to the acting user, bill the owner (2026-07-30)
+
+Aligns X metering with the LLM rail. Previously the X shadow ledger keyed on the account OWNER
+(`ownerUserId` is all `twitterService` receives, so token refreshes write back to the owner). The LLM
+rail instead records the ACTING user in the shadow ledger and rolls billing to the org owner. For an org
+where several members share one X account, owner-keying collapsed all their spend onto the owner — you
+couldn't see which member drove it.
+
+Option B records `userId = acting member` and `billingUserId = account owner`, matching LLM. Since
+`twitterService` methods only receive `ownerUserId`, the acting user is carried via an
+`AsyncLocalStorage` (`runWithXActingUser`) that the two Emma dispatchers (`twitterManagePost`,
+`twitterOutreach`) and the `TwitterAdapter` (createPost/listPosts) bind. `meterCall` reads it:
+`userId = actingUserId ?? ownerUserId`, `billingUserId = ownerUserId`. An UNWRAPPED path (some future
+caller) has no acting user in context and safely falls back to owner-attribution — never an error.
+
+Knock-on: `@handle` enrichment must resolve through the OWNER, so `buildXAccountBreakdown` now enriches
+via the row's `billingUserId` (owner), not `userId` (acting member). Pre-Option-B rows have
+`billingUserId === userId`, so it still works. This also pre-wires ENG-703 drawdown, which will charge
+`billingUserId` (the owner), exactly like the LLM cap already does via `resolveBillingUserId`.
+
+## ENG-664: meter X (Twitter) API usage + cost per account and per tool (2026-07-29)
+
+Builds directly on the [[ENG-693]] vendor dimension — no new table, no new pipeline.
+
+**Metering.** `twitterService.withRetryOn401` is the single chokepoint every data-plane
+X call already funnels through (it has `ownerUserId` + `accountId` in scope). It now takes a
+**required** `meter: TwitterMeterSpec` arg (`operation`, optional `requiredScope`, `units(result)`,
+`text`). On each successful call `meterCall()` fires `recordVendorUsage()` into `AW-UsageRecords`:
+- `userId  = ownerUserId`            → per-USER cut ("who spent our X budget")
+- `model   = "twitter:{operation}"`  → per-TOOL cut (recordVendorUsage namespaces the model slot)
+- `feature = "x-account:{accountId}"`→ per-ACCOUNT cut (the connected account)
+
+Making `operation` a required parameter means an uninstrumented call path **fails to compile**
+(acceptance criterion 3 — attribution is never silently dropped). Metering is fully guarded and
+fire-and-forget: it never fails or slows an X call (the units/pricing computation is wrapped, and
+`recordVendorUsage` swallows its own errors).
+
+**Cost is ALLOCATED, never measured.** X exposes no per-call price at runtime (the rate-limit
+headers `twitter-api-v2` returns carry quota, not dollars), so `utils/twitterPricing.ts` applies X's
+published pay-per-use rate card (docs.x.com, effective Apr 2026): post-create $0.015 ($0.200 with a
+link), post-read $0.005/resource, user-read $0.010, owned-read $0.001, DM-read $0.010, DM-create
+$0.015; interaction writes (like/follow/retweet/block/mute/delete) are recorded at $0 since X
+publishes no price. Rows carry `costSource: "allocated"`.
+
+**Reconciliation caveat (acceptance criterion 2).** X charges a repeat read of the SAME resource
+within a UTC day only once; we do not track resource ids, so a computed total is an allocated
+UPPER BOUND — it reconciles as `>=` the X console's billed usage, not to the cent. Exact
+reconciliation would need per-resource-id dedup (follow-up, not this PR). The partner-portal view
+labels X figures "allocated" and shows the dedup caveat so the number never reads as measured.
+
+**Surface.** New admin **Usage & Cost** tab (`partner-portal/.../UsageCostByUserTab.tsx`) renders the
+already-existing `GET /api/admin/usage/cost-aggregation` `topUsers` breakdown as a per-user table with
+a provider filter (All / LLM / X / other vendors) and an expandable per-tool breakdown. X spend flows
+into it automatically because it lands in the same ledger — no backend aggregation change was needed.
+
+**Handle-resolution sub-calls are metered too (AC1).** Several ops (`follow`/`unfollow`/`block`/`mute`
+family, `send_dm`, `get_user_tweets`, `get_dm_conversation`, and `list_followers`/`list_following` when
+a handle is passed) make an internal `userByUsername` handle→id lookup — a separate billable **user-read**
+($0.010). The meter spec carries `extraUserReads`, and `meterCall` records a companion `resolve_handle`
+row so no billable sub-call is left unattributed. `list_followers`/`list_following` for the OWN account
+(no handle) resolve nothing, so `extraUserReads` is 0 there.
+
+**Billing-cycle month math.** `currentXBillingCycle` clamps the reset day to the target month's real
+length (a `cap_reset_day` of 29–31 must not overflow a short prior month, e.g. Feb 31 → Feb 28) and rolls
+the year back at January. Without the clamp the derived allocated window could invert (start>end) and 500
+the reconciliation panel for any account whose reset day ≥ 29 early in a month.
+
+**Typed X 402 (credit exhaustion).** X errors carry the HTTP status on `.code`, and the tool taxonomy
+only knew `.status`/`.statusCode` and had no 402 branch — so a depleted-wallet 402 (ENG-604/633/662)
+classified as a generic `Error` and a mid-run 402 could read as success. Fixed end to end:
+- `withRetryOn401` converts any X 402 into a typed `XCreditsExhaustedError` (name stable, `code=402`) at
+  the single chokepoint, logging an `X_CREDITS_EXHAUSTED` marker for ops alerting. It is non-retryable and
+  never metered (the call did not succeed).
+- `classifyToolErrorClass` gains a stable `payment_required` class, reached three ways: status 402 (now
+  also reads `.code`, guarded to the 100–599 HTTP range), the typed error's name, and "HTTP 402" in text.
+- `classifyToolFailureType` maps `payment_required → config` — a billing/quota gap, excluded from the
+  tool-bug rate but visible and clustered, never silently a success.
+
+**Reconciliation (AC #2) — built (on-demand).** X's dedup ("same resource once per UTC day") is
+**app-wide** (the credit pool is AgentWeb's one Developer App), so per-user cost can only ever be
+*allocated* load attribution, not a fair split of the billed figure. So reconciliation is two numbers,
+never conflated: **allocated** (our ledger, above, an upper bound) for "who drives spend", and
+**measured** pulled live from X's own `GET /2/usage/tweets`. The shared app's Bearer token lives in the
+`{dev,prod}/AgentWeb/Twitter` secret (now exposed on `TwitterCredentials.bearerToken`);
+`twitterService.getXProjectUsage()` fetches app-only (never metered — not a user call) and returns
+`projectUsage`/`projectCap`/`capResetDay`. `GET /api/admin/usage/x-reconciliation` derives the current
+billing cycle from `capResetDay` (`currentXBillingCycle`), sums our allocated X ledger over that same
+window (`getXAllocatedTotals`, filtered to `twitter:*`), and returns measured beside allocated + the
+dedup delta + a cap gauge. Rendered as the "X API reconciliation" panel in the admin tab; an
+X-unreachable failure degrades to a warning (502) without breaking the tab.
+
+Note what `/2/usage/tweets` covers: **post-read consumption against the 2M cap** — X's authoritative,
+deduped count. It does NOT report writes or dollars, so `measuredDerivedCostUsd = measured reads × $0.005
++ our directly-counted non-read allocated`; that's a *tighter* dollar figure than allocated-from-log
+because the read count is already deduped. A `(utcDay, resourceId)` dedup table would give exact per-user
+*billed* numbers but costs one write per resource read — deferred unless finance needs per-user billed
+(not load) figures. A scheduled poller for historical snapshots + low-credit alerting is the next step.
+
+**By-account cut + @handle enrichment.** Each X call records `feature = x-account:{accountId}`, so the
+cost aggregation groups those rows into `byXAccount`. There is **no global GSI on account_id** (connected
+accounts are nested in the User record), so a scan-free handle lookup needs the owning userId — which the
+ledger row's partition key already carries. `buildXAccountBreakdown` groups by accountId, tracks per-user
+spend, and best-effort resolves the @handle via `getAccountById(accountId, heaviestSpenderUserId,
+'twitter')` (the heaviest spender is the owner in the common case) → `config.username`. This mirrors the
+existing `topUsers` email enrichment: a miss (e.g. an org-shared account the heaviest caller doesn't own)
+yields `handle: null` and the UI falls back to the raw accountId. Never fails the aggregation. The admin
+tab renders `@handle` (raw id alongside) via `xAccountRows`/`xAccountLabel`, falling back to the
+client-side `byFeature` derivation if the server omits the enriched cut.
+
+**Fair per-user drawdown (the ENG-664 "eventually" goal) — design only.** Because dedup is app-wide,
+enforcing a cap on raw allocated numbers over-bills shared reads. The right mechanism is **proportional
+settlement**: keep the live ledger allocated, then a periodic settlement pulls the measured app total,
+computes `factor = measured / allocated`, and charges each org owner their allocated-weighted share so
+`Σ charged = measured` exactly (reconciles) and each pays in proportion to load (fair). Applied at the
+org-owner level (`resolveBillingUserId`, as LLM already does) and kept behind `ENFORCE_COST_CAP=false`
+(observe-only) until ENG-703 defines Emma-Credit pricing. `recordVendorUsage` deliberately does NOT call
+`incrementUserTokenUsage` today — X spend is visible but does not draw down any cap yet.
+
+## ENG-746: the closure gate was blocked by an env var nobody set (2026-07-31)
+
+`GET /api/admin/loops/reliability-trend` returned `{count: 0, snapshots: []}` on every window, so
+closure-gate check 4 ("burn-in clean, `failedRunRate`/`degradedRunRate` no worse than the
+pre-release snapshot") failed for every issue and nothing on the board could close. Fourteen items
+were queued behind it. Investigation findings:
+
+- **It is NOT the ENG-593/CaptureGate problem, despite looking like one.** Worth stating because
+  the two are easy to conflate: both are "the loop never reaches a verdict". The reliability trend
+  is written by `runAgentReliabilitySnapshot` (`backend/src/cron/agentReliabilitySnapshotCron.ts`),
+  which is pure telemetry — it reads raw `agent-mode` events from `Dev-AW-LoopEvents` and aggregates
+  them under `loopId='agent-reliability-daily'`. It never calls `pollDecision()`, never touches
+  `CaptureGate`/`ApprovalGate`, and never reads the `LearningStore`. ENG-593 governs the *learning*
+  verdict, which is what makes `/loops/health` report `pending_approval` — a different pipeline.
+  Fixing this needed no ApprovalGate flip.
+- **The writer had never run, once, ever.** `server.ts` gated the cron behind
+  `AGENT_RELIABILITY_SNAPSHOT_ENABLED === 'true'`, and that variable is absent from
+  `Agentweb-backend-env-prod-3` while `AGENT_MODE_LOOP_ENABLED`, `AGENT_RUNTIME_SPINE_ENABLED`,
+  `AI_EVAL_LOOP_ENABLED`, `AI_READINESS_LOOP_ENABLED` and `ONBOARDING_LOOP_*` are all `true`. It was
+  simply missed when the feature shipped. Measured live: **121,389** raw `agent-mode` events,
+  **0** rows in the `agent-reliability-daily` partition. The source data was never the problem.
+  A 7-day window reading `count: 0` meant "never written", not "quiet week" — as suspected.
+- **The zero-denominator guard is a false-green generator.** `computeReliabilitySnapshot` returns
+  `degradedRunRate: 0` and `failedRunRate: 0` when `totalVerdicts === 0`. A window in which *nothing
+  ran* therefore renders as a flawless 0% failure rate — strictly better than any real baseline, so
+  a naive comparison reads a dead window as the best possible result. This sat directly in check 4's
+  path. `evaluateBurnIn` rejects a sub-`minRunCount` window on **both** sides of the comparison
+  rather than comparing its rates. Same family as ENG-734/743/754/777: a control reporting a value
+  it cannot substantiate.
+- **Turning the cron on is necessary but not sufficient.** Writing only "today" leaves one snapshot
+  with no pre-release baseline, so check 4 stays `insufficient_data` for another day; and the cron
+  first fires at the next 17:45 UTC, so a fresh deploy reads empty until then. Hence `catchUpDays`
+  (fills recent dateless days from events already stored, one event-partition read regardless of
+  span) plus a boot seed that runs if and only if the partition is empty.
+- **`passesClosureCheck4 === (verdict === 'clean')` is the whole safety property.** Every failure
+  path — no snapshots, no baseline, no post-release reading, too few runs, unparseable `releaseAt`,
+  a 500 — returns `insufficient_data`/`false`. There is deliberately no boolean-only form of the
+  result and no fourth "unknown" state a caller could coerce.
+- **Tolerance is a deliberate 2 points, not a weakening.** Daily rates move a point or two on
+  ordinary variance, and a zero-tolerance `<=` would mark healthy days `regressed` and rebuild this
+  same deadlock in a new shape. It only ever decides `clean` vs `regressed`; it cannot turn missing
+  data into a pass, because the run-count gate runs before any comparison.
+
 ## ENG-754: the Greptile 5/5 bar is now a check, not a habit (2026-07-29)
 
 `Require Greptile Review` used to poll Greptile's own `Greptile Review` check-run and pass on

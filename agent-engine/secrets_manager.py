@@ -144,6 +144,18 @@ def get_azure_openai_endpoint3() -> str:
     return _env_or_json_secret('AZURE_OPENAI_ENDPOINT3', 'azure-openai-3', 'endpoint')
 
 
+def get_azure_image_api_key() -> str:
+    # Deliberately separate from AZURE_OPENAI_API_KEY2 (ENG-410) - image
+    # generation and chat point at different Azure resources, so reusing
+    # the chat key would authenticate the image endpoint against the
+    # wrong resource.
+    return _env_or_json_secret('AZURE_IMAGE_API_KEY', 'azure-image', 'apiKey')
+
+
+def get_azure_image_endpoint() -> str:
+    return _env_or_json_secret('AZURE_IMAGE_ENDPOINT', 'azure-image', 'endpoint')
+
+
 def get_azure_openai_api_version3(default: str = '2025-01-01-preview') -> str:
     return _env_or_json_secret('AZURE_OPENAI_API_VERSION3', 'azure-openai-3', 'apiVersion', default)
 

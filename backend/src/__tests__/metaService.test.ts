@@ -1293,19 +1293,24 @@ describe('MetaService', () => {
             );
         });
 
-        it('should list datasets for a pixel', async () => {
-            const mockDatasets = [{ id: 'ds_1', name: 'Dataset 1' }];
+        // ENG-399: `last_fired_time` is what tells a user whether a pixel is actually
+        // firing — the discovery step this tool exists to serve.
+        it('should request last_fired_time when listing pixels', async () => {
             mockFetch.mockResolvedValue({
                 ok: true,
-                json: jest.fn().mockResolvedValue({ data: mockDatasets })
+                json: jest.fn().mockResolvedValue({ data: [] })
             });
 
-            const result = await service.listDatasets('pixel_1', mockAccessToken);
-            expect(result).toEqual(mockDatasets);
+            await service.listPixels(mockAdAccountId, mockAccessToken);
             expect(mockFetch).toHaveBeenCalledWith(
-                expect.stringContaining('pixel_1/datasets')
+                expect.stringContaining('last_fired_time')
             );
         });
+
+        // NOTE: the former 'should list datasets for a pixel' test was deleted with
+        // `listDatasets` itself (ENG-399). It asserted the request URL contained
+        // `pixel_1/datasets` — an edge Graph v25 removed — so it pinned the bug in place
+        // and passed for months while the feature was broken in production.
 
         it('should get dataset event stats', async () => {
             const mockStats = {

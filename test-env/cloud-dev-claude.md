@@ -73,7 +73,11 @@ The relay system will re-invoke you after the specified number of seconds (300 =
 **Example workflow for "wait for CI" (merge only if task explicitly says to):**
 1. Push your changes, create/update the PR
 2. In your response, include `[RELAY_RETRY_AFTER:300]` and explain what you're waiting for
-3. When re-invoked, check CI status with `gh pr checks <number>` or `gh run list`
+3. When re-invoked, check CI status with
+   `REPO=AgentWebPro/agentweb PR_NUMBER=<number> bash .github/scripts/merge-evidence.sh`
+   (exit 0 = PASS, 1 = FAIL, 2 = PENDING, 3 = NO_EVIDENCE, 4 = unreadable).
+   Prefer it over `gh pr checks`, which exits 0 on a conflicted PR and on a
+   stale all-skipped draft run — skipped is not failed (ENG-757).
 4. **If the task says to merge**, first check if the branch is up to date:
    ```bash
    gh api repos/AgentWebPro/agentweb/pulls/<number> --jq '.mergeable_state'
