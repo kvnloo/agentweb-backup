@@ -17557,8 +17557,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (!lookalikeListResult.success) {
           throw new Error(lookalikeListResult.message || 'Failed to list existing Meta custom audiences.');
         }
+        // Greptile follow-up finding: name-only matching isn't enough — a
+        // same-named lookalike from an earlier launch with a DIFFERENT
+        // ratio/country (a deliberate new request, not a retry — the
+        // confirm-token digest already includes ratio/country, so reaching
+        // here with a genuinely different digest means a fresh, separately
+        // confirmed launch) must not be silently reused. The campaign would
+        // target the old population while the ledger reports the newly
+        // requested spec. Requires the existing audience's actual spec to
+        // also match, not just its name.
         const existingLookalike = (lookalikeListResult.audiences || []).find(
-          (a: any) => String(a?.name ?? '').toLowerCase() === lookalikeName.toLowerCase()
+          (a: any) =>
+            String(a?.name ?? '').toLowerCase() === lookalikeName.toLowerCase() &&
+            a?.lookalike_spec?.ratio === args.lookalike_ratio &&
+            a?.lookalike_spec?.country === args.lookalike_country
         );
         let lookalikeAudience: { id: string; name: string };
         if (existingLookalike) {

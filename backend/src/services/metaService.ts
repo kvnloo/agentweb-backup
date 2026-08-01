@@ -1813,12 +1813,16 @@ export class MetaService {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
       const fields = [
-        'id', 
-        'name', 
-        'description', 
-        'delivery_status', 
-        'subtype', 
-        'customer_file_source'
+        'id',
+        'name',
+        'description',
+        'delivery_status',
+        'subtype',
+        'customer_file_source',
+        // ENG-600: needed so a lookalike reuse-by-name match can verify the
+        // existing audience's actual ratio/country, not just its name — see
+        // agentModeService's executeAudienceCampaignLaunch.
+        'lookalike_spec',
       ];
       this.log(`Listing custom audiences for account: ${adAccountId}`, { fields });
       const audiences = await account.getCustomAudiences(fields, { limit: 50 });
