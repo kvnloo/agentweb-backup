@@ -12,6 +12,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
+import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -1561,6 +1562,34 @@ export class AgentModeService {
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
 
+  // ENG-737: native @google/genai adapter — the only Gemini transport agent-mode
+  // calls use. It filters chain-of-thought at the source (thinkingConfig.
+  // includeThoughts=false + part.thought), so no reasoning leak is possible by
+  // construction — no heuristic, no fallback transport that could reintroduce it.
+  private gemini_native_client: any | null = null;
+  private gemini_native_sdk_promise: Promise<any> | null = null;
+  private gemini_api_key_promise: Promise<string> | null = null;
+
+  /** Resolve the Gemini API key from env or secrets (cached; shared by both clients). */
+  private async getGeminiApiKey(): Promise<string> {
+    if (this.gemini_api_key_promise) return this.gemini_api_key_promise;
+    this.gemini_api_key_promise = (async () => {
+      let geminiApiKey = process.env.GEMINI_API_KEY;
+      if (!geminiApiKey) {
+        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+        geminiApiKey = await getSecret(`${environment}/AgentWeb/GeminiAPIKey`);
+      }
+      if (!geminiApiKey || !geminiApiKey.trim()) {
+        throw new Error('Gemini API key is empty or not found in env/secrets');
+      }
+      return geminiApiKey.trim();
+    })().catch((err) => {
+      this.gemini_api_key_promise = null; // allow retry on transient secret failures
+      throw err;
+    });
+    return this.gemini_api_key_promise;
+  }
+
   // Helper method to get Gemini client (lazy-loaded from secrets manager)
   public async getGeminiClient(): Promise<OpenAI> {
     // Return cached client if available
@@ -1602,6 +1631,39 @@ export class AgentModeService {
     })();
 
     return this.gemini_client_promise;
+  }
+
+  /**
+   * ENG-737: native @google/genai client wrapper for gemini agent calls, presenting
+   * the same OpenAI-shaped `chat.completions.create` surface as getGeminiClient.
+   * Unlike the compat endpoint, this filters chain-of-thought natively
+   * (thinkingConfig.includeThoughts=false + part.thought), so no reasoning leaks —
+   * structurally, not via a heuristic. This is the only transport agent-mode
+   * Gemini calls use; there is deliberately no fallback to the OpenAI-compat
+   * endpoint, because that endpoint flattens thought parts into plain text and
+   * reintroduces the exact leak this client exists to prevent.
+   */
+  public getGeminiNativeClient(): any {
+    if (this.gemini_native_client) return this.gemini_native_client;
+    this.gemini_native_client = createGeminiNativeClient({
+      defaultMaxTokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
+      getClient: () => {
+        // Cache the SDK client so each agent turn reuses it (the key fetch is
+        // already cached); reset the promise on failure so a transient secret
+        // error can be retried.
+        if (this.gemini_native_sdk_promise) return this.gemini_native_sdk_promise;
+        this.gemini_native_sdk_promise = (async () => {
+          const { GoogleGenAI } = await import('@google/genai');
+          const apiKey = await this.getGeminiApiKey();
+          return new GoogleGenAI({ apiKey });
+        })().catch((err) => {
+          this.gemini_native_sdk_promise = null;
+          throw err;
+        });
+        return this.gemini_native_sdk_promise;
+      },
+    });
+    return this.gemini_native_client;
   }
 
   public async getVertexClient(modelId: string): Promise<any> {
@@ -2562,11 +2624,12 @@ export class AgentModeService {
 
     // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
     let client = this.llmModels[model].client;
-    if (!client) {
-      if (model.startsWith('gemini-')) {
-        client = await this.getGeminiClient();
-        this.llmModels[model].client = client;
-      } else if (model.startsWith('anthropic.')) {
+    if (model.startsWith('gemini-')) {
+      // ENG-737: always the native adapter — no fallback transport, resolved
+      // per-call (not cached on the registry).
+      client = this.getGeminiNativeClient();
+    } else if (!client) {
+      if (model.startsWith('anthropic.')) {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
       } else if (model.startsWith('claude-')) {
