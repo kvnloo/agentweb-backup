@@ -763,9 +763,17 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
           // (from ad_set_params.targeting) plus custom_audiences (the
           // resolved seed audience) — key order deliberately different from
           // construction order to prove the comparison isn't order-sensitive.
-          targeting: { custom_audiences: [{ id: 'aud_seed_6' }], geo_locations: { countries: ['US'] } },
+          // Reflects what Meta actually stores after createMetaAdsAdSet's own
+          // normalization: targeting_automation.advantage_audience defaulted
+          // to 0, bid_strategy resolved to its default. A retry's raw args
+          // (no targeting_automation, no bid_strategy) must still match this
+          // via the comparison's own equivalent normalization.
+          targeting: {
+            custom_audiences: [{ id: 'aud_seed_6' }], geo_locations: { countries: ['US'] },
+            targeting_automation: { advantage_audience: 0 },
+          },
           daily_budget: null, lifetime_budget: null, start_time: null, end_time: null,
-          optimization_goal: null, billing_event: null,
+          optimization_goal: null, billing_event: null, bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
         }],
       } as any);
       const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
@@ -864,6 +872,40 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
 
       expect(agentModeService.createMetaAdsAdSet).toHaveBeenCalled();
       expect(result.ledger.adSet.id).toBe('adset_new_promoted_object');
+    });
+
+    // Greptile follow-up finding: comparing the RAW requested budget/bid
+    // (dollars) against Meta's read-back value (cents — createMetaAdsAdSet
+    // multiplies by 100 before calling Meta) defeated reuse for the exact
+    // retry case this whole mechanism exists to handle. A legitimate retry
+    // with unchanged args (daily_budget: 10, i.e. $10) must match an
+    // existing ad set Meta reports as daily_budget: 1000 (cents).
+    it('reuses an existing ad set when the requested budget (dollars) matches Meta\'s stored value (cents)', async () => {
+      delete process.env.META_TEST_ACCOUNT_ALLOWLIST;
+      jest.spyOn(agentModeService as any, 'resolveOrCreateSeedAudience').mockResolvedValueOnce({
+        plannedAction: 'reuse', audience: { id: 'aud_seed_10', name: 'RankAI Warm List' }, created: false,
+        sourceSummary: 'CSV upload (...)', failures: [],
+      });
+      jest.spyOn(agentModeService, 'listMetaAdsAdSets').mockResolvedValueOnce({
+        success: true,
+        adSets: [{
+          id: 'adset_existing_budget', name: 'Targeted Ad Set',
+          targeting: {
+            custom_audiences: [{ id: 'aud_seed_10' }], geo_locations: { countries: ['US'] },
+            targeting_automation: { advantage_audience: 0 },
+          },
+          daily_budget: 1000, // $10.00 stored as cents by Meta
+          bid_strategy: 'LOWEST_COST_WITHOUT_CAP',
+        }],
+      } as any);
+      const createAdSetSpy = jest.spyOn(agentModeService, 'createMetaAdsAdSet');
+
+      const result = await agentModeService.launchTargetedAudienceCampaign(USER_ID, withConfirm({
+        ...baseArgs(), ad_set_params: { ...baseArgs().ad_set_params, daily_budget: 10 }, // $10.00, dollars
+      }));
+
+      expect(createAdSetSpy).not.toHaveBeenCalled();
+      expect(result.ledger.adSet.id).toBe('adset_existing_budget');
     });
 
     it('rejects a replay of an already-claimed preview token, returning a fresh preview instead of re-executing', async () => {

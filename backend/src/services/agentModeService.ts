@@ -17634,6 +17634,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (workflow === 'retargeting') {
         targeting.excluded_custom_audiences = [{ id: args.exclude_audience_id }];
       }
+      // Greptile finding: createMetaAdsAdSet defaults targeting_automation.
+      // advantage_audience to 0 when the caller didn't set it (Meta requires
+      // this field explicitly). It does this on its OWN local copy of
+      // targeting, not the object passed in — so without applying the same
+      // default here, comparing this `targeting` object against what Meta
+      // actually stored (and returns via LIST) would always see a spurious
+      // difference and never reuse, even for an identical retry.
+      if (!targeting.targeting_automation || targeting.targeting_automation.advantage_audience === undefined) {
+        targeting.targeting_automation = {
+          ...(targeting.targeting_automation || {}),
+          advantage_audience: 0,
+        };
+      }
 
       // Greptile finding: releasing the confirm token on a downstream
       // failure (e.g. Meta's ad-set-creation response lost/timed out even
@@ -17661,6 +17674,28 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // (mirroring metaService's own AD_SET_READ_FIELDS list) generically —
       // any explicitly-requested field that differs from the existing ad
       // set's actual value blocks reuse.
+      //
+      // Greptile follow-up finding: comparing RAW requested values against
+      // Meta's read-back values defeated reuse for the exact retry case this
+      // exists to handle — createMetaAdsAdSet normalizes daily_budget/
+      // lifetime_budget/bid_amount to cents (×100) and defaults bid_strategy/
+      // destination_type when unset before calling Meta, so an identical
+      // retry's RAW args never matched the normalized values Meta actually
+      // stored. Applies the same normalization here before comparing.
+      const toCentsForComparison = (val: number | undefined) => val !== undefined ? Math.round(val * 100) : undefined;
+      const resolvedBidStrategy = args.ad_set_params?.bid_strategy || 'LOWEST_COST_WITHOUT_CAP';
+      const resolvedDestinationType = args.ad_set_params?.destination_type === undefined &&
+        META_WEBSITE_OPTIMIZATION_GOALS.includes(args.ad_set_params?.optimization_goal)
+        ? 'WEBSITE'
+        : args.ad_set_params?.destination_type;
+      const normalizedRequestedAdSetParams: Record<string, any> = {
+        ...args.ad_set_params,
+        daily_budget: toCentsForComparison(args.ad_set_params?.daily_budget),
+        lifetime_budget: toCentsForComparison(args.ad_set_params?.lifetime_budget),
+        bid_amount: toCentsForComparison(args.ad_set_params?.bid_amount),
+        bid_strategy: resolvedBidStrategy,
+        destination_type: resolvedDestinationType,
+      };
       const AD_SET_REUSE_MATCH_FIELDS = [
         'daily_budget', 'lifetime_budget', 'start_time', 'end_time',
         'optimization_goal', 'billing_event', 'bid_strategy', 'bid_amount',
@@ -17670,7 +17705,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (String(as?.name ?? '').toLowerCase() !== String(adSetName ?? '').toLowerCase()) return false;
         if (this.canonicalJSON(as?.targeting) !== this.canonicalJSON(targeting)) return false;
         for (const field of AD_SET_REUSE_MATCH_FIELDS) {
-          const requested = (args.ad_set_params as any)?.[field];
+          const requested = normalizedRequestedAdSetParams[field];
           if (requested === undefined) continue; // not explicitly requested — don't require a match on it
           if (this.canonicalJSON(as?.[field] ?? null) !== this.canonicalJSON(requested)) return false;
         }
