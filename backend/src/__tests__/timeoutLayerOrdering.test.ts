@@ -42,11 +42,27 @@ describe('ENG-818 — timeout layer ordering', () => {
   const ebConf = fs.readFileSync(EB_CONF, 'utf8');
   const controller = fs.readFileSync(CONTROLLER, 'utf8');
 
-  /** The app-level cap, read from source so the test can't drift from the real default. */
+  /**
+   * The app-level cap, read from source so the test can't drift from the real default.
+   *
+   * The controller resolves this as `process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000'`,
+   * so a deployment that sets the env var moves the value the infra layers have to clear.
+   * We therefore assert against the EFFECTIVE cap — the override when one is present, the
+   * source default otherwise — rather than only the literal in the file. Otherwise raising
+   * the cap in an environment would silently re-create the exact collision this guards.
+   *
+   * Verified 2026-08-01: `Agentweb-backend-env-prod-3` sets no override, so the 600000
+   * default is what actually runs in production today.
+   */
   const appCapMatch = controller.match(
     /AGENT_MODE_GENERATION_TIMEOUT_MS\s*\|\|\s*'(\d+)'/,
   );
-  const appSeconds = Math.round(parseInt(appCapMatch![1], 10) / 1000);
+  const appDefaultMs = parseInt(appCapMatch![1], 10);
+  const appEffectiveMs = parseInt(
+    process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || String(appDefaultMs),
+    10,
+  );
+  const appSeconds = Math.round(appEffectiveMs / 1000);
 
   const albMatch = ebConf.match(/IdleTimeout:\s*(\d+)/);
   const albSeconds = parseInt(albMatch![1], 10);
@@ -67,8 +83,12 @@ describe('ENG-818 — timeout layer ordering', () => {
     expect(proxySend).toBeGreaterThan(appSeconds);
   });
 
-  it('gives the ALB strictly more headroom than nginx', () => {
+  it('gives the ALB strictly more headroom than every nginx proxy timeout', () => {
+    // Both proxy timeouts, not just read: proxy_send_timeout raised above the ALB idle
+    // timeout would re-create the collision on the request path instead of the response
+    // path, and an assertion that only covered proxy_read would not notice.
     expect(albSeconds).toBeGreaterThan(proxyRead);
+    expect(albSeconds).toBeGreaterThan(proxySend);
   });
 
   it('does not drain an instance before an in-flight request can finish', () => {
