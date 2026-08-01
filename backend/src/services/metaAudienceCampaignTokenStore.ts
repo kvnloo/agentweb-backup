@@ -45,15 +45,27 @@ function tokenConfigId(token: string): string {
 // waits out this window. A genuinely concurrent duplicate request within the
 // window still correctly loses the race, since the DynamoDB condition (not
 // the caller) decides atomically.
+//
+// Greptile follow-up finding: the staleness override alone didn't
+// distinguish "claimed because the launch failed and release also failed"
+// from "claimed because the launch SUCCEEDED" — after the window, a caller
+// could reclaim and re-execute an already-successfully-completed launch too,
+// defeating single-use replay protection entirely for anything older than
+// the window. Every claim is written with status "in_progress"; only a
+// record still in that status (never promoted to "consumed" by
+// markPreviewTokenSucceeded) is eligible for staleness-based reclaim — a
+// genuinely successful launch's record can never be reclaimed, no matter
+// how old.
 const CLAIM_STALE_AFTER_MS = 60_000;
 
 /**
  * Attempts to atomically claim a preview token for this user. Returns true
  * if this call won the claim — the token had never been claimed before, OR
- * the existing claim is older than CLAIM_STALE_AFTER_MS — and false if it's
- * claimed and still fresh (by a prior call, or a concurrent one that won the
- * race). The caller should treat false exactly like an invalid token and
- * fall back to a fresh preview rather than executing.
+ * the existing claim is still "in_progress" (never marked succeeded) and
+ * older than CLAIM_STALE_AFTER_MS — and false if it's claimed-and-fresh, or
+ * permanently consumed by a successful launch. The caller should treat
+ * false exactly like an invalid token and fall back to a fresh preview
+ * rather than executing.
  */
 export async function claimPreviewToken(userId: string, token: string): Promise<boolean> {
   const dynamodb = new AWS.DynamoDB.DocumentClient();
@@ -64,10 +76,15 @@ export async function claimPreviewToken(userId: string, token: string): Promise<
       Item: {
         userId,
         configId: tokenConfigId(token),
+        status: 'in_progress',
         consumedAt: new Date(now).toISOString(),
       },
-      ConditionExpression: 'attribute_not_exists(userId) OR consumedAt < :staleThreshold',
+      ConditionExpression: 'attribute_not_exists(userId) OR (#status = :inProgress AND consumedAt < :staleThreshold)',
+      ExpressionAttributeNames: {
+        '#status': 'status',
+      },
       ExpressionAttributeValues: {
+        ':inProgress': 'in_progress',
         ':staleThreshold': new Date(now - CLAIM_STALE_AFTER_MS).toISOString(),
       },
     }).promise();
@@ -76,6 +93,25 @@ export async function claimPreviewToken(userId: string, token: string): Promise<
     if (e.code === 'ConditionalCheckFailedException') return false;
     throw e;
   }
+}
+
+/**
+ * Marks a claimed token as permanently consumed after a successful launch —
+ * unlike an "in_progress" claim, a "consumed" record is never eligible for
+ * staleness-based reclaim, no matter how old, so a genuinely completed
+ * launch's token can never be replayed.
+ */
+export async function markPreviewTokenSucceeded(userId: string, token: string): Promise<void> {
+  const dynamodb = new AWS.DynamoDB.DocumentClient();
+  await dynamodb.put({
+    TableName: CONFIGS_TABLE,
+    Item: {
+      userId,
+      configId: tokenConfigId(token),
+      status: 'consumed',
+      consumedAt: new Date().toISOString(),
+    },
+  }).promise();
 }
 
 // Greptile follow-up finding: swallowing a delete failure on the first

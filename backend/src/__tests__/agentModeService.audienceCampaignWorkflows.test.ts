@@ -34,6 +34,7 @@ jest.mock('../services/metaAudienceSnapshotStore', () => ({
 jest.mock('../services/metaAudienceCampaignTokenStore', () => ({
   claimPreviewToken: jest.fn().mockResolvedValue(true),
   releasePreviewToken: jest.fn().mockResolvedValue(undefined),
+  markPreviewTokenSucceeded: jest.fn().mockResolvedValue(undefined),
 }));
 jest.mock('../utils/ssrfGuard', () => ({
   assertPublicHostname: jest.fn().mockResolvedValue(undefined),
@@ -44,7 +45,7 @@ jest.mock('../utils/ssrfGuard', () => ({
 import axios from 'axios';
 import { AgentModeService } from '../services/agentModeService';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from '../services/metaAudienceSnapshotStore';
-import { claimPreviewToken, releasePreviewToken } from '../services/metaAudienceCampaignTokenStore';
+import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from '../services/metaAudienceCampaignTokenStore';
 import { assertPublicHostname, resolvePinnedPublicAddress } from '../utils/ssrfGuard';
 
 describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
@@ -58,6 +59,7 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
     (saveAudienceSnapshotRowKeys as jest.Mock).mockResolvedValue(undefined);
     (claimPreviewToken as jest.Mock).mockResolvedValue(true);
     (releasePreviewToken as jest.Mock).mockResolvedValue(undefined);
+    (markPreviewTokenSucceeded as jest.Mock).mockResolvedValue(undefined);
     (assertPublicHostname as jest.Mock).mockResolvedValue(undefined);
     (resolvePinnedPublicAddress as jest.Mock).mockResolvedValue({ hostname: 's3.example.com', address: '93.184.216.34', family: 4 });
     // Default: no existing ad set matches (falls through to CREATE, the
@@ -785,6 +787,12 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       // re-execute (e.g. a second ad set under the same campaign) with no new
       // user confirmation. The token must be atomically claimed on success.
       expect(claimPreviewToken).toHaveBeenCalledWith(USER_ID, expect.any(String));
+
+      // Greptile follow-up finding: without marking a successful launch's
+      // token permanently consumed, the staleness override added for
+      // failed-release retries also made a genuinely completed launch's
+      // token replayable after the staleness window.
+      expect(markPreviewTokenSucceeded).toHaveBeenCalledWith(USER_ID, expect.any(String));
     });
 
     // Greptile finding: releasing the confirm token on a downstream failure
@@ -1254,6 +1262,9 @@ describe('AgentModeService - ENG-600 audience/campaign workflows', () => {
       // Releasing on failure lets the user retry the exact approved
       // arguments after fixing the underlying problem.
       expect(releasePreviewToken).toHaveBeenCalledWith(USER_ID, expect.any(String));
+      // A failed launch must never be marked permanently consumed — that
+      // would make the just-released token unreclaimable too.
+      expect(markPreviewTokenSucceeded).not.toHaveBeenCalled();
     });
 
     it('fails the whole launch when ad set creation fails', async () => {

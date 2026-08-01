@@ -31,7 +31,7 @@ jest.mock('aws-sdk', () => ({
   },
 }));
 
-import { claimPreviewToken, releasePreviewToken } from '../services/metaAudienceCampaignTokenStore';
+import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from '../services/metaAudienceCampaignTokenStore';
 
 describe('metaAudienceCampaignTokenStore', () => {
   beforeEach(() => {
@@ -103,6 +103,48 @@ describe('metaAudienceCampaignTokenStore', () => {
       expect(params.ConditionExpression).toContain('attribute_not_exists(userId)');
       expect(params.ConditionExpression).toContain(':staleThreshold');
       expect(params.ExpressionAttributeValues[':staleThreshold']).toEqual(expect.any(String));
+    });
+
+    // Greptile follow-up finding: the staleness override didn't distinguish
+    // "claimed because the launch failed and release also failed" from
+    // "claimed because the launch SUCCEEDED" — after 60s, a caller could
+    // reclaim and re-execute an already-successfully-completed launch too,
+    // defeating the original single-use replay protection entirely for
+    // anything older than the staleness window. The claim record now writes
+    // status "in_progress"; only records still in that status (never
+    // promoted to "consumed" by markPreviewTokenSucceeded) are eligible for
+    // staleness-based reclaim — a genuinely successful launch's record can
+    // never be reclaimed, no matter how old.
+    it('writes the claim with status "in_progress", and the condition only allows staleness override for that status', async () => {
+      mockPut.mockResolvedValueOnce({});
+
+      await claimPreviewToken('user1', 'abc123token');
+
+      const [params] = mockPut.mock.calls[0];
+      expect(params.Item.status).toBe('in_progress');
+      expect(params.ConditionExpression).toContain('#status = :inProgress');
+      expect(params.ExpressionAttributeValues[':inProgress']).toBe('in_progress');
+      expect(params.ExpressionAttributeNames['#status']).toBe('status');
+    });
+  });
+
+  // Greptile follow-up finding: without a way to mark a claim as
+  // PERMANENTLY consumed (vs. merely "claimed, outcome unknown"), the
+  // staleness override for failed-release retries also accidentally made
+  // successful launches replayable after 60 seconds.
+  describe('markPreviewTokenSucceeded', () => {
+    it('updates the claim record to a permanent "consumed" status', async () => {
+      mockPut.mockResolvedValueOnce({});
+
+      await markPreviewTokenSucceeded('user1', 'abc123token');
+
+      expect(mockPut).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Item: expect.objectContaining({
+            userId: 'user1', configId: 'metaAudienceCampaignConfirmToken:abc123token', status: 'consumed',
+          }),
+        })
+      );
     });
   });
 

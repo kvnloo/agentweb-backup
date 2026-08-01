@@ -186,7 +186,7 @@ import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys } from './metaAudienceSnapshotStore';
-import { claimPreviewToken, releasePreviewToken } from './metaAudienceCampaignTokenStore';
+import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
 import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
@@ -17558,7 +17558,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // the claim on failure lets a legitimate retry work, while the atomic
       // claim above still fully prevents concurrent double-execution.
       try {
-        return await this.executeAudienceCampaignLaunch(userId, args, workflow, source);
+        const result = await this.executeAudienceCampaignLaunch(userId, args, workflow, source);
+        // Greptile follow-up finding: without marking a successful launch's
+        // token permanently consumed, the staleness override added for
+        // failed-release retries also let a genuinely completed launch's
+        // token be reclaimed and replayed after the staleness window.
+        await markPreviewTokenSucceeded(userId, args.preview_token);
+        return result;
       } catch (e) {
         await releasePreviewToken(userId, args.preview_token);
         throw e;
