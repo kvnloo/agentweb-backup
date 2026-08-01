@@ -1,9 +1,10 @@
 import axios from 'axios';
+import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
-import { createHash, randomUUID } from 'crypto';
+import { createHash, createHmac, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
@@ -184,6 +185,11 @@ import {
 } from './googleAdsCampaignCriteria';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
+import { assertMetaAccountAllowed } from './metaTestAccountGuard';
+import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
+import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
+import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
+import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
@@ -14880,6 +14886,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  /**
+   * Thin wrapper used by executeAudienceCampaignLaunch's ad-set reuse-match
+   * check to determine whether the campaign has Advantage Campaign Budget
+   * (CBO) — needed to normalize the requested budget the same way
+   * createMetaAdsAdSet does (strips it entirely for CBO campaigns) before
+   * comparing against an existing ad set. Kept as its own method (mirroring
+   * listMetaAdsAdSets) so it can be mocked directly in tests.
+   */
+  public async getCampaignForAdSetReuseCheck(userId: string, accountId: string, campaignId: string): Promise<any> {
+    const { accountId: resolvedAccountId, accessToken } = await this.getMetaCredentials(userId, accountId);
+    return metaService.getCampaign(resolvedAccountId, accessToken, campaignId);
+  }
+
   public async listMetaAdsAdSets(
     userId: string,
     campaignId?: string,
@@ -16696,9 +16715,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       },
       {
         id: 'traffic',
-        label: 'Traffic / Awareness',
-        consequence: 'Optimizes for clicks/reach, not conversions — exposure only, not the default.',
+        label: 'Traffic',
+        consequence: 'Optimizes for clicks/landing-page views, not reach or conversions — exposure only, not the default.',
         payload: { objective: 'OUTCOME_TRAFFIC' },
+      },
+      {
+        id: 'awareness',
+        label: 'Awareness',
+        consequence: 'Optimizes for reach/impressions, not clicks or conversions — the objective REACH-optimized ad sets require.',
+        payload: { objective: 'OUTCOME_AWARENESS' },
       },
     ];
 
@@ -16895,7 +16920,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    */
   public async manageMetaCustomAudiences(
     userId: string,
-    action: 'LIST' | 'CREATE' | 'UPLOAD_USERS',
+    action: 'LIST' | 'CREATE' | 'UPLOAD_USERS' | 'DELETE_USERS' | 'REPLACE_USERS',
     account_id: string,
     params: any
   ): Promise<MetaApiResult> {
@@ -16977,10 +17002,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             // Already an array (e.g. from JSON)
             parsedPayload = userPayload;
           } else if (typeof userPayload === 'string') {
-            // Split by newline to get rows
-            const rows = userPayload.split(/\r?\n/).filter(row => row.trim().length > 0);
-            // Split by comma to get columns
-            parsedPayload = rows.map(row => row.split(',').map(cell => cell.trim()));
+            // Real CSV parsing (quoted fields containing commas, e.g. a phone
+            // value with an extension) — a naive split(',') silently corrupts
+            // column alignment on exactly this kind of real-world export.
+            try {
+              parsedPayload = parseCsv(userPayload, {
+                skip_empty_lines: true,
+                trim: true,
+                relax_column_count: true,
+              });
+            } catch (parseError: any) {
+              throw new Error(`Failed to parse CSV payload: ${parseError.message}`);
+            }
           } else {
             // Fallback or error
             parsedPayload = [];
@@ -17001,45 +17034,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             }
           }
 
-          // SHA256 Hashing logic
-          // Iterating through parsed payload and hashing fields based on schema
-
-          const hashedPayload = parsedPayload.map((row: string[]) => {
-            return row.map((cell: string, index: number) => {
-              const fieldType = (params.schema && params.schema[index]) ? params.schema[index].toUpperCase() : '';
-              let value = cell ? cell.trim() : '';
-
-              if (!value) return '';
-
-              // Pass through if already a SHA256 hash (64 hex chars)
-              if (/^[a-fA-F0-9]{64}$/.test(value)) {
-                return value;
-              }
-
-              // Normalization Rules per Meta requirements:
-              if (['EMAIL'].includes(fieldType)) {
-                value = value.toLowerCase();
-              } else if (['PHONE'].includes(fieldType)) {
-                // Standardize to digits only (strip spaces, dashes, parens)
-                value = value.toLowerCase().replace(/[^a-z0-9]/g, '');
-              } else if (['GEN'].includes(fieldType)) {
-                // Gender: 'f' or 'm'
-                value = value.toLowerCase() === 'female' ? 'f' : (value.toLowerCase() === 'male' ? 'm' : value.toLowerCase());
-              } else if (['DOBY', 'DOBM', 'DOBD'].includes(fieldType)) {
-                // Keep trimmed string
-                value = value.trim();
-              } else if (['COUNTRY'].includes(fieldType)) {
-                // Country codes must be lowercase 2-letter ISO
-                value = value.toLowerCase();
-              } else {
-                // Default: lowercase + trim
-                value = value.toLowerCase();
-              }
-
-              // Compute SHA256
-              return createHash('sha256').update(value).digest('hex');
-            });
-          });
+          // SHA256 Hashing logic (shared with resolveOrCreateSeedAudience's
+          // stale-member diff, which needs to hash rows the same way to
+          // compare against a previously saved snapshot — see hashAudienceRows).
+          const hashedPayload = this.hashAudienceRows(params.schema, parsedPayload);
 
           console.log(`[AgentMode] Hashed ${hashedPayload.length} rows for upload.`);
 
@@ -17057,18 +17055,934 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             result: result
           };
         }
+        case 'DELETE_USERS': {
+          // Removal counterpart of UPLOAD_USERS, used by resolveOrCreateSeedAudience
+          // to sync stale members out of a reused audience. Payload here is always
+          // an already-hashed array (rows previously saved in the snapshot store),
+          // never a raw CSV/URL — no fetch/parse/hash step needed.
+          if (!params.id || !params.payload || !params.schema) {
+            throw new Error('DELETE_USERS requires "id", "schema", and "payload".');
+          }
+          if (!Array.isArray(params.payload) || params.payload.length === 0) {
+            throw new Error('DELETE_USERS payload must be a non-empty array of rows.');
+          }
+          const result = await metaService.deleteCustomAudienceUsers(
+            accountId,
+            accessToken,
+            params.id,
+            params.schema,
+            params.payload
+          );
+          return {
+            success: true,
+            message: `Successfully initiated removal of ${params.payload.length} stale user(s) from audience ${params.id}`,
+            result: result
+          };
+        }
+        case 'REPLACE_USERS': {
+          // Used by resolveOrCreateSeedAudience when reusing an audience with
+          // no locally-saved membership snapshot to diff against — there's no
+          // baseline to know what's stale, so membership is atomically set to
+          // exactly the current source instead of add-only uploading (which
+          // would leave any pre-existing members that aren't in the current
+          // source stuck in the audience forever). Payload is the same raw
+          // (unhashed) row array UPLOAD_USERS receives from resolveOrCreateSeedAudience
+          // — hashed here the same way, via the shared hashAudienceRows helper
+          // (which passes already-hashed 64-hex values through unchanged).
+          if (!params.id || !params.payload || !params.schema) {
+            throw new Error('REPLACE_USERS requires "id", "schema", and "payload".');
+          }
+          if (!Array.isArray(params.payload) || params.payload.length === 0) {
+            throw new Error('REPLACE_USERS payload must be a non-empty array of rows.');
+          }
+          const hashedReplacePayload = this.hashAudienceRows(params.schema, params.payload);
+          const result = await metaService.replaceCustomAudienceUsers(
+            accountId,
+            accessToken,
+            params.id,
+            params.schema,
+            hashedReplacePayload
+          );
+          return {
+            success: true,
+            message: `Successfully replaced audience ${params.id} membership with ${params.payload.length} user(s)`,
+            result: result
+          };
+        }
         default:
           throw new Error(`Action ${action} is not supported for CUSTOM_AUDIENCE.`);
       }
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error managing custom audiences:', error);
+      // Meta's raw error.message (e.g. "Permissions error") is often too terse to
+      // act on. metaService.handleError attaches a structuredError with Meta's own
+      // consumer-facing error_user_msg (e.g. the exact accept-terms URL for
+      // "Custom audience terms not accepted", subcode 1870090) — prefer it when present.
+      const structured = error.structuredError;
+      let message = error.message || 'Failed to manage custom audiences.';
+      if (structured?.error_user_msg) {
+        message = structured.error_subcode === 1870090
+          ? `${structured.error_user_msg} This is a one-time setup step per ad account — once accepted, retry the same request.`
+          : structured.error_user_msg;
+      }
       return {
         success: false,
-        message: error.message || 'Failed to manage custom audiences.',
+        message,
         error: error.message
       };
     }
+  }
+
+  // ENG-600: fixed EMAIL/PHONE schema for the HubSpot/CSV audience-sourcing
+  // workflows — ticket scope is email/phone seed data, not arbitrary schemas.
+  private static AUDIENCE_SOURCE_SCHEMA = ['EMAIL', 'PHONE'];
+
+  /**
+   * Hashes raw row data per Meta's Custom Audience field-normalization rules
+   * (lowercased email, digits-only phone, etc.), passing through values that
+   * are already a 64-hex-char SHA256 hash unchanged. Shared by UPLOAD_USERS
+   * (manageMetaCustomAudiences) and resolveOrCreateSeedAudience's stale-member
+   * diff, which both need identical hashing so the same contact hashes to the
+   * same row-key regardless of which path produced it.
+   */
+  private hashAudienceRows(schema: string[], rows: string[][]): string[][] {
+    return rows.map((row: string[]) => {
+      return row.map((cell: string, index: number) => {
+        const fieldType = (schema && schema[index]) ? schema[index].toUpperCase() : '';
+        let value = cell ? cell.trim() : '';
+
+        if (!value) return '';
+
+        // Pass through if already a SHA256 hash (64 hex chars)
+        if (/^[a-fA-F0-9]{64}$/.test(value)) {
+          return value;
+        }
+
+        // Normalization Rules per Meta requirements:
+        if (['EMAIL'].includes(fieldType)) {
+          value = value.toLowerCase();
+        } else if (['PHONE'].includes(fieldType)) {
+          // Standardize to digits only (strip spaces, dashes, parens)
+          value = value.toLowerCase().replace(/[^a-z0-9]/g, '');
+        } else if (['GEN'].includes(fieldType)) {
+          // Gender: 'f' or 'm'
+          value = value.toLowerCase() === 'female' ? 'f' : (value.toLowerCase() === 'male' ? 'm' : value.toLowerCase());
+        } else if (['DOBY', 'DOBM', 'DOBD'].includes(fieldType)) {
+          // Keep trimmed string
+          value = value.trim();
+        } else if (['COUNTRY'].includes(fieldType)) {
+          // Country codes must be lowercase 2-letter ISO
+          value = value.toLowerCase();
+        } else {
+          // Default: lowercase + trim
+          value = value.toLowerCase();
+        }
+
+        // Compute SHA256
+        return createHash('sha256').update(value).digest('hex');
+      });
+    });
+  }
+
+  /** Deterministic row-key for a hashed row, used to diff audience snapshots. */
+  private audienceRowKey(hashedRow: string[]): string {
+    return hashedRow.join('|');
+  }
+
+  /**
+   * Fetches and parses a CSV URL into raw rows for resolveOrCreateSeedAudience's
+   * CSV source path. Fetched exactly once and reused as both the upload
+   * payload and the basis for the stale-member hash diff — fetching twice
+   * (e.g. once to diff, once inside UPLOAD_USERS) would let the two see
+   * different content if the URL's data changed in between, corrupting the
+   * diff against what was actually uploaded.
+   */
+  private async fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
+    // Greptile finding: this is a server-side fetch of a caller-supplied URL
+    // with no destination restriction — a classic SSRF vector (cloud metadata
+    // endpoints, RFC1918/internal hosts, loopback). Reuses the repo's existing
+    // guard rather than reinventing IP-range checks.
+    //
+    // Greptile follow-up finding (DNS rebinding): validating the hostname
+    // alone isn't enough if axios then does its own SEPARATE DNS lookup to
+    // actually connect — an attacker-controlled DNS server can answer a
+    // public IP for the validation query and a private IP for the
+    // connection query. Pinning the connection to the exact address that
+    // was validated (via a custom `lookup`) eliminates the second,
+    // unvalidated lookup entirely.
+    const { address, family } = await resolvePinnedPublicAddress(csvUrl);
+    // SSRF defence-in-depth: refuse to follow redirects. Validation only
+    // covers the user-supplied URL itself; if axios followed a redirect to
+    // e.g. http://169.254.169.254/, the guard would be bypassed entirely.
+    // maxRedirects:0 makes axios surface a redirect as an error instead —
+    // same defense already used by routes/crm.ts's load-from-url path.
+    const response = await axios.get(csvUrl, {
+      maxRedirects: 0,
+      lookup: (_hostname: string, options: any, callback: any) => {
+        if (typeof options === 'function') callback = options;
+        callback(null, address, family);
+      },
+    } as any);
+    if (Array.isArray(response.data)) {
+      return response.data;
+    }
+    const str: string = typeof response.data === 'object' ? JSON.stringify(response.data) : String(response.data ?? '');
+    return parseCsv(str, { skip_empty_lines: true, trim: true, relax_column_count: true });
+  }
+
+  /**
+   * Resolves the Meta Custom Audience that a targeted/retargeting campaign
+   * workflow should target: reuse an existing audience whose name matches
+   * (case-insensitive), or create a new one. Either way, the resolved
+   * audience is (re)populated from the caller's HubSpot list or CSV source —
+   * reuse does not skip the upload, so pointing an existing audience at a
+   * fresh source keeps it current rather than silently reusing stale data.
+   *
+   * `dryRun: true` only resolves the reuse-vs-create decision (for building
+   * a pre-execution confirmation preview) without creating/uploading anything.
+   *
+   * Any hard failure (LIST/CREATE/UPLOAD_USERS erroring) is thrown, not
+   * swallowed — the caller (the two new launch* orchestration methods) must
+   * fail the whole campaign-launch rather than attach an empty/broken audience.
+   * Only non-fatal source-side issues (e.g. contacts with no email/phone) are
+   * returned in `failures`.
+   */
+  private async resolveOrCreateSeedAudience(
+    userId: string,
+    accountId: string,
+    audienceName: string,
+    source: { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string },
+    opts: { dryRun: boolean }
+  ): Promise<{
+    plannedAction: 'reuse' | 'create';
+    audience?: { id: string; name: string };
+    created: boolean;
+    sourceSummary: string;
+    failures: string[];
+    recordsFound?: number;
+    recordsUsable?: number;
+  }> {
+    const listResult = await this.manageMetaCustomAudiences(userId, 'LIST', accountId, {});
+    if (!listResult.success) {
+      throw new Error(listResult.message || 'Failed to list existing Meta custom audiences.');
+    }
+    const existing = (listResult.audiences || []).find(
+      (a: any) => String(a?.name ?? '').toLowerCase() === audienceName.toLowerCase()
+    );
+    const plannedAction: 'reuse' | 'create' = existing ? 'reuse' : 'create';
+    const sourceSummary = source.type === 'hubspot_list'
+      ? `HubSpot list ${source.listId}`
+      : `CSV upload (${source.csvUrl})`;
+
+    if (opts.dryRun) {
+      return {
+        plannedAction,
+        audience: existing ? { id: existing.id, name: existing.name } : undefined,
+        created: false,
+        sourceSummary,
+        failures: [],
+      };
+    }
+
+    const failures: string[] = [];
+    let schema: string[] = AgentModeService.AUDIENCE_SOURCE_SCHEMA;
+    let payload: string[][];
+    let recordsFound: number | undefined;
+    let recordsUsable: number | undefined;
+
+    if (source.type === 'hubspot_list') {
+      const hubspotSvc = await this.resolveHubSpotService(userId, source.hubspotAccountId);
+      const { contacts, failedChunkContactCount } = await hubspotSvc.getContactsForList(source.listId);
+      const rows: string[][] = [];
+      let skipped = 0;
+      for (const c of contacts) {
+        if (c.email || c.phone) {
+          rows.push([c.email || '', c.phone || '']);
+        } else {
+          skipped++;
+        }
+      }
+      const totalFound = contacts.length + failedChunkContactCount;
+      if (skipped > 0) {
+        failures.push(`${skipped} of ${contacts.length} HubSpot contacts had neither email nor phone, skipped.`);
+      }
+      // Greptile P1 finding: a failed batch/read chunk was previously silently
+      // dropped, then (after an earlier fix) merely reported as a non-fatal
+      // ledger entry while the campaign still launched against a known-
+      // incomplete audience. A HubSpot read failure means we cannot say what
+      // the correct audience actually is, so this now blocks the whole launch
+      // rather than proceeding on a partial/wrong segment — the caller must
+      // retry once HubSpot is reachable again.
+      if (failedChunkContactCount > 0) {
+        throw new Error(`${failedChunkContactCount} of ${totalFound} HubSpot contacts could not be read (batch/read failure) — refusing to launch against a known-incomplete audience. Retry once HubSpot is reachable again.`);
+      }
+      payload = rows;
+      recordsFound = totalFound;
+      recordsUsable = rows.length;
+    } else {
+      // Fetched/parsed once here (not left as a URL for UPLOAD_USERS to fetch
+      // separately) — a second independent fetch would let the stale-member
+      // diff and the actual upload see two different snapshots of the same
+      // URL if its content changed in between, corrupting the diff. One fetch
+      // is also the source of truth for both the hash diff and the upload.
+      payload = await this.fetchAndParseCsvRows(source.csvUrl);
+    }
+
+    let audienceId: string;
+    let audienceLabel: string;
+    if (plannedAction === 'create') {
+      const createResult = await this.manageMetaCustomAudiences(userId, 'CREATE', accountId, {
+        name: audienceName,
+        subtype: 'CUSTOM',
+        customer_file_source: 'USER_PROVIDED_ONLY',
+        confirm: true,
+      });
+      if (!createResult.success) {
+        throw new Error(createResult.message || 'Failed to create Meta custom audience.');
+      }
+      audienceId = createResult.audience.id;
+      audienceLabel = createResult.audience.name;
+    } else {
+      audienceId = existing.id;
+      audienceLabel = existing.name;
+    }
+
+    // Greptile P1 finding: reusing an existing audience for a fresh source
+    // upload never removed members no longer present in the new source — a
+    // contact removed from the HubSpot list (or dropped from a refreshed CSV)
+    // stayed in the Meta audience forever. Diff the current source's hashed
+    // rows against the last-synced snapshot and remove anything stale before
+    // uploading the new set. Only meaningful on reuse — a brand-new audience
+    // has no prior snapshot to diff against.
+    const hashedRows = this.hashAudienceRows(schema, payload);
+    const newRowKeys = hashedRows.map((row) => this.audienceRowKey(row));
+
+    // Greptile P1 finding: a failed DELETE_USERS must not be forgotten. If the
+    // snapshot saved below only reflected the current source (newRowKeys), a
+    // stale member whose removal failed would simply disappear from tracking
+    // — the next sync would see no prior record of it and never retry the
+    // removal, leaving it targetable in Meta permanently. Un-removed keys are
+    // folded back into what gets saved so the next sync sees them as stale
+    // again and retries. Greptile follow-up: a failed removal must not just
+    // be tracked for next time — it means this launch would proceed against
+    // an audience known to still contain removed contacts, so it now blocks
+    // the whole launch (thrown), consistent with every other hard-failure
+    // step here (LIST/CREATE/UPLOAD_USERS/snapshot save).
+    // Greptile finding: reusing an audience with NO prior snapshot (first
+    // sync since stale-member sync shipped, or an audience created outside
+    // this flow) had no baseline to diff against, so add-only uploads could
+    // never remove any pre-existing members not in the current source — they
+    // stayed forever. Tracked here so the write below uses Meta's atomic
+    // usersreplace instead of an add-only upload in exactly this case; once a
+    // snapshot exists, reuse goes back to the normal diff-and-delete-then-add
+    // path (cheaper, and avoids replacing the whole set every sync).
+    let noBaselineReuse = false;
+    if (plannedAction === 'reuse') {
+      // Greptile finding: a snapshot READ failure was previously swallowed
+      // as non-fatal, leaving noBaselineReuse false — which fell through to
+      // an add-only upload against unknown state (we can't tell "no prior
+      // snapshot" from "couldn't read it"), the same "launch against
+      // unreconciled data" problem as the other blocking fixes here. A
+      // genuine infra failure still propagates and blocks below, same as
+      // ever.
+      //
+      // Greptile follow-up finding: a CORRUPTED snapshot (malformed index or
+      // chunk) threw the exact same generic error, permanently blocking
+      // every future launch for that audience — unlike a transient outage,
+      // corruption never resolves itself on retry. Treated the same as "no
+      // baseline exists": falls through to the self-healing REPLACE_USERS
+      // path below (never proceeds with the untrustworthy incomplete
+      // baseline) and a fresh, uncorrupted snapshot gets saved right after,
+      // fixing the corruption for good.
+      let previousRowKeys: string[] | null;
+      try {
+        previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
+      } catch (e) {
+        if (e instanceof CorruptSnapshotError) {
+          console.error(`AgentMode: Corrupt audience snapshot for ${audienceId}, treating as no baseline:`, e);
+          previousRowKeys = null;
+        } else {
+          throw e;
+        }
+      }
+      if (previousRowKeys) {
+        const currentKeySet = new Set(newRowKeys);
+        const staleRowKeys = previousRowKeys.filter((k) => !currentKeySet.has(k));
+        if (staleRowKeys.length > 0) {
+          const staleRows = staleRowKeys.map((k) => k.split('|'));
+          const deleteResult = await this.manageMetaCustomAudiences(userId, 'DELETE_USERS', accountId, {
+            id: audienceId,
+            schema,
+            payload: staleRows,
+            confirm: true,
+          });
+          if (!deleteResult.success) {
+            throw new Error(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
+          }
+        }
+      } else {
+        noBaselineReuse = true;
+      }
+    }
+
+    // Greptile finding: saving the snapshot AFTER the Meta upload meant a
+    // save failure left a successfully-uploaded member with NO record in
+    // any snapshot, ever — future diffs can only flag a member as stale by
+    // comparing against a PRIOR snapshot that recorded it, so an untracked-
+    // from-birth member could never be detected as no-longer-needed and
+    // would stay targetable in Meta forever. Additive UPLOAD_USERS is
+    // idempotent (a future sync just re-sends whatever's in the current
+    // source, self-healing a "snapshot updated, upload not yet retried"
+    // mismatch) but deletes are NOT (they depend entirely on snapshot
+    // history) — so for that path, the snapshot is saved BEFORE uploading.
+    //
+    // Greptile follow-up finding: REPLACE_USERS (the no-baseline reuse path)
+    // is the OPPOSITE case — saving before it has the mirror problem: if
+    // REPLACE_USERS then fails, the snapshot now falsely looks like an
+    // established baseline exists, so a retry switches to additive
+    // UPLOAD_USERS instead of retrying REPLACE_USERS, and pre-existing
+    // members that should have been wiped by the replace are never removed.
+    // REPLACE_USERS doesn't need the save-before reorder at all — it's
+    // fully idempotent regardless of tracking history (always sets Meta's
+    // membership to exactly the payload), so retrying it after ANY failure
+    // — including one where the snapshot save is what actually failed — is
+    // always correct. Save stays AFTER for this path, as originally.
+    if (!noBaselineReuse) {
+      await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
+    }
+
+    const uploadResult = await this.manageMetaCustomAudiences(userId, noBaselineReuse ? 'REPLACE_USERS' : 'UPLOAD_USERS', accountId, {
+      id: audienceId,
+      schema,
+      payload,
+      confirm: true,
+    });
+    if (!uploadResult.success) {
+      throw new Error(uploadResult.message || (noBaselineReuse ? 'Failed to replace users in Meta custom audience.' : 'Failed to upload users to Meta custom audience.'));
+    }
+
+    if (noBaselineReuse) {
+      await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
+    }
+
+    return {
+      plannedAction,
+      audience: { id: audienceId, name: audienceLabel },
+      created: plannedAction === 'create',
+      sourceSummary,
+      failures,
+      recordsFound,
+      recordsUsable,
+    };
+  }
+
+  /**
+   * Builds the human-readable preview shown before launching a targeted-audience
+   * or retargeting campaign, so the user always sees and confirms the resolved
+   * audience reuse/create decision before anything is created/uploaded — per
+   * ENG-600 product decision, name-collision reuse is never silent.
+   */
+  private buildAudienceCampaignConfirmationSummary(
+    workflow: 'targeted_audience' | 'retargeting',
+    args: any,
+    plan: { plannedAction: 'reuse' | 'create'; audience?: { id: string; name: string }; sourceSummary: string }
+  ): string {
+    const lines: string[] = [];
+    lines.push(
+      `${plan.plannedAction === 'reuse' ? 'Reuse existing' : 'Create a NEW'} Custom Audience "${args.audience_name}"` +
+      `${plan.audience ? ` (${plan.audience.id})` : ''}, sourced from ${plan.sourceSummary}.`
+    );
+    if (args.use_lookalike) {
+      lines.push(`Create a Lookalike Audience (ratio ${args.lookalike_ratio}, country ${args.lookalike_country}) from that seed.`);
+    }
+    lines.push(`Attach it to a NEW ad set under campaign ${args.campaign_id} (ad account ${args.account_id}).`);
+    if (workflow === 'retargeting') {
+      lines.push(`Exclude custom audience ${args.exclude_audience_id} so retargeting spend does not overlap the broad/prospecting audience.`);
+    }
+    // Greptile P1 finding: createMetaAdsAdSet silently strips daily_budget/
+    // lifetime_budget when the target campaign has Advantage Campaign Budget
+    // (CBO) enabled — a caller-supplied budget is only preview_token-bound by
+    // this confirm gate, not guaranteed to actually apply. Disclose the risk
+    // up front rather than let the user believe a specific budget is locked
+    // in by confirming.
+    if (args.ad_set_params?.daily_budget != null || args.ad_set_params?.lifetime_budget != null) {
+      lines.push(`Note: if campaign ${args.campaign_id} has Advantage Campaign Budget (CBO) enabled, Meta requires budget to be set at the campaign level — the daily/lifetime budget above will be silently dropped from the ad set in that case.`);
+    }
+    return lines.join(' ');
+  }
+
+  /**
+   * Deterministic JSON serialization with object keys sorted recursively, so
+   * two structurally-equal objects compare equal regardless of key order —
+   * unlike plain JSON.stringify, which is order-sensitive. Used by
+   * executeAudienceCampaignLaunch's ad-set reuse-by-match check to compare
+   * a requested targeting object against Meta's returned representation.
+   */
+  private canonicalJSON(value: any): string {
+    const sortKeys = (v: any): any => {
+      if (Array.isArray(v)) return v.map(sortKeys);
+      if (v && typeof v === 'object') {
+        return Object.keys(v).sort().reduce((acc: any, k: string) => {
+          acc[k] = sortKeys(v[k]);
+          return acc;
+        }, {});
+      }
+      return v;
+    };
+    return JSON.stringify(sortKeys(value ?? {}));
+  }
+
+  /**
+   * Live-test finding (real Meta, ENG-600): a full canonicalJSON deep-equal
+   * of a requested `targeting` object against Meta's returned representation
+   * never matches, even for a byte-identical retry — Meta injects its own
+   * defaults on read that we never sent (e.g. age_min/age_max/
+   * user_age_unknown/targeting_relaxation_types at the top level, and
+   * location_types nested inside geo_locations), and echoes back extra
+   * fields on objects we DID send (e.g. custom_audiences[].name). Strict
+   * equality treated every one of those as a real difference and reuse never
+   * triggered. This instead checks that every key/value WE explicitly
+   * requested is present in Meta's stored value, ignoring any extra keys
+   * Meta added — Meta-injected defaults no longer block a legitimate reuse
+   * match, while any actual difference in a field we requested still does.
+   */
+  private isDeepSubset(requested: any, actual: any): boolean {
+    if (requested === null || typeof requested !== 'object') return requested === actual;
+    if (Array.isArray(requested)) {
+      if (!Array.isArray(actual) || requested.length !== actual.length) return false;
+      return requested.every((item, i) => this.isDeepSubset(item, actual[i]));
+    }
+    if (actual === null || typeof actual !== 'object') return false;
+    return Object.keys(requested).every((key) => this.isDeepSubset(requested[key], actual[key]));
+  }
+
+  /**
+   * Greptile finding (PR #2234): confirm=true wasn't bound to what was
+   * actually previewed — a model could set confirm=true on the very first
+   * call (skipping the preview entirely) or change arguments between the
+   * preview and confirm calls, and the tool would execute on the unverified/
+   * changed arguments with no way to detect it. This computes a digest over
+   * every argument that defines WHAT gets created/changed; launchAudienceCampaign
+   * only treats a call as genuinely confirmed when args.preview_token matches
+   * the digest recomputed from the CURRENT args — so a first-call confirm=true
+   * (no token yet) or a changed argument after preview both fail the check
+   * and fall back into a fresh preview instead of executing.
+   *
+   * Greptile follow-up finding: a plain hash of the args is NOT sufficient —
+   * it's a pure function of caller-supplied data with no server secret, so
+   * any caller (including the model itself) can independently compute the
+   * exact same value and pass confirm=true on the very first call, without
+   * ever having gone through an actual preview. HMAC-signing with the
+   * server-only JWT secret (never exposed to the model/caller) makes the
+   * token non-forgeable: only a value this method itself produced can match.
+   */
+  private computeAudienceCampaignArgsDigest(args: any): string {
+    const canonical = {
+      account_id: args.account_id,
+      campaign_id: args.campaign_id,
+      audience_name: args.audience_name,
+      audience_source: args.audience_source,
+      use_lookalike: !!args.use_lookalike,
+      lookalike_ratio: args.lookalike_ratio,
+      lookalike_country: args.lookalike_country,
+      exclude_audience_id: args.exclude_audience_id,
+      ad_set_params: args.ad_set_params,
+    };
+    return createHmac('sha256', getJwtSecret()).update(JSON.stringify(canonical)).digest('hex');
+  }
+
+  /**
+   * Resolves args.audience_source into the discriminated union
+   * resolveOrCreateSeedAudience expects. Throws if neither or both of
+   * hubspot_list_id/csv_url are provided.
+   */
+  private resolveAudienceSourceArg(audience_source: any): { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string } {
+    const hasHubSpot = !!audience_source?.hubspot_list_id;
+    const hasCsv = !!audience_source?.csv_url;
+    if (hasHubSpot === hasCsv) {
+      throw new Error('audience_source must include exactly one of hubspot_list_id or csv_url.');
+    }
+    return hasHubSpot
+      ? { type: 'hubspot_list', listId: audience_source.hubspot_list_id, hubspotAccountId: audience_source.hubspot_account_id }
+      : { type: 'csv', csvUrl: audience_source.csv_url };
+  }
+
+  /**
+   * Shared implementation for launchTargetedAudienceCampaign / launchRetargetingCampaign
+   * (ENG-600). Sources or reuses a Meta Custom Audience from a HubSpot list or CSV,
+   * optionally creates a Lookalike from it, attaches it to a new ad set under an
+   * existing campaign, and returns a completion ledger. Uses the same 2-phase
+   * preview/confirm gate as call_meta_marketing_api's write actions
+   * (buildMetaWriteConfirmation) — collectConfirmationPrompt halts the turn on any
+   * result with awaitingUserConfirmation===true, regardless of which method produced it.
+   */
+  private async launchAudienceCampaign(
+    userId: string,
+    args: any,
+    workflow: 'targeted_audience' | 'retargeting'
+  ): Promise<any> {
+    try {
+      assertMetaAccountAllowed(args.account_id);
+
+      if (workflow === 'retargeting' && !args.exclude_audience_id) {
+        throw new Error('exclude_audience_id is required for the retargeting workflow.');
+      }
+      if (args.use_lookalike) {
+        if (args.lookalike_ratio === undefined || args.lookalike_ratio === null) {
+          throw new Error('lookalike_ratio is required when use_lookalike is true (0.01-0.20). No default is applied.');
+        }
+        if (!args.lookalike_country) {
+          throw new Error('lookalike_country is required when use_lookalike is true (2-letter ISO country code). No default is applied.');
+        }
+      }
+
+      const source = this.resolveAudienceSourceArg(args.audience_source);
+      const expectedPreviewToken = this.computeAudienceCampaignArgsDigest(args);
+      const confirmAttempted = args.confirm === true;
+      const tokenValid = args.preview_token === expectedPreviewToken;
+      const tokenMatches = confirmAttempted && tokenValid;
+      // Greptile P1 findings: (1) an HMAC-valid token was never consumed/
+      // invalidated after use — replaying the exact same confirmed call would
+      // silently re-execute (e.g. create a second ad set under the same
+      // campaign) with no new user confirmation; (2) a separate check-then-mark
+      // is non-atomic — two concurrent requests with the same valid token
+      // could both read "not yet consumed" before either write became
+      // visible. claimPreviewToken closes both: a single conditional DynamoDB
+      // put lets only one caller ever win the claim, so "confirmed" here means
+      // this exact call atomically claimed the token, not merely that the
+      // token matches.
+      const claimed = tokenMatches ? await claimPreviewToken(userId, args.preview_token) : false;
+      const alreadyConsumed = tokenMatches && !claimed;
+      const confirmed = claimed;
+
+      if (!confirmed) {
+        const plan = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: true });
+        const summary = this.buildAudienceCampaignConfirmationSummary(workflow, args, plan);
+        // Distinguish "first preview, nothing attempted yet" from "confirm was
+        // attempted but the token was missing/stale" from "confirm was
+        // attempted with a token that was already used once" — each needs a
+        // different explanation for why this falls back to a fresh preview.
+        const staleNotice = alreadyConsumed
+          ? 'This confirmation token was already used for a previous launch and cannot be reused — here is a fresh plan to confirm again. '
+          : confirmAttempted
+          ? 'The confirmation token was missing or no longer matches these arguments (they may have changed since the last preview), so this cannot execute yet — here is the CURRENT plan to confirm instead. '
+          : '';
+        return {
+          success: true,
+          requiresConfirmation: true,
+          awaitingUserConfirmation: true,
+          summary,
+          previewToken: expectedPreviewToken,
+          confirmationPrompt:
+            `${staleNotice}Based on your request, here's the ${workflow === 'retargeting' ? 'retargeting' : 'targeted-audience'} campaign ` +
+            `I'm about to launch — please check it's correct before I proceed:\n\n${summary}\n\n` +
+            `Reply "yes" / "confirm" if this is correct, or tell me what to change.`,
+          confirmationDetail: summary,
+          message: `${staleNotice}Confirm this ${workflow} campaign launch before it runs: ${summary} Show the user the plan above ` +
+            `and get explicit approval. Once approved, call this tool again with the EXACT SAME arguments plus confirm=true ` +
+            `and preview_token="${expectedPreviewToken}" (copy it verbatim from this response — it will not match if you retype it or change any argument).`,
+        };
+      }
+
+      // Greptile finding: once claimed, a failure anywhere below (reconciliation,
+      // lookalike, ad-set creation) left the token permanently consumed — since
+      // the digest is deterministic given the same args, re-previewing
+      // unchanged arguments produces the SAME token, already claimed forever,
+      // so the user could never retry the exact approved arguments. Releasing
+      // the claim on failure lets a legitimate retry work, while the atomic
+      // claim above still fully prevents concurrent double-execution.
+      try {
+        const result = await this.executeAudienceCampaignLaunch(userId, args, workflow, source);
+        // Greptile follow-up finding: without marking a successful launch's
+        // token permanently consumed, the staleness override added for
+        // failed-release retries also let a genuinely completed launch's
+        // token be reclaimed and replayed after the staleness window.
+        //
+        // Greptile finding: a failure from THIS write must not be treated as
+        // a launch failure — the external Meta mutations already completed
+        // by this point. Letting it propagate into the catch below via
+        // `throw` would report the completed launch as failed to the
+        // caller, which is wrong regardless of what happens to the token.
+        //
+        // Greptile follow-up finding: after markPreviewTokenSucceeded
+        // exhausts its own retries, silently leaving the claim dangling
+        // "in_progress" made it reclaimable — and therefore replayable —
+        // after the staleness window, with no bound on when that happens.
+        // Explicitly releasing the claim here (same best-effort delete
+        // releasePreviewToken already uses on a real failure) closes that
+        // limbo state immediately instead of leaving it to staleness. This
+        // is safe specifically because a resulting retry re-enters
+        // executeAudienceCampaignLaunch's reuse-by-match logic (audience
+        // name-match, lookalike spec-match, ad-set full-config-match — all
+        // live-verified against real Meta) rather than a bare unconditional
+        // re-execution: it finds and reuses the campaign/lookalike/ad set
+        // this call already created instead of duplicating them, so the
+        // worst case is a wasted extra LIST-and-compare pass, not duplicate
+        // spend.
+        try {
+          await markPreviewTokenSucceeded(userId, args.preview_token);
+        } catch (markError) {
+          console.error('AgentMode: Failed to mark audience-campaign preview token as succeeded (launch itself succeeded) — releasing the claim so a retry can safely reuse the already-created resources:', markError);
+          await releasePreviewToken(userId, args.preview_token);
+        }
+        return result;
+      } catch (e) {
+        await releasePreviewToken(userId, args.preview_token);
+        throw e;
+      }
+    } catch (error: any) {
+      return {
+        success: false,
+        workflow,
+        ledger: { failures: [{ step: 'launch', message: error.message }] },
+        message: error.message || `Failed to launch ${workflow} campaign.`,
+      };
+    }
+  }
+
+  private async executeAudienceCampaignLaunch(
+    userId: string,
+    args: any,
+    workflow: 'targeted_audience' | 'retargeting',
+    source: { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string }
+  ): Promise<any> {
+      const seed = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: false });
+
+      let attachAudienceId = seed.audience!.id;
+      let lookalike: { id: string; name: string; ratio: number; country: string } | null = null;
+      if (args.use_lookalike) {
+        // Greptile finding: releasing the confirm token on a downstream
+        // failure (e.g. ad-set creation) lets a legitimate retry reuse the
+        // same approved args — but CREATE isn't idempotent by name, so an
+        // unconditional retry after a lookalike had already been created
+        // would create ANOTHER same-named lookalike, leaving a duplicate
+        // Meta resource from a single confirmation. Reuse-by-exact-name-match
+        // first, same pattern the seed audience already uses.
+        const lookalikeName = `${args.audience_name} - Lookalike`;
+        const lookalikeListResult = await this.manageMetaCustomAudiences(userId, 'LIST', args.account_id, {});
+        if (!lookalikeListResult.success) {
+          throw new Error(lookalikeListResult.message || 'Failed to list existing Meta custom audiences.');
+        }
+        // Greptile follow-up findings: name-only matching isn't enough — a
+        // same-named lookalike from an earlier launch with a DIFFERENT
+        // ratio/country/seed audience (a deliberate new request, not a
+        // retry — the confirm-token digest already includes ratio/country
+        // and the source, so reaching here with a genuinely different
+        // digest means a fresh, separately confirmed launch) must not be
+        // silently reused. The campaign would target the old population
+        // while the ledger reports the newly requested spec. Requires the
+        // existing audience's actual spec — including its origin seed
+        // audience, not just ratio/country — to also match, not just its
+        // name.
+        const existingLookalike = (lookalikeListResult.audiences || []).find((a: any) => {
+          const origin = a?.lookalike_spec?.origin;
+          const originId = Array.isArray(origin) ? origin[0]?.id : origin?.id;
+          return (
+            String(a?.name ?? '').toLowerCase() === lookalikeName.toLowerCase() &&
+            a?.lookalike_spec?.ratio === args.lookalike_ratio &&
+            a?.lookalike_spec?.country === args.lookalike_country &&
+            originId === seed.audience!.id
+          );
+        });
+        let lookalikeAudience: { id: string; name: string };
+        if (existingLookalike) {
+          lookalikeAudience = { id: existingLookalike.id, name: existingLookalike.name };
+        } else {
+          const lookalikeResult = await this.manageMetaCustomAudiences(userId, 'CREATE', args.account_id, {
+            name: lookalikeName,
+            subtype: 'LOOKALIKE',
+            lookalike_spec: {
+              origin: [{ id: seed.audience!.id, type: 'custom_audience' }],
+              ratio: args.lookalike_ratio,
+              country: args.lookalike_country,
+            },
+            confirm: true,
+          });
+          if (!lookalikeResult.success) {
+            throw new Error(lookalikeResult.message || 'Failed to create Lookalike Audience.');
+          }
+          lookalikeAudience = lookalikeResult.audience;
+        }
+        attachAudienceId = lookalikeAudience.id;
+        lookalike = {
+          id: lookalikeAudience.id,
+          name: lookalikeAudience.name,
+          ratio: args.lookalike_ratio,
+          country: args.lookalike_country,
+        };
+      }
+
+      const targeting: any = {
+        ...(args.ad_set_params?.targeting || {}),
+        custom_audiences: [{ id: attachAudienceId }],
+      };
+      if (workflow === 'retargeting') {
+        targeting.excluded_custom_audiences = [{ id: args.exclude_audience_id }];
+      }
+      // Greptile finding: createMetaAdsAdSet defaults targeting_automation.
+      // advantage_audience to 0 when the caller didn't set it (Meta requires
+      // this field explicitly). It does this on its OWN local copy of
+      // targeting, not the object passed in — so without applying the same
+      // default here, comparing this `targeting` object against what Meta
+      // actually stored (and returns via LIST) would always see a spurious
+      // difference and never reuse, even for an identical retry.
+      if (!targeting.targeting_automation || targeting.targeting_automation.advantage_audience === undefined) {
+        targeting.targeting_automation = {
+          ...(targeting.targeting_automation || {}),
+          advantage_audience: 0,
+        };
+      }
+
+      // Greptile finding: releasing the confirm token on a downstream
+      // failure (e.g. Meta's ad-set-creation response lost/timed out even
+      // though the write actually completed) lets a legitimate retry reuse
+      // the same approved args — but createMetaAdsAdSet has no idempotency
+      // of its own, so an unconditional retry would create a SECOND ad set,
+      // duplicating delivery and spend from a single confirmation. Reuse an
+      // existing same-named ad set targeting the same audience under this
+      // campaign first, same reuse-by-match pattern as the lookalike fix.
+      const adSetName = args.ad_set_params?.name;
+      const existingAdSetsResult = await this.listMetaAdsAdSets(userId, args.campaign_id, args.account_id);
+      if (!existingAdSetsResult.success) {
+        throw new Error(existingAdSetsResult.message || 'Failed to list existing Meta ad sets.');
+      }
+      // Greptile follow-up findings: name + targeted-audience alone isn't
+      // enough — a same-named ad set targeting the same audience but with
+      // ANY different delivery knob (budget, schedule, optimization goal,
+      // billing event, bid strategy, destination type, promoted object, or
+      // — for retargeting — excluded audience, which lives inside
+      // `targeting`) must not be silently reused. The launch would report
+      // success while actually applying the OLD delivery configuration
+      // instead of the one the user just confirmed. Rather than keep
+      // special-casing individual fields one Greptile pass at a time,
+      // compares every field this method can even set on an ad set
+      // (mirroring metaService's own AD_SET_READ_FIELDS list) generically —
+      // any explicitly-requested field that differs from the existing ad
+      // set's actual value blocks reuse.
+      //
+      // Greptile follow-up finding: comparing RAW requested values against
+      // Meta's read-back values defeated reuse for the exact retry case this
+      // exists to handle — createMetaAdsAdSet normalizes daily_budget/
+      // lifetime_budget/bid_amount to cents (×100) and defaults bid_strategy/
+      // destination_type when unset before calling Meta, so an identical
+      // retry's RAW args never matched the normalized values Meta actually
+      // stored. Applies the same normalization here before comparing.
+      //
+      // Greptile follow-up finding: two more createMetaAdsAdSet transforms
+      // weren't mirrored — (1) daily_budget/lifetime_budget are stripped
+      // entirely (not just left unconverted) when the campaign has
+      // Advantage Campaign Budget (CBO), so a CBO retry's requested budget
+      // must also normalize to "no budget" for comparison; (2) start_time is
+      // auto-set to "now" at creation time for an ACTIVE ad set with no
+      // explicit start_time — a value that can never be reproduced on a
+      // later retry, so start_time is excluded from the comparison
+      // entirely in exactly that case (any existing ACTIVE match on every
+      // other field is accepted regardless of its actual start_time).
+      const campaign = await this.getCampaignForAdSetReuseCheck(userId, args.account_id, args.campaign_id);
+      const campaignHasBudget = !!(campaign?.daily_budget || campaign?.lifetime_budget);
+
+      const toCentsForComparison = (val: number | undefined) => val !== undefined ? Math.round(val * 100) : undefined;
+      const resolvedBidStrategy = args.ad_set_params?.bid_strategy || 'LOWEST_COST_WITHOUT_CAP';
+      const resolvedDestinationType = args.ad_set_params?.destination_type === undefined &&
+        META_WEBSITE_OPTIMIZATION_GOALS.includes(args.ad_set_params?.optimization_goal)
+        ? 'WEBSITE'
+        : args.ad_set_params?.destination_type;
+      const normalizedRequestedAdSetParams: Record<string, any> = {
+        ...args.ad_set_params,
+        daily_budget: campaignHasBudget ? undefined : toCentsForComparison(args.ad_set_params?.daily_budget),
+        lifetime_budget: campaignHasBudget ? undefined : toCentsForComparison(args.ad_set_params?.lifetime_budget),
+        bid_amount: toCentsForComparison(args.ad_set_params?.bid_amount),
+        bid_strategy: resolvedBidStrategy,
+        destination_type: resolvedDestinationType,
+      };
+      const startTimeIsUnreproducibleAutoFill = args.ad_set_params?.status === 'ACTIVE' && args.ad_set_params?.start_time === undefined;
+      const AD_SET_REUSE_MATCH_FIELDS = (
+        [
+          'daily_budget', 'lifetime_budget', 'start_time', 'end_time',
+          'optimization_goal', 'billing_event', 'bid_strategy', 'bid_amount',
+          'destination_type', 'promoted_object', 'status',
+        ] as const
+      ).filter((field) => field !== 'start_time' || !startTimeIsUnreproducibleAutoFill);
+      // Live-test finding against real Meta: the Graph API returns budget/bid
+      // fields as STRINGS ("500"), while our normalized requested values are
+      // numbers (500) — a strict canonicalJSON compare treated every
+      // legitimate retry as a mismatch purely from JSON type, never numeric
+      // value. Coerce these specific numeric-typed fields before comparing.
+      const NUMERIC_AD_SET_FIELDS = new Set(['daily_budget', 'lifetime_budget', 'bid_amount']);
+      const existingAdSet = (existingAdSetsResult.adSets || []).find((as: any) => {
+        if (String(as?.name ?? '').toLowerCase() !== String(adSetName ?? '').toLowerCase()) return false;
+        if (!this.isDeepSubset(targeting, as?.targeting)) return false;
+        for (const field of AD_SET_REUSE_MATCH_FIELDS) {
+          const requested = normalizedRequestedAdSetParams[field];
+          if (requested === undefined) continue; // not explicitly requested — don't require a match on it
+          let actual = as?.[field] ?? null;
+          if (NUMERIC_AD_SET_FIELDS.has(field) && actual !== null) actual = Number(actual);
+          if (this.canonicalJSON(actual) !== this.canonicalJSON(requested)) return false;
+        }
+        return true;
+      });
+
+      let adSet: { id: string; name: string };
+      if (existingAdSet) {
+        adSet = { id: existingAdSet.id, name: existingAdSet.name };
+      } else {
+        const adSetResult = await this.createMetaAdsAdSet(userId, {
+          ...args.ad_set_params,
+          account_id: args.account_id,
+          campaign_id: args.campaign_id,
+          targeting,
+        });
+        if (!adSetResult.success) {
+          throw new Error(adSetResult.message || 'Failed to create ad set.');
+        }
+        adSet = adSetResult.adSet;
+      }
+
+      const ledger = {
+        source: {
+          type: source.type,
+          identifier: source.type === 'hubspot_list' ? source.listId : source.csvUrl,
+          recordsFound: seed.recordsFound,
+          recordsUsable: seed.recordsUsable,
+        },
+        audience: { id: seed.audience!.id, name: seed.audience!.name, created: seed.created, subtype: 'CUSTOM' as const },
+        lookalike,
+        campaign: { id: args.campaign_id },
+        adSet: {
+          id: adSet.id,
+          name: adSet.name,
+          targetedAudienceId: attachAudienceId,
+          excludedAudienceId: workflow === 'retargeting' ? args.exclude_audience_id : undefined,
+        },
+        failures: seed.failures.map((message: string) => ({ step: 'seed_audience_source', message })),
+      };
+
+      return {
+        success: true,
+        workflow,
+        ledger,
+        message: `Launched ${workflow} campaign: audience "${ledger.audience.name}" (${seed.created ? 'created' : 'reused'})` +
+          `${lookalike ? `, lookalike "${lookalike.name}"` : ''} attached to ad set "${ledger.adSet.name}".`,
+      };
+  }
+
+  /**
+   * ENG-600: sources/reuses a Meta Custom Audience from a HubSpot list or CSV,
+   * optionally builds a Lookalike from it, and attaches it to a new ad set under
+   * an existing "targeted" campaign kept separate from any broad/control campaign.
+   */
+  public async launchTargetedAudienceCampaign(userId: string, args: any): Promise<any> {
+    return this.launchAudienceCampaign(userId, args, 'targeted_audience');
+  }
+
+  /**
+   * ENG-600: same audience-sourcing path as launchTargetedAudienceCampaign, but
+   * requires exclude_audience_id (typically the broad/prospecting audience) so
+   * retargeting spend structurally never overlaps prospecting spend.
+   */
+  public async launchRetargetingCampaign(userId: string, args: any): Promise<any> {
+    return this.launchAudienceCampaign(userId, args, 'retargeting');
   }
 
   /**

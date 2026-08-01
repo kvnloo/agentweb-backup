@@ -224,10 +224,19 @@ describe('MetaService', () => {
 
             const result = await service.createAdSet(mockAdAccountId, mockAccessToken, params);
 
-            expect(mockCreateAdSet).toHaveBeenCalledWith([], expect.objectContaining({
-                name: 'New Ad Set',
-                campaign_id: 'camp_123',
-            }));
+            // ENG-600 live-test finding: requesting zero fields back means Meta's
+            // real create response only echoes {id} — every caller that reads
+            // adSet.name off the result (e.g. the success message string) got
+            // literal "undefined" against the live API, even though mocked tests
+            // never caught it (the mock always returns the full object regardless
+            // of what fields were requested).
+            expect(mockCreateAdSet).toHaveBeenCalledWith(
+                expect.arrayContaining(['id', 'name']),
+                expect.objectContaining({
+                    name: 'New Ad Set',
+                    campaign_id: 'camp_123',
+                })
+            );
             expect(result).toEqual(mockAdSetData);
         });
 
@@ -247,7 +256,7 @@ describe('MetaService', () => {
                 destination_type: 'WEBSITE',
             });
 
-            expect(mockCreateAdSet).toHaveBeenCalledWith([], expect.objectContaining({ destination_type: 'WEBSITE' }));
+            expect(mockCreateAdSet.mock.calls[0][1]).toEqual(expect.objectContaining({ destination_type: 'WEBSITE' }));
         });
 
         it('omits destination_type from the payload when not provided (ENG-415)', async () => {
@@ -700,7 +709,7 @@ describe('MetaService', () => {
 
             const result = await service.createCustomAudience(mockAdAccountId, mockAccessToken, params);
 
-            expect(mockCreateCustomAudience).toHaveBeenCalledWith([], expect.objectContaining({
+            expect(mockCreateCustomAudience).toHaveBeenCalledWith(expect.arrayContaining(['id', 'name']), expect.objectContaining({
                 name: 'My Custom Audience',
                 subtype: 'CUSTOM',
                 customer_file_source: 'USER_PROVIDED_ONLY',
@@ -708,7 +717,14 @@ describe('MetaService', () => {
             expect(result).toEqual(mockAudienceData);
         });
 
-        it('should create a lookalike audience', async () => {
+        // ENG-600 live-test finding: Meta's current (v25) create API rejects
+        // lookalike_spec.origin entirely — "(#2654) ... No custom_audience ID
+        // given for lookalike cluster" — even with a well-formed
+        // {id, type: 'custom_audience'} entry. Per Meta's Lookalike Audiences
+        // guide, the seed is supplied via a separate top-level
+        // origin_audience_id param; lookalike_spec itself only carries
+        // type/country/ratio (origin only ever appears in READ responses).
+        it('translates lookalike_spec.origin into a top-level origin_audience_id (Meta v25 create shape)', async () => {
             const mockAudienceData = { id: 'audience_lookalike', name: 'Lookalike Audience' };
             const mockCreateCustomAudience = jest.fn().mockResolvedValue({ _data: mockAudienceData });
             (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
@@ -721,22 +737,258 @@ describe('MetaService', () => {
                 description: 'Lookalike test',
                 lookalike_spec: {
                     ratio: 0.01,
-                    origin: [{ id: 'source_audience_123' }],
+                    origin: [{ id: 'source_audience_123', type: 'custom_audience' }],
                     country: 'US'
                 },
             };
 
             const result = await service.createCustomAudience(mockAdAccountId, mockAccessToken, params);
 
-            expect(mockCreateCustomAudience).toHaveBeenCalledWith([], expect.objectContaining({
-                name: 'Lookalike Audience',
-                subtype: 'LOOKALIKE',
-                lookalike_spec: expect.objectContaining({
-                    ratio: 0.01,
-                    country: 'US',
-                }),
+            const [, calledParams] = mockCreateCustomAudience.mock.calls[0];
+            expect(calledParams.origin_audience_id).toBe('source_audience_123');
+            expect(calledParams.lookalike_spec.origin).toBeUndefined();
+            expect(calledParams.lookalike_spec).toEqual(expect.objectContaining({
+                type: 'similarity',
+                ratio: 0.01,
+                country: 'US',
             }));
             expect(result).toEqual(mockAudienceData);
+        });
+
+        describe('uploadCustomAudienceUsers', () => {
+            it('sends a single request with no session object when the payload is <= 10,000 rows', async () => {
+                const mockCreateUser = jest.fn().mockResolvedValue({ _data: { num_received: 2 } });
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    createUser: mockCreateUser,
+                }));
+
+                const payload = [['hash1', 'hash2'], ['hash3', 'hash4']];
+                const result = await service.uploadCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL', 'PHONE'], payload
+                );
+
+                expect(mockCreateUser).toHaveBeenCalledTimes(1);
+                const [, calledParams] = mockCreateUser.mock.calls[0];
+                expect(calledParams.payload.schema).toEqual(['EMAIL', 'PHONE']);
+                expect(calledParams.payload.data).toEqual(payload);
+                expect(calledParams.payload.session).toBeUndefined();
+                expect(result).toEqual({ num_received: 2 });
+            });
+
+            // ENG-600 known gap, now fixed: Meta caps a single /users request at
+            // 10,000 records ("If you have an upload with more than 10,000 users,
+            // you need to split it into separate batches"). A payload above that
+            // must be chunked into sequential requests sharing one session_id,
+            // incrementing batch_seq from 1, with last_batch_flag only on the
+            // final chunk — Meta's documented multi-batch upload protocol.
+            it('chunks a payload over 10,000 rows into sequential session-batched requests', async () => {
+                const mockCreateUser = jest.fn()
+                    .mockResolvedValueOnce({ _data: { num_received: 10000 } })
+                    .mockResolvedValueOnce({ _data: { num_received: 500 } });
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    createUser: mockCreateUser,
+                }));
+
+                const payload = Array.from({ length: 10500 }, (_, i) => [`hash${i}`]);
+                await service.uploadCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL'], payload
+                );
+
+                expect(mockCreateUser).toHaveBeenCalledTimes(2);
+
+                const [, firstParams] = mockCreateUser.mock.calls[0];
+                expect(firstParams.payload.data).toHaveLength(10000);
+                expect(firstParams.payload.session.batch_seq).toBe(1);
+                expect(firstParams.payload.session.last_batch_flag).toBe(false);
+                expect(typeof firstParams.payload.session.session_id).toBe('number');
+
+                const [, secondParams] = mockCreateUser.mock.calls[1];
+                expect(secondParams.payload.data).toHaveLength(500);
+                expect(secondParams.payload.session.batch_seq).toBe(2);
+                expect(secondParams.payload.session.last_batch_flag).toBe(true);
+                // Same session_id across all batches in the upload.
+                expect(secondParams.payload.session.session_id).toBe(firstParams.payload.session.session_id);
+            });
+
+            it('surfaces a mid-upload batch failure (throws) without silently dropping it', async () => {
+                const mockCreateUser = jest.fn()
+                    .mockResolvedValueOnce({ _data: { num_received: 10000 } })
+                    .mockRejectedValueOnce(new Error('Batch 2 rejected'));
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    createUser: mockCreateUser,
+                }));
+
+                const payload = Array.from({ length: 10500 }, (_, i) => [`hash${i}`]);
+
+                // handleError(error, context) throws (context is provided by every
+                // caller in this service) rather than returning an error shape —
+                // a batch failure partway through a chunked upload must propagate,
+                // not be silently swallowed after already having sent batch 1.
+                await expect(service.uploadCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL'], payload
+                )).rejects.toThrow('Batch 2 rejected');
+
+                expect(mockCreateUser).toHaveBeenCalledTimes(2);
+            });
+        });
+
+        // ENG-600 Greptile finding: reusing an existing audience for a fresh
+        // source upload never removed members no longer present in the new
+        // source — a contact removed from a HubSpot list (or dropped from a
+        // refreshed CSV) stayed in the Meta audience forever. deleteCustomAudienceUsers
+        // is the removal counterpart to uploadCustomAudienceUsers, used by
+        // agentModeService to sync stale members out before/after re-upload.
+        describe('deleteCustomAudienceUsers', () => {
+            it('sends a single request with no session object when the payload is <= 10,000 rows', async () => {
+                const mockDeleteUsers = jest.fn().mockResolvedValue({ _data: { num_received: 2 } });
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    deleteUsers: mockDeleteUsers,
+                }));
+
+                const payload = [['hash1', 'hash2'], ['hash3', 'hash4']];
+                const result = await service.deleteCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL', 'PHONE'], payload
+                );
+
+                expect(mockDeleteUsers).toHaveBeenCalledTimes(1);
+                // ENG-600 live-test finding: CustomAudience.deleteUsers takes a
+                // SINGLE params argument (unlike createUser(fields, params)) —
+                // asserting on mock.calls[0][0] (not [1]) locks in the call
+                // shape that actually reaches Meta, since a two-argument call
+                // silently drops the real params and Meta rejects it with
+                // "(#100) Missing required parameter: payload".
+                const [calledParams] = mockDeleteUsers.mock.calls[0];
+                expect(calledParams.payload.schema).toEqual(['EMAIL', 'PHONE']);
+                expect(calledParams.payload.data).toEqual(payload);
+                expect(calledParams.payload.session).toBeUndefined();
+                expect(result).toEqual({ num_received: 2 });
+                expect(mockDeleteUsers.mock.calls[0]).toHaveLength(1);
+            });
+
+            it('chunks a payload over 10,000 rows into sequential session-batched requests', async () => {
+                const mockDeleteUsers = jest.fn()
+                    .mockResolvedValueOnce({ _data: { num_received: 10000 } })
+                    .mockResolvedValueOnce({ _data: { num_received: 500 } });
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    deleteUsers: mockDeleteUsers,
+                }));
+
+                const payload = Array.from({ length: 10500 }, (_, i) => [`hash${i}`]);
+                await service.deleteCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL'], payload
+                );
+
+                expect(mockDeleteUsers).toHaveBeenCalledTimes(2);
+                const [firstParams] = mockDeleteUsers.mock.calls[0];
+                expect(firstParams.payload.data).toHaveLength(10000);
+                expect(firstParams.payload.session.batch_seq).toBe(1);
+                expect(firstParams.payload.session.last_batch_flag).toBe(false);
+
+                const [secondParams] = mockDeleteUsers.mock.calls[1];
+                expect(secondParams.payload.data).toHaveLength(500);
+                expect(secondParams.payload.session.batch_seq).toBe(2);
+                expect(secondParams.payload.session.last_batch_flag).toBe(true);
+                expect(secondParams.payload.session.session_id).toBe(firstParams.payload.session.session_id);
+            });
+
+            it('surfaces a mid-delete batch failure (throws) without silently dropping it', async () => {
+                const mockDeleteUsers = jest.fn()
+                    .mockResolvedValueOnce({ _data: { num_received: 10000 } })
+                    .mockRejectedValueOnce(new Error('Batch 2 rejected'));
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    deleteUsers: mockDeleteUsers,
+                }));
+
+                const payload = Array.from({ length: 10500 }, (_, i) => [`hash${i}`]);
+
+                await expect(service.deleteCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL'], payload
+                )).rejects.toThrow('Batch 2 rejected');
+
+                expect(mockDeleteUsers).toHaveBeenCalledTimes(2);
+            });
+        });
+
+        // ENG-600 Greptile finding: reusing an audience with no locally-saved
+        // membership snapshot (first sync since this feature shipped, or an
+        // audience that predates it / was created outside this flow) had no
+        // way to know what stale members might already be in that Meta
+        // audience, so add-only uploads could never remove them. Meta's
+        // usersreplace edge atomically sets the exact membership in one
+        // operation, eliminating the need for a diff baseline in that case.
+        describe('replaceCustomAudienceUsers', () => {
+            // Live-test finding against real Meta: unlike createUser/deleteUsers
+            // (session nested inside `payload`), /usersreplace requires
+            // `session` as a TOP-LEVEL param sibling to `payload`, always —
+            // nesting it inside `payload` still produced "(#100) The
+            // parameter session is required" against the real Graph API.
+            it('sends a single request with a top-level single-batch session object when the payload is <= 10,000 rows', async () => {
+                const mockCreateUsersReplace = jest.fn().mockResolvedValue({ _data: { num_received: 2 } });
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    createUsersReplace: mockCreateUsersReplace,
+                }));
+
+                const payload = [['hash1', 'hash2'], ['hash3', 'hash4']];
+                const result = await service.replaceCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL', 'PHONE'], payload
+                );
+
+                expect(mockCreateUsersReplace).toHaveBeenCalledTimes(1);
+                const [, calledParams] = mockCreateUsersReplace.mock.calls[0];
+                expect(calledParams.payload.schema).toEqual(['EMAIL', 'PHONE']);
+                expect(calledParams.payload.data).toEqual(payload);
+                expect(calledParams.payload.session).toBeUndefined();
+                expect(calledParams.session).toEqual({
+                    session_id: expect.any(Number),
+                    batch_seq: 1,
+                    last_batch_flag: true,
+                    estimated_num_total: payload.length,
+                });
+                expect(result).toEqual({ num_received: 2 });
+            });
+
+            it('chunks a payload over 10,000 rows into sequential session-batched requests', async () => {
+                const mockCreateUsersReplace = jest.fn()
+                    .mockResolvedValueOnce({ _data: { num_received: 10000 } })
+                    .mockResolvedValueOnce({ _data: { num_received: 500 } });
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    createUsersReplace: mockCreateUsersReplace,
+                }));
+
+                const payload = Array.from({ length: 10500 }, (_, i) => [`hash${i}`]);
+                await service.replaceCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL'], payload
+                );
+
+                expect(mockCreateUsersReplace).toHaveBeenCalledTimes(2);
+                const [, firstParams] = mockCreateUsersReplace.mock.calls[0];
+                expect(firstParams.payload.data).toHaveLength(10000);
+                expect(firstParams.session.batch_seq).toBe(1);
+                expect(firstParams.session.last_batch_flag).toBe(false);
+
+                const [, secondParams] = mockCreateUsersReplace.mock.calls[1];
+                expect(secondParams.payload.data).toHaveLength(500);
+                expect(secondParams.session.batch_seq).toBe(2);
+                expect(secondParams.session.last_batch_flag).toBe(true);
+                expect(secondParams.session.session_id).toBe(firstParams.session.session_id);
+            });
+
+            it('surfaces a mid-replace batch failure (throws) without silently dropping it', async () => {
+                const mockCreateUsersReplace = jest.fn()
+                    .mockResolvedValueOnce({ _data: { num_received: 10000 } })
+                    .mockRejectedValueOnce(new Error('Batch 2 rejected'));
+                (CustomAudience as unknown as jest.Mock).mockImplementation(() => ({
+                    createUsersReplace: mockCreateUsersReplace,
+                }));
+
+                const payload = Array.from({ length: 10500 }, (_, i) => [`hash${i}`]);
+
+                await expect(service.replaceCustomAudienceUsers(
+                    mockAdAccountId, mockAccessToken, 'audience_123', ['EMAIL'], payload
+                )).rejects.toThrow('Batch 2 rejected');
+
+                expect(mockCreateUsersReplace).toHaveBeenCalledTimes(2);
+            });
         });
     });
 
