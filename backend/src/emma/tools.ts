@@ -933,6 +933,10 @@ AD RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad that's missing them
 REQUIRED PARAMS PER ENTITY + ACTION:
   CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
   AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
+                        Optional but WRITABLE on create: bid_strategy (LOWEST_COST_WITHOUT_CAP | LOWEST_COST_WITH_BID_CAP | COST_CAP) and bid_amount.
+                        Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
+                        bid_amount is REQUIRED for LOWEST_COST_WITH_BID_CAP and COST_CAP, and must be OMITTED for LOWEST_COST_WITHOUT_CAP.
+                        NOT SUPPORTED: dayparting / ad scheduling (adset_schedule, pacing_type). A request for scheduled delivery is REJECTED, not silently ignored — tell the user it must be set in Ads Manager after creation. start_time/end_time are the flight window, not dayparting.
   AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
   AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.

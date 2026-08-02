@@ -224,6 +224,7 @@ import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
+import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 
 type MetaApiResult = {
   success: boolean;
@@ -1301,38 +1302,73 @@ export class AgentModeService {
     });
   }
 
-  async getDefaultModel(): Promise<string> {
-    const fallbackModel = this.default_model;
+  /**
+   * Resolve a model id configured in `AW-Settings`, or null when nothing usable
+   * is configured (missing row, blank value, unknown model, or a failed read).
+   *
+   * ENG-806: this applies the SAME legacy-alias map generation uses
+   * (`normalizeModelId`) BEFORE validating against the registry. Previously each
+   * getter did a raw `llmModels[value]` lookup, so a row holding a legacy alias
+   * failed validation and silently fell through to the fallback — the setting
+   * read as configured in the table and the admin UI but had no effect.
+   * `agent_mode_scheduled_chats_default_model` held the alias `claude-opus-4-8`
+   * and was inert for two months before anyone noticed.
+   *
+   * An unknown value now also raises a deduped oncall alert rather than only
+   * `console.warn`-ing into a log nobody reads ("fail loud, not partial"). The
+   * alert is fire-and-forget so model resolution never blocks on it.
+   */
+  private async resolveConfiguredModel(
+    settingName: string,
+    label: string
+  ): Promise<string | null> {
     try {
-      const setting = await settingsService.getSetting(this.defaultModelSettingName);
+      const setting = await settingsService.getSetting(settingName);
       const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported default model "${configuredModel}" in settings; using fallback.`);
+      if (!configuredModel) return null;
+
+      const normalizedModel = this.normalizeModelId(configuredModel);
+      if (this.llmModels[normalizedModel]) {
+        return normalizedModel;
       }
+
+      console.warn(`AgentMode: Unsupported ${label} model "${configuredModel}" in settings; using fallback.`);
+      void sendAgentModeOncallAlert({
+        subject: `AgentMode: unsupported ${label} model in AW-Settings`,
+        message:
+          `The AW-Settings row "${settingName}" holds "${configuredModel}", which is not a served model ` +
+          `even after legacy-alias resolution. That setting is being ignored and the fallback model is in ` +
+          `use, so the configured pin is inert.`,
+        context: {
+          Setting: settingName,
+          'Configured Value': configuredModel,
+          'After Alias Resolution': normalizedModel,
+        },
+        // One alert per (setting, bad value) per hour: a permanently
+        // misconfigured row must not flood oncall on every request.
+        dedupeKey: `model_setting_invalid:${settingName}:${configuredModel}`,
+        dedupeWindowMs: 60 * 60 * 1000,
+      }).catch((alertError) => {
+        console.error('AgentMode: Failed to send unsupported-model alert:', alertError);
+      });
     } catch (error) {
-      console.error('AgentMode: Error getting default model setting:', error);
+      console.error(`AgentMode: Error getting ${label} model setting:`, error);
     }
-    return fallbackModel;
+    return null;
+  }
+
+  async getDefaultModel(): Promise<string> {
+    return (
+      (await this.resolveConfiguredModel(this.defaultModelSettingName, 'default')) ??
+      this.default_model
+    );
   }
 
   async getReportsModel(): Promise<string> {
-    const fallbackModel = this.default_model;
-    try {
-      const setting = await settingsService.getSetting('agent_mode_reports_model');
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported reports model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting reports model setting:', error);
-    }
-    return fallbackModel;
+    return (
+      (await this.resolveConfiguredModel('agent_mode_reports_model', 'reports')) ??
+      this.default_model
+    );
   }
 
   // Model for the internal dedup judge (report_product_issues duplicate detection).
@@ -1341,71 +1377,37 @@ export class AgentModeService {
   // configurable default model. TODO(ENG-9): route this call through OpenRouter so
   // model choice becomes gateway/routing config rather than provider-specific.
   async getDedupJudgeModel(): Promise<string> {
-    const fallbackModel = this.default_model;
-    try {
-      const setting = await settingsService.getSetting('agent_mode_dedup_judge_model');
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported dedup judge model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting dedup judge model setting:', error);
-    }
-    return fallbackModel;
+    return (
+      (await this.resolveConfiguredModel('agent_mode_dedup_judge_model', 'dedup judge')) ??
+      this.default_model
+    );
   }
 
   async getScheduledChatsDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.scheduledChatsDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported scheduled chats default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting scheduled chats default model setting:', error);
-    }
-    // Fall back to the general default model
-    return this.getDefaultModel();
+    return (
+      (await this.resolveConfiguredModel(
+        this.scheduledChatsDefaultModelSettingName,
+        'scheduled chats default'
+      )) ?? this.getDefaultModel()
+    );
   }
 
   async getReportGenerationDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.reportGenerationDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported report generation default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting report generation default model setting:', error);
-    }
-    // Fall back to the general default model
-    return this.getDefaultModel();
+    return (
+      (await this.resolveConfiguredModel(
+        this.reportGenerationDefaultModelSettingName,
+        'report generation default'
+      )) ?? this.getDefaultModel()
+    );
   }
 
   async getImageGenerationDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.imageGenerationDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported image generation default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting image generation default model setting:', error);
-    }
-    // Fall back to the general default model
-    return this.getDefaultModel();
+    return (
+      (await this.resolveConfiguredModel(
+        this.imageGenerationDefaultModelSettingName,
+        'image generation default'
+      )) ?? this.getDefaultModel()
+    );
   }
 
   // Supported image API models (must match SUPPORTED_MODELS in imageGeneration.ts).
@@ -14936,6 +14938,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async createMetaAdsAdSet(userId: string, args: any): Promise<any> {
     try {
+      // ENG-838: dayparting is not implemented. `MetaAdsAdSetParams` has no
+      // `adset_schedule` and nothing in this codebase ever sends one, so a
+      // scheduled-delivery request used to be dropped in silence and the ad set
+      // shipped 24/7. That is how Open Future Forum spent $1,000 for 2 sign-ups
+      // on 3am impressions. Fail loudly instead: a caller who asked for a
+      // schedule must not receive an always-on ad set and a success message.
+      // Note `start_time`/`end_time` are the flight window, not dayparting, and
+      // stay supported.
+      //
+      // This runs BEFORE getMetaCredentials deliberately. Credential resolution
+      // can refresh a token against Meta and can throw its own auth error, so
+      // resolving first would both make a network call for a request we are
+      // certain to reject and mask a deterministic "not supported" answer behind
+      // an unrelated credential failure. A rejection that is knowable from the
+      // arguments alone should never depend on account state.
+      if (args.adset_schedule !== undefined || args.pacing_type !== undefined) {
+        const requested = args.adset_schedule !== undefined ? 'adset_schedule' : 'pacing_type';
+        throw new Error(
+          `Dayparting is not supported yet, so "${requested}" cannot be honored and this ad set was NOT created. ` +
+          `Creating it anyway would deliver 24/7 against a schedule you did not choose. ` +
+          `Either remove ${requested} and accept continuous delivery, or set the schedule manually in Ads Manager after creation. ` +
+          `Tracked as ENG-838.`
+        );
+      }
+
       const { accountId, accessToken } = await this.getMetaCredentials(userId, args.account_id);
 
       // --- Deterministic Validation Engine ---
@@ -15113,10 +15140,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const adSet = await metaService.createAdSet(accountId, accessToken, normalizedParams);
 
+      // ENG-838: surface the bid strategy that actually landed. When the caller
+      // does not choose one, `strategy` above resolves to Meta's default and the
+      // choice was previously invisible — a wrong strategy looked identical to a
+      // deliberate one. Reporting it makes the default detectable without
+      // changing behavior for existing callers.
+      // The user-facing message is deliberately unchanged: that string is
+      // customer-visible copy and is not this issue's to rewrite. The structured
+      // fields below are what make the choice detectable.
       return {
         success: true,
         message: `Ad set "${adSet.name}" created successfully`,
-        adSet: adSet
+        adSet: adSet,
+        appliedBidStrategy: strategy,
+        bidStrategyWasDefaulted: args.bid_strategy === undefined
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
