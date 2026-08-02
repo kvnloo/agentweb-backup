@@ -120,6 +120,42 @@ describe('POST /api/support/report-ui-bug — filing vs notification (ENG-529)',
     expect(fileUserIssue.mock.calls[0][0].description).toContain('\n');
   });
 
+  // AC5 (wiring) — the route must FORWARD its fingerprint to the filer, not just hand it to the
+  // in-process replay guard.
+  //
+  // This assertion exists because its absence was a real miss. The destination-idempotency
+  // mechanism was implemented in `intakeService` and unit-tested there by passing a fingerprint in
+  // directly — which proved the mechanism works when invoked correctly, and proved nothing about
+  // whether anything invokes it. The route computed the fingerprint inline for `fileReportOnce`
+  // only, so the Featurebase lookup and marker stamping were dead code for the live endpoint:
+  // shipped, and inert. Greptile caught it at 4/5.
+  //
+  // The in-process guard is bounded and evicts settled entries, so it CANNOT be the durable
+  // guarantee. Without this forwarding there is nothing at all behind AC5 once an entry is
+  // evicted, the process restarts, or a second instance serves the retry.
+  it('AC5: forwards the report fingerprint to the filer so destination idempotency is reachable', async () => {
+    await submit({ description: MULTILINE, reportType: 'bug', pageUrl: 'https://app.agentweb.pro/hub' });
+
+    expect(fileUserIssue).toHaveBeenCalledTimes(1);
+    const fingerprint = fileUserIssue.mock.calls[0][0].reportFingerprint;
+    expect(typeof fingerprint).toBe('string');
+    expect(fingerprint).toBeTruthy();
+  });
+
+  it('AC5: the same report yields the same fingerprint, a different one does not', async () => {
+    await submit({ description: MULTILINE, reportType: 'bug', pageUrl: 'https://app.agentweb.pro/hub' });
+    const first = fileUserIssue.mock.calls[0][0].reportFingerprint;
+
+    jest.clearAllMocks();
+    fileUserIssue.mockResolvedValue(FILED);
+    await submit({ description: 'a completely different report', reportType: 'bug', pageUrl: 'https://app.agentweb.pro/hub' });
+    const other = fileUserIssue.mock.calls[0][0].reportFingerprint;
+
+    // Stability is what makes the destination lookup find the earlier ticket; distinctness is what
+    // stops an unrelated report replaying someone else's card.
+    expect(other).not.toBe(first);
+  });
+
   // AC2 — the outbound notification subject is valid single-line text derived from the report.
   it('AC2: builds a single-line notification subject from a multiline description', async () => {
     await submit({ description: MULTILINE, reportType: 'bug' });

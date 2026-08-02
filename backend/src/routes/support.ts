@@ -446,8 +446,16 @@ router.post("/report-ui-bug", async (req, res) => {
     // became tickets #169/#170/#171 when the client retried three 500s).
     const reportItemType: 'feature_request' | 'bug' = typeKey === 'bug' ? 'bug' : 'feature_request';
     const { fileUserIssue } = await import('../services/intakeService');
+    // ONE fingerprint, used twice on purpose (ENG-529 AC5 / ENG-598 option A):
+    //   - `fileReportOnce` coalesces concurrent and in-window retries IN THIS PROCESS, and
+    //   - `fileUserIssue` stamps it on the Featurebase ticket and looks it up before creating,
+    //     which is the DURABLE half — it is what still holds after the bounded replay map evicts
+    //     this entry, after a restart, or when a second instance serves the retry.
+    // Computing it inline for the guard alone would leave the destination check dead code, so the
+    // two must share this value rather than each deriving their own.
+    const fingerprint = reportFingerprint({ userId, reportType: typeKey, description, pageUrl });
     const outcome = await fileReportOnce(
-      reportFingerprint({ userId, reportType: typeKey, description, pageUrl }),
+      fingerprint,
       () => fileUserIssue({
         type: reportItemType,
         title,
@@ -456,6 +464,7 @@ router.post("/report-ui-bug", async (req, res) => {
         userName: user.displayName || user.email,
         reportedByAdmin: isDelegated && adminEmail ? adminEmail : undefined,
         sessionId: typeof sessionId === "string" ? sessionId : undefined,
+        reportFingerprint: fingerprint,
         // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
         funnelStatus: user.funnelStatus,
         notionTags: ["Customer Reported", config.tag, ...funnelStatusTags],
