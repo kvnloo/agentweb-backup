@@ -8,8 +8,9 @@
 import express from 'express';
 import request from 'supertest';
 import supportRouter from '../routes/support';
+import { __resetReportIdempotencyForTests } from '../utils/reportIntake';
 
-const CANON = 'https://linear.app/emmabyaw/issue/ENG-289';
+const CANON ='https://linear.app/emmabyaw/issue/ENG-289';
 
 jest.mock('../services/intakeService', () => ({
   fileUserIssue: jest.fn().mockResolvedValue({
@@ -61,6 +62,9 @@ async function report() {
 describe('POST /api/support/report-ui-bug — canonical link is NOT exposed in the response (ENG-289, chat-only)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // Every case here submits the SAME report text as the same user, which the ENG-529 replay
+    // guard would (correctly) collapse onto one filing — reset it so each case files for real.
+    __resetReportIdempotencyForTests();
     reporterRecord = { userId: 'user-123', email: 'user@example.com', displayName: 'Test User' };
     delegateInfo = undefined;
   });
