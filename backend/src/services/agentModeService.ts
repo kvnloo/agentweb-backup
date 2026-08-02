@@ -14938,6 +14938,31 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async createMetaAdsAdSet(userId: string, args: any): Promise<any> {
     try {
+      // ENG-838: dayparting is not implemented. `MetaAdsAdSetParams` has no
+      // `adset_schedule` and nothing in this codebase ever sends one, so a
+      // scheduled-delivery request used to be dropped in silence and the ad set
+      // shipped 24/7. That is how Open Future Forum spent $1,000 for 2 sign-ups
+      // on 3am impressions. Fail loudly instead: a caller who asked for a
+      // schedule must not receive an always-on ad set and a success message.
+      // Note `start_time`/`end_time` are the flight window, not dayparting, and
+      // stay supported.
+      //
+      // This runs BEFORE getMetaCredentials deliberately. Credential resolution
+      // can refresh a token against Meta and can throw its own auth error, so
+      // resolving first would both make a network call for a request we are
+      // certain to reject and mask a deterministic "not supported" answer behind
+      // an unrelated credential failure. A rejection that is knowable from the
+      // arguments alone should never depend on account state.
+      if (args.adset_schedule !== undefined || args.pacing_type !== undefined) {
+        const requested = args.adset_schedule !== undefined ? 'adset_schedule' : 'pacing_type';
+        throw new Error(
+          `Dayparting is not supported yet, so "${requested}" cannot be honored and this ad set was NOT created. ` +
+          `Creating it anyway would deliver 24/7 against a schedule you did not choose. ` +
+          `Either remove ${requested} and accept continuous delivery, or set the schedule manually in Ads Manager after creation. ` +
+          `Tracked as ENG-838.`
+        );
+      }
+
       const { accountId, accessToken } = await this.getMetaCredentials(userId, args.account_id);
 
       // --- Deterministic Validation Engine ---
@@ -15115,10 +15140,20 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       const adSet = await metaService.createAdSet(accountId, accessToken, normalizedParams);
 
+      // ENG-838: surface the bid strategy that actually landed. When the caller
+      // does not choose one, `strategy` above resolves to Meta's default and the
+      // choice was previously invisible — a wrong strategy looked identical to a
+      // deliberate one. Reporting it makes the default detectable without
+      // changing behavior for existing callers.
+      // The user-facing message is deliberately unchanged: that string is
+      // customer-visible copy and is not this issue's to rewrite. The structured
+      // fields below are what make the choice detectable.
       return {
         success: true,
         message: `Ad set "${adSet.name}" created successfully`,
-        adSet: adSet
+        adSet: adSet,
+        appliedBidStrategy: strategy,
+        bidStrategyWasDefaulted: args.bid_strategy === undefined
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
