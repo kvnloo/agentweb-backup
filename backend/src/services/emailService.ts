@@ -320,7 +320,7 @@ The AgentWeb Team
           <h2 style="color: #1B2549; margin-top: 0;">Hi ${firstName}, welcome to AgentWeb!</h2>
 
           <p style="color: #333; line-height: 1.6;">
-            We're Harsha, Rui, Fangfang, and Matthew — the founders of AgentWeb. We're personally committed to making sure you get the most out of the product, and we'd love to hear what brought you here.
+            We're Harsha, Fangfang, and Matthew — the founders of AgentWeb. We're personally committed to making sure you get the most out of the product, and we'd love to hear what brought you here.
           </p>
 
           <p style="color: #333; line-height: 1.6;">
@@ -348,7 +348,7 @@ The AgentWeb Team
           </div>
 
           <p style="color: #333; line-height: 1.6; margin-top: 20px;">
-            — Harsha, Rui, Fangfang &amp; Matthew
+            — Harsha, Fangfang &amp; Matthew
           </p>
         </div>
 
@@ -360,7 +360,7 @@ The AgentWeb Team
 
     const text = `Hi ${firstName}, welcome to AgentWeb!
 
-We're Harsha, Rui, Fangfang, and Matthew — the founders of AgentWeb. We're personally committed to making sure you get the most out of the product, and we'd love to hear what brought you here.
+We're Harsha, Fangfang, and Matthew — the founders of AgentWeb. We're personally committed to making sure you get the most out of the product, and we'd love to hear what brought you here.
 
 Just reply to this email with any questions, feedback, or ideas — we read every message and will get back to you directly.
 
@@ -368,7 +368,7 @@ Need help or found an issue? You can also chat with Emma, our AI assistant insid
 
 Open AgentWeb: ${appUrl}
 
-— Harsha, Rui, Fangfang & Matthew
+— Harsha, Fangfang & Matthew
 
 You're receiving this because you just signed up for AgentWeb.
 `;
