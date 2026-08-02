@@ -22,6 +22,7 @@ jest.mock('../services/metaService', () => ({
     listCustomAudiences: jest.fn(),
     createCustomAudience: jest.fn(),
     uploadCustomAudienceUsers: jest.fn(),
+    replaceCustomAudienceUsers: jest.fn(),
     searchTargeting: jest.fn()
   }
 }));
@@ -309,6 +310,44 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
           })
         );
       });
+
+      // ENG-600: real live-test finding — Meta's raw error.message ("Permissions
+      // error") was surfacing to the user with no way to act on it. The SDK
+      // attaches a friendlier error_user_msg (with the exact accept-terms URL)
+      // via structuredError; prefer that when present.
+      it('surfaces the friendly error_user_msg (with accept-terms URL) instead of the generic SDK message', async () => {
+        const sdkError: any = new Error('Permissions error');
+        sdkError.structuredError = {
+          message: 'Permissions error',
+          code: 200,
+          error_subcode: 1870090,
+          error_user_title: 'Custom audience terms not accepted',
+          error_user_msg: 'Custom audience terms not accepted. To create or edit an audience with an uploaded customer list, agree to the custom audience terms at https://business.facebook.com/ads/manage/customaudiences/tos/?act=123456789.',
+          classification: 'PERMISSION_ERROR',
+        };
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.createCustomAudience as jest.Mock).mockRejectedValue(sdkError);
+
+        const result = await agentModeService.manageMetaCustomAudiences('user123', 'CREATE', '123456789', {
+          action: 'create', name: 'X', subtype: 'CUSTOM',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('agree to the custom audience terms at https://business.facebook.com/ads/manage/customaudiences/tos/?act=123456789');
+        expect(result.message).toContain('one-time setup');
+      });
+
+      it('falls back to error.message when no structuredError is present', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.createCustomAudience as jest.Mock).mockRejectedValue(new Error('Network timeout'));
+
+        const result = await agentModeService.manageMetaCustomAudiences('user123', 'CREATE', '123456789', {
+          action: 'create', name: 'X', subtype: 'CUSTOM',
+        });
+
+        expect(result.success).toBe(false);
+        expect(result.message).toBe('Network timeout');
+      });
     });
 
     describe('manageMetaCustomAudiences - upload_users', () => {
@@ -327,6 +366,35 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
 
         expect(result.success).toBe(true);
         expect(result.message).toBe('Successfully initiated user upload to audience audience_123');
+      });
+
+      // ENG-600 known gap, now fixed: the naive split(',') parser mis-splits
+      // any quoted field containing a comma (e.g. a phone value with an
+      // extension, "555-5678, ext. 2"), silently corrupting column alignment
+      // instead of parsing it as one field.
+      it('correctly parses a quoted field containing a comma (real-world CSV export)', async () => {
+        const params = {
+          action: 'upload_users',
+          audience_id: 'audience_123',
+          schema: ['EMAIL', 'PHONE'],
+          payload: 'john@example.com,"555-1234"\njane@example.com,"555-5678, ext. 2"',
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.uploadCustomAudienceUsers as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.manageMetaCustomAudiences('user123', 'UPLOAD_USERS', '123456789', {
+          id: params.audience_id, schema: params.schema, payload: params.payload,
+        });
+
+        expect(result.success).toBe(true);
+        const [, , , , hashedPayload] = (metaService.uploadCustomAudienceUsers as jest.Mock).mock.calls[0];
+        // Each row must still resolve to exactly 2 columns (email, phone) —
+        // the naive parser would have split row 2 into 3 columns and thrown
+        // a schema-mismatch error instead of reaching this point at all.
+        expect(hashedPayload).toHaveLength(2);
+        expect(hashedPayload[0]).toHaveLength(2);
+        expect(hashedPayload[1]).toHaveLength(2);
       });
 
       it('should handle array payload', async () => {
@@ -354,6 +422,86 @@ describe('AgentModeService - Meta Upload and Advanced Operations', () => {
             expect.arrayContaining([expect.any(String)])
           ])
         );
+      });
+
+      // ENG-600 Greptile finding: REPLACE_USERS (Meta's atomic usersreplace,
+      // used when reusing an audience with no snapshot baseline to diff
+      // against) must hash raw rows exactly like UPLOAD_USERS does — it's
+      // fed the same raw row array from resolveOrCreateSeedAudience.
+      it('hashes a raw array payload before calling metaService.replaceCustomAudienceUsers', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.replaceCustomAudienceUsers as jest.Mock).mockResolvedValue({ success: true });
+
+        const result = await agentModeService.manageMetaCustomAudiences(
+          'user123',
+          'REPLACE_USERS',
+          '123456789',
+          { id: 'audience_123', schema: ['EMAIL'], payload: [['email1@example.com'], ['email2@example.com']] }
+        );
+
+        expect(result.success).toBe(true);
+        expect(metaService.replaceCustomAudienceUsers).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          'audience_123',
+          ['EMAIL'],
+          expect.arrayContaining([
+            expect.arrayContaining([expect.any(String)]),
+            expect.arrayContaining([expect.any(String)])
+          ])
+        );
+        // Confirms it's actually hashed, not passed through raw.
+        const [, , , , hashedPayload] = (metaService.replaceCustomAudienceUsers as jest.Mock).mock.calls[0];
+        expect(hashedPayload[0][0]).not.toBe('email1@example.com');
+        expect(hashedPayload[0][0]).toMatch(/^[a-f0-9]{64}$/);
+      });
+
+      // ENG-600: the two new HubSpot/CSV audience-sourcing workflows pass an
+      // uploaded CSV attachment's URL straight through as `payload` — this
+      // locks in that the existing URL-detection/fetch path actually works
+      // before relying on it, rather than assuming.
+      it('fetches and parses a CSV payload from an https:// URL', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.uploadCustomAudienceUsers as jest.Mock).mockResolvedValue({ success: true });
+        (axios.get as jest.Mock).mockResolvedValue({
+          data: 'email1@example.com,+1234567890\nemail2@example.com,+9876543210',
+        });
+
+        const result = await agentModeService.manageMetaCustomAudiences(
+          'user123',
+          'UPLOAD_USERS',
+          '123456789',
+          { id: 'audience_123', schema: ['EMAIL', 'PHONE'], payload: 'https://s3.example.com/uploads/audience.csv' }
+        );
+
+        expect(axios.get).toHaveBeenCalledWith('https://s3.example.com/uploads/audience.csv');
+        expect(result.success).toBe(true);
+        expect(metaService.uploadCustomAudienceUsers).toHaveBeenCalledWith(
+          '123456789',
+          'mock-access-token',
+          'audience_123',
+          ['EMAIL', 'PHONE'],
+          [
+            [expect.any(String), expect.any(String)],
+            [expect.any(String), expect.any(String)],
+          ]
+        );
+      });
+
+      it('surfaces an error when the CSV payload URL fails to fetch', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (axios.get as jest.Mock).mockRejectedValue(new Error('Network timeout'));
+
+        const result = await agentModeService.manageMetaCustomAudiences(
+          'user123',
+          'UPLOAD_USERS',
+          '123456789',
+          { id: 'audience_123', schema: ['EMAIL'], payload: 'https://s3.example.com/uploads/missing.csv' }
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('Failed to fetch CSV content from URL');
+        expect(metaService.uploadCustomAudienceUsers).not.toHaveBeenCalled();
       });
     });
 

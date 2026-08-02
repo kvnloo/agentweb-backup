@@ -17,6 +17,11 @@ jest.mock('../services/connectedAccountsDb', () => ({
   getAccountsByUserId: jest.fn(),
 }));
 
+jest.mock('../services/v0Service', () => ({
+  getLandingPagesByOwner: jest.fn().mockResolvedValue([]),
+  getLandingPagesByOrg: jest.fn().mockResolvedValue([]),
+}));
+
 jest.mock('../utils/secretsManager', () => ({
   getMetaAccessToken: jest.fn().mockResolvedValue('mock-token'),
 }));
@@ -29,6 +34,7 @@ import { assessClientHealth, listAllClients } from '../services/clientHealthServ
 
 const { userDb } = require('../services/db');
 const { getAccountsByUserId } = require('../services/connectedAccountsDb');
+const { getLandingPagesByOwner, getLandingPagesByOrg } = require('../services/v0Service');
 
 describe('Client Health - assessClientHealth', () => {
   beforeEach(() => {
@@ -162,6 +168,141 @@ describe('Client Health - assessClientHealth', () => {
     expect(result.health.creative_variety.distinct_creatives).toBe(3);
     expect(result.health.status).toBeDefined();
     expect(['healthy', 'mediocre', 'at-risk', 'blocked']).toContain(result.health.status);
+  });
+
+  it('should detect a deployed landing page owned by another member of the client org', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'admin-user',
+      isAdmin: true,
+    });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'rankai-user',
+      email: 'hugo@rankai.ai',
+      displayName: 'Hugo',
+      orgId: 'rankai-org',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    (getLandingPagesByOrg as jest.Mock).mockResolvedValueOnce([
+      {
+        id: 'rankai-lander',
+        userId: 'rankai-teammate',
+        status: 'deployed',
+        customDomainUrl: 'https://rankai.agentwebforms.com',
+      },
+    ]);
+
+    const result = await assessClientHealth('admin-user', 'hugo@rankai.ai');
+
+    expect(result.success).toBe(true);
+    expect(result.health.lander_layer).toEqual({
+      has_lander: true,
+      platforms: ['landing_page'],
+    });
+    expect(getLandingPagesByOwner).toHaveBeenCalledWith('rankai-user');
+    expect(getLandingPagesByOrg).toHaveBeenCalledWith('rankai-org', 'rankai-user');
+  });
+
+  it('should count a deployed org landing page with a lead list as lead capture', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'admin-user',
+      isAdmin: true,
+    });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'rankai-user',
+      email: 'hugo@rankai.ai',
+      displayName: 'Hugo',
+      orgId: 'rankai-org',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    (getLandingPagesByOrg as jest.Mock).mockResolvedValueOnce([
+      {
+        id: 'rankai-book-demo',
+        userId: 'rankai-teammate',
+        status: 'deployed',
+        leadListId: 'rankai-book-demo-list',
+      },
+    ]);
+
+    const result = await assessClientHealth('admin-user', 'hugo@rankai.ai');
+
+    expect(result.success).toBe(true);
+    expect(result.health.lead_quality_layer).toEqual({
+      has_crm: true,
+      platforms: ['landing_page_lead_capture'],
+    });
+  });
+
+  it('should ignore non-deployed landing pages', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'admin-user',
+      isAdmin: true,
+    });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    (getLandingPagesByOwner as jest.Mock).mockResolvedValueOnce([
+      {
+        id: 'draft-lander',
+        userId: 'client-user',
+        status: 'draft',
+        leadListId: 'draft-list',
+      },
+    ]);
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.lander_layer.has_lander).toBe(false);
+    expect(result.health.lead_quality_layer.has_crm).toBe(false);
+  });
+
+  it('should preserve legacy health signals when landing-page lookup fails', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'admin-user',
+      isAdmin: true,
+    });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client',
+      productDomain: 'client.example.com',
+      emailDomain: 'mail.client.example.com',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    (getLandingPagesByOwner as jest.Mock).mockRejectedValueOnce(
+      new Error('landing-page table unavailable')
+    );
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.lander_layer.has_lander).toBe(true);
+    expect(result.health.lead_quality_layer.has_crm).toBe(true);
+  });
+
+  it('should still return health when landing-page lookup fails without legacy signals', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'admin-user',
+      isAdmin: true,
+    });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValueOnce({
+      userId: 'client-user',
+      email: 'client@example.com',
+      displayName: 'Client',
+    });
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    (getLandingPagesByOwner as jest.Mock).mockRejectedValueOnce(
+      new Error('landing-page table unavailable')
+    );
+
+    const result = await assessClientHealth('admin-user', 'client@example.com');
+
+    expect(result.success).toBe(true);
+    expect(result.health.lander_layer.has_lander).toBe(false);
+    expect(result.health.lead_quality_layer.has_crm).toBe(false);
   });
 
   // FAIL test 4: Lookup by name match when email not found
@@ -368,5 +509,61 @@ describe('Client Health - listAllClients', () => {
     expect(result.clients[2].email).toBe('client2@example.com');
     expect(result.clients[2].has_ads).toBe(false);
     expect(result.clients[2].signup_time).toBe('2024-02-20T08:30:00Z');
+  });
+
+  it('should use org landing-page and lead-capture signals in the client list', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'admin-user',
+      isAdmin: true,
+    });
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([
+      {
+        userId: 'rankai-user',
+        email: 'hugo@rankai.ai',
+        displayName: 'Hugo',
+        orgId: 'rankai-org',
+      },
+    ]);
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    (getLandingPagesByOrg as jest.Mock).mockResolvedValueOnce([
+      {
+        id: 'rankai-book-demo',
+        userId: 'rankai-teammate',
+        status: 'deployed',
+        leadListId: 'rankai-book-demo-list',
+      },
+    ]);
+
+    const result = await listAllClients('admin-user');
+
+    expect(result.success).toBe(true);
+    expect(result.clients[0].has_lander).toBe(true);
+    expect(result.clients[0].has_crm).toBe(true);
+  });
+
+  it('should preserve the client list when landing-page lookup fails', async () => {
+    (userDb.getUserById as jest.Mock).mockResolvedValueOnce({
+      userId: 'admin-user',
+      isAdmin: true,
+    });
+    (userDb.getAllUsers as jest.Mock).mockResolvedValueOnce([
+      {
+        userId: 'client-user',
+        email: 'client@example.com',
+        productDomain: 'client.example.com',
+        emailDomain: 'mail.client.example.com',
+      },
+    ]);
+    (getAccountsByUserId as jest.Mock).mockResolvedValueOnce([]);
+    (getLandingPagesByOwner as jest.Mock).mockRejectedValueOnce(
+      new Error('landing-page table unavailable')
+    );
+
+    const result = await listAllClients('admin-user');
+
+    expect(result.success).toBe(true);
+    expect(result.clients).toHaveLength(1);
+    expect(result.clients[0].has_lander).toBe(true);
+    expect(result.clients[0].has_crm).toBe(true);
   });
 });

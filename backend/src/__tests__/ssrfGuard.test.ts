@@ -244,3 +244,38 @@ describe('assertPublicHostname', () => {
     await expect(assertPublicHostname('http://unspec.example')).rejects.toThrow(/private|internal/i);
   });
 });
+
+// Greptile finding: assertPublicHostname validates one DNS answer, but a
+// caller that then does its own separate DNS lookup to actually connect
+// (e.g. axios.get without pinning) is vulnerable to DNS rebinding — an
+// attacker-controlled DNS server can return a public IP for the validation
+// lookup and a private IP for the connection lookup (different responses to
+// different queries). resolvePinnedPublicAddress returns the validated
+// address itself so the caller can pin its connection to exactly that IP,
+// eliminating the second, unvalidated lookup entirely.
+describe('resolvePinnedPublicAddress', () => {
+  it('returns the validated address and family for a public hostname', async () => {
+    mockResolvesTo('93.184.216.34');
+    const { resolvePinnedPublicAddress } = require('../utils/ssrfGuard');
+
+    const result = await resolvePinnedPublicAddress('http://example.com/audience.csv');
+
+    expect(result).toEqual({ hostname: 'example.com', address: '93.184.216.34', family: 4 });
+  });
+
+  it('returns the literal IP directly when the hostname is itself an IP (no DNS lookup)', async () => {
+    const { resolvePinnedPublicAddress } = require('../utils/ssrfGuard');
+
+    const result = await resolvePinnedPublicAddress('http://93.184.216.34/audience.csv');
+
+    expect(result).toEqual({ hostname: '93.184.216.34', address: '93.184.216.34', family: 4 });
+    expect(mockLookup).not.toHaveBeenCalled();
+  });
+
+  it('rejects the same way assertPublicHostname does when the resolved address is private', async () => {
+    mockResolvesTo('169.254.169.254');
+    const { resolvePinnedPublicAddress } = require('../utils/ssrfGuard');
+
+    await expect(resolvePinnedPublicAddress('http://metadata.example/audience.csv')).rejects.toThrow(/private|internal/i);
+  });
+});

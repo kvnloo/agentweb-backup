@@ -1,6 +1,6 @@
 import { chatbotDb, ChatSession, ChatMessage } from "./chatbotService";
 
-const SCORING_MODEL = "gemini-3.1-flash-lite";
+export const SCORING_MODEL = "gemini-3.1-flash-lite";
 
 // Token budget for the JSON scoring response. Must be generous enough for
 // "thinking" models (e.g. gemini-3.5-flash) whose internal reasoning consumes
@@ -397,6 +397,51 @@ export async function getDefaultScoringModel(): Promise<string> {
   return SCORING_MODEL;
 }
 
+/**
+ * Map a persisted scoring-model id onto one that is actually served.
+ *
+ * Scoring reads its model from config written WITHOUT registry validation —
+ * the `default-scoring-model` setting and each judge's `llmModel`. When a model
+ * is retired the stale id survives in the database, and both scoring paths used
+ * to hand it straight to `callLLM`, which throws `Invalid model '<id>'`. Because
+ * admin.ts scores sessions inside a `Promise.allSettled`, that throw is caught
+ * and the visible symptom is "sessions quietly stopped being scored" — no error
+ * surfaces to anyone. ENG-744 exposed this by retiring `gemini-3-pro-preview`
+ * (which had in fact been failing at Google with a 404 since 2026-03-09, so the
+ * stale-config hazard predates that removal).
+ *
+ * The chat path already solves this with `resolveGenerationModel` (ENG-46), so
+ * reuse it for validation + legacy aliasing rather than re-implementing the
+ * allow-list check. The one thing we deliberately do NOT reuse is its fallback
+ * target: that is the chat default, which in production is an Opus-tier model.
+ * Silently rerouting every scoring call there would turn a retired-model bug
+ * into a cost incident. Fall back to the scoring default instead, and only use
+ * the chat fallback if the scoring default is itself unserved (otherwise this
+ * function would just relocate the `Invalid model` throw rather than remove it).
+ */
+export async function resolveScoringModel(requested: string | undefined): Promise<string> {
+  const { agentModeService } = await import("./agentModeService");
+
+  if (requested) {
+    const { model, fellBack } = agentModeService.resolveGenerationModel(requested);
+    // Not a fallback => the id was served (possibly after legacy aliasing).
+    if (!fellBack) return model;
+    console.warn(
+      `SessionScoring: configured model '${requested}' is no longer served; ` +
+        `falling back to the scoring default '${SCORING_MODEL}'.`
+    );
+  }
+
+  const scoringDefault = agentModeService.resolveGenerationModel(SCORING_MODEL);
+  if (!scoringDefault.fellBack) return scoringDefault.model;
+
+  console.warn(
+    `SessionScoring: scoring default '${SCORING_MODEL}' is not served either; ` +
+      `using '${scoringDefault.model}'.`
+  );
+  return scoringDefault.model;
+}
+
 type ScoringResult = {
   score: number;
   reason: string;
@@ -450,7 +495,9 @@ export async function scoreSession(
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
   const systemPrompt = await getDefaultScoringPrompt();
-  const model = await getDefaultScoringModel();
+  // Persisted setting — validate before calling, or a retired id throws
+  // `Invalid model` and the session silently goes unscored (ENG-744).
+  const model = await resolveScoringModel(await getDefaultScoringModel());
 
   const llmPromise = agentModeService.callLLM(
     model,
@@ -509,8 +556,12 @@ export async function scoreSessionWithJudge(
 
   const { agentModeService } = await import("./agentModeService");
 
+  // Per-judge model is persisted without registry validation — same retired-id
+  // hazard as the default scoring model above (ENG-744).
+  const judgeModel = await resolveScoringModel(judge.llmModel || SCORING_MODEL);
+
   const llmPromise = agentModeService.callLLM(
-    judge.llmModel || SCORING_MODEL,
+    judgeModel,
     [
       { role: "system", content: judge.systemPrompt },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },

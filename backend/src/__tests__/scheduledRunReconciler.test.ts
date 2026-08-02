@@ -260,3 +260,71 @@ describe('recoverAbandonedScheduledRun', () => {
     expect(mockAlert).not.toHaveBeenCalled();
   });
 });
+
+// ENG-657: when an abandoned run's transcript ends on a safe boundary, the
+// reconciler marks it to RESUME (continue the same session) rather than restart
+// from scratch — and must NOT drop the "job incomplete" placeholder into a session
+// it's about to continue.
+describe('recoverAbandonedScheduledRun — resume decision (ENG-657)', () => {
+  // Balanced transcript: assistant fired a tool, its result is persisted, then the
+  // instance died (the reported prod shape).
+  const resumableTranscript = [
+    { role: 'system', content: 'automated run' },
+    { role: 'user', content: 'Enrich the CRM leads and recommend the top 10.' },
+    { role: 'assistant', content: 'Firing enrichment.', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }] },
+    { role: 'tool', tool_call_id: 'c1', content: '{"mode":"enrich","processedCount":5}' },
+  ];
+  // Died mid-tool-execution: tool_use c2 has no persisted result → unsafe to resume.
+  const danglingTranscript = [
+    { role: 'system', content: 'automated run' },
+    { role: 'user', content: 'Enrich the CRM leads.' },
+    { role: 'assistant', content: 'Enriching…', tool_calls: [
+      { id: 'c1', function: { name: 'enrich_leads_execute' } },
+      { id: 'c2', function: { name: 'enrich_leads_execute' } },
+    ] },
+    { role: 'tool', tool_call_id: 'c1', content: '{"processedCount":5}' },
+  ];
+
+  it('marks the run to RESUME (resumeSessionId) and skips the jobIncomplete placeholder on a safe boundary', async () => {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue(resumableTranscript as any);
+    const schedule = scheduleWithLease();
+
+    const won = await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    expect(won).toBe(true);
+    const requeue = mockScheduleDb.claimAbandonedRun.mock.calls[0][2] as any;
+    expect(requeue.resumeSessionId).toBe('sess-1');
+    // The session is being continued — no "gave up" placeholder is appended...
+    expect(mockChatbotDb.addMessageToSession).not.toHaveBeenCalled();
+    // ...but a non-terminal note is still recorded for visibility.
+    expect(mockChatbotDb.updateSessionError).toHaveBeenCalledTimes(1);
+    expect(mockChatbotDb.updateSessionError.mock.calls[0][1]).toMatch(/resume/i);
+    // The abandonment is still recorded as a run result (self-heals on retry).
+    expect(mockScheduleDb.addRunResult.mock.calls[0][1]).toMatchObject({ abandoned: true });
+  });
+
+  it('does NOT resume a run that died mid-tool-execution (falls back to restart + placeholder)', async () => {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue(danglingTranscript as any);
+    const schedule = scheduleWithLease();
+
+    const won = await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    expect(won).toBe(true);
+    const requeue = mockScheduleDb.claimAbandonedRun.mock.calls[0][2] as any;
+    expect(requeue.resumeSessionId).toBeUndefined();
+    // Unsafe to continue → existing behavior: placeholder + abandoned error.
+    expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledTimes(1);
+    expect(mockChatbotDb.addMessageToSession.mock.calls[0][1]).toMatchObject({ metadata: { jobIncomplete: true } });
+    expect(mockChatbotDb.updateSessionError.mock.calls[0][1]).toMatch(/abandoned/i);
+  });
+
+  it('does not resume past the retry cap (no resumeSessionId even on a safe boundary)', async () => {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue(resumableTranscript as any);
+    const overCap = scheduleWithLease({ zeroAssistantRetryCount: 3 });
+
+    await recoverAbandonedScheduledRun(overCap, overCap.runInFlight);
+
+    // Over cap → requeue is null, so there is no resume marker to carry.
+    expect(mockScheduleDb.claimAbandonedRun).toHaveBeenCalledWith('sched-1', 'run-abc', null);
+  });
+});

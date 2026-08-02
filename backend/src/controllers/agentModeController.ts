@@ -14,6 +14,7 @@ import { workPlanService } from '../services/workPlanService';
 import { v4 as uuidv4 } from 'uuid';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { resolveInboundAnswer, buildAnswerAcknowledgement, buildReaskDirective, AskUserQuestionError, PendingUserQuestion } from '../services/agentMode/core/askUserQuestion';
+import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/agentMode/core/resumePlan';
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
@@ -33,8 +34,12 @@ import {
   IDEM_TTL_INTERACTIVE_S,
 } from '../services/agentMode/runStore';
 import { stripImageDataForPersistence } from '../services/agentMode/incrementalPersist';
+// ENG-446: the single seam that puts canonical marketing-action payloads (ENG-445)
+// on existing report/run envelopes. No surface parses or re-ranks on its own.
+import { MarketingActionCarrier, normalizeMarketingActions } from '../services/marketingActionEnvelope';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
@@ -75,6 +80,18 @@ const SCHEDULED_JOB_INCOMPLETE_MESSAGE =
   "can exceed the run's time or memory budget and end without finishing. " +
   "The run will be retried automatically. If this keeps happening, split the request into smaller batches " +
   "(fewer items per run) so each run can complete and report its results.";
+
+// ENG-657: injected as the user turn when RESUMING an abandoned scheduled run
+// (its instance was terminated mid-flight, e.g. by a deploy). The full transcript
+// up to the last completed step is already the session history, so the model must
+// continue from there — NOT restart the task or re-run steps whose results it can
+// already see above.
+const SCHEDULED_RUN_RESUME_MESSAGE =
+  "[SYSTEM] This scheduled run was interrupted (the machine it was running on was " +
+  "replaced) after completing the steps shown above. This is an automated run with no " +
+  "human present. Do NOT start over and do NOT repeat any tool call whose result is " +
+  "already visible in the history above. Continue from exactly where you left off, using " +
+  "the data already gathered, and produce the final deliverable the task asked for.";
 
 /**
  * In-memory set of session IDs that are currently generating a response.
@@ -728,6 +745,85 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
   return INCOMPLETE_WORK_PATTERNS.some((re) => re.test(content));
 }
 
+// Deterministic, TOOL-CALL-based completion detector for scheduled runs (ENG-518).
+//
+// Some workflows split a mutation into a dry-run PREVIEW tool and a write-back
+// EXECUTE tool (the preview samples the result and its description tells the
+// model to confirm with the user before committing). In a scheduled, unattended
+// run the model can present the preview samples as if they were the deliverable
+// and end the turn — the enrichment is previewed but never committed. The
+// text/flag-based classifier above cannot see this: the closing text need not
+// admit anything or ask to confirm, so the gate lets the run finish mid-pipeline.
+//
+// This maps each preview tool to the execute tool that commits its result. If a
+// scheduled run previewed a list but never ran the execute counterpart FOR THAT
+// SAME LIST, the run stopped before write-back and needs one more continuation.
+const PREVIEW_EXECUTE_TOOL_PAIRS: Record<string, string> = {
+  enrich_leads_preview: 'enrich_leads_execute',
+};
+
+// The tool call arg identifying which CRM list a preview/execute call targeted.
+// list_id is a required arg on both tools; `arguments` is normally the parsed
+// object, but a preflight-failure path can carry the raw JSON string, so handle
+// both shapes.
+function previewExecuteListId(toolCall: any): string | null {
+  const args = toolCall?.arguments;
+  if (!args) return null;
+  if (typeof args === 'string') {
+    try {
+      const parsed = JSON.parse(args);
+      return typeof parsed?.list_id === 'string' ? parsed.list_id : null;
+    } catch {
+      return null;
+    }
+  }
+  return typeof args.list_id === 'string' ? args.list_id : null;
+}
+
+// Deterministic, PER-LIST, RESULT-AWARE detector for the preview→write-back gap.
+//
+// Takes the whole run's accumulated tool-call objects ({ name, arguments, result }).
+// For each preview/execute pair it fires only when a list was previewed AND the
+// engine confirmed that preview is enrichable (processedCount > 0) AND no execute
+// ran for that same list_id. This deliberately does NOT fire for:
+//   - a list whose preview resolved nobody (processedCount 0): forcing a write there
+//     would loop on an unenrichable list and commit nothing useful; and
+//   - a list already committed by its execute call (per-list, so a partial
+//     multi-list run still fires for the lists that were NOT executed).
+// Both narrowings keep the gate from commanding CRM writes a preview never warranted.
+export function scheduledRunPreviewedWithoutExecute(toolCalls: any[]): boolean {
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) return false;
+  return Object.entries(PREVIEW_EXECUTE_TOOL_PAIRS).some(([previewTool, executeTool]) => {
+    const enrichablePreviewedLists = new Set<string>();
+    const executedLists = new Set<string>();
+    for (const tc of toolCalls) {
+      const listId = previewExecuteListId(tc);
+      if (!listId) continue;
+      if (tc?.name === previewTool) {
+        if (Number(tc?.result?.processedCount) > 0) enrichablePreviewedLists.add(listId);
+      } else if (tc?.name === executeTool) {
+        // Only a SUCCESSFUL write-back closes the gap. An execute closes a list
+        // when it (a) did not throw, (b) persisted at least one record
+        // (processedCount > 0), and (c) had NO write-back failure
+        // (failureBreakdown.updateFailed === 0). A thrown/zero-write execute, or one
+        // that produced values but failed to PERSIST some of them (updateFailed > 0
+        // — a genuine uncommitted write, distinct from a lead the engine simply
+        // could not resolve or find data for), leaves the enrichment uncommitted, so
+        // the gate keeps chasing (bounded by completionGateMaxContinuations) to
+        // retry the write instead of silently accepting a partially-persisted list.
+        const r = tc?.result;
+        const persistedSomething = Number(r?.processedCount) > 0;
+        const hadWriteFailure = Number(r?.failureBreakdown?.updateFailed) > 0;
+        if (!tc?.error && persistedSomething && !hadWriteFailure) executedLists.add(listId);
+      }
+    }
+    for (const listId of enrichablePreviewedLists) {
+      if (!executedLists.has(listId)) return true;
+    }
+    return false;
+  });
+}
+
 // Deterministic detector for the ENG-369 failure mode: a scheduled/unattended
 // run that halted to ask a HUMAN to confirm/approve before proceeding, when no
 // human is present to answer — so the task dead-ends with no deliverable.
@@ -819,7 +915,7 @@ export function scheduledRunAwaitsConfirmation(content: string): boolean {
 // The distinct reasons a scheduled run's latest turn needs one more
 // continuation before it can be considered finished. null = no continuation
 // needed. Ordered by precedence when more than one signal is present.
-export type ScheduledContinuationReason = 'budget' | 'confirmation' | 'unfinished';
+export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmation' | 'unfinished';
 
 // Classify why (if at all) a scheduled run's latest turn needs a continuation:
 //   (a) 'budget' — the run was truncated because it exhausted its step budget
@@ -833,13 +929,19 @@ export type ScheduledContinuationReason = 'budget' | 'confirmation' | 'unfinishe
 //       before proceeding, with no human present to answer (ENG-369); or
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
 //       (scheduledRunSignalsIncompleteWork).
-// Budget truncation takes precedence (it is a hard state signal); a
+// A 'preview-only' write-back gap (ENG-518) takes precedence over everything: it
+// is a hard, tool-call-based fact (a list was previewed as enrichable but its
+// execute counterpart never committed it) that stays true whatever the closing
+// text said, and its continuation message is the most specific ("commit the
+// write-back now"). Budget truncation comes next (also a hard state signal); a
 // confirmation halt takes precedence over a plain unfinished-work admission so
 // the continuation message can be tailored to "proceed best-effort".
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  toolCalls?: any[];
 }): ScheduledContinuationReason | null {
+  if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
@@ -852,6 +954,7 @@ export function classifyScheduledContinuation(response: {
 export function scheduledRunSignalsIncompleteResponse(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  toolCalls?: any[];
 }): boolean {
   return classifyScheduledContinuation(response) !== null;
 }
@@ -914,7 +1017,9 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
 export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  toolCalls?: any[];
 }): Promise<ScheduledContinuationReason | null> {
+  if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (await scheduledTurnDefersToUser(content)) return 'confirmation';
@@ -945,6 +1050,16 @@ type RunVerifiedChatResult = {
   // scheduled caller maps this to a `pending_user_input` outcome and notifies.
   parked?: boolean;
   pendingUserQuestion?: PendingUserQuestion;
+  // ENG-636: set when a run had to stop on a blocking question but the caller has
+  // NO channel to reach a human (headless, fire-and-forget). The run failed
+  // explicitly instead of parking into a void; there is no pendingUserQuestion to
+  // answer. Distinct from `parked` so monitoring/callers can tell the two apart.
+  parkedUnnotifiable?: boolean;
+  // ENG-635: the run met its tool/keyword requirements but its final turn still
+  // deferred to an absent human (completion gate exhausted while still asking to
+  // confirm). `success` stays true (a deliverable existed for HTTP callers), but the
+  // SCHEDULED path treats this as a failed run (records failure + oncall).
+  deferredUnresolved?: boolean;
 };
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -971,6 +1086,22 @@ export async function runVerifiedChat(
     // for IMMUTABLE questions. This is a deliberate, default-off WAIVER of the
     // human protection on irreversible decisions (owner opted in per-schedule).
     fullAutonomy?: boolean;
+    // ENG-636: does a PARK on this run actually reach a human? Only true for
+    // callers with a notification/answer channel: runScheduledChat (owner email)
+    // and the interactive verifiedGenerate endpoint (the live session renders the
+    // pendingUserQuestion card). Default FALSE so any headless, fire-and-forget
+    // caller (resultEndpoint, imageReports, slack/humanEval/revision) is fail-safe:
+    // an unanswerable park is surfaced as an explicit `parkedUnnotifiable` failure
+    // rather than dropped into a void no one will ever action. Fail-safe default
+    // means a NEW headless caller is covered automatically (no drift).
+    parkNotifiable?: boolean;
+    // ENG-657: tool calls already made in a PRIOR (abandoned) portion of this
+    // session that this run is RESUMING. Seeded into the run's accumulated tool
+    // calls so keyword/required-function verification counts the whole task, not
+    // just the continuation turns — otherwise a resumed run would be wrongly marked
+    // `passed: false` for calls it made before the interruption, and the verify
+    // retry loop could re-prompt the model into re-running a completed side-effect.
+    priorToolCalls?: Array<{ name: string }>;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -983,7 +1114,8 @@ export async function runVerifiedChat(
     attachments = [],
     completionGate = false,
     completionGateMaxContinuations = 2,
-    fullAutonomy = false
+    fullAutonomy = false,
+    parkNotifiable = false
   } = params;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
@@ -1097,8 +1229,13 @@ export async function runVerifiedChat(
     remainingFunctionCallCounts[reqFunc.functionName] = reqFunc.minCount;
   });
 
-  // Track all function calls across attempts.
-  const allActualFunctionCallsForReporting: string[] = [];
+  // Track all function calls across attempts. ENG-657: on a resume, seed with the
+  // tool calls the abandoned portion already made so requiredFunctionCalls counts
+  // the whole task — otherwise a resumed run is falsely marked incomplete and the
+  // verify loop could re-prompt the model into re-running a completed side effect.
+  const allActualFunctionCallsForReporting: string[] = Array.isArray(params.priorToolCalls)
+    ? params.priorToolCalls.map((c) => c.name).filter(Boolean)
+    : [];
 
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
@@ -1113,11 +1250,19 @@ export async function runVerifiedChat(
   // have left an unanswered blocking AskUserQuestion (the tool handler persisted
   // it via updateSessionAskUserQuestion). Handle it identically at BOTH LLM call
   // sites so the park guarantee can never be bypassed: re-read from the DB (never
-  // trust a stale in-memory blank), then AUTO-TAKE Emma's recommended option under
-  // full autonomy (bounded, logged as a delegation — a deliberate per-schedule
-  // WAIVER of the human protection on irreversible decisions), otherwise PARK and
-  // stop rather than proceed on a guess. Returns 'autoTake' (caller retries), a
-  // 'park' result to return, or null when no question is awaiting.
+  // trust a stale in-memory blank), then decide between AUTO-TAKE and PARK.
+  //
+  // ENG-517: a headless/scheduled run must NOT block on a REVERSIBLE question —
+  // a data shortfall, report-scope choice, etc. has an obvious safe default
+  // (Emma's recommended option), so auto-take it and keep going rather than
+  // parking and never delivering. IMMUTABLE questions (e.g. the Meta campaign
+  // objective) still PARK unless the schedule opted into full autonomy — those
+  // are the irreversible decisions a human must own (auto-taking one is the
+  // deliberate per-schedule WAIVER that `fullAutonomy` represents).
+  //
+  // Either way the auto-take is bounded (MAX_AUTO_TAKES) and logged as a
+  // delegation. Returns 'autoTake' (caller retries), a 'park' result to return,
+  // or null when no question is awaiting.
   const resolveAwaitingUserQuestion = async (): Promise<
     { action: 'autoTake' } | { action: 'park'; result: RunVerifiedChatResult } | null
   > => {
@@ -1125,54 +1270,93 @@ export async function runVerifiedChat(
     if (postTurnSession?.pendingUserQuestion?.status !== 'awaiting') return null;
     const pending = postTurnSession.pendingUserQuestion;
 
-    if (fullAutonomy && autoTakesUsed < MAX_AUTO_TAKES) {
+    // Reversible questions auto-proceed in any headless run; immutable ones only
+    // when the schedule explicitly waived the human protection (full autonomy).
+    const canAutoTake = fullAutonomy || pending.immutable !== true;
+    if (canAutoTake && autoTakesUsed < MAX_AUTO_TAKES) {
       autoTakesUsed++;
       const answered = resolveInboundAnswer(pending, { delegated: true }, new Date().toISOString());
       await chatbotDb.updateSessionAskUserQuestion(sessionId, answered, {
         requireStillAwaiting: pending.questionId,
       });
       const chosen = answered.options.find(o => o.id === answered.answer!.optionId);
+      const takeKind = fullAutonomy && pending.immutable === true ? 'full-autonomy' : 'reversible-default';
       console.log(
-        `AgentMode runVerifiedChat: full-autonomy auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
+        `AgentMode runVerifiedChat: ${takeKind} auto-take on session ${sessionId} — question ${pending.questionId} → "${chosen?.label}" (delegation); continuing`
       );
       // Breadcrumb in history so Emma sees the decision and resumes without
       // re-asking (best-effort; the persisted answer is the source of truth).
+      // Label the breadcrumb by the actual session, not the trigger: runVerifiedChat
+      // is also invoked from non-scheduled callers (verifiedGenerate, slack revision,
+      // revisionService, humanEvalActionService, imageReports), so hardcoding
+      // '[Scheduled run]' would write a false label into those sessions' history.
+      const breadcrumbPrefix =
+        fullAutonomy && pending.immutable === true
+          ? '[Full autonomy]'
+          : postTurnSession.sessionType === 'scheduled'
+            ? '[Scheduled run]'
+            : '[Auto-proceed]';
       try {
         await chatbotDb.addMessageToSession(sessionId, {
           role: 'user',
-          content: `[Full autonomy] Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
+          content: `${breadcrumbPrefix} Proceed with "${chosen?.label}"${answered.answer?.rationale ? ` — ${answered.answer.rationale}` : ''}.`,
           timestamp: new Date().toISOString(),
           metadata: { timestamp: new Date().toISOString(), autoDelegatedAnswer: true, questionId: pending.questionId } as any,
         });
       } catch (breadcrumbError) {
-        console.error('Failed to persist full-autonomy auto-take breadcrumb:', breadcrumbError);
+        console.error('Failed to persist auto-take breadcrumb:', breadcrumbError);
       }
       return { action: 'autoTake' };
     }
 
-    console.log(
-      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}) awaiting a selection; run will not proceed on a guess`
+    // Shared failure body for both park variants below.
+    const stopResultBase = {
+      success: false as const,
+      content: allContent,
+      toolCalls: allToolCalls,
+      keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+      keywordMisses: remainingKeywords,
+      functionCallMatches: [] as string[],
+      functionCallMisses: requiredFunctions.map(f => f.functionName),
+      functionStatus: requiredFunctions.map(reqFunc => ({
+        functionName: reqFunc.functionName,
+        requiredCount: reqFunc.minCount,
+        actualCount: countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting),
+        met: false,
+      })),
+      attempts: attempt,
+      workPlanCompleted: false,
+    };
+
+    // ENG-636: a PARK only makes sense when a human will actually see and answer
+    // the question. Callers with a notification/answer channel (scheduled →
+    // owner email; interactive verifiedGenerate → live session card) set
+    // parkNotifiable. Headless, fire-and-forget callers do NOT — for them a park
+    // is a dead end: no one is told, no one can answer, and the run silently
+    // delivers nothing. In that case FAIL EXPLICITLY (parkedUnnotifiable) instead
+    // of returning a pendingUserQuestion nobody will ever action. This is the
+    // correct terminal behavior for an IMMUTABLE question too: we must never
+    // auto-decide an irreversible choice, and the write gate still blocks the
+    // action — so an honest, monitorable failure is the safe outcome.
+    if (!parkNotifiable) {
+      console.error(
+        `AgentMode runVerifiedChat: session ${sessionId} hit a blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) after ${autoTakesUsed} auto-take(s), but this run has NO channel to reach a human (parkNotifiable=false). Failing explicitly rather than parking into a void — no deliverable, no one to answer (ENG-636).`
+      );
+      return {
+        action: 'park',
+        result: { ...stopResultBase, parkedUnnotifiable: true },
+      };
+    }
+
+    console.warn(
+      `AgentMode runVerifiedChat: parking session ${sessionId} — blocking user question (${pending.questionId}, immutable=${pending.immutable === true}) awaiting a human selection after ${autoTakesUsed} auto-take(s); run will not proceed on a guess. A human will be notified (scheduled owner email / interactive card).`
     );
     return {
       action: 'park',
       result: {
-        success: false,
+        ...stopResultBase,
         parked: true,
         pendingUserQuestion: postTurnSession.pendingUserQuestion,
-        content: allContent,
-        toolCalls: allToolCalls,
-        keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
-        keywordMisses: remainingKeywords,
-        functionCallMatches: [],
-        functionCallMisses: requiredFunctions.map(f => f.functionName),
-        functionStatus: requiredFunctions.map(reqFunc => ({
-          functionName: reqFunc.functionName,
-          requiredCount: reqFunc.minCount,
-          actualCount: countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting),
-          met: false,
-        })),
-        attempts: attempt,
-        workPlanCompleted: false,
       },
     };
   };
@@ -1191,7 +1375,24 @@ export async function runVerifiedChat(
         // to proceed best-effort rather than to "finish remaining entities" (ENG-369).
         completionGateContinue = false;
         userMessage =
-          completionGateReason === 'budget'
+          completionGateReason === 'preview-only'
+            ? 'Your previous run produced enrichment PREVIEWS (a dry-run sample) but ' +
+              'never committed them with the write-back step (enrich_leads_execute), and ' +
+              'a preview does not change any data. This is an automated run with no human ' +
+              'present — do NOT wait for confirmation or approval. Act on what THIS ' +
+              "scheduled task actually asked for:\n" +
+              '• If the task asked you to ENRICH, update, populate, refresh, or fill in ' +
+              'the leads (the usual case), you MUST now call enrich_leads_execute for ' +
+              'every list whose preview was enrichable (processedCount > 0), using the ' +
+              'same output_fields you previewed — do not merely describe what would ' +
+              'happen; actually run the write-back. Skip only a list whose preview ' +
+              'failed (processedCount === 0 with identityResolutionFailed > 0).\n' +
+              '• If, and only if, the task EXPLICITLY asked to preview / sample / show ' +
+              'what enrichment WOULD do WITHOUT changing the data, do NOT call ' +
+              'enrich_leads_execute — deliver that preview report instead.\n' +
+              'Then complete the rest of the requested workflow (e.g. recommendations, ' +
+              'drafts) and produce the final report.'
+          : completionGateReason === 'budget'
             ? 'The previous run was cut short because it exhausted its processing-step ' +
               'budget before it could produce the final deliverable. Using the data ' +
               'already gathered, produce the final consolidated report now. Surface any ' +
@@ -1237,8 +1438,14 @@ export async function runVerifiedChat(
         if (continuationQuestion?.action === 'park') {
           return continuationQuestion.result;
         }
-        // Re-evaluate the gate against the continuation's own output.
-        const continuationReason = await classifyScheduledContinuationAsync(continuationResponse);
+        // Re-evaluate the gate against the continuation's own output. Pass the
+        // whole run's accumulated tool-call objects (name + arguments + result) so a
+        // still-uncommitted per-list preview→execute gap (ENG-518) keeps the gate
+        // firing until the write-back actually runs for every enrichable list.
+        const continuationReason = await classifyScheduledContinuationAsync({
+          ...continuationResponse,
+          toolCalls: allToolCalls,
+        });
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -1250,9 +1457,27 @@ export async function runVerifiedChat(
           await waitForVerifiedChatRetry(attempt);
           continue;
         }
-        // Continuation produced no further "unfinished" admission → done.
+        // ENG-635: the continuation budget (or attempt budget) is exhausted. If this
+        // final continuation STILL defers the task to an absent human (a 'confirmation'
+        // halt) rather than delivering, the run produced no real deliverable. Flag it
+        // via `deferredUnresolved` (rather than flipping `success`) so the SCHEDULED
+        // path records a failure + oncall, WITHOUT changing the success/HTTP contract
+        // for non-scheduled callers (imageReports/revision/etc.) — those met their
+        // required tool calls, so a deliverable DID exist and they must not 500.
+        // Scoped to 'confirmation' only: an 'unfinished'/'budget' turn that still
+        // surfaces a partial report with actionable next-steps is a valid terminal state.
+        const haltedUnresolved = continuationReason === 'confirmation';
+        if (haltedUnresolved) {
+          console.warn(
+            `AgentMode runVerifiedChat: session ${sessionId} exhausted the completion gate ` +
+            `(${completionGateContinuationsUsed}/${completionGateMaxContinuations}) but the final turn still ` +
+            `defers to the user — flagging deferredUnresolved (scheduled runs record a failure).`
+          );
+        }
+        // Continuation produced no further blocking signal (or an accepted partial) → done.
         return {
           success: true,
+          deferredUnresolved: haltedUnresolved,
           content: allContent,
           toolCalls: allToolCalls,
           keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
@@ -1407,7 +1632,13 @@ export async function runVerifiedChat(
         completionGateContinuationsUsed < completionGateMaxContinuations &&
         attempt < maxAttempts;
       const responseContinuationReason = gateEligible
-        ? await classifyScheduledContinuationAsync(response)
+        ? await classifyScheduledContinuationAsync({
+            ...response,
+            // Preview→execute detection needs the whole run's tool-call objects
+            // (name + arguments + result), not just this turn's — an earlier attempt
+            // may hold the unmatched, still-uncommitted preview.
+            toolCalls: allToolCalls,
+          })
         : null;
       if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
@@ -1558,12 +1789,17 @@ function getZeroAssistantRequeueDelayMs(retryCount: number): number {
 }
 
 // Common function to run a scheduled chat (used by both test and actual execution)
+//
+// ENG-446: the run result IS the run envelope. It carries the canonical
+// marketing-action payload (MarketingActionCarrier — optional, because legacy
+// runs carry none) alongside the existing output, and is persisted verbatim by
+// scheduleDb.addRunResult, so no separate action storage path exists.
 export async function runScheduledChat(
   schedule: any,
   userId: string,
   isTest: boolean = false,
   preGeneratedRunId?: string
-): Promise<{
+): Promise<MarketingActionCarrier & {
   scheduleId: string;
   runId: string;
   // ENG-396: 'pending_user_input' when the run parked on a blocking AskUserQuestion.
@@ -1801,35 +2037,303 @@ export async function runScheduledChat(
     // annotation, but still requeues the run).
     if (!isTest) {
       try {
-        await scheduleDb.setRunInFlight(schedule.scheduleId, {
+        const leaseOutcome = await scheduleDb.setRunInFlight(schedule.scheduleId, {
           runId: leaseRunId,
           sessionId: '',
           startedAt: new Date().toISOString(),
           instanceId: SCHEDULED_RUN_INSTANCE_ID,
         });
-        leaseAcquired = true;
-        heartbeatTimer = setInterval(() => {
-          void scheduleDb.heartbeatRunInFlight(schedule.scheduleId, leaseRunId);
-        }, HEARTBEAT_INTERVAL_MS);
-        if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+        if (leaseOutcome === 'already_in_flight') {
+          // Another dispatcher already owns this schedule's run right now (a real
+          // cross-instance race, not hypothetical). Bail out completely — no session,
+          // no resume check, nothing — rather than proceed alongside it and risk
+          // clobbering its lease later via our own (conditional-on-our-runId) clear.
+          console.warn(`runScheduledChat: schedule ${schedule.scheduleId} already has an active in-flight run on another dispatcher; skipping this concurrent dispatch.`);
+          return {
+            scheduleId: schedule.scheduleId,
+            runId: leaseRunId,
+            status: 'success' as const,
+            passed: false,
+            actualResponse: 'Scheduled run skipped: this schedule is already being run by another dispatcher.',
+            actualFunctionCalls: [],
+            keywordMatches: [],
+            keywordMisses: schedule.keywords || [],
+            functionCallMatches: [],
+            functionCallMisses: schedule.requiredFunctionCalls || [],
+            executionTime: 0,
+            sessionId: '',
+            attempt: 0,
+            createdAt: new Date().toISOString(),
+          };
+        }
+        leaseAcquired = leaseOutcome === 'acquired';
+        if (leaseAcquired) {
+          heartbeatTimer = setInterval(() => {
+            void scheduleDb.heartbeatRunInFlight(schedule.scheduleId, leaseRunId);
+          }, HEARTBEAT_INTERVAL_MS);
+          if (typeof heartbeatTimer.unref === 'function') heartbeatTimer.unref();
+        }
       } catch (leaseError) {
+        // leaseAcquired stays false here — this is NOT swallowed as a tolerable
+        // no-lease continuation. The guard immediately below refuses to run this
+        // dispatch at all without a durable lease (Greptile: a lease failure must
+        // not let a session run untracked).
         console.error(`Failed to set in-flight lease for schedule ${schedule.scheduleId}:`, leaseError);
       }
     }
 
-    // Create a session for the run.
-    const testSession = await chatbotDb.createChatSession(
-      userId,
-      undefined,
-      "agent",
-      pageIdentifier,
-      undefined,
-      undefined,
-      undefined,
-      schedule.emailCampaignTaskId,
-      'scheduled' // sessionType
-    );
-    sessionId = testSession.sessionId;
+    // A deferred fire returns cleanly (no exception), so it does NOT leave a stale
+    // lease for the reconciler to catch — unlike a crash, nothing will retry it soon
+    // on its own. And the dispatch loop already advanced nextRunTime to the FULL next
+    // cadence *before* calling into this run (to prevent double-dispatch), so without
+    // this, a defer would silently wait a full cycle instead of retrying shortly —
+    // worse than the crash case it exists to avoid (Greptile). Mirror the
+    // reconciler's own short, bounded backoff so a defer gets another attempt soon,
+    // capped by the same requeue limit so a persistently un-resumable schedule still
+    // eventually falls back to its normal cadence instead of retrying forever.
+    const scheduleRetrySoon = async () => {
+      const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+      if (nextRetryCount > ZERO_ASSISTANT_MAX_REQUEUES) return;
+      try {
+        await scheduleDb.updateSchedule(schedule.scheduleId, {
+          nextRunTime: new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString(),
+          zeroAssistantRetryCount: nextRetryCount,
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (retryScheduleError) {
+        console.error(`runScheduledChat: failed to schedule a short retry after a no-lease defer for ${schedule.scheduleId}:`, retryScheduleError);
+      }
+    };
+
+    // Require a durable lease before running ANY non-test scheduled dispatch, not
+    // just resume (Greptile). Without this, a lease-establishment failure let a
+    // FRESH session get created and run untracked: a kill during that run would be
+    // invisible to the reconciler (no lease to find), so the abandoned session's
+    // final deliverable would just never arrive, with nothing to auto-heal it.
+    // Defer and retry shortly instead of running blind.
+    if (!isTest && !leaseAcquired) {
+      console.warn(`runScheduledChat: no durable lease for schedule ${schedule.scheduleId}; skipping this dispatch rather than running untracked.`);
+      await scheduleRetrySoon();
+      return {
+        scheduleId: schedule.scheduleId,
+        runId: leaseRunId,
+        status: 'success' as const,
+        passed: false,
+        actualResponse: 'Scheduled run deferred (no-lease): could not establish a durable in-flight lease; will retry shortly rather than run untracked.',
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+    }
+
+    // ENG-657: resume path. When the reconciler marked this schedule to resume an
+    // abandoned session (it ended on a safe boundary), CONTINUE that session from
+    // its last completed step instead of creating a fresh one and re-running the
+    // whole task. The marker is consumed unconditionally (at-most-once resume);
+    // anything off — session gone, wrong owner, or no longer safely resumable —
+    // falls back to a normal fresh run, so this is strictly additive.
+    let isResumeRun = false;
+    // ENG-657: tool calls the abandoned portion already made, seeded into the
+    // resumed run's verification so requiredFunctionCalls counts the whole task.
+    let resumePriorToolCalls: Array<{ name: string }> = [];
+    const pendingResumeSessionId: string | undefined =
+      !isTest && typeof schedule.pendingResumeSessionId === 'string' && schedule.pendingResumeSessionId
+        ? schedule.pendingResumeSessionId
+        : undefined;
+    if (pendingResumeSessionId) {
+      // A benign "deferred" result for the bow-out paths below. The resume-marker path
+      // is resume-OR-BOW-OUT: it must NEVER fall through to a fresh restart, because a
+      // restart re-runs the whole task — duplicating the already-completed CRM writes /
+      // emails the marker exists to continue past. When we can't resume, we defer:
+      // recovery is left to the claim winner or the reconciler. Records no run result
+      // (returns before addRunResult) and no sessionId (no email/scoring of a non-run);
+      // the in-flight lease is released by the `finally` on return.
+      const deferredResumeResult = (reason: string) => ({
+        scheduleId: schedule.scheduleId,
+        runId: leaseRunId,
+        status: 'success' as const, // no error occurred — recovery is simply deferred
+        passed: false,
+        actualResponse: `Scheduled run deferred (${reason}): resume of the abandoned session is being handled by the claim winner or the reconciler; no duplicate execution was performed.`,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      });
+
+      // scheduleRetrySoon is defined above (shared with the general no-lease bail-out)
+      // and a durable lease is already guaranteed by this point — the no-lease case
+      // returns before ever reaching pendingResumeSessionId, above.
+
+      // Load + validate BEFORE claiming, so a transient read failure never consumes
+      // the marker or triggers a restart — the marker persists and a later fire retries.
+      let resumeSession: any;
+      let loadThrew = false;
+      try {
+        resumeSession = await chatbotDb.getChatSession(pendingResumeSessionId);
+      } catch (resumeError) {
+        loadThrew = true;
+        console.error(`runScheduledChat: failed to load resume session ${pendingResumeSessionId}; leaving the marker for a later retry (no restart):`, resumeError);
+      }
+
+      if (loadThrew) {
+        // Transient load failure: marker left intact for the next fire; do not restart.
+        await scheduleRetrySoon();
+        return deferredResumeResult('load-error');
+      }
+
+      const canResume =
+        !!resumeSession &&
+        resumeSession.userId === userId &&
+        planScheduledRunResume((resumeSession.messages || []) as any).resumable;
+
+      if (!canResume) {
+        // Marker present but the session can't be safely resumed now (missing / owner
+        // mismatch / no-longer-safe boundary — a rare race, since the reconciler only
+        // marks resumable sessions). A retry-soon here would eventually land a fresh
+        // restart of the same task, re-running the abandoned session's already-
+        // completed side effects — the exact thing this whole resume-or-bow-out path
+        // exists to prevent (Greptile). Auto-restart is not a safe recovery for this
+        // one; PAUSE the schedule and alert oncall instead, so a human decides rather
+        // than an automatic retry silently duplicating real-world side effects.
+        //
+        // Claim the marker and pause in ONE atomic conditional write (Greptile),
+        // not two sequential steps — a separately-claimed-then-retried-pause can
+        // split (claim succeeds, every pause write then fails), leaving an ACTIVE
+        // schedule with no resume identity that a later fire restarts from scratch.
+        // A single atomic write can't partially apply: any failure (lost race or
+        // transient) leaves the marker untouched, safe to retry.
+        let pauseOutcome: 'paused' | 'lost_claim' | 'error' = 'error';
+        for (let attempt = 0; attempt < 3 && pauseOutcome === 'error'; attempt++) {
+          pauseOutcome = await scheduleDb.claimAndPauseUnresumable(schedule.scheduleId, pendingResumeSessionId);
+        }
+        if (pauseOutcome === 'lost_claim') {
+          console.warn(`runScheduledChat: lost the claim while marking session ${pendingResumeSessionId} unresumable; another dispatcher owns this schedule's recovery — not pausing.`);
+          return deferredResumeResult('not-resumable-unowned');
+        }
+        if (pauseOutcome === 'error') {
+          // Marker is still intact — the atomic write never partially applied — so
+          // retrying soon is safe: no duplicate-effect risk, unlike a consumed-but-
+          // unpaused marker would carry.
+          console.error(`runScheduledChat: failed to claim+pause schedule ${schedule.scheduleId} after 3 attempts; marker left intact for a later retry (no duplicate-effect risk).`);
+          await scheduleRetrySoon();
+          return deferredResumeResult('not-resumable-pause-failed');
+        }
+        console.warn(`runScheduledChat: resume marker for session ${pendingResumeSessionId} no longer resumable; paused schedule (no auto-restart, to avoid duplicate side effects) and alerting oncall.`);
+        void fileAutoIssue({
+          title: `Scheduled Chat auto-paused: ${schedule.scheduleName}`,
+          description: `Schedule "${schedule.scheduleName}" had an abandoned run (session ${pendingResumeSessionId}) that the reconciler marked resumable, but it was no longer safely resumable by the time this dispatch ran. Auto-restarting would risk re-running the abandoned session's already-completed side effects (e.g. CRM writes, emails), so the schedule has been paused instead of auto-retried. Review the session and re-enable the schedule manually.`,
+          source: 'Scheduled chat (resume)',
+          extraLabels: ['Scheduled Chat'],
+          notionTags: ['Scheduled Chat'],
+          notionContext: {
+            'Schedule ID': schedule.scheduleId,
+            'User ID': userId,
+            'Abandoned Session ID': pendingResumeSessionId,
+          },
+        })
+          .catch(err => console.error('Failed to file auto-pause issue for unresumable abandoned session:', err))
+          .then(() => sendAgentModeOncallAlert({
+            subject: `Scheduled Chat auto-paused: ${schedule.scheduleName}`,
+            message: `Abandoned session ${pendingResumeSessionId} was marked resumable by the reconciler but was no longer safely resumable at dispatch time. Paused the schedule rather than auto-restart (which would risk duplicate side effects). Needs manual review.`,
+            sessionId: pendingResumeSessionId,
+            context: {
+              'Schedule ID': schedule.scheduleId,
+              'Schedule Name': schedule.scheduleName,
+              'User ID': userId,
+              'Abandoned Session ID': pendingResumeSessionId,
+            },
+          }))
+          .catch(err => console.error('Failed to send oncall alert for auto-paused schedule:', err));
+        return deferredResumeResult('not-resumable-paused');
+      }
+
+      // Attach the resumed session to the lease BEFORE claiming the marker, not after.
+      // Closes a race Greptile flagged: a kill landing between claimPendingResume
+      // succeeding and the (formerly later) attach call left the lease's sessionId
+      // empty, so the reconciler saw an empty-session abandonment and requeued a
+      // fresh restart — re-running this session's already-completed side effects.
+      // Attaching first means the lease already names the right session no matter
+      // when a kill lands after this point — PROVIDED the attach itself lands. If it
+      // doesn't (Greptile, round 2), the marker is still intact (not yet claimed), so
+      // defer rather than proceed on an unconfirmed lease — a later fire retries.
+      if (leaseAcquired) {
+        let attached = false;
+        try {
+          attached = await scheduleDb.attachSessionToRunInFlight(schedule.scheduleId, leaseRunId, pendingResumeSessionId);
+        } catch (attachError) {
+          console.error(`Failed to attach resume session to in-flight lease for schedule ${schedule.scheduleId}:`, attachError);
+        }
+        if (!attached) {
+          console.warn(`runScheduledChat: could not attach resume session ${pendingResumeSessionId} to lease for schedule ${schedule.scheduleId}; deferring (marker left intact for a later retry).`);
+          await scheduleRetrySoon();
+          return deferredResumeResult('attach-error');
+        }
+      }
+
+      // Atomically CLAIM: exactly one dispatcher wins and resumes this session; any
+      // concurrent dispatcher loses and bows out (never a parallel resume or a restart).
+      let won = false;
+      try {
+        won = await scheduleDb.claimPendingResume(schedule.scheduleId, pendingResumeSessionId);
+      } catch (claimError) {
+        console.error(`runScheduledChat: resume claim error for session ${pendingResumeSessionId}; deferring:`, claimError);
+        await scheduleRetrySoon();
+        return deferredResumeResult('claim-error');
+      }
+      if (!won) {
+        console.warn(`runScheduledChat: lost the resume claim for session ${pendingResumeSessionId} on schedule ${schedule.scheduleId} (another dispatcher is resuming it); deferring — no fresh restart.`);
+        // No retry-soon here: the winner is actively resuming this same schedule's
+        // session right now — a fast re-fire would just lose the claim again.
+        return deferredResumeResult('lost-claim');
+      }
+
+      // Won the claim on a validated, resumable session — continue it.
+      // NOTE: the reconciler does not append a jobIncomplete placeholder on the
+      // resumable path, and buildMarketingContext() drops any assistant message flagged
+      // metadata.isErrorMessage (covers both jobIncomplete and isRunFailureNotice), so
+      // no run-failure placeholder reaches the model on resume even though the worker
+      // reloads the full transcript from the DB.
+      isResumeRun = true;
+      sessionId = pendingResumeSessionId;
+      // Credit the abandoned portion's tool calls to this run's verification.
+      resumePriorToolCalls = (resumeSession.messages || []).flatMap((m: any) => {
+        const calls = (Array.isArray(m?.tool_calls) && m.tool_calls.length)
+          ? m.tool_calls
+          : (Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : []);
+        return calls
+          .map((tc: any) => tc?.function?.name || tc?.name)
+          .filter(Boolean)
+          .map((name: string) => ({ name }));
+      });
+      console.log(`runScheduledChat: RESUMING abandoned session ${sessionId} for schedule ${schedule.scheduleId} (${schedule.scheduleName}); ${resumePriorToolCalls.length} prior tool call(s) carried into verification`);
+    }
+
+    // Create a session for the run (skipped when resuming an existing one).
+    if (!isResumeRun) {
+      const testSession = await chatbotDb.createChatSession(
+        userId,
+        undefined,
+        "agent",
+        pageIdentifier,
+        undefined,
+        undefined,
+        undefined,
+        schedule.emailCampaignTaskId,
+        'scheduled' // sessionType
+      );
+      sessionId = testSession.sessionId;
+    }
 
     // Attach the freshly-created session to the lease so the reconciler's recovery
     // annotates the correct session if this run is later abandoned. Best-effort:
@@ -1860,11 +2364,16 @@ export async function runScheduledChat(
       minCount: functionCallMinCalls[funcName] || 1
     }));
 
-    const resolvedStartingMessage = applyScheduledChatVariableValues(
-      schedule.startingMessage,
-      schedule.variableValues || {},
-      scheduleVariables
-    );
+    // On a resume, the original task prompt is already the first message of the
+    // session being continued; re-sending it would make the model start over. Send
+    // a continuation directive instead so it picks up from the last completed step.
+    const resolvedStartingMessage = isResumeRun
+      ? SCHEDULED_RUN_RESUME_MESSAGE
+      : applyScheduledChatVariableValues(
+          schedule.startingMessage,
+          schedule.variableValues || {},
+          scheduleVariables
+        );
 
     // Extract file attachments from file-type variables
     const fileAttachments = extractFileAttachmentsFromVariables(
@@ -1887,13 +2396,19 @@ export async function runScheduledChat(
       maxAttempts: 20,
       attachments: fileAttachments,
       llmModel: schedule.llmModel || defaultModel,
+      // ENG-657: on a resume, count the abandoned portion's tool calls in
+      // verification so requiredFunctionCalls isn't falsely missed (empty otherwise).
+      priorToolCalls: resumePriorToolCalls,
       // Deterministic backstop for multi-entity scheduled runs (PR #1941 follow-up):
       // if the run admits it left work unfinished, auto-continue before finishing.
       completionGate: true,
       // ENG-396: opt-in per-schedule full autonomy — auto-take Emma's recommended
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
-      fullAutonomy: schedule.fullAutonomy === true
+      fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-636: a scheduled park IS notifiable — the block below emails the owner
+      // and records a `pending_user_input` outcome, so a park reaches a human.
+      parkNotifiable: true
     });
 
     // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
@@ -1991,11 +2506,16 @@ export async function runScheduledChat(
       };
     });
 
+    // ENG-635: a run that met its requirements but still deferred to an absent human
+    // (deferredUnresolved) produced no real deliverable — record it as a failure so it
+    // is surfaced (auto-issue + oncall) instead of scored as a clean run.
+    const runDelivered = result.success && !result.deferredUnresolved;
+
     const finalResult = {
       scheduleId: schedule.scheduleId,
       runId: preGeneratedRunId || require('uuid').v4(),
-      status: (result.success ? 'success' : 'failure') as 'success' | 'failure',
-      passed: result.success,
+      status: (runDelivered ? 'success' : 'failure') as 'success' | 'failure',
+      passed: runDelivered,
       actualResponse: result.content,
       actualFunctionCalls: actualFunctionCalls,
       keywordMatches: result.keywordMatches,
@@ -2333,30 +2853,58 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
     ? new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString()
     : undefined;
 
+  // ENG-657: decide whether the requeued run should RESUME this session from its
+  // last persisted step instead of restarting the task from scratch. Only when the
+  // transcript ends on a safe, balanced boundary (planScheduledRunResume) — a run
+  // killed mid-tool-execution is NOT resumed (never re-drive a half-applied side
+  // effect). Best-effort: any read/plan failure falls back to a fresh restart.
+  let resumeSessionId = '';
+  if (willRequeue && lease.sessionId) {
+    try {
+      const priorMessages = await chatbotDb.getMessagesFromMessagesTable(lease.sessionId);
+      if (planScheduledRunResume(priorMessages as any).resumable) {
+        resumeSessionId = lease.sessionId;
+      }
+    } catch (planError) {
+      console.error(`recoverAbandonedScheduledRun: resume-plan check failed for session ${lease.sessionId}, will restart fresh:`, planError);
+    }
+  }
+
   // Atomic single-winner claim. If another instance already reaped this lease the
   // conditional write fails and we return false without touching the session.
   const won = await scheduleDb.claimAbandonedRun(
     schedule.scheduleId,
     lease.runId,
     willRequeue
-      ? { nextRunTime: requeuedAt!, retryCount: nextRetryCount, sessionId: lease.sessionId || '', lastAt: nowIso }
+      ? { nextRunTime: requeuedAt!, retryCount: nextRetryCount, sessionId: lease.sessionId || '', lastAt: nowIso, ...(resumeSessionId ? { resumeSessionId } : {}) }
       : null
   );
   if (!won) return false;
 
   // We own the recovery. Make the orphaned session self-explanatory (best-effort).
+  // When the run will RESUME, do NOT append the "job incomplete" placeholder — the
+  // session is being continued, not given up on, and the placeholder would read to
+  // the model as an assistant turn that already quit. Record a non-terminal note so
+  // the state is still visible.
   if (lease.sessionId) {
     try {
-      await chatbotDb.addMessageToSession(lease.sessionId, {
-        role: 'assistant',
-        content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
-        timestamp: nowIso,
-        metadata: { timestamp: nowIso, isErrorMessage: true, jobIncomplete: true },
-      });
-      await chatbotDb.updateSessionError(
-        lease.sessionId,
-        'Scheduled run abandoned: the owning process terminated mid-run (recovered by reconciler).'
-      );
+      if (resumeSessionId) {
+        await chatbotDb.updateSessionError(
+          lease.sessionId,
+          'Scheduled run interrupted mid-run (instance terminated); queued to resume from the last completed step.'
+        );
+      } else {
+        await chatbotDb.addMessageToSession(lease.sessionId, {
+          role: 'assistant',
+          content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+          timestamp: nowIso,
+          metadata: { timestamp: nowIso, isErrorMessage: true, jobIncomplete: true },
+        });
+        await chatbotDb.updateSessionError(
+          lease.sessionId,
+          'Scheduled run abandoned: the owning process terminated mid-run (recovered by reconciler).'
+        );
+      }
     } catch (annotateError) {
       console.error(`recoverAbandonedScheduledRun: failed to annotate session ${lease.sessionId}:`, annotateError);
     }
@@ -2735,7 +3283,19 @@ export async function generateSessionResponse(
           if (scheduleIdMatch) {
             systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
           }
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType);
+          // Resolve the schedule owner's admin status so the directive only
+          // injects its admin-only (get_chat_history / list_all_clients) identity
+          // slice for admin-owned scheduled runs. Scoped to the scheduled branch,
+          // so this is one extra read only on scheduled runs. A prompt-enrichment
+          // lookup must never break the run, so a failed read degrades to the safe
+          // default (treat as non-admin → omit the admin-only slice).
+          let ownerIsAdmin = false;
+          try {
+            ownerIsAdmin = (await userDb.getUserById(session.userId))?.isAdmin === true;
+          } catch (adminLookupError) {
+            console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
+          }
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
@@ -2795,6 +3355,17 @@ export async function generateSessionResponse(
     throw new Error('Session not found after update');
   }
 
+  // Strip any harness crash/abandon placeholders (ENG-324 jobIncomplete, ENG-473
+  // isRunFailureNotice) from the history fed to the model — they are not real
+  // turns and reading one back would look like the assistant already gave up
+  // (Greptile, ENG-657: the resume planner already computes a placeholder-free
+  // resumeHistory, but the reload above re-fetches raw persisted messages,
+  // discarding that cleanup). Safe for every session, not just resumed ones —
+  // these placeholders are never meant to be replayed to the model as prior turns.
+  const sessionHistoryForWorker = (updatedSession.messages || []).filter(
+    (m: any) => !isRunFailurePlaceholder(m)
+  );
+
   // If this session is linked to a GTM work item, update status to agent_in_progress
   if (updatedSession.gtmWorkItem) {
     try {
@@ -2831,7 +3402,7 @@ export async function generateSessionResponse(
   const response = await generateMarketingResponseWorkerService.runInWorker(
     {
       messageContent,
-      sessionHistory: updatedSession.messages,
+      sessionHistory: sessionHistoryForWorker,
       userId,
       llmModel,
       sessionId,
@@ -3483,6 +4054,10 @@ export const agentModeController = {
         }
       }
 
+      // ENG-510: stamp when this turn's generation began so that, if the whole-turn cap
+      // kills it mid-flight, we count only the media THIS turn saved (not prior turns').
+      const turnStartMs = Date.now();
+
       // Capture the generation promise so the durable path can reattach to it if the
       // run times out while the work is still going (it keeps running detached).
       const genPromise = generateSessionResponse(
@@ -3557,6 +4132,40 @@ export const agentModeController = {
           console.log(`AgentMode: generation timed out for session ${sessionId} — cancelling orphaned worker run`);
           requestCancel(sessionId);
           generateMarketingResponseWorkerService.cancelSession(sessionId);
+
+          // ENG-510: the cap can fire AFTER one or more image variants already finished
+          // and were saved (synchronous image-generated markers). A bare 504 there hides
+          // that finished work and leaves the user with no idea that "continue" will
+          // complete the rest. If this turn delivered >= 1 image, persist a clear
+          // partial-delivery message and return it (200) instead — Emma then resumes ONLY
+          // the still-missing assets on "continue" (it sees the saved markers in history).
+          // Non-media timeouts fall through to the existing 504 unchanged.
+          try {
+            // ENG-510: strongly consistent read — a marker written moments before the cap
+            // fired must not be missed by an eventually-consistent read (which would drop
+            // to a bare 504 despite a completed, saved image).
+            const timedOutSession = await chatbotDb.getChatSession(sessionId, true);
+            const timeoutImages = collectMediaGeneratedSince(timedOutSession?.messages, turnStartMs);
+            const continuationMsg = buildTimeoutContinuationMessage(timeoutImages);
+            if (continuationMsg) {
+              markProgressComplete(sessionId);
+              await chatbotDb.addMessageToSession(sessionId, {
+                role: 'assistant',
+                content: continuationMsg,
+                timestamp: new Date().toISOString(),
+                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+              }).catch((persistErr) =>
+                console.error('AgentMode: failed to persist timeout continuation message:', persistErr),
+              );
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_media' });
+              }
+              res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+              return;
+            }
+          } catch (continuationErr) {
+            console.error('AgentMode: partial-media timeout continuation failed (falling through to 504):', continuationErr);
+          }
         }
         throw genErr; // preserve existing error handling (returns 504 GENERATION_TIMEOUT)
       }
@@ -4259,6 +4868,8 @@ export const agentModeController = {
 
   // Generate response for shared conversation (with conversable token)
   async generateSharedResponse(req: Request, res: Response) {
+    // ENG-510: declared before the try so the catch's partial-timeout branch can read it.
+    let sharedTurnStartMs = Date.now();
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
@@ -4307,6 +4918,25 @@ export const agentModeController = {
 
       try {
 
+      // ENG-705: this route is registered before `router.use(authenticateToken)`,
+      // so the caller is anonymous — but the spend is not. Gate on the share
+      // OWNER's allowance (the account `generateSessionResponse` already bills
+      // via incrementUserTokenUsage) so an unauthenticated visitor can never
+      // cause more vendor spend than the owner could cause themselves. This runs
+      // before any LLM call: refuse loudly, never a degraded-but-billed path.
+      const usageStatus = await checkTokenUsage(session.userId);
+      if (!usageStatus.allowed) {
+        // The caller is anonymous, so the denial carries the message ONLY.
+        // `usageStatus` is the owner's billing record (allowance, bonus, dollar
+        // spend, cost cap, enforcement state); echoing it here would turn this
+        // public route into a read side-channel on the owner's account for
+        // anyone holding the share link. Authenticated owners still read their
+        // usage through the subscription-usage endpoint.
+        return res.status(429).json({
+          error: 'Monthly token limit reached for this shared session. Please contact the owner of this link.',
+        });
+      }
+
       // Clear old progress store (but keep active connections)
       progressStore.delete(session.sessionId);
 
@@ -4321,6 +4951,9 @@ export const agentModeController = {
         ip: req.ip || (req.headers?.['x-forwarded-for'] as string | undefined)?.split(',')[0].trim(),
         userAgent: req.headers?.['user-agent'] as string | undefined,
       };
+      // ENG-510: stamp when this turn began so a whole-turn-cap kill can count only the
+      // media THIS turn saved (see the partial-delivery branch in the catch below).
+      sharedTurnStartMs = Date.now();
       const response = await withGenerationTimeout(
         generateSessionResponse(
           session.sessionId,
@@ -4367,11 +5000,45 @@ export const agentModeController = {
         markProgressComplete(shareId);
       }
 
+      // ENG-510: a timeout that already saved >=1 image is a PARTIAL SUCCESS, not an
+      // error. Persist the finished images inline (markdown → rendered in-thread) plus a
+      // "continue" prompt instead of a generic error, so the user actually receives the
+      // completed work on reload even if a retry keeps timing out. Additive: only replaces
+      // the error message on a media-bearing timeout; every other failure is unchanged.
+      let handledPartialTimeout = false;
+      if (shareId && (error as any)?.isGenerationTimeout) {
+        try {
+          // ENG-510: strongly consistent read so a marker written just before the cap is
+          // not missed (see the regular /generate path above).
+          const timedOutSession = await chatbotDb.getChatSession(shareId, true);
+          const timeoutImages = collectMediaGeneratedSince(timedOutSession?.messages, sharedTurnStartMs);
+          const continuationMsg = buildTimeoutContinuationMessage(timeoutImages);
+          if (continuationMsg) {
+            await chatbotDb.addMessageToSession(shareId, {
+              role: 'assistant',
+              content: continuationMsg,
+              timestamp: new Date().toISOString(),
+              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+            });
+            handledPartialTimeout = true;
+            // ENG-510: return the partial delivery as a normal 200 (mirrors the regular
+            // /generate path) instead of falling through to the 504 GENERATION_TIMEOUT
+            // below — a partial SUCCESS must not reach the live caller as a bare timeout.
+            // Progress was already completed above; the session lock is released in the
+            // inner finally, so this early return is safe.
+            res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+            return;
+          }
+        } catch (persistErr) {
+          console.error('AgentMode: shared partial-media timeout continuation failed (falling back to error message):', persistErr);
+        }
+      }
+
       // Persist an error message to the session so the user sees feedback on reload.
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
-      if (shareId && !(error instanceof Error && isSessionLimitError(error))) {
+      if (!handledPartialTimeout && shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
@@ -6177,7 +6844,19 @@ export const agentModeController = {
       // Get test history
       const testHistory = await scheduleDb.getRunResults(scheduleId);
 
-      res.json(testHistory);
+      // ENG-446: hand every consumer the canonical marketing-action list the run
+      // itself selected — same ids, same order, empty for legacy runs that carry
+      // none. Consumers render this; they never re-rank or regenerate it.
+      // Arrays are excluded deliberately: spreading one into an object literal
+      // would silently turn it into {0: …, 1: …}. A malformed entry passes
+      // through untouched rather than being corrupted into a wrong answer.
+      const historyWithActions = (testHistory || []).map((run: any) =>
+        run !== null && typeof run === 'object' && !Array.isArray(run)
+          ? normalizeMarketingActions(run)
+          : run
+      );
+
+      res.json(historyWithActions);
     } catch (error) {
       console.error('AgentMode: Get test history error:', error);
       res.status(500).json({ error: 'Failed to get test history' });
@@ -7380,7 +8059,10 @@ export const agentModeController = {
         keywords: keywords || [],
         requiredFunctions: requiredFunctionsArray,
         maxAttempts: maxAttemptsParam || 5,
-        attachments: attachmentsArray
+        attachments: attachmentsArray,
+        // ENG-636: interactive endpoint — the user's live session renders the
+        // pendingUserQuestion card, so a park reaches a human who can answer.
+        parkNotifiable: true
       });
 
       // If client disconnected, don't try to send response

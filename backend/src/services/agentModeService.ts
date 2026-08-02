@@ -1,9 +1,10 @@
 import axios from 'axios';
+import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
 import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
-import { createHash, randomUUID } from 'crypto';
+import { createHash, createHmac, randomUUID } from 'crypto';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { Storage } from '@google-cloud/storage';
 import { v4 as uuidv4 } from 'uuid';
@@ -12,6 +13,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { computeTermination } from './agentMode/core/agentStep';
+import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -51,11 +53,13 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
+import { BEDROCK_BEARER_TOKEN_MODELS, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
   imageGenerationCostUsd,
   videoGenerationCostUsd,
 } from '../utils/llmPricing';
+import { normalizeImageModel } from './imageGeneration';
 import { enqueueFindEmailJobForNewLeads } from './agentModeService.autoEnrich';
 import { CRM_DATA_CHANGED_EVENT, buildCrmDataChangedPayload } from '../emma/crmMutationEvents';
 import {
@@ -81,7 +85,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status'];
+const ADMIN_SKILL_TOOL_NAMES = ['manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -170,12 +174,22 @@ export function isCompleteHtmlDocument(draft: string): boolean {
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
-import { twitterService } from './twitterService';
+import { twitterService, runWithXActingUser } from './twitterService';
 import { describeXApiError } from '../utils/twitterErrors';
+import { normalizeMetaInsightsFiltering, describeMetaGraphApiError } from '../utils/metaInsightsFiltering';
 import * as linkedInAdsService from './linkedInAdsService';
 import { googleAdsService } from './googleAdsService';
+import {
+  NegativeCampaignCriteriaValidationError,
+  validateNegativeCampaignCriteria,
+} from './googleAdsCampaignCriteria';
 import { preflightTrackingGate } from './googleAdsTrackingPreflight';
 import { HubSpotService } from './hubspotService';
+import { assertMetaAccountAllowed } from './metaTestAccountGuard';
+import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
+import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
+import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
+import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
 import { getAgentRunRecorder } from '../loops/instances/agent-mode';
@@ -210,6 +224,7 @@ import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
 import { summarizeBreakdownSections, buildToolPartialFailureTelemetry } from './agentMode/metaBreakdownStatus';
 import { validateToolOutputContract } from '../utils/toolOutputContract';
 import { computeWaitSeconds, WAIT_SECONDS_PARAMETERS } from '../utils/waitSecondsBudget';
+import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 
 type MetaApiResult = {
   success: boolean;
@@ -223,6 +238,7 @@ import {
   ALLOWED_NODE_TYPES,
   AllowedNodeType,
   ALLOWED_INSIGHTS_FIELDS,
+  suggestInsightsFields,
   ALLOWED_INSIGHTS_BREAKDOWNS,
   ALLOWED_ACTION_BREAKDOWNS,
   ALLOWED_DATE_PRESETS,
@@ -704,10 +720,6 @@ const DATA_ANALYSIS_FILE_END_MARKER = '<<<AGENTWEB_FILE_END>>>';
 const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'avif', 'heic', 'heif']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'avi', 'webm', 'mkv', 'flv', 'wmv', 'm4v', 'ogv', '3gp', 'ts']);
 
-// Models served from the separate Bedrock account (231030591963) reached via a
-// long-term API key (bearer token) rather than the app's default SigV4 creds.
-const BEARER_TOKEN_MODELS = new Set(['anthropic.claude-opus-4-8']);
-
 // Legacy model ids persisted by sessions/schedules created before a model was
 // renamed. Maps the old id to its current registry key so old sessions keep
 // working instead of throwing "Invalid model". Opus 4.8 was renamed from the
@@ -784,7 +796,15 @@ export class AgentModeService {
   private readonly FILE_CACHE_MAX_SIZE = 1000; // Max 1000 cached files
   private readonly FILE_CACHE_MAX_AGE_MS = 3600000; // 1 hour TTL
   private readonly FILE_CACHE_CLEANUP_INTERVAL_MS = 600000; // Cleanup every 10 minutes
-  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'gpt-5.5';
+  // ENG-759: the default chat model. Opus 5 and Opus 4.8 are both $5/$25, so this
+  // is a capability upgrade at no cost change. Opus 5 is AccessDenied on our
+  // default AWS account and reachable ONLY through the bearer-token account, so it
+  // MUST stay in BEDROCK_BEARER_TOKEN_MODELS — see utils/bedrockInferenceProfiles.
+  // This literal is the last-resort fallback; the effective default is the
+  // `agent_mode_default_model` setting when one is configured (getDefaultModel).
+  // It previously read 'gpt-5.5', which meant a missing/invalid setting silently
+  // dropped every chat onto an Azure GPT deployment instead of the intended Claude.
+  default_model: string = process.env.AZURE_OPENAI_DEPLOYMENT_AGENT_MODE || 'anthropic.claude-opus-5';
   private defaultModelSettingName = 'agent_mode_default_model';
   private scheduledChatsDefaultModelSettingName = 'agent_mode_scheduled_chats_default_model';
   private reportGenerationDefaultModelSettingName = 'agent_mode_report_generation_default_model';
@@ -1282,38 +1302,73 @@ export class AgentModeService {
     });
   }
 
-  async getDefaultModel(): Promise<string> {
-    const fallbackModel = this.default_model;
+  /**
+   * Resolve a model id configured in `AW-Settings`, or null when nothing usable
+   * is configured (missing row, blank value, unknown model, or a failed read).
+   *
+   * ENG-806: this applies the SAME legacy-alias map generation uses
+   * (`normalizeModelId`) BEFORE validating against the registry. Previously each
+   * getter did a raw `llmModels[value]` lookup, so a row holding a legacy alias
+   * failed validation and silently fell through to the fallback — the setting
+   * read as configured in the table and the admin UI but had no effect.
+   * `agent_mode_scheduled_chats_default_model` held the alias `claude-opus-4-8`
+   * and was inert for two months before anyone noticed.
+   *
+   * An unknown value now also raises a deduped oncall alert rather than only
+   * `console.warn`-ing into a log nobody reads ("fail loud, not partial"). The
+   * alert is fire-and-forget so model resolution never blocks on it.
+   */
+  private async resolveConfiguredModel(
+    settingName: string,
+    label: string
+  ): Promise<string | null> {
     try {
-      const setting = await settingsService.getSetting(this.defaultModelSettingName);
+      const setting = await settingsService.getSetting(settingName);
       const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported default model "${configuredModel}" in settings; using fallback.`);
+      if (!configuredModel) return null;
+
+      const normalizedModel = this.normalizeModelId(configuredModel);
+      if (this.llmModels[normalizedModel]) {
+        return normalizedModel;
       }
+
+      console.warn(`AgentMode: Unsupported ${label} model "${configuredModel}" in settings; using fallback.`);
+      void sendAgentModeOncallAlert({
+        subject: `AgentMode: unsupported ${label} model in AW-Settings`,
+        message:
+          `The AW-Settings row "${settingName}" holds "${configuredModel}", which is not a served model ` +
+          `even after legacy-alias resolution. That setting is being ignored and the fallback model is in ` +
+          `use, so the configured pin is inert.`,
+        context: {
+          Setting: settingName,
+          'Configured Value': configuredModel,
+          'After Alias Resolution': normalizedModel,
+        },
+        // One alert per (setting, bad value) per hour: a permanently
+        // misconfigured row must not flood oncall on every request.
+        dedupeKey: `model_setting_invalid:${settingName}:${configuredModel}`,
+        dedupeWindowMs: 60 * 60 * 1000,
+      }).catch((alertError) => {
+        console.error('AgentMode: Failed to send unsupported-model alert:', alertError);
+      });
     } catch (error) {
-      console.error('AgentMode: Error getting default model setting:', error);
+      console.error(`AgentMode: Error getting ${label} model setting:`, error);
     }
-    return fallbackModel;
+    return null;
+  }
+
+  async getDefaultModel(): Promise<string> {
+    return (
+      (await this.resolveConfiguredModel(this.defaultModelSettingName, 'default')) ??
+      this.default_model
+    );
   }
 
   async getReportsModel(): Promise<string> {
-    const fallbackModel = this.default_model;
-    try {
-      const setting = await settingsService.getSetting('agent_mode_reports_model');
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported reports model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting reports model setting:', error);
-    }
-    return fallbackModel;
+    return (
+      (await this.resolveConfiguredModel('agent_mode_reports_model', 'reports')) ??
+      this.default_model
+    );
   }
 
   // Model for the internal dedup judge (report_product_issues duplicate detection).
@@ -1322,71 +1377,37 @@ export class AgentModeService {
   // configurable default model. TODO(ENG-9): route this call through OpenRouter so
   // model choice becomes gateway/routing config rather than provider-specific.
   async getDedupJudgeModel(): Promise<string> {
-    const fallbackModel = this.default_model;
-    try {
-      const setting = await settingsService.getSetting('agent_mode_dedup_judge_model');
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported dedup judge model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting dedup judge model setting:', error);
-    }
-    return fallbackModel;
+    return (
+      (await this.resolveConfiguredModel('agent_mode_dedup_judge_model', 'dedup judge')) ??
+      this.default_model
+    );
   }
 
   async getScheduledChatsDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.scheduledChatsDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported scheduled chats default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting scheduled chats default model setting:', error);
-    }
-    // Fall back to the general default model
-    return this.getDefaultModel();
+    return (
+      (await this.resolveConfiguredModel(
+        this.scheduledChatsDefaultModelSettingName,
+        'scheduled chats default'
+      )) ?? this.getDefaultModel()
+    );
   }
 
   async getReportGenerationDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.reportGenerationDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported report generation default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting report generation default model setting:', error);
-    }
-    // Fall back to the general default model
-    return this.getDefaultModel();
+    return (
+      (await this.resolveConfiguredModel(
+        this.reportGenerationDefaultModelSettingName,
+        'report generation default'
+      )) ?? this.getDefaultModel()
+    );
   }
 
   async getImageGenerationDefaultModel(): Promise<string> {
-    try {
-      const setting = await settingsService.getSetting(this.imageGenerationDefaultModelSettingName);
-      const configuredModel = setting?.settingValue?.trim();
-      if (configuredModel) {
-        if (this.llmModels[configuredModel]) {
-          return configuredModel;
-        }
-        console.warn(`AgentMode: Unsupported image generation default model "${configuredModel}" in settings; using fallback.`);
-      }
-    } catch (error) {
-      console.error('AgentMode: Error getting image generation default model setting:', error);
-    }
-    // Fall back to the general default model
-    return this.getDefaultModel();
+    return (
+      (await this.resolveConfiguredModel(
+        this.imageGenerationDefaultModelSettingName,
+        'image generation default'
+      )) ?? this.getDefaultModel()
+    );
   }
 
   // Supported image API models (must match SUPPORTED_MODELS in imageGeneration.ts).
@@ -1549,6 +1570,34 @@ export class AgentModeService {
   private vertex_client: any | null = null;
   private vertex_client_promise: Promise<any> | null = null;
 
+  // ENG-737: native @google/genai adapter — the only Gemini transport agent-mode
+  // calls use. It filters chain-of-thought at the source (thinkingConfig.
+  // includeThoughts=false + part.thought), so no reasoning leak is possible by
+  // construction — no heuristic, no fallback transport that could reintroduce it.
+  private gemini_native_client: any | null = null;
+  private gemini_native_sdk_promise: Promise<any> | null = null;
+  private gemini_api_key_promise: Promise<string> | null = null;
+
+  /** Resolve the Gemini API key from env or secrets (cached; shared by both clients). */
+  private async getGeminiApiKey(): Promise<string> {
+    if (this.gemini_api_key_promise) return this.gemini_api_key_promise;
+    this.gemini_api_key_promise = (async () => {
+      let geminiApiKey = process.env.GEMINI_API_KEY;
+      if (!geminiApiKey) {
+        const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
+        geminiApiKey = await getSecret(`${environment}/AgentWeb/GeminiAPIKey`);
+      }
+      if (!geminiApiKey || !geminiApiKey.trim()) {
+        throw new Error('Gemini API key is empty or not found in env/secrets');
+      }
+      return geminiApiKey.trim();
+    })().catch((err) => {
+      this.gemini_api_key_promise = null; // allow retry on transient secret failures
+      throw err;
+    });
+    return this.gemini_api_key_promise;
+  }
+
   // Helper method to get Gemini client (lazy-loaded from secrets manager)
   public async getGeminiClient(): Promise<OpenAI> {
     // Return cached client if available
@@ -1590,6 +1639,39 @@ export class AgentModeService {
     })();
 
     return this.gemini_client_promise;
+  }
+
+  /**
+   * ENG-737: native @google/genai client wrapper for gemini agent calls, presenting
+   * the same OpenAI-shaped `chat.completions.create` surface as getGeminiClient.
+   * Unlike the compat endpoint, this filters chain-of-thought natively
+   * (thinkingConfig.includeThoughts=false + part.thought), so no reasoning leaks —
+   * structurally, not via a heuristic. This is the only transport agent-mode
+   * Gemini calls use; there is deliberately no fallback to the OpenAI-compat
+   * endpoint, because that endpoint flattens thought parts into plain text and
+   * reintroduces the exact leak this client exists to prevent.
+   */
+  public getGeminiNativeClient(): any {
+    if (this.gemini_native_client) return this.gemini_native_client;
+    this.gemini_native_client = createGeminiNativeClient({
+      defaultMaxTokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
+      getClient: () => {
+        // Cache the SDK client so each agent turn reuses it (the key fetch is
+        // already cached); reset the promise on failure so a transient secret
+        // error can be retried.
+        if (this.gemini_native_sdk_promise) return this.gemini_native_sdk_promise;
+        this.gemini_native_sdk_promise = (async () => {
+          const { GoogleGenAI } = await import('@google/genai');
+          const apiKey = await this.getGeminiApiKey();
+          return new GoogleGenAI({ apiKey });
+        })().catch((err) => {
+          this.gemini_native_sdk_promise = null;
+          throw err;
+        });
+        return this.gemini_native_sdk_promise;
+      },
+    });
+    return this.gemini_native_client;
   }
 
   public async getVertexClient(modelId: string): Promise<any> {
@@ -1810,7 +1892,9 @@ export class AgentModeService {
     // default IAM credentials (992382574572) cannot reach. Authenticate that model
     // with a long-term Bedrock API key (bearer token) instead of SigV4, scoped to a
     // dedicated client so all other models keep using the default credential chain.
-    const usesBearerToken = BEARER_TOKEN_MODELS.has(modelId);
+    // Models served from the separate Bedrock account (231030591963) reached via
+    // a long-term API key (bearer token) rather than the app's default SigV4 creds.
+    const usesBearerToken = BEDROCK_BEARER_TOKEN_MODELS.has(modelId);
     let bedrockClient: any;
     if (usesBearerToken) {
       const environment = process.env.NODE_ENV === 'production' ? 'prod' : 'dev';
@@ -1846,14 +1930,7 @@ export class AgentModeService {
 
     // Map certain model IDs to their corresponding inference profile ARNs
     // Note: Newer Claude models require using inference profiles for cross-region access
-    const inferenceProfileMap: Record<string, string> = {
-      'anthropic.claude-sonnet-4-5-20250929-v1:0': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-5-20250929-v1:0',
-      'anthropic.claude-sonnet-4-6': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-sonnet-4-6',
-      'anthropic.claude-opus-4-6-v1': 'arn:aws:bedrock:us-west-2:992382574572:inference-profile/global.anthropic.claude-opus-4-6-v1',
-      // Opus 4.8 lives in account 231030591963 (reached via bearer token above).
-      'anthropic.claude-opus-4-8': 'us.anthropic.claude-opus-4-8',
-    };
-    const actualModelId = inferenceProfileMap[modelId] || modelId;
+    const actualModelId = resolveBedrockModelId(modelId);
 
     // Create OpenAI-compatible wrapper using direct Converse API
     return {
@@ -2386,8 +2463,13 @@ export class AgentModeService {
     'gpt-5.4-nano': { client: this.getAzureOpenAIClient('gpt-5.4-nano'), supportsTemperature: true, maxTools: 128, supportsVision: true },
     'gpt-5.5': { client: this.getAzureOpenAIClient('gpt-5.5'), supportsTemperature: false, maxTools: 128, supportsVision: true },
     // List gemini models - client will be lazy-loaded
-    // gemini-3-pro-preview omitted from vision: the Gemini API returns 404 for this id (not served).
-    'gemini-3-pro-preview': { client: null, supportsTemperature: true },
+    // gemini-3-pro-preview REMOVED (ENG-744): Google shut it down 2026-03-09 and it
+    // returns a hard 404 on a real call, but it stayed selectable here for ~4.5 months,
+    // so picking it was a guaranteed failure. llmPricing.ts already carried the
+    // DEPRECATED 2026-03-09 note; only the registry had not caught up. Migrate to
+    // gemini-3.1-pro-preview (below), which is the newest Gemini Pro that exists.
+    // Its price entry is intentionally left in place — a rate for a removed model is
+    // harmless, a missing rate for a live one is not.
     'gemini-3-flash-preview': { client: null, supportsTemperature: true, supportsVision: true },
     'gemini-3.1-pro-preview': { client: null, supportsTemperature: true, supportsVision: true },
     'gemini-3.1-flash-lite': { client: null, supportsTemperature: true, supportsVision: true },
@@ -2401,6 +2483,15 @@ export class AgentModeService {
     // Claude Opus 4.8 via AWS Bedrock (cross-account, bearer-token auth) — available to all users
     // temperature is deprecated for this model
     'anthropic.claude-opus-4-8': { client: null, supportsTemperature: false, supportsVision: true },
+    // ENG-744 — Claude 5 generation. Opus 5 and Sonnet 5 use the same
+    // cross-account bearer-token path as Opus 4.8; Haiku 4.5 is on the default
+    // account. Account routing lives in utils/bedrockInferenceProfiles.ts.
+    // Opus 5 / Sonnet 5 reject `temperature` with a 400 ("`temperature` is
+    // deprecated for this model") — verified against live Bedrock, not assumed.
+    'anthropic.claude-opus-5': { client: null, supportsTemperature: false, supportsVision: true },
+    'anthropic.claude-sonnet-5': { client: null, supportsTemperature: false, supportsVision: true },
+    // Haiku 4.5 still accepts temperature (also live-verified).
+    'anthropic.claude-haiku-4-5-20251001-v1:0': { client: null, supportsTemperature: true, supportsVision: true },
   };
 
   async getSupportedModels(isAdmin: boolean = false) {
@@ -2418,7 +2509,7 @@ export class AgentModeService {
   }
   /**
    * Make an LLM call with the specified model and parameters
-   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3-pro-preview')
+   * @param model - The model to use (e.g., 'gpt-5.5', 'gemini-3.1-pro-preview')
    * @param messages - Array of chat messages
    * @param options - Optional parameters for the LLM call
    * @returns The LLM response
@@ -2541,11 +2632,12 @@ export class AgentModeService {
 
     // Get the client - lazy-load Gemini, Bedrock, or Vertex client if needed
     let client = this.llmModels[model].client;
-    if (!client) {
-      if (model.startsWith('gemini-')) {
-        client = await this.getGeminiClient();
-        this.llmModels[model].client = client;
-      } else if (model.startsWith('anthropic.')) {
+    if (model.startsWith('gemini-')) {
+      // ENG-737: always the native adapter — no fallback transport, resolved
+      // per-call (not cached on the registry).
+      client = this.getGeminiNativeClient();
+    } else if (!client) {
+      if (model.startsWith('anthropic.')) {
         client = await this.getBedrockClient(model);
         this.llmModels[model].client = client;
       } else if (model.startsWith('claude-')) {
@@ -2688,15 +2780,21 @@ export class AgentModeService {
   }
 
   private getImageGenerationFallbackModel(
-    primaryModel: string | undefined,
+    currentModel: string | undefined,
     inputImages: string[] | undefined,
-    logoImage: string | undefined
+    logoImage: string | undefined,
+    modelExplicitlyChosen: boolean = false
   ): string | undefined {
     // Keep generation fallback narrow. Telemetry showed the painful cases were
     // product-fidelity workflows and explicit model choices; silently switching
     // providers there changes output semantics. Only recover when the caller left
     // model selection to us and the request is fresh text-to-image.
-    if (primaryModel) {
+    //
+    // ENG-510: gate on whether the model was an explicit per-request choice — NOT
+    // merely on a model string being present. The admin-configured default is
+    // resolved to a concrete id before generation, but that is a system default,
+    // not a user choice, so a transient timeout on it must still fail over.
+    if (modelExplicitlyChosen) {
       return undefined;
     }
 
@@ -2705,8 +2803,13 @@ export class AgentModeService {
       return undefined;
     }
 
+    // Pick the first alternate that isn't the model we just failed on (compare on
+    // the normalized id so e.g. the legacy "...-preview" alias matches its GA id).
+    const normalizedCurrent = normalizeImageModel(currentModel);
     const fallbackOrder = ['gpt-image-2', 'gemini-3.1-flash-image', 'gemini-2.5-flash-image'];
-    return fallbackOrder[0];
+    return fallbackOrder.find(
+      (model) => model !== currentModel && model !== normalizedCurrent
+    );
   }
 
   private getVisionFallbackModel(primaryModel: string): string | undefined {
@@ -3043,6 +3146,20 @@ export class AgentModeService {
       const mediaBudgetMs = parseInt(process.env.AGENT_MODE_MEDIA_BUDGET_MS || '420000', 10);
       const mediaGenerationDeadlineMs = mediaBudgetMs > 0 ? Date.now() + mediaBudgetMs : undefined;
       let mediaAssetsProducedThisRun = 0;
+      // ENG-510: the fixed soft budget above assumed fast images and leaves only ~3 min
+      // of headroom below the controller's 10-min whole-turn hard cap. A single slow
+      // high-quality image can take ~6–7 min, so the next variant slips past the fixed
+      // deadline and runs past the cap — losing the already-generated variants. Give the
+      // dispatcher the hard-cap deadline + the longest media latency seen this run so it
+      // can also defer when there isn't time left for one more call. Mirror the soft
+      // budget's disable switch (off when AGENT_MODE_MEDIA_BUDGET_MS=0).
+      const generationTimeoutMs = parseInt(process.env.AGENT_MODE_GENERATION_TIMEOUT_MS || '600000', 10);
+      const generationHardCapMs = mediaBudgetMs > 0 ? Date.now() + generationTimeoutMs : undefined;
+      let longestMediaCallMsThisRun = 0;
+      // ENG-510: accumulate dedupe keys of media-gen calls that produced an asset, across
+      // iterations of this turn, so the dispatcher can suppress an identical re-request in a
+      // later iteration (e.g. resuming after a timeout) instead of regenerating the image.
+      const mediaCallKeysThisRun = new Map<string, string>();
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
@@ -3480,6 +3597,9 @@ export class AgentModeService {
           maxToolContentSize: MAX_TOOL_CONTENT_SIZE,
           mediaGenerationDeadlineMs,
           mediaAssetsProducedThisRun,
+          generationHardCapMs,
+          longestMediaCallMsThisRun,
+          priorMediaCallKeys: mediaCallKeysThisRun,
           ports: {
             evaluateAgentToolPolicy,
             validateAndRepairToolArgs,
@@ -3519,6 +3639,16 @@ export class AgentModeService {
         // Carry the running per-run media-asset total forward so the next iteration's
         // budget decision knows whether this run has already produced ≥1 asset.
         mediaAssetsProducedThisRun += dispatchResult.mediaAssetsProduced;
+        // ENG-510: carry the run-wide longest media-call latency forward so the next
+        // iteration's adaptive hard-cap reserve uses real observed durations.
+        longestMediaCallMsThisRun = Math.max(longestMediaCallMsThisRun, dispatchResult.longestMediaCallMs ?? 0);
+        // ENG-510: fold this iteration's produced media keys into the run-wide set so the
+        // next iteration suppresses an identical regenerate-the-same-image re-request.
+        if (dispatchResult.producedMediaCallKeys) {
+          for (const [key, id] of dispatchResult.producedMediaCallKeys) {
+            if (!mediaCallKeysThisRun.has(key)) mediaCallKeysThisRun.set(key, id);
+          }
+        }
 
         // Send progress update after all tools complete.
         // Only send tool calls added in this iteration — the frontend accumulates
@@ -4145,12 +4275,8 @@ export class AgentModeService {
     // not the cause — the user was nudging a flow that kept looping. The real driver was
     // this regenerate-from-scratch-after-timeout loop; surfacing already-made assets is
     // what actually breaks it.
-    if (includeResumeGuidance && Array.isArray(generatedImageFilenames) && generatedImageFilenames.length > 0) {
-      workPlanContent += `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them UNLESS the user explicitly asks to regenerate, restart, redo, or change them. Otherwise only generate the images that are still missing.\n`;
-      for (const filename of generatedImageFilenames) {
-        workPlanContent += `   - ${filename}\n`;
-      }
-      workPlanContent += `\n`;
+    if (includeResumeGuidance) {
+      workPlanContent += AgentModeService.buildGeneratedAssetsAwarenessText(generatedImageFilenames);
     }
 
     workPlan.steps.forEach((step: any) => {
@@ -4216,6 +4342,25 @@ export class AgentModeService {
       filenames.push(filename);
     }
     return filenames;
+  }
+
+  /**
+   * ENG-510: the shared "already-generated assets" awareness block. Lists images already
+   * saved this session so the model regenerates ONLY what is still missing after a
+   * mid-batch timeout — INCLUDING an image that completed in the orphaned worker AFTER the
+   * whole-turn cap fired (that image's marker lands in history but was never in any
+   * assistant toolCalls stamp). Returns '' when there is nothing to surface. Used both
+   * inside a work plan and standalone for plain multi-image requests, which have no work
+   * plan (the reported ENG-510 scenario — multiple ad-illustration variants).
+   */
+  public static buildGeneratedAssetsAwarenessText(generatedImageFilenames?: string[]): string {
+    if (!Array.isArray(generatedImageFilenames) || generatedImageFilenames.length === 0) return '';
+    let text = `⚠️ ALREADY-GENERATED ASSETS (${generatedImageFilenames.length}): these images already exist in this session and are saved — DO NOT regenerate them UNLESS the user explicitly asks to regenerate, restart, redo, or change them. Otherwise only generate the images that are still missing.\n`;
+    for (const filename of generatedImageFilenames) {
+      text += `   - ${filename}\n`;
+    }
+    text += `\n`;
+    return text;
   }
 
   private buildMarketingContext(messageContent: string, sessionHistory: ChatMessage[], currentTaskStatuses: any[] = [], workPlan?: any, screenshotUrl?: string): any[] {
@@ -4377,6 +4522,18 @@ export class AgentModeService {
     if (workPlan) {
       const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
       messages.push(...AgentModeService.buildWorkPlanContextMessages(workPlan, generatedImageFilenames));
+    } else {
+      // ENG-510: even WITHOUT a work plan (plain multi-image requests — the reported
+      // scenario), a run that timed out mid-batch leaves already-generated images in
+      // history. On the "continue" turn the model must be told which images already
+      // exist so it regenerates ONLY the missing ones — otherwise an image that
+      // completed in the orphaned worker AFTER the cap (its marker present, but no
+      // toolCalls stamp and not named in the continuation message) gets redone.
+      const generatedImageFilenames = AgentModeService.extractGeneratedImageFilenames(sessionHistory);
+      const assetAwarenessText = AgentModeService.buildGeneratedAssetsAwarenessText(generatedImageFilenames);
+      if (assetAwarenessText) {
+        messages.push({ role: 'assistant', content: assetAwarenessText });
+      }
     }
 
     // Append the current user message at the end (with vision if a screenshot URL was provided)
@@ -5107,6 +5264,21 @@ export class AgentModeService {
         };
       }
       return base;
+    }
+
+    // ENG-518: preserve the enrichment run summary's scalar counts so the scheduled
+    // completion gate can (a) tell an enrichable preview (processedCount > 0) from an
+    // unenrichable one and (b) pair previews to executes per list. The large `samples`
+    // array is dropped — the model already saw it in the tool message; only the small
+    // counts matter for the gate and reporting.
+    if (toolName === 'enrich_leads_preview' || toolName === 'enrich_leads_execute') {
+      return {
+        runId: result?.runId,
+        mode: result?.mode,
+        processedCount: result?.processedCount,
+        failedCount: result?.failedCount,
+        failureBreakdown: result?.failureBreakdown,
+      };
     }
 
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
@@ -13777,6 +13949,81 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   }
 
   /**
+   * Fail closed before spending a Meta API call we can prove will be refused.
+   *
+   * Only an authoritative 'missing' (recorded `granted_scopes` that contain no
+   * ads scope) blocks here. A legacy record with no `granted_scopes` reads as
+   * 'unknown' and is allowed through — its `scopes` field holds the scopes we
+   * *requested*, not what Meta granted, so refusing on it would lock out
+   * connections that actually work. Those are caught after the fact by
+   * normalizeMetaAdsReadError. (ENG-629)
+   */
+  private async assertMetaAdsScope(selected: any): Promise<void> {
+    const { getMetaAdsScopeState, buildMetaAdsScopeError } = await import('../utils/metaAdsScope');
+    if (getMetaAdsScopeState(selected?.config) !== 'missing') return;
+
+    const label = selected?.account_id || selected?.config?.ad_account_id;
+    throw buildMetaAdsScopeError({ accountLabel: label ? `act_${String(label).replace('act_', '')}` : undefined });
+  }
+
+  /**
+   * Turn Meta's authoritative "you never granted ads permission" refusal into the
+   * single actionable re-consent error, and record what we just learned.
+   *
+   * Two jobs, both required by ENG-629:
+   *  - Throw (not return a soft `{ success:false }`). The soft shape is what let
+   *    an unattended run render an empty report as though metrics came back.
+   *  - Persist the now-known grant so the next read fails at the pre-flight gate
+   *    instead of hitting Meta again with the same impossible request. The write
+   *    is best-effort: a persistence failure must never mask the user-facing error.
+   *
+   * Returns normally when the error is NOT a scope problem, so callers keep their
+   * existing handling for rate limits, validation errors (ENG-630), etc.
+   */
+  private async normalizeMetaAdsReadError(
+    error: any,
+    userId: string,
+    connection?: { platform?: string; account_id?: string; config?: any }
+  ): Promise<void> {
+    const {
+      isMetaAdsScopeRefusal,
+      buildMetaAdsScopeError,
+      META_ADS_READ_SCOPES,
+    } = await import('../utils/metaAdsScope');
+
+    // Strictly an Ads-scope refusal. A generic permission error must fall
+    // through untouched — narrowing a grant on that evidence would brick a
+    // connection that actually has ads access (Greptile P1-2).
+    if (!isMetaAdsScopeRefusal(error)) return;
+
+    if (connection?.account_id && connection?.platform) {
+      try {
+        const previous: unknown = connection.config?.granted_scopes;
+        const retained = (Array.isArray(previous) ? previous : [])
+          .filter((s: unknown) => typeof s === 'string')
+          .filter((s: string) => !(META_ADS_READ_SCOPES as readonly string[]).includes(s.trim()));
+
+        const { updateAccountConfig } = await import('./connectedAccountsDb');
+        await updateAccountConfig(userId, connection.platform as any, connection.account_id, {
+          // Meta just told us authoritatively that no ads scope is granted.
+          // Recording it converts every subsequent attempt into a pre-flight refusal.
+          granted_scopes: retained,
+          ads_scope_revoked_at: new Date().toISOString(),
+        });
+      } catch (persistError: any) {
+        console.warn(
+          `[AgentMode] ENG-629: could not persist missing Meta ads scope for user ${userId}: ${persistError?.message ?? persistError}`
+        );
+      }
+    }
+
+    throw buildMetaAdsScopeError({
+      accountLabel: connection?.account_id ? `act_${String(connection.account_id).replace('act_', '')}` : undefined,
+      cause: error,
+    });
+  }
+
+  /**
    * Ensure the selected Meta ad-account token is usable, refreshing it inline
    * if it is expired or close to expiry. Meta has no refresh tokens, so we
    * re-exchange the still-valid (or recently-expired-but-exchangeable) token
@@ -13846,11 +14093,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw this.makeMetaAuthError(`Meta ad account with ID "${accountId}" not found in connected accounts. Ensure you have the correct ID from list_connected_accounts.`);
       }
 
-      await this.ensureUsableMetaToken(selected, userId);
+      await this.ensureUsableMetaToken(selected, selected.userId || userId);
+      await this.assertMetaAdsScope(selected);
 
       return {
         accountId: clean(selected.account_id || selected.config?.ad_account_id),
-        accessToken: selected.config.access_token
+        accessToken: selected.config.access_token,
+        connection: selected
       };
     }
 
@@ -13868,13 +14117,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // 4. Default to the single available account
     const selected = fbAccounts[0];
 
-    await this.ensureUsableMetaToken(selected, userId);
+    await this.ensureUsableMetaToken(selected, selected.userId || userId);
+    await this.assertMetaAdsScope(selected);
 
     console.log(`[AgentMode] Using Meta credentials from connected_accounts for user ${userId} (Account: ${selected.account_name})`);
 
     return {
       accountId: clean(selected.account_id || selected.config?.ad_account_id),
-      accessToken: selected.config.access_token
+      accessToken: selected.config.access_token,
+      connection: selected
     };
   }
 
@@ -13918,13 +14169,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         throw new Error("fields array is required");
       }
 
-      const invalidFields = fields.filter(
+      // ENG-511: Do NOT hard-reject the whole call when some requested fields are
+      // unknown. Meta Insights has a large, evolving field vocabulary and the model
+      // occasionally requests a valid-but-unwhitelisted field (e.g.
+      // cost_per_inline_link_click) or a plausible-but-unsupported one. Previously
+      // any unknown field threw, the model re-issued the identical call, and the
+      // anti-loop/retry guard hard-blocked the entire insights channel before any
+      // metrics came back. Instead: drop the unknown fields, keep the valid subset,
+      // and proceed. Only fail when NOTHING valid remains — and even then, name the
+      // dropped fields so the model corrects rather than blindly retries.
+      const droppedFields = fields.filter(
         (f) => !ALLOWED_INSIGHTS_FIELDS.includes(f)
       );
+      let validFields = fields.filter((f) =>
+        ALLOWED_INSIGHTS_FIELDS.includes(f)
+      );
 
-      if (invalidFields.length) {
+      if (!validFields.length) {
+        // ENG-511: point the model at the closest valid field for each bad one so
+        // it can correct a typo/loose phrasing rather than guess.
+        const suggestions = suggestInsightsFields(droppedFields);
+        const suggestionHint = Object.keys(suggestions).length
+          ? ` Did you mean: ${Object.entries(suggestions)
+              .map(([bad, good]) => `${bad} -> ${good}`)
+              .join(", ")}?`
+          : "";
         throw new Error(
-          `Invalid insights fields requested: ${invalidFields.join(", ")}`
+          `Invalid insights fields requested: ${droppedFields.join(", ")}. None are supported, so no data could be fetched — do not retry with the same fields.${suggestionHint} Choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`
         );
       }
 
@@ -13985,6 +14256,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         }
       }
 
+      // Meta requires `filtering` to be a LIST. The model supplies it as a bare
+      // object or as pre-serialized JSON often enough that both shapes reached
+      // production: the string produced `(#100) param filtering must be an
+      // array`, and the object was silently dropped by the old `?.length` guard,
+      // widening the query to the whole account. Normalize both, and reject
+      // anything unhonourable here — before we spend a credential or an API
+      // call — rather than quietly answering a different question (ENG-630).
+      const normalizedFiltering = normalizeMetaInsightsFiltering(filtering);
+
       const { accountId, accessToken } =
         await this.getMetaCredentials(userId, account_id);
 
@@ -14003,7 +14283,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const submitUrl = `${baseUrl}/${actualNodeId}/insights`;
 
       const filteredParams = {
-        fields: fields.join(","),
+        fields: validFields.join(","),
         limit: 5000,
 
         ...(date_preset && { date_preset }),
@@ -14015,60 +14295,141 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         ...(action_breakdowns?.length && {
           action_breakdowns: action_breakdowns.join(","),
         }),
-        ...(filtering?.length && { filtering }),
+        ...(normalizedFiltering && { filtering: normalizedFiltering }),
       };
 
-      const submitRes = await axios.post(submitUrl, {
-        ...filteredParams,
-        access_token: accessToken,
-      });
-
-      const reportRunId = (submitRes.data as any)?.report_run_id;
-
-      if (!reportRunId) {
-        throw new Error("Failed to get report_run_id from Meta");
-      }
-
-      // Polling Engine
-      let attempts = 0;
-      const maxAttempts = 60;
-
-      while (attempts < maxAttempts) {
-        attempts++;
-
-        await new Promise((resolve) => setTimeout(resolve, 10000));
-
-        const statusRes = await axios.get(`${baseUrl}/${reportRunId}`, {
-          params: { access_token: accessToken },
+      // ENG-511: Run the full report (submit → poll → fetch) as one unit. Meta
+      // rejects some whitelisted fields at SUBMIT time (HTTP 400 on the POST) but
+      // others only LAZILY at result-read time (e.g. onsite_conversion_lead_grouped
+      // returns "(#100) Tried accessing nonexisting summary field ..." on the GET,
+      // after a report_run_id was already issued). Wrapping the whole run lets us
+      // self-heal a bad field regardless of which stage surfaces it.
+      const runReport = async (
+        fieldsToSend: string[]
+      ): Promise<{ reportRunId: string; data: any[] }> => {
+        const submitRes = await axios.post(submitUrl, {
+          ...filteredParams,
+          fields: fieldsToSend.join(","),
+          access_token: accessToken,
         });
-
-        const status = (statusRes.data as any)?.async_status;
-
-        if (status === "Job Completed") break;
-
-        if (status === "Job Failed" || status === "Job Skipped") {
-          throw new Error(`Meta Insights Job failed: ${status}`);
+        const rid = (submitRes.data as any)?.report_run_id;
+        if (!rid) {
+          throw new Error("Failed to get report_run_id from Meta");
         }
 
-        if (attempts === maxAttempts) {
-          throw new Error("Meta Insights Job timed out.");
+        // Polling Engine
+        let attempts = 0;
+        const maxAttempts = 60;
+        while (attempts < maxAttempts) {
+          attempts++;
+          await new Promise((resolve) => setTimeout(resolve, 10000));
+          const statusRes = await axios.get(`${baseUrl}/${rid}`, {
+            params: { access_token: accessToken },
+          });
+          const status = (statusRes.data as any)?.async_status;
+          if (status === "Job Completed") break;
+          if (status === "Job Failed" || status === "Job Skipped") {
+            throw new Error(`Meta Insights Job failed: ${status}`);
+          }
+          if (attempts === maxAttempts) {
+            throw new Error("Meta Insights Job timed out.");
+          }
         }
-      }
 
-      // Fetch Paginated Results
-      const resultsUrl = `${baseUrl}/${reportRunId}/insights`;
+        // Fetch Paginated Results
+        const resultsUrl = `${baseUrl}/${rid}/insights`;
+        const collected: any[] = [];
+        let nextUrl: string | null = resultsUrl;
+        let isFirstRequest = true;
+        while (nextUrl) {
+          const res: any = isFirstRequest
+            ? await axios.get(nextUrl, { params: { access_token: accessToken } })
+            : await axios.get(nextUrl); // paging.next already includes token
+          collected.push(...(res.data?.data || []));
+          nextUrl = res.data?.paging?.next || null;
+          isFirstRequest = false;
+        }
+        return { reportRunId: rid, data: collected };
+      };
 
-      let allData: any[] = [];
-      let nextUrl: string | null = resultsUrl;
-      let isFirstRequest = true;
+      // ENG-511: If Meta rejects a whitelisted field (400 at submit OR at read),
+      // don't surface a bare error the model will blindly re-issue until the
+      // anti-loop guard hard-blocks the whole insights channel. Parse the offending
+      // field(s) out of Meta's error, drop them, and retry the whole report exactly
+      // ONCE with the valid remainder. If we cannot isolate the offender (or nothing
+      // valid would remain), return a structured no-retry error so the model
+      // corrects rather than loops.
+      let reportRunId: string;
+      let allData: any[];
+      // Meta names incompatible fields ONE AT A TIME, so a single retry only clears
+      // one bad field. Loop: drop the field(s) Meta names, retry with the remainder,
+      // and repeat until the report succeeds or nothing valid is left. Each pass
+      // removes >=1 field, so validFields strictly shrinks — the loop is bounded by
+      // the field count (maxHealAttempts is a belt-and-suspenders cap).
+      const maxHealAttempts = validFields.length + 1;
+      let healAttempts = 0;
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        try {
+          const run = await runReport(validFields);
+          reportRunId = run.reportRunId;
+          allData = run.data;
+          break;
+        } catch (reportErr: any) {
+          const metaError = reportErr?.response?.data?.error;
+          const status = reportErr?.response?.status;
+          const haystack = `${metaError?.message || ""} ${metaError?.error_user_msg || ""} ${metaError?.error_user_title || ""}`;
+          const isFieldError = status === 400 && /field/i.test(haystack);
 
-      while (nextUrl) {
-        const res: any = isFirstRequest
-          ? await axios.get(nextUrl, { params: { access_token: accessToken } })
-          : await axios.get(nextUrl); // paging.next already includes token
-        allData.push(...(res.data?.data || []));
-        nextUrl = res.data?.paging?.next || null;
-        isFirstRequest = false;
+          // Word-boundary match so a rejected field is not confused with a longer
+          // sibling that contains it (e.g. `ctr` inside `inline_link_click_ctr`).
+          const metaRejectedFields = isFieldError
+            ? validFields.filter((f) => new RegExp(`\\b${f}\\b`).test(haystack))
+            : [];
+          const retryFields = validFields.filter(
+            (f) => !metaRejectedFields.includes(f)
+          );
+
+          if (
+            isFieldError &&
+            metaRejectedFields.length &&
+            retryFields.length &&
+            healAttempts < maxHealAttempts
+          ) {
+            // Drop the Meta-rejected field(s) and retry with the valid subset.
+            healAttempts++;
+            droppedFields.push(...metaRejectedFields);
+            validFields = retryFields;
+            filteredParams.fields = validFields.join(",");
+            continue;
+          }
+
+          if (!isFieldError) {
+            throw reportErr;
+          }
+
+          // Field error we cannot recover from (offender unisolable, nothing valid
+          // remains, or cap hit): return a structured no-retry error so the model
+          // corrects rather than loops.
+          const suggestions = suggestInsightsFields(metaRejectedFields);
+          const suggestionHint = Object.keys(suggestions).length
+            ? ` Did you mean: ${Object.entries(suggestions)
+                .map(([bad, good]) => `${bad} -> ${good}`)
+                .join(", ")}?`
+            : "";
+          return {
+            success: false,
+            error: `Meta rejected the requested insights field(s)${metaRejectedFields.length ? `: ${metaRejectedFields.join(", ")}` : ""}. Do not retry the same request — remove or replace the offending field(s).${suggestionHint} Choose from allowed fields such as impressions, clicks, spend, cpc, ctr, reach, inline_link_clicks, cost_per_inline_link_click.`,
+            metadata: {
+              tool: "call_meta_ads_insights_api",
+              account_id,
+              meta_error: metaError?.message || reportErr?.message,
+              ...(Object.keys(suggestions).length && {
+                field_suggestions: suggestions,
+              }),
+            },
+          };
+        }
       }
 
       const envelope = {
@@ -14081,6 +14442,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           query: filteredParams,
           report_run_id: reportRunId,
           api_version: version,
+          // ENG-511: surface any unsupported fields we dropped so the model knows
+          // why they are absent and does not re-request them on the next turn, plus
+          // a closest-valid-field suggestion for each so a typo/loose phrasing is
+          // actionable (e.g. `impression` -> `impressions`) rather than silently gone.
+          ...(droppedFields.length && { dropped_fields: droppedFields }),
+          ...(droppedFields.length &&
+            Object.keys(suggestInsightsFields(droppedFields)).length && {
+              dropped_field_suggestions: suggestInsightsFields(droppedFields),
+            }),
         },
         data: allData,
       };
@@ -14101,9 +14471,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error("Error in callMetaAdsInsightsApiWrapper:", error);
+      // An axios rejection stringifies to "Request failed with status code 400",
+      // which tells the model nothing it can act on and reads as an opaque
+      // outage. Meta's actual explanation lives in response.data.error — surface
+      // it, minus the credential material Meta echoes back (ENG-630).
       return {
         success: false,
-        error: error.message,
+        error: describeMetaGraphApiError(error) || error.message,
       };
     }
   }
@@ -14400,20 +14774,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       switch (action) {
         case 'LIST': {
-          // List all pixels, then list datasets for each pixel
+          // Meta unified pixels and datasets in Graph v25 — a pixel IS its own dataset, and the
+          // per-pixel `/<pixel_id>/datasets` edge was removed. Querying it returns
+          // `(#100) Tried accessing nonexisting field (datasets)`, and because metaService's
+          // error handler rethrows, that one dead edge failed the entire LIST — making pixel
+          // discovery impossible in-product (ENG-399). The pixel id is the dataset id that
+          // GET_MATCH_QUALITY consumes, so derive it directly and issue no per-pixel call at all.
+          // Same conclusion the lander pixel resolver already reached (metaService.ts).
           const pixels = await metaService.listPixels(accountId, accessToken);
-          const results: any[] = [];
-          for (const pixel of pixels) {
-            const datasets = await metaService.listDatasets(pixel.id, accessToken);
-            results.push({
-              pixel_id: pixel.id,
-              pixel_name: pixel.name,
-              datasets: datasets
-            });
-          }
+          const results = pixels.map((pixel: any) => ({
+            pixel_id: pixel.id,
+            pixel_name: pixel.name,
+            last_fired_time: pixel.last_fired_time,
+            dataset_id: pixel.id,
+            datasets: [{ id: pixel.id, name: pixel.name }]
+          }));
           return {
             success: true,
-            message: `Found ${pixels.length} pixel(s) with ${results.reduce((sum: number, p: any) => sum + (p.datasets?.length || 0), 0)} dataset(s)`,
+            message: `Found ${pixels.length} pixel(s); each pixel id doubles as its dataset id for GET_MATCH_QUALITY`,
             pixels: results
           };
         }
@@ -14447,8 +14825,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     account_id?: string,
     options: { campaignId?: string; fields?: string | string[] } = {}
   ): Promise<any> {
+    let connection: any;
     try {
-      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+      const credentials = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = credentials;
+      connection = (credentials as any).connection;
       // Only forward the read-options bag when the caller supplied a campaign_id filter or
       // an explicit fields selection; otherwise call listCampaigns the same 2-arg way as
       // before. This preserves the CALL CONVENTION for a plain list-all — it does NOT keep
@@ -14470,6 +14851,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
+      // A permission refusal from Meta is not a "no campaigns" result — throw the
+      // actionable re-consent error and record the grant we just learned (ENG-629).
+      await this.normalizeMetaAdsReadError(error, connection?.userId || userId, connection);
       console.error('AgentMode: Error fetching Meta ad campaigns:', error);
       return {
         success: false,
@@ -14500,6 +14884,19 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         details: error.structuredError
       };
     }
+  }
+
+  /**
+   * Thin wrapper used by executeAudienceCampaignLaunch's ad-set reuse-match
+   * check to determine whether the campaign has Advantage Campaign Budget
+   * (CBO) — needed to normalize the requested budget the same way
+   * createMetaAdsAdSet does (strips it entirely for CBO campaigns) before
+   * comparing against an existing ad set. Kept as its own method (mirroring
+   * listMetaAdsAdSets) so it can be mocked directly in tests.
+   */
+  public async getCampaignForAdSetReuseCheck(userId: string, accountId: string, campaignId: string): Promise<any> {
+    const { accountId: resolvedAccountId, accessToken } = await this.getMetaCredentials(userId, accountId);
+    return metaService.getCampaign(resolvedAccountId, accessToken, campaignId);
   }
 
   public async listMetaAdsAdSets(
@@ -15582,43 +15979,46 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async getMetaAdsMetrics(timeframe: string, userId: string, campaign_ids: string[] | string): Promise<any> {
+  public async getMetaAdsMetrics(
+    timeframe: string,
+    userId: string,
+    campaign_ids: string[] | string,
+    requestedAccountId?: string,
+  ): Promise<any> {
     try {
+      const rawCampaignIds = Array.isArray(campaign_ids)
+        ? campaign_ids
+        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
+      const campaignFilterIds = [
+        ...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))
+      ];
+      console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
+      if (campaignFilterIds.length === 0) {
+        return {
+          success: false,
+          message: 'campaign_ids is required and must contain at least one campaign ID.',
+          error: 'Invalid campaign_ids'
+        };
+      }
 
-      // Import the Meta API functions directly to reuse the same logic
-      const { getMetaAccessToken } = await import('../utils/secretsManager');
-      const { userDb } = await import('./db');
       const { fetchWithRetryAndPaging } = await import('../utils/metaApiFetch');
 
-      // Get user from database
-      const user = await userDb.getUserById(userId);
-      if (!user) {
-        return {
-          success: false,
-          message: 'User not found',
-          error: 'User not found'
-        };
-      }
-
-      // Check if user has ad account configured
-      if (!user.adAccount || user.adAccount.trim() === "") {
-        return {
-          success: false,
-          message: 'Ad account not configured. Please configure your Meta ad account first.',
-          error: 'Ad account not configured'
-        };
-      }
-
-      // Get Meta API access token from Secrets Manager
+      // Use the same account resolver as the raw Insights tool. This keeps
+      // connected-account, org-shared, and legacy account selection consistent.
+      let accountId: string;
       let accessToken: string;
       try {
-        accessToken = await getMetaAccessToken();
+        ({ accountId, accessToken } = await this.getMetaCredentials(userId, requestedAccountId));
       } catch (error: any) {
-        console.error('AgentMode: Error fetching Meta access token:', error);
+        const credentialFailure =
+          error?.isMetaAuthError ||
+          /meta.*(?:access token|secret)|(?:access token|secret).*meta/i.test(error?.message || '');
+        if (!credentialFailure) throw error;
         return {
           success: false,
-          message: 'Meta access token not configured. Please contact your administrator.',
-          error: error.message || 'Failed to fetch access token from Secrets Manager'
+          message: error.message,
+          error: error.message,
+          errorType: 'connection'
         };
       }
 
@@ -15642,21 +16042,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const untilStr = endDate.toISOString().split('T')[0];
       const attributionDays = Math.max(1, Math.ceil((endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24))) + 1; // +1 to include both start and end dates
 
-      // Build filtering parameter for API calls from campaign_ids
-      let campaignFilterIds: string[] = [];
-      const rawCampaignIds = Array.isArray(campaign_ids)
-        ? campaign_ids
-        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
-      campaignFilterIds = [...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))];
-      console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
-      if (campaignFilterIds.length === 0) {
-        return {
-          success: false,
-          message: 'campaign_ids is required and must contain at least one campaign ID.',
-          error: 'Invalid campaign_ids'
-        };
-      }
-
       // Build filtering parameter for API calls
       const filteringParam = campaignFilterIds.length > 0
         ? `&filtering=[{"field":"campaign.id","operator":"IN","value":["${campaignFilterIds.join('","')}"]}]`
@@ -15666,48 +16051,49 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // Get campaigns, ad sets, ads, and insights using Graph API - fetch at multiple levels
       // Using fetchWithRetryAndPaging to automatically handle pagination if there are multiple pages
       const [campaignsData, adSetsData, adsData, adInsightsData, adSetInsightsData, campaignInsightsData, insightsDemographicsData, insightsPlacementData, insightsDeviceData] = await Promise.all([
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/campaigns?fields=id,name,status,objective${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/adsets?fields=id,name,status,campaign_id,targeting${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/ads?fields=id,name,status,adset_id,campaign_id,creative{thumbnail_url,title,body,image_url}${filteringParam}&access_token=${accessToken}`),
         // Ad-level insights for ads processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,ad_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=ad${filteringParam}&access_token=${accessToken}`),
         // Adset-level insights for ad sets processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,adset_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=adset${filteringParam}&access_token=${accessToken}`),
         // Campaign-level insights for campaigns processing
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,frequency,campaign_id,actions,cost_per_action_type&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Demographics breakdown (age/gender)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=age,gender&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Placement breakdown (publisher platform and position)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=publisher_platform,platform_position&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`),
         // Device breakdown (mobile/desktop, etc.)
-        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${user.adAccount}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
+        fetchWithRetryAndPaging(`https://graph.facebook.com/${apiVersion}/act_${accountId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach,actions,cost_per_action_type,campaign_id&breakdowns=impression_device&time_range={'since':'${sinceStr}','until':'${untilStr}'}&level=campaign${filteringParam}&access_token=${accessToken}`)
       ]);
 
 
-      // Check for errors in any of the responses
-      if (campaignsData.error) {
-        console.error('AgentMode: Campaigns API Error:', campaignsData.error);
-        throw new Error(`Campaigns API Error: ${campaignsData.error.message}`);
-      }
-      if (adSetsData.error) {
-        console.error('AgentMode: Ad Sets API Error:', adSetsData.error);
-        throw new Error(`Ad Sets API Error: ${adSetsData.error.message}`);
-      }
-      if (adsData.error) {
-        console.error('AgentMode: Ads API Error:', adsData.error);
-        throw new Error(`Ads API Error: ${adsData.error.message}`);
-      }
-      if (adInsightsData.error) {
-        console.error('AgentMode: Ad-level Insights API Error:', adInsightsData.error);
-        throw new Error(`Ad-level Insights API Error: ${adInsightsData.error.message}`);
-      }
-      if (adSetInsightsData.error) {
-        console.error('AgentMode: Adset-level Insights API Error:', adSetInsightsData.error);
-        throw new Error(`Adset-level Insights API Error: ${adSetInsightsData.error.message}`);
-      }
-      if (campaignInsightsData.error) {
-        console.error('AgentMode: Campaign-level Insights API Error:', campaignInsightsData.error);
-        throw new Error(`Campaign-level Insights API Error: ${campaignInsightsData.error.message}`);
+      // Keep connection lookup, permission, and query failures distinct so Emma
+      // can prompt for the right remedy instead of always asking for reconnect.
+      for (const [section, response] of [
+        ['Campaigns', campaignsData],
+        ['Ad Sets', adSetsData],
+        ['Ads', adsData],
+        ['Ad-level Insights', adInsightsData],
+        ['Adset-level Insights', adSetInsightsData],
+        ['Campaign-level Insights', campaignInsightsData],
+      ] as const) {
+        if (!response?.error) continue;
+        console.error(`AgentMode: ${section} API Error:`, response.error);
+        const message = response.error.message || 'Unknown Meta API error';
+        const code = Number(response.error.code);
+        const connectionFailure =
+          code === 190 ||
+          /access token|oauth|token.*(?:expired|invalid|revoked)/i.test(message);
+        const permissionFailure =
+          [10, 200].includes(code) ||
+          /permission|not authorized/i.test(message);
+        const typedError = new Error(`${section} API Error: ${message}`) as any;
+        typedError.metaMetricsErrorType = connectionFailure
+          ? 'connection'
+          : (permissionFailure ? 'permission' : 'api');
+        throw typedError;
       }
       // ENG-104: breakdown endpoints are NON-fatal (we proceed without them), but
       // a missing/errored breakdown must be distinguishable from an empty-but-OK
@@ -15784,13 +16170,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       };
 
       return result;
-    } catch (error) {
+    } catch (error: any) {
       console.error('AgentMode: Error fetching Meta ads metrics:', error);
       console.error('AgentMode: Error stack:', error instanceof Error ? error.stack : 'No stack trace');
+      const errorType = error?.isMetaAuthError
+        ? 'connection'
+        : (error?.metaMetricsErrorType || 'api');
+      const message = error instanceof Error ? error.message : 'Unknown error';
       return {
         success: false,
-        message: 'Failed to fetch Meta ads metrics. Please ensure your Meta ad account is properly configured.',
-        error: error instanceof Error ? error.message : 'Unknown error'
+        message,
+        error: message,
+        errorType
       };
     }
   }
@@ -16324,9 +16715,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       },
       {
         id: 'traffic',
-        label: 'Traffic / Awareness',
-        consequence: 'Optimizes for clicks/reach, not conversions — exposure only, not the default.',
+        label: 'Traffic',
+        consequence: 'Optimizes for clicks/landing-page views, not reach or conversions — exposure only, not the default.',
         payload: { objective: 'OUTCOME_TRAFFIC' },
+      },
+      {
+        id: 'awareness',
+        label: 'Awareness',
+        consequence: 'Optimizes for reach/impressions, not clicks or conversions — the objective REACH-optimized ad sets require.',
+        payload: { objective: 'OUTCOME_AWARENESS' },
       },
     ];
 
@@ -16523,7 +16920,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    */
   public async manageMetaCustomAudiences(
     userId: string,
-    action: 'LIST' | 'CREATE' | 'UPLOAD_USERS',
+    action: 'LIST' | 'CREATE' | 'UPLOAD_USERS' | 'DELETE_USERS' | 'REPLACE_USERS',
     account_id: string,
     params: any
   ): Promise<MetaApiResult> {
@@ -16605,10 +17002,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             // Already an array (e.g. from JSON)
             parsedPayload = userPayload;
           } else if (typeof userPayload === 'string') {
-            // Split by newline to get rows
-            const rows = userPayload.split(/\r?\n/).filter(row => row.trim().length > 0);
-            // Split by comma to get columns
-            parsedPayload = rows.map(row => row.split(',').map(cell => cell.trim()));
+            // Real CSV parsing (quoted fields containing commas, e.g. a phone
+            // value with an extension) — a naive split(',') silently corrupts
+            // column alignment on exactly this kind of real-world export.
+            try {
+              parsedPayload = parseCsv(userPayload, {
+                skip_empty_lines: true,
+                trim: true,
+                relax_column_count: true,
+              });
+            } catch (parseError: any) {
+              throw new Error(`Failed to parse CSV payload: ${parseError.message}`);
+            }
           } else {
             // Fallback or error
             parsedPayload = [];
@@ -16629,45 +17034,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             }
           }
 
-          // SHA256 Hashing logic
-          // Iterating through parsed payload and hashing fields based on schema
-
-          const hashedPayload = parsedPayload.map((row: string[]) => {
-            return row.map((cell: string, index: number) => {
-              const fieldType = (params.schema && params.schema[index]) ? params.schema[index].toUpperCase() : '';
-              let value = cell ? cell.trim() : '';
-
-              if (!value) return '';
-
-              // Pass through if already a SHA256 hash (64 hex chars)
-              if (/^[a-fA-F0-9]{64}$/.test(value)) {
-                return value;
-              }
-
-              // Normalization Rules per Meta requirements:
-              if (['EMAIL'].includes(fieldType)) {
-                value = value.toLowerCase();
-              } else if (['PHONE'].includes(fieldType)) {
-                // Standardize to digits only (strip spaces, dashes, parens)
-                value = value.toLowerCase().replace(/[^a-z0-9]/g, '');
-              } else if (['GEN'].includes(fieldType)) {
-                // Gender: 'f' or 'm'
-                value = value.toLowerCase() === 'female' ? 'f' : (value.toLowerCase() === 'male' ? 'm' : value.toLowerCase());
-              } else if (['DOBY', 'DOBM', 'DOBD'].includes(fieldType)) {
-                // Keep trimmed string
-                value = value.trim();
-              } else if (['COUNTRY'].includes(fieldType)) {
-                // Country codes must be lowercase 2-letter ISO
-                value = value.toLowerCase();
-              } else {
-                // Default: lowercase + trim
-                value = value.toLowerCase();
-              }
-
-              // Compute SHA256
-              return createHash('sha256').update(value).digest('hex');
-            });
-          });
+          // SHA256 Hashing logic (shared with resolveOrCreateSeedAudience's
+          // stale-member diff, which needs to hash rows the same way to
+          // compare against a previously saved snapshot — see hashAudienceRows).
+          const hashedPayload = this.hashAudienceRows(params.schema, parsedPayload);
 
           console.log(`[AgentMode] Hashed ${hashedPayload.length} rows for upload.`);
 
@@ -16685,18 +17055,934 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             result: result
           };
         }
+        case 'DELETE_USERS': {
+          // Removal counterpart of UPLOAD_USERS, used by resolveOrCreateSeedAudience
+          // to sync stale members out of a reused audience. Payload here is always
+          // an already-hashed array (rows previously saved in the snapshot store),
+          // never a raw CSV/URL — no fetch/parse/hash step needed.
+          if (!params.id || !params.payload || !params.schema) {
+            throw new Error('DELETE_USERS requires "id", "schema", and "payload".');
+          }
+          if (!Array.isArray(params.payload) || params.payload.length === 0) {
+            throw new Error('DELETE_USERS payload must be a non-empty array of rows.');
+          }
+          const result = await metaService.deleteCustomAudienceUsers(
+            accountId,
+            accessToken,
+            params.id,
+            params.schema,
+            params.payload
+          );
+          return {
+            success: true,
+            message: `Successfully initiated removal of ${params.payload.length} stale user(s) from audience ${params.id}`,
+            result: result
+          };
+        }
+        case 'REPLACE_USERS': {
+          // Used by resolveOrCreateSeedAudience when reusing an audience with
+          // no locally-saved membership snapshot to diff against — there's no
+          // baseline to know what's stale, so membership is atomically set to
+          // exactly the current source instead of add-only uploading (which
+          // would leave any pre-existing members that aren't in the current
+          // source stuck in the audience forever). Payload is the same raw
+          // (unhashed) row array UPLOAD_USERS receives from resolveOrCreateSeedAudience
+          // — hashed here the same way, via the shared hashAudienceRows helper
+          // (which passes already-hashed 64-hex values through unchanged).
+          if (!params.id || !params.payload || !params.schema) {
+            throw new Error('REPLACE_USERS requires "id", "schema", and "payload".');
+          }
+          if (!Array.isArray(params.payload) || params.payload.length === 0) {
+            throw new Error('REPLACE_USERS payload must be a non-empty array of rows.');
+          }
+          const hashedReplacePayload = this.hashAudienceRows(params.schema, params.payload);
+          const result = await metaService.replaceCustomAudienceUsers(
+            accountId,
+            accessToken,
+            params.id,
+            params.schema,
+            hashedReplacePayload
+          );
+          return {
+            success: true,
+            message: `Successfully replaced audience ${params.id} membership with ${params.payload.length} user(s)`,
+            result: result
+          };
+        }
         default:
           throw new Error(`Action ${action} is not supported for CUSTOM_AUDIENCE.`);
       }
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error managing custom audiences:', error);
+      // Meta's raw error.message (e.g. "Permissions error") is often too terse to
+      // act on. metaService.handleError attaches a structuredError with Meta's own
+      // consumer-facing error_user_msg (e.g. the exact accept-terms URL for
+      // "Custom audience terms not accepted", subcode 1870090) — prefer it when present.
+      const structured = error.structuredError;
+      let message = error.message || 'Failed to manage custom audiences.';
+      if (structured?.error_user_msg) {
+        message = structured.error_subcode === 1870090
+          ? `${structured.error_user_msg} This is a one-time setup step per ad account — once accepted, retry the same request.`
+          : structured.error_user_msg;
+      }
       return {
         success: false,
-        message: error.message || 'Failed to manage custom audiences.',
+        message,
         error: error.message
       };
     }
+  }
+
+  // ENG-600: fixed EMAIL/PHONE schema for the HubSpot/CSV audience-sourcing
+  // workflows — ticket scope is email/phone seed data, not arbitrary schemas.
+  private static AUDIENCE_SOURCE_SCHEMA = ['EMAIL', 'PHONE'];
+
+  /**
+   * Hashes raw row data per Meta's Custom Audience field-normalization rules
+   * (lowercased email, digits-only phone, etc.), passing through values that
+   * are already a 64-hex-char SHA256 hash unchanged. Shared by UPLOAD_USERS
+   * (manageMetaCustomAudiences) and resolveOrCreateSeedAudience's stale-member
+   * diff, which both need identical hashing so the same contact hashes to the
+   * same row-key regardless of which path produced it.
+   */
+  private hashAudienceRows(schema: string[], rows: string[][]): string[][] {
+    return rows.map((row: string[]) => {
+      return row.map((cell: string, index: number) => {
+        const fieldType = (schema && schema[index]) ? schema[index].toUpperCase() : '';
+        let value = cell ? cell.trim() : '';
+
+        if (!value) return '';
+
+        // Pass through if already a SHA256 hash (64 hex chars)
+        if (/^[a-fA-F0-9]{64}$/.test(value)) {
+          return value;
+        }
+
+        // Normalization Rules per Meta requirements:
+        if (['EMAIL'].includes(fieldType)) {
+          value = value.toLowerCase();
+        } else if (['PHONE'].includes(fieldType)) {
+          // Standardize to digits only (strip spaces, dashes, parens)
+          value = value.toLowerCase().replace(/[^a-z0-9]/g, '');
+        } else if (['GEN'].includes(fieldType)) {
+          // Gender: 'f' or 'm'
+          value = value.toLowerCase() === 'female' ? 'f' : (value.toLowerCase() === 'male' ? 'm' : value.toLowerCase());
+        } else if (['DOBY', 'DOBM', 'DOBD'].includes(fieldType)) {
+          // Keep trimmed string
+          value = value.trim();
+        } else if (['COUNTRY'].includes(fieldType)) {
+          // Country codes must be lowercase 2-letter ISO
+          value = value.toLowerCase();
+        } else {
+          // Default: lowercase + trim
+          value = value.toLowerCase();
+        }
+
+        // Compute SHA256
+        return createHash('sha256').update(value).digest('hex');
+      });
+    });
+  }
+
+  /** Deterministic row-key for a hashed row, used to diff audience snapshots. */
+  private audienceRowKey(hashedRow: string[]): string {
+    return hashedRow.join('|');
+  }
+
+  /**
+   * Fetches and parses a CSV URL into raw rows for resolveOrCreateSeedAudience's
+   * CSV source path. Fetched exactly once and reused as both the upload
+   * payload and the basis for the stale-member hash diff — fetching twice
+   * (e.g. once to diff, once inside UPLOAD_USERS) would let the two see
+   * different content if the URL's data changed in between, corrupting the
+   * diff against what was actually uploaded.
+   */
+  private async fetchAndParseCsvRows(csvUrl: string): Promise<string[][]> {
+    // Greptile finding: this is a server-side fetch of a caller-supplied URL
+    // with no destination restriction — a classic SSRF vector (cloud metadata
+    // endpoints, RFC1918/internal hosts, loopback). Reuses the repo's existing
+    // guard rather than reinventing IP-range checks.
+    //
+    // Greptile follow-up finding (DNS rebinding): validating the hostname
+    // alone isn't enough if axios then does its own SEPARATE DNS lookup to
+    // actually connect — an attacker-controlled DNS server can answer a
+    // public IP for the validation query and a private IP for the
+    // connection query. Pinning the connection to the exact address that
+    // was validated (via a custom `lookup`) eliminates the second,
+    // unvalidated lookup entirely.
+    const { address, family } = await resolvePinnedPublicAddress(csvUrl);
+    // SSRF defence-in-depth: refuse to follow redirects. Validation only
+    // covers the user-supplied URL itself; if axios followed a redirect to
+    // e.g. http://169.254.169.254/, the guard would be bypassed entirely.
+    // maxRedirects:0 makes axios surface a redirect as an error instead —
+    // same defense already used by routes/crm.ts's load-from-url path.
+    const response = await axios.get(csvUrl, {
+      maxRedirects: 0,
+      lookup: (_hostname: string, options: any, callback: any) => {
+        if (typeof options === 'function') callback = options;
+        callback(null, address, family);
+      },
+    } as any);
+    if (Array.isArray(response.data)) {
+      return response.data;
+    }
+    const str: string = typeof response.data === 'object' ? JSON.stringify(response.data) : String(response.data ?? '');
+    return parseCsv(str, { skip_empty_lines: true, trim: true, relax_column_count: true });
+  }
+
+  /**
+   * Resolves the Meta Custom Audience that a targeted/retargeting campaign
+   * workflow should target: reuse an existing audience whose name matches
+   * (case-insensitive), or create a new one. Either way, the resolved
+   * audience is (re)populated from the caller's HubSpot list or CSV source —
+   * reuse does not skip the upload, so pointing an existing audience at a
+   * fresh source keeps it current rather than silently reusing stale data.
+   *
+   * `dryRun: true` only resolves the reuse-vs-create decision (for building
+   * a pre-execution confirmation preview) without creating/uploading anything.
+   *
+   * Any hard failure (LIST/CREATE/UPLOAD_USERS erroring) is thrown, not
+   * swallowed — the caller (the two new launch* orchestration methods) must
+   * fail the whole campaign-launch rather than attach an empty/broken audience.
+   * Only non-fatal source-side issues (e.g. contacts with no email/phone) are
+   * returned in `failures`.
+   */
+  private async resolveOrCreateSeedAudience(
+    userId: string,
+    accountId: string,
+    audienceName: string,
+    source: { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string },
+    opts: { dryRun: boolean }
+  ): Promise<{
+    plannedAction: 'reuse' | 'create';
+    audience?: { id: string; name: string };
+    created: boolean;
+    sourceSummary: string;
+    failures: string[];
+    recordsFound?: number;
+    recordsUsable?: number;
+  }> {
+    const listResult = await this.manageMetaCustomAudiences(userId, 'LIST', accountId, {});
+    if (!listResult.success) {
+      throw new Error(listResult.message || 'Failed to list existing Meta custom audiences.');
+    }
+    const existing = (listResult.audiences || []).find(
+      (a: any) => String(a?.name ?? '').toLowerCase() === audienceName.toLowerCase()
+    );
+    const plannedAction: 'reuse' | 'create' = existing ? 'reuse' : 'create';
+    const sourceSummary = source.type === 'hubspot_list'
+      ? `HubSpot list ${source.listId}`
+      : `CSV upload (${source.csvUrl})`;
+
+    if (opts.dryRun) {
+      return {
+        plannedAction,
+        audience: existing ? { id: existing.id, name: existing.name } : undefined,
+        created: false,
+        sourceSummary,
+        failures: [],
+      };
+    }
+
+    const failures: string[] = [];
+    let schema: string[] = AgentModeService.AUDIENCE_SOURCE_SCHEMA;
+    let payload: string[][];
+    let recordsFound: number | undefined;
+    let recordsUsable: number | undefined;
+
+    if (source.type === 'hubspot_list') {
+      const hubspotSvc = await this.resolveHubSpotService(userId, source.hubspotAccountId);
+      const { contacts, failedChunkContactCount } = await hubspotSvc.getContactsForList(source.listId);
+      const rows: string[][] = [];
+      let skipped = 0;
+      for (const c of contacts) {
+        if (c.email || c.phone) {
+          rows.push([c.email || '', c.phone || '']);
+        } else {
+          skipped++;
+        }
+      }
+      const totalFound = contacts.length + failedChunkContactCount;
+      if (skipped > 0) {
+        failures.push(`${skipped} of ${contacts.length} HubSpot contacts had neither email nor phone, skipped.`);
+      }
+      // Greptile P1 finding: a failed batch/read chunk was previously silently
+      // dropped, then (after an earlier fix) merely reported as a non-fatal
+      // ledger entry while the campaign still launched against a known-
+      // incomplete audience. A HubSpot read failure means we cannot say what
+      // the correct audience actually is, so this now blocks the whole launch
+      // rather than proceeding on a partial/wrong segment — the caller must
+      // retry once HubSpot is reachable again.
+      if (failedChunkContactCount > 0) {
+        throw new Error(`${failedChunkContactCount} of ${totalFound} HubSpot contacts could not be read (batch/read failure) — refusing to launch against a known-incomplete audience. Retry once HubSpot is reachable again.`);
+      }
+      payload = rows;
+      recordsFound = totalFound;
+      recordsUsable = rows.length;
+    } else {
+      // Fetched/parsed once here (not left as a URL for UPLOAD_USERS to fetch
+      // separately) — a second independent fetch would let the stale-member
+      // diff and the actual upload see two different snapshots of the same
+      // URL if its content changed in between, corrupting the diff. One fetch
+      // is also the source of truth for both the hash diff and the upload.
+      payload = await this.fetchAndParseCsvRows(source.csvUrl);
+    }
+
+    let audienceId: string;
+    let audienceLabel: string;
+    if (plannedAction === 'create') {
+      const createResult = await this.manageMetaCustomAudiences(userId, 'CREATE', accountId, {
+        name: audienceName,
+        subtype: 'CUSTOM',
+        customer_file_source: 'USER_PROVIDED_ONLY',
+        confirm: true,
+      });
+      if (!createResult.success) {
+        throw new Error(createResult.message || 'Failed to create Meta custom audience.');
+      }
+      audienceId = createResult.audience.id;
+      audienceLabel = createResult.audience.name;
+    } else {
+      audienceId = existing.id;
+      audienceLabel = existing.name;
+    }
+
+    // Greptile P1 finding: reusing an existing audience for a fresh source
+    // upload never removed members no longer present in the new source — a
+    // contact removed from the HubSpot list (or dropped from a refreshed CSV)
+    // stayed in the Meta audience forever. Diff the current source's hashed
+    // rows against the last-synced snapshot and remove anything stale before
+    // uploading the new set. Only meaningful on reuse — a brand-new audience
+    // has no prior snapshot to diff against.
+    const hashedRows = this.hashAudienceRows(schema, payload);
+    const newRowKeys = hashedRows.map((row) => this.audienceRowKey(row));
+
+    // Greptile P1 finding: a failed DELETE_USERS must not be forgotten. If the
+    // snapshot saved below only reflected the current source (newRowKeys), a
+    // stale member whose removal failed would simply disappear from tracking
+    // — the next sync would see no prior record of it and never retry the
+    // removal, leaving it targetable in Meta permanently. Un-removed keys are
+    // folded back into what gets saved so the next sync sees them as stale
+    // again and retries. Greptile follow-up: a failed removal must not just
+    // be tracked for next time — it means this launch would proceed against
+    // an audience known to still contain removed contacts, so it now blocks
+    // the whole launch (thrown), consistent with every other hard-failure
+    // step here (LIST/CREATE/UPLOAD_USERS/snapshot save).
+    // Greptile finding: reusing an audience with NO prior snapshot (first
+    // sync since stale-member sync shipped, or an audience created outside
+    // this flow) had no baseline to diff against, so add-only uploads could
+    // never remove any pre-existing members not in the current source — they
+    // stayed forever. Tracked here so the write below uses Meta's atomic
+    // usersreplace instead of an add-only upload in exactly this case; once a
+    // snapshot exists, reuse goes back to the normal diff-and-delete-then-add
+    // path (cheaper, and avoids replacing the whole set every sync).
+    let noBaselineReuse = false;
+    if (plannedAction === 'reuse') {
+      // Greptile finding: a snapshot READ failure was previously swallowed
+      // as non-fatal, leaving noBaselineReuse false — which fell through to
+      // an add-only upload against unknown state (we can't tell "no prior
+      // snapshot" from "couldn't read it"), the same "launch against
+      // unreconciled data" problem as the other blocking fixes here. A
+      // genuine infra failure still propagates and blocks below, same as
+      // ever.
+      //
+      // Greptile follow-up finding: a CORRUPTED snapshot (malformed index or
+      // chunk) threw the exact same generic error, permanently blocking
+      // every future launch for that audience — unlike a transient outage,
+      // corruption never resolves itself on retry. Treated the same as "no
+      // baseline exists": falls through to the self-healing REPLACE_USERS
+      // path below (never proceeds with the untrustworthy incomplete
+      // baseline) and a fresh, uncorrupted snapshot gets saved right after,
+      // fixing the corruption for good.
+      let previousRowKeys: string[] | null;
+      try {
+        previousRowKeys = await getAudienceSnapshotRowKeys(userId, audienceId);
+      } catch (e) {
+        if (e instanceof CorruptSnapshotError) {
+          console.error(`AgentMode: Corrupt audience snapshot for ${audienceId}, treating as no baseline:`, e);
+          previousRowKeys = null;
+        } else {
+          throw e;
+        }
+      }
+      if (previousRowKeys) {
+        const currentKeySet = new Set(newRowKeys);
+        const staleRowKeys = previousRowKeys.filter((k) => !currentKeySet.has(k));
+        if (staleRowKeys.length > 0) {
+          const staleRows = staleRowKeys.map((k) => k.split('|'));
+          const deleteResult = await this.manageMetaCustomAudiences(userId, 'DELETE_USERS', accountId, {
+            id: audienceId,
+            schema,
+            payload: staleRows,
+            confirm: true,
+          });
+          if (!deleteResult.success) {
+            throw new Error(`Failed to remove ${staleRowKeys.length} stale member(s) from audience ${audienceId}: ${deleteResult.message}`);
+          }
+        }
+      } else {
+        noBaselineReuse = true;
+      }
+    }
+
+    // Greptile finding: saving the snapshot AFTER the Meta upload meant a
+    // save failure left a successfully-uploaded member with NO record in
+    // any snapshot, ever — future diffs can only flag a member as stale by
+    // comparing against a PRIOR snapshot that recorded it, so an untracked-
+    // from-birth member could never be detected as no-longer-needed and
+    // would stay targetable in Meta forever. Additive UPLOAD_USERS is
+    // idempotent (a future sync just re-sends whatever's in the current
+    // source, self-healing a "snapshot updated, upload not yet retried"
+    // mismatch) but deletes are NOT (they depend entirely on snapshot
+    // history) — so for that path, the snapshot is saved BEFORE uploading.
+    //
+    // Greptile follow-up finding: REPLACE_USERS (the no-baseline reuse path)
+    // is the OPPOSITE case — saving before it has the mirror problem: if
+    // REPLACE_USERS then fails, the snapshot now falsely looks like an
+    // established baseline exists, so a retry switches to additive
+    // UPLOAD_USERS instead of retrying REPLACE_USERS, and pre-existing
+    // members that should have been wiped by the replace are never removed.
+    // REPLACE_USERS doesn't need the save-before reorder at all — it's
+    // fully idempotent regardless of tracking history (always sets Meta's
+    // membership to exactly the payload), so retrying it after ANY failure
+    // — including one where the snapshot save is what actually failed — is
+    // always correct. Save stays AFTER for this path, as originally.
+    if (!noBaselineReuse) {
+      await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
+    }
+
+    const uploadResult = await this.manageMetaCustomAudiences(userId, noBaselineReuse ? 'REPLACE_USERS' : 'UPLOAD_USERS', accountId, {
+      id: audienceId,
+      schema,
+      payload,
+      confirm: true,
+    });
+    if (!uploadResult.success) {
+      throw new Error(uploadResult.message || (noBaselineReuse ? 'Failed to replace users in Meta custom audience.' : 'Failed to upload users to Meta custom audience.'));
+    }
+
+    if (noBaselineReuse) {
+      await saveAudienceSnapshotRowKeys(userId, audienceId, newRowKeys);
+    }
+
+    return {
+      plannedAction,
+      audience: { id: audienceId, name: audienceLabel },
+      created: plannedAction === 'create',
+      sourceSummary,
+      failures,
+      recordsFound,
+      recordsUsable,
+    };
+  }
+
+  /**
+   * Builds the human-readable preview shown before launching a targeted-audience
+   * or retargeting campaign, so the user always sees and confirms the resolved
+   * audience reuse/create decision before anything is created/uploaded — per
+   * ENG-600 product decision, name-collision reuse is never silent.
+   */
+  private buildAudienceCampaignConfirmationSummary(
+    workflow: 'targeted_audience' | 'retargeting',
+    args: any,
+    plan: { plannedAction: 'reuse' | 'create'; audience?: { id: string; name: string }; sourceSummary: string }
+  ): string {
+    const lines: string[] = [];
+    lines.push(
+      `${plan.plannedAction === 'reuse' ? 'Reuse existing' : 'Create a NEW'} Custom Audience "${args.audience_name}"` +
+      `${plan.audience ? ` (${plan.audience.id})` : ''}, sourced from ${plan.sourceSummary}.`
+    );
+    if (args.use_lookalike) {
+      lines.push(`Create a Lookalike Audience (ratio ${args.lookalike_ratio}, country ${args.lookalike_country}) from that seed.`);
+    }
+    lines.push(`Attach it to a NEW ad set under campaign ${args.campaign_id} (ad account ${args.account_id}).`);
+    if (workflow === 'retargeting') {
+      lines.push(`Exclude custom audience ${args.exclude_audience_id} so retargeting spend does not overlap the broad/prospecting audience.`);
+    }
+    // Greptile P1 finding: createMetaAdsAdSet silently strips daily_budget/
+    // lifetime_budget when the target campaign has Advantage Campaign Budget
+    // (CBO) enabled — a caller-supplied budget is only preview_token-bound by
+    // this confirm gate, not guaranteed to actually apply. Disclose the risk
+    // up front rather than let the user believe a specific budget is locked
+    // in by confirming.
+    if (args.ad_set_params?.daily_budget != null || args.ad_set_params?.lifetime_budget != null) {
+      lines.push(`Note: if campaign ${args.campaign_id} has Advantage Campaign Budget (CBO) enabled, Meta requires budget to be set at the campaign level — the daily/lifetime budget above will be silently dropped from the ad set in that case.`);
+    }
+    return lines.join(' ');
+  }
+
+  /**
+   * Deterministic JSON serialization with object keys sorted recursively, so
+   * two structurally-equal objects compare equal regardless of key order —
+   * unlike plain JSON.stringify, which is order-sensitive. Used by
+   * executeAudienceCampaignLaunch's ad-set reuse-by-match check to compare
+   * a requested targeting object against Meta's returned representation.
+   */
+  private canonicalJSON(value: any): string {
+    const sortKeys = (v: any): any => {
+      if (Array.isArray(v)) return v.map(sortKeys);
+      if (v && typeof v === 'object') {
+        return Object.keys(v).sort().reduce((acc: any, k: string) => {
+          acc[k] = sortKeys(v[k]);
+          return acc;
+        }, {});
+      }
+      return v;
+    };
+    return JSON.stringify(sortKeys(value ?? {}));
+  }
+
+  /**
+   * Live-test finding (real Meta, ENG-600): a full canonicalJSON deep-equal
+   * of a requested `targeting` object against Meta's returned representation
+   * never matches, even for a byte-identical retry — Meta injects its own
+   * defaults on read that we never sent (e.g. age_min/age_max/
+   * user_age_unknown/targeting_relaxation_types at the top level, and
+   * location_types nested inside geo_locations), and echoes back extra
+   * fields on objects we DID send (e.g. custom_audiences[].name). Strict
+   * equality treated every one of those as a real difference and reuse never
+   * triggered. This instead checks that every key/value WE explicitly
+   * requested is present in Meta's stored value, ignoring any extra keys
+   * Meta added — Meta-injected defaults no longer block a legitimate reuse
+   * match, while any actual difference in a field we requested still does.
+   */
+  private isDeepSubset(requested: any, actual: any): boolean {
+    if (requested === null || typeof requested !== 'object') return requested === actual;
+    if (Array.isArray(requested)) {
+      if (!Array.isArray(actual) || requested.length !== actual.length) return false;
+      return requested.every((item, i) => this.isDeepSubset(item, actual[i]));
+    }
+    if (actual === null || typeof actual !== 'object') return false;
+    return Object.keys(requested).every((key) => this.isDeepSubset(requested[key], actual[key]));
+  }
+
+  /**
+   * Greptile finding (PR #2234): confirm=true wasn't bound to what was
+   * actually previewed — a model could set confirm=true on the very first
+   * call (skipping the preview entirely) or change arguments between the
+   * preview and confirm calls, and the tool would execute on the unverified/
+   * changed arguments with no way to detect it. This computes a digest over
+   * every argument that defines WHAT gets created/changed; launchAudienceCampaign
+   * only treats a call as genuinely confirmed when args.preview_token matches
+   * the digest recomputed from the CURRENT args — so a first-call confirm=true
+   * (no token yet) or a changed argument after preview both fail the check
+   * and fall back into a fresh preview instead of executing.
+   *
+   * Greptile follow-up finding: a plain hash of the args is NOT sufficient —
+   * it's a pure function of caller-supplied data with no server secret, so
+   * any caller (including the model itself) can independently compute the
+   * exact same value and pass confirm=true on the very first call, without
+   * ever having gone through an actual preview. HMAC-signing with the
+   * server-only JWT secret (never exposed to the model/caller) makes the
+   * token non-forgeable: only a value this method itself produced can match.
+   */
+  private computeAudienceCampaignArgsDigest(args: any): string {
+    const canonical = {
+      account_id: args.account_id,
+      campaign_id: args.campaign_id,
+      audience_name: args.audience_name,
+      audience_source: args.audience_source,
+      use_lookalike: !!args.use_lookalike,
+      lookalike_ratio: args.lookalike_ratio,
+      lookalike_country: args.lookalike_country,
+      exclude_audience_id: args.exclude_audience_id,
+      ad_set_params: args.ad_set_params,
+    };
+    return createHmac('sha256', getJwtSecret()).update(JSON.stringify(canonical)).digest('hex');
+  }
+
+  /**
+   * Resolves args.audience_source into the discriminated union
+   * resolveOrCreateSeedAudience expects. Throws if neither or both of
+   * hubspot_list_id/csv_url are provided.
+   */
+  private resolveAudienceSourceArg(audience_source: any): { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string } {
+    const hasHubSpot = !!audience_source?.hubspot_list_id;
+    const hasCsv = !!audience_source?.csv_url;
+    if (hasHubSpot === hasCsv) {
+      throw new Error('audience_source must include exactly one of hubspot_list_id or csv_url.');
+    }
+    return hasHubSpot
+      ? { type: 'hubspot_list', listId: audience_source.hubspot_list_id, hubspotAccountId: audience_source.hubspot_account_id }
+      : { type: 'csv', csvUrl: audience_source.csv_url };
+  }
+
+  /**
+   * Shared implementation for launchTargetedAudienceCampaign / launchRetargetingCampaign
+   * (ENG-600). Sources or reuses a Meta Custom Audience from a HubSpot list or CSV,
+   * optionally creates a Lookalike from it, attaches it to a new ad set under an
+   * existing campaign, and returns a completion ledger. Uses the same 2-phase
+   * preview/confirm gate as call_meta_marketing_api's write actions
+   * (buildMetaWriteConfirmation) — collectConfirmationPrompt halts the turn on any
+   * result with awaitingUserConfirmation===true, regardless of which method produced it.
+   */
+  private async launchAudienceCampaign(
+    userId: string,
+    args: any,
+    workflow: 'targeted_audience' | 'retargeting'
+  ): Promise<any> {
+    try {
+      assertMetaAccountAllowed(args.account_id);
+
+      if (workflow === 'retargeting' && !args.exclude_audience_id) {
+        throw new Error('exclude_audience_id is required for the retargeting workflow.');
+      }
+      if (args.use_lookalike) {
+        if (args.lookalike_ratio === undefined || args.lookalike_ratio === null) {
+          throw new Error('lookalike_ratio is required when use_lookalike is true (0.01-0.20). No default is applied.');
+        }
+        if (!args.lookalike_country) {
+          throw new Error('lookalike_country is required when use_lookalike is true (2-letter ISO country code). No default is applied.');
+        }
+      }
+
+      const source = this.resolveAudienceSourceArg(args.audience_source);
+      const expectedPreviewToken = this.computeAudienceCampaignArgsDigest(args);
+      const confirmAttempted = args.confirm === true;
+      const tokenValid = args.preview_token === expectedPreviewToken;
+      const tokenMatches = confirmAttempted && tokenValid;
+      // Greptile P1 findings: (1) an HMAC-valid token was never consumed/
+      // invalidated after use — replaying the exact same confirmed call would
+      // silently re-execute (e.g. create a second ad set under the same
+      // campaign) with no new user confirmation; (2) a separate check-then-mark
+      // is non-atomic — two concurrent requests with the same valid token
+      // could both read "not yet consumed" before either write became
+      // visible. claimPreviewToken closes both: a single conditional DynamoDB
+      // put lets only one caller ever win the claim, so "confirmed" here means
+      // this exact call atomically claimed the token, not merely that the
+      // token matches.
+      const claimed = tokenMatches ? await claimPreviewToken(userId, args.preview_token) : false;
+      const alreadyConsumed = tokenMatches && !claimed;
+      const confirmed = claimed;
+
+      if (!confirmed) {
+        const plan = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: true });
+        const summary = this.buildAudienceCampaignConfirmationSummary(workflow, args, plan);
+        // Distinguish "first preview, nothing attempted yet" from "confirm was
+        // attempted but the token was missing/stale" from "confirm was
+        // attempted with a token that was already used once" — each needs a
+        // different explanation for why this falls back to a fresh preview.
+        const staleNotice = alreadyConsumed
+          ? 'This confirmation token was already used for a previous launch and cannot be reused — here is a fresh plan to confirm again. '
+          : confirmAttempted
+          ? 'The confirmation token was missing or no longer matches these arguments (they may have changed since the last preview), so this cannot execute yet — here is the CURRENT plan to confirm instead. '
+          : '';
+        return {
+          success: true,
+          requiresConfirmation: true,
+          awaitingUserConfirmation: true,
+          summary,
+          previewToken: expectedPreviewToken,
+          confirmationPrompt:
+            `${staleNotice}Based on your request, here's the ${workflow === 'retargeting' ? 'retargeting' : 'targeted-audience'} campaign ` +
+            `I'm about to launch — please check it's correct before I proceed:\n\n${summary}\n\n` +
+            `Reply "yes" / "confirm" if this is correct, or tell me what to change.`,
+          confirmationDetail: summary,
+          message: `${staleNotice}Confirm this ${workflow} campaign launch before it runs: ${summary} Show the user the plan above ` +
+            `and get explicit approval. Once approved, call this tool again with the EXACT SAME arguments plus confirm=true ` +
+            `and preview_token="${expectedPreviewToken}" (copy it verbatim from this response — it will not match if you retype it or change any argument).`,
+        };
+      }
+
+      // Greptile finding: once claimed, a failure anywhere below (reconciliation,
+      // lookalike, ad-set creation) left the token permanently consumed — since
+      // the digest is deterministic given the same args, re-previewing
+      // unchanged arguments produces the SAME token, already claimed forever,
+      // so the user could never retry the exact approved arguments. Releasing
+      // the claim on failure lets a legitimate retry work, while the atomic
+      // claim above still fully prevents concurrent double-execution.
+      try {
+        const result = await this.executeAudienceCampaignLaunch(userId, args, workflow, source);
+        // Greptile follow-up finding: without marking a successful launch's
+        // token permanently consumed, the staleness override added for
+        // failed-release retries also let a genuinely completed launch's
+        // token be reclaimed and replayed after the staleness window.
+        //
+        // Greptile finding: a failure from THIS write must not be treated as
+        // a launch failure — the external Meta mutations already completed
+        // by this point. Letting it propagate into the catch below via
+        // `throw` would report the completed launch as failed to the
+        // caller, which is wrong regardless of what happens to the token.
+        //
+        // Greptile follow-up finding: after markPreviewTokenSucceeded
+        // exhausts its own retries, silently leaving the claim dangling
+        // "in_progress" made it reclaimable — and therefore replayable —
+        // after the staleness window, with no bound on when that happens.
+        // Explicitly releasing the claim here (same best-effort delete
+        // releasePreviewToken already uses on a real failure) closes that
+        // limbo state immediately instead of leaving it to staleness. This
+        // is safe specifically because a resulting retry re-enters
+        // executeAudienceCampaignLaunch's reuse-by-match logic (audience
+        // name-match, lookalike spec-match, ad-set full-config-match — all
+        // live-verified against real Meta) rather than a bare unconditional
+        // re-execution: it finds and reuses the campaign/lookalike/ad set
+        // this call already created instead of duplicating them, so the
+        // worst case is a wasted extra LIST-and-compare pass, not duplicate
+        // spend.
+        try {
+          await markPreviewTokenSucceeded(userId, args.preview_token);
+        } catch (markError) {
+          console.error('AgentMode: Failed to mark audience-campaign preview token as succeeded (launch itself succeeded) — releasing the claim so a retry can safely reuse the already-created resources:', markError);
+          await releasePreviewToken(userId, args.preview_token);
+        }
+        return result;
+      } catch (e) {
+        await releasePreviewToken(userId, args.preview_token);
+        throw e;
+      }
+    } catch (error: any) {
+      return {
+        success: false,
+        workflow,
+        ledger: { failures: [{ step: 'launch', message: error.message }] },
+        message: error.message || `Failed to launch ${workflow} campaign.`,
+      };
+    }
+  }
+
+  private async executeAudienceCampaignLaunch(
+    userId: string,
+    args: any,
+    workflow: 'targeted_audience' | 'retargeting',
+    source: { type: 'hubspot_list'; listId: string; hubspotAccountId?: string } | { type: 'csv'; csvUrl: string }
+  ): Promise<any> {
+      const seed = await this.resolveOrCreateSeedAudience(userId, args.account_id, args.audience_name, source, { dryRun: false });
+
+      let attachAudienceId = seed.audience!.id;
+      let lookalike: { id: string; name: string; ratio: number; country: string } | null = null;
+      if (args.use_lookalike) {
+        // Greptile finding: releasing the confirm token on a downstream
+        // failure (e.g. ad-set creation) lets a legitimate retry reuse the
+        // same approved args — but CREATE isn't idempotent by name, so an
+        // unconditional retry after a lookalike had already been created
+        // would create ANOTHER same-named lookalike, leaving a duplicate
+        // Meta resource from a single confirmation. Reuse-by-exact-name-match
+        // first, same pattern the seed audience already uses.
+        const lookalikeName = `${args.audience_name} - Lookalike`;
+        const lookalikeListResult = await this.manageMetaCustomAudiences(userId, 'LIST', args.account_id, {});
+        if (!lookalikeListResult.success) {
+          throw new Error(lookalikeListResult.message || 'Failed to list existing Meta custom audiences.');
+        }
+        // Greptile follow-up findings: name-only matching isn't enough — a
+        // same-named lookalike from an earlier launch with a DIFFERENT
+        // ratio/country/seed audience (a deliberate new request, not a
+        // retry — the confirm-token digest already includes ratio/country
+        // and the source, so reaching here with a genuinely different
+        // digest means a fresh, separately confirmed launch) must not be
+        // silently reused. The campaign would target the old population
+        // while the ledger reports the newly requested spec. Requires the
+        // existing audience's actual spec — including its origin seed
+        // audience, not just ratio/country — to also match, not just its
+        // name.
+        const existingLookalike = (lookalikeListResult.audiences || []).find((a: any) => {
+          const origin = a?.lookalike_spec?.origin;
+          const originId = Array.isArray(origin) ? origin[0]?.id : origin?.id;
+          return (
+            String(a?.name ?? '').toLowerCase() === lookalikeName.toLowerCase() &&
+            a?.lookalike_spec?.ratio === args.lookalike_ratio &&
+            a?.lookalike_spec?.country === args.lookalike_country &&
+            originId === seed.audience!.id
+          );
+        });
+        let lookalikeAudience: { id: string; name: string };
+        if (existingLookalike) {
+          lookalikeAudience = { id: existingLookalike.id, name: existingLookalike.name };
+        } else {
+          const lookalikeResult = await this.manageMetaCustomAudiences(userId, 'CREATE', args.account_id, {
+            name: lookalikeName,
+            subtype: 'LOOKALIKE',
+            lookalike_spec: {
+              origin: [{ id: seed.audience!.id, type: 'custom_audience' }],
+              ratio: args.lookalike_ratio,
+              country: args.lookalike_country,
+            },
+            confirm: true,
+          });
+          if (!lookalikeResult.success) {
+            throw new Error(lookalikeResult.message || 'Failed to create Lookalike Audience.');
+          }
+          lookalikeAudience = lookalikeResult.audience;
+        }
+        attachAudienceId = lookalikeAudience.id;
+        lookalike = {
+          id: lookalikeAudience.id,
+          name: lookalikeAudience.name,
+          ratio: args.lookalike_ratio,
+          country: args.lookalike_country,
+        };
+      }
+
+      const targeting: any = {
+        ...(args.ad_set_params?.targeting || {}),
+        custom_audiences: [{ id: attachAudienceId }],
+      };
+      if (workflow === 'retargeting') {
+        targeting.excluded_custom_audiences = [{ id: args.exclude_audience_id }];
+      }
+      // Greptile finding: createMetaAdsAdSet defaults targeting_automation.
+      // advantage_audience to 0 when the caller didn't set it (Meta requires
+      // this field explicitly). It does this on its OWN local copy of
+      // targeting, not the object passed in — so without applying the same
+      // default here, comparing this `targeting` object against what Meta
+      // actually stored (and returns via LIST) would always see a spurious
+      // difference and never reuse, even for an identical retry.
+      if (!targeting.targeting_automation || targeting.targeting_automation.advantage_audience === undefined) {
+        targeting.targeting_automation = {
+          ...(targeting.targeting_automation || {}),
+          advantage_audience: 0,
+        };
+      }
+
+      // Greptile finding: releasing the confirm token on a downstream
+      // failure (e.g. Meta's ad-set-creation response lost/timed out even
+      // though the write actually completed) lets a legitimate retry reuse
+      // the same approved args — but createMetaAdsAdSet has no idempotency
+      // of its own, so an unconditional retry would create a SECOND ad set,
+      // duplicating delivery and spend from a single confirmation. Reuse an
+      // existing same-named ad set targeting the same audience under this
+      // campaign first, same reuse-by-match pattern as the lookalike fix.
+      const adSetName = args.ad_set_params?.name;
+      const existingAdSetsResult = await this.listMetaAdsAdSets(userId, args.campaign_id, args.account_id);
+      if (!existingAdSetsResult.success) {
+        throw new Error(existingAdSetsResult.message || 'Failed to list existing Meta ad sets.');
+      }
+      // Greptile follow-up findings: name + targeted-audience alone isn't
+      // enough — a same-named ad set targeting the same audience but with
+      // ANY different delivery knob (budget, schedule, optimization goal,
+      // billing event, bid strategy, destination type, promoted object, or
+      // — for retargeting — excluded audience, which lives inside
+      // `targeting`) must not be silently reused. The launch would report
+      // success while actually applying the OLD delivery configuration
+      // instead of the one the user just confirmed. Rather than keep
+      // special-casing individual fields one Greptile pass at a time,
+      // compares every field this method can even set on an ad set
+      // (mirroring metaService's own AD_SET_READ_FIELDS list) generically —
+      // any explicitly-requested field that differs from the existing ad
+      // set's actual value blocks reuse.
+      //
+      // Greptile follow-up finding: comparing RAW requested values against
+      // Meta's read-back values defeated reuse for the exact retry case this
+      // exists to handle — createMetaAdsAdSet normalizes daily_budget/
+      // lifetime_budget/bid_amount to cents (×100) and defaults bid_strategy/
+      // destination_type when unset before calling Meta, so an identical
+      // retry's RAW args never matched the normalized values Meta actually
+      // stored. Applies the same normalization here before comparing.
+      //
+      // Greptile follow-up finding: two more createMetaAdsAdSet transforms
+      // weren't mirrored — (1) daily_budget/lifetime_budget are stripped
+      // entirely (not just left unconverted) when the campaign has
+      // Advantage Campaign Budget (CBO), so a CBO retry's requested budget
+      // must also normalize to "no budget" for comparison; (2) start_time is
+      // auto-set to "now" at creation time for an ACTIVE ad set with no
+      // explicit start_time — a value that can never be reproduced on a
+      // later retry, so start_time is excluded from the comparison
+      // entirely in exactly that case (any existing ACTIVE match on every
+      // other field is accepted regardless of its actual start_time).
+      const campaign = await this.getCampaignForAdSetReuseCheck(userId, args.account_id, args.campaign_id);
+      const campaignHasBudget = !!(campaign?.daily_budget || campaign?.lifetime_budget);
+
+      const toCentsForComparison = (val: number | undefined) => val !== undefined ? Math.round(val * 100) : undefined;
+      const resolvedBidStrategy = args.ad_set_params?.bid_strategy || 'LOWEST_COST_WITHOUT_CAP';
+      const resolvedDestinationType = args.ad_set_params?.destination_type === undefined &&
+        META_WEBSITE_OPTIMIZATION_GOALS.includes(args.ad_set_params?.optimization_goal)
+        ? 'WEBSITE'
+        : args.ad_set_params?.destination_type;
+      const normalizedRequestedAdSetParams: Record<string, any> = {
+        ...args.ad_set_params,
+        daily_budget: campaignHasBudget ? undefined : toCentsForComparison(args.ad_set_params?.daily_budget),
+        lifetime_budget: campaignHasBudget ? undefined : toCentsForComparison(args.ad_set_params?.lifetime_budget),
+        bid_amount: toCentsForComparison(args.ad_set_params?.bid_amount),
+        bid_strategy: resolvedBidStrategy,
+        destination_type: resolvedDestinationType,
+      };
+      const startTimeIsUnreproducibleAutoFill = args.ad_set_params?.status === 'ACTIVE' && args.ad_set_params?.start_time === undefined;
+      const AD_SET_REUSE_MATCH_FIELDS = (
+        [
+          'daily_budget', 'lifetime_budget', 'start_time', 'end_time',
+          'optimization_goal', 'billing_event', 'bid_strategy', 'bid_amount',
+          'destination_type', 'promoted_object', 'status',
+        ] as const
+      ).filter((field) => field !== 'start_time' || !startTimeIsUnreproducibleAutoFill);
+      // Live-test finding against real Meta: the Graph API returns budget/bid
+      // fields as STRINGS ("500"), while our normalized requested values are
+      // numbers (500) — a strict canonicalJSON compare treated every
+      // legitimate retry as a mismatch purely from JSON type, never numeric
+      // value. Coerce these specific numeric-typed fields before comparing.
+      const NUMERIC_AD_SET_FIELDS = new Set(['daily_budget', 'lifetime_budget', 'bid_amount']);
+      const existingAdSet = (existingAdSetsResult.adSets || []).find((as: any) => {
+        if (String(as?.name ?? '').toLowerCase() !== String(adSetName ?? '').toLowerCase()) return false;
+        if (!this.isDeepSubset(targeting, as?.targeting)) return false;
+        for (const field of AD_SET_REUSE_MATCH_FIELDS) {
+          const requested = normalizedRequestedAdSetParams[field];
+          if (requested === undefined) continue; // not explicitly requested — don't require a match on it
+          let actual = as?.[field] ?? null;
+          if (NUMERIC_AD_SET_FIELDS.has(field) && actual !== null) actual = Number(actual);
+          if (this.canonicalJSON(actual) !== this.canonicalJSON(requested)) return false;
+        }
+        return true;
+      });
+
+      let adSet: { id: string; name: string };
+      if (existingAdSet) {
+        adSet = { id: existingAdSet.id, name: existingAdSet.name };
+      } else {
+        const adSetResult = await this.createMetaAdsAdSet(userId, {
+          ...args.ad_set_params,
+          account_id: args.account_id,
+          campaign_id: args.campaign_id,
+          targeting,
+        });
+        if (!adSetResult.success) {
+          throw new Error(adSetResult.message || 'Failed to create ad set.');
+        }
+        adSet = adSetResult.adSet;
+      }
+
+      const ledger = {
+        source: {
+          type: source.type,
+          identifier: source.type === 'hubspot_list' ? source.listId : source.csvUrl,
+          recordsFound: seed.recordsFound,
+          recordsUsable: seed.recordsUsable,
+        },
+        audience: { id: seed.audience!.id, name: seed.audience!.name, created: seed.created, subtype: 'CUSTOM' as const },
+        lookalike,
+        campaign: { id: args.campaign_id },
+        adSet: {
+          id: adSet.id,
+          name: adSet.name,
+          targetedAudienceId: attachAudienceId,
+          excludedAudienceId: workflow === 'retargeting' ? args.exclude_audience_id : undefined,
+        },
+        failures: seed.failures.map((message: string) => ({ step: 'seed_audience_source', message })),
+      };
+
+      return {
+        success: true,
+        workflow,
+        ledger,
+        message: `Launched ${workflow} campaign: audience "${ledger.audience.name}" (${seed.created ? 'created' : 'reused'})` +
+          `${lookalike ? `, lookalike "${lookalike.name}"` : ''} attached to ad set "${ledger.adSet.name}".`,
+      };
+  }
+
+  /**
+   * ENG-600: sources/reuses a Meta Custom Audience from a HubSpot list or CSV,
+   * optionally builds a Lookalike from it, and attaches it to a new ad set under
+   * an existing "targeted" campaign kept separate from any broad/control campaign.
+   */
+  public async launchTargetedAudienceCampaign(userId: string, args: any): Promise<any> {
+    return this.launchAudienceCampaign(userId, args, 'targeted_audience');
+  }
+
+  /**
+   * ENG-600: same audience-sourcing path as launchTargetedAudienceCampaign, but
+   * requires exclude_audience_id (typically the broad/prospecting audience) so
+   * retargeting spend structurally never overlaps prospecting spend.
+   */
+  public async launchRetargetingCampaign(userId: string, args: any): Promise<any> {
+    return this.launchAudienceCampaign(userId, args, 'retargeting');
   }
 
   /**
@@ -21390,6 +22676,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         };
       }
 
+      // ENG-510: distinguish an LLM-specified model from a system-resolved default.
+      // Only a genuine per-request choice should suppress the transient-timeout
+      // fallback; the admin-configured default is a system preference, not a
+      // semantic lock, so a timeout on it must still fail over to another provider
+      // instead of delivering zero images. Resolving the default here (rather than
+      // in the tool handler) preserves that distinction end-to-end.
+      const modelExplicitlyChosen = typeof imageModel === 'string' && imageModel.trim().length > 0;
+      const resolvedImageModel = modelExplicitlyChosen
+        ? imageModel
+        : await this.getImageApiDefaultModel();
+
       const inputImagesForRequest = inputImages || [];
       const primaryRequest = {
         prompt,
@@ -21399,11 +22696,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         inputImages: inputImagesForRequest,
         logoImage,
         userId,
-        imageModel
+        imageModel: resolvedImageModel
       };
 
       let result: any;
-      let imageModelUsed = imageModel || 'gemini-3-pro-image-preview';
+      let imageModelUsed = resolvedImageModel || 'gemini-3-pro-image-preview';
       let fallbackUsed = false;
       let primaryError: string | undefined;
 
@@ -21411,7 +22708,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         result = await imageService.generateImage(primaryRequest);
       } catch (primaryFailure: any) {
         primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
-        const fallbackModel = this.getImageGenerationFallbackModel(imageModel, inputImagesForRequest, logoImage);
+        const fallbackModel = this.getImageGenerationFallbackModel(resolvedImageModel, inputImagesForRequest, logoImage, modelExplicitlyChosen);
         if (!fallbackModel || !this.isRetryableMediaToolError(primaryError)) {
           throw primaryFailure;
         }
@@ -21446,7 +22743,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       if (!(result.success && result.imageUrl) && !fallbackUsed) {
         primaryError = result.error || 'Failed to generate image';
-        const fallbackModel = this.getImageGenerationFallbackModel(imageModel, inputImagesForRequest, logoImage);
+        const fallbackModel = this.getImageGenerationFallbackModel(resolvedImageModel, inputImagesForRequest, logoImage, modelExplicitlyChosen);
         if (fallbackModel && this.isRetryableMediaToolError(primaryError)) {
           console.warn(
             `AgentMode: Image generation with "${imageModelUsed}" failed with a retryable error; trying fallback "${fallbackModel}":`,
@@ -21506,7 +22803,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               // Stable marker so extractGeneratedImageFilenames can detect generated
               // images without relying solely on the content-string format.
               kind: 'image-generated',
-              imageFilename: result.filename
+              imageFilename: result.filename,
+              // ENG-510: carry the URL on this immediately-persisted marker so a completed
+              // image is discoverable (scanMessagesForAssets) even if the whole-turn cap
+              // kills the turn before the end-of-turn toolCalls stamp runs — graceful
+              // partial delivery instead of losing finished work. De-duped by URL.
+              imageUrl: result.imageUrl
             }
           });
         } catch (error) {
@@ -26564,6 +27866,26 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // List connected accounts helper
+  /**
+   * Capability annotation for a Meta ad account in list_connected_accounts.
+   *
+   * Returns `{}` for non-Meta accounts and for Meta records whose grant we cannot
+   * prove either way, so the payload only ever carries facts. (ENG-629 AC1)
+   */
+  private async describeMetaAdsCapability(acc: any): Promise<Record<string, any>> {
+    if (acc?.platform !== 'meta' && acc?.platform !== 'facebook') return {};
+    if (acc?.config?.account_type !== 'ad_account') return {};
+
+    const { getMetaAdsScopeState, META_ADS_RECONSENT_MESSAGE } = await import('../utils/metaAdsScope');
+    const state = getMetaAdsScopeState(acc.config);
+
+    if (state === 'granted') return { ads_capable: true };
+    if (state === 'missing') {
+      return { ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE };
+    }
+    return {};
+  }
+
   async listConnectedAccounts(userId: string, platform: string = 'all'): Promise<any> {
     try {
       const { getAccountsByUserIdIncludingOrgShared, isTokenValid } = await import('./connectedAccountsDb');
@@ -26630,6 +27952,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 currency: (acc.config as { currency?: string }).currency || 'USD',
               }
             : {}),
+          // A Meta ad account can be connected and unexpired yet unable to read ads
+          // data because the owner never granted ads_read/ads_management. Without
+          // this, `is_active: true` alone reads as "fully capable" and the model
+          // plans work it cannot complete (ENG-629). Only emitted when we actually
+          // know — an unknown legacy record stays silent rather than crying wolf.
+          ...(await this.describeMetaAdsCapability(acc)),
         })))
       };
     } catch (error) {
@@ -27088,6 +28416,29 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         };
       }
 
+      // ENG-660: for a personal LinkedIn account, AgentWeb works from the posts
+      // created through AgentWeb itself (personal profiles have no organic post
+      // ingestion — only AgentWeb-published posts are ever on file). When none
+      // are on file, a bare "Successfully loaded 0 posts" led the model to claim
+      // the fetch of the
+      // user's posts succeeded (a tool-success hallucination). Signal this as an
+      // explicitly-unsupported read via organicReadUnsupported + the message so
+      // the model states the truth instead of implying it read the user's
+      // LinkedIn. success stays true on purpose: nothing failed (the account is
+      // connected and healthy), so this must NOT render as a tool "failure" in
+      // the UI. The message leads with what AgentWeb DOES (positive, ownership
+      // framing) so the model doesn't present this as a weakness/"limitation".
+      const accountType = (matchingAccount.config as any)?.account_type;
+      if (result.posts.length === 0 && matchingAccount.platform === 'linkedin' && accountType === 'personal') {
+        return {
+          success: true,
+          organicReadUnsupported: true,
+          posts: [],
+          message:
+            'AgentWeb works from the LinkedIn posts you create with it, and there aren\'t any AgentWeb-created posts on file for this personal account — so there\'s nothing here to analyze for writing voice. Frame this as normal AgentWeb behavior and keep the focus on the constructive next step — do not describe it as a shortcoming and do not blame any external platform. Do NOT claim you have read or analyzed the user\'s existing LinkedIn posts, and there\'s no need to retry. The best next step: invite the user to paste or upload a few of their recent posts, then build their writing-voice profile from those — and offer to save it so future posts match their style.',
+        };
+      }
+
       return {
         success: true,
         message: `Successfully loaded ${result.posts.length} posts`,
@@ -27214,6 +28565,31 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * Perform LinkedIn outreach actions using Unipile API.
    * URL-vs-provider_id resolution is handled inside LinkedInOutreachService.
    */
+  /**
+   * The single definition of "this LinkedIn account is dead, here is how to fix it".
+   * Returned both by the preflight below and by the reactive 401 handler, so the two
+   * paths can never drift into telling the user two different stories (ENG-281).
+   */
+  private linkedInDisconnectedResponse() {
+    return {
+      success: false,
+      message: 'LinkedIn account disconnected',
+      error: [
+        'The LinkedIn account is disconnected from Unipile and cannot be used for outreach.',
+        '',
+        'Common reasons a connected account becomes disconnected:',
+        '1. LinkedIn detected automation activity and revoked the session',
+        '2. You logged into LinkedIn from another browser or device, invalidating the session held by Unipile',
+        '3. The LinkedIn session cookie expired (typically every 30–90 days)',
+        '4. Unipile lost the session internally and requires a manual reconnect',
+        '',
+        'Next steps:',
+        '1. Go to Settings > Connected Accounts and click Reconnect on your LinkedIn account.',
+        '2. If reconnect does not work, remove the connection entirely and add it again as a new connection.',
+      ].join('\n')
+    };
+  }
+
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
@@ -27253,6 +28629,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         success: false,
         error: 'No LinkedIn account is connected. To use LinkedIn Outreach, please connect your LinkedIn account in Settings → Connected Accounts.',
       };
+    }
+
+    // Preflight the session before spending a call on it (ENG-281). A Unipile
+    // LinkedIn session can die while the connection record still exists, and every
+    // action on that account then fails with the same 401 — but only AFTER a full
+    // round-trip. A scheduled run repeats that per recipient, burning attempts and
+    // reporting a late, opaque failure instead of a reconnect prompt.
+    //
+    // resolveAccountId already filters on this exact probe, so the fallback path was
+    // covered; an explicitly-passed account_id — the normal path after
+    // list_connected_accounts, which itself reports is_active from the same source —
+    // was not. isAccountConnected is 10-minute cached and timeout-bounded, so a live
+    // account pays at most one probe per account per 10 minutes, and a dead account
+    // now costs nothing at all.
+    // Block ONLY on a proven-dead session. An indeterminate probe (timeout, 5xx,
+    // network) says nothing about session validity, and blocking on it would
+    // suppress a healthy account behind a false reconnect prompt for the probe's
+    // full 10-minute cache window — a worse failure than the late 401 this
+    // preflight exists to avoid. On 'unknown' we fall through to the real call and
+    // let the reactive 401 handler below stay the backstop, i.e. exactly today's
+    // behaviour.
+    const sessionState = await linkedInOutreachService.probeAccountSession(account_id);
+    if (sessionState === 'disconnected') {
+      console.log(`[AgentMode] linkedinOutreach: account ${account_id} failed preflight — disconnected Unipile session`);
+      return this.linkedInDisconnectedResponse();
+    }
+    if (sessionState === 'unknown') {
+      console.log(`[AgentMode] linkedinOutreach: account ${account_id} preflight indeterminate — proceeding, reactive handler remains the backstop`);
     }
 
     // The service accepts either a LinkedIn URL or a raw provider_id.
@@ -27760,23 +29164,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       const structuredError = (error as any).structuredError;
       if (structuredError?.code === 'errors/disconnected_account' || structuredError?.classification === 'AUTH_ERROR') {
-        return {
-          success: false,
-          message: 'LinkedIn account disconnected',
-          error: [
-            'The LinkedIn account is disconnected from Unipile and cannot be used for outreach.',
-            '',
-            'Common reasons a connected account becomes disconnected:',
-            '1. LinkedIn detected automation activity and revoked the session',
-            '2. You logged into LinkedIn from another browser or device, invalidating the session held by Unipile',
-            '3. The LinkedIn session cookie expired (typically every 30–90 days)',
-            '4. Unipile lost the session internally and requires a manual reconnect',
-            '',
-            'Next steps:',
-            '1. Go to Settings > Connected Accounts and click Reconnect on your LinkedIn account.',
-            '2. If reconnect does not work, remove the connection entirely and add it again as a new connection.',
-          ].join('\n')
-        };
+        // A session can die between the preflight above and this call (or inside the
+        // probe's 10-minute cache window), so the reactive path stays as the backstop.
+        // Both return the identical response via one helper.
+        linkedInOutreachService.clearStatusCache(account_id);
+        return this.linkedInDisconnectedResponse();
       }
 
       // Account-level invitation throttle (ENG-126). Once a LinkedIn account hits
@@ -27825,7 +29217,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
    * written back to the owner's record. When list_id/lead_id/lead_email are
    * supplied, sent tweets and DMs are logged to AW-EmailEvents for CRM parity.
    */
+  // Public entry: bind the acting user into the X metering context so every X
+  // call this dispatch makes attributes the shadow ledger to the ACTING user and
+  // bills the account owner (ENG-664 Option B, matching the LLM rail).
   async twitterManagePost(userId: string, args: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args));
+  }
+
+  private async _twitterManagePostImpl(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
@@ -27996,7 +29395,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
+  // Public entry: bind the acting user into the X metering context (see twitterManagePost).
   async twitterOutreach(userId: string, args: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterOutreachImpl(userId, args));
+  }
+
+  private async _twitterOutreachImpl(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, handle, recipient_handle, query, max_results, tweet_id, x_list_id, list_name, list_id, lead_id, lead_email } = args;
@@ -29056,7 +30460,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
   public async handleCallGoogleAdsApi(userId: string, args: {
     customer_id: string;
-    entity_type: 'BUDGET' | 'CAMPAIGN' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
+    entity_type: 'BUDGET' | 'CAMPAIGN' | 'CAMPAIGN_CRITERION' | 'AD_GROUP' | 'KEYWORD' | 'AD' | 'ASSET' | 'CAMPAIGN_ASSET' | 'ASSET_GROUP' | 'LOCATION' | 'BIDDING_STRATEGY';
     action: string;
     [key: string]: any;
   }, opts?: { sessionId?: string }): Promise<any> {
@@ -29067,6 +30471,25 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       if (entity_type === 'BIDDING_STRATEGY' && action === 'LIST') {
         const biddingStrategies = await googleAdsService.listBiddingStrategies(userId, customer_id);
         return { success: true, biddingStrategies };
+      }
+
+      if (entity_type === 'CAMPAIGN_CRITERION' && action === 'ADD') {
+        const { placementUrls, mobileAppCategoryResourceNames } = validateNegativeCampaignCriteria(
+          customer_id,
+          args.campaign_resource_name,
+          args.placement_urls,
+          args.mobile_app_category_resource_names,
+        );
+        await googleAdsService.addNegativeCampaignCriteria(
+          userId,
+          customer_id,
+          args.campaign_resource_name,
+          { placementUrls, mobileAppCategoryResourceNames },
+        );
+        return {
+          success: true,
+          message: `Added ${placementUrls.length + mobileAppCategoryResourceNames.length} negative campaign criteria`,
+        };
       }
 
       if (entity_type === 'CAMPAIGN') {
@@ -29398,15 +30821,34 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
       return { success: false, error: `Unsupported entity_type=${entity_type} action=${action}` };
     } catch (error: any) {
+      if (error instanceof NegativeCampaignCriteriaValidationError) {
+        return {
+          success: false,
+          errorType: error.errorType,
+          errorCode: error.errorCode,
+          error: error.message,
+        };
+      }
       if (error.isGoogleAdsAuthError) return { success: false, error: error.message, authError: true };
       console.error('[AgentMode] handleCallGoogleAdsApi error:', error);
       const gadsErrors: any[] = error?.response?.data?.error?.details?.[0]?.errors || [];
+      const gadsErrorCodes = gadsErrors
+        .map((e: any) => Object.values(e.errorCode || {})[0])
+        .filter(Boolean);
       const gadsError = gadsErrors.length
         ? gadsErrors.map((e: any) => {
             const code = Object.values(e.errorCode || {})[0];
             return code ? `${code}: ${e.message}` : e.message;
           }).join('; ')
         : undefined;
+      if (args.entity_type === 'CAMPAIGN_CRITERION') {
+        return {
+          success: false,
+          errorType: gadsError ? 'GOOGLE_ADS_API_ERROR' : 'INTERNAL_ERROR',
+          errorCode: gadsErrorCodes[0] || 'UNKNOWN_GOOGLE_ADS_ERROR',
+          error: gadsError || error.message || 'Unknown error',
+        };
+      }
       return { success: false, error: gadsError || error.message || 'Unknown error' };
     }
   }

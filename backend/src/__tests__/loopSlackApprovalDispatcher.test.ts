@@ -52,6 +52,16 @@ jest.mock('../services/intakeService', () => ({
   fileAutoIssue: (...args: unknown[]) => mockFileAutoIssue(...args),
 }));
 
+const mockClaimLoopDecision = jest.fn();
+const mockRecordLoopApproval = jest.fn();
+const mockRecordLoopDenial = jest.fn();
+
+jest.mock('../loops/core/learning/approvalPersistence', () => ({
+  claimLoopDecision: (...args: unknown[]) => mockClaimLoopDecision(...args),
+  recordLoopApproval: (...args: unknown[]) => mockRecordLoopApproval(...args),
+  recordLoopDenial: (...args: unknown[]) => mockRecordLoopDenial(...args),
+}));
+
 // -------------------------------------------------------------------------------
 
 import {
@@ -83,12 +93,27 @@ function mockBotMessage(text: string, bot_id = 'BBOT123'): void {
 beforeEach(() => {
   jest.clearAllMocks();
   _resetLoopApprovalForTesting();
+  delete process.env.LOOP_SLACK_DECISION_GATE_ENABLED;
   dispatchEntry = null;
   mockGetDispatched.mockImplementation(async () => dispatchEntry);
   mockMarkDispatched.mockImplementation(async (_ts: string, pageIds: string[]) => {
     dispatchEntry = { dispatchedAt: new Date(), pageIds: [...pageIds] };
   });
   mockAuthTest.mockResolvedValue({ user_id: 'UBOT123' });
+  mockClaimLoopDecision.mockResolvedValue({
+    loopId: 'test-loop',
+    decision: 'approved',
+    accepted: true,
+    created: true,
+    proposalIds: ['proposal-1'],
+  });
+  mockRecordLoopApproval.mockResolvedValue({
+    loopId: null,
+    approved: 0,
+    shipped: 0,
+    dispatchFailures: 0,
+  });
+  mockRecordLoopDenial.mockResolvedValue({ loopId: 'test-loop', denied: 1 });
 });
 
 // -------------------------------------------------------------------------------
@@ -123,6 +148,27 @@ describe('handleLoopApprovalReaction — gate checks', () => {
       makeEvent({ item: { type: 'file', channel: DM_CHANNEL, ts: MSG_TS } }),
     );
     expect(mockHistoryFn).not.toHaveBeenCalled();
+  });
+
+  it('accepts a rejection reaction without dispatching work', async () => {
+    mockBotMessage(`*Daily digest*\nRun ID: run-001\n1. Fix the thing\n\n${FOOTER}`);
+
+    await handleLoopApprovalReaction(makeEvent({ reaction: 'x' }));
+    const historyCallCount = mockHistoryFn.mock.calls.length;
+    mockHistoryFn.mockReset();
+
+    expect(historyCallCount).toBeGreaterThan(0);
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
+    expect(mockMarkDispatched).not.toHaveBeenCalled();
+  });
+
+  it('restores the prior checkmark-only behavior when the decision gate is disabled', async () => {
+    process.env.LOOP_SLACK_DECISION_GATE_ENABLED = 'false';
+
+    await handleLoopApprovalReaction(makeEvent({ reaction: 'x' }));
+
+    expect(mockHistoryFn).not.toHaveBeenCalled();
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
   });
 });
 
@@ -217,6 +263,32 @@ describe('handleLoopApprovalReaction — tasks path (no Notion URLs)', () => {
 
   beforeEach(() => {
     mockBotMessage(taskText);
+  });
+
+  it('does not dispatch when a conflicting terminal decision already won', async () => {
+    mockClaimLoopDecision.mockResolvedValueOnce({
+      loopId: 'test-loop',
+      decision: 'denied',
+      accepted: false,
+      created: false,
+      proposalIds: ['comp-a'],
+    });
+
+    await handleLoopApprovalReaction(makeEvent());
+
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
+    expect(mockMarkDispatched).not.toHaveBeenCalled();
+    expect(mockPostMessage.mock.calls[0][0].text).toMatch(/already resolved as denied/i);
+  });
+
+  it('fails closed without dispatch when the atomic decision claim errors', async () => {
+    mockClaimLoopDecision.mockRejectedValueOnce(new Error('Dynamo unavailable'));
+
+    await handleLoopApprovalReaction(makeEvent());
+
+    expect(mockFileAutoIssue).not.toHaveBeenCalled();
+    expect(mockMarkDispatched).not.toHaveBeenCalled();
+    expect(mockPostMessage.mock.calls[0][0].text).toMatch(/no work was dispatched/i);
   });
 
   it('records durable completion only after Linear intake succeeds', async () => {

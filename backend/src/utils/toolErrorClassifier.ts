@@ -52,10 +52,17 @@ const GATEWAY_NAME_CLASSES: Record<string, string> = {
   ToolOutputContractError: 'invalid_output',
   TimeoutError: 'timeout',
   AbortError: 'timeout',
+  // Typed X credit-exhaustion (ENG-664) — classify by name so a 402 clusters as
+  // a billing stop even when it crosses a module/mock boundary.
+  XCreditsExhaustedError: 'payment_required',
 };
 
 function classFromStatus(status: number): string | null {
   if (status === 401 || status === 403) return 'auth';
+  // 402 Payment Required — a metered vendor wallet is out of credits (X shared
+  // Developer App, ENG-604/664). A hard billing stop, distinct from a transient
+  // 429 rate limit, so it clusters on its own.
+  if (status === 402) return 'payment_required';
   if (status === 404) return 'not_found';
   if (status === 408 || status === 504) return 'timeout';
   if (status === 429) return 'rate_limit';
@@ -126,8 +133,18 @@ export function classifyToolErrorClass(error: unknown): string {
       ?? GATEWAY_NAME_CLASSES[error.constructor?.name ?? ''];
     if (byName) return byName;
 
-    const statusProp = (error as { status?: unknown }).status
+    let statusProp = (error as { status?: unknown }).status
       ?? (error as { statusCode?: unknown }).statusCode;
+    // `.code` is where twitter-api-v2's ApiResponseError puts the HTTP status
+    // (there is no `.status`/`.statusCode` on it) — read it too so X errors
+    // (402/403/404/429) classify by status. Guarded to the HTTP range so a Node
+    // errno or other non-HTTP numeric `.code` is never mistaken for a status.
+    if (statusProp === undefined) {
+      const codeProp = (error as { code?: unknown }).code;
+      if (typeof codeProp === 'number' && codeProp >= 100 && codeProp <= 599) {
+        statusProp = codeProp;
+      }
+    }
     if (typeof statusProp === 'number') {
       const byStatus = classFromStatus(statusProp);
       if (byStatus) return byStatus;

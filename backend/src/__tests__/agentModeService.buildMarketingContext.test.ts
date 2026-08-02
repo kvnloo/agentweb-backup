@@ -842,3 +842,69 @@ describe('AgentModeService - buildMarketingContext with Attachments', () => {
   });
 });
 
+
+// ENG-510: already-generated-asset awareness must be surfaced even WITHOUT a work plan,
+// so a "continue" after a mid-batch timeout regenerates only the still-missing images —
+// including one that landed in the orphaned worker after the whole-turn cap.
+describe('AgentModeService - already-generated asset awareness (ENG-510)', () => {
+  const agentModeService = new AgentModeService();
+
+  const imgMarker = (filename: string, ts: string): ChatMessage => ({
+    role: 'system',
+    content: `Image generated: ${filename}`,
+    timestamp: ts,
+    metadata: { timestamp: ts, kind: 'image-generated', imageFilename: filename, imageUrl: `https://s3/${filename}` },
+  } as any);
+
+  describe('buildGeneratedAssetsAwarenessText', () => {
+    it('returns empty string when there are no generated images', () => {
+      expect(AgentModeService.buildGeneratedAssetsAwarenessText(undefined)).toBe('');
+      expect(AgentModeService.buildGeneratedAssetsAwarenessText([])).toBe('');
+    });
+
+    it('lists every filename with a do-not-regenerate instruction', () => {
+      const text = AgentModeService.buildGeneratedAssetsAwarenessText(['icon-sun.png', 'icon-moon.png']);
+      expect(text).toContain('ALREADY-GENERATED ASSETS (2)');
+      expect(text).toContain('DO NOT regenerate them');
+      expect(text).toContain('- icon-sun.png');
+      expect(text).toContain('- icon-moon.png');
+    });
+  });
+
+  describe('standalone injection (no work plan)', () => {
+    it('surfaces already-generated images on a continue turn with no work plan', () => {
+      const sessionHistory: ChatMessage[] = [
+        { role: 'system', content: 'You are EMMA', timestamp: '2026-07-24T06:46:00.000Z' },
+        { role: 'user', content: 'Generate a sun, a moon, and a star icon', timestamp: '2026-07-24T06:47:00.000Z' },
+        imgMarker('icon-sun.png', '2026-07-24T06:54:00.000Z'),
+        imgMarker('icon-moon.png', '2026-07-24T06:56:00.000Z'),
+        // completed in the orphaned worker AFTER the cap — marker present, no toolCalls stamp
+        imgMarker('icon-star.png', '2026-07-24T06:58:00.000Z'),
+        { role: 'user', content: 'continue', timestamp: '2026-07-24T06:59:00.000Z' },
+      ];
+
+      const result = (agentModeService as any).buildMarketingContext('continue', sessionHistory, []);
+      const awareness = result.find(
+        (m: any) => m.role === 'assistant' && typeof m.content === 'string' && m.content.includes('ALREADY-GENERATED ASSETS')
+      );
+      expect(awareness).toBeDefined();
+      // the orphan-window image (star) must be listed so it is NOT redone
+      expect(awareness.content).toContain('icon-star.png');
+      expect(awareness.content).toContain('icon-sun.png');
+      expect(awareness.content).toContain('icon-moon.png');
+      expect(awareness.content).toContain('ALREADY-GENERATED ASSETS (3)');
+    });
+
+    it('injects nothing when no images have been generated', () => {
+      const sessionHistory: ChatMessage[] = [
+        { role: 'system', content: 'You are EMMA', timestamp: '2026-07-24T06:46:00.000Z' },
+        { role: 'user', content: 'continue', timestamp: '2026-07-24T06:59:00.000Z' },
+      ];
+      const result = (agentModeService as any).buildMarketingContext('continue', sessionHistory, []);
+      const awareness = result.find(
+        (m: any) => typeof m.content === 'string' && m.content.includes('ALREADY-GENERATED ASSETS')
+      );
+      expect(awareness).toBeUndefined();
+    });
+  });
+});

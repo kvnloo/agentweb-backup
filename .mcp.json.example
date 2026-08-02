@@ -10,14 +10,14 @@
       "command": "npx",
       "args": ["-y", "@notionhq/notion-mcp-server"],
       "env": {
-        "OPENAPI_MCP_HEADERS": "{\"Authorization\":\"Bearer <YOUR_NOTION_TOKEN>\",\"Notion-Version\":\"2025-09-03\"}"
+        "OPENAPI_MCP_HEADERS": "${NOTION_MCP_HEADERS}"
       }
     },
     "okareo": {
       "command": "uvx",
-      "args": ["okareo-mcp"],
+      "args": ["--with", "mcp[cli]<2", "--from", "okareo-mcp==0.0.43", "okareo-mcp"],
       "env": {
-        "OKAREO_API_KEY": "<YOUR_OKAREO_API_KEY>"
+        "OKAREO_API_KEY": "${OKAREO_API_KEY}"
       }
     }
   }

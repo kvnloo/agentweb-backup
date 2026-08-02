@@ -820,14 +820,18 @@ router.delete("/generated/:id", async (req, res: Response) => {
  * POST /api/landing-pages/v0/generated/:id/duplicate
  * Duplicate a landing page record for independent editing
  */
-router.post("/generated/:id/duplicate", async (req, res: Response) => {
+// ENG-705: duplicate re-runs a FULL v0 generation, so it is exactly as
+// expensive as /generate and is gated identically — the shared `rateLimiter`
+// (same quota as generate/deploy/iterate, so it cannot be used to bypass them)
+// and "edit" access, matching /iterate rather than the old "view".
+router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) => {
   try {
     const userId = (req as unknown as AuthenticatedRequest).user?.userId;
     if (!userId) {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const auth = await authorizeLandingPageAccess(req.params.id, userId, "view");
+    const auth = await authorizeLandingPageAccess(req.params.id, userId, "edit");
     if (!auth.ok) return res.status(auth.status).json({ error: auth.error });
     const original = auth.page;
 

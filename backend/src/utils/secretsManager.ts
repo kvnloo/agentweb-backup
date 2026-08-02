@@ -384,6 +384,14 @@ export async function getOutlookCredentials(): Promise<OutlookCredentials> {
 export interface TwitterCredentials {
   clientId: string;
   clientSecret: string;
+  /**
+   * App-only OAuth2 Bearer token for the shared X Developer App. Present in the
+   * secret alongside clientId/clientSecret; used for app-level endpoints that are
+   * not tied to a connected user — notably GET /2/usage/tweets, the app's own
+   * billed consumption against the read cap (ENG-664 reconciliation). Optional so
+   * an older secret without it still loads.
+   */
+  bearerToken?: string;
 }
 
 /**

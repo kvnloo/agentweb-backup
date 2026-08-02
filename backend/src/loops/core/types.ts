@@ -220,6 +220,10 @@ export interface LearningEvent {
   proposal?: MutationProposal<unknown>;
   mutation?: Mutation;
   decision?: Decision;
+  /** Atomic run-level Slack decision claim. One record resolves every listed
+   * proposal together, avoiding partial multi-proposal terminal state. */
+  decisionClaim?: 'approved' | 'denied';
+  decisionProposalIds?: readonly string[];
   /** Resolved ship-time T — when the mutation actually went live (decision
    * resolved to approved/auto_shipped). Drives outcome attribution. */
   shippedAt?: Date | null;
@@ -252,6 +256,9 @@ export interface LearningRecord extends LearningEvent {
 /** Layer 4. */
 export interface LearningStore {
   record(event: LearningEvent): Promise<void>;
+  /** Atomically append a deterministic decision record once. Returns false
+   * when another process already claimed the same decision key. */
+  recordDecisionIfAbsent(event: LearningEvent, decisionKey: string): Promise<boolean>;
   queryHistory(filter: HistoryFilter): Promise<LearningRecord[]>;
   /** Most recent record carrying a non-null `verdict` for the given rule, or
    * null. Lets the policy layer apply a failure-driven cooldown — don't

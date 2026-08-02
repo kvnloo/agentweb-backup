@@ -63,12 +63,14 @@ jest.mock('../services/db', () => ({
     getScheduleById: jest.fn(),
     getSchedulesReadyToRun: jest.fn(),
     updateScheduleAfterRun: jest.fn(),
-    setRunInFlight: jest.fn().mockResolvedValue(undefined),
-    attachSessionToRunInFlight: jest.fn().mockResolvedValue(undefined),
+    setRunInFlight: jest.fn().mockResolvedValue('acquired'),
+    attachSessionToRunInFlight: jest.fn().mockResolvedValue(true),
     heartbeatRunInFlight: jest.fn().mockResolvedValue(undefined),
     clearRunInFlight: jest.fn().mockResolvedValue(true),
     getInFlightSchedules: jest.fn().mockResolvedValue([]),
     claimAbandonedRun: jest.fn().mockResolvedValue(true),
+    claimPendingResume: jest.fn().mockResolvedValue(true),
+    claimAndPauseUnresumable: jest.fn().mockResolvedValue('paused'),
     updateSchedule: jest.fn(),
     getSchedulesByUserId: jest.fn(),
   },
@@ -244,6 +246,313 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
     });
 
+    // ENG-657: resume an abandoned run whose instance was terminated mid-flight
+    // (e.g. by a deploy) instead of restarting the whole task in a fresh session.
+    describe('resume of an abandoned run (ENG-657)', () => {
+      const resumeSessionId = 'resume-sess-1';
+      const resumableMessages = [
+        { role: 'system', content: 'automated run' },
+        { role: 'user', content: 'Enrich the CRM leads and recommend the top 10.' },
+        { role: 'assistant', content: 'Firing enrichment.', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: '{"mode":"enrich","processedCount":5}' },
+      ];
+      const resumeSchedule = {
+        ...baseSchedule,
+        keywords: [],
+        requiredFunctionCalls: [],
+        pendingResumeSessionId: resumeSessionId,
+      };
+
+      it('continues the existing session (no new session) and injects a continuation directive', async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: resumableMessages,
+        } as any);
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        // Reuses the abandoned session — does NOT create a fresh one.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(result.sessionId).toBe(resumeSessionId);
+        // The resume marker is consumed (at-most-once resume).
+        expect(mockScheduleDb.claimPendingResume).toHaveBeenCalledWith(mockScheduleId, resumeSessionId);
+        // The model turn is driven against the existing session with a CONTINUATION
+        // directive, not the original task prompt (which would restart the task).
+        const workerArg = (mockGenerateMarketingResponseWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
+        expect(workerArg.sessionId).toBe(resumeSessionId);
+        expect(workerArg.messageContent).toMatch(/Continue from exactly where you left off/i);
+        expect(workerArg.messageContent).not.toBe(baseSchedule.startingMessage);
+      });
+
+      it('strips a stale jobIncomplete/isRunFailureNotice placeholder from the history actually sent to the worker (Greptile)', async () => {
+        // The resume planner computes a placeholder-free resumeHistory, but the
+        // worker call reloads the session fresh from the DB (to pick up the just-
+        // saved continuation message) — that reload must not silently re-introduce
+        // a stale crash placeholder the planner already decided to drop, or the
+        // model reads back "the assistant already gave up" mid-continuation.
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: [
+            ...resumableMessages,
+            { role: 'assistant', content: 'please retry', metadata: { isRunFailureNotice: true } },
+          ],
+        } as any);
+
+        await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        const workerArg = (mockGenerateMarketingResponseWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
+        const hasPlaceholder = (workerArg.sessionHistory || []).some(
+          (m: any) => m?.metadata?.isRunFailureNotice === true || m?.metadata?.jobIncomplete === true
+        );
+        expect(hasPlaceholder).toBe(false);
+      });
+
+      it('PAUSES the schedule (never fresh-restarts) when the resume session is no longer safely resumable', async () => {
+        // Dangling tool_use → planScheduledRunResume refuses. A fresh restart (now or
+        // on a later retry) would re-run the whole task and duplicate the already-
+        // completed side effects — the exact thing this path exists to prevent
+        // (Greptile: "deferral only delays fresh restart"). So this case does NOT
+        // schedule a retry at all; it pauses the schedule and alerts oncall so a
+        // human decides, rather than an automatic restart silently duplicating
+        // real-world side effects.
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'x' },
+            { role: 'user', content: 'Enrich.' },
+            { role: 'assistant', content: '…', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }, { id: 'c2', function: { name: 'enrich_leads_execute' } }] },
+            { role: 'tool', tool_call_id: 'c1', content: '{}' },
+          ],
+        } as any);
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        // No fresh session, no worker run — deferred, atomically claimed+paused.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+        expect(mockScheduleDb.claimAndPauseUnresumable).toHaveBeenCalledWith(mockScheduleId, resumeSessionId);
+        expect(result.sessionId).toBe('');
+
+        // Paused via the atomic op, not a separate retry-soon reschedule.
+        const retryCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(
+          call => call[0] === mockScheduleId && call[1]?.nextRunTime
+        );
+        expect(retryCall).toBeUndefined();
+      });
+
+      it('does NOT pause the schedule when another dispatcher already owns the not-resumable claim (ENG-657/Greptile)', async () => {
+        // If the atomic claim+pause loses its condition (someone else already
+        // changed the marker), we don't own this recovery decision. Pausing anyway
+        // would suppress the winner's future scheduled runs for no reason.
+        (mockScheduleDb.claimAndPauseUnresumable as jest.Mock).mockResolvedValueOnce('lost_claim');
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'x' },
+            { role: 'user', content: 'Enrich.' },
+            { role: 'assistant', content: '…', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }, { id: 'c2', function: { name: 'enrich_leads_execute' } }] },
+            { role: 'tool', tool_call_id: 'c1', content: '{}' },
+          ],
+        } as any);
+        (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        expect(result.sessionId).toBe('');
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        // No pause, no retry — we don't have standing to touch this schedule at all.
+        const anyUpdateCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
+        expect(anyUpdateCall).toBeUndefined();
+      });
+
+      it('leaves the marker intact and retries soon when claim+pause fails for a transient reason (ENG-657/Greptile)', async () => {
+        // The atomic write can't partially apply — if it fails transiently (not a
+        // lost race), the marker is still there, so retrying soon is safe: no
+        // duplicate-effect risk, unlike a consumed-but-unpaused marker would carry.
+        (mockScheduleDb.claimAndPauseUnresumable as jest.Mock).mockResolvedValue('error');
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'x' },
+            { role: 'user', content: 'Enrich.' },
+            { role: 'assistant', content: '…', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }, { id: 'c2', function: { name: 'enrich_leads_execute' } }] },
+            { role: 'tool', tool_call_id: 'c1', content: '{}' },
+          ],
+        } as any);
+        (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        expect(result.sessionId).toBe('');
+        expect(mockScheduleDb.claimAndPauseUnresumable).toHaveBeenCalledTimes(3); // 3 attempts, per the retry loop
+        const retryCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(
+          call => call[0] === mockScheduleId && call[1]?.nextRunTime
+        );
+        expect(retryCall).toBeDefined();
+      });
+
+      it('DEFERS on a transient session-load failure, leaving the marker intact (no restart)', async () => {
+        (mockChatbotDb.getChatSession as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB timeout'));
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        // Transient read failure → no restart, and the marker is NOT consumed so a
+        // later fire can retry the resume.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+        expect(mockScheduleDb.claimPendingResume).not.toHaveBeenCalled();
+        expect(result.sessionId).toBe('');
+      });
+
+      it('counts the abandoned portion\'s required function calls so a resume is not falsely failed (ENG-657)', async () => {
+        // Schedule REQUIRES get_marketing_tips (a subscription-allowed function in
+        // this suite's mock); it was called before the crash and is in the resumable
+        // history. The continuation turn does NOT re-call it.
+        const priorCall = 'get_marketing_tips';
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'automated run' },
+            { role: 'user', content: 'Do the marketing task.' },
+            { role: 'assistant', content: 'Fetching tips.', tool_calls: [{ id: 'c1', function: { name: priorCall } }] },
+            { role: 'tool', tool_call_id: 'c1', content: '{"ok":true}' },
+          ],
+        } as any);
+        // Continuation produces only the final write-up — does NOT re-call the tool.
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+          ...mockResponse, content: 'Here are the top 10 recommended leads and 2 follow-up drafts.', toolCalls: [],
+        });
+
+        const result = await runScheduledChat(
+          { ...resumeSchedule, requiredFunctionCalls: [priorCall] } as any,
+          mockUserId,
+          false,
+        );
+
+        // sanity: resume actually fired (no fresh session)
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        // The prior call is credited → run passes without re-running it...
+        expect(result.functionCallMatches).toContain(priorCall);
+        expect(result.functionCallMisses).not.toContain(priorCall);
+        expect(result.passed).toBe(true);
+        // ...and the verify loop does NOT retry (which could have re-driven the tool).
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledTimes(1);
+      });
+
+      it('DEFERS when it loses the atomic claim (another dispatcher won) — no resume AND no fresh restart', async () => {
+        (mockScheduleDb.claimPendingResume as jest.Mock).mockResolvedValue(false);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
+        } as any);
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        // Lost claim → the winner handles this fire. This dispatcher must NOT resume
+        // (parallel) and must NOT fresh-restart (duplicate side effects) — it bows out.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+        expect(result.sessionId).toBe('');
+      });
+
+      it('ignores the resume marker for a manual test run (never resumes)', async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
+        } as any);
+
+        await runScheduledChat(resumeSchedule as any, mockUserId, true);
+
+        // isTest=true → resume path is skipped entirely; a fresh session is created.
+        expect(mockChatbotDb.createChatSession).toHaveBeenCalledTimes(1);
+        expect(mockScheduleDb.claimPendingResume).not.toHaveBeenCalled();
+      });
+
+      it('attaches the resumed session to the lease BEFORE claiming the marker (closes the empty-sessionId-abandon race)', async () => {
+        // If a kill lands between claimPendingResume succeeding and the lease being
+        // annotated with the resumed sessionId, the reconciler sees an empty-session
+        // abandonment and requeues a blind fresh restart — re-running this session's
+        // already-completed side effects. Attaching first closes that window: the
+        // lease already names the right session no matter when a kill lands after.
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
+        } as any);
+
+        await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        const attachCalls = (mockScheduleDb.attachSessionToRunInFlight as jest.Mock).mock.calls;
+        const claimOrder = (mockScheduleDb.claimPendingResume as jest.Mock).mock.invocationCallOrder[0];
+        const firstAttachOrder = (mockScheduleDb.attachSessionToRunInFlight as jest.Mock).mock.invocationCallOrder[0];
+
+        // At least one attach call names the resumed session, and it happens before the claim.
+        expect(attachCalls.some(call => call[2] === resumeSessionId)).toBe(true);
+        expect(firstAttachOrder).toBeLessThan(claimOrder);
+      });
+
+      it('schedules a short retry on a genuinely-retryable deferred fire (claim-error) instead of silently waiting for the next full cadence (ENG-657)', async () => {
+        // A deferred fire returns cleanly — it does NOT leave a stale lease for the
+        // reconciler to catch the way a crash would, and the dispatch loop already
+        // advanced nextRunTime to the full next cadence before this run started.
+        // Without an explicit short retry, a defer would silently wait a full cycle.
+        // Unlike the "no longer resumable" case, a transient claim error carries no
+        // duplicate-effect risk on retry — the session is still genuinely resumable,
+        // so retrying soon (rather than pausing) is correct here.
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
+        } as any);
+        (mockScheduleDb.claimPendingResume as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+
+        const result = await runScheduledChat({ ...resumeSchedule, zeroAssistantRetryCount: 0 } as any, mockUserId, false);
+
+        expect(result.sessionId).toBe(''); // deferred (claim-error)
+        const updateCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
+        expect(updateCall).toBeDefined();
+        expect(updateCall[1]).toEqual(expect.objectContaining({ zeroAssistantRetryCount: 1, nextRunTime: expect.any(String) }));
+      });
+
+      it('does NOT schedule another retry once the requeue cap is already exhausted (ENG-657)', async () => {
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
+        } as any);
+        (mockScheduleDb.claimPendingResume as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+        (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
+
+        await runScheduledChat({ ...resumeSchedule, zeroAssistantRetryCount: 3 } as any, mockUserId, false);
+
+        // ZERO_ASSISTANT_MAX_REQUEUES is 3 — a 4th retry is over cap, so no reschedule.
+        const updateCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
+        expect(updateCall).toBeUndefined();
+      });
+
+      it('DEFERS without touching the marker when no durable lease could be established (ENG-657/Greptile)', async () => {
+        // If setRunInFlight throws (transient error, not a lost race — that path
+        // returns earlier), leaseAcquired stays false. Without this guard, execution
+        // would fall through to claiming the marker and starting the worker with NO
+        // lease at all — a kill during that run would leave neither a reconcilable
+        // lease nor a resume marker (already consumed), so nothing could ever detect
+        // or retry it.
+        (mockScheduleDb.setRunInFlight as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession, sessionId: resumeSessionId, userId: mockUserId, messages: resumableMessages,
+        } as any);
+
+        const result = await runScheduledChat(resumeSchedule as any, mockUserId, false);
+
+        expect(result.sessionId).toBe('');
+        // The marker must NOT be consumed — a later, properly-leased dispatch retries it.
+        expect(mockScheduleDb.claimPendingResume).not.toHaveBeenCalled();
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+      });
+    });
+
     it('stamps an in-flight lease on a production run and releases it when the run settles (ENG-324)', async () => {
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         ...mockResponse,
@@ -292,6 +601,45 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await runScheduledChat(baseSchedule, mockUserId, true);
       expect(mockScheduleDb.setRunInFlight).not.toHaveBeenCalled();
       expect(mockScheduleDb.clearRunInFlight).not.toHaveBeenCalled();
+    });
+
+    it('bails out entirely — no session, no clear — when another dispatcher already holds the lease (ENG-657/Greptile)', async () => {
+      // A real cross-instance race: two dispatchers pick up the same due schedule.
+      // The loser must not touch anything — not create a session, not clear any
+      // lease in its `finally` (which would tear down the winner's real lease and
+      // make its still-running attempt invisible to the reconciler).
+      (mockScheduleDb.setRunInFlight as jest.Mock).mockResolvedValueOnce('already_in_flight');
+
+      const result = await runScheduledChat(baseSchedule, mockUserId, false);
+
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+      expect(mockScheduleDb.clearRunInFlight).not.toHaveBeenCalled();
+      expect(mockScheduleDb.attachSessionToRunInFlight).not.toHaveBeenCalled();
+      expect(result.sessionId).toBe('');
+      expect(result.status).toBe('success');
+    });
+
+    it('DEFERS a normal (non-resume) run instead of creating an untracked session when no durable lease could be established (ENG-657/Greptile)', async () => {
+      // Not resume-specific: if setRunInFlight throws (transient error, not a lost
+      // race — that path returns earlier), leaseAcquired stays false. Without this
+      // guard, a FRESH session would still get created and run with no lease at
+      // all — a kill during that run would be invisible to the reconciler (nothing
+      // to find), so its final deliverable would simply never arrive.
+      (mockScheduleDb.setRunInFlight as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+      (mockScheduleDb.updateSchedule as jest.Mock).mockClear();
+
+      const result = await runScheduledChat(baseSchedule, mockUserId, false);
+
+      expect(result.sessionId).toBe('');
+      expect(result.status).toBe('success');
+      expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+      // Retries shortly rather than waiting a full cadence — same short backoff as
+      // the resume-side no-lease case.
+      const retryCall = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls.find(call => call[0] === mockScheduleId);
+      expect(retryCall).toBeDefined();
+      expect(retryCall[1]).toEqual(expect.objectContaining({ zeroAssistantRetryCount: 1, nextRunTime: expect.any(String) }));
     });
 
     it('should require canonical you_search_web for You.com web search', async () => {

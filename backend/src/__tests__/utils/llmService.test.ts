@@ -51,6 +51,7 @@ jest.mock('@langchain/core/output_parsers', () => ({
 import { LLMService, createLLMService } from '../../utils/llmService';
 import { AzureChatOpenAI } from '@langchain/openai';
 import { ChatBedrockConverse } from '@langchain/aws';
+import { BedrockRuntimeClient } from '@aws-sdk/client-bedrock-runtime';
 
 describe('llmService', () => {
   beforeEach(() => {
@@ -147,6 +148,48 @@ describe('llmService', () => {
     it('should handle specific Claude opus 4.6 model ID transformation', () => {
       new LLMService('anthropic.claude-opus-4-6-v1');
       expect(ChatBedrockConverse).toHaveBeenCalled();
+    });
+
+    // ── ENG-683 ──────────────────────────────────────────────────────────────
+    // LLMService used to carry its own 3-entry if/else copy of the Bedrock
+    // inference-profile map, which had drifted (no opus-4-8) and built its
+    // BedrockRuntimeClient without pinning SigV4.
+
+    it('AC #3: maps Opus 4.8 to its profile id, matching agentModeService', () => {
+      new LLMService('anthropic.claude-opus-4-8');
+      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'us.anthropic.claude-opus-4-8' })
+      );
+    });
+
+    it('AC #4: pins SigV4 so a set AWS_BEARER_TOKEN_BEDROCK cannot hijack auth', () => {
+      // Cloud-dev boxes set this for the Claude Code CLI. Without the pin the
+      // SDK prefers bearer auth and sends a token scoped to account
+      // 231030591963, 403ing every model in the default account (992382574572).
+      process.env.AWS_BEARER_TOKEN_BEDROCK = 'test-bearer-token';
+      try {
+        new LLMService('anthropic.claude-sonnet-4-6');
+        expect(BedrockRuntimeClient).toHaveBeenCalledWith(
+          expect.objectContaining({ authSchemePreference: ['sigv4'] })
+        );
+      } finally {
+        delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+      }
+    });
+
+    it('AC #4: pins SigV4 unconditionally, not only when a bearer token is present', () => {
+      delete process.env.AWS_BEARER_TOKEN_BEDROCK;
+      new LLMService('anthropic.claude-sonnet-4-6');
+      expect(BedrockRuntimeClient).toHaveBeenCalledWith(
+        expect.objectContaining({ authSchemePreference: ['sigv4'] })
+      );
+    });
+
+    it('AC #5: passes an unmapped Claude model id through unchanged', () => {
+      new LLMService('anthropic.claude-v2');
+      expect(ChatBedrockConverse).toHaveBeenCalledWith(
+        expect.objectContaining({ model: 'anthropic.claude-v2' })
+      );
     });
 
     it('should use default API version when env var not set', () => {

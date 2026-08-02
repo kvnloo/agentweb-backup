@@ -36,11 +36,11 @@ const LEGACY_IMAGE_MODEL_ALIASES: Record<string, string> = {
   "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
 };
 
-// ENG-410: the original Azure image-gen endpoint lived in departed co-founder Rui's personal
-// Microsoft account. It stays as the fallback for the legacy raw-key secret format so this
-// change is behaviour-preserving until `{env}/AgentWeb/Azure/Image` is switched to the JSON
-// `{ apiKey, endpoint }` format pointing at the AgentWeb-owned resource.
-const LEGACY_AZURE_IMAGE_ENDPOINT = "https://ai-ruiwangwarm7085ai345967089938.services.ai.azure.com";
+// ENG-410: the Azure image-gen endpoint is now sourced entirely from
+// `{env}/AgentWeb/Azure/Image` (JSON `{ apiKey, endpoint }`), which points at the
+// AgentWeb-owned resource. The previous hardcoded fallback endpoint lived in departed
+// co-founder Rui's personal Microsoft account and has been removed; a secret without an
+// endpoint now fails loudly instead of silently routing there.
 
 /**
  * Normalize a legacy image-model id to its canonical (GA) equivalent.
@@ -66,9 +66,17 @@ interface ImageGenerationParams {
 }
 
 export class ImageService {
-  // Default timeout for a single image generation API call (10 minutes).
-  // Prevents sessions from hanging indefinitely when a provider is unresponsive.
-  private readonly IMAGE_GENERATION_TIMEOUT_MS = 10 * 60 * 1000;
+  // Timeout for a SINGLE image generation API call. ENG-510 (mode 2 — provider hang):
+  // this MUST stay below the whole-turn generation cap (agentModeController
+  // GENERATION_TIMEOUT_MS, 10 min) — when they were equal, a single hung/silent provider
+  // call consumed the ENTIRE turn, leaving no headroom to fail over to another provider,
+  // deliver the other (parallel) variants, or surface a graceful message, so the turn
+  // died with a bare timeout. 8 min still clears observed legitimate slow generations
+  // (~6.5 min for high-quality Pro) so it does not regress successful-but-slow renders,
+  // while leaving ~2 min under the cap for a fast cross-provider failover / wrap-up.
+  // Env-overridable for per-environment tuning; invalid/empty falls back to the default.
+  private readonly IMAGE_GENERATION_TIMEOUT_MS =
+    parseInt(process.env.IMAGE_GENERATION_TIMEOUT_MS || '', 10) || 8 * 60 * 1000;
 
   constructor() {
     // No initialization needed - clients will be created as needed
@@ -411,13 +419,20 @@ export class ImageService {
       if (!apiKey) {
         throw new Error(`${model} Azure image secret JSON is missing "apiKey"`);
       }
+      if (!parsed.endpoint || parsed.endpoint.trim() === "") {
+        throw new Error(`${model} Azure image secret JSON is missing "endpoint"`);
+      }
       // Trailing slashes are stripped so callers can safely build `${endpoint}/openai/...`.
-      const endpoint = (parsed.endpoint || LEGACY_AZURE_IMAGE_ENDPOINT).replace(/\/+$/, "");
+      const endpoint = parsed.endpoint.trim().replace(/\/+$/, "");
       return { apiKey, endpoint };
     }
 
-    // Legacy raw-key format: key from the secret, endpoint from the constant.
-    return { apiKey: trimmed, endpoint: LEGACY_AZURE_IMAGE_ENDPOINT };
+    // Raw-key secrets carry no endpoint. Fail loudly rather than silently falling back
+    // to a hardcoded endpoint (which historically pointed at a departed employee's
+    // personal Azure account). Store the secret as {"apiKey":"…","endpoint":"…"}.
+    throw new Error(
+      `${model} Azure image secret must be JSON with "apiKey" and "endpoint" (raw-key format is no longer supported)`
+    );
   }
 
   /**

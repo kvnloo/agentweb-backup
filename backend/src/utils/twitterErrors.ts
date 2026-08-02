@@ -25,14 +25,69 @@ interface XApiErrorLike {
 }
 
 /**
+ * Typed, machine-detectable X credit-exhaustion condition (ENG-664).
+ *
+ * A raw X 402 only carries the status on `.code`, so downstream telemetry and
+ * the tool-error classifier had nothing structural to key on — a mid-run 402
+ * (ENG-604/633/662) classified as a generic `Error` and could read as success.
+ * `withRetryOn401` converts every X 402 into this at the single chokepoint so a
+ * depleted wallet is a hard, non-retryable, clusterable failure. `name` is
+ * stable ('XCreditsExhaustedError') so classifyToolErrorClass maps it by name
+ * even across module/mock boundaries, and `code` stays 402 for status-based
+ * classification.
+ */
+export class XCreditsExhaustedError extends Error {
+  /** HTTP status kept so status-based classification still works. */
+  readonly code = 402 as const;
+  constructor(message: string) {
+    super(message);
+    this.name = 'XCreditsExhaustedError';
+  }
+}
+
+/**
+ * True when an error is an X credit-exhaustion (HTTP 402) — either a raw
+ * twitter-api-v2 ApiResponseError (status on `.code`) or the typed
+ * XCreditsExhaustedError. Duck-typed so it works regardless of how the error
+ * crossed a module/mock boundary.
+ */
+export function isXApiCreditsError(error: unknown): boolean {
+  if (error instanceof XCreditsExhaustedError) return true;
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    (error as XApiErrorLike).code === 402
+  );
+}
+
+/**
  * Build a human-readable message from an error thrown by an X API call.
  * When the error carries X's structured payload (title/detail/errors), those are
  * surfaced (with the HTTP status). Otherwise falls back to the error's own
  * message so nothing is ever swallowed.
  */
+// HTTP 402 (Payment Required) from the X API means AgentWeb's shared X Developer
+// App has run out of X API credits/usage for the current period, so every read
+// (search/profile enrichment) and write (post/reply) is blocked until AgentWeb
+// tops up or upgrades that plan. Every user connects their X *account* against
+// AgentWeb's single app (one clientId/clientSecret from the Twitter secret — see
+// getTwitterCredentials/getAppClient), so the credit balance is AgentWeb's, NOT
+// the end user's: the user has no X Developer Portal access to it and cannot
+// resolve it themselves. The surfaced error must therefore point them to AgentWeb
+// support rather than blame their own connection or send them to a portal they
+// can't act in. This is not something a retry can clear. (ENG-604)
+const X_CREDITS_HINT =
+  ". AgentWeb's X (Twitter) API plan has run out of credits for the current " +
+  'billing period, so X reads and posts are temporarily paused until AgentWeb ' +
+  'tops up or upgrades that plan. This is a platform-side limit on AgentWeb, not ' +
+  'a problem with your connected X account — please contact AgentWeb support to ' +
+  'get X access restored.';
+
 export function describeXApiError(error: unknown): string {
   const e = error as XApiErrorLike;
   const data = e?.data;
+  const code = typeof e?.code === 'number' ? e.code : undefined;
+  const creditsHint = code === 402 ? X_CREDITS_HINT : '';
 
   if (data && typeof data === 'object') {
     const parts: string[] = [];
@@ -51,12 +106,17 @@ export function describeXApiError(error: unknown): string {
 
     const detail = parts.filter(Boolean).join(' — ');
     if (detail) {
-      const code = typeof e.code === 'number' ? ` (HTTP ${e.code})` : '';
-      return `X API error${code}: ${detail}`;
+      const codeStr = code !== undefined ? ` (HTTP ${code})` : '';
+      return `X API error${codeStr}${': '}${detail}${creditsHint}`;
     }
   }
 
-  if (error instanceof Error) return error.message;
-  if (typeof error === 'string') return error;
-  return 'Unknown error';
+  const base =
+    error instanceof Error ? error.message : typeof error === 'string' ? error : 'Unknown error';
+
+  // A 402 with no structured payload (e.g. an empty body) must still explain that
+  // this is an AgentWeb-side credit limit rather than collapsing to a bare
+  // "Request failed with code 402".
+  if (creditsHint) return `X API error (HTTP 402): ${base}${creditsHint}`;
+  return base;
 }

@@ -66,6 +66,7 @@ const tools: MutationTools<unknown> = { apply: jest.fn() };
 function learningStore() {
   return {
     record: jest.fn().mockResolvedValue(undefined),
+    recordDecisionIfAbsent: jest.fn().mockResolvedValue(true),
     queryHistory: jest.fn().mockResolvedValue([]),
     lastOutcomeForRule: jest.fn().mockResolvedValue(null),
   } satisfies LearningStore;
