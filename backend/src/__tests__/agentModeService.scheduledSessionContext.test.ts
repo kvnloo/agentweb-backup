@@ -141,6 +141,10 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   // and (4) surface gaps as actionable items.
 
   const directive = getUnattendedExecutionDirective('scheduled');
+  // The userId→identity (list_all_clients) slice is admin-gated — it only
+  // injects for an admin schedule owner, so identity-resolution assertions run
+  // against the admin variant.
+  const adminDirective = getUnattendedExecutionDirective('scheduled', true);
 
   // ── Self-guard: mirrors getScheduledSessionOverride so the function is safe
   //    to call unconditionally and cannot leak the unattended block into a
@@ -272,6 +276,67 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(lower).toContain('carve-out');
     expect(lower).toContain('does not loosen per-entity actions');
     expect(lower).toContain('per-entity completion loop');
+  });
+
+  // ── (7) userId → email/name identity resolution ─────────────────────────────
+  // Regression coverage for ENG-500 (session fa552592, "Daily User Activity
+  // Report"): get_chat_history returns per-session data keyed by numeric userId
+  // only — no email/name — and there is no per-userId profile lookup tool. The
+  // run correctly recognised it could not turn userIds into human-readable
+  // identities, proposed the supported workaround (map userIds to emails via the
+  // client list), but — being unattended — stopped to ask for approval, so the
+  // report was never delivered. A sibling 5/5 run proved the report is fully
+  // achievable by resolving identities via list_all_clients. The directive must
+  // teach that supported mapping so the run completes on its own instead of
+  // stopping for a lookup tool that does not exist.
+  it('names list_all_clients as the supported userId → email/name resolution path', () => {
+    expect(adminDirective).toContain('list_all_clients');
+  });
+
+  it('tells the run to map userIds to emails/names rather than ship raw userIds or stop', () => {
+    const lower = adminDirective.toLowerCase();
+    expect(lower).toContain('userid');
+    // the mapping produces a human-readable identity (email / name)
+    expect(lower).toMatch(/email.*(name|displayname)|(name|displayname).*email/);
+    // and the absence of a direct per-userId lookup is not a blocker
+    expect(lower).toContain('not');
+  });
+
+  // Strict data-minimization (ENG-500 / Greptile P1): scheduled reports are
+  // auto-emailed / posted to Slack with no recipient-level authorization, so the
+  // sensitive account fields list_all_clients also returns must NEVER leave the
+  // session — even if the task explicitly asks for them. list_all_clients is used
+  // ONLY for the userId→email/displayName mapping.
+  it('forbids copying list_all_clients sensitive fields into the report even when the task asks for them', () => {
+    const lower = adminDirective.toLowerCase();
+    // it must flag that list_all_clients returns more than identity data
+    expect(lower).toContain('roles');
+    expect(lower).toContain('subscription');
+    expect(lower).toMatch(/stripe|billing|payment/);
+    // and hard-forbid emitting them (no explicit-request carve-out)
+    expect(lower).toMatch(/only|never/);
+    expect(lower).toContain('even if the task asks for them');
+    // the guard must reference the auto-distribution / recipient-authorization risk
+    expect(lower).toMatch(/recipient|auto-emailed|slack/);
+  });
+
+  // The identity-resolution slice references two admin-only tools
+  // (get_chat_history, list_all_clients). It must be admin-gated: a non-admin
+  // scheduled run cannot call either (403 at the service layer), so injecting
+  // the guidance would be dead weight — and we never want to hand the "is this
+  // caller authorized" decision to the model as prose. The rest of the
+  // unattended directive still applies to every scheduled run.
+  it('injects the identity-resolution slice only for admin owners, never for non-admins', () => {
+    const nonAdmin = getUnattendedExecutionDirective('scheduled', false);
+    expect(nonAdmin).not.toContain('list_all_clients');
+    expect(nonAdmin).not.toContain('IDENTITY RESOLUTION');
+    // default (no isAdmin arg) must also omit it — safe by default
+    expect(directive).not.toContain('list_all_clients');
+    // but the general best-effort/per-entity directive is still present for all
+    // scheduled runs regardless of admin status
+    expect(nonAdmin).toContain('BEST-EFFORT');
+    expect(nonAdmin).toContain('PER-ENTITY COMPLETION LOOP');
+    expect(adminDirective).toContain('PER-ENTITY COMPLETION LOOP');
   });
 });
 

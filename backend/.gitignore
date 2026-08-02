@@ -1,5 +1,8 @@
 eval-cases/
 
+# ENG-204 skill-row snapshots taken before a hardening mutation/delete.
+skill-backups/
+
 # Reusable Arga twin coordinates written by `npm run test:twins:setup`.
 # Carries a seeded Slack bot token + admin proxy JWT — NEVER commit.
 .env.twins.json

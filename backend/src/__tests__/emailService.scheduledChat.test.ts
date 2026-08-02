@@ -1,11 +1,42 @@
 import { emailService } from '../services/emailService';
+import { chatbotDb } from '../services/chatbotService';
+import { userDb } from '../services/db';
 
-// Mock chatbotService used inside sendScheduledChatResultEmail to avoid side effects
+// Mock chatbotService used inside sendScheduledChatResultEmail to avoid side effects.
+// getChatSession is read by the recipient-authorization guard (ENG-500); default it
+// to undefined so the guard classifies the report as non-sensitive (no-op) unless a
+// test overrides it.
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     updateSessionInteractiveShareMetadata: jest.fn().mockResolvedValue(undefined),
+    // Default to a PRESENT session with a clean tool record so the guard can
+    // positively verify the report is ordinary (fail-closed default treats an
+    // absent session as sensitive). Individual tests override for sensitive cases.
+    getChatSession: jest.fn().mockResolvedValue({ sessionId: 'session-abc', userId: 'owner-id', calledFunctions: {} }),
+    getMessagesFromMessagesTable: jest.fn().mockResolvedValue([]),
+    createOrReuseInteractiveShare: jest.fn().mockResolvedValue('https://app/share'),
   },
 }));
+
+// The guard resolves per-recipient admin status + the owner via userDb.
+jest.mock('../services/db', () => ({
+  userDb: { getUserByEmail: jest.fn(), getUserById: jest.fn() },
+}));
+
+// Shared result fixture for the guard tests (module scope so it is visible
+// regardless of which describe block the guard tests live in).
+const GUARD_BASE_RESULT = {
+  passed: true,
+  actualResponse: 'Hello world',
+  keywordMatches: [] as string[],
+  keywordMisses: [] as string[],
+  functionCallMatches: [] as string[],
+  functionCallMisses: [] as string[],
+  executionTime: 1234,
+  sessionId: 'session-abc',
+  attempt: 1,
+  createdAt: new Date().toISOString(),
+};
 
 describe('emailService.sendScheduledChatResultEmail', () => {
   const baseResult = {
@@ -300,6 +331,169 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
     expect(htmlContent).not.toContain('<a href="https://evil.example">');
     expect(htmlContent).toContain('&lt;script&gt;');
     expect(htmlContent).toContain('&lt;a href=');
+  });
+
+  // ── Recipient-authorization guard (ENG-500), end-to-end through the real send ──
+  it('withholds non-admin recipients for a cross-account (sensitive) report and adds a notice', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { list_all_clients: 1, get_chat_history: 1 },
+    });
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) =>
+      email === 'admin@example.com' || email === 'owner@example.com' ? { email, isAdmin: true } : { email, isAdmin: false }
+    );
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(
+      ['admin@example.com', 'nonadmin@example.com'],
+      'Daily User Activity Report',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients, , textContent, htmlContent] = spy.mock.calls[0];
+    // non-admin withheld; admin kept; owner added (custodian + gets the notice)
+    expect(recipients).toContain('admin@example.com');
+    expect(recipients).toContain('owner@example.com');
+    expect(recipients).not.toContain('nonadmin@example.com');
+    // the withholding notice is injected into the delivered body
+    expect(htmlContent).toContain('withheld');
+    expect(htmlContent).toContain('nonadmin@example.com');
+    expect(textContent).toContain('withheld');
+  });
+
+  it('HTML-escapes withheld addresses in the notice so a crafted recipient cannot inject markup', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { list_all_clients: 1 },
+    });
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) =>
+      email === 'owner@example.com' ? { email, isAdmin: true } : { email, isAdmin: false }
+    );
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(
+      ['<img src=x onerror=alert(1)>@evil.com'],
+      'Daily User Activity Report',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    const [, , , htmlContent] = spy.mock.calls[0];
+    expect(htmlContent).not.toContain('<img src=x onerror=alert(1)>');
+    expect(htmlContent).toContain('&lt;img src=x onerror=alert(1)&gt;');
+  });
+
+  it('still restricts when the counter is clean but the tool-call MESSAGES show a cross-account tool (swallowed-counter fail-open closed)', async () => {
+    // calledFunctions missed list_all_clients (its counter write was swallowed),
+    // but the authoritative tool-call message records prove it ran.
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { search_tool_response: 1 }, // no cross-account tool recorded
+    });
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+      { role: 'assistant', tool_calls: [{ type: 'function', function: { name: 'list_all_clients', arguments: '{}' } }] },
+      { role: 'tool', name: 'list_all_clients', content: '...' },
+    ]);
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: true });
+    (userDb.getUserByEmail as jest.Mock).mockImplementation(async (email: string) =>
+      email === 'owner@example.com' ? { email, isAdmin: true } : { email, isAdmin: false }
+    );
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(
+      ['nonadmin@example.com'],
+      'Daily User Activity Report',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients] = spy.mock.calls[0];
+    // non-admin withheld, fell back to owner-only
+    expect(recipients).toEqual(['owner@example.com']);
+    expect(recipients).not.toContain('nonadmin@example.com');
+  });
+
+  it('does NOT silently drop: notifies the owner when a sensitive report has no authorized recipients', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { list_all_clients: 1 },
+    });
+    // owner is NOT an admin and neither is the configured recipient → nobody authorized
+    (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'owner-id', email: 'owner@example.com', isAdmin: false });
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+    const oncallSpy = jest.spyOn(emailService, 'sendOncallAlert').mockResolvedValue(undefined);
+
+    await emailService.sendScheduledChatResultEmail(
+      ['nonadmin@example.com'],
+      'Daily User Activity Report',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    // durable escalation fired (report not lost silently)
+    expect(oncallSpy).toHaveBeenCalledTimes(1);
+    // exactly one send: the delivery-blocked STATUS notice to the owner (not the report)
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients, subject, , htmlContent] = spy.mock.calls[0];
+    expect(recipients).toEqual(['owner@example.com']);
+    expect(subject).toContain('not delivered');
+    expect(htmlContent).not.toContain('<html>'); // the report body is NOT included
+  });
+
+  it('fails closed (restricts) when the session cannot be found — cannot verify ordinary', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(undefined); // missing session
+    (userDb.getUserById as jest.Mock).mockResolvedValue(undefined); // owner unknown
+    (userDb.getUserByEmail as jest.Mock).mockResolvedValue({ isAdmin: false });
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+    const oncallSpy = jest.spyOn(emailService, 'sendOncallAlert').mockResolvedValue(undefined);
+
+    await emailService.sendScheduledChatResultEmail(
+      ['nonadmin@example.com'],
+      'Some Report',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    // unverifiable → treated sensitive → non-admin withheld → nobody authorized →
+    // no report broadcast, durable oncall escalation instead
+    expect(oncallSpy).toHaveBeenCalledTimes(1);
+    const reportSends = spy.mock.calls.filter(c => Array.isArray(c[0]) && c[0].includes('nonadmin@example.com'));
+    expect(reportSends).toHaveLength(0);
+  });
+
+  it('leaves recipients unchanged and does no lookups for an ordinary (non-sensitive) report', async () => {
+    (chatbotDb.getChatSession as jest.Mock).mockResolvedValue({
+      sessionId: 'session-abc',
+      userId: 'owner-id',
+      calledFunctions: { install_skills: 1 },
+    });
+    // counter clean AND no cross-account tool in the messages → genuinely non-sensitive
+    (chatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([
+      { role: 'assistant', tool_calls: [{ function: { name: 'install_skills' } }] },
+    ]);
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledChatResultEmail(
+      ['a@example.com', 'b@example.com'],
+      'Weekly Digest',
+      GUARD_BASE_RESULT,
+      'schedule-123'
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients] = spy.mock.calls[0];
+    expect(recipients).toEqual(['a@example.com', 'b@example.com']);
+    expect(userDb.getUserByEmail).not.toHaveBeenCalled();
   });
 });
 

@@ -46,7 +46,35 @@ export interface UsageRecordIncrement {
   costMicroUsd: number;
   billingUserId: string;
   onBehalfOf?: string;
+
+  // ── Vendor dimension (ENG-693). All optional and all NON-KEY: an existing row
+  // stays valid and readable without any of them, so no backfill is required. ──
+
+  /** Vendor that served the call: "bedrock", "openai", "v0", "you.com", … */
+  provider?: string;
+  /**
+   * Chat session this CALL came from (declared on the caller context since Ship 1).
+   * Persisted as the row's `lastSessionId` breadcrumb — see `UsageRecordRow`.
+   */
+  sessionId?: string;
+  /**
+   * The thing being counted for a vendor that does NOT bill by tokens
+   * ("render", "query", "character"). Its presence is what marks this write as a
+   * per-unit entry: token counters are then omitted entirely rather than written
+   * as zeros, so a reader can tell "no tokens" from "zero tokens".
+   */
+  unit?: string;
+  /** How many `unit`s this call consumed. Accumulates across calls on the row. */
+  quantity?: number;
+  /**
+   * Whether `costMicroUsd` is a figure the vendor reported ("measured") or one we
+   * produced by applying our own rate ("allocated"). Absent on pre-ENG-693 rows.
+   */
+  costSource?: CostSource;
 }
+
+/** Provenance of a cost figure — see `UsageRecordIncrement.costSource`. */
+export type CostSource = "measured" | "allocated";
 
 export interface UsageRecordRow {
   userId: string;
@@ -54,17 +82,43 @@ export interface UsageRecordRow {
   date: string;
   model: string;
   feature: string;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheWriteTokens: number;
-  totalTokens: number;
+  /** Absent on per-unit vendor rows, which carry no token counters at all. */
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  totalTokens?: number;
   costMicroUsd: number;
   callCount: number;
   billingUserId: string;
   onBehalfOf?: string;
   updatedAt: string;
   ttl: number;
+  /** Vendor dimension (ENG-693) — absent on every row written before that change. */
+  provider?: string;
+  /**
+   * The most recent session that contributed to this row — a trace breadcrumb, NOT
+   * an attribution key. The row aggregates every session that used this
+   * {date}#{model}#{feature}, so its counters are not this session's alone. Never
+   * read it as "the session that owns this usage".
+   */
+  lastSessionId?: string;
+  unit?: string;
+  quantity?: number;
+  costSource?: CostSource;
+}
+
+/**
+ * True only for a per-unit vendor entry (ENG-693).
+ *
+ * Deliberately requires BOTH `provider` and `unit`. A row written before this
+ * change has neither, so it reports false and is never surfaced as a vendor
+ * entry costing $0 — its real token cost keeps being read from `costMicroUsd`.
+ * An LLM row carries `provider` but no `unit`, and is likewise not a vendor
+ * entry: it is token-priced spend that happens to name its provider.
+ */
+export function isVendorEntry(row: UsageRecordRow): boolean {
+  return row.provider != null && row.unit != null;
 }
 
 function buildSortKey(date: string, model: string, feature: string): string {
@@ -79,6 +133,10 @@ export const usageRecordDb = {
    * Single UpdateExpression with ADD — creates the row on first write.
    */
   async incrementUsage(inc: UsageRecordIncrement): Promise<void> {
+    // A per-unit vendor entry counts `quantity`, not tokens. Writing the token
+    // counters as zeros would make "this vendor doesn't bill by tokens"
+    // indistinguishable from "this call used zero tokens", so they're omitted.
+    const isUnitEntry = inc.unit != null;
     const cacheReadTokens = inc.cacheReadTokens || 0;
     const cacheWriteTokens = inc.cacheWriteTokens || 0;
     const totalTokens =
@@ -92,11 +150,6 @@ export const usageRecordDb = {
       "#ttl": "ttl",
     };
     const values: Record<string, any> = {
-      ":in": inc.inputTokens,
-      ":out": inc.outputTokens,
-      ":cr": cacheReadTokens,
-      ":cw": cacheWriteTokens,
-      ":tt": totalTokens,
       ":cost": Math.round(inc.costMicroUsd),
       ":one": 1,
       ":date": inc.date,
@@ -107,22 +160,80 @@ export const usageRecordDb = {
       ":ttl": Math.floor(Date.now() / 1000) + TTL_SECONDS,
     };
 
-    let setClause =
-      "SET #date = :date, #model = :model, #feature = :feature, " +
-      "billingUserId = :billing, updatedAt = :now, #ttl = if_not_exists(#ttl, :ttl)";
+    const addClauses: string[] = [];
+    if (isUnitEntry) {
+      names["#quantity"] = "quantity";
+      values[":qty"] = Math.max(0, Math.round(inc.quantity || 0));
+      addClauses.push("#quantity :qty");
+    } else {
+      Object.assign(values, {
+        ":in": inc.inputTokens,
+        ":out": inc.outputTokens,
+        ":cr": cacheReadTokens,
+        ":cw": cacheWriteTokens,
+        ":tt": totalTokens,
+      });
+      addClauses.push(
+        "inputTokens :in",
+        "outputTokens :out",
+        "cacheReadTokens :cr",
+        "cacheWriteTokens :cw",
+        "totalTokens :tt"
+      );
+    }
+    addClauses.push("costMicroUsd :cost", "callCount :one");
+
+    const setClauses = [
+      "#date = :date",
+      "#model = :model",
+      "#feature = :feature",
+      "billingUserId = :billing",
+      "updatedAt = :now",
+      "#ttl = if_not_exists(#ttl, :ttl)",
+    ];
     if (inc.onBehalfOf) {
-      setClause += ", onBehalfOf = :obo";
+      setClauses.push("onBehalfOf = :obo");
       values[":obo"] = inc.onBehalfOf;
+    }
+
+    // Descriptive (non-counter) attributes of the row. A row is a DAILY AGGREGATE
+    // of N calls, so these are written with if_not_exists: the first writer's
+    // value sticks and the row never flaps between concurrent callers. That is
+    // sound only because each of these is constant across every writer to a given
+    // key — `recordVendorUsage` namespaces the model slot as `{provider}:{operation}`,
+    // so one row cannot mix vendors, units, or cost provenance. All three go through
+    // ExpressionAttributeNames because `unit` is a DynamoDB reserved word.
+    const descriptive: Array<[string, unknown]> = [
+      ["provider", inc.provider],
+      ["unit", inc.unit],
+      ["costSource", inc.costSource],
+    ];
+    for (const [attr, value] of descriptive) {
+      if (value == null) continue;
+      names[`#${attr}`] = attr;
+      values[`:${attr}`] = value;
+      setClauses.push(`#${attr} = if_not_exists(#${attr}, :${attr})`);
+    }
+
+    // Session is the one call-level fact that is NOT constant across a row. The sort
+    // key is {date}#{model}#{feature}, so N sessions share one bucket while its
+    // counters accumulate all of their usage. Pinning a single id onto that row —
+    // the first (if_not_exists) or the last — reads as "this session owns this
+    // usage" and is false for every session but one. Stored as `lastSessionId`
+    // under plain SET so the attribute name states exactly what it holds: a trace
+    // breadcrumb to the most recent contributing session, never an attribution key.
+    // Session-granular spend would need the session in the sort key, which is a key
+    // change this slice deliberately excludes (see the issue's out-of-scope list).
+    if (inc.sessionId != null) {
+      values[":lastSessionId"] = inc.sessionId;
+      setClauses.push("lastSessionId = :lastSessionId");
     }
 
     await getDocumentClient()
       .update({
         TableName: TABLE_NAME,
         Key: { userId: inc.userId, sk: buildSortKey(inc.date, inc.model, inc.feature) },
-        UpdateExpression:
-          "ADD inputTokens :in, outputTokens :out, cacheReadTokens :cr, " +
-          "cacheWriteTokens :cw, totalTokens :tt, costMicroUsd :cost, callCount :one " +
-          setClause,
+        UpdateExpression: `ADD ${addClauses.join(", ")} SET ${setClauses.join(", ")}`,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
       })

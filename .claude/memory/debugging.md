@@ -101,5 +101,9 @@ See `docs/debug-production.md` for copying prod sessions to dev.
 
 ## Async Wait Pattern (CI, Deploy)
 Use `[RELAY_RETRY_AFTER:300]` in response to get re-invoked after N seconds (max 600).
-Before merging: check `gh api repos/AgentWebPro/agentweb/pulls/<N> --jq '.mergeable_state'`
-If `behind`: `git fetch origin main && git rebase origin/main && git push --force-with-lease`, then wait for CI again.
+Before merging, establish CI evidence with
+`REPO=AgentWebPro/agentweb PR_NUMBER=<N> bash .github/scripts/merge-evidence.sh`
+(exit 0 = a real run executed against the current head). Do not rely on
+`gh pr checks`: it exits 0 on a conflicted PR and on an all-skipped draft run,
+because skipped is not failed (ENG-757). Exit 3 = nothing ever ran.
+If the branch is `behind`: `git fetch origin main && git rebase origin/main && git push --force-with-lease`, then wait for CI again.

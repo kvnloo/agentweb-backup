@@ -57,11 +57,14 @@ import BenchmarksTab from "../components/admin/BenchmarksTab";
 import SubscriptionTypesTab from "../components/admin/SubscriptionTypesTab";
 import McpServersTab from "../components/admin/McpServersTab";
 import EmmaMcpUsageTab from "../components/admin/EmmaMcpUsageTab";
+import UsageCostByUserTab from "../components/admin/UsageCostByUserTab";
+import CostDashboardTab from "../components/admin/CostDashboardTab";
 import ResultEndpointsTab from "../components/admin/ResultEndpointsTab";
 import ScoringJudgesTab from "../components/admin/ScoringJudgesTab";
 import CrmTab from "../components/admin/CrmTab";
 import V0CreditsCard from "../components/admin/V0CreditsCard";
 import CostBreakdownBody, { OrgUsageRollup } from "../components/admin/CostBreakdownBody";
+import XCostBreakdownBody, { XOrgUsageRollup } from "../components/admin/XCostBreakdownBody";
 import RevenueTab from "../components/admin/RevenueTab";
 import FunnelTab from "../components/admin/FunnelTab";
 import AlertEmailsTab from "../components/admin/AlertEmailsTab";
@@ -783,6 +786,8 @@ export default function AdminDashboard() {
     'connected-accounts': 21,
     'contractors': 22,
     'emma-mcp': 23,
+    'costs': 24,
+    'usage-cost': 25,
   };
   
   // Get initial tab value from URL or default to Users
@@ -814,6 +819,10 @@ export default function AdminDashboard() {
   const [expandedUserId, setExpandedUserId] = useState<string | null>(null);
   const [userActivities, setUserActivities] = useState<Record<string, Array<{ sessionId: string; title: string; createdAt: string; updatedAt: string; portalType?: string; sessionType?: string; delegateInfo?: { adminEmail: string; isDelegated: boolean }; }>>>({});
   const [userActivitiesLoading, setUserActivitiesLoading] = useState<Record<string, boolean>>({});
+  // Per-user current-month X (Twitter) $ cost, fetched lazily when a card expands
+  // (ENG-664) — avoids a full ledger scan on every /admin/users load. undefined =
+  // not fetched yet, null = loading, number = loaded.
+  const [xCostByUser, setXCostByUser] = useState<Record<string, number | null>>({});
   const [waitlistOrderBy, setWaitlistOrderBy] = useState<keyof WaitlistEntry>("joinedAt");
   const [waitlistOrder, setWaitlistOrder] = useState<"asc" | "desc">("desc");
   const [message, setMessage] = useState("");
@@ -939,6 +948,15 @@ export default function AdminDashboard() {
     setCostBreakdownView(v);
     try { localStorage.setItem("costBreakdownView", v); } catch { /* non-fatal */ }
   };
+
+  // Per-user X (Twitter) cost breakdown modal (ENG-664) — mirrors the LLM one but
+  // reads the X-only ledger cut; reuses costBreakdownView for the table/bars toggle.
+  const [xBreakdownUser, setXBreakdownUser] = useState<User | null>(null);
+  const [xBreakdownMonth, setXBreakdownMonth] = useState<string>("");
+  const [xBreakdownData, setXBreakdownData] = useState<XOrgUsageRollup | null>(null);
+  const [xBreakdownLoading, setXBreakdownLoading] = useState(false);
+  const [xBreakdownError, setXBreakdownError] = useState<string | null>(null);
+  const xBreakdownReqRef = useRef(0);
   const [grantBonusDialogOpen, setGrantBonusDialogOpen] = useState(false);
   const [grantBonusUserId, setGrantBonusUserId] = useState<string | null>(null);
   const [grantBonusEmail, setGrantBonusEmail] = useState("");
@@ -1154,6 +1172,44 @@ export default function AdminDashboard() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [costBreakdownUser?.userId, costBreakdownMonth]);
+
+  // ── Per-user X (Twitter) cost breakdown (ENG-664) ──
+  const fetchXBreakdown = async (userId: string, month: string) => {
+    const reqId = ++xBreakdownReqRef.current;
+    const isStale = () => reqId !== xBreakdownReqRef.current;
+    setXBreakdownLoading(true);
+    setXBreakdownError(null);
+    try {
+      // Org-aware rollup: allocated X spend summed across all org members, with a
+      // per-member breakdown (mirrors the LLM org-rollup; see backend).
+      const response = await axios.get(
+        buildApiUrl(`/api/admin/users/${userId}/usage/x-org-rollup`),
+        { headers: { Authorization: `Bearer ${token}` }, params: { month } }
+      );
+      if (isStale()) return;
+      setXBreakdownData(response.data);
+    } catch (error: any) {
+      if (isStale()) return;
+      setXBreakdownData(null);
+      setXBreakdownError(error.response?.data?.message || "Failed to load X breakdown");
+    } finally {
+      if (!isStale()) setXBreakdownLoading(false);
+    }
+  };
+
+  const openXBreakdown = (user: User) => {
+    setXBreakdownUser(user);
+    setXBreakdownData(null);
+    setXBreakdownError(null);
+    setXBreakdownMonth(new Date().toISOString().slice(0, 7));
+  };
+
+  useEffect(() => {
+    if (xBreakdownUser && xBreakdownMonth) {
+      fetchXBreakdown(xBreakdownUser.userId, xBreakdownMonth);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [xBreakdownUser?.userId, xBreakdownMonth]);
 
   // Load waitlist data only when Waitlist tab (3) is selected
   useEffect(() => {
@@ -3362,6 +3418,8 @@ export default function AdminDashboard() {
             <Tab label="Connected Accounts" {...a11yProps(21)} />
             <Tab label="Contractors" {...a11yProps(22)} />
             <Tab label="Emma MCP" {...a11yProps(23)} />
+            <Tab label="LLM Costs" {...a11yProps(24)} />
+            <Tab label="Usage & Cost" {...a11yProps(25)} />
           </Tabs>
         </Box>
 
@@ -4422,6 +4480,18 @@ export default function AdminDashboard() {
                           if (nextExpanded && userNotesMap[nextExpanded] === undefined) {
                             loadUserNotes(nextExpanded);
                           }
+                          // Lazily fetch this user's current-month X cost (single-user
+                          // ledger query) only when the card opens — never on list load.
+                          if (nextExpanded && xCostByUser[nextExpanded] === undefined) {
+                            const month = new Date().toISOString().slice(0, 7);
+                            setXCostByUser(prev => ({ ...prev, [nextExpanded]: null }));
+                            axios.get(buildApiUrl(`/api/admin/users/${nextExpanded}/usage/x-breakdown`), {
+                              headers: { Authorization: `Bearer ${token}` },
+                              params: { start: `${month}-01`, end: `${month}-31` },
+                            })
+                              .then(res => setXCostByUser(prev => ({ ...prev, [nextExpanded]: res.data?.costUsd ?? 0 })))
+                              .catch(() => setXCostByUser(prev => ({ ...prev, [nextExpanded]: 0 })));
+                          }
                         }}
                       >
                         <TableCell sx={{ p: 0.5, width: 32 }}>
@@ -4925,6 +4995,25 @@ export default function AdminDashboard() {
                                     )}
                                   </Box>
                                 </Grid>
+                                {/* X (Twitter) API cost — allocated, observe-only (ENG-664) */}
+                                {user.roles?.includes("customer") && (
+                                  <Grid item xs={6}>
+                                    <HelpCaption
+                                      label="X (Twitter) Cost"
+                                      help="Allocated $ cost of this user's X/Twitter API calls this month — X's pay-per-use rate card applied to their call counts. Observe-only: X spend is NOT deducted from any cap. Open the breakdown for per-tool cost."
+                                    />
+                                    <Box sx={{ display: "flex", alignItems: "center", gap: 1, mt: 0.5 }}>
+                                      <Typography variant="body2">
+                                        {xCostByUser[user.userId] === null
+                                          ? "…"
+                                          : `$${(xCostByUser[user.userId] ?? 0).toFixed(4)} this month`}
+                                      </Typography>
+                                      <Tooltip title="View per-tool X (Twitter) cost breakdown">
+                                        <IconButton size="small" onClick={() => openXBreakdown(user)} color="primary"><BarChartIcon fontSize="small" /></IconButton>
+                                      </Tooltip>
+                                    </Box>
+                                  </Grid>
+                                )}
                                 {/* Extra Cost Usage (enrichment, image gen, etc.) */}
                                 {user.roles?.includes("customer") && (
                                   <Grid item xs={6}>
@@ -6558,6 +6647,14 @@ export default function AdminDashboard() {
           <EmmaMcpUsageTab />
         </TabPanel>
 
+        <TabPanel value={tabValue} index={24}>
+          <CostDashboardTab />
+        </TabPanel>
+
+        <TabPanel value={tabValue} index={25}>
+          <UsageCostByUserTab />
+        </TabPanel>
+
       </Paper>
 
       {/* Satisfaction Score Override Popover */}
@@ -6779,6 +6876,54 @@ export default function AdminDashboard() {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setCostBreakdownUser(null)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Per-user X (Twitter) cost breakdown (ENG-664) */}
+      <Dialog open={!!xBreakdownUser} onClose={() => setXBreakdownUser(null)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 2 }}>
+          <span>X (Twitter) Cost — {xBreakdownUser?.email}</span>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 1.5 }}>
+            <ButtonGroup size="small" aria-label="x cost breakdown view">
+              <Button
+                variant={costBreakdownView === "table" ? "contained" : "outlined"}
+                onClick={() => changeCostBreakdownView("table")}
+              >
+                Table
+              </Button>
+              <Button
+                variant={costBreakdownView === "bars" ? "contained" : "outlined"}
+                onClick={() => changeCostBreakdownView("bars")}
+                startIcon={<BarChartIcon fontSize="small" />}
+              >
+                Bars
+              </Button>
+            </ButtonGroup>
+            <TextField
+              select
+              size="small"
+              label="Month"
+              value={xBreakdownMonth}
+              onChange={(e) => setXBreakdownMonth(e.target.value)}
+              sx={{ width: 170 }}
+            >
+              {recentMonthOptions(12).map((m) => (
+                <MenuItem key={m.value} value={m.value}>{m.label}</MenuItem>
+              ))}
+            </TextField>
+          </Box>
+        </DialogTitle>
+        <DialogContent dividers>
+          {xBreakdownLoading ? (
+            <Box sx={{ display: "flex", justifyContent: "center", py: 4 }}><CircularProgress /></Box>
+          ) : xBreakdownError ? (
+            <Typography color="error" variant="body2" sx={{ py: 2 }}>{xBreakdownError}</Typography>
+          ) : (
+            <XCostBreakdownBody rollup={xBreakdownData} view={costBreakdownView} />
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setXBreakdownUser(null)}>Close</Button>
         </DialogActions>
       </Dialog>
 
@@ -8372,13 +8517,13 @@ const AgentModeSettings = () => {
     } catch (error) {
       console.error('Error loading supported models:', error);
     }
-    const fallbackModels = [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const fallbackModels = [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     setSupportedModels(fallbackModels);
     return fallbackModels;
   };
 
   const loadDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       try {
         const response = await axios.get(buildApiUrl('/api/settings/agent_mode_default_model'), {
@@ -8547,7 +8692,7 @@ const AgentModeSettings = () => {
   };
 
   const loadScheduledChatsDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_scheduled_chats_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -8599,7 +8744,7 @@ const AgentModeSettings = () => {
   };
 
   const loadReportGenerationDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_report_generation_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -8649,7 +8794,7 @@ const AgentModeSettings = () => {
   };
 
   const loadImageGenerationDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_image_generation_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -8797,7 +8942,7 @@ const AgentModeSettings = () => {
   };
 
   const loadVideoGenerationDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_video_generation_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -8847,7 +8992,7 @@ const AgentModeSettings = () => {
   };
 
   const loadCustomerSupportDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_customer_support_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -8897,7 +9042,7 @@ const AgentModeSettings = () => {
   };
 
   const loadCodingAgentDefaultModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_coding_agent_default_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -9016,7 +9161,7 @@ const AgentModeSettings = () => {
   };
 
   const loadBackupModel = async (models: string[] = []) => {
-    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3-pro-preview'];
+    const availableModels = models.length > 0 ? models : [fallbackDefaultModel, 'gemini-3.1-pro-preview'];
     try {
       const response = await axios.get(buildApiUrl('/api/settings/agent_mode_backup_model'), {
         headers: { Authorization: `Bearer ${token}` }
@@ -9397,7 +9542,7 @@ const AgentModeSettings = () => {
             >
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model} disabled={model === backupModel}>
                   {model}{model === backupModel ? ' (used as backup model)' : ''}
@@ -9449,7 +9594,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model} disabled={model === defaultModel}>
                   {model}{model === defaultModel ? ' (current default model)' : ''}
@@ -9501,7 +9646,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}
@@ -9553,7 +9698,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}
@@ -9605,7 +9750,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}
@@ -9755,7 +9900,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}
@@ -9807,7 +9952,7 @@ const AgentModeSettings = () => {
               </MenuItem>
               {(supportedModels.length > 0
                 ? supportedModels
-                : [fallbackDefaultModel, 'gemini-3-pro-preview']
+                : [fallbackDefaultModel, 'gemini-3.1-pro-preview']
               ).map((model) => (
                 <MenuItem key={model} value={model}>
                   {model}

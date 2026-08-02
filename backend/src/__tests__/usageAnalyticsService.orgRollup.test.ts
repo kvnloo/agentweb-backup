@@ -15,6 +15,8 @@ jest.mock('../services/usageRecordDb', () => ({
     queryByUserDateRange: jest.fn(),
     scanByDateRange: jest.fn(),
   },
+  // Real semantics: a per-unit vendor row has BOTH provider and unit.
+  isVendorEntry: (r: any) => !!(r && r.provider && r.unit),
 }));
 
 jest.mock('../services/db', () => ({
@@ -248,5 +250,32 @@ describe('getUserOrgUsageRollup', () => {
 
     expect(r.countedUsd).toBeCloseTo(12, 6); // from history, not the current $999
     expect(r.countedSource).toBe('history');
+  });
+});
+
+describe('LLM-only: vendor rows excluded from the rollup (ENG-664)', () => {
+  it('does not let X (per-unit vendor) spend inflate gross burn / depress coverage', async () => {
+    // Solo user: one $1 LLM row + one $5 X row (provider+unit → vendor entry).
+    mockGetUser.mockResolvedValue(user({ userId: 'u', orgId: undefined }));
+    mockQuery.mockResolvedValue([
+      row({ costMicroUsd: 1_000_000 }), // LLM $1
+      row({
+        sk: '2026-07-02#twitter:search_tweets#x-account:acc-1',
+        model: 'twitter:search_tweets',
+        feature: 'x-account:acc-1',
+        provider: 'twitter',
+        unit: 'post',
+        quantity: 1000,
+        costMicroUsd: 5_000_000, // X $5 — must be excluded
+      }),
+    ]);
+
+    const r = await getUserOrgUsageRollup('u', '2026-07');
+
+    // Gross burn is the LLM $1 only; the $5 X row is not counted here.
+    expect(r.grossBurnUsd).toBeCloseTo(1, 6);
+    // byModel contains the LLM model, never the twitter one.
+    expect(r.byModel.map((m) => m.model)).toContain('anthropic.claude-opus-4-8');
+    expect(r.byModel.map((m) => m.model)).not.toContain('twitter:search_tweets');
   });
 });
