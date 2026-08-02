@@ -11,6 +11,10 @@ import { settingsService } from '../services/settingsService';
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
     callLLM: jest.fn(),
+    // ENG-744: scoring now validates a persisted model id against the registry
+    // before calling. Pass-through keeps these fixtures' model expectations
+    // exactly as they were while satisfying the real service's contract.
+    resolveGenerationModel: (m: string) => ({ model: m, fellBack: false, requestedModel: m }),
   },
 }));
 

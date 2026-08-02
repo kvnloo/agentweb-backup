@@ -25,6 +25,7 @@ jest.mock('../../middleware/admin', () => ({
 jest.mock('../../services/usageAnalyticsService', () => ({
   getUserUsageByModelDay: jest.fn(),
   getUsageComparison: jest.fn(),
+  getUserXBreakdown: jest.fn(),
 }));
 
 import adminUsageRoutes from '../adminUsage';
@@ -32,10 +33,12 @@ import { authenticateToken } from '../../middleware/auth';
 import {
   getUserUsageByModelDay,
   getUsageComparison,
+  getUserXBreakdown,
 } from '../../services/usageAnalyticsService';
 
 const mockByModelDay = getUserUsageByModelDay as jest.Mock;
 const mockComparison = getUsageComparison as jest.Mock;
+const mockXBreakdown = getUserXBreakdown as jest.Mock;
 const mockAuth = authenticateToken as unknown as jest.Mock;
 
 let app: express.Application;
@@ -156,4 +159,38 @@ describe('admin usage routes', () => {
       expect(res.body.error).toBe('Unknown error');
     });
   });
+
+  describe('GET /api/admin/users/:userId/usage/x-breakdown', () => {
+    it('400s without valid start/end', async () => {
+      await request(app)
+        .get('/api/admin/users/u1/usage/x-breakdown?start=nope&end=2026-07-31')
+        .expect(400);
+      expect(mockXBreakdown).not.toHaveBeenCalled();
+    });
+
+    it('returns the per-user X breakdown for an admin', async () => {
+      const payload = {
+        userId: 'u1', start: '2026-07-01', end: '2026-07-31', costUsd: 0.065, callCount: 6,
+        byOperation: [{ operation: 'search_tweets', callCount: 5, quantity: 10, costUsd: 0.05 }],
+      };
+      mockXBreakdown.mockResolvedValue(payload);
+      const res = await request(app)
+        .get('/api/admin/users/u1/usage/x-breakdown?start=2026-07-01&end=2026-07-31')
+        .expect(200);
+      expect(res.body).toEqual(payload);
+      expect(mockXBreakdown).toHaveBeenCalledWith('u1', '2026-07-01', '2026-07-31');
+    });
+
+    it('403s for non-admin users', async () => {
+      mockAuth.mockImplementation((req: any, _res: any, next: any) => {
+        req.user = { userId: 'basic-1', email: 'basic@example.com', isAdmin: false };
+        next();
+      });
+      await request(app)
+        .get('/api/admin/users/u1/usage/x-breakdown?start=2026-07-01&end=2026-07-31')
+        .expect(403);
+      expect(mockXBreakdown).not.toHaveBeenCalled();
+    });
+  });
+
 });

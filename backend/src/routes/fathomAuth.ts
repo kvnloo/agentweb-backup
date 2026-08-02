@@ -11,6 +11,18 @@ import { storeOAuthSession, retrieveOAuthSession } from '../services/oauthTokenS
 
 const router = express.Router();
 
+/**
+ * The destination URL registered with Fathom. When FATHOM_WEBHOOK_SECRET is
+ * configured, the shared token rides in the URL so legitimate deliveries pass
+ * the webhook handler's authentication (PR #2203 P1 — Fathom sends no custom
+ * headers, so the token must live in the registered URL). Exported for tests.
+ */
+export function buildFathomWebhookDestinationUrl(baseUrl: string): string {
+  const url = `${baseUrl}/api/webhooks/fathom`;
+  const secret = process.env.FATHOM_WEBHOOK_SECRET;
+  return secret ? `${url}?token=${encodeURIComponent(secret)}` : url;
+}
+
 const STATE_EXPIRATION = '15m';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
@@ -166,12 +178,16 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     try {
       const fathomApi = new FathomApiService(tokens.access_token);
       const baseUrl = process.env.API_BASE_URL || 'https://api.agentweb.pro';
-      const webhookUrl = `${baseUrl}/api/webhooks/fathom`;
-      const { id: webhookId } = await fathomApi.registerWebhook(webhookUrl);
+      // Register WITH the shared token (when configured) so deliveries pass the
+      // authenticated webhook handler; store the tokenless URL — no secrets in
+      // the account config.
+      const { id: webhookId } = await fathomApi.registerWebhook(
+        buildFathomWebhookDestinationUrl(baseUrl),
+      );
 
       await updateAccountConfig(userId, 'fathom', accountId, {
         webhook_id: webhookId,
-        webhook_url: webhookUrl,
+        webhook_url: `${baseUrl}/api/webhooks/fathom`,
       });
       console.log(`[Fathom] Registered webhook ${webhookId} for user ${userId}`);
     } catch (webhookErr: any) {

@@ -8,12 +8,12 @@ const CRM_SCOPES = [
   'crm.objects.contacts.write',
   'crm.objects.deals.read',
 ];
-const MARKETING_SCOPES = [
-  ...CRM_SCOPES,
+const MARKETING_ONLY_SCOPES = [
   'marketing.campaigns.read',
   'marketing.campaigns.write',
   'content',
 ];
+const MARKETING_SCOPES = [...CRM_SCOPES, ...MARKETING_ONLY_SCOPES];
 const mockOAuthSessions = new Map<string, any>();
 
 jest.mock('../config/integrations', () => ({
@@ -25,6 +25,7 @@ jest.mock('../config/integrations', () => ({
     tokenUrl: 'https://api.hubapi.com/oauth/v1/token',
     tokenInfoUrl: 'https://api.hubapi.com/oauth/v1/access-tokens',
     scopes: CRM_SCOPES,
+    marketingOnlyScopes: MARKETING_ONLY_SCOPES,
     marketingScopes: MARKETING_SCOPES,
   }),
 }));
@@ -136,7 +137,14 @@ describe('HubSpot OAuth Routes', () => {
       expect(scope).not.toContain('marketing.campaigns.read');
     });
 
-    it('returns marketing scopes when accountType=marketing', async () => {
+    // ENG-600 fallout: the HubSpot app has ALL scopes marked "Required" at the
+    // app level, so anything sent in the `scope` param must be grantable by
+    // every connecting account, CRM-only included. Marketing-only scopes must
+    // go through `optional_scope` instead — requested opportunistically,
+    // granted only if the portal has Marketing Hub, never blocking the auth
+    // flow for CRM-only accounts. `scope` must NEVER contain marketing-only
+    // scopes, for either accountType.
+    it('puts marketing-only scopes in optional_scope, not scope, when accountType=marketing', async () => {
       const res = await request(app)
         .get('/api/oauth/hubspot/init?accountType=marketing')
         .set('Authorization', 'Bearer mock-token');
@@ -144,9 +152,23 @@ describe('HubSpot OAuth Routes', () => {
       expect(res.status).toBe(200);
       const url = new URL(res.body.url);
       const scope = url.searchParams.get('scope') ?? '';
+      const optionalScope = url.searchParams.get('optional_scope') ?? '';
+
       expect(scope).toContain('crm.objects.contacts.read');
-      expect(scope).toContain('marketing.campaigns.read');
-      expect(scope).toContain('content');
+      expect(scope).not.toContain('marketing.campaigns.read');
+      expect(scope).not.toContain('content');
+
+      expect(optionalScope).toContain('marketing.campaigns.read');
+      expect(optionalScope).toContain('content');
+    });
+
+    it('omits optional_scope entirely when accountType=crm', async () => {
+      const res = await request(app)
+        .get('/api/oauth/hubspot/init?accountType=crm')
+        .set('Authorization', 'Bearer mock-token');
+
+      const url = new URL(res.body.url);
+      expect(url.searchParams.has('optional_scope')).toBe(false);
     });
 
     it('encodes accountType into state JWT', async () => {

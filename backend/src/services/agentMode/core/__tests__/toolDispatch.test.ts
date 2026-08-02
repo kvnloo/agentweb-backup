@@ -15,6 +15,7 @@ import {
 } from '../../../agentToolGatewayService';
 import {
   executePreparedTools,
+  stableStringify,
   type ExecutePreparedToolsInput,
   type ToolDispatchPorts,
 } from '../toolDispatch';
@@ -441,27 +442,31 @@ describe('executePreparedTools', () => {
       expect(input.toolCallsLedger[0].result).toEqual({ deferred: true, reason: 'media_generation_time_budget' });
     });
 
-    it('still produces one asset when over budget but nothing has been generated yet (forward progress)', async () => {
+    it('still makes forward progress (one batch) when over budget but nothing generated yet', async () => {
       const { ports, executed } = mediaPorts();
       const input = makeInput(
         [
           toolCall('a', 'generate_image', '{"prompt":"1"}'),
           toolCall('b', 'generate_image', '{"prompt":"2"}'),
           toolCall('c', 'generate_image', '{"prompt":"3"}'),
+          toolCall('d', 'generate_image', '{"prompt":"4"}'),
         ],
         ports,
         { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 0 },
       );
       const result = await executePreparedTools(input);
 
-      // First call runs (no asset existed yet); the remaining two defer.
-      expect(executed).toEqual(['generate_image']);
-      expect(result.mediaAssetsProduced).toBe(1);
+      // The first batch (bounded concurrency) runs as forward progress — a batch of 3
+      // concurrent images takes ~one image's wall-clock, so it is as cap-safe as the old
+      // single-image forward progress while delivering more. The 4th (next batch) defers.
+      expect(executed).toEqual(['generate_image', 'generate_image', 'generate_image']);
+      expect(result.mediaAssetsProduced).toBe(3);
       expect(result.mediaBudgetDeferred).toBe(true);
-      expect(result.pendingCounterUpdates).toEqual({ generate_image: 1 });
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 3 });
       expect(input.messages.map((m: any) => m.content)).toEqual([
         expect.stringContaining('https://s3/generate_image.png'),
-        expect.stringMatching(/paused|continue/i),
+        expect.stringContaining('https://s3/generate_image.png'),
+        expect.stringContaining('https://s3/generate_image.png'),
         expect.stringMatching(/paused|continue/i),
       ]);
     });
@@ -512,6 +517,235 @@ describe('executePreparedTools', () => {
       );
       const result = await executePreparedTools(input);
       expect(result.mediaAssetsProduced).toBe(0);
+      expect(result.mediaBudgetDeferred).toBe(true);
+    });
+  });
+
+  describe('adaptive hard-cap deferral (ENG-510)', () => {
+    // Gateway fake whose media-gen calls report a configurable wall-clock duration,
+    // so we can prove the deferral reserves enough time for one more call below the
+    // whole-turn hard cap (which a fixed soft-budget deadline cannot when a single
+    // image is slow enough to nearly consume the whole budget).
+    function mediaPortsWithDuration(durationMs: number) {
+      const executed: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          executed.push(i.toolName);
+          const result = await i.execute();
+          const isMedia = i.toolName === 'generate_image' || i.toolName === 'generate_video';
+          return { status: 'success', result, durationMs: isMedia ? durationMs : 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async (i: any) => ({ success: true, imageUrl: `https://s3/${i.toolName}.png` }),
+      });
+      return { ports, executed };
+    }
+
+    it('defers the next media call when within one media-call duration of the hard cap, even before the soft deadline', async () => {
+      const { ports, executed } = mediaPortsWithDuration(5000);
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        {
+          // Soft budget NOT exceeded — the old fixed-deadline check alone would run it.
+          mediaGenerationDeadlineMs: Date.now() + 60_000,
+          mediaAssetsProducedThisRun: 1,
+          // Only ~100ms left before the whole-turn hard cap, but a media call takes ~5s.
+          generationHardCapMs: Date.now() + 100,
+          longestMediaCallMsThisRun: 5000,
+        } as any,
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual([]);
+      expect(result.mediaBudgetDeferred).toBe(true);
+      expect(result.mediaAssetsProduced).toBe(0);
+      expect(input.toolCallsLedger[0].result).toEqual({ deferred: true, reason: 'media_generation_time_budget' });
+    });
+
+    it('does NOT defer when there is ample time before the hard cap', async () => {
+      const { ports, executed } = mediaPortsWithDuration(5000);
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        {
+          mediaGenerationDeadlineMs: Date.now() + 60_000,
+          mediaAssetsProducedThisRun: 1,
+          generationHardCapMs: Date.now() + 600_000, // plenty of headroom for another call
+          longestMediaCallMsThisRun: 5000,
+        } as any,
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual(['generate_image']);
+      expect(result.mediaBudgetDeferred).toBe(false);
+      expect(result.mediaAssetsProduced).toBe(1);
+    });
+
+    it('defers a solo per-iteration media call when the run-wide longest duration will not fit before the hard cap', async () => {
+      // The real prod failure mode: variants emitted ONE PER ITERATION. Iteration 2's solo
+      // generate_image must be deferred because iteration 1's image (threaded in via
+      // longestMediaCallMsThisRun) was slow and there is < one image of time left.
+      const { ports, executed } = mediaPortsWithDuration(5000);
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        {
+          mediaGenerationDeadlineMs: Date.now() + 60_000, // soft budget NOT exceeded
+          mediaAssetsProducedThisRun: 1,                  // a prior iteration already produced one
+          generationHardCapMs: Date.now() + 3000,         // < the longest observed media call
+          longestMediaCallMsThisRun: 5000,                // prior iteration's image took ~5s
+        } as any,
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual([]);
+      expect(result.mediaBudgetDeferred).toBe(true);
+      expect(result.mediaAssetsProduced).toBe(0);
+    });
+
+    it('reports the longest media-call duration this iteration, carrying the prior-run floor', async () => {
+      const { ports } = mediaPortsWithDuration(5000);
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        {
+          generationHardCapMs: Date.now() + 600_000,
+          longestMediaCallMsThisRun: 8000, // a slower earlier call this run
+        } as any,
+      );
+      const result = await executePreparedTools(input);
+      // Max of this batch's 5s call and the 8s prior-run floor.
+      expect(result.longestMediaCallMs).toBe(8000);
+    });
+
+    it('is inert when no hard cap is supplied (budget disabled / unit tests)', async () => {
+      const { ports, executed } = mediaPortsWithDuration(5000);
+      const input = makeInput(
+        [toolCall('a', 'generate_image', '{"prompt":"x"}')],
+        ports,
+        {
+          mediaGenerationDeadlineMs: undefined,
+          generationHardCapMs: undefined,
+          longestMediaCallMsThisRun: 5000,
+          mediaAssetsProducedThisRun: 3,
+        } as any,
+      );
+      const result = await executePreparedTools(input);
+      expect(executed).toEqual(['generate_image']);
+      expect(result.mediaBudgetDeferred).toBe(false);
+    });
+  });
+
+  describe('bounded-concurrency media batches (ENG-510)', () => {
+    // Gateway that tracks how many tool executions overlap in flight, so we can prove
+    // batched media-gen runs concurrently but capped — not strictly serial, not unbounded.
+    function concurrencyPorts() {
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const executed: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((r) => setImmediate(r)); // yield so batch siblings start before we finish
+          const result = await i.execute();
+          executed.push(i.toolName);
+          inFlight--;
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async (i: any) => ({ success: true, imageUrl: `https://s3/${i.toolName}.png` }),
+      });
+      return { ports, executed, maxInFlight: () => maxInFlight };
+    }
+
+    it('runs several batched image variants concurrently, capped at 3 in flight', async () => {
+      const { ports, executed, maxInFlight } = concurrencyPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'),
+          toolCall('c', 'generate_image', '{"prompt":"3"}'),
+          toolCall('d', 'generate_image', '{"prompt":"4"}'),
+        ],
+        ports,
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toHaveLength(4);
+      expect(maxInFlight()).toBe(3); // concurrent, but bounded to 3
+      expect(result.mediaAssetsProduced).toBe(4);
+      // Results preserve emission order regardless of completion order.
+      expect(input.toolCallsLedger.map((t: any) => t.id)).toEqual(['a', 'b', 'c', 'd']);
+    });
+
+    it('stays strictly sequential when wait_seconds is present', async () => {
+      const { ports, maxInFlight } = concurrencyPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('w', 'wait_seconds', '{"seconds":0}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'),
+        ],
+        ports,
+      );
+      await executePreparedTools(input);
+      expect(maxInFlight()).toBe(1);
+    });
+
+    it('delivers the succeeding variants when one in the batch fails (partial success under rate limits)', async () => {
+      // The bounded concurrency raises the chance of a provider 429; the image service
+      // already retries 429/503 with backoff, but if one variant still exhausts its
+      // retries the batch must NOT be all-or-nothing — the others still deliver and the
+      // failure is reported so the user can retry just that one (same as a deferral).
+      const executed: string[] = [];
+      const ports = makePorts({
+        executeAgentToolThroughGateway: async (i) => {
+          executed.push(i.toolName);
+          if (i.args && i.args.prompt === '2') {
+            return { status: 'error', error: new Error('429 Too Many Requests — rate limit exceeded'), durationMs: 1, policyDecision: i.policyDecision };
+          }
+          const result = await i.execute();
+          return { status: 'success', result, durationMs: 1, policyDecision: i.policyDecision };
+        },
+        executePreparedAgentTool: async (i: any) => ({ success: true, imageUrl: `https://s3/${i.toolName}.png` }),
+      });
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'), // exhausts retries → fails
+          toolCall('c', 'generate_image', '{"prompt":"3"}'),
+        ],
+        ports,
+      );
+      const result = await executePreparedTools(input);
+
+      // Two variants delivered, one failed — not all-or-nothing.
+      expect(result.mediaAssetsProduced).toBe(2);
+      expect(result.pendingCounterUpdates).toEqual({ generate_image: 2 });
+      expect(result.failedCounterUpdates).toEqual({ generate_image: 1 });
+      // Emission order preserved; the failing variant carries the (retryable) error.
+      expect(input.toolCallsLedger.map((t: any) => t.id)).toEqual(['a', 'b', 'c']);
+      expect(input.toolCallsLedger[1].error).toBeTruthy();
+    });
+
+    it('defers the next BATCH as a unit once over budget with an asset produced', async () => {
+      const { ports, executed } = concurrencyPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('b', 'generate_image', '{"prompt":"2"}'),
+          toolCall('c', 'generate_image', '{"prompt":"3"}'),
+          toolCall('d', 'generate_image', '{"prompt":"4"}'),
+          toolCall('e', 'generate_image', '{"prompt":"5"}'),
+          toolCall('f', 'generate_image', '{"prompt":"6"}'),
+        ],
+        ports,
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 0 },
+      );
+      const result = await executePreparedTools(input);
+      // First batch of 3 runs (forward progress); the second batch is deferred as a unit.
+      expect(executed).toHaveLength(3);
+      expect(result.mediaAssetsProduced).toBe(3);
       expect(result.mediaBudgetDeferred).toBe(true);
     });
   });
@@ -767,5 +1001,80 @@ describe('executePreparedTools', () => {
       const entry = telemetered.find((r: any) => r.toolCall?.id === 'a');
       expect(entry.status).toBe('success');
     });
+  });
+});
+
+// ENG-510: cross-iteration media-gen dedupe. The ENG-108 dedupe is per-iteration, so a
+// model that re-emits an identical generate_image in a LATER iteration of the same turn
+// (e.g. resuming after a timeout) would regenerate the image. The dispatcher suppresses a
+// media-gen call whose successful result is already recorded from an earlier iteration —
+// scoped to media tools so repeated mutations still run, and only for successes so a failed
+// call stays retryable.
+describe('executePreparedTools — cross-iteration media dedupe (ENG-510)', () => {
+  const imageGatewayPorts = () =>
+    makePorts({
+      executePreparedAgentTool: async (_i: any) => ({ success: true, imageUrl: 'https://s3/img.png' }),
+    });
+
+  it('records a produced media key, then suppresses the same generate_image next iteration', async () => {
+    // Iteration 1: fresh run, one image call → executes and is recorded.
+    const ports1 = imageGatewayPorts();
+    const in1 = makeInput([toolCall('a', 'generate_image', '{"prompt":"sun"}')], ports1, {
+      priorMediaCallKeys: new Map<string, string>(),
+    });
+    const r1 = await executePreparedTools(in1);
+    expect((ports1 as any).__execOrder).toEqual(['generate_image']);
+    expect(r1.producedMediaCallKeys.size).toBe(1);
+    expect(r1.mediaAssetsProduced).toBe(1);
+
+    // Iteration 2: the SAME call, with iteration 1's keys threaded in → suppressed.
+    const ports2 = imageGatewayPorts();
+    const in2 = makeInput([toolCall('b', 'generate_image', '{"prompt":"sun"}')], ports2, {
+      priorMediaCallKeys: r1.producedMediaCallKeys,
+    });
+    const r2 = await executePreparedTools(in2);
+    expect((ports2 as any).__execOrder).toEqual([]); // did NOT regenerate
+    expect(r2.mediaAssetsProduced).toBe(0);
+    expect(r2.pendingCounterUpdates.generate_image).toBeUndefined();
+    // Still answers the tool_call_id so the next LLM turn has no orphan.
+    const msg = in2.messages.find((m: any) => m.tool_call_id === 'b');
+    expect(msg).toBeDefined();
+    expect(msg.role).toBe('tool');
+  });
+
+  it('does NOT suppress a distinct variant (different args) from a prior iteration', async () => {
+    const prior = new Map<string, string>([[`generate_image:${stableStringify({ prompt: 'sun' })}`, 'a']]);
+    const ports = imageGatewayPorts();
+    const input = makeInput([toolCall('b', 'generate_image', '{"prompt":"moon"}')], ports, {
+      priorMediaCallKeys: prior,
+    });
+    const result = await executePreparedTools(input);
+    expect((ports as any).__execOrder).toEqual(['generate_image']); // moon still generated
+    expect(result.mediaAssetsProduced).toBe(1);
+  });
+
+  it('does NOT suppress a repeated non-media (mutating) call across iterations', async () => {
+    // Even if a non-media key were present, the media-only guard leaves it alone, so a
+    // legitimately-repeated send_email still runs.
+    const prior = new Map<string, string>([[`send_email:${stableStringify({ to: 'x' })}`, 'a']]);
+    const ports = makePorts();
+    const input = makeInput([toolCall('b', 'send_email', '{"to":"x"}')], ports, {
+      priorMediaCallKeys: prior,
+    });
+    await executePreparedTools(input);
+    expect((ports as any).__execOrder).toEqual(['send_email']); // repeated mutation runs
+  });
+
+  it('does NOT record a FAILED generation, so it stays retryable next iteration', async () => {
+    const ports = makePorts({
+      executePreparedAgentTool: async (_i: any) => {
+        throw new Error('provider timeout');
+      },
+    });
+    const input = makeInput([toolCall('a', 'generate_image', '{"prompt":"sun"}')], ports, {
+      priorMediaCallKeys: new Map<string, string>(),
+    });
+    const result = await executePreparedTools(input);
+    expect(result.producedMediaCallKeys.size).toBe(0); // failure not recorded → retryable
   });
 });

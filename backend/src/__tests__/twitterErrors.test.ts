@@ -1,4 +1,8 @@
-import { describeXApiError } from '../utils/twitterErrors';
+import {
+  describeXApiError,
+  isXApiCreditsError,
+  XCreditsExhaustedError,
+} from '../utils/twitterErrors';
 
 /**
  * Unit tests for describeXApiError — the AC#3 error-surfacing helper.
@@ -81,5 +85,79 @@ describe('describeXApiError', () => {
     const msg = describeXApiError(err);
     expect(msg).toContain('Bad Request');
     expect(msg).not.toContain('HTTP');
+  });
+
+  // ENG-604: HTTP 402 = AgentWeb's shared X Developer App is out of X API credits.
+  // The plan/credit balance belongs to AgentWeb (every user connects against the
+  // one shared app), NOT the end user — so the surfaced error must explain it is a
+  // platform-side limit and route them to AgentWeb support, NOT tell them to top up
+  // "their" plan or visit a Developer Portal they have no access to.
+  it('explains an AgentWeb-side credit limit on a 402 credits-depleted error', () => {
+    const err = makeApiResponseError(402, {
+      title: 'Payment Required',
+      detail: 'credits depleted',
+    });
+    const msg = describeXApiError(err);
+    expect(msg).toContain('Payment Required');
+    expect(msg).toContain('credits depleted');
+    expect(msg).toContain('402');
+    // Actionable AND correctly attributed: AgentWeb-side credit limit, contact support.
+    expect(msg).toMatch(/credits/i);
+    expect(msg).toMatch(/AgentWeb/);
+    expect(msg).toMatch(/support/i);
+    // Must NOT blame the user's own X account/plan or send them to the Developer Portal.
+    expect(msg).not.toMatch(/your X \(Twitter\) API plan|your X app/i);
+    expect(msg).not.toMatch(/developer\.x\.com|Developer Portal/i);
+  });
+
+  it('surfaces the credit-limit explanation on a 402 even when the X payload is empty', () => {
+    const err = makeApiResponseError(402, {});
+    const msg = describeXApiError(err);
+    expect(msg).toMatch(/AgentWeb/);
+    expect(msg).toMatch(/support/i);
+    expect(msg).toContain('402');
+    expect(msg).not.toBe('Request failed with code 402');
+  });
+
+  it('does NOT add the credit hint to non-402 errors', () => {
+    const err = makeApiResponseError(403, { title: 'Forbidden', detail: 'no permission' });
+    const msg = describeXApiError(err);
+    expect(msg).not.toMatch(/AgentWeb's X \(Twitter\) API plan/);
+    expect(msg).not.toMatch(/contact AgentWeb support/i);
+  });
+});
+
+/**
+ * ENG-664 — X 402 (credit exhaustion) must be a typed, machine-detectable
+ * condition, not just prose inside a message. A depleted shared X wallet
+ * (ENG-604/633/662) is a hard, non-retryable, platform-side stop.
+ */
+describe('isXApiCreditsError', () => {
+  const xError = (code: number) => Object.assign(new Error(`Request failed with code ${code}`), { code });
+
+  it('is true only for an X 402', () => {
+    expect(isXApiCreditsError(xError(402))).toBe(true);
+    expect(isXApiCreditsError(xError(403))).toBe(false);
+    expect(isXApiCreditsError(xError(429))).toBe(false);
+  });
+
+  it('detects a wrapped XCreditsExhaustedError', () => {
+    expect(isXApiCreditsError(new XCreditsExhaustedError('X API error (HTTP 402): ...'))).toBe(true);
+  });
+
+  it('is false for non-X errors and non-objects', () => {
+    expect(isXApiCreditsError(new Error('boom'))).toBe(false);
+    expect(isXApiCreditsError(undefined)).toBe(false);
+    expect(isXApiCreditsError('402')).toBe(false);
+  });
+});
+
+describe('XCreditsExhaustedError', () => {
+  it('carries a stable name and HTTP 402 code so it classifies structurally', () => {
+    const e = new XCreditsExhaustedError('out of credits');
+    expect(e).toBeInstanceOf(Error);
+    expect(e.name).toBe('XCreditsExhaustedError');
+    expect(e.code).toBe(402);
+    expect(e.message).toBe('out of credits');
   });
 });

@@ -61,14 +61,23 @@ router.get('/init', authenticateToken, async (req: any, res) => {
     const accountType: HubSpotAccountType = req.query.accountType === 'marketing' ? 'marketing' : 'crm';
     const config = await getHubSpotConfig();
     const state = generateState(req.user.userId, accountType);
-    const scopes = accountType === 'marketing' ? config.marketingScopes : config.scopes;
 
+    // `scope` must only ever contain the base CRM scopes — every scope listed
+    // here is registered as "Required" on the HubSpot app, so anything placed
+    // in `scope` blocks the auth flow for accounts without that entitlement
+    // (e.g. a CRM-only portal choking on marketing.campaigns.*). Marketing-only
+    // scopes go through `optional_scope` instead: requested opportunistically
+    // for accountType=marketing, granted only if the portal actually has
+    // Marketing Hub, and never sent at all for accountType=crm.
     const params = new URLSearchParams({
       client_id: config.clientId,
       redirect_uri: config.redirectUri,
-      scope: scopes.join(' '),
+      scope: config.scopes.join(' '),
       state,
     });
+    if (accountType === 'marketing') {
+      params.set('optional_scope', config.marketingOnlyScopes.join(' '));
+    }
 
     const url = `${config.authorizationUrl}?${params.toString()}`;
     res.json({ success: true, url });

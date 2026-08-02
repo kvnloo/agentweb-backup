@@ -53,3 +53,42 @@ describe('AgentMode system prompt - browser session persistence & isolation guid
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('unattended/scheduled run cannot relay a one-time code');
   });
 });
+
+// ENG-494 follow-up: a manually-imported Browser Sessions cookie can die
+// server-side at any time, independent of the synthetic expiry estimate shown
+// in Settings. Without this guidance, load_browser_cookies reporting "success"
+// (a cookie was injected) would be mistaken for "still authenticated" — Emma
+// would proceed as if logged in, land back on a signin page, and the failure
+// would recur silently on every future run with no signal to the user.
+describe('AgentMode system prompt - manually-imported session failure reporting (mark_browser_session_failed)', () => {
+  it('warns that load_browser_cookies success does not guarantee the site still honors the session', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('does NOT guarantee the site still honors it');
+  });
+
+  it('directs Emma to call mark_browser_session_failed when genuinely blocked by a login gate, with a concrete (not vague) trigger condition', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('mark_browser_session_failed(domain)');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('not just a page that happens to mention "sign in" somewhere');
+  });
+
+  it('clarifies this is a report, not a fix, and scopes it to manually-imported domains only (not the automatic __all__ jar)', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('This is a report, not a fix');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('only for domains the user explicitly imported');
+  });
+
+  // Risk-reduction pass: the first version of this guidance was worded generically
+  // enough that an LLM could plausibly read it as "always double-check auth after
+  // load_browser_cookies, on every task" — adding overhead to flows that never had
+  // this problem. Tightened to make explicit this is one thing to *notice*, not an
+  // extra step to always perform, and to bias hard against false positives (an
+  // incorrect "please reimport" banner on a session that's actually fine is a worse
+  // outcome than an occasional missed report).
+  it('makes explicit this does not add a mandatory verification step to unrelated login flows', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('it is one extra thing to notice, not an extra step to perform');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('should never add a dedicated verification pass to a task that isn\'t already hitting a login-shaped wall');
+  });
+
+  it('biases against false positives — an incorrect failure report is treated as worse than an occasional missed one', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('Be conservative before calling it');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('worse outcome than an occasional missed report');
+  });
+});
