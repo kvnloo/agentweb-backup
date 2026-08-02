@@ -14938,10 +14938,6 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async createMetaAdsAdSet(userId: string, args: any): Promise<any> {
     try {
-      const { accountId, accessToken } = await this.getMetaCredentials(userId, args.account_id);
-
-      // --- Deterministic Validation Engine ---
-
       // ENG-838: dayparting is not implemented. `MetaAdsAdSetParams` has no
       // `adset_schedule` and nothing in this codebase ever sends one, so a
       // scheduled-delivery request used to be dropped in silence and the ad set
@@ -14950,6 +14946,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // schedule must not receive an always-on ad set and a success message.
       // Note `start_time`/`end_time` are the flight window, not dayparting, and
       // stay supported.
+      //
+      // This runs BEFORE getMetaCredentials deliberately. Credential resolution
+      // can refresh a token against Meta and can throw its own auth error, so
+      // resolving first would both make a network call for a request we are
+      // certain to reject and mask a deterministic "not supported" answer behind
+      // an unrelated credential failure. A rejection that is knowable from the
+      // arguments alone should never depend on account state.
       if (args.adset_schedule !== undefined || args.pacing_type !== undefined) {
         const requested = args.adset_schedule !== undefined ? 'adset_schedule' : 'pacing_type';
         throw new Error(
@@ -14959,6 +14962,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           `Tracked as ENG-838.`
         );
       }
+
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, args.account_id);
+
+      // --- Deterministic Validation Engine ---
 
       // 0. Fetch campaign to resolve objective and detect Advantage Campaign Budget (CBO)
       const campaign = await metaService.getCampaign(accountId, accessToken, args.campaign_id);

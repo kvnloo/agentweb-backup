@@ -110,6 +110,27 @@ describe('ENG-838 — ad set bid strategy and dayparting must not silently defau
       expect(metaService.createAdSet).not.toHaveBeenCalled();
     });
 
+    it('rejects dayparting before touching credentials, so no Meta call is made and no auth error masks it', async () => {
+      // The account is NOT connected, so getMetaCredentials would throw its own
+      // auth error. A rejection knowable from the arguments alone must not depend
+      // on account state, and must not cost a token refresh against Meta for a
+      // request we are certain to reject.
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ id: 'user123', connected_accounts: [] });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...baseAdSetParams,
+        adset_schedule: [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }]
+      });
+
+      expect(result.success).toBe(false);
+      // The dayparting answer, not "Meta Ads account is not connected".
+      expect(String(result.error)).toMatch(/dayparting|adset_schedule/i);
+      expect(String(result.error)).not.toMatch(/not connected/i);
+      // And nothing downstream ran at all.
+      expect(metaService.getCampaign).not.toHaveBeenCalled();
+      expect(metaService.createAdSet).not.toHaveBeenCalled();
+    });
+
     it('rejects a pacing_type day_parting request and does not create the ad set', async () => {
       const result = await service.createMetaAdsAdSet('user123', {
         ...baseAdSetParams,
