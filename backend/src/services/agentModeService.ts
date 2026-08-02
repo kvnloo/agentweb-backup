@@ -9907,7 +9907,15 @@ export class AgentModeService {
       const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
-      if (!filters || filters.length === 0) {
+      // ENG-821: a free-text `search` IS a filter criterion. This guard used to reject
+      // `{ filters: [], search: "acme" }` even though the handler supports search natively
+      // (see the `options.search` parameter above) — 11 identical rejections of otherwise
+      // valid calls in one 5-day window. Widening it to match the handler's own capability;
+      // a call with neither filters nor search is still rejected.
+      //
+      // Note the near-identical guard in deleteLeads is deliberately NOT widened: a bulk
+      // delete should never run on free-text alone.
+      if ((!filters || filters.length === 0) && !options?.search) {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
       }
 

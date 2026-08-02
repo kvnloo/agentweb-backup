@@ -1391,12 +1391,34 @@ emmaToolRegistry.register({
   },
   execute: async (args, context) => {
     // Backward-compatible normalization: accept legacy campaign_id or string campaign_ids.
+    //
+    // ENG-821: the schema advertises "array or string", so the model reasonably emits a
+    // JSON-ENCODED array — '["120241445300020585"]'. That hit the plain-string branch and
+    // became a one-element array holding the literal JSON text, which Meta then rejected
+    // with `(#100) param filtering must be an array`. Parse it back into real ids first so
+    // the "array or string" promise is actually true.
+    const parseCampaignIdString = (raw: string): string[] => {
+      const trimmed = raw.trim();
+      if (!trimmed) return [];
+      if (trimmed.startsWith('[')) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (Array.isArray(parsed)) {
+            return parsed.map((id) => String(id ?? '').trim()).filter((id) => id.length > 0);
+          }
+        } catch {
+          // Not valid JSON — fall through and treat it as a single literal id.
+        }
+      }
+      return [trimmed];
+    };
+
     const normalizedCampaignIds = Array.isArray(args.campaign_ids)
       ? args.campaign_ids
       : (typeof args.campaign_ids === 'string' && args.campaign_ids.trim())
-        ? [args.campaign_ids.trim()]
+        ? parseCampaignIdString(args.campaign_ids)
         : (typeof args.campaign_id === 'string' && args.campaign_id.trim())
-          ? [args.campaign_id.trim()]
+          ? parseCampaignIdString(args.campaign_id)
           : [];
 
     return await agentModeService.getMetaAdsMetrics(
@@ -6363,7 +6385,13 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
-          description: 'The fact to remember (max 2000 chars). Be specific and actionable.'
+          // ENG-821: the 2000-char cap is enforced by a hard throw in db.ts. Declaring it
+          // only in this description string left it advisory, and long summaries routinely
+          // blew past it: 22 rejections plus 11 retry-amplified ones in a single 5-day
+          // window, the largest source of tool failures on the account. maxLength makes the
+          // constraint machine-readable so the call is never generated over-length.
+          maxLength: 2000,
+          description: 'The fact to remember (max 2000 chars — longer content is rejected; split it into multiple memories). Be specific and actionable.'
         },
         category: {
           type: 'string',
