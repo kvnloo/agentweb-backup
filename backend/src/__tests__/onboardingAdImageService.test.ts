@@ -886,6 +886,32 @@ describe("onboardingAdImageService", () => {
       expect(ok).toBe(true);
     });
 
+    it("allows a generic binary content-type through (getImageMimeType sniffs it)", async () => {
+      // S3 objects lacking ContentType metadata / some CDNs serve real image
+      // bytes as octet-stream; these generate fine downstream and must not hard-fail.
+      for (const ct of ["application/octet-stream", "binary/octet-stream"]) {
+        const ok = await isBrandLogoFetchable("https://s3/logo.png", {
+          httpGet: async () => ({
+            status: 200,
+            headers: { "content-type": ct },
+            data: Buffer.from([137, 80, 78, 71]),
+          }),
+        });
+        expect(ok).toBe(true);
+      }
+    });
+
+    it("returns false when a 200 serves a JSON error body, not an image", async () => {
+      const ok = await isBrandLogoFetchable("https://cdn/error", {
+        httpGet: async () => ({
+          status: 200,
+          headers: { "content-type": "application/json" },
+          data: Buffer.from('{"error":"not found"}'),
+        }),
+      });
+      expect(ok).toBe(false);
+    });
+
     it("returns false for an empty or non-string URL without fetching", async () => {
       let called = false;
       const httpGet = async () => {
