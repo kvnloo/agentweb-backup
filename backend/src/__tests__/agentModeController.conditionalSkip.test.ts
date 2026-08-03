@@ -290,13 +290,23 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: skipList })).toBe(true);
     expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: skipList })).toBe(false);
 
-    // Authorized but UNPARSEABLE cadence + no named weekday → fail closed: we cannot
-    // confirm today is genuinely a non-publishing day, so we do not waive.
+    // Authorized but the cadence is not weekday-based (no day-sets) → fail closed:
+    // we cannot confirm today is genuinely a non-publishing day, so we do not waive.
     const vagueAuth = 'Skip on any non-publishing day for this schedule.';
     expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: vagueAuth })).toBe(false);
-    // …but if the model names today's weekday, the UTC check corroborates the run date.
+    // …and the model NAMING today's weekday does NOT rescue it: naming the day only
+    // proves the model knows the date, not that today is excluded by the cadence.
+    // The weekday check is veto-only; authorization must come from the owner's
+    // parsed weekday cadence (Greptile, ENG-844).
     const namedSunday = 'Today is Sunday, a non-publishing day. Skipping.';
-    expect(scheduledRunSignalsConditionalSkip(namedSunday, { now: sunday, instruction: vagueAuth })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(namedSunday, { now: sunday, instruction: vagueAuth })).toBe(false);
+
+    // Greptile's exact example: "publish only when approved" passes the
+    // authorization regex but defines no weekday cadence. A correctly-named weekday
+    // must NOT waive the required calls on any day.
+    const approvalGate = 'Publish only when approved by the brand team.';
+    expect(scheduledRunSignalsConditionalSkip(namedSunday, { now: sunday, instruction: approvalGate })).toBe(false);
+    expect(scheduledRunSignalsConditionalSkip('Today is Monday, a non-publishing day. Skipping.', { now: monday, instruction: approvalGate })).toBe(false);
   });
 });
 
