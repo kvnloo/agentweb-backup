@@ -236,6 +236,38 @@ describe('scheduledRunSignalsConditionalSkip', () => {
       scheduledRunSignalsConditionalSkip('Today is Sunday, a non-publishing day. Skipping — no post created.', { now: utcMonday })
     ).toBe(false);
   });
+
+  it('honors the skip ONLY when the schedule OWNER\'s instruction authorizes it (Greptile P1)', () => {
+    // Identical, well-formed cadence-skip prose from the model. Whether it is
+    // waived must depend on the schedule's OWN instruction: the authorization to
+    // skip comes from the human who configured the schedule, not from the model's
+    // post-hoc explanation. Without an authorizing instruction, a model that
+    // spontaneously claims a skip on a run carrying write-call minimums would
+    // silently waive them (unauthorized skip).
+    const skipProse = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
+
+    // Owner defined a conditional publishing cadence → authorized.
+    const authorizing = [
+      'Publish today\'s thought-leadership post only on Mon/Wed/Fri.',
+      'Post only on Tuesday, Thursday, and Saturday.',
+      'If today is Saturday or Sunday, publish nothing and report a non-publishing day.',
+    ];
+    authorizing.forEach((instruction) =>
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: SUNDAY, instruction })).toBe(true)
+    );
+
+    // Owner never built a skip into the schedule → a model-authored skip is NOT waived.
+    const unauthorized = [
+      'Publish today\'s thought-leadership post.',
+      'Draft and publish a LinkedIn update about payroll automation every day.',
+    ];
+    unauthorized.forEach((instruction) =>
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: SUNDAY, instruction })).toBe(false)
+    );
+
+    // Undefined instruction (pure text-classifier callers) leaves the gate inert.
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: SUNDAY })).toBe(true);
+  });
 });
 
 describe('runScheduledChat — conditional skip day', () => {
@@ -329,6 +361,69 @@ describe('runScheduledChat — conditional skip day', () => {
     });
 
     const result = await runScheduledChat(publishSchedule, mockUserId, true);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
+    expect(result).toEqual(
+      expect.objectContaining({
+        scheduleId: mockScheduleId,
+        status: 'failure',
+        passed: false,
+        attempt: 20,
+      })
+    );
+    expect((result as any).conditionalSkip).toBeUndefined();
+  });
+
+  it('does NOT waive a PARTIALLY-executed run (one write already made, another unmet)', async () => {
+    // The agent already published to one destination (post_on_connected_account
+    // succeeded) but did not generate_image, then wrapped up with cadence-skip
+    // wording. A true cadence skip makes ZERO write calls; a partial execution has
+    // real external state and must NOT be laundered into a clean "skip" — it must
+    // still retry + record a failure (Greptile P1, ENG-844).
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'Today is a non-publishing day per the Mon/Wed/Fri cadence — skipping the rest of this run.',
+      toolCalls: [{ name: 'post_on_connected_account' }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    });
+
+    const result = await runScheduledChat(publishSchedule, mockUserId, true);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
+    expect(result).toEqual(
+      expect.objectContaining({
+        scheduleId: mockScheduleId,
+        status: 'failure',
+        passed: false,
+        attempt: 20,
+      })
+    );
+    expect((result as any).conditionalSkip).toBeUndefined();
+  });
+
+  it('does NOT waive a skip the schedule instruction never authorized (unauthorized skip)', async () => {
+    // Same well-formed cadence-skip prose, but this schedule's instruction has NO
+    // conditional-skip rule — the model spontaneously claimed a non-publishing day.
+    // The waiver must be tied to the OWNER's configured cadence, so this run is not
+    // waived: it retries and is recorded as a failure (Greptile P1, ENG-844).
+    mockScheduleDb.getScheduleById.mockResolvedValue({
+      ...publishSchedule,
+      startingMessage: 'Publish today\'s thought-leadership post every day.',
+    });
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'Today is a non-publishing day per the Mon/Wed/Fri cadence. Skipping this run — nothing published.',
+      toolCalls: [],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    });
+
+    const result = await runScheduledChat(
+      { ...publishSchedule, startingMessage: 'Publish today\'s thought-leadership post every day.' },
+      mockUserId,
+      true
+    );
 
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
     expect(result).toEqual(
