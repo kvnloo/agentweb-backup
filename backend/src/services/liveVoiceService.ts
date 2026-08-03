@@ -496,7 +496,7 @@ async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
  * user (the live WebSocket has no per-turn message array to inject into).
  * Returns an empty string when no loop is detected.
  */
-function buildAntiLoopDirective(allMessages: Array<{ role: string; content: unknown }>): string {
+function buildAntiLoopDirective(allMessages: Array<{ role: string; content: unknown; tool_calls?: unknown }>): string {
   const LOOP_DETECTION_THRESHOLD = 3;
   const normalize = (content: unknown): string => {
     const text = typeof content === 'string'
@@ -507,18 +507,33 @@ function buildAntiLoopDirective(allMessages: Array<{ role: string; content: unkn
     return text.trim().toLowerCase();
   };
 
-  const userMessages = allMessages.filter(m => m.role === 'user');
-  if (userMessages.length < LOOP_DETECTION_THRESHOLD) return '';
+  // Positions of user messages within the full transcript (we need the full
+  // transcript, not just the user subset, so we can inspect the assistant turns
+  // BETWEEN the repeats — see the progress check below).
+  const userIdx: number[] = [];
+  allMessages.forEach((m, i) => { if (m.role === 'user') userIdx.push(i); });
+  if (userIdx.length < LOOP_DETECTION_THRESHOLD) return '';
 
-  const lastNorm = normalize(userMessages[userMessages.length - 1].content);
+  const lastNorm = normalize(allMessages[userIdx[userIdx.length - 1]].content);
   if (!lastNorm) return '';
 
   let trailingIdentical = 0;
-  for (let i = userMessages.length - 1; i >= 0; i--) {
-    if (normalize(userMessages[i].content) === lastNorm) trailingIdentical++;
+  let firstIdenticalPos = userIdx.length; // index into userIdx of the first trailing-identical user turn
+  for (let k = userIdx.length - 1; k >= 0; k--) {
+    if (normalize(allMessages[userIdx[k]].content) === lastNorm) { trailingIdentical++; firstIdenticalPos = k; }
     else break;
   }
   if (trailingIdentical < LOOP_DETECTION_THRESHOLD) return '';
+
+  // ENG-763 (Greptile): equality alone does NOT prove a stuck clarification loop.
+  // If the assistant actually did work — made a tool call — between these identical
+  // user turns, the user is repeating a legitimate serviced request, not withholding
+  // information the assistant asked for. Only fire when the assistant made NO progress
+  // across the repeated turns, so a valid repeated request is never refused or parked.
+  const assistantMadeProgress = allMessages
+    .slice(userIdx[firstIdenticalPos])
+    .some(m => m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0);
+  if (assistantMadeProgress) return '';
 
   return `\n\n[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] The user has sent the same message ${trailingIdentical} times without providing information you asked for. They will NOT provide it. You MUST:
 1. STOP asking for that information — do not repeat the same clarification again
