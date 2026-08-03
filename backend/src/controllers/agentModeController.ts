@@ -70,16 +70,49 @@ export const RECONCILE_INTERVAL_MS = 2 * 60 * 1000; // reconciler sweep cadence
 const SCHEDULED_RUN_INSTANCE_ID: string = require('uuid').v4();
 
 // User-facing fallback shown when a scheduled run terminates with zero assistant
-// output (crash/timeout/context-limit). A silent, empty session reads as a total
-// failure to the user (ENG-209: a 40-competitor report produced no output). This
-// guarantees the session is never left blank — the user always sees a structured
-// "job incomplete" message with a concrete next step (split into smaller batches).
+// output because it genuinely ran out of its time/memory/size budget (a big job
+// that timed out, hit the context limit, was OOM-killed, or ran but emitted no
+// assistant turn). A silent, empty session reads as a total failure to the user
+// (ENG-209: a 40-competitor report produced no output). The "split into smaller
+// batches" next step only makes sense for THIS class of failure — see
+// SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE for the deterministic-error class.
 const SCHEDULED_JOB_INCOMPLETE_MESSAGE =
   "This scheduled run stopped before it could produce a response, so no results were generated. " +
   "Large jobs that research many items in a single run — for example, dozens of competitors in one report — " +
   "can exceed the run's time or memory budget and end without finishing. " +
   "The run will be retried automatically. If this keeps happening, split the request into smaller batches " +
   "(fewer items per run) so each run can complete and report its results.";
+
+// ENG-826: user-facing fallback for a zero-output run that failed on a DETERMINISTIC
+// system/provider error (e.g. a schema-validation 400, an auth failure, a content
+// filter), NOT a time/memory budget overrun. Blaming job size here is misleading and
+// the "split into smaller batches" advice is useless — the run would fail identically
+// however small it is. The failing session's stored assistant message used to assert
+// the budget cause unconditionally, sending anyone debugging from the transcript down
+// the wrong path (the ENG-826 gemini-3.5-flash union-schema 400 read as a size limit).
+// An auto-issue + oncall alert is always filed on this path, so "flagged for our team"
+// is accurate.
+const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
+  "This scheduled run stopped before it could produce a response, so no results were generated. " +
+  "It ran into an unexpected system error — not a time or size limit — so retrying or splitting the " +
+  "request into smaller batches won't help on its own. The run will be retried automatically and the " +
+  "failure has been flagged for our team to investigate. If it keeps failing, please contact support.";
+
+// ENG-826: choose the right zero-output message for the actual failure. Budget/size-
+// shaped failures (context-limit, generation timeout, worker OOM/replacement, or a
+// run that emitted no assistant turn) keep the "split into smaller batches" guidance;
+// everything else (deterministic provider/validation errors, auth, content filters,
+// transient 5xx) gets the honest system-error message that does NOT assert a size cause.
+// Exported for direct unit testing. The reconciler path (a dead process, with no error
+// object to classify) deliberately keeps SCHEDULED_JOB_INCOMPLETE_MESSAGE.
+export function zeroAssistantIncompleteMessage(error: unknown): string {
+  const budgetShaped =
+    isContextLimitError(error) ||
+    isWorkerShutdownError(error) ||
+    isZeroAssistantOutputError(error) ||
+    Boolean((error as any)?.isGenerationTimeout);
+  return budgetShaped ? SCHEDULED_JOB_INCOMPLETE_MESSAGE : SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE;
+}
 
 // ENG-657: injected as the user turn when RESUMING an abandoned scheduled run
 // (its instance was terminated mid-flight, e.g. by a deploy). The full transcript
@@ -2670,15 +2703,23 @@ export async function runScheduledChat(
       // instead of an empty session. Done BEFORE requeue so the failed session
       // is self-explanatory; the requeue (below) runs in a fresh session.
       if (sessionId) {
+        // ENG-826: pick the message that matches the ACTUAL failure. A deterministic
+        // provider/validation error (e.g. the gemini-3.5-flash union-schema 400) must
+        // not be reported as a time/memory-budget overrun with "split into smaller
+        // batches" advice that can't help — that mislabels the transcript for anyone
+        // debugging it. Budget-shaped failures keep the original guidance.
+        const incompleteMessage = zeroAssistantIncompleteMessage(error);
+        const failureClass = incompleteMessage === SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE ? 'system' : 'budget';
         try {
           await chatbotDb.addMessageToSession(sessionId, {
             role: 'assistant',
-            content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+            content: incompleteMessage,
             timestamp: new Date().toISOString(),
             metadata: {
               timestamp: new Date().toISOString(),
               isErrorMessage: true,
               jobIncomplete: true,
+              failureClass,
             },
           });
         } catch (persistError) {
