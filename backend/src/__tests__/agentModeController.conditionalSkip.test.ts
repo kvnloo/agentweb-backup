@@ -352,6 +352,29 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     }
   });
 
+  it('does not invent a cadence from a weekday bound to a noun/possessive (Greptile P1)', () => {
+    const sunday = new Date('2026-08-02T12:00:00Z');
+    const monday = new Date('2026-08-03T12:00:00Z');
+    const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
+
+    // A weekday used possessively or as an adjective on a noun ("Monday's approval",
+    // "Monday team", "Wednesday review") is an approval/condition gate, NOT a
+    // weekday cadence — no cadence day-sets, so the skip fails closed on every day.
+    for (const instr of [
+      "Publish only on Monday's approval.",
+      'Publish only on approval from the Monday team.',
+      'Publish only on the Wednesday review outcome.',
+    ]) {
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: instr })).toBe(false);
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: instr })).toBe(false);
+    }
+
+    // Sanity: a genuine day-LIST of the same shape still parses and waives correctly.
+    const realCadence = 'Publish only on Monday, Wednesday and Friday.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: realCadence })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: realCadence })).toBe(false);
+  });
+
   it('expands weekday RANGES so a mid-range day is a publishing day (Greptile P1)', () => {
     const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
     const wednesday = new Date('2026-08-05T12:00:00Z'); // getUTCDay() === 3
