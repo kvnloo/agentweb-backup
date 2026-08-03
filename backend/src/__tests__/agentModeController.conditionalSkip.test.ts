@@ -109,6 +109,7 @@ import { scheduleDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import {
   runScheduledChat,
+  runVerifiedChat,
   scheduledRunSignalsConditionalSkip,
 } from '../controllers/agentModeController';
 
@@ -461,6 +462,39 @@ describe('runScheduledChat — conditional skip day', () => {
   // deterministic regardless of the day CI runs.
   const SUNDAY_NON_PUBLISH = new Date('2026-08-02T12:00:00Z'); // getUTCDay() === 0
   const MONDAY_PUBLISH = new Date('2026-08-03T12:00:00Z'); // getUTCDay() === 1
+
+  it('does NOT waive a resumed run whose abandoned portion made a non-required write (Greptile P1)', async () => {
+    // The current turn reports a legitimate cadence skip with zero writes, but the
+    // abandoned portion this run RESUMED already sent an email — carried in
+    // priorToolCalls. That external side effect must be visible to the no-writes
+    // skip ledger, so the run is NOT waived as a clean skip.
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'Today is a non-publishing day per the Mon/Wed/Fri cadence. Skipping this run.',
+      toolCalls: [],
+      knowledgeBaseQueries: [], sources: [], responseMessages: [],
+    });
+
+    const baseParams = {
+      sessionId: 'test-session-lucas',
+      userId: mockUserId,
+      startingMessage: 'Publish today\'s thought-leadership post only on Mon/Wed/Fri.',
+      keywords: [] as string[],
+      requiredFunctions: [{ functionName: 'post_on_connected_account', minCount: 1 }],
+      completionGate: true,
+      maxAttempts: 2,
+      now: SUNDAY_NON_PUBLISH,
+    };
+
+    const resumed = await runVerifiedChat({ ...baseParams, priorToolCalls: [{ name: 'send_email_from_sender' }] });
+    expect(resumed.success).toBe(false);
+    expect((resumed as any).conditionalSkip).toBeUndefined();
+
+    // Control: the identical run with NO prior write is legitimately waived — proving
+    // the prior write is what blocks it, not the cadence/date.
+    const clean = await runVerifiedChat({ ...baseParams, priorToolCalls: [] });
+    expect(clean.success).toBe(true);
+    expect((clean as any).conditionalSkip).toBe(true);
+  });
 
   it('records a SUCCESSFUL skip (marked conditionalSkip) without retrying for the unmet write calls', async () => {
     // The agent correctly identifies a non-publishing day and produces zero write
