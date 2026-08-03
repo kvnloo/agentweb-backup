@@ -480,6 +480,27 @@ describe('sanitizeGeminiSchema', () => {
     expect(sanitizeGeminiSchema({ type: ['null'] })).toEqual({ type: 'string', nullable: true });
   });
 
+  it('resolves an `object`/scalar union to `object` when the node carries `properties` (ENG-826)', () => {
+    // A union that pairs `object` with a scalar and actually defines `properties`
+    // (some MCP tools describe a payload this way) should collapse to `object` so
+    // the nested shape stays meaningful — not to the scalar member. Array-only
+    // keywords are irrelevant here and must not appear.
+    const input = {
+      type: ['object', 'string'],
+      properties: { id: { type: 'string' } },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: { id: { type: 'string' } },
+    });
+  });
+
+  it('does NOT force `object` for an object-union that lacks `properties`', () => {
+    // Without sibling `properties`, `object` is not more faithful than the scalar,
+    // so we fall to the first non-null member rather than inventing an empty object.
+    expect(sanitizeGeminiSchema({ type: ['string', 'object'] })).toEqual({ type: 'string' });
+  });
+
   it('drops oneOf/allOf/const (absent from the genai Schema type, e.g. dynamic MCP tool schemas)', () => {
     const input = {
       type: 'object',

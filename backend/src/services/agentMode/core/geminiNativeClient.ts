@@ -86,7 +86,16 @@ export function sanitizeGeminiSchema(schema: any): any {
   if (Array.isArray(out.type)) {
     const members = out.type.filter((t: any) => typeof t === 'string');
     const nonNull = members.filter((t: string) => t !== 'null');
-    const resolved = nonNull.includes('array') ? 'array' : (nonNull[0] || 'string');
+    // Prefer a type consistent with this node's sibling constraints so the
+    // collapsed schema stays faithful, not just valid: `array` when present (so
+    // `items` stays meaningful), else `object` when the node actually carries
+    // `properties`, else the first non-null member; `string` only as a last resort
+    // for a degenerate union (`[]` / `['null']`).
+    const resolved = nonNull.includes('array')
+      ? 'array'
+      : (nonNull.includes('object') && out.properties !== undefined)
+        ? 'object'
+        : (nonNull[0] || 'string');
     out.type = resolved;
     if (members.length !== nonNull.length) out.nullable = true;
     if (resolved !== 'array') {
