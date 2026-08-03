@@ -7026,8 +7026,25 @@ export class AgentModeService {
           const axios = (await import('axios')).default;
           // For private S3 URLs from our bucket, generate a presigned URL so the download succeeds
           const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
-          const fetchUrl = isS3Url(imageUrl) ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
-          const imgResp = await axios.get<ArrayBuffer>(fetchUrl, { responseType: 'arraybuffer', timeout: 30000 });
+          const isOwnS3 = isS3Url(imageUrl);
+          const fetchUrl = isOwnS3 ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
+          const requestConfig: any = { responseType: 'arraybuffer', timeout: 30000 };
+          if (!isOwnS3) {
+            // describe_image is an agent-callable foundation tool fed image URLs
+            // from untrusted content, so this server-side fetch of an
+            // agent-supplied URL is a reachable SSRF vector (cloud metadata,
+            // RFC1918/loopback). Guard non-S3 URLs exactly as fetchAndParseCsvRows
+            // does: validate the host resolves to a public IP, pin the connection
+            // to that exact address (DNS-rebinding safe), and refuse redirects so
+            // the guard can't be bypassed (ENG-834).
+            const { address, family } = await resolvePinnedPublicAddress(fetchUrl);
+            requestConfig.maxRedirects = 0;
+            requestConfig.lookup = (_hostname: string, options: any, callback: any) => {
+              if (typeof options === 'function') callback = options;
+              callback(null, address, family);
+            };
+          }
+          const imgResp = await axios.get<ArrayBuffer>(fetchUrl, requestConfig);
           // Normalize content-type: strip any charset/extra params and trim whitespace.
           // Do NOT default a missing/empty header to a native type here — that would
           // short-circuit sharp detection and embed non-PNG bytes as image/png (ENG-370).
