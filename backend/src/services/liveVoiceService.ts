@@ -496,7 +496,9 @@ async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
  * user (the live WebSocket has no per-turn message array to inject into).
  * Returns an empty string when no loop is detected.
  */
-function buildAntiLoopDirective(allMessages: Array<{ role: string; content: unknown; tool_calls?: unknown }>): string {
+function buildAntiLoopDirective(
+  allMessages: Array<{ role: string; content: unknown; tool_calls?: unknown; metadata?: { toolCalls?: unknown } }>
+): string {
   const LOOP_DETECTION_THRESHOLD = 3;
   const normalize = (content: unknown): string => {
     const text = typeof content === 'string'
@@ -530,9 +532,15 @@ function buildAntiLoopDirective(allMessages: Array<{ role: string; content: unkn
   // user turns, the user is repeating a legitimate serviced request, not withholding
   // information the assistant asked for. Only fire when the assistant made NO progress
   // across the repeated turns, so a valid repeated request is never refused or parked.
+  // The live path persists executed tools under `metadata.toolCalls` (see the
+  // addMessagesToSession call in handleTurnComplete); check that shape AND any
+  // top-level `tool_calls` so reloaded live sessions are recognized as progress.
+  const madeToolCall = (m: { tool_calls?: unknown; metadata?: { toolCalls?: unknown } }): boolean =>
+    (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) ||
+    (Array.isArray(m.metadata?.toolCalls) && m.metadata!.toolCalls.length > 0);
   const assistantMadeProgress = allMessages
     .slice(userIdx[firstIdenticalPos])
-    .some(m => m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length > 0);
+    .some(m => m.role === 'assistant' && madeToolCall(m));
   if (assistantMadeProgress) return '';
 
   return `\n\n[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] The user has sent the same message ${trailingIdentical} times without providing information you asked for. They will NOT provide it. You MUST:
