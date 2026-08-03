@@ -308,6 +308,45 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     expect(scheduledRunSignalsConditionalSkip(namedSunday, { now: sunday, instruction: approvalGate })).toBe(false);
     expect(scheduledRunSignalsConditionalSkip('Today is Monday, a non-publishing day. Skipping.', { now: monday, instruction: approvalGate })).toBe(false);
   });
+
+  it('rejects a skip that made a NON-required write call, but allows read/context calls (Greptile P1)', () => {
+    const sunday = new Date('2026-08-02T12:00:00Z');
+    const instr = 'Publish only on Mon/Wed/Fri.';
+    const skipProse = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
+
+    // Read/context tool calls do not make it a non-skip.
+    expect(scheduledRunSignalsConditionalSkip(skipProse, {
+      now: sunday, instruction: instr,
+      toolCalls: [{ name: 'read_brand_guidelines' }, { name: 'read_market_strategy' }, { name: 'you_search_web' }],
+    })).toBe(true);
+
+    // A write tool NOT in requiredFunctions still means an external side effect →
+    // not a clean skip.
+    for (const writeTool of ['send_email_from_sender', 'post_on_connected_account', 'generate_image', 'update_lead', 'create_lead']) {
+      expect(scheduledRunSignalsConditionalSkip(skipProse, {
+        now: sunday, instruction: instr, toolCalls: [{ name: writeTool }],
+      })).toBe(false);
+    }
+  });
+
+  it('evaluates the owner cadence in the schedule timezone, not UTC (Greptile P1)', () => {
+    const publishOnlyMWF = 'Publish only on Mon/Wed/Fri.';
+    const skipProse = 'This is a non-publishing day per the Mon/Wed/Fri cadence. Skipping this run.';
+
+    // 2026-08-03T02:00Z is MONDAY in UTC but still SUNDAY in US/Pacific (7pm Sun).
+    const utcMonPacificSun = new Date('2026-08-03T02:00:00Z');
+    // UTC → Monday (a publish day) → rejected.
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: utcMonPacificSun, instruction: publishOnlyMWF })).toBe(false);
+    // Schedule timezone US/Pacific → Sunday (non-publishing) → waived.
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: utcMonPacificSun, instruction: publishOnlyMWF, timezone: 'America/Los_Angeles' })).toBe(true);
+
+    // Inverse: 2026-08-02T16:00Z is SUNDAY in UTC but already MONDAY in Asia/Tokyo (+9).
+    const utcSunTokyoMon = new Date('2026-08-02T16:00:00Z');
+    // No timezone (UTC) → Sunday → waived.
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: utcSunTokyoMon, instruction: publishOnlyMWF })).toBe(true);
+    // Schedule timezone Asia/Tokyo → Monday (a publish day) → rejected.
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: utcSunTokyoMon, instruction: publishOnlyMWF, timezone: 'Asia/Tokyo' })).toBe(false);
+  });
 });
 
 describe('runScheduledChat — conditional skip day', () => {
@@ -489,6 +528,28 @@ describe('runScheduledChat — conditional skip day', () => {
         passed: false,
         attempt: 20,
       })
+    );
+    expect((result as any).conditionalSkip).toBeUndefined();
+  });
+
+  it('does NOT waive a skip that performed a NON-required write (send_email_from_sender)', async () => {
+    // The run emitted a legitimate cadence-skip on a real non-publishing day, but it
+    // also fired a write tool that is NOT in requiredFunctions. That external side
+    // effect means it was not a clean no-op — it must not be recorded as a skip
+    // (Greptile P1, ENG-844).
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'Today is a non-publishing day per the Mon/Wed/Fri cadence. Skipping the post.',
+      toolCalls: [{ name: 'send_email_from_sender' }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    });
+
+    const result = await runScheduledChat(publishSchedule, mockUserId, true, undefined, SUNDAY_NON_PUBLISH);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
+    expect(result).toEqual(
+      expect.objectContaining({ scheduleId: mockScheduleId, status: 'failure', passed: false, attempt: 20 })
     );
     expect((result as any).conditionalSkip).toBeUndefined();
   });
