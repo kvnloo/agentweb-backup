@@ -78,6 +78,9 @@ type AdImageFormat = "1080x1080" | "1080x1350";
 /** Hard per-variant timeout. Beyond this we patch with placeholder. */
 const PER_VARIANT_TIMEOUT_MS = 180_000;
 
+/** Timeout for the one-shot logo preflight fetch (ENG-792). */
+const LOGO_PREFLIGHT_TIMEOUT_MS = 15_000;
+
 /** Default Gemini Pro image model — supports 1080x1080 + 1080x1350. */
 const DEFAULT_IMAGE_MODEL = "gemini-3-pro-image-preview";
 
@@ -695,6 +698,82 @@ export async function generateAdImagesForUser(
 }
 
 /**
+ * Preflight a resolved brand logo URL (ENG-792): does it actually serve usable
+ * image bytes right now?
+ *
+ * A persisted `logoUrl` can be structurally present yet unfetchable — a deleted
+ * S3 object, a hotlink-protected asset, or (the reported case) a Google
+ * favicon-service URL `https://www.google.com/s2/favicons?domain=…` that
+ * 301→404s when the domain has no crawlable favicon. Passing such a URL to
+ * `generate_image` makes `processInputImage`'s axios GET throw on EVERY
+ * variant, so all three creatives come back as placeholders while the run is
+ * still marked "ready" — the customer sees broken onboarding creatives.
+ *
+ * We catch that here so the orchestrator can treat an unfetchable logo the same
+ * as a missing one: fail the run with the actionable brand-config message
+ * instead of shipping broken placeholders (consistent with the ENG-326 gate —
+ * ad images are never generated with a broken/invented/approximate logo).
+ *
+ * Returns true only when the URL responds 2xx with a non-empty body whose
+ * content-type is an image (or unknown — `processInputImage` sniffs the
+ * extension in that case). Never throws.
+ */
+export async function isBrandLogoFetchable(
+  logoUrl: string,
+  deps: {
+    httpGet?: (url: string) => Promise<{
+      status?: number;
+      headers?: Record<string, unknown>;
+      data?: unknown;
+    }>;
+  } = {}
+): Promise<boolean> {
+  if (typeof logoUrl !== "string" || logoUrl.trim() === "") return false;
+  const httpGet =
+    deps.httpGet ??
+    (async (url: string) => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const axios = (await import("axios")).default;
+      return axios.get(url, {
+        responseType: "arraybuffer",
+        timeout: LOGO_PREFLIGHT_TIMEOUT_MS,
+        headers: { "User-Agent": "Mozilla/5.0 (compatible; AgentWeb/1.0)" },
+      });
+    });
+  try {
+    const resp = await httpGet(logoUrl);
+    // axios rejects non-2xx by default, but an injected fetcher (or a custom
+    // validateStatus) might not — reject explicitly.
+    if (
+      typeof resp?.status === "number" &&
+      (resp.status < 200 || resp.status >= 300)
+    ) {
+      return false;
+    }
+    const data: any = resp?.data;
+    const byteLength =
+      data == null
+        ? 0
+        : typeof data.byteLength === "number"
+          ? data.byteLength
+          : typeof data.length === "number"
+            ? data.length
+            : 0;
+    if (byteLength <= 0) return false;
+    const contentType = String(
+      (resp?.headers as any)?.["content-type"] || ""
+    ).toLowerCase();
+    // An HTML/JSON/text error body served with 200 is not a usable logo. An
+    // empty/unknown content-type is allowed through — processInputImage sniffs
+    // the file extension for those.
+    if (contentType && !contentType.includes("image")) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Fire-and-forget orchestrator. Reads the User record, gates on
  * `creativeDirStatus === 'ready'`, runs the parallel image-generation loop,
  * and patches the User with the result.
@@ -704,7 +783,16 @@ export async function generateAdImagesForUser(
  */
 export async function triggerAdImageGenerationForUser(
   userId: string,
-  deps: { imageGen?: AdImageGeneratorDep; timeoutMs?: number } = {}
+  deps: {
+    imageGen?: AdImageGeneratorDep;
+    timeoutMs?: number;
+    /**
+     * Logo-fetchability preflight (ENG-792). Injected in tests; defaults to a
+     * real one-shot HTTP fetch. Returning false routes the run through the
+     * same actionable "upload your logo" failure path as a missing logo.
+     */
+    verifyLogoUrl?: (logoUrl: string) => Promise<boolean>;
+  } = {}
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
   if (!user) return;
@@ -775,6 +863,43 @@ export async function triggerAdImageGenerationForUser(
     });
     void reportUIError({
       operation: "onboarding:ad-image:missing-brand-logo",
+      errorMessage: reason,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "adImage",
+      },
+    });
+    return;
+  }
+
+  // ENG-792: a persisted logo URL can be structurally present yet unfetchable
+  // (deleted S3 object, hotlink protection, or a Google favicon-service URL
+  // that 301→404s for a domain with no crawlable favicon). Such a URL makes
+  // generate_image's input-image fetch throw on EVERY variant, so the run
+  // would ship three placeholders while reporting "ready" — the exact
+  // "onboarding creatives fail to generate" symptom. Preflight it once and
+  // treat an unfetchable logo like a missing one (never invent/approximate).
+  const verifyLogoUrl = deps.verifyLogoUrl ?? isBrandLogoFetchable;
+  const logoUsable = await verifyLogoUrl(brand.logoUrl);
+  if (!logoUsable) {
+    const reason =
+      "your saved brand logo could not be loaded — its URL is broken or " +
+      "unreachable (for example a favicon-service link that returns 404). " +
+      "Re-upload your logo in brand config, then regenerate. Ad images are " +
+      "never generated with a broken, invented, or approximate logo (ENG-326).";
+    const current = await userDb.getUserById(userId);
+    await userDb.updateUser(
+      userId,
+      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
+    );
+    // eslint-disable-next-line no-console
+    console.error("[onboardingAdImageService] gated on unfetchable brand logo", {
+      userId,
+      reason,
+    });
+    void reportUIError({
+      operation: "onboarding:ad-image:unfetchable-brand-logo",
       errorMessage: reason,
       userId,
       context: {
