@@ -111,6 +111,7 @@ import {
   runScheduledChat,
   runVerifiedChat,
   scheduledRunSignalsConditionalSkip,
+  reconstructPriorToolCalls,
 } from '../controllers/agentModeController';
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -405,6 +406,33 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     expect(scheduledRunSignalsConditionalSkip(skipProse, { now: utcSunTokyoMon, instruction: publishOnlyMWF })).toBe(true);
     // Schedule timezone Asia/Tokyo → Monday (a publish day) → rejected.
     expect(scheduledRunSignalsConditionalSkip(skipProse, { now: utcSunTokyoMon, instruction: publishOnlyMWF, timezone: 'Asia/Tokyo' })).toBe(false);
+  });
+});
+
+describe('reconstructPriorToolCalls (ENG-844)', () => {
+  it('prefers the executed ledger so a failed prior call keeps its error', () => {
+    // Message carries BOTH the request-only tool_calls (no error) and the persisted
+    // execution ledger (with error). The executed ledger must win.
+    const messages = [{
+      tool_calls: [{ function: { name: 'send_email_from_sender' } }],
+      metadata: { toolCalls: [{ name: 'send_email_from_sender', error: 'SMTP 550' }] },
+    }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([{ name: 'send_email_from_sender', error: 'SMTP 550' }]);
+  });
+
+  it('preserves a structured error from the executed ledger', () => {
+    const messages = [{ metadata: { toolCalls: [{ name: 'post_on_connected_account', error: { code: 500 } }] } }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([{ name: 'post_on_connected_account', error: { code: 500 } }]);
+  });
+
+  it('falls back to request tool_calls when a message has no executed ledger', () => {
+    const messages = [{ tool_calls: [{ function: { name: 'get_leads' } }] }];
+    expect(reconstructPriorToolCalls(messages)).toEqual([{ name: 'get_leads' }]);
+  });
+
+  it('drops nameless calls and tolerates non-array input', () => {
+    expect(reconstructPriorToolCalls(undefined as any)).toEqual([]);
+    expect(reconstructPriorToolCalls([{ metadata: { toolCalls: [{}, { name: 'get_leads' }] } }])).toEqual([{ name: 'get_leads' }]);
   });
 });
 
