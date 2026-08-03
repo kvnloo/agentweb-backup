@@ -69,6 +69,26 @@ export function sanitizeGeminiSchema(schema: any): any {
   const out: any = {};
   for (const [key, value] of Object.entries(schema)) {
     if (DROP.has(key) || key.startsWith('x-')) continue;
+    // Gemini's `Schema.type` is a SINGLE OpenAPI type; a JSON-Schema union
+    // `type: ['string','array']` (or a nullable `['string','null']`) is rejected
+    // with a 400 the moment the tool is attached — this broke 100% of
+    // gemini-3.5-flash agent turns whose tool set carried such a field (the
+    // `email` tool's to/cc/bcc, the `campaign_ids` filter, etc.), so scheduled
+    // runs died with zero assistant output before the first token (ENG-845).
+    // Bedrock/opus tolerated the union, which is why only Gemini failed. Collapse
+    // to one type: `null` → `nullable: true`; prefer a type consistent with the
+    // node's sibling constraints (array when `items` present, object when
+    // `properties`) so the schema stays valid AND faithful; else take the first.
+    if (key === 'type' && Array.isArray(value)) {
+      const members = value.map((t) => String(t).toLowerCase());
+      if (members.includes('null')) out.nullable = true;
+      const nonNull = members.filter((t) => t !== 'null');
+      let chosen: string | undefined = nonNull[0];
+      if (nonNull.includes('array') && schema.items !== undefined) chosen = 'array';
+      else if (nonNull.includes('object') && schema.properties !== undefined) chosen = 'object';
+      if (chosen !== undefined) out.type = chosen;
+      continue;
+    }
     out[key] = sanitizeGeminiSchema(value);
   }
   return out;
