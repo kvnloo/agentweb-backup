@@ -714,9 +714,11 @@ export async function generateAdImagesForUser(
  * instead of shipping broken placeholders (consistent with the ENG-326 gate —
  * ad images are never generated with a broken/invented/approximate logo).
  *
- * Returns true only when the URL responds 2xx with a non-empty body whose
- * content-type is an image (or unknown — `processInputImage` sniffs the
- * extension in that case). Never throws.
+ * Returns true when the URL responds 2xx with a non-empty body whose
+ * content-type is not clearly textual (an image, a generic binary type, or
+ * unknown — `processInputImage`'s getImageMimeType sniffs the extension and
+ * defaults to image/png in those cases). Only textual/document error bodies
+ * (text/*, application/json) are rejected. Never throws.
  */
 export async function isBrandLogoFetchable(
   logoUrl: string,
@@ -763,10 +765,17 @@ export async function isBrandLogoFetchable(
     const contentType = String(
       (resp?.headers as any)?.["content-type"] || ""
     ).toLowerCase();
-    // An HTML/JSON/text error body served with 200 is not a usable logo. An
-    // empty/unknown content-type is allowed through — processInputImage sniffs
-    // the file extension for those.
-    if (contentType && !contentType.includes("image")) return false;
+    // Only reject clearly-textual/document error bodies served with 200 (an
+    // HTML/JSON/text response is not a usable logo). Generic binary types
+    // (application/octet-stream, binary/octet-stream) and empty/unknown
+    // content-types are allowed through — processInputImage's getImageMimeType
+    // tolerates those by sniffing the URL extension and defaulting to
+    // image/png, so gating them here would regress logos that generate fine
+    // today (e.g. S3 objects lacking ContentType metadata).
+    const isTextualContentType =
+      contentType.startsWith("text/") ||
+      contentType.startsWith("application/json");
+    if (isTextualContentType) return false;
     return true;
   } catch {
     return false;
