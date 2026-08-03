@@ -906,14 +906,50 @@ function parseScheduleCadence(instruction: string): { publishDays: Set<number>; 
   return { publishDays, skipDays };
 }
 
+// The owner's weekday cadence ("publish Mon/Wed/Fri") is expressed in the
+// SCHEDULE'S local calendar, so the cadence day-of-week must be read in the
+// schedule's timezone — evaluating it in UTC mis-judges the day for any run near
+// a midnight boundary and can waive a skip on the owner's actual publishing day
+// (Greptile P1, ENG-844). Falls back to UTC when no/invalid timezone is given.
+// NB: the model-asserted-weekday VETO stays UTC on purpose — the model is handed
+// its "Current date" as a UTC calendar date, so that is the reference IT reasons in.
+function weekdayInTimeZone(when: Date, timeZone?: string): number {
+  if (!timeZone) return when.getUTCDay();
+  try {
+    const wd = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(when);
+    const idx = WEEKDAY_ABBREV_TO_INDEX[wd.slice(0, 3).toLowerCase()];
+    return idx ?? when.getUTCDay();
+  } catch {
+    return when.getUTCDay();
+  }
+}
+
+// A legitimate cadence skip makes NO write of consequence — not just none of the
+// schedule's REQUIRED minimums. A run can call other side-effecting tools not in
+// requiredFunctions (send_email_from_sender, post_on_connected_account, …); any
+// such call means the run was not a clean no-op and must not be laundered into a
+// successful skip (Greptile P1, ENG-844). Classify by the tool name's leading verb
+// so new write tools are covered without an enumerated registry; read/context
+// tools (read_*, get_*, describe_image, you_search_web) do not match.
+const WRITE_TOOL_VERB = /(?:^|_)(?:post|publish|send|generate|create|update|delete|remove|upload|submit|schedule|enrich)(?:_|$)/i;
+function isWriteToolCall(toolCall: any): boolean {
+  const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
+  return name.length > 0 && WRITE_TOOL_VERB.test(name);
+}
+
 export function scheduledRunSignalsConditionalSkip(
   content: string,
-  options: { toolCalls?: any[]; now?: Date; instruction?: string } = {}
+  options: { toolCalls?: any[]; now?: Date; instruction?: string; timezone?: string } = {}
 ): boolean {
   if (!content || typeof content !== 'string') return false;
 
   const now = options.now ?? new Date();
+  // UTC weekday — the reference the MODEL reasons in (its "Current date" is a UTC
+  // calendar date), used only for the model-asserted-weekday VETO in step (4).
   const todayIdx = now.getUTCDay();
+  // The OWNER'S cadence weekday, read in the schedule's timezone — the reference
+  // the cadence day-lists ("publish Mon/Wed/Fri") are expressed in (Greptile P1).
+  const cadenceDayIdx = weekdayInTimeZone(now, options.timezone);
   // Tracks whether the skip has been corroborated against the actual RUN DATE
   // (by the parsed cadence and/or the model naming today's weekday). When an
   // instruction is provided we REQUIRE this before waiving (see final gate).
@@ -936,12 +972,14 @@ export function scheduledRunSignalsConditionalSkip(
     if (!instructionAuthorizesConditionalSkip(instruction!)) return false;
     const { publishDays, skipDays } = parseScheduleCadence(instruction!);
     if (publishDays.size > 0) {
-      // Positive cadence: today must fall OUTSIDE the publish window.
-      if (publishDays.has(todayIdx)) return false;
+      // Positive cadence: today (in the schedule's timezone) must fall OUTSIDE the
+      // publish window.
+      if (publishDays.has(cadenceDayIdx)) return false;
       runDateCorroborated = true;
     } else if (skipDays.size > 0) {
-      // Only a skip-day list was given: today must be one of the named skip days.
-      if (!skipDays.has(todayIdx)) return false;
+      // Only a skip-day list was given: today (schedule timezone) must be one of
+      // the named skip days.
+      if (!skipDays.has(cadenceDayIdx)) return false;
       runDateCorroborated = true;
     }
   }
@@ -975,10 +1013,14 @@ export function scheduledRunSignalsConditionalSkip(
   );
   if (SKIP_FAILURE_SIGNAL_PATTERNS.some((re) => re.test(failureScan))) return false;
 
-  // (3) Non-spoofable ledger check: a legitimate cadence skip makes no write
-  // calls AND no tool errors. If any tool actually errored, this was a failure.
+  // (3) Non-spoofable ledger check: a legitimate cadence skip makes NO write calls
+  // AND no tool errors. Any tool error means this was a failure, not a skip; any
+  // WRITE call — even one not in the schedule's requiredFunctions, e.g.
+  // send_email_from_sender — means the run had an external side effect and is not
+  // a clean no-op, so it must not be waived (Greptile P1, ENG-844).
   const toolCalls = options.toolCalls;
-  if (Array.isArray(toolCalls) && toolCalls.some((tc) => tc && typeof tc === 'object' && 'error' in tc)) {
+  if (Array.isArray(toolCalls) &&
+      toolCalls.some((tc) => (tc && typeof tc === 'object' && 'error' in tc) || isWriteToolCall(tc))) {
     return false;
   }
 
@@ -986,7 +1028,9 @@ export function scheduledRunSignalsConditionalSkip(
   // must agree with the actual UTC weekday (getUTCDay — the model is handed its
   // "Current date" as a UTC calendar date via new Date().toISOString(), see
   // generateMarketingResponse; a server-LOCAL getDay would desync on a non-UTC
-  // host, and scheduled chats carry no timezone of their own). This catches a
+  // host). This is deliberately UTC even though the cadence check uses the
+  // schedule timezone: the veto validates the MODEL's claim, and the model reasons
+  // in UTC. This catches a
   // grossly mis-dated skip. It does NOT corroborate the waiver: the model naming
   // today's weekday only proves it knows the date, not that today is genuinely a
   // non-publishing day. For a schedule whose cadence is not weekday-based (e.g.
@@ -1373,6 +1417,10 @@ export async function runVerifiedChat(
     // Production leaves it undefined (the detector uses `new Date()`); tests pin it
     // so the cadence-vs-today check is deterministic regardless of the day CI runs.
     now?: Date;
+    // Schedule's IANA timezone (ENG-844): the owner's weekday cadence is read in
+    // this zone so a run near a midnight boundary is judged on the owner's calendar
+    // day, not UTC. Undefined falls back to UTC.
+    scheduleTimezone?: string;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -1911,7 +1959,7 @@ export async function runVerifiedChat(
         (reqFunc) => countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) === 0
       );
       if (completionGate && !allFunctionCallsMet && noRequiredWriteCallsMade &&
-          scheduledRunSignalsConditionalSkip(allContent, { toolCalls: allToolCalls, instruction: startingMessage, now: params.now })) {
+          scheduledRunSignalsConditionalSkip(allContent, { toolCalls: allToolCalls, instruction: startingMessage, now: params.now, timezone: params.scheduleTimezone })) {
         // Low-severity breadcrumb: a conditional skip is a SUCCESSFUL run, but it is
         // waiving write-call minimums on an audited publishing pipeline, so keep it
         // observable (and threaded into runResults via `conditionalSkip`) rather than
@@ -2740,7 +2788,10 @@ export async function runScheduledChat(
       parkNotifiable: true,
       // ENG-844: forward the injectable clock so the conditional-skip run-date
       // cross-check is deterministic under test (undefined in production).
-      now: nowOverride
+      now: nowOverride,
+      // ENG-844: the owner's weekday cadence is evaluated in the schedule's
+      // timezone (falls back to UTC when unset).
+      scheduleTimezone: schedule.timezone
     });
 
     // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
