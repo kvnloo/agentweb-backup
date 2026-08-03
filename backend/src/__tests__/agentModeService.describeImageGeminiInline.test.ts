@@ -52,6 +52,18 @@ jest.mock('../utils/s3Utils', () => ({
   presignS3Url: jest.fn((u: string) => `${u}?presigned=1`),
 }));
 
+// describe_image is agent-callable and fed URLs from untrusted content, so the
+// non-S3 fetch path must go through the repo's SSRF guard. Mock it to avoid real
+// DNS while asserting it is invoked and that a blocked URL is not fetched.
+const mockResolvePinned = jest.fn();
+jest.mock('../utils/ssrfGuard', () => {
+  const actual = jest.requireActual('../utils/ssrfGuard');
+  return {
+    ...actual,
+    resolvePinnedPublicAddress: (...a: any[]) => mockResolvePinned(...a),
+  };
+});
+
 jest.mock('../services/chatbotService');
 jest.mock('../services/settingsService');
 jest.mock('../utils/secretsManager');
@@ -59,6 +71,8 @@ jest.mock('../utils/secretsManager');
 import sharp from 'sharp';
 import { randomBytes } from 'crypto';
 import { AgentModeService } from '../services/agentModeService';
+import { isS3Url } from '../utils/s3Utils';
+import { SsrfBlockedError } from '../utils/ssrfGuard';
 
 const S3_URL =
   'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/x/files/1/y/cover.png';
@@ -120,4 +134,54 @@ describe('describeImage — Gemini vision path inlines + downscales (ENG-834)', 
     expect(inlinedBytes.length).toBeLessThan(bigPng.length);
     expect(inlinedBytes.length).toBeLessThan(4 * 1024 * 1024);
   }, 20000);
+
+  it('SSRF-guards a non-S3 image URL: validates the host and pins the connection (no redirects)', async () => {
+    (isS3Url as jest.Mock).mockReturnValueOnce(false);
+    mockResolvePinned.mockResolvedValueOnce({ hostname: 'example.com', address: '93.184.216.34', family: 4 });
+    const pngBytes = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+      'base64'
+    );
+    mockAxiosGet.mockResolvedValue({ data: pngBytes, headers: { 'content-type': 'image/png' } });
+    const callLLMSpy = jest
+      .spyOn(service, 'callLLM')
+      .mockResolvedValue({ choices: [{ message: { content: 'ok' } }] } as any);
+
+    const externalUrl = 'https://example.com/cover.png';
+    const result = await service.describeImage('gemini-3.5-flash', externalUrl);
+
+    expect(result.success).toBe(true);
+    // Guard ran against the external URL before any fetch.
+    expect(mockResolvePinned).toHaveBeenCalledWith(externalUrl);
+    // axios.get must pin the connection to the validated address and refuse redirects.
+    const [, cfg] = mockAxiosGet.mock.calls[0];
+    expect(cfg.maxRedirects).toBe(0);
+    expect(typeof cfg.lookup).toBe('function');
+    const cb = jest.fn();
+    cfg.lookup('example.com', {}, cb);
+    expect(cb).toHaveBeenCalledWith(null, '93.184.216.34', 4);
+    // Image was still inlined for the Gemini path.
+    const [, messages] = callLLMSpy.mock.calls[0];
+    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    expect(imgBlock.image_url.url).toMatch(/^data:image\//);
+  });
+
+  it('does not fetch a non-S3 URL that the SSRF guard blocks (falls back to the raw URL)', async () => {
+    (isS3Url as jest.Mock).mockReturnValueOnce(false);
+    mockResolvePinned.mockRejectedValueOnce(new SsrfBlockedError());
+    const callLLMSpy = jest
+      .spyOn(service, 'callLLM')
+      .mockResolvedValue({ choices: [{ message: { content: 'ok' } }] } as any);
+
+    const internalUrl = 'http://169.254.169.254/latest/meta-data/';
+    const result = await service.describeImage('gemini-3.5-flash', internalUrl);
+
+    expect(result.success).toBe(true);
+    // Blocked before any server-side fetch of the internal endpoint.
+    expect(mockAxiosGet).not.toHaveBeenCalled();
+    // No inlined bytes were produced; the raw URL is passed through unchanged.
+    const [, messages] = callLLMSpy.mock.calls[0];
+    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    expect(imgBlock.image_url.url).toBe(internalUrl);
+  });
 });
