@@ -7004,14 +7004,24 @@ export class AgentModeService {
       // Use custom prompt or default
       const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
 
-      // Claude models require the image as inline bytes rather than a bare URL:
-      //  - Bedrock Converse API requires base64 data URIs.
+      // Vision models here require the image as inline bytes rather than a bare URL:
+      //  - Bedrock Converse API (anthropic.*) requires base64 data URIs.
       //  - Anthropic-on-Vertex (claude-*) can take a url source, but our images are
       //    typically private S3 objects Anthropic's fetcher cannot reach, so we
       //    download and presign them into a base64 data URI here.
-      // Download the image and convert to a data URI for these models.
+      //  - Gemini (gemini-*) receives a non-data URL as `fileData.fileUri`, which it
+      //    cannot fetch for a private S3 object, and it rejects an un-downscaled 4K
+      //    image (e.g. 3072x5504 ~16MB from gemini-3.1-flash-image) with a hard
+      //    400 INVALID_ARGUMENT. Downloading + downscaling + inlining here keeps the
+      //    payload self-contained and within Gemini's inline limits (ENG-834).
+      // Download the image and convert to a (downscaled) data URI for these models.
       let resolvedImageUrl = imageUrl;
-      if ((llmModel.startsWith('anthropic.') || llmModel.startsWith('claude-')) && !imageUrl.startsWith('data:')) {
+      if (
+        (llmModel.startsWith('anthropic.') ||
+          llmModel.startsWith('claude-') ||
+          llmModel.startsWith('gemini-')) &&
+        !imageUrl.startsWith('data:')
+      ) {
         try {
           const axios = (await import('axios')).default;
           // For private S3 URLs from our bucket, generate a presigned URL so the download succeeds
