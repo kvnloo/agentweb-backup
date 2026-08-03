@@ -489,9 +489,16 @@ describe('runScheduledChat — conditional skip day', () => {
     expect(resumed.success).toBe(false);
     expect((resumed as any).conditionalSkip).toBeUndefined();
 
-    // Control: the identical run with NO prior write is legitimately waived — proving
-    // the prior write is what blocks it, not the cadence/date.
-    const clean = await runVerifiedChat({ ...baseParams, priorToolCalls: [] });
+    // A prior tool ERROR also blocks the skip — even on a READ tool that would not
+    // veto on its own. Proves the preserved error property (not just writes) rejects
+    // a resumed run whose abandoned portion failed.
+    const priorError = await runVerifiedChat({ ...baseParams, priorToolCalls: [{ name: 'get_leads', error: 'HTTP 500 from CRM' }] });
+    expect(priorError.success).toBe(false);
+    expect((priorError as any).conditionalSkip).toBeUndefined();
+
+    // Control: the identical run with NO prior write/error is legitimately waived —
+    // proving the prior write/error is what blocks it, not the cadence/date.
+    const clean = await runVerifiedChat({ ...baseParams, priorToolCalls: [{ name: 'get_leads' }] });
     expect(clean.success).toBe(true);
     expect((clean as any).conditionalSkip).toBe(true);
   });
