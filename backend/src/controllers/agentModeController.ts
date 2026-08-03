@@ -2857,51 +2857,34 @@ export async function runScheduledChat(
                 if (owner?.email) recipients = [owner.email];
               }
               if (recipients.length > 0) {
-                // An email send and a DB flag-write can't be atomic, so persist the
-                // dedup flag FIRST, then send, then roll the flag back if the send fails.
-                // This makes the ONLY divergence a rare double-fault (send fails AND the
-                // rollback write fails); there is no single-fault path to either a
-                // duplicate alert (persist-after-send failing) or permanent suppression.
-                let flagged = false;
-                try {
-                  await scheduleDb.updateSchedule(schedule.scheduleId, {
-                    zeroAssistantOwnerAlerted: true,
-                    updatedAt: new Date().toISOString(),
-                  });
-                  flagged = true;
-                } catch (flagError) {
-                  console.error(
-                    `Could not record owner-alert state for schedule ${schedule.scheduleId}; skipping this slot's alert (the next failing run will retry it):`,
-                    flagError
-                  );
-                }
-                if (flagged) {
-                  const alertSent = await emailService.sendScheduledRunFailedEmail(
-                    recipients,
-                    schedule.scheduleName,
-                    schedule.scheduleId,
-                    {
-                      failedAttempts: nextRetryCount,
-                      failureClass: classifyZeroAssistantFailure(error),
-                    }
-                  );
-                  if (!alertSent) {
-                    // Delivery failed after we marked the episode alerted — roll the flag
-                    // back so the next failing run re-attempts the alert rather than
-                    // suppressing it. (If this rollback also fails, the owner may miss this
-                    // episode's alert — a rare double-fault we log and accept.)
-                    try {
-                      await scheduleDb.updateSchedule(schedule.scheduleId, {
-                        zeroAssistantOwnerAlerted: false,
-                        updatedAt: new Date().toISOString(),
-                      });
-                    } catch (rollbackError) {
-                      console.error(
-                        `Owner failure alert failed to send AND the dedup flag could not be rolled back for schedule ${schedule.scheduleId}; owner may miss this alert:`,
-                        rollbackError
-                      );
-                    }
+                const alertSent = await emailService.sendScheduledRunFailedEmail(
+                  recipients,
+                  schedule.scheduleName,
+                  schedule.scheduleId,
+                  {
+                    failedAttempts: nextRetryCount,
+                    failureClass: classifyZeroAssistantFailure(error),
                   }
+                );
+                // Mark alerted ONLY after the email was actually delivered. If delivery
+                // failed, leave the flag unset so the next failing slot re-attempts the
+                // alert rather than suppressing every future notification for this episode.
+                if (alertSent) {
+                  try {
+                    await scheduleDb.updateSchedule(schedule.scheduleId, {
+                      zeroAssistantOwnerAlerted: true,
+                      updatedAt: new Date().toISOString(),
+                    });
+                  } catch (flagError) {
+                    console.error(
+                      `Failed to set zeroAssistantOwnerAlerted for schedule ${schedule.scheduleId}:`,
+                      flagError
+                    );
+                  }
+                } else {
+                  console.error(
+                    `Owner failure alert not delivered for schedule ${schedule.scheduleId}; will retry on the next failing run.`
+                  );
                 }
               } else {
                 // No recipients yet — do NOT mark alerted, so if the owner later adds a

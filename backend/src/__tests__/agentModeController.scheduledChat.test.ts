@@ -998,7 +998,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(flagWrite).toBeUndefined();
     });
 
-    it('rolls the dedup flag back when the email fails to deliver (retries the alert next slot)', async () => {
+    it('does NOT mark alerted when the email fails to deliver (retries the alert next slot)', async () => {
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
       mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
       mockEmailService.sendScheduledRunFailedEmail.mockResolvedValue(false as any); // delivery failed
@@ -1009,30 +1009,11 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         false,
       );
 
-      // Mark-first-then-rollback: the flag is set to true up front, then the failed send
-      // rolls it back to false so the NEXT failing run re-attempts the alert (no permanent
-      // suppression). Net effective state is false.
+      // Attempted the send, but delivery failed -> flag must stay unset so the next
+      // failing run re-attempts the alert instead of suppressing it forever.
       expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalledTimes(1);
-      const flagWrites = mockScheduleDb.updateSchedule.mock.calls
-        .filter((c: any[]) => typeof c[1]?.zeroAssistantOwnerAlerted === 'boolean')
-        .map((c: any[]) => c[1].zeroAssistantOwnerAlerted);
-      expect(flagWrites).toEqual([true, false]); // marked, then rolled back
-    });
-
-    it('skips the alert this slot when the dedup flag cannot be recorded (no duplicate risk)', async () => {
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
-      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
-      // The mark-first write fails, so we must NOT send (we'd have no dedup record and
-      // risk emailing again next slot). The next failing run retries the whole thing.
-      (mockScheduleDb.updateSchedule as jest.Mock).mockRejectedValueOnce(new Error('Dynamo throttled'));
-
-      await runScheduledChat(
-        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3 } as any,
-        mockUserId,
-        false,
-      );
-
-      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+      const flagWrite = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantOwnerAlerted === true);
+      expect(flagWrite).toBeUndefined();
     });
 
     it('prefers the schedule\'s configured emailNotifications over the account email', async () => {
