@@ -480,74 +480,19 @@ async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
       ? ''
       : `\n\n--- Prior conversation history (for context) ---\n${lines.join('\n')}\n--- End of prior history ---`;
 
-    return historyBlock + buildAntiLoopDirective(allMessages);
+    // ENG-763: the live-voice path deliberately does NOT inject a cross-message
+    // anti-loop directive. The reported bug surfaced on the agentMode text path
+    // (served by claude-opus-4-8), which is fully fixed there; a purely structural
+    // "3 identical user turns" heuristic on the live path cannot distinguish a
+    // stuck clarification loop from a legitimate repeated request answered with
+    // text-only turns, so it was removed to avoid parking valid repeats. The live
+    // path keeps its other ENG-763 protections: the anti-attribution system-prompt
+    // line and the install_skills onboarding tool-gate.
+    return historyBlock;
   } catch (err: any) {
     console.warn('[liveVoiceService] Failed to load history for system prompt:', err?.message);
     return '';
   }
-}
-
-/**
- * ENG-763 — cross-message loop breaker for the live-voice path. When the user
- * has repeated the same low-signal message several times in a row, the model
- * tends to loop restating the same clarification instead of making progress.
- * Mirrors the text-path directive in agentModeService (LOOP_DETECTION_THRESHOLD),
- * but embeds it in the system instruction so it is never attributable to the
- * user (the live WebSocket has no per-turn message array to inject into).
- * Returns an empty string when no loop is detected.
- */
-function buildAntiLoopDirective(
-  allMessages: Array<{ role: string; content: unknown; tool_calls?: unknown; metadata?: { toolCalls?: unknown } }>
-): string {
-  const LOOP_DETECTION_THRESHOLD = 3;
-  const normalize = (content: unknown): string => {
-    const text = typeof content === 'string'
-      ? content
-      : Array.isArray(content)
-        ? (content as any[]).map((c: any) => c?.text || '').filter(Boolean).join(' ')
-        : String(content ?? '');
-    return text.trim().toLowerCase();
-  };
-
-  // Positions of user messages within the full transcript (we need the full
-  // transcript, not just the user subset, so we can inspect the assistant turns
-  // BETWEEN the repeats — see the progress check below).
-  const userIdx: number[] = [];
-  allMessages.forEach((m, i) => { if (m.role === 'user') userIdx.push(i); });
-  if (userIdx.length < LOOP_DETECTION_THRESHOLD) return '';
-
-  const lastNorm = normalize(allMessages[userIdx[userIdx.length - 1]].content);
-  if (!lastNorm) return '';
-
-  let trailingIdentical = 0;
-  let firstIdenticalPos = userIdx.length; // index into userIdx of the first trailing-identical user turn
-  for (let k = userIdx.length - 1; k >= 0; k--) {
-    if (normalize(allMessages[userIdx[k]].content) === lastNorm) { trailingIdentical++; firstIdenticalPos = k; }
-    else break;
-  }
-  if (trailingIdentical < LOOP_DETECTION_THRESHOLD) return '';
-
-  // ENG-763 (Greptile): equality alone does NOT prove a stuck clarification loop.
-  // If the assistant actually did work — made a tool call — between these identical
-  // user turns, the user is repeating a legitimate serviced request, not withholding
-  // information the assistant asked for. Only fire when the assistant made NO progress
-  // across the repeated turns, so a valid repeated request is never refused or parked.
-  // The live path persists executed tools under `metadata.toolCalls` (see the
-  // addMessagesToSession call in handleTurnComplete); check that shape AND any
-  // top-level `tool_calls` so reloaded live sessions are recognized as progress.
-  const madeToolCall = (m: { tool_calls?: unknown; metadata?: { toolCalls?: unknown } }): boolean =>
-    (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) ||
-    (Array.isArray(m.metadata?.toolCalls) && m.metadata!.toolCalls.length > 0);
-  const assistantMadeProgress = allMessages
-    .slice(userIdx[firstIdenticalPos])
-    .some(m => m.role === 'assistant' && madeToolCall(m));
-  if (assistantMadeProgress) return '';
-
-  return `\n\n[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] The user has repeated the same message ${trailingIdentical} times. You MUST:
-1. FIRST decide whether you can actually FULFILL this request right now — using your tools or information already available. If you can, DO IT. A repeated request you are able to service is NOT a loop; never refuse or defer a request you could simply complete.
-2. Only if the request genuinely cannot proceed without specific information the user has not provided: STOP re-asking the same clarification, and instead use your available tools to find context yourself (e.g. read_brand_guidelines for business name, website, and brand info).
-3. If it still cannot proceed, offer ONE concrete short menu of next steps or gracefully hold — do not repeat the same question.
-4. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words.`;
 }
 
 /**
