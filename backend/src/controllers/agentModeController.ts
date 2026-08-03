@@ -90,13 +90,16 @@ const SCHEDULED_JOB_INCOMPLETE_MESSAGE =
 // however small it is. The failing session's stored assistant message used to assert
 // the budget cause unconditionally, sending anyone debugging from the transcript down
 // the wrong path (the ENG-826 gemini-3.5-flash union-schema 400 read as a size limit).
-// An auto-issue + oncall alert is always filed on this path, so "flagged for our team"
-// is accurate.
+// Wording note: this path records the run as failed (session error + failureClass
+// metadata, picked up by the daily satisfaction scorer) and retries it, but does NOT
+// currently raise a proactive per-run owner alert (issue #1 in ENG-826 — the requeue-
+// exhaustion branch only logs). So the copy promises recording + retry + a support
+// contact, NOT an active investigation we can't yet guarantee.
 const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
   "This scheduled run stopped before it could produce a response, so no results were generated. " +
   "It ran into an unexpected system error — not a time or size limit — so retrying or splitting the " +
-  "request into smaller batches won't help on its own. The run will be retried automatically and the " +
-  "failure has been flagged for our team to investigate. If it keeps failing, please contact support.";
+  "request into smaller batches won't help on its own. The run has been recorded as failed and will " +
+  "be retried automatically. If it keeps failing, please contact support.";
 
 // ENG-826: choose the right zero-output message for the actual failure. Budget/size-
 // shaped failures (context-limit, generation timeout, worker OOM/replacement, or a
