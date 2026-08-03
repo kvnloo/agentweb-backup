@@ -962,19 +962,25 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   // consistently failing and will NOT be auto-retried again until its next scheduled
   // slot. Previously this state only produced a server log the owner never saw, so a
   // customer's schedule (e.g. the gemini-3.5-flash "LinkedIn Post Factory" runs in
-  // ENG-826) could keep failing silently. Best-effort: never throws.
+  // ENG-826) could keep failing silently. Best-effort: never throws. Returns true ONLY
+  // if the provider actually accepted the email — the caller gates its once-per-episode
+  // suppression flag on this, so a failed delivery is retried on the next failing run
+  // instead of silently suppressing every future alert.
   async sendScheduledRunFailedEmail(
     toEmails: string | string[],
     scheduleName: string,
     scheduleId: string,
     opts: { failedAttempts: number; failureClass: 'budget' | 'transient' | 'system' }
-  ) {
+  ): Promise<boolean> {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
       const currentDate = new Date().toLocaleDateString('en-US', {
         year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
       });
       const { failedAttempts } = opts;
+      // Escape the request-derived schedule name before it goes into HTML — a name
+      // containing markup would otherwise render in the recipient's email client.
+      const safeName = this.escapeHtml(scheduleName);
       // Class-specific guidance for the EXHAUSTED state. Deliberately NOT the per-run
       // in-chat message: that one promises "will be retried automatically", which would
       // contradict this email's "won't retry until the next scheduled run" framing.
@@ -1004,13 +1010,13 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
           <div class="container">
             <div class="header">
               <h1>⚠️ Scheduled Chat Keeps Failing</h1>
-              <p style="margin: 5px 0 0 0; opacity: 0.9;">${scheduleName}</p>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeName}</p>
             </div>
             <div class="content">
               <div class="error-section">
                 <h3>Your scheduled chat has failed ${failedAttempts} times in a row</h3>
                 <p style="margin: 0; line-height: 1.6;">
-                  <strong>"${scheduleName}"</strong> last attempted to run at <strong>${currentDate}</strong> and produced no result.
+                  <strong>"${safeName}"</strong> last attempted to run at <strong>${currentDate}</strong> and produced no result.
                   It has now failed on every automatic retry, so it will not be retried again until its next scheduled run.
                 </p>
                 <p style="margin: 10px 0 0 0; line-height: 1.6;">${userMessage}</p>
@@ -1036,12 +1042,17 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
 
       const subject = `⚠️ Scheduled Chat Keeps Failing: ${scheduleName}`;
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
-      await this.sendEmail(emailList, subject, text, html);
+      // Strict send so a real delivery failure is observable here (sendEmail swallows
+      // errors, which would let us mark the episode alerted without actually notifying).
+      await this.sendEmailStrict(emailList, subject, text, html);
       console.log(`Scheduled run-failed email sent to recipients: ${emailList.join(', ')} (schedule ${scheduleId})`);
+      return true;
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled run-failed email to ${emailList.join(', ')}:`, error);
-      // Don't throw — a notification failure must not break the scheduled chat flow.
+      // Don't throw — a notification failure must not break the scheduled chat flow —
+      // but report it so the caller does NOT suppress future alerts for this episode.
+      return false;
     }
   },
 

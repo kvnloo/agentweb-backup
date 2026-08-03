@@ -947,6 +947,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     it('notifies the owner (falling back to account email) once the requeue cap is exhausted', async () => {
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
       mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+      mockEmailService.sendScheduledRunFailedEmail.mockResolvedValue(true as any); // delivered
 
       // retryCount already at the cap (3) -> this failure is over the limit -> no requeue, notify.
       await runScheduledChat(
@@ -993,6 +994,24 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       );
 
       expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+      const flagWrite = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantOwnerAlerted === true);
+      expect(flagWrite).toBeUndefined();
+    });
+
+    it('does NOT mark alerted when the email fails to deliver (retries the alert next slot)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+      mockEmailService.sendScheduledRunFailedEmail.mockResolvedValue(false as any); // delivery failed
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3 } as any,
+        mockUserId,
+        false,
+      );
+
+      // Attempted the send, but delivery failed -> flag must stay unset so the next
+      // failing run re-attempts the alert instead of suppressing it forever.
+      expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalledTimes(1);
       const flagWrite = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantOwnerAlerted === true);
       expect(flagWrite).toBeUndefined();
     });

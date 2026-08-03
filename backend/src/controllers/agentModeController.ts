@@ -2857,7 +2857,7 @@ export async function runScheduledChat(
                 if (owner?.email) recipients = [owner.email];
               }
               if (recipients.length > 0) {
-                await emailService.sendScheduledRunFailedEmail(
+                const alertSent = await emailService.sendScheduledRunFailedEmail(
                   recipients,
                   schedule.scheduleName,
                   schedule.scheduleId,
@@ -2866,18 +2866,24 @@ export async function runScheduledChat(
                     failureClass: classifyZeroAssistantFailure(error),
                   }
                 );
-                // Mark alerted so the next failing slot doesn't re-email. Best-effort:
-                // if this write fails we may send one duplicate later, which is safer
-                // than throwing on the failure path.
-                try {
-                  await scheduleDb.updateSchedule(schedule.scheduleId, {
-                    zeroAssistantOwnerAlerted: true,
-                    updatedAt: new Date().toISOString(),
-                  });
-                } catch (flagError) {
+                // Mark alerted ONLY after the email was actually delivered. If delivery
+                // failed, leave the flag unset so the next failing slot re-attempts the
+                // alert rather than suppressing every future notification for this episode.
+                if (alertSent) {
+                  try {
+                    await scheduleDb.updateSchedule(schedule.scheduleId, {
+                      zeroAssistantOwnerAlerted: true,
+                      updatedAt: new Date().toISOString(),
+                    });
+                  } catch (flagError) {
+                    console.error(
+                      `Failed to set zeroAssistantOwnerAlerted for schedule ${schedule.scheduleId}:`,
+                      flagError
+                    );
+                  }
+                } else {
                   console.error(
-                    `Failed to set zeroAssistantOwnerAlerted for schedule ${schedule.scheduleId}:`,
-                    flagError
+                    `Owner failure alert not delivered for schedule ${schedule.scheduleId}; will retry on the next failing run.`
                   );
                 }
               } else {
