@@ -185,6 +185,38 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     expect(scheduledRunSignalsConditionalSkip(c, { now: MONDAY })).toBe(false);
   });
 
+  it('fires on the REAL production skip wording (session 442e7880… msg[2])', () => {
+    // Faithful excerpt of the actual attempt-1 skip Emma emitted on Sunday
+    // 2026-08-02. Two things here previously defeated the detector and let the
+    // bug reproduce: (a) the weekday is wrapped in <strong> so the "today is
+    // Sunday" assertion was hidden, and (b) the completion ledger renders a
+    // literal "<td>Failed</td><td>0</td>" — a SUCCESS signal (zero failures) that
+    // the failure-veto regex matched as the word "Failed". The detector must
+    // strip HTML and ignore a zero-valued failure ledger, and then fire.
+    const realSkip = [
+      'LUCAS: non-publishing day, skipped.',
+      '',
+      '<strong>Weekday check:</strong> Today is <strong>Sunday, 2 August 2026</strong> — outside the Mon/Wed/Fri publishing window, so nothing was created, generated, or published this run.',
+      '',
+      '<ul>',
+      '<li><strong>Actions taken:</strong> none. No brand/strategy reads, no research, no image generation, no posts to the company page, Hannah\'s profile, Instagram, or X.</li>',
+      '<li><strong>Cost avoided:</strong> one image generation + four publish calls.</li>',
+      '</ul>',
+      '',
+      '<strong>Completion ledger</strong>',
+      '<table>',
+      '<tr><td>Attempted</td><td>0</td></tr>',
+      '<tr><td>Succeeded</td><td>0</td></tr>',
+      '<tr><td>Failed</td><td>0</td></tr>',
+      '</table>',
+    ].join('\n');
+    // Pinned to the run's actual weekday (Sunday) — the UTC anchor must agree.
+    expect(scheduledRunSignalsConditionalSkip(realSkip, { now: SUNDAY, toolCalls: [] })).toBe(true);
+    // And a real failure ledger ("Failed 1") in the same shape must STILL veto.
+    const realFailureLedger = realSkip.replace('<td>Failed</td><td>0</td>', '<td>Failed</td><td>1</td>');
+    expect(scheduledRunSignalsConditionalSkip(realFailureLedger, { now: SUNDAY, toolCalls: [] })).toBe(false);
+  });
+
   it('anchors the weekday cross-check to UTC, matching the model\'s UTC "Current date"', () => {
     // The model is handed its "Current date" as a UTC calendar date
     // (new Date().toISOString()), so its weekday reasoning is UTC-based. The
