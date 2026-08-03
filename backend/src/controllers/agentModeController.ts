@@ -1483,7 +1483,10 @@ export async function runVerifiedChat(
     // just the continuation turns — otherwise a resumed run would be wrongly marked
     // `passed: false` for calls it made before the interruption, and the verify
     // retry loop could re-prompt the model into re-running a completed side-effect.
-    priorToolCalls?: Array<{ name: string }>;
+    // `error` is preserved (ENG-844) so the conditional-skip error-veto can reject a
+    // resumed run whose ABANDONED portion had a failed tool call — reconstructing only
+    // names would hide that failure and let it be recorded as a clean skip.
+    priorToolCalls?: Array<{ name: string; error?: any }>;
     // Injectable clock for the conditional-skip run-date cross-check (ENG-844).
     // Production leaves it undefined (the detector uses `new Date()`); tests pin it
     // so the cadence-vs-today check is deterministic regardless of the day CI runs.
@@ -2596,7 +2599,7 @@ export async function runScheduledChat(
     let isResumeRun = false;
     // ENG-657: tool calls the abandoned portion already made, seeded into the
     // resumed run's verification so requiredFunctionCalls counts the whole task.
-    let resumePriorToolCalls: Array<{ name: string }> = [];
+    let resumePriorToolCalls: Array<{ name: string; error?: any }> = [];
     const pendingResumeSessionId: string | undefined =
       !isTest && typeof schedule.pendingResumeSessionId === 'string' && schedule.pendingResumeSessionId
         ? schedule.pendingResumeSessionId
@@ -2767,9 +2770,17 @@ export async function runScheduledChat(
           ? m.tool_calls
           : (Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : []);
         return calls
-          .map((tc: any) => tc?.function?.name || tc?.name)
-          .filter(Boolean)
-          .map((name: string) => ({ name }));
+          .map((tc: any) => {
+            const name = tc?.function?.name || tc?.name;
+            if (!name) return null;
+            // Preserve a failure marker so the conditional-skip error-veto rejects a
+            // resumed run whose abandoned portion failed a tool (ENG-844). Executed
+            // tool calls carry the error on metadata.toolCalls[].error.
+            return (tc && typeof tc === 'object' && tc.error != null)
+              ? { name, error: tc.error }
+              : { name };
+          })
+          .filter(Boolean);
       });
       console.log(`runScheduledChat: RESUMING abandoned session ${sessionId} for schedule ${schedule.scheduleId} (${schedule.scheduleName}); ${resumePriorToolCalls.length} prior tool call(s) carried into verification`);
     }
