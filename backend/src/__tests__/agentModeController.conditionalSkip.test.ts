@@ -377,6 +377,27 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: realCadence })).toBe(false);
   });
 
+  it('applies the cadence-context guard to RANGES and shorthands too, not just singletons (Greptile P1)', () => {
+    const saturday = new Date('2026-08-08T12:00:00Z'); // getUTCDay() === 6
+    const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
+
+    // A range or weekend/weekday shorthand bound to a noun/possessive is an approval
+    // gate, NOT a cadence — it must not invent one (a Saturday run would otherwise be
+    // wrongly waived). Greptile's exact example is the first.
+    for (const instr of [
+      'Publish only when the Monday to Friday team approves.',
+      "Publish only on Mon-Fri's sign-off.",
+      'Publish only on weekend approvals.',
+      'Publish only on weekday escalations.',
+    ]) {
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: saturday, instruction: instr })).toBe(false);
+    }
+
+    // Sanity: genuine range / shorthand cadences still parse (Saturday is outside Mon–Fri).
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: saturday, instruction: 'Publish only on Monday to Friday.' })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: saturday, instruction: 'Publish only on weekdays.' })).toBe(true);
+  });
+
   it('expands weekday RANGES so a mid-range day is a publishing day (Greptile P1)', () => {
     const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
     const wednesday = new Date('2026-08-05T12:00:00Z'); // getUTCDay() === 3
