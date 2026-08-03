@@ -184,6 +184,41 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     expect(scheduledRunSignalsConditionalSkip(c, { now: SUNDAY })).toBe(true);
     expect(scheduledRunSignalsConditionalSkip(c, { now: MONDAY })).toBe(false);
   });
+
+  it('cross-checks the asserted weekday in the SCHEDULE timezone, not server UTC', () => {
+    // 2026-08-03T05:00Z is MONDAY in UTC but SUNDAY 22:00 in America/Los_Angeles
+    // (PDT, UTC-7). A "Today is Sunday" skip is legitimate for an LA-based owner.
+    const nearLocalMidnight = new Date('2026-08-03T05:00:00Z');
+    const sundaySkip = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
+
+    // WITHOUT the timezone it wrongly compares against the server's UTC weekday
+    // (Monday) and rejects the legitimate skip — the bug this fix closes.
+    expect(scheduledRunSignalsConditionalSkip(sundaySkip, { now: nearLocalMidnight })).toBe(false);
+
+    // WITH the owner's timezone it evaluates the LOCAL weekday (Sunday) and accepts.
+    expect(
+      scheduledRunSignalsConditionalSkip(sundaySkip, { now: nearLocalMidnight, timezone: 'America/Los_Angeles' })
+    ).toBe(true);
+  });
+
+  it('still rejects a genuinely hallucinated weekday even with a timezone', () => {
+    // Local weekday (LA) is Sunday, but the turn claims Wednesday — a mis-dated
+    // skip of a real publishing day must still be rejected.
+    const nearLocalMidnight = new Date('2026-08-03T05:00:00Z');
+    const wrongDaySkip = 'Today is Wednesday, a non-publishing day. Skipping — no post created.';
+    expect(
+      scheduledRunSignalsConditionalSkip(wrongDaySkip, { now: nearLocalMidnight, timezone: 'America/Los_Angeles' })
+    ).toBe(false);
+  });
+
+  it('falls back to the server weekday when the timezone is invalid/unknown', () => {
+    // An unparseable IANA zone must not crash and must not silently pass — it
+    // falls back to the server-local comparison (unchanged strict behavior).
+    const c = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
+    expect(scheduledRunSignalsConditionalSkip(c, { now: SUNDAY, timezone: 'Not/AZone' })).toBe(true);
+    const MONDAY = new Date('2026-08-03T12:00:00Z');
+    expect(scheduledRunSignalsConditionalSkip(c, { now: MONDAY, timezone: 'Not/AZone' })).toBe(false);
+  });
 });
 
 describe('runScheduledChat — conditional skip day', () => {
