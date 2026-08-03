@@ -156,3 +156,26 @@ describe('classifyToolFailureType', () => {
     });
   });
 });
+
+describe('payment_required → config (ENG-664)', () => {
+  it('treats X credit exhaustion as a config/quota gap, not a tool bug', () => {
+    expect(classifyToolFailureType('payment_required')).toBe('config');
+  });
+
+  it('classifies a 402 credit message as config even without an errorClass', () => {
+    expect(
+      classifyToolFailureType('', 'X API error (HTTP 402): AgentWeb X plan out of credits'),
+    ).toBe('config');
+  });
+});
+
+describe('402 alternation is HTTP-status-anchored, not a bare number (ENG-664)', () => {
+  it('does NOT classify an unrelated "402" (id / line number) as config', () => {
+    expect(classifyToolFailureType('', 'failed at line 402 while parsing row')).toBe('bug');
+    expect(classifyToolFailureType('', 'record 402 not found')).not.toBe('config');
+  });
+  it('still classifies a real HTTP 402 credit message as config', () => {
+    expect(classifyToolFailureType('', 'X API error (HTTP 402): out of credits')).toBe('config');
+    expect(classifyToolFailureType('', 'status code 402 payment required')).toBe('config');
+  });
+});

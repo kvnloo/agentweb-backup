@@ -159,8 +159,17 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
         expect((agentModeService as any).llmModels[id].supportsVision).toBe(true);
       });
 
-      it('AC #5 — does not change the default model', async () => {
-        expect((agentModeService as any).default_model).toBe('gpt-5.5');
+      /*
+       * SUPERSEDED by ENG-759 (approved by Harsha 2026-07-30: "opus 5 as default
+       * is fine"). ENG-744's AC #5 was "merely ADDING the Claude 5 family must not
+       * re-route the default" — that guard was correct for ENG-744 and is still
+       * the intent here: the default only moves by an explicit, approved decision.
+       * ENG-759 is that decision, so the expected value changes from 'gpt-5.5' to
+       * Opus 5 while the guard itself is kept (it would still catch an accidental
+       * re-route caused by a future catalog addition).
+       */
+      it('AC #5 — default model only moves by explicit decision (now Opus 5, ENG-759)', async () => {
+        expect((agentModeService as any).default_model).toBe('anthropic.claude-opus-5');
       });
 
       it('AC #6 — leaves the live voice model untouched', () => {
@@ -513,15 +522,19 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
   });
 
   describe('Gemini client lazy-loading', () => {
-    it('should lazy-load Gemini client for gemini-3.1-pro-preview on first callLLM', async () => {
+    // ENG-737: gemini calls always resolve via getGeminiNativeClient (the only
+    // transport — no compat fallback, no kill-switch) instead of caching on
+    // llmModels[model].client — that cache was removed deliberately so nothing
+    // stale can survive a settings change. getGeminiNativeClient is synchronous.
+
+    it('should lazy-load the native Gemini client for gemini-3.1-pro-preview on first callLLM', async () => {
       const mockCreate = jest.fn().mockResolvedValue({
         choices: [{ message: { content: 'test response' } }],
         usage: { prompt_tokens: 10, completion_tokens: 5 },
       });
       const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
 
-      // Spy on getGeminiClient to return our mock
-      jest.spyOn(agentModeService as any, 'getGeminiClient').mockResolvedValue(mockGeminiClient);
+      jest.spyOn(agentModeService as any, 'getGeminiNativeClient').mockReturnValue(mockGeminiClient);
 
       const messages = [
         { role: 'system', content: 'You are a helpful assistant.' },
@@ -530,22 +543,18 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       await (agentModeService as any).callLLM('gemini-3.1-pro-preview', messages);
 
-      // getGeminiClient should have been called
-      expect((agentModeService as any).getGeminiClient).toHaveBeenCalled();
-
-      // After calling, the client should be cached (no longer null)
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.1-pro-preview'].client).toBe(mockGeminiClient);
+      expect((agentModeService as any).getGeminiNativeClient).toHaveBeenCalled();
+      expect(mockCreate).toHaveBeenCalled();
     });
 
-    it('should lazy-load Gemini client for gemini-3.1-flash-lite on first callLLM', async () => {
+    it('should lazy-load the native Gemini client for gemini-3.1-flash-lite on first callLLM', async () => {
       const mockCreate = jest.fn().mockResolvedValue({
         choices: [{ message: { content: 'test response' } }],
         usage: { prompt_tokens: 10, completion_tokens: 5 },
       });
       const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
 
-      jest.spyOn(agentModeService as any, 'getGeminiClient').mockResolvedValue(mockGeminiClient);
+      jest.spyOn(agentModeService as any, 'getGeminiNativeClient').mockReturnValue(mockGeminiClient);
 
       const messages = [
         { role: 'system', content: 'You are a helpful assistant.' },
@@ -554,20 +563,18 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       await (agentModeService as any).callLLM('gemini-3.1-flash-lite', messages);
 
-      expect((agentModeService as any).getGeminiClient).toHaveBeenCalled();
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.1-flash-lite'].client).toBe(mockGeminiClient);
+      expect((agentModeService as any).getGeminiNativeClient).toHaveBeenCalled();
+      expect(mockCreate).toHaveBeenCalled();
     });
 
-    it('should lazy-load Gemini client for gemini-3.5-flash on first callLLM', async () => {
+    it('should lazy-load the native Gemini client for gemini-3.5-flash on first callLLM', async () => {
       const mockCreate = jest.fn().mockResolvedValue({
         choices: [{ message: { content: 'test response' } }],
         usage: { prompt_tokens: 10, completion_tokens: 5 },
       });
       const mockGeminiClient = { chat: { completions: { create: mockCreate } } };
 
-      jest.spyOn(agentModeService as any, 'getGeminiClient').mockResolvedValue(mockGeminiClient);
+      jest.spyOn(agentModeService as any, 'getGeminiNativeClient').mockReturnValue(mockGeminiClient);
 
       const messages = [
         { role: 'system', content: 'You are a helpful assistant.' },
@@ -576,10 +583,8 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
 
       await (agentModeService as any).callLLM('gemini-3.5-flash', messages);
 
-      expect((agentModeService as any).getGeminiClient).toHaveBeenCalled();
-
-      const llmModels = (agentModeService as any).llmModels;
-      expect(llmModels['gemini-3.5-flash'].client).toBe(mockGeminiClient);
+      expect((agentModeService as any).getGeminiNativeClient).toHaveBeenCalled();
+      expect(mockCreate).toHaveBeenCalled();
     });
   });
 

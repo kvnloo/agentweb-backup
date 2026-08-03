@@ -11,7 +11,7 @@ export class LinkedInOutreachService {
   private cachedDsn: string | null = null;
   private cachedApiKey: string | null = null;
   // Short-lived cache for connectivity checks — avoids a Unipile API call on every page load
-  private connectedStatusCache: Map<string, { connected: boolean; timestamp: number }> = new Map();
+  private connectedStatusCache: Map<string, { state: 'connected' | 'disconnected' | 'unknown'; timestamp: number }> = new Map();
   private static readonly CONNECTED_STATUS_TTL_MS = 10 * 60 * 1000; // 10 minutes
   // Per-user resolved account cache — avoids re-running the full account resolution chain on every call
   private resolvedAccountCache: Map<string, { accountId: string; timestamp: number }> = new Map();
@@ -316,12 +316,28 @@ export class LinkedInOutreachService {
     this.resolvedAccountCache.delete(userId);
   }
 
-  async isAccountConnected(accountId: string): Promise<boolean> {
+  /**
+   * Tri-state session probe (ENG-281).
+   *
+   * `isAccountConnected` collapses "the session is definitively dead" and "the probe
+   * could not tell" into a single `false`. That is fine for callers that merely skip
+   * to the next account, but a caller that BLOCKS an action on the result must not
+   * treat a timeout or a network blip as proof of disconnection — doing so suppresses
+   * a healthy account and tells the user to reconnect for no reason, for the whole
+   * 10-minute cache window.
+   *
+   * So: `'disconnected'` only for signals that actually mean the LinkedIn session is
+   * gone (Unipile `errors/disconnected_account`, HTTP 401, or an AUTH_ERROR
+   * classification — the same signals the reactive handler keys on). Everything else
+   * (timeout, 5xx, network, client-init failure) is `'unknown'`, and the caller
+   * decides. `isAccountConnected` keeps its exact previous semantics on top of this.
+   */
+  async probeAccountSession(accountId: string): Promise<'connected' | 'disconnected' | 'unknown'> {
     const cached = this.connectedStatusCache.get(accountId);
     if (cached && Date.now() - cached.timestamp < LinkedInOutreachService.CONNECTED_STATUS_TTL_MS) {
-      return cached.connected;
+      return cached.state;
     }
-    let connected: boolean;
+    let state: 'connected' | 'disconnected' | 'unknown';
     try {
       const client = await this.getClient();
       const timeoutMs = LinkedInOutreachService.CONNECTIVITY_CHECK_TIMEOUT_MS;
@@ -339,7 +355,7 @@ export class LinkedInOutreachService {
       const publicIdentifier = account?.connection_params?.im?.publicIdentifier;
       if (!publicIdentifier) {
         this.log(`Account ${accountId} has no publicIdentifier — assuming connected`);
-        connected = true;
+        state = 'connected';
       } else {
         await LinkedInOutreachService.withTimeout(
           client.request.send({
@@ -350,16 +366,34 @@ export class LinkedInOutreachService {
           timeoutMs,
           `LinkedIn connectivity check (profile) for ${accountId}`,
         );
-        connected = true;
+        state = 'connected';
       }
     } catch (error: any) {
-      const code = error?.body?.code || error?.code || '';
-      const status = error?.body?.status || error?.status;
-      this.log(`Account ${accountId} connectivity check failed (${status} ${code}${error?.isTimeout ? ' timeout' : ''})`);
-      connected = false;
+      // Unipile surfaces this on `body`; our own wrapper re-shapes it onto
+      // `structuredError`. Read both so the classification cannot depend on which
+      // layer threw.
+      const structured = error?.structuredError;
+      const code = structured?.code || error?.body?.code || error?.code || '';
+      const status = structured?.status || error?.body?.status || error?.status;
+      const classification = structured?.classification || error?.body?.classification || error?.classification;
+      // Only these mean "the LinkedIn session is gone". A timeout or transport
+      // failure proves nothing about the session, so it must not be reported as
+      // a disconnection to a caller that would block on it.
+      const definitivelyDisconnected =
+        code === 'errors/disconnected_account' ||
+        classification === 'AUTH_ERROR' ||
+        Number(status) === 401;
+      state = definitivelyDisconnected ? 'disconnected' : 'unknown';
+      this.log(`Account ${accountId} connectivity check failed (${status} ${code}${error?.isTimeout ? ' timeout' : ''}) → ${state}`);
     }
-    this.connectedStatusCache.set(accountId, { connected, timestamp: Date.now() });
-    return connected;
+    this.connectedStatusCache.set(accountId, { state, timestamp: Date.now() });
+    return state;
+  }
+
+  async isAccountConnected(accountId: string): Promise<boolean> {
+    // Unchanged semantics for every pre-existing caller: anything that is not a
+    // proven-live session is `false`, including an indeterminate probe.
+    return (await this.probeAccountSession(accountId)) === 'connected';
   }
 
   /**

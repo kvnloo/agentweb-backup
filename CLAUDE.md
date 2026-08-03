@@ -13,6 +13,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   coverage, staging/API/browser smoke where applicable, every relevant GitHub
   check, latest-head Greptile 5/5 with no unresolved actionable P1/P2,
   attribution, rollback evidence, and acceptance-contract completeness all pass.
+- Establish "every relevant GitHub check" with
+  `REPO=AgentWebPro/agentweb PR_NUMBER=<n> bash .github/scripts/merge-evidence.sh`
+  (exit 0), never with `gh pr checks` alone. `gh pr checks` answers "did anything
+  fail", and a skipped job has not failed — so it exits 0 on a conflicted PR that
+  cannot schedule a run at all, and on a stale draft-time run in which every job
+  skipped. Exit 3 is `NO_EVIDENCE`: nothing ever executed against this head,
+  which is not the same as passing and never satisfies the gate (ENG-757).
 - Database/data-plane work requires Harsha before merge: migrations or persistent
   schema/table/index/key/model changes; backfills, bulk mutations, deletes, or
   production data repair; persistence provisioning/retention/backup/access

@@ -61,6 +61,8 @@ const mockMuteUser = jest.fn();
 const mockUnmuteUser = jest.fn();
 
 jest.mock('../services/twitterService', () => ({
+  // Passthrough — the dispatchers bind the acting user into the X metering context.
+  runWithXActingUser: (_id: string | undefined, fn: () => unknown) => fn(),
   twitterService: {
     postTweet: (...a: any[]) => mockPostTweet(...a),
     postThread: (...a: any[]) => mockPostThread(...a),

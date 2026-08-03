@@ -46,17 +46,38 @@ beforeEach(() => {
 afterEach(() => jest.restoreAllMocks());
 
 describe('scheduleDb.setRunInFlight', () => {
-  it('writes the lease with heartbeatAt defaulted to startedAt', async () => {
+  it('writes the lease with heartbeatAt defaulted to startedAt, conditional on no existing lease', async () => {
     mockDynamoDB.update.mockReturnValue(ok());
-    await scheduleDb.setRunInFlight('sched-1', {
+    const outcome = await scheduleDb.setRunInFlight('sched-1', {
       runId: 'run-1', sessionId: 'sess-1', startedAt: '2026-07-16T12:00:00.000Z', instanceId: 'inst-1',
     });
     const params = mockDynamoDB.update.mock.calls[0][0];
     expect(params.UpdateExpression).toBe('SET runInFlight = :lease');
+    expect(params.ConditionExpression).toBe('attribute_not_exists(runInFlight)');
     expect(params.ExpressionAttributeValues[':lease']).toEqual({
       runId: 'run-1', sessionId: 'sess-1', startedAt: '2026-07-16T12:00:00.000Z',
       instanceId: 'inst-1', heartbeatAt: '2026-07-16T12:00:00.000Z',
     });
+    expect(outcome).toBe('acquired');
+  });
+
+  it('reports already_in_flight (never clobbers) when another dispatcher already holds the lease (ENG-657/Greptile)', async () => {
+    // Two dispatchers picking up the same due schedule is a real cross-instance
+    // race, not hypothetical — this is what stops the second one from blindly
+    // overwriting the first's lease (and later clearing it out from under the
+    // still-running first attempt).
+    mockDynamoDB.update.mockReturnValue(conditionalFail());
+    const outcome = await scheduleDb.setRunInFlight('sched-1', {
+      runId: 'run-2', sessionId: '', startedAt: '2026-07-16T12:00:00.000Z', instanceId: 'inst-2',
+    });
+    expect(outcome).toBe('already_in_flight');
+  });
+
+  it('propagates (does not swallow) an unexpected error, distinct from a lost race — matches existing handleDynamoDbError behavior', async () => {
+    mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('throttled')) });
+    await expect(scheduleDb.setRunInFlight('sched-1', {
+      runId: 'run-1', sessionId: '', startedAt: '2026-07-16T12:00:00.000Z', instanceId: 'inst-1',
+    })).rejects.toThrow('throttled');
   });
 });
 
@@ -71,14 +92,19 @@ describe('scheduleDb.attachSessionToRunInFlight (ENG-479)', () => {
     expect(params.ExpressionAttributeValues[':runId']).toBe('run-1');
   });
 
-  it('never rejects — swallows a stale-lease condition failure', async () => {
+  it('never rejects — swallows a stale-lease condition failure, and reports it as false (ENG-657)', async () => {
     mockDynamoDB.update.mockReturnValue(conditionalFail());
-    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBeUndefined();
+    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBe(false);
   });
 
-  it('never rejects — swallows an unexpected error', async () => {
+  it('never rejects — swallows an unexpected error, and reports it as false (ENG-657)', async () => {
     mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('throttled')) });
-    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBeUndefined();
+    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBe(false);
+  });
+
+  it('reports success as true so the resume path can require a confirmed attach (ENG-657)', async () => {
+    mockDynamoDB.update.mockReturnValue(ok());
+    await expect(scheduleDb.attachSessionToRunInFlight('sched-1', 'run-1', 'sess-1')).resolves.toBe(true);
   });
 });
 
@@ -169,5 +195,30 @@ describe('scheduleDb.getInFlightSchedules', () => {
   it('returns an empty array on query failure instead of throwing', async () => {
     mockDynamoDB.query.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('boom')) });
     await expect(scheduleDb.getInFlightSchedules()).resolves.toEqual([]);
+  });
+});
+
+describe('scheduleDb.claimAndPauseUnresumable (ENG-657/Greptile)', () => {
+  it('atomically pauses the schedule and removes the marker in one write', async () => {
+    mockDynamoDB.update.mockReturnValue(ok());
+    const outcome = await scheduleDb.claimAndPauseUnresumable('sched-1', 'sess-1');
+    const params = mockDynamoDB.update.mock.calls[0][0];
+    expect(params.UpdateExpression).toBe('SET #status = :paused, updatedAt = :now REMOVE pendingResumeSessionId');
+    expect(params.ConditionExpression).toBe('pendingResumeSessionId = :sid');
+    expect(params.ExpressionAttributeValues[':sid']).toBe('sess-1');
+    expect(params.ExpressionAttributeValues[':paused']).toBe('paused');
+    expect(outcome).toBe('paused');
+  });
+
+  it('reports lost_claim (never partially applies) when the marker no longer matches', async () => {
+    mockDynamoDB.update.mockReturnValue(conditionalFail());
+    const outcome = await scheduleDb.claimAndPauseUnresumable('sched-1', 'sess-1');
+    expect(outcome).toBe('lost_claim');
+  });
+
+  it('reports error (marker left untouched) on an unexpected failure', async () => {
+    mockDynamoDB.update.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('throttled')) });
+    const outcome = await scheduleDb.claimAndPauseUnresumable('sched-1', 'sess-1');
+    expect(outcome).toBe('error');
   });
 });

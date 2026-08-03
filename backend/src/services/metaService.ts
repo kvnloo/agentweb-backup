@@ -178,7 +178,7 @@ export class MetaService {
 
   private static readonly AD_SET_READ_FIELDS = [
     'id', 'name', 'status', 'campaign_id',
-    'optimization_goal', 'billing_event', 'destination_type', 'promoted_object', 'bid_strategy',
+    'optimization_goal', 'billing_event', 'destination_type', 'promoted_object', 'bid_strategy', 'bid_amount',
     'daily_budget', 'lifetime_budget', 'start_time', 'end_time', 'targeting',
   ] as const;
 
@@ -1066,7 +1066,10 @@ export class MetaService {
       this.log(`Creating ad set in account: ${adAccountId} with payload:`, adSetParams);
       
       // Note: SDK v24.0.1+ internal POST mapping handlesact_ prefix and body params correctly.
-      const adSet = await account.createAdSet([], adSetParams);
+      // Request id+name back explicitly — Meta's create response only echoes an
+      // empty fields array as {id}, so callers reading adSet.name (e.g. success
+      // message strings) got literal "undefined" against the live API.
+      const adSet = await account.createAdSet(['id', 'name'], adSetParams);
       return adSet._data;
     } catch (error: any) {
       return this.handleError(error, 'createAdSet');
@@ -1810,12 +1813,16 @@ export class MetaService {
       this.initApi(accessToken);
       const account = new AdAccount(`act_${adAccountId}`);
       const fields = [
-        'id', 
-        'name', 
-        'description', 
-        'delivery_status', 
-        'subtype', 
-        'customer_file_source'
+        'id',
+        'name',
+        'description',
+        'delivery_status',
+        'subtype',
+        'customer_file_source',
+        // ENG-600: needed so a lookalike reuse-by-name match can verify the
+        // existing audience's actual ratio/country, not just its name — see
+        // agentModeService's executeAudienceCampaignLaunch.
+        'lookalike_spec',
       ];
       this.log(`Listing custom audiences for account: ${adAccountId}`, { fields });
       const audiences = await account.getCustomAudiences(fields, { limit: 50 });
@@ -1842,44 +1849,209 @@ export class MetaService {
       if (params.subtype === 'CUSTOM') {
           audienceParams.customer_file_source = params.customer_file_source || 'USER_PROVIDED_ONLY';
       } else if (params.subtype === 'LOOKALIKE') {
-          audienceParams.lookalike_spec = params.lookalike_spec; 
-          // { ratio: 0.01, origin: [{id: '...'}], country: 'US' }
+          // Meta's current create API takes the seed via a top-level
+          // origin_audience_id param, not a lookalike_spec.origin array —
+          // that shape only appears when READING a lookalike back (confirmed
+          // live: "(#2654) ... No custom_audience ID given for lookalike
+          // cluster" when origin was sent inside lookalike_spec). Callers
+          // still pass the seed as lookalike_spec.origin[0].id (our public
+          // shape, unchanged) — translated here at the Graph API boundary.
+          const { origin, ...lookalikeSpecRest } = params.lookalike_spec || {};
+          const originAudienceId = Array.isArray(origin) ? origin[0]?.id : undefined;
+          if (originAudienceId) {
+            audienceParams.origin_audience_id = originAudienceId;
+          }
+          audienceParams.lookalike_spec = {
+            type: 'similarity',
+            ...lookalikeSpecRest,
+          };
       }
 
       this.log(`Creating custom audience in account: ${adAccountId}`, audienceParams);
-      const audience = await account.createCustomAudience([], audienceParams);
+      const audience = await account.createCustomAudience(['id', 'name'], audienceParams);
       return audience._data;
     } catch (error) {
       return this.handleError(error, 'createCustomAudience');
     }
   }
 
+  // Meta caps a single POST /{audience_id}/users request at 10,000 records.
+  // Uploads above that must be split into sequential batches sharing one
+  // session_id, with batch_seq incrementing from 1 and last_batch_flag set
+  // only on the final batch — Meta's documented multi-batch upload protocol.
+  private static readonly CUSTOM_AUDIENCE_USERS_BATCH_SIZE = 10000;
+
   /**
-   * Add users to a Custom Audience (from CSV/Hashed data)
+   * Add users to a Custom Audience (from CSV/Hashed data). Payloads over
+   * 10,000 rows are chunked into sequential session-batched requests
+   * (see CUSTOM_AUDIENCE_USERS_BATCH_SIZE); smaller payloads are sent as a
+   * single request with no session object, unchanged from prior behavior.
    */
   public async uploadCustomAudienceUsers(adAccountId: string, accessToken: string, audienceId: string, schema: string[], payload: string | string[][]) {
     try {
       this.initApi(accessToken);
       const audience = new CustomAudience(audienceId);
-      
-      this.log(`Uploading users to custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
-      
-      const params = {
-        payload: {
-          schema: schema,
-          data: payload
-        }
-      };
 
-      // For 'createUser' edge (POST /users), the first arg is 'fields' (usually empty), second is 'params'
-      const result = await audience.createUser(
-        [], 
-        params
-      );
-      
-      return result._data || result;
+      this.log(`Uploading users to custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
+
+      const rows = payload;
+      if (!Array.isArray(rows) || rows.length <= MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE) {
+        const result = await audience.createUser([], { payload: { schema, data: payload } });
+        return result._data || result;
+      }
+
+      // Multi-batch upload: same session_id across every chunk, sequential
+      // (not parallel) so batch_seq ordering matches send order.
+      const sessionId = Math.floor(Math.random() * 1_000_000_000);
+      const totalBatches = Math.ceil(rows.length / MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE);
+      let lastResult: any;
+      for (let i = 0; i < totalBatches; i++) {
+        const chunk = rows.slice(
+          i * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE,
+          (i + 1) * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE
+        );
+        const batchSeq = i + 1;
+        const isLastBatch = batchSeq === totalBatches;
+        this.log(`Uploading batch ${batchSeq}/${totalBatches} to custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
+        const result = await audience.createUser([], {
+          payload: {
+            schema,
+            data: chunk,
+            session: {
+              session_id: sessionId,
+              batch_seq: batchSeq,
+              last_batch_flag: isLastBatch,
+              estimated_num_total: rows.length,
+            },
+          },
+        });
+        lastResult = result._data || result;
+      }
+      return lastResult;
     } catch (error) {
        return this.handleError(error, 'uploadCustomAudienceUsers');
+    }
+  }
+
+  /**
+   * Remove users from a Custom Audience (the sync-to-remove counterpart of
+   * uploadCustomAudienceUsers). Chunking/session protocol mirrors the upload
+   * method exactly — Meta's 10,000-record cap and session_id/batch_seq/
+   * last_batch_flag batching apply to /users deletes the same way.
+   */
+  public async deleteCustomAudienceUsers(adAccountId: string, accessToken: string, audienceId: string, schema: string[], payload: string | string[][]) {
+    try {
+      this.initApi(accessToken);
+      const audience = new CustomAudience(audienceId);
+
+      this.log(`Deleting users from custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
+
+      const rows = payload;
+      if (!Array.isArray(rows) || rows.length <= MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE) {
+        // ENG-600 live-test finding: unlike createUser(fields, params),
+        // CustomAudience.deleteUsers takes a SINGLE params argument — calling
+        // it deleteUsers([], {...}) silently discards the real params object
+        // (the SDK reads only arguments[0], which was the empty fields array),
+        // so Meta received no payload at all: "(#100) Missing required
+        // parameter: payload".
+        const result = await audience.deleteUsers({ payload: { schema, data: payload } });
+        return result._data || result;
+      }
+
+      const sessionId = Math.floor(Math.random() * 1_000_000_000);
+      const totalBatches = Math.ceil(rows.length / MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE);
+      let lastResult: any;
+      for (let i = 0; i < totalBatches; i++) {
+        const chunk = rows.slice(
+          i * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE,
+          (i + 1) * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE
+        );
+        const batchSeq = i + 1;
+        const isLastBatch = batchSeq === totalBatches;
+        this.log(`Deleting batch ${batchSeq}/${totalBatches} from custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
+        const result = await audience.deleteUsers({
+          payload: {
+            schema,
+            data: chunk,
+            session: {
+              session_id: sessionId,
+              batch_seq: batchSeq,
+              last_batch_flag: isLastBatch,
+              estimated_num_total: rows.length,
+            },
+          },
+        });
+        lastResult = result._data || result;
+      }
+      return lastResult;
+    } catch (error) {
+      return this.handleError(error, 'deleteCustomAudienceUsers');
+    }
+  }
+
+  /**
+   * Atomically replace a Custom Audience's entire membership with the given
+   * payload (Meta's /usersreplace edge). Used when reusing an audience with
+   * no locally-saved membership snapshot to diff against (first sync since
+   * ENG-600's stale-member sync shipped, or an audience created outside this
+   * flow) — an add-only upload would never be able to remove members already
+   * in the audience that aren't in the current source, whereas a replace
+   * needs no diff/baseline at all: it sets membership to exactly this
+   * payload in one operation. Chunking/session protocol mirrors
+   * uploadCustomAudienceUsers/deleteCustomAudienceUsers.
+   */
+  public async replaceCustomAudienceUsers(adAccountId: string, accessToken: string, audienceId: string, schema: string[], payload: string | string[][]) {
+    try {
+      this.initApi(accessToken);
+      const audience = new CustomAudience(audienceId);
+
+      this.log(`Replacing users in custom audience: ${audienceId}`, { schema, payloadType: typeof payload });
+
+      // Live-test finding: unlike createUser/deleteUsers (session nested
+      // inside `payload`), Meta's /usersreplace edge requires `session` as a
+      // TOP-LEVEL param sibling to `payload`, always — even for a single
+      // batch. Nesting it inside `payload` (mirroring the /users edges)
+      // still produces "(#100) The parameter session is required", confirmed
+      // live against the real Graph API.
+      const rows = payload;
+      const sessionId = Math.floor(Math.random() * 1_000_000_000);
+      if (!Array.isArray(rows) || rows.length <= MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE) {
+        const result = await audience.createUsersReplace([], {
+          payload: { schema, data: payload },
+          session: {
+            session_id: sessionId,
+            batch_seq: 1,
+            last_batch_flag: true,
+            estimated_num_total: Array.isArray(rows) ? rows.length : undefined,
+          },
+        });
+        return result._data || result;
+      }
+
+      const totalBatches = Math.ceil(rows.length / MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE);
+      let lastResult: any;
+      for (let i = 0; i < totalBatches; i++) {
+        const chunk = rows.slice(
+          i * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE,
+          (i + 1) * MetaService.CUSTOM_AUDIENCE_USERS_BATCH_SIZE
+        );
+        const batchSeq = i + 1;
+        const isLastBatch = batchSeq === totalBatches;
+        this.log(`Replacing batch ${batchSeq}/${totalBatches} in custom audience: ${audienceId}`, { session_id: sessionId, rows: chunk.length });
+        const result = await audience.createUsersReplace([], {
+          payload: { schema, data: chunk },
+          session: {
+            session_id: sessionId,
+            batch_seq: batchSeq,
+            last_batch_flag: isLastBatch,
+            estimated_num_total: rows.length,
+          },
+        });
+        lastResult = result._data || result;
+      }
+      return lastResult;
+    } catch (error) {
+      return this.handleError(error, 'replaceCustomAudienceUsers');
     }
   }
 
@@ -2033,7 +2205,7 @@ export class MetaService {
   public async listPixels(adAccountId: string, accessToken: string) {
     try {
       const apiVersion = process.env.META_API_VERSION || 'v25.0';
-      const url = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adspixels?fields=id,name,is_created_by_business&access_token=${accessToken}`;
+      const url = `https://graph.facebook.com/${apiVersion}/act_${adAccountId}/adspixels?fields=id,name,last_fired_time,is_created_by_business&access_token=${accessToken}`;
       const { fetchWithRetry } = await import('../utils/metaApiFetch');
       const response = await fetchWithRetry(url);
       const data = await response.json();
@@ -2043,25 +2215,6 @@ export class MetaService {
       return data.data || [];
     } catch (error) {
       return this.handleError(error, 'listPixels');
-    }
-  }
-
-  /**
-   * List datasets (server event data sources) linked to a pixel
-   */
-  public async listDatasets(pixelId: string, accessToken: string) {
-    try {
-      const apiVersion = process.env.META_API_VERSION || 'v25.0';
-      const url = `https://graph.facebook.com/${apiVersion}/${pixelId}/datasets?fields=id,name&access_token=${accessToken}`;
-      const { fetchWithRetry } = await import('../utils/metaApiFetch');
-      const response = await fetchWithRetry(url);
-      const data = await response.json();
-      if (data.error) {
-        throw new Error(data.error.message || 'Failed to list datasets');
-      }
-      return data.data || [];
-    } catch (error) {
-      return this.handleError(error, 'listDatasets');
     }
   }
 
@@ -2087,8 +2240,9 @@ export class MetaService {
   /**
    * Auto-resolve which Meta pixel a lander should use, from the site owner's already-connected
    * Meta ad account. Uses `pixel.id` directly as the dataset id — Meta unified
-   * pixel + dataset in Graph v25, so the per-pixel `listDatasets` edge (broken, see ENG-399)
-   * is never called at all.
+   * pixel + dataset in Graph v25, so there is no per-pixel dataset lookup to make. (The old
+   * `listDatasets` helper hit the removed `/<pixel_id>/datasets` edge and was deleted in
+   * ENG-399, which fixed the same bug in the DATASET LIST tool path.)
    *
    * Never throws: an unconnected account, an ambiguous pixel/account set, or any Graph/
    * credential error all resolve to `{ unresolved: true, reason }` so generation can proceed

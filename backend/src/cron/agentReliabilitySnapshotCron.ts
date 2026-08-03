@@ -133,38 +133,97 @@ export interface SnapshotCronDeps {
   clock: ClockPort;
 }
 
+export interface WriteSnapshotOptions {
+  /**
+   * How many UTC days back to ensure a snapshot exists for, counting the
+   * current day. 1 (the default) preserves the original today-only behaviour.
+   *
+   * Higher values make the cron self-healing: any recent day with no row yet —
+   * because the cron was disabled, the box was down, or the feature had simply
+   * never been switched on (ENG-746) — is computed from events already in the
+   * store. Without this, the first run after an outage produces a single
+   * snapshot with no pre-release baseline beside it, and closure-gate check 4
+   * stays `insufficient_data` for another full day.
+   *
+   * Completed days are written once and then left alone; the current day is
+   * always rewritten because its window is still moving.
+   */
+  catchUpDays?: number;
+}
+
+/** The (date, window) pairs that already have a row, so catch-up can skip them. */
+async function existingSnapshotKeys(dynamo: DynamoPort): Promise<Set<string>> {
+  const result = await dynamo.query({
+    tableName: LOOP_EVENTS_TABLE,
+    keyConditionExpression: 'loopId = :loopId',
+    expressionAttributeValues: { ':loopId': RELIABILITY_SNAPSHOT_LOOP_ID },
+  });
+  const keys = new Set<string>();
+  for (const item of result.items) {
+    const sk = typeof item.tsSession === 'string' ? item.tsSession : undefined;
+    if (sk) keys.add(sk);
+  }
+  return keys;
+}
+
 /**
  * Compute + persist the daily snapshots (24h + 7d) for the UTC day that just
- * ended (or the current day when run mid-day). Idempotent per (date, window).
- * Returns the snapshots written. Best-effort: callers should not rely on it
- * throwing — runAgentReliabilitySnapshot swallows for the scheduler.
+ * ended (or the current day when run mid-day), plus — when `catchUpDays` > 1 —
+ * any of the preceding days that have no row yet. Idempotent per (date,
+ * window). Returns the snapshots written, oldest-first. Best-effort: callers
+ * should not rely on it throwing — runAgentReliabilitySnapshot swallows for the
+ * scheduler.
+ *
+ * The event partition is read exactly once and reused for every day computed,
+ * so filling a two-week gap costs the same single query as writing one day.
  */
 export async function writeReliabilitySnapshots(
   deps: SnapshotCronDeps,
+  opts: WriteSnapshotOptions = {},
 ): Promise<ReliabilitySnapshot[]> {
   const now = deps.clock.now();
   const events = await readAgentModeEvents(deps.dynamo);
-  const date = utcDateString(now);
+  const today = utcDateString(now);
 
-  const windows: Array<{ label: string; start: Date }> = [
-    { label: '24h', start: new Date(now.getTime() - MS_PER_DAY) },
-    { label: '7d', start: new Date(now.getTime() - 7 * MS_PER_DAY) },
+  const catchUpDays = Math.max(1, Math.floor(opts.catchUpDays ?? 1));
+  const existing = catchUpDays > 1 ? await existingSnapshotKeys(deps.dynamo) : new Set<string>();
+
+  const windows: Array<{ label: string; spanMs: number }> = [
+    { label: '24h', spanMs: MS_PER_DAY },
+    { label: '7d', spanMs: 7 * MS_PER_DAY },
   ];
 
   const written: ReliabilitySnapshot[] = [];
-  for (const w of windows) {
-    const snap = computeReliabilitySnapshot({
-      events,
-      date,
-      windowStart: w.start,
-      windowEnd: now,
-      windowLabel: w.label,
-      now,
-    });
-    // putItem on the same PK+SK overwrites — re-running the same day yields ONE
-    // row per (date, window), never a duplicate.
-    await deps.dynamo.putItem(LOOP_EVENTS_TABLE, snapshotToItem(snap));
-    written.push(snap);
+  // Oldest-first so the trend line reads naturally as it is built.
+  for (let back = catchUpDays - 1; back >= 0; back--) {
+    const date = utcDateString(new Date(now.getTime() - back * MS_PER_DAY));
+    // A completed day must close on its own UTC boundary, NOT at "now minus N
+    // days" — the latter preserves the time of day, so a row labelled for one
+    // date would carry hours belonging to the previous one and drop hours of
+    // its own. Burn-in classifies rows as pre- or post-release purely by this
+    // label, so a mislabelled window could put pre-release events in a
+    // "post-release" snapshot and produce a wrong verdict. Today is the one
+    // window that legitimately ends at `now`, because it is still moving.
+    const dayEnd = back === 0 ? now : new Date(`${date}T23:59:59.999Z`);
+
+    for (const w of windows) {
+      const sk = snapshotSortKey(date, w.label);
+      // A completed past day is written once; today always refreshes.
+      if (back > 0 && existing.has(sk)) continue;
+
+      const snap = computeReliabilitySnapshot({
+        events,
+        date,
+        windowStart: new Date(dayEnd.getTime() - w.spanMs),
+        windowEnd: dayEnd,
+        windowLabel: w.label,
+        now,
+      });
+      // putItem on the same PK+SK overwrites — re-running the same day yields
+      // ONE row per (date, window), never a duplicate.
+      await deps.dynamo.putItem(LOOP_EVENTS_TABLE, snapshotToItem(snap));
+      written.push(snap);
+    }
   }
   return written;
 }
@@ -197,28 +256,87 @@ export async function readReliabilityTrend(
   return limit > 0 ? snaps.slice(-limit) : snaps;
 }
 
+/** Default catch-up horizon, matching readReliabilityTrend's 14-day default so
+ * one run populates the whole trend the endpoint will return. */
+export const DEFAULT_CATCH_UP_DAYS = 14;
+
+/** Catch-up horizon from env, clamped to a sane range. An unset or blank value
+ * means "use the default" — note `Number('')` is 0, not NaN, so the emptiness
+ * check has to come first or a blank variable would silently mean 1 day. */
+export function resolveCatchUpDays(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_CATCH_UP_DAYS;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return DEFAULT_CATCH_UP_DAYS;
+  return Math.max(1, Math.min(90, Math.floor(n)));
+}
+
+/**
+ * Boot-time seed. The cron fires once a day at 17:45 UTC, so on the first boot
+ * after this ships the trend would stay empty — and closure-gate check 4
+ * unsatisfiable — until that hour came around. This runs a single catch-up pass
+ * at startup IF AND ONLY IF the snapshot partition is completely empty, which is
+ * true exactly once, in the ENG-746 state. Once any row exists this returns
+ * immediately, so it costs one small partition query per boot thereafter.
+ *
+ * NEVER throws — a telemetry seed must not affect boot.
+ */
+export async function seedReliabilitySnapshotsIfEmpty(): Promise<boolean> {
+  try {
+    const { productionLoopPorts } = await import('../loops/adapters/awsAdapters');
+    const ports = productionLoopPorts();
+    const existing = await existingSnapshotKeys(ports.dynamo);
+    if (existing.size > 0) return false;
+
+    const catchUpDays = resolveCatchUpDays(process.env.AGENT_RELIABILITY_SNAPSHOT_CATCHUP_DAYS);
+    const written = await writeReliabilitySnapshots(
+      { dynamo: ports.dynamo, clock: ports.clock },
+      { catchUpDays },
+    );
+    console.log(
+      `[AgentReliabilitySnapshot] Seeded an empty trend with ${written.length} rows ` +
+        `across ${catchUpDays} days (first run — see ENG-746).`,
+    );
+    return true;
+  } catch (err) {
+    console.error('[AgentReliabilitySnapshot] seed failed (swallowed):', err);
+    return false;
+  }
+}
+
 /**
  * Scheduler entry point. Builds production ports, writes the snapshots, logs a
  * one-line summary. NEVER throws — telemetry must not crash the boot/scheduler.
- * Gated by the caller in server.ts behind AGENT_RELIABILITY_SNAPSHOT_ENABLED.
+ *
+ * Runs by default; set AGENT_RELIABILITY_SNAPSHOT_ENABLED=false to opt out.
+ * It was previously opt-in, the variable was never added to the production
+ * environment, and the cron therefore never ran once — leaving the reliability
+ * trend permanently empty and closure-gate check 4 unsatisfiable (ENG-746).
  */
 export async function runAgentReliabilitySnapshot(): Promise<void> {
   try {
     // Lazy import keeps the AWS SDK off the cold path for callers that inject.
     const { productionLoopPorts } = await import('../loops/adapters/awsAdapters');
     const ports = productionLoopPorts();
-    const written = await writeReliabilitySnapshots({ dynamo: ports.dynamo, clock: ports.clock });
-    const day = written[0];
+    const catchUpDays = resolveCatchUpDays(process.env.AGENT_RELIABILITY_SNAPSHOT_CATCHUP_DAYS);
+    const written = await writeReliabilitySnapshots(
+      { dynamo: ports.dynamo, clock: ports.clock },
+      { catchUpDays },
+    );
+    const day = written[written.length - 1];
     if (day) {
+      // Summarize the current day; note any older days filled in this pass.
+      const todayRows = written.filter((s) => s.date === day.date);
+      const backfilled = written.length - todayRows.length;
       console.log(
         `[AgentReliabilitySnapshot] ${day.date}: ` +
-          written
+          todayRows
             .map(
               (s) =>
                 `${s.windowLabel} success=${(s.toolSuccessRate * 100).toFixed(1)}% ` +
                 `degraded=${(s.degradedRunRate * 100).toFixed(1)}% runs=${s.runCount}`,
             )
-            .join('  |  '),
+            .join('  |  ') +
+          (backfilled > 0 ? `  (+${backfilled} catch-up rows)` : ''),
       );
     } else {
       console.log('[AgentReliabilitySnapshot] no snapshot written (no windows)');

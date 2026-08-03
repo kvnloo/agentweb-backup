@@ -202,9 +202,9 @@ jobs:
             }
 
   # These scripts are the ones that decide whether a deploy really happened
-  # (ENG-734) and whether Greptile really passed (ENG-754), so they get their own
-  # regression suites. Both run the real script against a mocked CLI — no AWS
-  # access, no GitHub access, ~30s.
+  # (ENG-734), whether Greptile really passed (ENG-754), and whether CI ever ran
+  # at all (ENG-757), so they get their own regression suites. All run the real
+  # script against a mocked CLI — no AWS access, no GitHub access, ~30s.
   ci-scripts-tests:
     name: CI script tests
     needs: detect-changes
@@ -226,6 +226,9 @@ jobs:
 
       - name: Run greptile-gate.sh regression suite
         run: bash .github/scripts/greptile-gate.test.sh
+
+      - name: Run merge-evidence.sh regression suite
+        run: bash .github/scripts/merge-evidence.test.sh
 
   # This job used to poll Greptile's own `Greptile Review` check-run and pass on
   # conclusion=success. Greptile marks that check-run success for every completed

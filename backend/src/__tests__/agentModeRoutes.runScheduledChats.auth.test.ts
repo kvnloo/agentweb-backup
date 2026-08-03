@@ -67,6 +67,10 @@ jest.mock('../services/db', () => ({
     updateScheduleAfterRun: jest.fn(),
     updateSchedule: jest.fn(),
     getSchedulesByUserId: jest.fn(),
+    setRunInFlight: jest.fn().mockResolvedValue('acquired'),
+    attachSessionToRunInFlight: jest.fn().mockResolvedValue(true),
+    heartbeatRunInFlight: jest.fn().mockResolvedValue(undefined),
+    clearRunInFlight: jest.fn().mockResolvedValue(true),
   },
   userDb: {
     getUserById: jest.fn(),
