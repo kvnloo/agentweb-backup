@@ -3075,23 +3075,33 @@ export class AgentModeService {
         m => (m.content || '').trim().toLowerCase() === normalizedCurrent
       ).length;
 
-      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD) {
+      // ENG-763: when the loop-breaker fires, also hard-gate `install_skills` for
+      // this turn (see the tool-build block below). On the agentMode path
+      // install_skills is the legitimate skill gateway, so it is only stripped
+      // while a loop is active — a stuck user should never trigger skill
+      // installation, and the read-only foundation context tools
+      // (read_brand_guidelines / read_market_strategy) remain available so the
+      // model is never starved of a way to make progress.
+      const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD;
+      if (loopBreakerActive) {
         // ENG-763: inject as a `system` directive, NOT a `user` turn. Provider
         // converters hoist role:'system' into the system instruction, so the model
         // never sees this control text as part of the user's message. Injecting it
         // as role:'user' (with the old "[SYSTEM OVERRIDE]" wording) caused the model
         // — Gemini merges consecutive user parts — to read the directive as the
         // user's own words and quote "[SYSTEM OVERRIDE]" back, attributing text to
-        // the user that they never sent.
+        // the user that they never sent. The directive also no longer tells the
+        // model to "proceed with reasonable generic placeholders" — for a task with
+        // no target (e.g. a QA check) that is an instruction to fabricate, which the
+        // model refuses and then falls back to re-asking, sustaining the loop.
         messages.push({
           role: 'system',
           content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
-1. STOP asking for that information immediately — do not repeat it again under any circumstances
-2. Use your available tools to find context yourself: call read_brand_guidelines to get business name, website, and brand info; call read_market_strategy to get goals and target market
-3. If those tools provide enough context, proceed with the task using that information
-4. If context is still insufficient, proceed with reasonable generic placeholders and complete as much of the task as possible
-5. Never block on missing user-provided details — always find a way to make progress
-6. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
+1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
+2. To gather context on your own, you may ONLY call the read-only context tools read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Do NOT call install_skills or any other setup/configuration tool, and do NOT take any irreversible action, just to appear productive.
+3. If that context is enough to complete the task, do so using it.
+4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
+5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
         });
       }
 
@@ -3313,6 +3323,18 @@ export class AgentModeService {
           if (excludeTools?.length && filteredToolsCache) {
             const excludeSet = new Set(excludeTools);
             filteredToolsCache = filteredToolsCache.filter((t: any) => !excludeSet.has(t.function?.name));
+          }
+
+          // ENG-763: hard tool-gate for the anti-loop path. While a repetition loop
+          // is active, a stuck user must never trigger skill installation — the model
+          // was calling install_skills to "make progress", violating the onboarding
+          // guardrail. This is not a prompt hint (which the model ignored) but a real
+          // gate, and it is scoped to loop-active turns only so normal onboarding
+          // (where install_skills is the intended gateway) is unaffected.
+          if (loopBreakerActive && filteredToolsCache) {
+            filteredToolsCache = filteredToolsCache.filter(
+              (t: any) => t.function?.name !== 'install_skills'
+            );
           }
         }
 
