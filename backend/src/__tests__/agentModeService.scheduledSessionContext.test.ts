@@ -344,42 +344,70 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   // Mentions"): the scheduled prompt explicitly authorized posting replies, yet
   // the agent invented an "active X publishing gate" that no tool ever returned
   // and used it to skip twitter_manage_post — drafting replies, titling the run
-  // "Replies queued", and posting nothing. The directive must (a) ban asserting
-  // an unverified platform/publish gate as fact, (b) require the authorized
-  // action tool to actually be attempted, and (c) tie completion claims to real
-  // tool outcomes.
-  it('bans asserting a publish/platform gate that no tool call actually returned', () => {
-    const lower = directive.toLowerCase();
-    expect(lower).toContain('no fabricated platform or publish gate');
-    expect(lower).toMatch(/never assert|may not claim/);
-    // the ban is tied to the absence of a real gate/permission tool error
-    expect(lower).toContain('permission error');
-    expect(lower).toContain('fabrication');
+  // "Replies queued", and posting nothing.
+  //
+  // The fix has two independent layers:
+  //   (a) TRUTHFUL REPORTING — UNCONDITIONAL: never assert a platform/publish
+  //       gate that no tool call actually returned, and tie the title/summary to
+  //       real tool outcomes. This holds regardless of publish authorization,
+  //       because inventing a gate is a reporting violation either way.
+  //   (b) AUTHORIZED-ACTION OVERRIDE — GATED on the machine-readable
+  //       publishAuthorized signal (ENG-827's fullAutonomy owner opt-in), NOT on
+  //       the model's reading of the prompt's free text (review finding 1). Only
+  //       an owner-authorized schedule gets "you MUST attempt the action / the
+  //       generic get-approval default does NOT apply". A non-authorized run
+  //       keeps the safe draft-and-notify default.
+  const authorizedDirective = getUnattendedExecutionDirective('scheduled', true, true);
+  const unauthorizedDirective = getUnattendedExecutionDirective('scheduled', true, false);
+
+  it('bans asserting a publish/platform gate no tool call returned — unconditionally', () => {
+    for (const d of [directive, authorizedDirective, unauthorizedDirective]) {
+      const lower = d.toLowerCase();
+      expect(lower).toContain('no fabricated platform or publish gate');
+      expect(lower).toMatch(/never assert|may not claim/);
+      // the ban is tied to the absence of a real gate/permission tool error
+      expect(lower).toContain('permission error');
+      expect(lower).toContain('fabrication');
+    }
   });
 
-  it('does not conflate the generic get-approval guidance with a hard platform gate', () => {
-    expect(directive.toLowerCase()).toContain('always get approval before publishing to social');
-    expect(directive.toLowerCase()).toContain('not a hard platform gate');
+  it('on a real block, names the specific tool + verbatim error and falls back to draft/memory/product issue — unconditionally', () => {
+    for (const d of [directive, authorizedDirective, unauthorizedDirective]) {
+      const lower = d.toLowerCase();
+      expect(lower).toContain('verbatim error');
+      expect(lower).toContain('report_product_issues');
+      expect(lower).toContain('save memory');
+    }
   });
 
-  it('requires the authorized publishing tool to actually be attempted, not just drafted', () => {
-    const lower = directive.toLowerCase();
+  it('ties the run title/summary to actual tool-call outcomes — no false "queued" — unconditionally', () => {
+    for (const d of [directive, authorizedDirective, unauthorizedDirective]) {
+      const lower = d.toLowerCase();
+      expect(lower).toContain('posted nothing');
+      expect(lower).toContain('queued');
+    }
+  });
+
+  // The authorized-action override rides ONLY on the machine-readable
+  // publishAuthorized signal — never inferred from the prompt's wording.
+  it('emits the authorized-action override ONLY when publishAuthorized is true', () => {
+    const lower = authorizedDirective.toLowerCase();
     expect(lower).toContain('authorized actions must be attempted');
     expect(lower).toContain('twitter_manage_post');
     expect(lower).toContain('drafting the content and reporting it as done is not completion');
+    // the generic get-approval default is treated as already satisfied — but only
+    // because the owner opted in, not because the prompt "said so".
+    expect(lower).toContain('generic "always get approval before publishing to social" default');
   });
 
-  it('on a real block, names the specific tool + error and falls back to draft/memory/product issue', () => {
-    const lower = directive.toLowerCase();
-    expect(lower).toContain('verbatim error');
-    expect(lower).toContain('report_product_issues');
-    expect(lower).toContain('save memory');
-  });
-
-  it('ties the run title/summary to actual tool-call outcomes (no false "queued")', () => {
-    const lower = directive.toLowerCase();
-    expect(lower).toContain('posted nothing');
-    expect(lower).toContain('queued');
+  it('withholds the authorized-action override when the schedule is NOT publish-authorized', () => {
+    // default (no signal) and explicit-false both keep the safe draft-and-notify
+    // default: the override never authorizes publishing off free-text wording.
+    for (const d of [directive, unauthorizedDirective]) {
+      const lower = d.toLowerCase();
+      expect(lower).not.toContain('authorized actions must be attempted');
+      expect(lower).not.toContain('drafting the content and reporting it as done is not completion');
+    }
   });
 });
 
