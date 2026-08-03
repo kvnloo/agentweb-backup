@@ -118,7 +118,10 @@ const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockWorker = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 
 describe('scheduledRunSignalsConditionalSkip', () => {
-  it('detects explicit non-publishing-day / whole-run skip declarations', () => {
+  // A fixed Sunday (2026-08-02) so weekday-naming assertions cross-check cleanly.
+  const SUNDAY = new Date('2026-08-02T12:00:00Z');
+
+  it('detects a CADENCE-anchored whole-run skip with no failure/tool-error signal', () => {
     const positives = [
       'Today is Sunday, a non-publishing day. Skipping — no post created.',
       'This is not a publishing day, so I am skipping today.',
@@ -127,7 +130,8 @@ describe('scheduledRunSignalsConditionalSkip', () => {
       'Per the guardrail I am creating and publishing nothing this run.',
       'Today is a rest day for this schedule.',
     ];
-    positives.forEach((c) => expect(scheduledRunSignalsConditionalSkip(c)).toBe(true));
+    // now pinned to Sunday so the "Today is Sunday" assertion agrees with the server.
+    positives.forEach((c) => expect(scheduledRunSignalsConditionalSkip(c, { now: SUNDAY })).toBe(true));
   });
 
   it('does NOT fire on a normal publishing turn or a partial-progress admission', () => {
@@ -139,7 +143,46 @@ describe('scheduledRunSignalsConditionalSkip', () => {
       '',
       undefined as unknown as string,
     ];
-    negatives.forEach((c) => expect(scheduledRunSignalsConditionalSkip(c)).toBe(false));
+    negatives.forEach((c) => expect(scheduledRunSignalsConditionalSkip(c, { now: SUNDAY })).toBe(false));
+  });
+
+  it('does NOT fire on a bare "skip today" with no cadence rationale', () => {
+    // Ambiguous skip prose that could equally describe a failure — must NOT be
+    // waived without a cadence/weekday rationale.
+    expect(scheduledRunSignalsConditionalSkip('Skipping today for now.', { now: SUNDAY })).toBe(false);
+    expect(scheduledRunSignalsConditionalSkip('No post today.', { now: SUNDAY })).toBe(false);
+  });
+
+  it('does NOT fire when a failure is worded as a skip (genuine failure must still alert)', () => {
+    const failureSkips = [
+      "Skipping today's post — I could not access LinkedIn.",
+      'No post today; LinkedIn auth failed.',
+      'Non-publishing day handling aside, the post errored and was not published.',
+      "It's a non-publishing day, but I also couldn't reach the API.",
+    ];
+    failureSkips.forEach((c) => expect(scheduledRunSignalsConditionalSkip(c, { now: SUNDAY })).toBe(false));
+  });
+
+  it('does NOT fire when a tool call in the run actually errored', () => {
+    const cleanSkip = 'Today is a non-publishing day per the Mon/Wed/Fri cadence. Skipping this run.';
+    // Same prose, but the ledger shows a real tool error → this was a failure, not a skip.
+    expect(
+      scheduledRunSignalsConditionalSkip(cleanSkip, {
+        now: SUNDAY,
+        toolCalls: [{ name: 'post_on_connected_account', error: 'HTTP 500 from LinkedIn' }],
+      })
+    ).toBe(false);
+    // No tool errors → the same prose is a legitimate skip.
+    expect(
+      scheduledRunSignalsConditionalSkip(cleanSkip, { now: SUNDAY, toolCalls: [{ name: 'read_brand_guidelines' }] })
+    ).toBe(true);
+  });
+
+  it('rejects a skip whose asserted weekday contradicts the server weekday', () => {
+    const MONDAY = new Date('2026-08-03T12:00:00Z');
+    const c = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
+    expect(scheduledRunSignalsConditionalSkip(c, { now: SUNDAY })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(c, { now: MONDAY })).toBe(false);
   });
 });
 
@@ -191,10 +234,12 @@ describe('runScheduledChat — conditional skip day', () => {
     jest.useRealTimers();
   });
 
-  it('records a SUCCESSFUL skip without retrying for the unmet write calls', async () => {
-    // The agent correctly identifies a non-publishing day and produces zero write calls.
+  it('records a SUCCESSFUL skip (marked conditionalSkip) without retrying for the unmet write calls', async () => {
+    // The agent correctly identifies a non-publishing day and produces zero write
+    // calls and zero tool errors. Cadence-anchored, no failure wording, no weekday
+    // assertion to cross-check — so the carve-out fires.
     mockWorker.runInWorker.mockResolvedValue({
-      content: 'Today is Sunday, a non-publishing day. Skipping today — no image generated and nothing published.',
+      content: 'Today is a non-publishing day per the Mon/Wed/Fri cadence. Skipping this run — no image generated and nothing published.',
       toolCalls: [],
       knowledgeBaseQueries: [],
       sources: [],
@@ -204,7 +249,8 @@ describe('runScheduledChat — conditional skip day', () => {
     const result = await runScheduledChat(publishSchedule, mockUserId, true);
 
     // The run must NOT be retried 20 times pressing for post_on_connected_account /
-    // generate_image — it should exit on the first attempt as a clean skip.
+    // generate_image — it should exit on the first attempt as a clean skip, and the
+    // stored result must be DISTINGUISHABLE from a real publish (conditionalSkip).
     expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
     expect(result).toEqual(
       expect.objectContaining({
@@ -213,8 +259,35 @@ describe('runScheduledChat — conditional skip day', () => {
         passed: true,
         attempt: 1,
         functionCallMisses: [],
+        conditionalSkip: true,
       })
     );
+  });
+
+  it('does NOT waive the write calls when the "skip" is actually a tool failure', async () => {
+    // Cadence wording is present, but a required write tool ERRORED — this is a
+    // genuine failure that must still retry + be recorded as a failure (so the
+    // fileAutoIssue/oncall path can fire), never silently waived.
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'It is a non-publishing day, but post_on_connected_account failed anyway.',
+      toolCalls: [{ name: 'post_on_connected_account', error: 'HTTP 500 from LinkedIn' }],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    });
+
+    const result = await runScheduledChat(publishSchedule, mockUserId, true);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
+    expect(result).toEqual(
+      expect.objectContaining({
+        scheduleId: mockScheduleId,
+        status: 'failure',
+        passed: false,
+        attempt: 20,
+      })
+    );
+    expect((result as any).conditionalSkip).toBeUndefined();
   });
 
   it('still retries when the run does NOT signal a skip (write calls genuinely missing)', async () => {
