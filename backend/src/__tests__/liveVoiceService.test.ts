@@ -1304,13 +1304,14 @@ describe('ENG-763 anti-loop directive in the live system prompt', () => {
     // serviced each time (tool calls in between) is not a stuck clarification loop —
     // firing the directive would wrongly refuse/park a legitimate repeated request.
     makeCallbacks();
+    // Live turns persist executed tools under `metadata.toolCalls` — the shape the
+    // guard must recognize on reload (Greptile). One turn uses that shape; another
+    // uses top-level `tool_calls` so the guard is proven to accept both.
     mockGetMessagesFromMessagesTable.mockResolvedValueOnce([
       { role: 'user', content: 'post my weekly update' },
-      { role: 'assistant', content: '', tool_calls: [{ id: 't1', function: { name: 'post_on_connected_account', arguments: '{}' } }] },
-      { role: 'assistant', content: 'Posted your update.' },
+      { role: 'assistant', content: 'Posted your update.', metadata: { toolCalls: [{ name: 'post_on_connected_account' }] } },
       { role: 'user', content: 'post my weekly update' },
-      { role: 'assistant', content: '', tool_calls: [{ id: 't2', function: { name: 'post_on_connected_account', arguments: '{}' } }] },
-      { role: 'assistant', content: 'Posted again.' },
+      { role: 'assistant', content: 'Posted again.', tool_calls: [{ id: 't2', function: { name: 'post_on_connected_account', arguments: '{}' } }] },
       { role: 'user', content: 'post my weekly update' },
     ]);
 
