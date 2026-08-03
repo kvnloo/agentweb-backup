@@ -268,6 +268,36 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     // Undefined instruction (pure text-classifier callers) leaves the gate inert.
     expect(scheduledRunSignalsConditionalSkip(skipProse, { now: SUNDAY })).toBe(true);
   });
+
+  it('cross-checks the RUN DATE against the schedule cadence, not just the prose (Greptile P1)', () => {
+    const sunday = new Date('2026-08-02T12:00:00Z'); // getUTCDay() === 0 (non-publishing)
+    const monday = new Date('2026-08-03T12:00:00Z'); // getUTCDay() === 1 (publishing)
+    const skipProse = 'This is a non-publishing day per the Mon/Wed/Fri cadence. Skipping this run.';
+    const publishOnlyMWF = 'Publish only on Mon/Wed/Fri.';
+
+    // Positive cadence: a skip is legitimate on Sunday (outside the publish window)
+    // but WRONG on Monday (in it) — even though the prose is identical and names no day.
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: publishOnlyMWF })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: publishOnlyMWF })).toBe(false);
+
+    // Naming the weekday correctly does NOT rescue a skip on a publishing day — the
+    // cadence cross-check is authoritative over the model's "non-publishing" claim.
+    const namedMonday = 'Today is Monday, a non-publishing day for this cadence. Skipping.';
+    expect(scheduledRunSignalsConditionalSkip(namedMonday, { now: monday, instruction: publishOnlyMWF })).toBe(false);
+
+    // Skip-day list only: today must be one of the named skip days.
+    const skipList = 'If today is Saturday or Sunday, publish nothing.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: skipList })).toBe(true);
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: monday, instruction: skipList })).toBe(false);
+
+    // Authorized but UNPARSEABLE cadence + no named weekday → fail closed: we cannot
+    // confirm today is genuinely a non-publishing day, so we do not waive.
+    const vagueAuth = 'Skip on any non-publishing day for this schedule.';
+    expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: vagueAuth })).toBe(false);
+    // …but if the model names today's weekday, the UTC check corroborates the run date.
+    const namedSunday = 'Today is Sunday, a non-publishing day. Skipping.';
+    expect(scheduledRunSignalsConditionalSkip(namedSunday, { now: sunday, instruction: vagueAuth })).toBe(true);
+  });
 });
 
 describe('runScheduledChat — conditional skip day', () => {
@@ -318,10 +348,17 @@ describe('runScheduledChat — conditional skip day', () => {
     jest.useRealTimers();
   });
 
+  // A Sunday and a Monday for the Mon/Wed/Fri schedule: Sunday is a genuine
+  // non-publishing day (skip is legitimate), Monday is a publishing day (a skip is
+  // WRONG and must not be waived). Pinned so the run-date cross-check is
+  // deterministic regardless of the day CI runs.
+  const SUNDAY_NON_PUBLISH = new Date('2026-08-02T12:00:00Z'); // getUTCDay() === 0
+  const MONDAY_PUBLISH = new Date('2026-08-03T12:00:00Z'); // getUTCDay() === 1
+
   it('records a SUCCESSFUL skip (marked conditionalSkip) without retrying for the unmet write calls', async () => {
     // The agent correctly identifies a non-publishing day and produces zero write
-    // calls and zero tool errors. Cadence-anchored, no failure wording, no weekday
-    // assertion to cross-check — so the carve-out fires.
+    // calls and zero tool errors. Cadence-anchored, no failure wording, and the run
+    // date (Sunday) is outside the Mon/Wed/Fri publish window — so the carve-out fires.
     mockWorker.runInWorker.mockResolvedValue({
       content: 'Today is a non-publishing day per the Mon/Wed/Fri cadence. Skipping this run — no image generated and nothing published.',
       toolCalls: [],
@@ -330,7 +367,7 @@ describe('runScheduledChat — conditional skip day', () => {
       responseMessages: [],
     });
 
-    const result = await runScheduledChat(publishSchedule, mockUserId, true);
+    const result = await runScheduledChat(publishSchedule, mockUserId, true, undefined, SUNDAY_NON_PUBLISH);
 
     // The run must NOT be retried 20 times pressing for post_on_connected_account /
     // generate_image — it should exit on the first attempt as a clean skip, and the
@@ -346,6 +383,50 @@ describe('runScheduledChat — conditional skip day', () => {
         conditionalSkip: true,
       })
     );
+  });
+
+  it('does NOT waive a skip claimed on a real PUBLISHING day, even without a named weekday (Greptile P1)', async () => {
+    // The Mon/Wed/Fri schedule runs on MONDAY — a publishing day. The model emits
+    // cadence-skip prose but never names Monday, so the weekday cross-check cannot
+    // fire. The run-date-vs-cadence check must still reject it: Monday IS in the
+    // publish window, so a skip is wrong and must retry + alert, not be waived.
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'This is a non-publishing day per the Mon/Wed/Fri cadence — skipping this run, nothing published.',
+      toolCalls: [],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    });
+
+    const result = await runScheduledChat(publishSchedule, mockUserId, true, undefined, MONDAY_PUBLISH);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
+    expect(result).toEqual(
+      expect.objectContaining({ scheduleId: mockScheduleId, status: 'failure', passed: false, attempt: 20 })
+    );
+    expect((result as any).conditionalSkip).toBeUndefined();
+  });
+
+  it('does NOT waive a skip that names the day correctly but the day is a PUBLISHING day (Greptile P1)', async () => {
+    // The trickier case: the model NAMES Monday (so the weekday cross-check passes —
+    // the weekday is stated correctly) but wrongly frames it as non-publishing. The
+    // cadence cross-check is authoritative: Monday is in the Mon/Wed/Fri publish
+    // window, so this is not a legitimate skip.
+    mockWorker.runInWorker.mockResolvedValue({
+      content: 'Today is Monday, a non-publishing day for this cadence. Skipping — nothing published.',
+      toolCalls: [],
+      knowledgeBaseQueries: [],
+      sources: [],
+      responseMessages: [],
+    });
+
+    const result = await runScheduledChat(publishSchedule, mockUserId, true, undefined, MONDAY_PUBLISH);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(20);
+    expect(result).toEqual(
+      expect.objectContaining({ scheduleId: mockScheduleId, status: 'failure', passed: false, attempt: 20 })
+    );
+    expect((result as any).conditionalSkip).toBeUndefined();
   });
 
   it('does NOT waive the write calls when the "skip" is actually a tool failure', async () => {
