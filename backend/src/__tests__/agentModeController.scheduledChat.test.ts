@@ -963,6 +963,38 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // Exhausted -> must NOT schedule another retry.
       const requeue = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantRetryCount === 4);
       expect(requeue).toBeUndefined();
+      // Marks the episode alerted so subsequent failing slots don't re-email.
+      const flagWrite = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantOwnerAlerted === true);
+      expect(flagWrite).toBeTruthy();
+    });
+
+    it('does NOT re-notify once the owner has already been alerted for this episode', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3,
+          zeroAssistantOwnerAlerted: true } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+    });
+
+    it('does NOT mark alerted when there are no recipients (so a later address still gets alerted)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue(null as any); // no owner email, no emailNotifications
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3 } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+      const flagWrite = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantOwnerAlerted === true);
+      expect(flagWrite).toBeUndefined();
     });
 
     it('prefers the schedule\'s configured emailNotifications over the account email', async () => {
@@ -1140,6 +1172,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           zeroAssistantRetryCount: 0,
           lastZeroAssistantOutputAt: '',
           lastZeroAssistantOutputSessionId: '',
+          // ENG-826 #1: a success re-arms the owner alert for a future episode.
+          zeroAssistantOwnerAlerted: false,
         })
       );
     });
