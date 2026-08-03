@@ -30,8 +30,15 @@ import {
   ONBOARDING_TELEMETRY_EVENTS,
   recordOnboardingEvent,
 } from './services/onboardingTelemetry';
+import { createFathomLinearPort } from './services/fathomLinearProductionPort';
+import { registerFathomLinearPort } from './services/fathomLinearPortRegistry';
 
 dotenv.config();
+
+// Production composition root for the Fathom → Linear router. The adapter is
+// inert until a signed recording.ready webhook reaches the router; credentials
+// are resolved lazily through linearService on the first Linear operation.
+registerFathomLinearPort(createFathomLinearPort());
 
 // Fail fast at boot (before binding the port) if the JWT secret is missing, rather than
 // letting tokens be signed/verified with a fallback secret or erroring on first request.
