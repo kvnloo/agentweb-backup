@@ -231,7 +231,12 @@ describe('AgentModeService - Cross-message Loop Detection', () => {
     expect(antiLoopMsg).toBeDefined();
   });
 
-  it('anti-loop message instructs Emma to use brand/market tools and proceed with defaults', async () => {
+  it('anti-loop directive gracefully holds instead of fabricating placeholders (ENG-763)', async () => {
+    // The old directive told the model to "proceed with reasonable generic
+    // placeholders". For tasks like a QA check that has no target, that is an
+    // instruction to fabricate — which the model (correctly) refuses, then falls
+    // back to re-asking the same question, sustaining the very loop this directive
+    // is meant to break. The new directive tells it to offer a menu and hold.
     mockDeps();
     const callLLMSpy = jest
       .spyOn(agentModeService as any, 'callLLM')
@@ -258,8 +263,90 @@ describe('AgentModeService - Cross-message Loop Detection', () => {
       (m: any) => typeof m.content === 'string' && m.content.includes('ANTI-LOOP')
     );
     expect(antiLoopMsg).toBeDefined();
-    expect(antiLoopMsg.content).toContain('reasonable generic placeholders');
-    expect(antiLoopMsg.content).toContain('Never block on missing user-provided details');
+    // No fabrication invitation — that was the loop-sustaining root cause.
+    expect(antiLoopMsg.content).not.toContain('reasonable generic placeholders');
+    expect(antiLoopMsg.content).not.toMatch(/fabricate (?!one)/i);
+    // Graceful hold + concrete menu instead of another round of the same question.
+    expect(antiLoopMsg.content.toLowerCase()).toContain('menu');
+    expect(antiLoopMsg.content.toLowerCase()).toContain('hold');
+    // Must steer AWAY from install_skills as a way to "make progress" (ENG-763).
+    expect(antiLoopMsg.content).toContain('install_skills');
+  });
+});
+
+describe('AgentModeService - install_skills onboarding tool-gate during loops (ENG-763)', () => {
+  let agentModeService: AgentModeService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    agentModeService = new AgentModeService();
+  });
+
+  const TOOLS = [
+    { type: 'function', function: { name: 'install_skills' } },
+    { type: 'function', function: { name: 'read_brand_guidelines' } },
+    { type: 'function', function: { name: 'read_market_strategy' } },
+  ];
+
+  function toolNamesPassedToLLM(callLLMSpy: jest.SpyInstance): string[] {
+    const opts = callLLMSpy.mock.calls[0][2] as any;
+    return (opts?.tools ?? []).map((t: any) => t.function?.name);
+  }
+
+  it('strips install_skills from the tool set on the turn the loop-breaker fires', async () => {
+    mockDeps();
+    jest.spyOn(agentModeService as any, 'getFilteredTools').mockResolvedValue(TOOLS);
+    const callLLMSpy = jest
+      .spyOn(agentModeService as any, 'callLLM')
+      .mockResolvedValue(makeLLMResponse());
+
+    const repeated = 'qa exactly once check';
+    const sessionHistory = [
+      { role: 'user', content: repeated },
+      { role: 'assistant', content: 'Need a target.' },
+      { role: 'user', content: repeated },
+      { role: 'assistant', content: 'Still need a target.' },
+      { role: 'user', content: repeated },
+      { role: 'assistant', content: 'Cannot proceed without a target.' },
+    ];
+
+    await agentModeService.generateMarketingResponse(
+      repeated,
+      sessionHistory as any,
+      'test-user',
+      agentModeService.default_model,
+      'test-session'
+    );
+
+    const names = toolNamesPassedToLLM(callLLMSpy);
+    expect(names).not.toContain('install_skills');
+    // Foundation context tools stay available so the model is never starved.
+    expect(names).toContain('read_brand_guidelines');
+    expect(names).toContain('read_market_strategy');
+  });
+
+  it('does NOT strip install_skills for a normal (non-looping) onboarding turn', async () => {
+    mockDeps();
+    jest.spyOn(agentModeService as any, 'getFilteredTools').mockResolvedValue(TOOLS);
+    const callLLMSpy = jest
+      .spyOn(agentModeService as any, 'callLLM')
+      .mockResolvedValue(makeLLMResponse());
+
+    const sessionHistory = [
+      { role: 'user', content: 'Hi' },
+      { role: 'assistant', content: 'Hello!' },
+    ];
+
+    await agentModeService.generateMarketingResponse(
+      'Help me set up my brand',
+      sessionHistory as any,
+      'test-user',
+      agentModeService.default_model,
+      'test-session'
+    );
+
+    // install_skills is the intended gateway in normal onboarding — keep it.
+    expect(toolNamesPassedToLLM(callLLMSpy)).toContain('install_skills');
   });
 });
 
