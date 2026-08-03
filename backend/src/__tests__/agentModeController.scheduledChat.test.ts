@@ -3000,6 +3000,14 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       mockScheduleDb.getSchedulesByUserId = jest.fn();
     });
 
+    // ENG-826 #4: getScheduledChats now attaches a computed runHealth summary to each
+    // returned schedule (empty runResults -> the zero-state below). These sorting/
+    // filtering assertions compare the full response, so mirror that added field.
+    const withHealth = (s: any) => ({
+      ...s,
+      runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 },
+    });
+
     it('should sort scheduled chats by createdAt descending (newest first)', async () => {
       const oldSchedule = {
         scheduleId: 'old-schedule',
@@ -3054,9 +3062,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       // Verify the response is sorted by createdAt descending
       expect(mockRes.json).toHaveBeenCalledWith([
-        newSchedule,    // 2026-01-26 (newest)
-        middleSchedule, // 2026-01-15
-        oldSchedule,    // 2026-01-01 (oldest)
+        withHealth(newSchedule),    // 2026-01-26 (newest)
+        withHealth(middleSchedule), // 2026-01-15
+        withHealth(oldSchedule),    // 2026-01-01 (oldest)
       ]);
     });
 
@@ -3102,8 +3110,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // Schedule with createdAt should come first (newest)
       // Schedule without createdAt should be treated as epoch 0 (oldest)
       expect(mockRes.json).toHaveBeenCalledWith([
-        scheduleWithCreatedAt,
-        scheduleWithoutCreatedAt,
+        withHealth(scheduleWithCreatedAt),
+        withHealth(scheduleWithoutCreatedAt),
       ]);
     });
 
@@ -3147,7 +3155,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await agentModeController.getScheduledChats(mockReq, mockRes);
 
       // Should only return scheduled_chat type
-      expect(mockRes.json).toHaveBeenCalledWith([scheduledChat]);
+      expect(mockRes.json).toHaveBeenCalledWith([withHealth(scheduledChat)]);
     });
   });
 
