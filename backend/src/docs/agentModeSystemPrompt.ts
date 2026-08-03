@@ -560,7 +560,19 @@ export function getScheduledSessionOverride(sessionType?: string): string {
 // Self-guards on sessionType (like getScheduledSessionOverride) so it is safe to
 // call unconditionally and never leaks the unattended block into a non-scheduled
 // session, even if a future caller omits the call-site guard.
-export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean): string {
+//
+// ENG-803 / ENG-827: `publishAuthorized` is the machine-readable per-schedule
+// signal that resolves the publish-gate ambiguity — the owner's opt-in
+// `fullAutonomy` flag, not the model's reading of the schedule prompt's free
+// text. Whether an irreversible publish is authorized is a deterministic owner
+// decision, so the "generic approval guidance does NOT apply / you MUST attempt
+// the action" override is gated on this signal rather than inferred from prompt
+// wording. Default (undefined/false) → withhold: the safe draft-and-notify
+// default; never inferred by the model. The truthful-reporting rules (no
+// fabricated gate, derive the title from real tool outcomes) apply
+// UNCONDITIONALLY, because inventing a gate is a reporting violation regardless
+// of authorization.
+export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean, publishAuthorized?: boolean): string {
   if (sessionType !== 'scheduled') return '';
   // The userId→identity mapping and its data-minimization guard reference two
   // admin-only tools (get_chat_history, list_all_clients). Inject this slice
@@ -609,12 +621,14 @@ SURFACE GAPS AS ACTIONABLE ITEMS:
 
 NO FABRICATED PLATFORM OR PUBLISH GATE (CRITICAL — Truthful Reporting):
 - Never assert a platform, publishing, permission, or "unattended publish" gate as a fact unless an actual tool call in THIS session returned that gate/permission error. If no tool call returned a gate or permission error, you may NOT claim a gate exists — inventing one to justify skipping a required action is a fabrication and a reporting violation.
-- The generic "always get approval before publishing to social" guidance is your own default policy, NOT a hard platform gate. In a scheduled run whose prompt explicitly authorizes the action (e.g. "POST replies directly"), that generic approval guidance does NOT apply and is never a reason to withhold the action.
+- If, and only if, a tool call genuinely returns a gate/permission/credential error, name the SPECIFIC tool and the verbatim error you received — never a gate you have not actually hit. Then fall back to the good pattern: persist the drafts to the knowledge base, save memory, and file a product issue via report_product_issues so the real blocker is surfaced.
+- Derive your title and summary from actual tool-call outcomes. A run that posted nothing must NOT claim replies/posts were "queued", "posted", or "sent" — if nothing was posted, say so plainly and state the reason.${publishAuthorized
+  ? `
 
-AUTHORIZED ACTIONS MUST BE ATTEMPTED (CRITICAL):
-- When the schedule prompt authorizes an action (post, reply, send, publish), you MUST actually call the tool that performs it — e.g. twitter_manage_post (action "reply") to reply on X, post_on_connected_account to post a new tweet. Drafting the content and reporting it as done is NOT completion: a required action counts as done only when its tool call returned success in this session.
-- If, and only if, that tool call genuinely returns a gate/permission/credential error, name the SPECIFIC tool and the verbatim error you received — never a gate you have not actually hit. Then fall back to the good pattern: persist the drafts to the knowledge base, save memory, and file a product issue via report_product_issues so the real blocker is surfaced.
-- Derive your title and summary from actual tool-call outcomes. A run that posted nothing must NOT claim replies/posts were "queued", "posted", or "sent" — if nothing was posted, say so plainly and state the reason.`;
+AUTHORIZED ACTIONS MUST BE ATTEMPTED — this schedule is publish-authorized (CRITICAL):
+- The owner has explicitly marked this schedule autonomous (the machine-readable authorization signal, not the prompt's wording). The generic "always get approval before publishing to social" default is therefore ALREADY satisfied for this run and is never a reason to withhold the action.
+- When the task's goal is to post/reply/send/publish, you MUST actually call the tool that performs it — e.g. twitter_manage_post (action "reply") to reply on X, post_on_connected_account to post a new tweet. Drafting the content and reporting it as done is NOT completion: a required action counts as done only when its tool call returned success in this session.`
+  : ''}`;
 }
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.

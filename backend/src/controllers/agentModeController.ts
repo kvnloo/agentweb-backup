@@ -3295,7 +3295,24 @@ export async function generateSessionResponse(
           } catch (adminLookupError) {
             console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
           }
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin);
+          // ENG-803: resolve the schedule's opt-in autonomy flag into the
+          // publish-authorization signal so the directive gates the "you MUST
+          // attempt the authorized action / generic approval does NOT apply"
+          // override on the owner's machine-readable opt-in — never on the
+          // model's reading of the schedule prompt's free text. `fullAutonomy`
+          // means the owner explicitly marked this schedule autonomous, which IS
+          // the standing approval to publish unattended. A failed read degrades
+          // to the safe default (not authorized → draft & notify); a
+          // prompt-enrichment lookup must never break the run.
+          let publishAuthorized = false;
+          if (scheduleIdMatch) {
+            try {
+              publishAuthorized = (await scheduleDb.getScheduleById(scheduleIdMatch[1]))?.fullAutonomy === true;
+            } catch (scheduleLookupError) {
+              console.error(`AgentMode: failed to resolve publish authorization for scheduled session ${session.sessionId}; defaulting to draft-and-notify:`, scheduleLookupError);
+            }
+          }
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, publishAuthorized);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
