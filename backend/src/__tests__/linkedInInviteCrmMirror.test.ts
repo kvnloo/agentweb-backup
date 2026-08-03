@@ -126,7 +126,9 @@ describe('mirrorLinkedInInviteToCrm', () => {
     });
 
     expect(res).toEqual({ leadId: 'lead_new_1', listId: LIST, created: true, engagementLogged: true });
-    // normalized (lowercased, query/trailing-slash stripped, www-canonical)
+    // normalized (lowercased, query/trailing-slash stripped, www-canonical), created
+    // under a DETERMINISTIC url-derived leadId with a fail-if-exists guard so two
+    // concurrent mirrors of one invitee cannot spawn duplicate leads (ENG-787).
     expect(createLead).toHaveBeenCalledWith(LIST, expect.objectContaining({
       linkedin: 'https://www.linkedin.com/in/david-yao',
       firstName: 'David',
@@ -134,7 +136,10 @@ describe('mirrorLinkedInInviteToCrm', () => {
       company: 'Acme',
       status: 'contacted',
       userId: 'user_1',
+      leadId: expect.stringMatching(/^lead_li_[0-9a-f]+$/),
+      failIfExists: true,
     }));
+    // Engagement appended through the unified CAS path (4th opts arg present).
     expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_new_1', expect.objectContaining({
       eventType: 'linkedin.invite.sent',
       eventData: expect.objectContaining({
@@ -142,7 +147,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
         accountId: 'tMgX8uZJTZWTG_mFY1aI2A',
         linkedin: 'https://www.linkedin.com/in/david-yao',
       }),
-    }));
+    }), expect.anything());
     // stamps the invite timestamp
     expect(updateLead).toHaveBeenCalledWith(LIST, 'lead_new_1', expect.objectContaining({
       linkedInInviteSentAt: expect.any(String),
@@ -386,7 +391,7 @@ describe('mirrorLinkedInInviteToCrm', () => {
       });
       expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_new_1', expect.objectContaining({
         eventData: expect.objectContaining({ invitationId: 'inv_1' }),
-      }));
+      }), expect.anything());
     });
 
     it('skips the append when the same invitation id is already recorded', async () => {
@@ -595,12 +600,37 @@ describe('mirrorLinkedInInviteToCrm', () => {
       expect(res?.engagementLogged).toBe(false);
     });
 
-    it('appends a brand-new lead unguarded — nothing can be racing it yet', async () => {
+    it('appends a brand-new lead through the unified (dedup-checked) path', async () => {
+      // The created path no longer short-circuits to an unconditional append: it
+      // flows through the same CAS/idempotency loop as every other path, so a lead
+      // adopted from a concurrent create cannot double-log the same invitation.
       findLeadByLinkedinInList.mockResolvedValue(null);
       await mirrorLinkedInInviteToCrm({
         listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
       });
-      expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_new_1', expect.anything());
+      expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_new_1', expect.anything(), expect.anything());
+    });
+
+    it('adopts the winner and does not create a duplicate when a concurrent create wins the race', async () => {
+      // Greptile P1: two mirrors creating the same absent invitee at once used to
+      // insert two leads. The loser's fail-if-exists create now throws
+      // leadAlreadyExists; the mirror adopts the winner's lead by its deterministic id.
+      findLeadByLinkedinInList.mockResolvedValue(null);
+      const raceErr: any = new Error('exists'); raceErr.leadAlreadyExists = true;
+      createLead.mockRejectedValueOnce(raceErr);
+      // The winner's lead, resolved by the deterministic id via getLeadById.
+      getLeadById.mockResolvedValueOnce({
+        leadId: 'lead_li_winner', listId: LIST, status: 'contacted', updatedAt: '2026-08-03T00:00:00.000Z',
+      });
+
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
+      });
+
+      expect(res).toEqual({ leadId: 'lead_li_winner', listId: LIST, created: false, engagementLogged: true });
+      // Exactly one create attempt was made — no duplicate lead spawned.
+      expect(createLead).toHaveBeenCalledTimes(1);
+      expect(getLeadById).toHaveBeenCalledWith(LIST, expect.stringMatching(/^lead_li_[0-9a-f]+$/));
     });
 
     it('appends unguarded when the lead has no updatedAt to compare against', async () => {

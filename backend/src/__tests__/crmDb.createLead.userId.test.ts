@@ -145,3 +145,49 @@ describe('crmDb.createLead — userId + nameCompanyKey', () => {
     expect(lastPutItem().linkedin).toBe('https://www.linkedin.com/in/jane');
   });
 });
+
+// ENG-787: deterministic leadId + fail-if-exists conditional create, so two
+// concurrent mirrors of the same invitee resolve to ONE lead (Greptile P1).
+describe('crmDb.createLead — deterministic id + failIfExists', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    queryPromiseMock.mockResolvedValue({ Items: [] });
+    putPromiseMock.mockResolvedValue({});
+  });
+
+  function lastPutParams(): any {
+    const call = putSpy.mock.calls[putSpy.mock.calls.length - 1];
+    if (!call) throw new Error('put was not called');
+    return call[0];
+  }
+
+  it('uses the caller-supplied leadId and guards the put with attribute_not_exists', async () => {
+    getPromiseMock.mockResolvedValueOnce({ Item: { listId: 'list-1', userId: 'user-1' } }).mockResolvedValue({ Item: null });
+
+    const res = await crmDb.createLead('list-1', {
+      firstName: 'Jane', lastName: 'Doe', company: 'Acme',
+      leadId: 'lead_li_deadbeef', failIfExists: true,
+    });
+
+    expect((res as any).leadId).toBe('lead_li_deadbeef');
+    expect(lastPutParams().Item.leadId).toBe('lead_li_deadbeef');
+    expect(lastPutParams().ConditionExpression).toBe('attribute_not_exists(leadId)');
+  });
+
+  it('does NOT set a ConditionExpression when failIfExists is absent (default put unchanged)', async () => {
+    getPromiseMock.mockResolvedValueOnce({ Item: { listId: 'list-1', userId: 'user-1' } }).mockResolvedValue({ Item: null });
+    await crmDb.createLead('list-1', { firstName: 'Jane', lastName: 'Doe' });
+    expect(lastPutParams().ConditionExpression).toBeUndefined();
+  });
+
+  it('throws a tagged leadAlreadyExists error when the conditional put loses the race', async () => {
+    getPromiseMock.mockResolvedValueOnce({ Item: { listId: 'list-1', userId: 'user-1' } }).mockResolvedValue({ Item: null });
+    const conditionErr: any = new Error('The conditional request failed');
+    conditionErr.code = 'ConditionalCheckFailedException';
+    putPromiseMock.mockRejectedValueOnce(conditionErr);
+
+    await expect(
+      crmDb.createLead('list-1', { firstName: 'Jane', leadId: 'lead_li_x', failIfExists: true }),
+    ).rejects.toMatchObject({ leadAlreadyExists: true });
+  });
+});
