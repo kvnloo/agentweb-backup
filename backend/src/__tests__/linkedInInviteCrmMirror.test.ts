@@ -548,6 +548,26 @@ describe('mirrorLinkedInInviteToCrm', () => {
       );
     });
 
+    it('CASes against the freshly stamped updatedAt for a legacy lead that loaded without one', async () => {
+      // A pre-existing lead from before updatedAt was stamped: the loaded snapshot
+      // has no updatedAt, but updateLead (ALL_NEW) returns the value it just set.
+      // The append must guard on that fresh value, not fall to the unguarded path
+      // where two concurrent mirrors would both double-log the same invitation
+      // (ENG-787 Greptile P1).
+      const legacy = { leadId: 'lead_existing', listId: LIST, status: 'contacted', linkedin: PROFILE, engagements: [] };
+      findLeadByLinkedinInList.mockResolvedValue(legacy);
+      updateLead.mockResolvedValueOnce({ ...legacy, updatedAt: '2026-08-03T00:00:00.000Z' });
+
+      await mirrorLinkedInInviteToCrm({
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
+      });
+
+      expect(addLeadEngagement).toHaveBeenCalledWith(
+        LIST, 'lead_existing', expect.anything(),
+        { expectedUpdatedAt: '2026-08-03T00:00:00.000Z' },
+      );
+    });
+
     it('skips when the racing writer already recorded this invitation', async () => {
       findLeadByLinkedinInList.mockResolvedValue(lead());
       const raced: any = new Error('precondition failed');
