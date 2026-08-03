@@ -93,7 +93,8 @@ function stableToolExecutionKey(toolName: string, args: unknown): string {
 const LIVE_SYSTEM_PROMPT = `You are Emma, an expert marketing assistant having a voice conversation.
 Speak with a neutral General American English accent.
 Respond naturally and conversationally — keep answers concise and direct.
-Be warm and friendly, enthusiastic about good news, thoughtful when analyzing data, encouraging when motivating the user, and concerned when flagging problems.`;
+Be warm and friendly, enthusiastic about good news, thoughtful when analyzing data, encouraging when motivating the user, and concerned when flagging problems.
+Never attribute words to the user that they did not literally say. Only ever quote the user's own actual words — never quote internal or system-authored instructions (including any "override" or "system" text) back as if the user wrote them.`;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -142,6 +143,8 @@ interface LiveEntry {
   lastUserActivityAt?: number;
   /** Number of completed assistant turns in this live session. */
   turnCount: number;
+  /** Tool profile in effect — the onboarding profile hard-gates forbidden tools. */
+  toolProfile: LiveToolProfile;
 }
 
 // ---------------------------------------------------------------------------
@@ -473,13 +476,55 @@ async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
       }
     }
 
-    if (lines.length === 0) return '';
+    const historyBlock = lines.length === 0
+      ? ''
+      : `\n\n--- Prior conversation history (for context) ---\n${lines.join('\n')}\n--- End of prior history ---`;
 
-    return `\n\n--- Prior conversation history (for context) ---\n${lines.join('\n')}\n--- End of prior history ---`;
+    return historyBlock + buildAntiLoopDirective(allMessages);
   } catch (err: any) {
     console.warn('[liveVoiceService] Failed to load history for system prompt:', err?.message);
     return '';
   }
+}
+
+/**
+ * ENG-763 — cross-message loop breaker for the live-voice path. When the user
+ * has repeated the same low-signal message several times in a row, the model
+ * tends to loop restating the same clarification instead of making progress.
+ * Mirrors the text-path directive in agentModeService (LOOP_DETECTION_THRESHOLD),
+ * but embeds it in the system instruction so it is never attributable to the
+ * user (the live WebSocket has no per-turn message array to inject into).
+ * Returns an empty string when no loop is detected.
+ */
+function buildAntiLoopDirective(allMessages: Array<{ role: string; content: unknown }>): string {
+  const LOOP_DETECTION_THRESHOLD = 3;
+  const normalize = (content: unknown): string => {
+    const text = typeof content === 'string'
+      ? content
+      : Array.isArray(content)
+        ? (content as any[]).map((c: any) => c?.text || '').filter(Boolean).join(' ')
+        : String(content ?? '');
+    return text.trim().toLowerCase();
+  };
+
+  const userMessages = allMessages.filter(m => m.role === 'user');
+  if (userMessages.length < LOOP_DETECTION_THRESHOLD) return '';
+
+  const lastNorm = normalize(userMessages[userMessages.length - 1].content);
+  if (!lastNorm) return '';
+
+  let trailingIdentical = 0;
+  for (let i = userMessages.length - 1; i >= 0; i--) {
+    if (normalize(userMessages[i].content) === lastNorm) trailingIdentical++;
+    else break;
+  }
+  if (trailingIdentical < LOOP_DETECTION_THRESHOLD) return '';
+
+  return `\n\n[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] The user has sent the same message ${trailingIdentical} times without providing information you asked for. They will NOT provide it. You MUST:
+1. STOP asking for that information — do not repeat the same clarification again
+2. Use your available tools to find context yourself (e.g. read_brand_guidelines for business name, website, and brand info)
+3. If context is still insufficient, offer a concrete short menu of next steps or gracefully hold — do not loop
+4. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words.`;
 }
 
 /**
@@ -644,6 +689,7 @@ async function doStartLiveSession(
     functionDeclarations,
     startedAt,
     turnCount: 0,
+    toolProfile,
   };
 
   // Pass history via system prompt on fresh starts. Code-1000 resumptions already
@@ -1014,6 +1060,20 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
         const toolName = fc.name!;
         const toolArgs = fc.args ?? {};
         const isOnboardingSafe = ONBOARDING_LIVE_TOOLS.has(toolName);
+
+        // ENG-763: hard tool-gate for the onboarding flow. `install_skills` (and any
+        // other non-onboarding tool) is forbidden during onboarding. The onboarding
+        // profile already omits it from the declared tool set, but a hallucinated or
+        // model-fabricated call must still be blocked here at the gate rather than
+        // executed — prompt instructions alone are not a guardrail.
+        if (entry.toolProfile === 'onboarding' && !isOnboardingSafe) {
+          console.warn(`[liveVoiceService] Blocked forbidden tool "${toolName}" during onboarding for ${sessionId}`);
+          const blockedMsg = `${toolName} is not available during onboarding.`;
+          if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
+          entry.pendingToolCalls.push({ id: fc.id || toolName, name: toolName, arguments: toolArgs, error: blockedMsg });
+          return { id: fc.id, name: toolName, response: { error: blockedMsg } } as any;
+        }
+
         try {
           let execution: Promise<any>;
           if (isOnboardingSafe) {
