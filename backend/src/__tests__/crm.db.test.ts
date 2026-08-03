@@ -2030,6 +2030,35 @@ describe('CRM Database Service', () => {
       expect(params.ExpressionAttributeValues[':expectedUpdatedAt']).toBe('2026-07-31T10:00:00.000Z');
     });
 
+    it('advances updatedAt strictly past the CAS token when the clock is in the same millisecond', async () => {
+      // Otherwise a successful append could rewrite the identical updatedAt, leaving
+      // the CAS token unchanged so a second concurrent append still satisfies it and
+      // double-records the engagement (ENG-787).
+      const expected = '2026-07-31T10:00:00.000Z';
+      jest.useFakeTimers().setSystemTime(new Date(expected));
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev, { expectedUpdatedAt: expected });
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.ExpressionAttributeValues[':updatedAt']).toBe('2026-07-31T10:00:00.001Z');
+      expect(params.ExpressionAttributeValues[':updatedAt'] > expected).toBe(true);
+      jest.useRealTimers();
+    });
+
+    it('keeps the real timestamp when the clock is already past the CAS token', async () => {
+      const expected = '2026-07-31T10:00:00.000Z';
+      const now = '2026-07-31T10:00:05.000Z';
+      jest.useFakeTimers().setSystemTime(new Date(now));
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev, { expectedUpdatedAt: expected });
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.ExpressionAttributeValues[':updatedAt']).toBe(now);
+      jest.useRealTimers();
+    });
+
     it('flags a lost CAS race distinctly from a missing lead', async () => {
       const err: any = new Error('conditional request failed');
       err.code = 'ConditionalCheckFailedException';
