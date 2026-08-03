@@ -3076,14 +3076,22 @@ export class AgentModeService {
       ).length;
 
       if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD) {
+        // ENG-763: inject as a `system` directive, NOT a `user` turn. Provider
+        // converters hoist role:'system' into the system instruction, so the model
+        // never sees this control text as part of the user's message. Injecting it
+        // as role:'user' (with the old "[SYSTEM OVERRIDE]" wording) caused the model
+        // — Gemini merges consecutive user parts — to read the directive as the
+        // user's own words and quote "[SYSTEM OVERRIDE]" back, attributing text to
+        // the user that they never sent.
         messages.push({
-          role: 'user',
-          content: `[SYSTEM OVERRIDE - ANTI-LOOP TRIGGERED] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
+          role: 'system',
+          content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
 1. STOP asking for that information immediately — do not repeat it again under any circumstances
 2. Use your available tools to find context yourself: call read_brand_guidelines to get business name, website, and brand info; call read_market_strategy to get goals and target market
 3. If those tools provide enough context, proceed with the task using that information
 4. If context is still insufficient, proceed with reasonable generic placeholders and complete as much of the task as possible
-5. Never block on missing user-provided details — always find a way to make progress`
+5. Never block on missing user-provided details — always find a way to make progress
+6. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
         });
       }
 
