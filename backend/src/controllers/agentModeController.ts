@@ -860,22 +860,90 @@ function instructionAuthorizesConditionalSkip(instruction: string): boolean {
   return SCHEDULE_SKIP_AUTHORIZATION_PATTERNS.some((re) => re.test(text));
 }
 
+const WEEKDAY_ABBREV_TO_INDEX: Record<string, number> = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+};
+
+// Extract every weekday named in a text fragment (Mon, Tuesday, THU, …) as 0–6
+// indices, plus the "weekend"/"weekday" shorthands the owner may use instead of
+// listing days. Order/dupes don't matter — callers collect into a Set.
+function weekdaysInFragment(fragment: string): number[] {
+  const out: number[] = [];
+  for (const m of fragment.matchAll(/\b(sun|mon|tue|wed|thu|fri|sat)[a-z]*\b/gi)) {
+    const idx = WEEKDAY_ABBREV_TO_INDEX[m[1].toLowerCase()];
+    if (idx !== undefined) out.push(idx);
+  }
+  if (/\bweekends?\b/i.test(fragment)) out.push(0, 6);
+  if (/\bweekdays?\b/i.test(fragment)) out.push(1, 2, 3, 4, 5);
+  return out;
+}
+
+// Parse the schedule OWNER'S instruction into the day-sets that define its
+// publishing cadence: the days it publishes on ("publish only on Mon/Wed/Fri")
+// and/or the days it explicitly skips ("if Tue/Thu/Sat/Sun, publish nothing").
+// Used to cross-check the actual RUN DATE — a skip claimed on a real publishing
+// day must NOT be waived even if the model omits or mislabels the weekday
+// (Greptile P1, ENG-844). Clause-scoped so a "publish" clause and a "skip" clause
+// in the same instruction are classified independently; an ambiguous day-bearing
+// clause (neither keyword) is ignored rather than guessed.
+function parseScheduleCadence(instruction: string): { publishDays: Set<number>; skipDays: Set<number> } {
+  const publishDays = new Set<number>();
+  const skipDays = new Set<number>();
+  if (!instruction || typeof instruction !== 'string') return { publishDays, skipDays };
+  const text = instruction.replace(/<[^>]+>/g, ' ');
+  const skipKeyword = /\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post)|non-?publishing|not\s+a\s+(?:publishing|posting)\s+day)\b/i;
+  const publishOnlyKeyword = /\b(?:publish|post|publishing)\s+only\b|\bonly\s+(?:publish|post|on)\b/i;
+  for (const clause of text.split(/[.;\n]+/)) {
+    const days = weekdaysInFragment(clause);
+    if (days.length === 0) continue;
+    const isSkip = skipKeyword.test(clause);
+    const isPublishOnly = publishOnlyKeyword.test(clause);
+    // A "publish only on <days>" clause names the PUBLISH days; a skip clause names
+    // the SKIP days. Publish-only wins a tie (its days are the positive cadence).
+    if (isPublishOnly) days.forEach((d) => publishDays.add(d));
+    else if (isSkip) days.forEach((d) => skipDays.add(d));
+  }
+  return { publishDays, skipDays };
+}
+
 export function scheduledRunSignalsConditionalSkip(
   content: string,
   options: { toolCalls?: any[]; now?: Date; instruction?: string } = {}
 ): boolean {
   if (!content || typeof content !== 'string') return false;
 
-  // (0) Authorization gate: only honor a skip the SCHEDULE OWNER authorized. When
-  // the caller supplies the schedule's instruction (it always does on the real
-  // scheduled path), it must itself define the conditional cadence — otherwise a
-  // model-authored skip on a run that carries write-call minimums is unauthorized
-  // and must NOT be waived (Greptile P1, ENG-844). Undefined instruction (pure
-  // text-classifier unit tests) leaves this check inert.
+  const now = options.now ?? new Date();
+  const todayIdx = now.getUTCDay();
+  // Tracks whether the skip has been corroborated against the actual RUN DATE
+  // (by the parsed cadence and/or the model naming today's weekday). When an
+  // instruction is provided we REQUIRE this before waiving (see final gate).
+  let runDateCorroborated = false;
+
+  // (0) Authorization + run-date gate: only honor a skip the SCHEDULE OWNER
+  // authorized, ON a day that owner's cadence actually excludes. When the caller
+  // supplies the schedule's instruction (it always does on the real scheduled
+  // path):
+  //   - the instruction must itself define a conditional cadence (else a
+  //     model-authored skip on a run carrying write-call minimums is unauthorized);
+  //   - and TODAY must be a non-publishing day under that cadence. Parsing the
+  //     instruction's publish/skip day-lists lets us reject a skip emitted ON a
+  //     publishing day even when the model omits or mislabels the weekday — the
+  //     deeper form of the same bug (Greptile P1, ENG-844).
+  // Undefined instruction (pure text-classifier callers) leaves this gate inert.
   const instruction = options.instruction;
-  if (typeof instruction === 'string' && instruction.length > 0 &&
-      !instructionAuthorizesConditionalSkip(instruction)) {
-    return false;
+  const instructionProvided = typeof instruction === 'string' && instruction.length > 0;
+  if (instructionProvided) {
+    if (!instructionAuthorizesConditionalSkip(instruction!)) return false;
+    const { publishDays, skipDays } = parseScheduleCadence(instruction!);
+    if (publishDays.size > 0) {
+      // Positive cadence: today must fall OUTSIDE the publish window.
+      if (publishDays.has(todayIdx)) return false;
+      runDateCorroborated = true;
+    } else if (skipDays.size > 0) {
+      // Only a skip-day list was given: today must be one of the named skip days.
+      if (!skipDays.has(todayIdx)) return false;
+      runDateCorroborated = true;
+    }
   }
 
   // Emma emits HTML (the marketing persona renders <strong>, <ul>, <table>…), so
@@ -923,9 +991,16 @@ export function scheduledRunSignalsConditionalSkip(
   // both sides share. This catches a grossly mis-dated skip without false rejects.
   const asserted = assertedTodayWeekday(text);
   if (asserted !== null) {
-    const now = options.now ?? new Date();
-    if (asserted !== now.getUTCDay()) return false;
+    if (asserted !== todayIdx) return false;
+    runDateCorroborated = true;
   }
+
+  // (5) When the schedule instruction is provided (the real scheduled path always
+  // provides it), the skip MUST be corroborated against the run date — by the
+  // parsed cadence and/or the model naming today's weekday. If neither could
+  // confirm today is genuinely a non-publishing day, fail closed rather than waive
+  // a possibly-missed publication on an audited pipeline (Greptile P1, ENG-844).
+  if (instructionProvided && !runDateCorroborated) return false;
 
   return true;
 }
@@ -1292,6 +1367,10 @@ export async function runVerifiedChat(
     // `passed: false` for calls it made before the interruption, and the verify
     // retry loop could re-prompt the model into re-running a completed side-effect.
     priorToolCalls?: Array<{ name: string }>;
+    // Injectable clock for the conditional-skip run-date cross-check (ENG-844).
+    // Production leaves it undefined (the detector uses `new Date()`); tests pin it
+    // so the cadence-vs-today check is deterministic regardless of the day CI runs.
+    now?: Date;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -1830,7 +1909,7 @@ export async function runVerifiedChat(
         (reqFunc) => countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) === 0
       );
       if (completionGate && !allFunctionCallsMet && noRequiredWriteCallsMade &&
-          scheduledRunSignalsConditionalSkip(allContent, { toolCalls: allToolCalls, instruction: startingMessage })) {
+          scheduledRunSignalsConditionalSkip(allContent, { toolCalls: allToolCalls, instruction: startingMessage, now: params.now })) {
         // Low-severity breadcrumb: a conditional skip is a SUCCESSFUL run, but it is
         // waiving write-call minimums on an audited publishing pipeline, so keep it
         // observable (and threaded into runResults via `conditionalSkip`) rather than
@@ -2043,7 +2122,10 @@ export async function runScheduledChat(
   schedule: any,
   userId: string,
   isTest: boolean = false,
-  preGeneratedRunId?: string
+  preGeneratedRunId?: string,
+  // Injectable clock forwarded to the conditional-skip run-date cross-check
+  // (ENG-844). Production omits it; tests pin it for a deterministic weekday.
+  nowOverride?: Date
 ): Promise<MarketingActionCarrier & {
   scheduleId: string;
   runId: string;
@@ -2653,7 +2735,10 @@ export async function runScheduledChat(
       fullAutonomy: schedule.fullAutonomy === true,
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
-      parkNotifiable: true
+      parkNotifiable: true,
+      // ENG-844: forward the injectable clock so the conditional-skip run-date
+      // cross-check is deterministic under test (undefined in production).
+      now: nowOverride
     });
 
     // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
