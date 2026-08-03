@@ -90,11 +90,11 @@ const SCHEDULED_JOB_INCOMPLETE_MESSAGE =
 // however small it is. The failing session's stored assistant message used to assert
 // the budget cause unconditionally, sending anyone debugging from the transcript down
 // the wrong path (the ENG-826 gemini-3.5-flash union-schema 400 read as a size limit).
-// Wording note: this path records the run as failed (session error + failureClass
-// metadata, picked up by the daily satisfaction scorer) and retries it, but does NOT
-// currently raise a proactive per-run owner alert (issue #1 in ENG-826 — the requeue-
-// exhaustion branch only logs). So the copy promises recording + retry + a support
-// contact, NOT an active investigation we can't yet guarantee.
+// Wording note: this per-run message is shown for EVERY failed attempt (including the
+// early ones that will still auto-retry), so it only promises recording + automatic
+// retry + a support contact. The proactive owner email (ENG-826 #1) is sent separately
+// and ONLY once the retries are exhausted (see the requeue-exhaustion branch below), so
+// it is not claimed here — that would over-promise on attempts that haven't exhausted yet.
 const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
   "This scheduled run stopped before it could produce a response, so no results were generated. " +
   "It ran into an unexpected system error — not a time or size limit — so retrying or splitting the " +
@@ -2825,8 +2825,44 @@ export async function runScheduledChat(
           }
         } else {
           console.error(
-            `Scheduled chat ${schedule.scheduleId} exceeded zero-output requeue limit (${ZERO_ASSISTANT_MAX_REQUEUES}); alerting without requeue.`
+            `Scheduled chat ${schedule.scheduleId} exceeded zero-output requeue limit (${ZERO_ASSISTANT_MAX_REQUEUES}); notifying owner.`
           );
+          // ENG-826 (#1): the automatic retries are exhausted — the schedule is
+          // consistently failing and won't auto-retry until its next slot. Proactively
+          // notify the owner instead of only logging (the old behaviour left the owner
+          // unaware). Recipients: the schedule's configured notification list, else the
+          // owner's account email. Best-effort — a notification failure must never break
+          // the run, and it fires only ONCE at exhaustion (not on each of the retries).
+          try {
+            let recipients: string[] = Array.isArray(schedule.emailNotifications)
+              ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+              : [];
+            if (recipients.length === 0) {
+              const owner = await userDb.getUserById(userId);
+              if (owner?.email) recipients = [owner.email];
+            }
+            if (recipients.length > 0) {
+              await emailService.sendScheduledRunFailedEmail(
+                recipients,
+                schedule.scheduleName,
+                schedule.scheduleId,
+                {
+                  failedAttempts: nextRetryCount,
+                  failureClass: classifyZeroAssistantFailure(error),
+                  userMessage: zeroAssistantIncompleteMessage(error),
+                }
+              );
+            } else {
+              console.error(
+                `No notification recipients for repeatedly-failing schedule ${schedule.scheduleId}; owner alert skipped.`
+              );
+            }
+          } catch (notifyError) {
+            console.error(
+              `Failed to send owner failure alert for schedule ${schedule.scheduleId}:`,
+              notifyError
+            );
+          }
         }
       }
     }
