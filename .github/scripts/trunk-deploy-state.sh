@@ -240,35 +240,38 @@ elif [ "${HEAD_SHA_MATCHES_TRUNK}" != 'true' ]; then
   SHA_NOTE=" This is the newest trunk commit that has a completed deploy (${RUN_HEAD_SHA:-unknown}); the current ${TRUNK_BRANCH} head ${TRUNK_HEAD_SHA:-unknown} has not deployed yet."
 fi
 
-case "${CONCLUSION}" in
-  success)
-    # A success only proves the trunk is shippable if it was chosen by walking
-    # trunk history. Without that ranking an ancestor re-run can be masking a
-    # newer commit's failed deploy, so the honest state is UNKNOWN rather than
-    # DEPLOYABLE — and UNKNOWN fails closed under enforcement, exactly as a
-    # missing run or an unreadable payload does. Reporting mode still shows the
-    # recency reading so a human can see what was found.
-    #
-    # A FAILURE needs no such caveat and stays BLOCKED either way: a failed
-    # deploy is positive evidence, and ranking cannot make it less true.
-    if [ "${COMMIT_RANKED}" = 'true' ]; then
+# Ranking decides whether the run is evidence about TRUNK at all; the run's
+# conclusion decides what that evidence says. Those are separate questions and
+# conflating them is what produced the earlier asymmetry.
+#
+# An unrankable run is not authoritative in EITHER direction. An unrankable
+# success might be an ancestor re-run masking a newer failure; an unrankable
+# failure might be a run older than the history window, or a commit that was
+# force-pushed away, and blaming current trunk for it sends someone hunting a
+# problem that is not there. Both are UNKNOWN, and UNKNOWN fails closed under
+# enforcement exactly as a missing run or an unreadable payload does — so
+# nothing becomes less safe, only less falsely confident.
+if [ "${COMMIT_RANKED}" != 'true' ]; then
+  STATE='UNKNOWN'
+  REASON="a ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} ended '${CONCLUSION:-no conclusion}', but it could not be ranked against trunk history, so it says nothing authoritative about ${TRUNK_BRANCH}.${SHA_NOTE}"
+else
+  case "${CONCLUSION}" in
+    success)
       STATE='DEPLOYABLE'
-      REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} succeeded.${SHA_NOTE}"
-    else
+      REASON="the newest ${TRUNK_BRANCH} commit with a completed ${TRUNK_DEPLOY_WORKFLOW} run succeeded.${SHA_NOTE}"
+      ;;
+    '' | null)
       STATE='UNKNOWN'
-      REASON="a ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} succeeded, but it could not be ranked against trunk history, so it does not prove ${TRUNK_BRANCH} is deployable.${SHA_NOTE}"
-    fi
-    ;;
-  '' | null)
-    REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run (${RUN_ID}) reported no conclusion."
-    ;;
-  *)
-    # failure, cancelled, timed_out, startup_failure, action_required, neutral.
-    # Only `success` means the trunk shipped. A cancelled deploy never reached
-    # production, so counting it as fine is how a trunk goes quietly unshipped.
-    STATE='BLOCKED'
-    REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} ended '${CONCLUSION}', so ${TRUNK_BRANCH} is not known to be deployable.${SHA_NOTE}"
-    ;;
-esac
+      REASON="the deciding ${TRUNK_DEPLOY_WORKFLOW} run (${RUN_ID}) reported no conclusion."
+      ;;
+    *)
+      # failure, cancelled, timed_out, startup_failure, action_required, neutral.
+      # Only `success` means the trunk shipped. A cancelled deploy never reached
+      # production, so counting it as fine is how a trunk goes quietly unshipped.
+      STATE='BLOCKED'
+      REASON="the newest ${TRUNK_BRANCH} commit with a completed ${TRUNK_DEPLOY_WORKFLOW} run ended '${CONCLUSION}', so ${TRUNK_BRANCH} is not deployable.${SHA_NOTE}"
+      ;;
+  esac
+fi
 
 finish

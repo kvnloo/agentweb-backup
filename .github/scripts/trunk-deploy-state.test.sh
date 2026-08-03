@@ -112,6 +112,15 @@ RUN_CANCELLED='{"databaseId":30700000002,"status":"completed","conclusion":"canc
                 "url":"https://github.com/AgentWebPro/agentweb/actions/runs/30700000002",
                 "headSha":"ee55ff66"}'
 
+# history <dir> <sha...>  — trunk commits, newest first. Without this a fixture
+# is deliberately unrankable, which is now UNKNOWN in BOTH directions.
+history() {
+  local dir="$1"; shift
+  : >"${dir}/trunk_commits"
+  local sha
+  for sha in "$@"; do printf '%s\n' "${sha}" >>"${dir}/trunk_commits"; done
+}
+
 STDOUT=''
 STATUS=0
 
@@ -148,17 +157,17 @@ install_mock_gh
 # ---------------------------------------------------------------------------
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
-printf '%s\n' '9db4d5947' >"${d}/trunk_commits"
+history "${d}" '9db4d5947'
 run_gate "${d}"
 check 'AC4: a healthy trunk reports DEPLOYABLE and exits 0' 0 'state=DEPLOYABLE'
 
-d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"; history "${d}" 'aa11bb22'
 run_gate "${d}"
 check 'AC4: a failed latest deploy reports BLOCKED' 0 'state=BLOCKED'
 
 # Reporting mode stays exit 0 so a monitoring caller can read state without
 # treating a broken trunk as its own crash. Enforcement is opt-in, below.
-d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"; history "${d}" 'aa11bb22'
 run_gate "${d}"
 check 'AC4: BLOCKED still exits 0 in report mode' 0 'run_url=https://github.com/AgentWebPro/agentweb/actions/runs/30712345678'
 
@@ -166,29 +175,29 @@ check 'AC4: BLOCKED still exits 0 in report mode' 0 'run_url=https://github.com/
 # AC2 — the merge gate refuses to merge onto a broken trunk, and NAMES it
 # ---------------------------------------------------------------------------
 
-d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"; history "${d}" 'aa11bb22'
 run_gate "${d}" --require-deployable
 check 'AC2: --require-deployable refuses a broken trunk' 1 'TRUNK_NOT_DEPLOYABLE'
 
-d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"; history "${d}" 'aa11bb22'
 run_gate "${d}" --require-deployable
 check 'AC2: the refusal names the failing run so it is actionable' 1 '30712345678'
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
-printf '%s\n' '9db4d5947' >"${d}/trunk_commits"
+history "${d}" '9db4d5947'
 run_gate "${d}" --require-deployable
 check 'AC2: a healthy trunk passes enforcement' 0 'state=DEPLOYABLE'
 
 # The override exists because a fix FOR the broken deploy must be mergeable.
 # Requiring a reason is the whole point: it has to be a decision, not a flag.
-d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"; history "${d}" 'aa11bb22'
 STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_DEPLOY_OVERRIDE_REASON='#2241 reverts the deploy that broke trunk' \
   bash "${GATE_SCRIPT}" --require-deployable 2>&1)"; STATUS=$?
 check 'AC2: an explicit override merges and is recorded' 0 'override=#2241 reverts the deploy that broke trunk'
 
 # An empty override must not silently disable the gate — that is how a control
 # becomes decorative.
-d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"; history "${d}" 'aa11bb22'
 STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_DEPLOY_OVERRIDE_REASON='' \
   bash "${GATE_SCRIPT}" --require-deployable 2>&1)"; STATUS=$?
 check 'AC2: an empty override reason does NOT unblock' 1 'TRUNK_NOT_DEPLOYABLE'
@@ -218,22 +227,22 @@ check 'fail-closed: an unreadable payload blocks rather than passing' 2 'UNKNOWN
 # newest COMPLETED run is what decides; an in-flight run is reported, never
 # mistaken for proof.
 
-d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_INFLIGHT},${RUN_FAILED}]"
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_INFLIGHT},${RUN_FAILED}]"; history "${d}" 'cc33dd44' 'aa11bb22'
 run_gate "${d}" --require-deployable
 check 'a deploy in flight above a failure still blocks' 1 'TRUNK_NOT_DEPLOYABLE'
 
-d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_INFLIGHT},${RUN_FAILED}]"
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_INFLIGHT},${RUN_FAILED}]"; history "${d}" 'cc33dd44' 'aa11bb22'
 run_gate "${d}"
 check 'an in-flight run is reported rather than hidden' 0 'in_flight=true'
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_INFLIGHT},${RUN_OK}]"
-printf '%s\n' '9db4d5947' >"${d}/trunk_commits"
+history "${d}" '9db4d5947'
 run_gate "${d}" --require-deployable
 check 'a deploy in flight above a success does not block' 0 'state=DEPLOYABLE'
 
 # A cancelled deploy never shipped. Treating it as success is how a trunk goes
 # quietly unshipped.
-d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_CANCELLED}]"
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_CANCELLED}]"; history "${d}" 'ee55ff66'
 run_gate "${d}" --require-deployable
 check 'a cancelled deploy is not a successful deploy' 1 'TRUNK_NOT_DEPLOYABLE'
 
@@ -398,6 +407,40 @@ check 'commit-ranked: unavailable history is declared, not papered over' 0 'comm
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
 run_gate "${d}"
 check 'commit-ranked: and the masking risk is spelled out' 0 'masking a newer failure'
+
+# ---------------------------------------------------------------------------
+# Ranking is symmetric: an unrankable run is authoritative in NEITHER direction
+# ---------------------------------------------------------------------------
+#
+# An earlier cut treated an unrankable success as UNKNOWN but an unrankable
+# failure as definitive proof the trunk was broken. That asymmetry was wrong.
+# Ranking answers "is this run evidence about TRUNK at all"; the conclusion
+# answers "what does that evidence say". They are separate questions.
+#
+# An unrankable failure can be a run older than the history window, or a commit
+# that was force-pushed away. Reporting BLOCKED for it sends someone hunting a
+# trunk problem that does not exist. Both directions are UNKNOWN — which still
+# fails closed, so nothing is less safe, only less falsely confident.
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"; history "${d}" 'ffffffff'
+run_gate "${d}"
+check 'symmetry: an off-history FAILURE is UNKNOWN, not BLOCKED' 0 'state=UNKNOWN'
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"; history "${d}" 'ffffffff'
+run_gate "${d}"
+check 'symmetry: an off-history SUCCESS is UNKNOWN too' 0 'state=UNKNOWN'
+
+# Unknown is not a softening. Both still refuse under enforcement — the point is
+# an honest diagnosis, not a weaker gate.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"; history "${d}" 'ffffffff'
+run_gate "${d}" --require-deployable
+check 'symmetry: an unrankable run still fails closed under enforcement' 2 'TRUNK_NOT_DEPLOYABLE'
+
+# And the diagnosis still says which conclusion was actually observed, so the
+# information is not thrown away — only its authority over trunk is.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"; history "${d}" 'ffffffff'
+run_gate "${d}"
+check 'symmetry: the observed conclusion is still reported' 0 "ended 'failure'"
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ]
