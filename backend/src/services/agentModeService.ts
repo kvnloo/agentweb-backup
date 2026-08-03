@@ -3075,14 +3075,22 @@ export class AgentModeService {
         m => (m.content || '').trim().toLowerCase() === normalizedCurrent
       ).length;
 
-      // ENG-763: when the loop-breaker fires, also hard-gate `install_skills` for
-      // this turn (see the tool-build block below). On the agentMode path
-      // install_skills is the legitimate skill gateway, so it is only stripped
-      // while a loop is active — a stuck user should never trigger skill
-      // installation, and the read-only foundation context tools
-      // (read_brand_guidelines / read_market_strategy) remain available so the
-      // model is never starved of a way to make progress.
-      const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD;
+      // ENG-763: the loop-breaker is an INTERACTIVE-ONLY construct — it reacts to a
+      // human sending the same message 3+ times. Scheduled/headless runs get a fresh
+      // session per run (one user turn), so this can never legitimately trigger there;
+      // gating it out explicitly is defense-in-depth against any future path and, more
+      // importantly, guarantees a headless run is NEVER told to "hold and wait for the
+      // user" (which would park an autonomous delivery — the ENG-517/634 class) and
+      // that a scheduled run's install_skills gateway is never stripped.
+      const isScheduledSession = currentSession?.sessionType === 'scheduled';
+      //
+      // When the loop-breaker fires, also hard-gate `install_skills` for this turn
+      // (see the tool-build block below). On the agentMode path install_skills is the
+      // legitimate skill gateway, so it is only stripped while a loop is active — a
+      // stuck user should never trigger skill installation, and the read-only
+      // foundation context tools (read_brand_guidelines / read_market_strategy) remain
+      // available so the model is never starved of a way to make progress.
+      const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession;
       if (loopBreakerActive) {
         // ENG-763: inject as a `system` directive, NOT a `user` turn. Provider
         // converters hoist role:'system' into the system instruction, so the model
