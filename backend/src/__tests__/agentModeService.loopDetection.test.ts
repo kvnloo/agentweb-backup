@@ -325,6 +325,44 @@ describe('AgentModeService - install_skills onboarding tool-gate during loops (E
     expect(names).toContain('read_market_strategy');
   });
 
+  it('does NOT fire the loop-breaker in a scheduled/headless session (never parks, keeps install_skills)', async () => {
+    // ENG-763 defense-in-depth: the loop-breaker is interactive-only. A scheduled
+    // run must never be told to "hold and wait for the user" (that would park an
+    // autonomous delivery — the ENG-517/634 class), and its install_skills gateway
+    // must stay intact — even in the (structurally impossible) case that 3+ identical
+    // user turns reach a scheduled session.
+    mockDeps({ session: { sessionId: 'sched', messages: [], associatedSkills: null, sessionType: 'scheduled' } });
+    jest.spyOn(agentModeService as any, 'getFilteredTools').mockResolvedValue(TOOLS);
+    const callLLMSpy = jest
+      .spyOn(agentModeService as any, 'callLLM')
+      .mockResolvedValue(makeLLMResponse());
+
+    const repeated = 'run the weekly report';
+    const sessionHistory = [
+      { role: 'user', content: repeated },
+      { role: 'assistant', content: 'Working.' },
+      { role: 'user', content: repeated },
+      { role: 'assistant', content: 'Working.' },
+      { role: 'user', content: repeated },
+      { role: 'assistant', content: 'Working.' },
+    ];
+
+    await agentModeService.generateMarketingResponse(
+      repeated,
+      sessionHistory as any,
+      'test-user',
+      agentModeService.default_model,
+      'sched'
+    );
+
+    const messagesArg = callLLMSpy.mock.calls[0][1] as any[];
+    const antiLoopMsg = messagesArg.find(
+      (m: any) => typeof m.content === 'string' && m.content.includes('ANTI-LOOP')
+    );
+    expect(antiLoopMsg).toBeUndefined();
+    expect(toolNamesPassedToLLM(callLLMSpy)).toContain('install_skills');
+  });
+
   it('does NOT strip install_skills for a normal (non-looping) onboarding turn', async () => {
     mockDeps();
     jest.spyOn(agentModeService as any, 'getFilteredTools').mockResolvedValue(TOOLS);
