@@ -967,14 +967,23 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
     toEmails: string | string[],
     scheduleName: string,
     scheduleId: string,
-    opts: { failedAttempts: number; failureClass: 'budget' | 'transient' | 'system'; userMessage: string }
+    opts: { failedAttempts: number; failureClass: 'budget' | 'transient' | 'system' }
   ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
       const currentDate = new Date().toLocaleDateString('en-US', {
         year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
       });
-      const { failedAttempts, userMessage } = opts;
+      const { failedAttempts } = opts;
+      // Class-specific guidance for the EXHAUSTED state. Deliberately NOT the per-run
+      // in-chat message: that one promises "will be retried automatically", which would
+      // contradict this email's "won't retry until the next scheduled run" framing.
+      const GUIDANCE: Record<'budget' | 'transient' | 'system', string> = {
+        budget: 'The run looks too large to finish in a single pass — splitting it into smaller batches (fewer items per run) should let each run complete.',
+        transient: 'This looks like a temporary problem (a rate limit or a brief service hiccup). It may well recover on the next scheduled run; if it keeps happening, contact support.',
+        system: 'This looks like a system error rather than a time or size limit, so retrying alone may not fix it — please contact support if it continues.',
+      };
+      const userMessage = GUIDANCE[opts.failureClass] || GUIDANCE.system;
 
       const html = `
         <html>

@@ -505,7 +505,6 @@ describe('emailService.sendScheduledRunFailedEmail (ENG-826 #1)', () => {
   const opts = {
     failedAttempts: 4,
     failureClass: 'system' as const,
-    userMessage: 'It ran into an unexpected system error — not a time or size limit.',
   };
 
   it('sends ONE email to all recipients with a keeps-failing subject', async () => {
@@ -523,8 +522,10 @@ describe('emailService.sendScheduledRunFailedEmail (ENG-826 #1)', () => {
     expect(recipients).toEqual(['ops@example.com', 'lead@example.com']);
     expect(subject).toContain('LinkedIn Post Factory');
     expect(subject.toLowerCase()).toContain('failing');
-    // The honest, class-specific user message is carried into the body.
-    expect(text).toContain(opts.userMessage);
+    // Carries class-specific guidance for the exhausted state (system class here),
+    // NOT the per-run "will be retried automatically" copy (which would contradict).
+    expect(text.toLowerCase()).toContain('system error');
+    expect(text).not.toContain('will be retried automatically');
     expect(html).toContain('4 times in a row');
   });
 

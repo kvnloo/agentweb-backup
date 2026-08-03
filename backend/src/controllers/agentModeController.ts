@@ -2849,7 +2849,6 @@ export async function runScheduledChat(
                 {
                   failedAttempts: nextRetryCount,
                   failureClass: classifyZeroAssistantFailure(error),
-                  userMessage: zeroAssistantIncompleteMessage(error),
                 }
               );
             } else {
