@@ -1008,6 +1008,30 @@ function isWriteToolCall(toolCall: any): boolean {
   return name.length > 0 && !isReadOnlyToolName(name);
 }
 
+// Reconstruct the tool calls an abandoned session already made, for an ENG-657
+// resume. A message can carry BOTH the request-only assistant `tool_calls` and the
+// persisted EXECUTION ledger `metadata.toolCalls`; prefer the executed ledger
+// because only it carries result/error markers. Preferring the request list would
+// drop a FAILED abandoned call's error, which the conditional-skip error-veto needs
+// to reject a failed run (Greptile P1, ENG-844). Falls back to the request list
+// only for a message that has no executed ledger. Each returned entry keeps the
+// name and, when the call failed, its error.
+export function reconstructPriorToolCalls(messages: any[]): Array<{ name: string; error?: any }> {
+  if (!Array.isArray(messages)) return [];
+  return messages.flatMap((m: any) => {
+    const executed = Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : [];
+    const requested = Array.isArray(m?.tool_calls) ? m.tool_calls : [];
+    const calls = executed.length ? executed : requested;
+    return calls
+      .map((tc: any) => {
+        const name = tc?.function?.name || tc?.name;
+        if (!name) return null;
+        return (tc && typeof tc === 'object' && tc.error != null) ? { name, error: tc.error } : { name };
+      })
+      .filter(Boolean);
+  }) as Array<{ name: string; error?: any }>;
+}
+
 export function scheduledRunSignalsConditionalSkip(
   content: string,
   options: { toolCalls?: any[]; now?: Date; instruction?: string; timezone?: string } = {}
@@ -2764,24 +2788,9 @@ export async function runScheduledChat(
       // reloads the full transcript from the DB.
       isResumeRun = true;
       sessionId = pendingResumeSessionId;
-      // Credit the abandoned portion's tool calls to this run's verification.
-      resumePriorToolCalls = (resumeSession.messages || []).flatMap((m: any) => {
-        const calls = (Array.isArray(m?.tool_calls) && m.tool_calls.length)
-          ? m.tool_calls
-          : (Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : []);
-        return calls
-          .map((tc: any) => {
-            const name = tc?.function?.name || tc?.name;
-            if (!name) return null;
-            // Preserve a failure marker so the conditional-skip error-veto rejects a
-            // resumed run whose abandoned portion failed a tool (ENG-844). Executed
-            // tool calls carry the error on metadata.toolCalls[].error.
-            return (tc && typeof tc === 'object' && tc.error != null)
-              ? { name, error: tc.error }
-              : { name };
-          })
-          .filter(Boolean);
-      });
+      // Credit the abandoned portion's tool calls to this run's verification,
+      // preferring the executed ledger so a failed prior call keeps its error (ENG-844).
+      resumePriorToolCalls = reconstructPriorToolCalls(resumeSession.messages || []);
       console.log(`runScheduledChat: RESUMING abandoned session ${sessionId} for schedule ${schedule.scheduleId} (${schedule.scheduleName}); ${resumePriorToolCalls.length} prior tool call(s) carried into verification`);
     }
 
