@@ -1313,7 +1313,7 @@ async function runTurn(identifier, entry, cap, message, turnId, lockPath, edit =
         updateIssueEntry(identifier, (e) => { const { watch, ...rest } = e; return rest; });
         emit({ type: 'watch', state: 'done', blocked });
       } else if (w.reason && !w.done && !blocked) {
-        const cad = CHAT.watch?.cadenceMs ?? 5 * 60 * 1000, maxMs = CHAT.watch?.maxMs ?? 24 * 60 * 60 * 1000, nextAt = Date.now() + cad;
+        const cad = CHAT.watch?.cadenceMs ?? 4 * 60 * 1000, maxMs = CHAT.watch?.maxMs ?? 24 * 60 * 60 * 1000, nextAt = Date.now() + cad;
         updateIssueEntry(identifier, (e) => ({ ...e, watch: { goal: w.reason.slice(0, 300), nextAt, since: e.watch?.since || Date.now(), until: e.watch?.until || (Date.now() + maxMs), at: new Date().toISOString() } }));
         emit({ type: 'watch', state: 'armed', goal: w.reason.slice(0, 300), nextAt });
       }
@@ -2089,7 +2089,7 @@ function watchTick() {
     if (d !== 'fire') continue;
     // Pre-advance nextAt so a turn that crashes or forgets to re-arm can't immediately re-fire; a healthy
     // turn re-arms (or clears) the watch itself via its [[WATCH]]/[[WATCH_DONE]] handling.
-    updateIssueEntry(entry.identifier, (e) => (e.watch ? { ...e, watch: { ...e.watch, nextAt: now + (cfg.cadenceMs || 5 * 60 * 1000) } } : e));
+    updateIssueEntry(entry.identifier, (e) => (e.watch ? { ...e, watch: { ...e.watch, nextAt: now + (cfg.cadenceMs || 4 * 60 * 1000) } } : e));
     fireWatchTurn(entry.identifier, entry.watch);
     return; // ONE per tick — serialize to keep memory/CPU bounded across many watched PRs
   }
@@ -2107,7 +2107,7 @@ function onListening() {
   // Resume/drive background watches (merge-when-green, etc.) — see config.chat.watch.
   if ((CHAT.watch?.enabled) !== false) {
     setInterval(watchTick, CHAT.watch?.tickMs || 60 * 1000);
-    log(`watch: tick ${Math.round((CHAT.watch?.tickMs || 60000) / 1000)}s · cadence ${Math.round((CHAT.watch?.cadenceMs || 3e5) / 6e4)}m · cap ${Math.round((CHAT.watch?.maxMs || 864e5) / 36e5)}h`);
+    log(`watch: tick ${Math.round((CHAT.watch?.tickMs || 60000) / 1000)}s · cadence ${Math.round((CHAT.watch?.cadenceMs || 2.4e5) / 6e4)}m · cap ${Math.round((CHAT.watch?.maxMs || 864e5) / 36e5)}h`);
   }
 }
 

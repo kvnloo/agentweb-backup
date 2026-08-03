@@ -344,7 +344,7 @@ export const config = {
     // (the watch lives in state.json). Memory-gated + serialized so it can never contribute to an OOM.
     watch: {
       enabled: true,
-      cadenceMs: 5 * 60 * 1000,        // recheck a waiting task every ~5 min
+      cadenceMs: 4 * 60 * 1000,        // recheck a waiting task every ~4 min
       maxMs: 24 * 60 * 60 * 1000,      // safety cap: auto-stop (and notify) a watch after 24h
       minMemMB: 3000,                  // skip a tick entirely if available RAM is below this (never add to OOM pressure)
       tickMs: 60 * 1000,               // how often the server scans state for a due watch (fires at most one/tick)
