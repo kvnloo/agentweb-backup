@@ -763,6 +763,9 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
 // failed") would be silently waived, un-auditing a live publishing pipeline
 // (the retry + fileAutoIssue + oncall path would never fire). So the carve-out
 // only fires when ALL of these hold:
+//   0. the SCHEDULE'S OWN INSTRUCTION authorizes a conditional skip (defines the
+//      cadence / non-publishing-day rule) — the authorization comes from the human
+//      who wrote the schedule, not from the model's post-hoc prose; and
 //   1. the skip is tied to a CADENCE/weekday rationale, not a bare "skip today"
 //      (a self-contained cadence phrase, or a skip declaration + a cadence
 //      rationale in the same turn);
@@ -832,11 +835,48 @@ function assertedTodayWeekday(content: string): number | null {
   return WEEKDAY_NAMES.indexOf(m[1].toLowerCase());
 }
 
+// The waiver must be AUTHORIZED BY THE SCHEDULE OWNER, not merely asserted by the
+// model. These match the OWNER'S configured instruction (the schedule's starting
+// message) for evidence it defines a conditional publishing cadence — "publish
+// only on Mon/Wed/Fri", a named "non-publishing day", or an explicit "if today is
+// X … publish nothing / skip". Without this, a model that spontaneously claims a
+// skip on a day it was actually supposed to publish would silently waive its
+// required write calls (Greptile P1, ENG-844): the skip prose is the model's, but
+// the authorization to skip has to come from the human who wrote the schedule.
+const SCHEDULE_SKIP_AUTHORIZATION_PATTERNS: RegExp[] = [
+  /\b(?:publish|post|posts?|publishing)\s+only\s+(?:on|when|if)\b/i,
+  /\bonly\s+(?:publish|post)(?:es|ing|s)?\b/i,
+  /\b(?:publish|post)(?:es|ing|s)?\s+only\s+on\b/i,
+  /\bonly\s+on\s+(?:mon|tue|wed|thu|fri|sat|sun)/i,
+  /\bnon-?publishing\s+day\b/i,
+  /\bnot\s+a\s+(?:publishing|posting)\s+day\b/i,
+  /\bif\b[^.]*\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post))/i,
+  /\b(?:skip|publish\s+nothing|post\s+nothing|no\s+post)\b[^.]*\b(?:mon|tue|wed|thu|fri|sat|sun|weekend|weekday)/i,
+];
+
+function instructionAuthorizesConditionalSkip(instruction: string): boolean {
+  if (!instruction || typeof instruction !== 'string') return false;
+  const text = instruction.replace(/<[^>]+>/g, ' ');
+  return SCHEDULE_SKIP_AUTHORIZATION_PATTERNS.some((re) => re.test(text));
+}
+
 export function scheduledRunSignalsConditionalSkip(
   content: string,
-  options: { toolCalls?: any[]; now?: Date } = {}
+  options: { toolCalls?: any[]; now?: Date; instruction?: string } = {}
 ): boolean {
   if (!content || typeof content !== 'string') return false;
+
+  // (0) Authorization gate: only honor a skip the SCHEDULE OWNER authorized. When
+  // the caller supplies the schedule's instruction (it always does on the real
+  // scheduled path), it must itself define the conditional cadence — otherwise a
+  // model-authored skip on a run that carries write-call minimums is unauthorized
+  // and must NOT be waived (Greptile P1, ENG-844). Undefined instruction (pure
+  // text-classifier unit tests) leaves this check inert.
+  const instruction = options.instruction;
+  if (typeof instruction === 'string' && instruction.length > 0 &&
+      !instructionAuthorizesConditionalSkip(instruction)) {
+    return false;
+  }
 
   // Emma emits HTML (the marketing persona renders <strong>, <ul>, <table>…), so
   // strip tags before matching — otherwise "<strong>Sunday</strong>" hides the
@@ -1779,7 +1819,18 @@ export async function runVerifiedChat(
       // exit cleanly. Scoped to scheduled runs (completionGate) so interactive/image/
       // revision callers are unaffected, and only fires when a required call is actually
       // unmet — a run that DID publish flows through the normal success path below.
-      if (completionGate && !allFunctionCallsMet && scheduledRunSignalsConditionalSkip(allContent, { toolCalls: allToolCalls })) {
+      //
+      // A true cadence skip makes ZERO write calls by design. If ANY required write
+      // call was actually made (a partially-executed run — e.g. it published to one
+      // destination then emitted skip wording), this is NOT a skip: waiving here would
+      // launder partial external state into a clean "skip" and clear the misses on the
+      // still-unmet calls. Require every required call to have zero invocations before
+      // the carve-out is even eligible (Greptile P1, ENG-844).
+      const noRequiredWriteCallsMade = requiredFunctions.every(
+        (reqFunc) => countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) === 0
+      );
+      if (completionGate && !allFunctionCallsMet && noRequiredWriteCallsMade &&
+          scheduledRunSignalsConditionalSkip(allContent, { toolCalls: allToolCalls, instruction: startingMessage })) {
         // Low-severity breadcrumb: a conditional skip is a SUCCESSFUL run, but it is
         // waiving write-call minimums on an audited publishing pipeline, so keep it
         // observable (and threaded into runResults via `conditionalSkip`) rather than
