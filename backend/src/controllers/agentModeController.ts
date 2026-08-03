@@ -838,15 +838,34 @@ export function scheduledRunSignalsConditionalSkip(
 ): boolean {
   if (!content || typeof content !== 'string') return false;
 
+  // Emma emits HTML (the marketing persona renders <strong>, <ul>, <table>…), so
+  // strip tags before matching — otherwise "<strong>Sunday</strong>" hides the
+  // weekday assertion and a "<td>Failed</td><td>0</td>" completion ledger is read
+  // as prose. Verified against the real ENG-844 session (442e7880…): both
+  // happened, and without this the carve-out never fired on the actual skip.
+  const text = content.replace(/<[^>]+>/g, ' ');
+
   // (1) Must be a cadence-anchored skip, not a bare "skip today".
   const isCadenceSkip =
-    CADENCE_SKIP_PATTERNS.some((re) => re.test(content)) ||
-    (SKIP_DECLARATION_PATTERNS.some((re) => re.test(content)) &&
-      CADENCE_RATIONALE_PATTERNS.some((re) => re.test(content)));
+    CADENCE_SKIP_PATTERNS.some((re) => re.test(text)) ||
+    (SKIP_DECLARATION_PATTERNS.some((re) => re.test(text)) &&
+      CADENCE_RATIONALE_PATTERNS.some((re) => re.test(text)));
   if (!isCadenceSkip) return false;
 
-  // (2) A failure worded as a skip is not a cadence skip.
-  if (SKIP_FAILURE_SIGNAL_PATTERNS.some((re) => re.test(content))) return false;
+  // (2) A failure worded as a skip is not a cadence skip. But FIRST neutralize a
+  // zero/none-valued failure ledger — a clean run routinely reports "Failed: 0" /
+  // "Failed  0" (a "<td>Failed</td><td>0</td>" cell) / "failures: none", which is
+  // a SUCCESS signal, not a failure. Only the ledger's own value is dropped
+  // (label THEN count); a nonzero or asserted failure ("Failed 1", "post failed",
+  // "auth failed", "couldn't reach the API") is untouched and still vetoes. NB:
+  // matching a zero that PRECEDES the word (`0 failed`) is deliberately avoided —
+  // once tags are stripped, the prior ledger row's count ("Succeeded 0") sits
+  // right before the next row's "Failed" and would falsely neutralize it.
+  const failureScan = text.replace(
+    /\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi,
+    ' '
+  );
+  if (SKIP_FAILURE_SIGNAL_PATTERNS.some((re) => re.test(failureScan))) return false;
 
   // (3) Non-spoofable ledger check: a legitimate cadence skip makes no write
   // calls AND no tool errors. If any tool actually errored, this was a failure.
@@ -862,7 +881,7 @@ export function scheduledRunSignalsConditionalSkip(
   // against a server-LOCAL weekday (getDay) would desync on any non-UTC host, and
   // scheduled chats carry no timezone of their own, so UTC is the single reference
   // both sides share. This catches a grossly mis-dated skip without false rejects.
-  const asserted = assertedTodayWeekday(content);
+  const asserted = assertedTodayWeekday(text);
   if (asserted !== null) {
     const now = options.now ?? new Date();
     if (asserted !== now.getUTCDay()) return false;
