@@ -746,10 +746,10 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
 }
 
 // ENG-844: Deterministic detector for a scheduled run that LEGITIMATELY
-// short-circuited on a conditional guard — e.g. a schedule that runs DAILY but
-// is instructed to publish only on Mon/Wed/Fri, running on a non-publishing day.
-// Such a run correctly produces ZERO write calls (post_on_connected_account /
-// generate_image) BY DESIGN and reports a skip.
+// short-circuited on a conditional CADENCE guard — e.g. a schedule that runs
+// DAILY but is instructed to publish only on Mon/Wed/Fri, running on a
+// non-publishing day. Such a run correctly produces ZERO write calls
+// (post_on_connected_account / generate_image) BY DESIGN and reports a skip.
 //
 // Without recognising this, runVerifiedChat keeps retrying to satisfy the
 // schedule's requiredFunctionCalls, re-sending an identical "Please try again.
@@ -758,24 +758,112 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
 // eventually trips the anti-loop override in agentModeService — pushing a
 // correctly-behaving agent toward off-cadence publishing or fabricating success.
 //
+// A freeform-text match ALONE is unsafe: a genuine FAILURE worded as a skip
+// ("Skipping today's post — I couldn't access LinkedIn", "No post today; auth
+// failed") would be silently waived, un-auditing a live publishing pipeline
+// (the retry + fileAutoIssue + oncall path would never fire). So the carve-out
+// only fires when ALL of these hold:
+//   1. the skip is tied to a CADENCE/weekday rationale, not a bare "skip today"
+//      (a self-contained cadence phrase, or a skip declaration + a cadence
+//      rationale in the same turn);
+//   2. NO failure/tool-error signal appears in the turn's prose; and
+//   3. NO tool call in the run actually errored (the non-spoofable ledger check
+//      used elsewhere — `'error' in toolCall`); and
+//   4. if the turn asserts a specific weekday as "today", it agrees with the
+//      server's actual weekday (a hallucinated/mis-dated skip is rejected).
+//
 // This is DISTINCT from scheduledRunSignalsIncompleteWork (which detects a run
 // that left SOME items undone and should continue). Here the WHOLE run is a
-// deliberate no-op, so the patterns anchor strictly on an explicit whole-run
-// skip decision ("non-publishing day", "skipping today", "nothing to publish
-// today") — never on a normal publishing turn or a partial-progress admission.
-const CONDITIONAL_SKIP_PATTERNS: RegExp[] = [
+// deliberate no-op.
+
+// A phrase that BY ITSELF expresses a cadence/weekday skip (rationale baked in).
+const CADENCE_SKIP_PATTERNS: RegExp[] = [
   /\bnon-?publishing\s+day\b/i,
   /\bnot\s+a\s+(?:publishing|posting)\s+day\b/i,
-  /\btoday\s+is\s+(?:not\s+a\s+(?:publishing|posting)\s+day|a\s+(?:non-?publishing|skip|rest)\s+day)\b/i,
-  /\bskipp?(?:ing|ed)?\s+(?:today|this\s+(?:run|cycle|schedule))\b/i,
-  /\bno\s+(?:post|publishing|publish)\s+(?:today|scheduled\s+(?:for\s+)?today)\b/i,
-  /\bnothing\s+to\s+(?:post|publish)\s+today\b/i,
+  /\btoday\s+is\s+(?:not\s+a\s+(?:publishing|posting)\s+day|a\s+(?:non-?publishing|skip|rest|off)\s+day)\b/i,
+  /\b(?:rest|off|skip|non-?publishing)\s+day\s+for\s+this\s+(?:schedule|cadence)\b/i,
   /\bcreat(?:e|ing)\s+and\s+publish(?:ing)?\s+nothing\b/i,
 ];
 
-export function scheduledRunSignalsConditionalSkip(content: string): boolean {
+// A bare skip declaration. On its own this is ambiguous (a failure can be worded
+// the same way), so it only counts as a cadence skip when paired with a
+// CADENCE_RATIONALE match below.
+const SKIP_DECLARATION_PATTERNS: RegExp[] = [
+  /\bskipp?(?:ing|ed)?\s+(?:today|this\s+(?:run|cycle|schedule|post))\b/i,
+  /\bno\s+(?:post|publishing|publish)\s+(?:today|scheduled\s+(?:for\s+)?today)\b/i,
+  /\bnothing\s+to\s+(?:post|publish)\s+today\b/i,
+];
+
+// Evidence the skip is driven by the schedule's PUBLISHING CADENCE (a weekday
+// window), not by an error — this is what separates a legitimate skip from a
+// failure dressed up as one.
+const CADENCE_RATIONALE_PATTERNS: RegExp[] = [
+  /\bcadence\b/i,
+  /\bonly\s+(?:publish|post)(?:es|ing|s)?\b/i,
+  /\b(?:publish|post)(?:es|ing|s)?\s+only\b/i,
+  /\bonly\s+on\s+(?:mon|tue|wed|thu|fri|sat|sun)/i,
+  /\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\s*[\/,]\s*(?:mon|tue|wed|thu|fri|sat|sun)/i,
+  /\bnon-?publishing\s+day\b/i,
+  /\bnot\s+a\s+(?:publishing|posting)\s+day\b/i,
+];
+
+// A run that hit a FAILURE (missing access, auth, timeout, tool error) is NOT a
+// cadence skip — it must still retry + alert. Any of these veto the carve-out.
+const SKIP_FAILURE_SIGNAL_PATTERNS: RegExp[] = [
+  // Contractions only fire on a real apostrophe so words like "current" (…nt) do
+  // not false-veto: couldn't, wasn't, isn't, can't, don't, won't, …
+  /\b\w+n['’]t\b/i,
+  /\b(?:cannot|could\s+not|was\s+not\s+able|were\s+not\s+able|not\s+able\s+to|unable\s+to)\b/i,
+  /\b(?:failed(?:\s+to)?|failure|errored?|an?\s+error|timed?\s*out|time[\s-]?out)\b/i,
+  /\b(?:unauthori[sz]ed|not\s+authori[sz]ed|no\s+access|access\s+denied|permission\s+denied|forbidden|rate[\s-]?limit)\b/i,
+  /\bauth(?:entication|orization)?\s+(?:fail(?:ed|ure)?|error|issue|problem)\b/i,
+  /\b(?:token\s+expired|invalid\s+(?:token|credential))/i,
+];
+
+const WEEKDAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+// Extract a weekday the turn asserts is TODAY (e.g. "Today is Sunday",
+// "Sunday, which is a non-publishing day"). Returns the 0–6 index or null.
+function assertedTodayWeekday(content: string): number | null {
+  const m =
+    content.match(/\btoday\s+is\s+(?:a\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i) ||
+    content.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\s*,?\s+(?:which\s+)?is\s+(?:a\s+)?(?:non-?publishing|not\s+a\s+(?:publishing|posting))/i);
+  if (!m) return null;
+  return WEEKDAY_NAMES.indexOf(m[1].toLowerCase());
+}
+
+export function scheduledRunSignalsConditionalSkip(
+  content: string,
+  options: { toolCalls?: any[]; now?: Date } = {}
+): boolean {
   if (!content || typeof content !== 'string') return false;
-  return CONDITIONAL_SKIP_PATTERNS.some((re) => re.test(content));
+
+  // (1) Must be a cadence-anchored skip, not a bare "skip today".
+  const isCadenceSkip =
+    CADENCE_SKIP_PATTERNS.some((re) => re.test(content)) ||
+    (SKIP_DECLARATION_PATTERNS.some((re) => re.test(content)) &&
+      CADENCE_RATIONALE_PATTERNS.some((re) => re.test(content)));
+  if (!isCadenceSkip) return false;
+
+  // (2) A failure worded as a skip is not a cadence skip.
+  if (SKIP_FAILURE_SIGNAL_PATTERNS.some((re) => re.test(content))) return false;
+
+  // (3) Non-spoofable ledger check: a legitimate cadence skip makes no write
+  // calls AND no tool errors. If any tool actually errored, this was a failure.
+  const toolCalls = options.toolCalls;
+  if (Array.isArray(toolCalls) && toolCalls.some((tc) => tc && typeof tc === 'object' && 'error' in tc)) {
+    return false;
+  }
+
+  // (4) Server-side weekday cross-check: if the turn names a weekday as "today",
+  // it must agree with the server's actual weekday.
+  const asserted = assertedTodayWeekday(content);
+  if (asserted !== null) {
+    const now = options.now ?? new Date();
+    if (asserted !== now.getDay()) return false;
+  }
+
+  return true;
 }
 
 // Deterministic, TOOL-CALL-based completion detector for scheduled runs (ENG-518).
@@ -1667,10 +1755,18 @@ export async function runVerifiedChat(
       // exit cleanly. Scoped to scheduled runs (completionGate) so interactive/image/
       // revision callers are unaffected, and only fires when a required call is actually
       // unmet — a run that DID publish flows through the normal success path below.
-      if (completionGate && !allFunctionCallsMet && scheduledRunSignalsConditionalSkip(allContent)) {
+      if (completionGate && !allFunctionCallsMet && scheduledRunSignalsConditionalSkip(allContent, { toolCalls: allToolCalls })) {
+        // Low-severity breadcrumb: a conditional skip is a SUCCESSFUL run, but it is
+        // waiving write-call minimums on an audited publishing pipeline, so keep it
+        // observable (and threaded into runResults via `conditionalSkip`) rather than
+        // laundering it through the silent success path (ENG-844).
+        const waivedWriteCalls = requiredFunctions
+          .filter((reqFunc) => countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) < reqFunc.minCount)
+          .map((reqFunc) => reqFunc.functionName);
         console.log(
           `AgentMode runVerifiedChat: session ${sessionId} legitimately short-circuited on a conditional ` +
-          `skip day — recording a successful skip without pressing for required write calls.`
+          `CADENCE skip day (no write calls, no tool errors) — recording a successful skip without pressing ` +
+          `for required write calls. Unmet write minimums waived: ${waivedWriteCalls.join(', ') || '(none)'}`
         );
         const skipFunctionStatus = requiredFunctions.map((reqFunc) => {
           const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
@@ -2601,7 +2697,14 @@ export async function runScheduledChat(
       sessionId: sessionId,
       attempt: result.attempts,
       createdAt: new Date().toISOString(),
-      summary: generatedSummary
+      summary: generatedSummary,
+      // ENG-844: a legitimate conditional-cadence skip (e.g. a Mon/Wed/Fri
+      // schedule running on a non-publishing day) is a SUCCESSFUL run that
+      // produced zero write calls BY DESIGN. Persist a distinguishing marker so
+      // a skip is not indistinguishable from a real publish in runResults /
+      // downstream reporting — a bare success would otherwise hide the waived
+      // write-call minimums.
+      ...(result.conditionalSkip ? { conditionalSkip: true } : {}),
     };
 
     // Save the result to database (without actualResponse to save space)
