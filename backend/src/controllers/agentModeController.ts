@@ -117,6 +117,38 @@ export function zeroAssistantIncompleteMessage(error: unknown): string {
   return budgetShaped ? SCHEDULED_JOB_INCOMPLETE_MESSAGE : SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE;
 }
 
+// ENG-826 (recommendation #4): compact run-health summary surfaced on each schedule
+// in the list so an owner can see a run of consecutive failures — e.g. the 3 silent
+// gemini-3.5-flash failures in this issue — straight on the card, without opening the
+// run-history panel. getScheduledChats deliberately strips the full runResults array
+// for payload size, so the client can't derive this itself; we compute it server-side.
+export interface ScheduleRunHealth {
+  lastRunStatus: 'success' | 'failure' | 'pending_user_input' | null;
+  lastRunAt: string | null;
+  // Failures counted back from the MOST RECENT run, stopping at the first non-failure.
+  // A 'success' or a 'pending_user_input' (parked, awaiting a human) breaks the streak —
+  // a park is not a failure. So this reflects an ongoing, unresolved failure run only.
+  consecutiveFailures: number;
+}
+
+export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
+  const results = Array.isArray(runResults) ? runResults : [];
+  if (results.length === 0) {
+    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 };
+  }
+  const last = results[results.length - 1] || {};
+  let consecutiveFailures = 0;
+  for (let i = results.length - 1; i >= 0; i--) {
+    if (results[i]?.status === 'failure') consecutiveFailures++;
+    else break;
+  }
+  return {
+    lastRunStatus: last.status ?? null,
+    lastRunAt: last.createdAt ?? null,
+    consecutiveFailures,
+  };
+}
+
 // ENG-657: injected as the user turn when RESUMING an abandoned scheduled run
 // (its instance was terminated mid-flight, e.g. by a deploy). The full transcript
 // up to the last completed step is already the session history, so the model must
@@ -6214,10 +6246,15 @@ export const agentModeController = {
       });
 
       // Exclude runResults to keep response size manageable (run history is
-      // available via the dedicated GET /scheduled-chats/:id/test-history endpoint)
-      const scheduledChatsWithoutRunResults = scheduledChats.map(({ runResults, ...rest }: any) => rest);
+      // available via the dedicated GET /scheduled-chats/:id/test-history endpoint),
+      // but first derive a compact runHealth summary (ENG-826 #4) so the list can
+      // flag consecutive failures on the card without fetching full history.
+      const scheduledChatsWithHealth = scheduledChats.map(({ runResults, ...rest }: any) => ({
+        ...rest,
+        runHealth: computeScheduleRunHealth(runResults),
+      }));
 
-      res.json(scheduledChatsWithoutRunResults);
+      res.json(scheduledChatsWithHealth);
     } catch (error) {
       console.error('AgentMode: Get scheduled chats error:', error);
       res.status(500).json({ error: 'Failed to get scheduled chats' });
