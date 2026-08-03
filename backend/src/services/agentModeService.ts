@@ -173,24 +173,31 @@ export function isCompleteHtmlDocument(draft: string): boolean {
   return hasOpen && hasClose;
 }
 
-// ENG-844: tools that publish LIVE / perform an irreversible external write. A
-// scheduled run that legitimately withholds one of these on a non-publishing day
-// gets pressed by verification retries ("Please try again. Make sure to
-// post_on_connected_account (1 more time needed)"). When that identical prompt
-// repeats enough to trip the anti-loop override, the override's remedy ("proceed
-// with placeholders / always make progress") is WRONG here: the blocker is
-// authorization, not missing information, and no placeholder can stand in for
-// consent to publish. This predicate lets the override step DETERMINISTICALLY
-// decline to fire on such a press, so a correctly-behaving agent is never pushed
-// toward an off-cadence live publish or into fabricating that it published.
+// ENG-844: the anti-loop override ("stop asking, find context yourself, proceed
+// with placeholders, always make progress") is a remedy for a HUMAN who keeps
+// repeating a message without supplying requested information. A scheduled
+// verification RETRY press — "Please try again. Make sure to <tool> (N more
+// time(s) needed)." (agentModeController.runVerifiedChat) — is neither: no human
+// authored it, and nothing is missing except a tool CALL, which a placeholder
+// can never substitute for. Letting the override fire on such a press pressures
+// the model to make the call or fabricate that it did — and when the call is an
+// irreversible/publishing write, that means an off-cadence live post. So the
+// override step DETERMINISTICALLY declines to fire on any function-call press.
+//
+// The "(N more time(s) needed)" suffix is emitted ONLY for unmet required
+// FUNCTION calls, never for keyword-only reminders, so it reliably marks such a
+// press without over-matching an ordinary human message.
 const IRREVERSIBLE_PUBLISH_TOOLS = ['post_on_connected_account', 'post_thread', 'publish_blog_article'];
 
-export function isIrreversibleWriteRetryPress(text: string): boolean {
+export function isVerificationFunctionCallRetryPress(text: string): boolean {
   if (!text || typeof text !== 'string') return false;
-  // Only the verification harness's write-call retry prompt (agentModeController
-  // runVerifiedChat) has this shape; a human never phrases a request this way.
-  if (!/please try again\.\s*make sure to /i.test(text)) return false;
-  return IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
+  return /please try again\.\s*make sure to /i.test(text) && /\(\d+\s+more\s+times?\s+needed\)/i.test(text);
+}
+
+// Does that press target an irreversible/publishing write (vs. a reversible tool
+// like generate_image)? Used only to sharpen the suppression log line.
+export function pressesIrreversiblePublishWrite(text: string): boolean {
+  return isVerificationFunctionCallRetryPress(text) && IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
 }
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
@@ -3095,16 +3102,18 @@ export class AgentModeService {
         m => (m.content || '').trim().toLowerCase() === normalizedCurrent
       ).length;
 
-      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && isIrreversibleWriteRetryPress(messageContent)) {
-        // ENG-844: the repeated prompt is a verification retry pressing an
-        // irreversible/publishing write, not a human withholding information. The
-        // anti-loop override's "proceed with placeholders" remedy is designed for
-        // MISSING INFORMATION and must never become license to publish live. Do
-        // NOT inject it; let the run retry/exit through its normal path (the
-        // scheduled verifier records a failure + alerts) rather than pushing a
-        // correctly-withheld publish or a fabricated success.
+      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && isVerificationFunctionCallRetryPress(messageContent)) {
+        // ENG-844: the repeated prompt is a verification retry pressing a required
+        // tool CALL, not a human withholding information. The anti-loop override's
+        // "proceed with placeholders / make progress" remedy is for MISSING
+        // INFORMATION and cannot satisfy a tool call — and for an irreversible/
+        // publishing write it becomes pressure to publish off-cadence or fabricate
+        // success. Do NOT inject it; let the run retry/exit through its normal path
+        // (the scheduled verifier records a failure + alerts).
         console.warn(
-          `AgentMode: anti-loop override SUPPRESSED for session ${sessionId} — the repeated prompt presses an irreversible/publishing write; not injecting a 'proceed anyway' instruction (ENG-844).`
+          `AgentMode: anti-loop override SUPPRESSED for session ${sessionId} — the repeated prompt is a verification tool-call retry press` +
+          `${pressesIrreversiblePublishWrite(messageContent) ? ' for an IRREVERSIBLE/publishing write' : ''}; ` +
+          `not injecting a 'proceed anyway' instruction (ENG-844).`
         );
       } else if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD) {
         messages.push({
