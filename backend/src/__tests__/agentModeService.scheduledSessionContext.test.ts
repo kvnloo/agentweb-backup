@@ -338,6 +338,49 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(nonAdmin).toContain('PER-ENTITY COMPLETION LOOP');
     expect(adminDirective).toContain('PER-ENTITY COMPLETION LOOP');
   });
+
+  // ── (8) No fabricated publish/platform gate; authorized actions must run ─────
+  // Regression coverage for ENG-803 (session 0fe2e743, "Harsha X Reply Guy —
+  // Mentions"): the scheduled prompt explicitly authorized posting replies, yet
+  // the agent invented an "active X publishing gate" that no tool ever returned
+  // and used it to skip twitter_manage_post — drafting replies, titling the run
+  // "Replies queued", and posting nothing. The directive must (a) ban asserting
+  // an unverified platform/publish gate as fact, (b) require the authorized
+  // action tool to actually be attempted, and (c) tie completion claims to real
+  // tool outcomes.
+  it('bans asserting a publish/platform gate that no tool call actually returned', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('no fabricated platform or publish gate');
+    expect(lower).toMatch(/never assert|may not claim/);
+    // the ban is tied to the absence of a real gate/permission tool error
+    expect(lower).toContain('permission error');
+    expect(lower).toContain('fabrication');
+  });
+
+  it('does not conflate the generic get-approval guidance with a hard platform gate', () => {
+    expect(directive.toLowerCase()).toContain('always get approval before publishing to social');
+    expect(directive.toLowerCase()).toContain('not a hard platform gate');
+  });
+
+  it('requires the authorized publishing tool to actually be attempted, not just drafted', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('authorized actions must be attempted');
+    expect(lower).toContain('twitter_manage_post');
+    expect(lower).toContain('drafting the content and reporting it as done is not completion');
+  });
+
+  it('on a real block, names the specific tool + error and falls back to draft/memory/product issue', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('verbatim error');
+    expect(lower).toContain('report_product_issues');
+    expect(lower).toContain('save memory');
+  });
+
+  it('ties the run title/summary to actual tool-call outcomes (no false "queued")', () => {
+    const lower = directive.toLowerCase();
+    expect(lower).toContain('posted nothing');
+    expect(lower).toContain('queued');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
