@@ -2029,8 +2029,15 @@ export async function runVerifiedChat(
       const noRequiredWriteCallsMade = requiredFunctions.every(
         (reqFunc) => countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) === 0
       );
+      // The no-side-effects skip invariant must see the WHOLE task's tool calls,
+      // including any made in an abandoned portion that this run resumed. Those
+      // live in params.priorToolCalls (seeded into the required-call counts but not
+      // into allToolCalls), so a resumed non-required write — e.g. an email sent
+      // before the interruption — would otherwise be invisible to the write-veto
+      // and a partial run could be laundered into a clean skip (Greptile P1, ENG-844).
+      const skipLedgerToolCalls = [...(params.priorToolCalls ?? []), ...allToolCalls];
       if (completionGate && !allFunctionCallsMet && noRequiredWriteCallsMade &&
-          scheduledRunSignalsConditionalSkip(allContent, { toolCalls: allToolCalls, instruction: startingMessage, now: params.now, timezone: params.scheduleTimezone })) {
+          scheduledRunSignalsConditionalSkip(allContent, { toolCalls: skipLedgerToolCalls, instruction: startingMessage, now: params.now, timezone: params.scheduleTimezone })) {
         // Low-severity breadcrumb: a conditional skip is a SUCCESSFUL run, but it is
         // waiving write-call minimums on an audited publishing pipeline, so keep it
         // observable (and threaded into runResults via `conditionalSkip`) rather than
