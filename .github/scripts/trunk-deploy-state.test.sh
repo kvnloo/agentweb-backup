@@ -53,14 +53,28 @@ if [ "${1:-}" = "run" ] && [ "${2:-}" = "list" ]; then
 fi
 
 if [ "${1:-}" = "api" ]; then
-  # Resolving the trunk head commit. `trunk_head_sha` absent => simulate a
-  # failure, which the gate must treat as non-fatal.
-  if [ -f "${MOCK_DIR}/trunk_head_sha" ]; then
-    cat "${MOCK_DIR}/trunk_head_sha"
-    exit 0
-  fi
-  printf 'mock gh: simulated api failure\n' >&2
-  exit 1
+  # TWO distinct calls share this verb and must not be conflated:
+  #   repos/X/commits/BRANCH   -> the head sha        (fixture: trunk_head_sha)
+  #   repos/X/commits?sha=...  -> trunk history list  (fixture: trunk_commits)
+  # A missing fixture simulates an API failure, which the gate must survive.
+  case "${2:-}" in
+    *'commits?'*)
+      if [ -f "${MOCK_DIR}/trunk_commits" ]; then
+        cat "${MOCK_DIR}/trunk_commits"
+        exit 0
+      fi
+      printf 'mock gh: simulated commits-list failure\n' >&2
+      exit 1
+      ;;
+    *)
+      if [ -f "${MOCK_DIR}/trunk_head_sha" ]; then
+        cat "${MOCK_DIR}/trunk_head_sha"
+        exit 0
+      fi
+      printf 'mock gh: simulated api failure\n' >&2
+      exit 1
+      ;;
+  esac
 fi
 
 printf 'mock gh: unexpected invocation: %s\n' "$*" >&2
@@ -252,11 +266,13 @@ RUN_TRUNK_SUCCESS='{"databaseId":30900000011,"status":"completed","conclusion":"
 # says DEPLOYABLE and would wave a merge onto a trunk that cannot ship.
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OTHER_SUCCESS},${RUN_TRUNK_FAILED}]"
 printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+printf '%s\n' "${TRUNK_SHA}" >"${d}/trunk_commits"
 run_gate "${d}" --require-deployable
 check 'SHA-bound: the trunk head run decides, not merely the newest' 1 'TRUNK_NOT_DEPLOYABLE'
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OTHER_SUCCESS},${RUN_TRUNK_FAILED}]"
 printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+printf '%s\n' "${TRUNK_SHA}" >"${d}/trunk_commits"
 run_gate "${d}"
 check 'SHA-bound: it names the trunk head run, not the unrelated one' 0 'run_id=30900000010'
 
@@ -264,11 +280,13 @@ check 'SHA-bound: it names the trunk head run, not the unrelated one' 0 'run_id=
 # an unrelated FAILED run must not block a trunk whose own deploy succeeded.
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED},${RUN_TRUNK_SUCCESS}]"
 printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+printf '%s\n' "${TRUNK_SHA}" >"${d}/trunk_commits"
 run_gate "${d}" --require-deployable
 check 'SHA-bound: an unrelated failure does not block a healthy trunk head' 0 'state=DEPLOYABLE'
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_TRUNK_SUCCESS}]"
 printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+printf '%s\n' "${TRUNK_SHA}" >"${d}/trunk_commits"
 run_gate "${d}"
 check 'SHA-bound: a match is reported as such' 0 'head_sha_matches_trunk=true'
 
@@ -282,8 +300,9 @@ check 'SHA-bound: no run at trunk head still yields a verdict' 0 'state=DEPLOYAB
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
 printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+printf '%s\n%s\n' "${TRUNK_SHA}" '9db4d5947' >"${d}/trunk_commits"
 run_gate "${d}"
-check 'SHA-bound: and it discloses that the verdict is not at trunk head' 0 'not the current main head'
+check 'SHA-bound: and it discloses that the verdict is not at trunk head' 0 'has not deployed yet'
 
 # Resolving the trunk head is best-effort. If that call fails the gate must
 # still work — degrading to recency — and must not silently imply a SHA match.
@@ -293,11 +312,86 @@ check 'SHA-bound: an unresolvable trunk head degrades rather than breaking' 0 's
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
 run_gate "${d}"
-check 'SHA-bound: and says the verdict is not commit-bound' 0 'not bound to a specific commit'
+check 'SHA-bound: and says the verdict is not commit-ranked' 0 'NOT ranked by commit'
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
 run_gate "${d}"
 check 'SHA-bound: never claims a match it could not verify' 0 'head_sha_matches_trunk=false'
+
+# ---------------------------------------------------------------------------
+# Ranking by COMMIT, not by run recency (Greptile round 2 on #2254)
+# ---------------------------------------------------------------------------
+#
+# The masking case. Trunk history is Z (head), Y, X — newest first.
+#   - Z has no completed deploy yet (normal: main outruns a 12-20 min deploy)
+#   - Y's deploy FAILED — trunk genuinely cannot ship
+#   - X's deploy was RE-RUN today and succeeded, so by run-creation time it is
+#     the newest completed run of all
+#
+# Ranking by run recency picks X's re-run, reports DEPLOYABLE, and waves a merge
+# onto a trunk whose latest real deploy failed. That is ENG-837 happening again
+# through a different door. Ranking by commit reaches Y first and blocks.
+
+SHA_Z='cccccccccccccccccccccccccccccccccccccccc'
+SHA_Y='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+SHA_X='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+TRUNK_HISTORY="${SHA_Z}
+${SHA_Y}
+${SHA_X}"
+
+RUN_X_RERUN_SUCCESS='{"databaseId":31000000001,"status":"completed","conclusion":"success",
+                      "url":"https://github.com/AgentWebPro/agentweb/actions/runs/31000000001",
+                      "headSha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}'
+RUN_Y_FAILED='{"databaseId":31000000002,"status":"completed","conclusion":"failure",
+               "url":"https://github.com/AgentWebPro/agentweb/actions/runs/31000000002",
+               "headSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
+RUN_Y_SUCCESS='{"databaseId":31000000003,"status":"completed","conclusion":"success",
+                "url":"https://github.com/AgentWebPro/agentweb/actions/runs/31000000003",
+                "headSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
+
+# Note the run order: X's re-run is FIRST, i.e. newest by creation time.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_X_RERUN_SUCCESS},${RUN_Y_FAILED}]"
+printf '%s' "${SHA_Z}" >"${d}/trunk_head_sha"
+STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_COMMITS="${TRUNK_HISTORY}" \
+  bash "${GATE_SCRIPT}" --require-deployable 2>&1)"; STATUS=$?
+check 'commit-ranked: an ancestor re-run cannot mask a newer commit failure' 1 'TRUNK_NOT_DEPLOYABLE'
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_X_RERUN_SUCCESS},${RUN_Y_FAILED}]"
+printf '%s' "${SHA_Z}" >"${d}/trunk_head_sha"
+STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_COMMITS="${TRUNK_HISTORY}" \
+  bash "${GATE_SCRIPT}" 2>&1)"; STATUS=$?
+check 'commit-ranked: it names the newer commit run, not the newer-created one' 0 'run_id=31000000002'
+
+# The converse: with Y green, X's older state is irrelevant and must not block.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED},${RUN_Y_SUCCESS}]"
+printf '%s' "${SHA_Z}" >"${d}/trunk_head_sha"
+STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_COMMITS="${TRUNK_HISTORY}" \
+  bash "${GATE_SCRIPT}" --require-deployable 2>&1)"; STATUS=$?
+check 'commit-ranked: an off-trunk failure does not block a green trunk commit' 0 'state=DEPLOYABLE'
+
+# "Head has not deployed yet" is the normal steady state and must stay
+# non-blocking, but it has to be stated rather than implied.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_Y_SUCCESS}]"
+printf '%s' "${SHA_Z}" >"${d}/trunk_head_sha"
+STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_COMMITS="${TRUNK_HISTORY}" \
+  bash "${GATE_SCRIPT}" 2>&1)"; STATUS=$?
+check 'commit-ranked: an untested head is disclosed, not hidden' 0 'has not deployed yet'
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_Y_SUCCESS}]"
+printf '%s' "${SHA_Z}" >"${d}/trunk_head_sha"
+STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_COMMITS="${TRUNK_HISTORY}" \
+  bash "${GATE_SCRIPT}" 2>&1)"; STATUS=$?
+check 'commit-ranked: and flagged as commit-ranked' 0 'commit_ranked=true'
+
+# Without trunk history the gate still answers, but must not pretend the answer
+# is commit-ranked — the masking above becomes possible again and it says so.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
+run_gate "${d}"
+check 'commit-ranked: unavailable history is declared, not papered over' 0 'commit_ranked=false'
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
+run_gate "${d}"
+check 'commit-ranked: and the masking risk is spelled out' 0 'masking a newer failure'
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ]

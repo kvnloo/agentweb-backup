@@ -44,6 +44,8 @@
 #   TRUNK_DEPLOY_LOOKBACK         runs to inspect, default 20
 #   TRUNK_DEPLOY_OVERRIDE_REASON  non-empty text unblocks --require-deployable
 #   TRUNK_HEAD_SHA                override the resolved trunk head (testing)
+#   TRUNK_COMMITS                 override trunk history, newest-first (testing)
+#   TRUNK_COMMIT_LOOKBACK         trunk commits to walk, default 50
 #
 # Exit status:
 #   0  DEPLOYABLE, or report mode, or an accepted override
@@ -56,6 +58,7 @@ TRUNK_REPO="${TRUNK_REPO:-AgentWebPro/agentweb}"
 TRUNK_BRANCH="${TRUNK_BRANCH:-main}"
 TRUNK_DEPLOY_WORKFLOW="${TRUNK_DEPLOY_WORKFLOW:-Deploy}"
 TRUNK_DEPLOY_LOOKBACK="${TRUNK_DEPLOY_LOOKBACK:-20}"
+TRUNK_COMMIT_LOOKBACK="${TRUNK_COMMIT_LOOKBACK:-50}"
 TRUNK_DEPLOY_OVERRIDE_REASON="${TRUNK_DEPLOY_OVERRIDE_REASON:-}"
 
 REQUIRE_DEPLOYABLE=0
@@ -84,6 +87,8 @@ CONCLUSION=''
 IN_FLIGHT='false'
 RUN_HEAD_SHA=''
 HEAD_SHA_MATCHES_TRUNK='false'
+# True when the verdict was chosen by walking trunk history rather than by run recency.
+COMMIT_RANKED='true'
 
 emit() {
   printf 'state=%s\n' "${STATE}"
@@ -95,6 +100,7 @@ emit() {
   printf 'run_head_sha=%s\n' "${RUN_HEAD_SHA}"
   printf 'trunk_head_sha=%s\n' "${TRUNK_HEAD_SHA:-}"
   printf 'head_sha_matches_trunk=%s\n' "${HEAD_SHA_MATCHES_TRUNK}"
+  printf 'commit_ranked=%s\n' "${COMMIT_RANKED}"
   printf 'repo=%s\n' "${TRUNK_REPO}"
   printf 'branch=%s\n' "${TRUNK_BRANCH}"
 }
@@ -159,35 +165,61 @@ if printf '%s' "${RUNS}" | jq -e '[.[] | select(.status != "completed")] | lengt
   IN_FLIGHT='true'
 fi
 
-# Bind the verdict to a commit, not just to recency.
+# Rank candidate runs by COMMIT POSITION ON TRUNK, not by run creation time.
 #
-# `gh run list` orders by creation time, so a run created earlier but finishing
-# later does not displace a newer one — the ordering alone is sound. What it
-# cannot express is *which commit* the verdict describes. A re-run of an old
-# deploy, or a branch that was reset, produces a newest-completed run whose
-# `headSha` is not on the current trunk at all, and the gate would then report
-# on a different line of history while sounding authoritative.
+# Recency of the *run* is the wrong axis, and this is the defect that survived
+# the first fix. `gh run list` orders by creation time, so re-running an old
+# commit's deploy today makes that old run the newest completed one. If a newer
+# commit's deploy failed in between, the stale success masks it and the gate
+# waves a merge onto a trunk that genuinely cannot ship — ENG-837's exact shape.
 #
-# So: a completed run for the CURRENT trunk head wins outright. Otherwise fall
-# back to newest-completed and say plainly that the verdict is older than the
-# trunk, which is normal (main moves faster than deploys) but must be visible
-# rather than implied.
+# Ordering by commit instead makes the masking structurally impossible: walk
+# trunk history newest-first and take the first commit that has a completed
+# deploy. A re-run of an ancestor can never outrank a descendant's failure,
+# because the descendant is reached first.
+#
+# The head commit itself usually has no completed deploy — main advances faster
+# than a 12-20 minute deploy — so "no run at HEAD" is the normal steady state,
+# not an error. Requiring one would serialise every merge behind a full deploy
+# cycle. That may well be the right policy for a repo that ships to production
+# on merge, but it is a throughput decision for a human, not something to
+# smuggle in via a CI script. What matters here is that the answer describes
+# the newest commit that HAS been tested, and says so.
 TRUNK_HEAD_SHA="${TRUNK_HEAD_SHA:-}"
 if [ -z "${TRUNK_HEAD_SHA}" ]; then
-  # Non-fatal: without it the gate still works, it just cannot claim SHA match.
+  # Non-fatal: without it the gate degrades to run-recency and says so.
   TRUNK_HEAD_SHA="$(gh api "repos/${TRUNK_REPO}/commits/${TRUNK_BRANCH}" -q '.sha' 2>/dev/null || printf '')"
 fi
 
-LATEST=''
-if [ -n "${TRUNK_HEAD_SHA}" ]; then
-  LATEST="$(printf '%s' "${RUNS}" \
-    | jq -c --arg sha "${TRUNK_HEAD_SHA}" \
-      '[.[] | select(.status == "completed") | select((.headSha // "") == $sha)][0] // empty' 2>/dev/null)"
-  [ -n "${LATEST}" ] && HEAD_SHA_MATCHES_TRUNK='true'
+# Trunk commits, newest first. Supplied directly in tests; one API call live.
+TRUNK_COMMITS="${TRUNK_COMMITS:-}"
+if [ -z "${TRUNK_COMMITS}" ] && [ -n "${TRUNK_HEAD_SHA}" ]; then
+  TRUNK_COMMITS="$(gh api \
+    "repos/${TRUNK_REPO}/commits?sha=${TRUNK_BRANCH}&per_page=${TRUNK_COMMIT_LOOKBACK}" \
+    -q '.[].sha' 2>/dev/null || printf '')"
 fi
 
+LATEST=''
+if [ -n "${TRUNK_COMMITS}" ]; then
+  while IFS= read -r commit; do
+    [ -z "${commit}" ] && continue
+    LATEST="$(printf '%s' "${RUNS}" \
+      | jq -c --arg sha "${commit}" \
+        '[.[] | select(.status == "completed") | select((.headSha // "") == $sha)][0] // empty' 2>/dev/null)"
+    if [ -n "${LATEST}" ]; then
+      [ "${commit}" = "${TRUNK_HEAD_SHA}" ] && HEAD_SHA_MATCHES_TRUNK='true'
+      break
+    fi
+  done <<EOF
+${TRUNK_COMMITS}
+EOF
+fi
+
+# Only when trunk history is unavailable does run-recency get used, and the
+# reason then states that the verdict is not commit-ranked.
 if [ -z "${LATEST}" ]; then
   LATEST="$(printf '%s' "${RUNS}" | jq -c '[.[] | select(.status == "completed")][0] // empty' 2>/dev/null)"
+  COMMIT_RANKED='false'
 fi
 
 if [ -z "${LATEST}" ]; then
@@ -201,12 +233,10 @@ CONCLUSION="$(printf '%s' "${LATEST}" | jq -r '.conclusion // ""')"
 RUN_HEAD_SHA="$(printf '%s' "${LATEST}" | jq -r '.headSha // ""')"
 
 SHA_NOTE=''
-if [ "${HEAD_SHA_MATCHES_TRUNK}" != 'true' ]; then
-  if [ -z "${TRUNK_HEAD_SHA}" ]; then
-    SHA_NOTE=" Could not resolve ${TRUNK_BRANCH}'s head commit, so this verdict is not bound to a specific commit."
-  else
-    SHA_NOTE=" This verdict describes commit ${RUN_HEAD_SHA:-unknown}, not the current ${TRUNK_BRANCH} head ${TRUNK_HEAD_SHA}."
-  fi
+if [ "${COMMIT_RANKED}" != 'true' ]; then
+  SHA_NOTE=" Trunk history was unavailable, so this verdict was chosen by run recency and is NOT ranked by commit — a re-run of an older commit could be masking a newer failure."
+elif [ "${HEAD_SHA_MATCHES_TRUNK}" != 'true' ]; then
+  SHA_NOTE=" This is the newest trunk commit that has a completed deploy (${RUN_HEAD_SHA:-unknown}); the current ${TRUNK_BRANCH} head ${TRUNK_HEAD_SHA:-unknown} has not deployed yet."
 fi
 
 case "${CONCLUSION}" in
