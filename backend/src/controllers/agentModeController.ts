@@ -101,20 +101,51 @@ const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
   "request into smaller batches won't help on its own. The run has been recorded as failed and will " +
   "be retried automatically. If it keeps failing, please contact support.";
 
-// ENG-826: choose the right zero-output message for the actual failure. Budget/size-
-// shaped failures (context-limit, generation timeout, worker OOM/replacement, or a
-// run that emitted no assistant turn) keep the "split into smaller batches" guidance;
-// everything else (deterministic provider/validation errors, auth, content filters,
-// transient 5xx) gets the honest system-error message that does NOT assert a size cause.
-// Exported for direct unit testing. The reconciler path (a dead process, with no error
-// object to classify) deliberately keeps SCHEDULED_JOB_INCOMPLETE_MESSAGE.
-export function zeroAssistantIncompleteMessage(error: unknown): string {
+// ENG-826 edge case: a TRANSIENT failure (rate limit, 429/5xx, timeout, dropped
+// connection) is neither a size/budget overrun nor a deterministic error. It really
+// does recover on retry — so it must NOT get the system-error copy that says "retrying
+// won't help" (that copy is only true for deterministic errors). Give it its own honest
+// message: temporary, auto-retried, usually self-clearing.
+const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
+  "This scheduled run stopped before it could produce a response, so no results were generated. " +
+  "It hit a temporary problem — a rate limit or a brief service hiccup — not a time or size limit. " +
+  "It has been recorded and will be retried automatically, and a transient issue like this usually " +
+  "clears on its own. If it keeps happening, please contact support.";
+
+// ENG-826: classify a zero-output scheduled-run failure so the persisted message and
+// the `failureClass` metadata match the ACTUAL cause. Precedence:
+//  1) 'budget' — context-limit, generation timeout, worker OOM/replacement, or a run
+//     that emitted no assistant turn: the "split into smaller batches" guidance applies.
+//  2) 'transient' — rate limit / 5xx / timeout / dropped connection: recovers on the
+//     automatic retry (checked AFTER budget because isContextLimitError is excluded
+//     from transient, and worker-shutdown/zero-output are budget-shaped by definition).
+//  3) 'system' — everything else (deterministic provider/validation errors like the
+//     gemini union-schema 400, auth, content filters): retrying won't help on its own.
+// Exported for direct unit testing.
+export type ScheduledRunFailureClass = 'budget' | 'transient' | 'system';
+
+export function classifyZeroAssistantFailure(error: unknown): ScheduledRunFailureClass {
   const budgetShaped =
     isContextLimitError(error) ||
     isWorkerShutdownError(error) ||
     isZeroAssistantOutputError(error) ||
     Boolean((error as any)?.isGenerationTimeout);
-  return budgetShaped ? SCHEDULED_JOB_INCOMPLETE_MESSAGE : SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE;
+  if (budgetShaped) return 'budget';
+  if (isTransientLLMError(error)) return 'transient';
+  return 'system';
+}
+
+// The reconciler path (a dead process, with no error object to classify) deliberately
+// keeps SCHEDULED_JOB_INCOMPLETE_MESSAGE.
+export function zeroAssistantIncompleteMessage(error: unknown): string {
+  switch (classifyZeroAssistantFailure(error)) {
+    case 'budget':
+      return SCHEDULED_JOB_INCOMPLETE_MESSAGE;
+    case 'transient':
+      return SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE;
+    default:
+      return SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE;
+  }
 }
 
 // ENG-826 (recommendation #4): compact run-health summary surfaced on each schedule
@@ -2743,8 +2774,8 @@ export async function runScheduledChat(
         // not be reported as a time/memory-budget overrun with "split into smaller
         // batches" advice that can't help — that mislabels the transcript for anyone
         // debugging it. Budget-shaped failures keep the original guidance.
+        const failureClass = classifyZeroAssistantFailure(error);
         const incompleteMessage = zeroAssistantIncompleteMessage(error);
-        const failureClass = incompleteMessage === SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE ? 'system' : 'budget';
         try {
           await chatbotDb.addMessageToSession(sessionId, {
             role: 'assistant',
