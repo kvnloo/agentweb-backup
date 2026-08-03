@@ -455,6 +455,68 @@ describe('sanitizeGeminiSchema', () => {
       },
     });
   });
+
+  // ENG-845: Gemini's Schema.type is a SINGLE OpenAPI type. A JSON-Schema union
+  // `type: ['string','array']` (used by the agent-mode `email` tool's to/cc/bcc and
+  // the `campaign_ids` filter) is rejected with a 400 the instant the tool is
+  // attached, so gemini-3.5-flash scheduled runs crashed with zero assistant output
+  // before the first token. Bedrock/opus tolerated the union, so only Gemini failed.
+  it('collapses a multi-type `type` array to a single type (ENG-845)', () => {
+    const input = {
+      type: 'object',
+      properties: {
+        to: { type: ['string', 'array'], description: 'Recipient(s)' },
+      },
+      required: ['to'],
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'Recipient(s)' },
+      },
+      required: ['to'],
+    });
+  });
+
+  it('prefers `array` for a multi-type union that carries `items` so it stays faithful (ENG-845)', () => {
+    const input = {
+      type: 'object',
+      properties: {
+        campaign_ids: {
+          type: ['array', 'string'],
+          items: { type: 'string' },
+          minItems: 1,
+          description: 'campaign ids',
+        },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        campaign_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          minItems: 1,
+          description: 'campaign ids',
+        },
+      },
+    });
+  });
+
+  it('maps a nullable `type: [T, "null"]` union to a single type + nullable (ENG-845)', () => {
+    const input = {
+      type: 'object',
+      properties: {
+        note: { type: ['string', 'null'], description: 'optional note' },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        note: { type: 'string', nullable: true, description: 'optional note' },
+      },
+    });
+  });
 });
 
 describe('createGeminiNativeClient (end-to-end wiring)', () => {
