@@ -21,6 +21,7 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
+import { isPublishName } from '../utils/hardeningGaps';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -2359,10 +2360,19 @@ export async function runScheduledChat(
     const expectedKeywords = schedule.keywords || [];
     const functionCallMinCalls = schedule.functionCallMinCalls || {};
 
-    const requiredFunctions = expectedFunctionCalls.map((funcName: string) => ({
-      functionName: funcName,
-      minCount: functionCallMinCalls[funcName] || 1
-    }));
+    // ENG-827: when this schedule is NOT pre-authorized to publish unattended
+    // (fullAutonomy off — same signal that drives the draft-and-notify PUBLISH
+    // AUTHORIZATION directive), drop live-publish tools from the deterministic
+    // required-function checker. Otherwise the checker keeps nudging the model to
+    // call post_on_connected_account while the system prompt tells it NOT to
+    // publish — the exact contradiction that burned the reported runs in a loop.
+    const publishAuthorized = schedule.fullAutonomy === true;
+    const requiredFunctions = expectedFunctionCalls
+      .filter((funcName: string) => publishAuthorized || !isPublishName(funcName))
+      .map((funcName: string) => ({
+        functionName: funcName,
+        minCount: functionCallMinCalls[funcName] || 1
+      }));
 
     // On a resume, the original task prompt is already the first message of the
     // session being continued; re-sending it would make the model start over. Send
