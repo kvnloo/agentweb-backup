@@ -43,6 +43,7 @@ import {
   buildSixLayerPromptForVariant,
   extractAdImageBrandContext,
   generateAdImagesForUser,
+  isBrandLogoFetchable,
   pickFormatSplit,
   startAdImageGenerationForUser,
   triggerAdImageGenerationForUser,
@@ -457,7 +458,10 @@ describe("onboardingAdImageService", () => {
       userDb.updateUser.mockResolvedValue({});
       const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       errSpy.mockRestore();
 
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
@@ -477,7 +481,10 @@ describe("onboardingAdImageService", () => {
       userDb.updateUser.mockResolvedValue({});
       const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       errSpy.mockRestore();
       const written = userDb.updateUser.mock.calls[0][1];
       expect(written.adImageStatus).toBe("failed");
@@ -491,7 +498,10 @@ describe("onboardingAdImageService", () => {
       userDb.updateUser.mockResolvedValue({});
       const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       errSpy.mockRestore();
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("failed");
@@ -515,7 +525,10 @@ describe("onboardingAdImageService", () => {
         });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const written = userDb.updateUser.mock.calls[0][1];
       expect(written.adImageStatus).toBe("ready");
@@ -544,7 +557,10 @@ describe("onboardingAdImageService", () => {
       userDb.updateUser.mockResolvedValue({});
       const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       errSpy.mockRestore();
 
       expect(gen.callCount).toBe(0);
@@ -553,6 +569,49 @@ describe("onboardingAdImageService", () => {
       expect(written.adImageStatus).toBe("failed");
       expect(written.adImageError).toMatch(/logo/i);
       expect(written.adImageError).toMatch(/brand/i);
+    });
+
+    it("fails the run when the persisted logo URL is present but unfetchable — never ships broken placeholders (ENG-792)", async () => {
+      // Reproduces the reported bug: the account's logo is a Google
+      // favicon-service URL that 301→404s for a domain with no crawlable
+      // favicon, so every variant's input-image fetch throws. Before the fix
+      // the run shipped 3 placeholders as "ready"; now the unfetchable logo is
+      // treated like a missing one and the run fails with an actionable error.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: {
+            brandData: {
+              brandName: "DramaBreak",
+              logoUrl:
+                "https://www.google.com/s2/favicons?domain=dramabreak.ai&sz=128",
+            },
+          },
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: new Date().toISOString(),
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      const gen = new FakeImageGen(okResponder);
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        // The persisted favicon URL fails the real preflight; simulate that.
+        verifyLogoUrl: async () => false,
+      });
+      errSpy.mockRestore();
+
+      expect(gen.callCount).toBe(0);
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("failed");
+      expect(written.adImageError).toMatch(/logo/i);
+      expect(written.adImageError).toMatch(/re-upload|brand config/i);
     });
 
     it("resolves the ORG brandGuidelines for org members — an org-level logo satisfies the gate", async () => {
@@ -583,7 +642,10 @@ describe("onboardingAdImageService", () => {
       });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
 
       expect(orgDb.getOrgById).toHaveBeenCalledWith("org1");
       const written = userDb.updateUser.mock.calls[0][1];
@@ -620,7 +682,10 @@ describe("onboardingAdImageService", () => {
       });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
 
       expect(gen.lastParams[0].logoImage).toBe("https://s3/org/current.png");
     });
@@ -644,7 +709,10 @@ describe("onboardingAdImageService", () => {
         });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       const written = userDb.updateUser.mock.calls[0][1];
       expect(written.adImageStatus).toBe("ready");
       expect(gen.lastParams[0].logoImage).toBe("https://s3/att/logo.png");
@@ -662,7 +730,10 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce({ userId: "u1", adImageStatus: "idle" });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
@@ -688,7 +759,10 @@ describe("onboardingAdImageService", () => {
       // ends in 'ready' with placeholders. (Hard failures are routed via the
       // partial-failure path because we always want the UI to render
       // something.)
-      await triggerAdImageGenerationForUser("u1", { imageGen: throwingGen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: throwingGen as any,
+        verifyLogoUrl: async () => true,
+      });
       errSpy.mockRestore();
       const written = userDb.updateUser.mock.calls[0][1];
       expect(written.adImageStatus).toBe("ready");
@@ -707,7 +781,10 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("ready");
     });
 
@@ -723,7 +800,10 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("ready");
     });
 
@@ -739,9 +819,83 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce(null);
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       // Patch returned null because current was {} → updateUser not called
       expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("isBrandLogoFetchable (ENG-792 logo preflight)", () => {
+    const pngHeaders = { "content-type": "image/png" };
+
+    it("returns true for a 2xx image response with a non-empty body", async () => {
+      const ok = await isBrandLogoFetchable("https://s3/logo.png", {
+        httpGet: async () => ({
+          status: 200,
+          headers: pngHeaders,
+          data: Buffer.from([137, 80, 78, 71]),
+        }),
+      });
+      expect(ok).toBe(true);
+    });
+
+    it("returns false when the fetch throws (favicon 404, DNS, timeout)", async () => {
+      const ok = await isBrandLogoFetchable(
+        "https://www.google.com/s2/favicons?domain=dramabreak.ai&sz=128",
+        {
+          httpGet: async () => {
+            throw new Error("Request failed with status code 404");
+          },
+        }
+      );
+      expect(ok).toBe(false);
+    });
+
+    it("returns false for a non-2xx status from an injected fetcher", async () => {
+      const ok = await isBrandLogoFetchable("https://s3/logo.png", {
+        httpGet: async () => ({ status: 404, headers: pngHeaders, data: Buffer.from([1]) }),
+      });
+      expect(ok).toBe(false);
+    });
+
+    it("returns false when the body is empty even on a 200", async () => {
+      const ok = await isBrandLogoFetchable("https://s3/logo.png", {
+        httpGet: async () => ({ status: 200, headers: pngHeaders, data: Buffer.alloc(0) }),
+      });
+      expect(ok).toBe(false);
+    });
+
+    it("returns false when a 200 serves an HTML error body, not an image", async () => {
+      const ok = await isBrandLogoFetchable("https://cdn/error", {
+        httpGet: async () => ({
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+          data: Buffer.from("<!doctype html><html>not found</html>"),
+        }),
+      });
+      expect(ok).toBe(false);
+    });
+
+    it("allows an unknown/empty content-type through (extension is sniffed later)", async () => {
+      const ok = await isBrandLogoFetchable("https://s3/logo.png", {
+        httpGet: async () => ({ status: 200, headers: {}, data: Buffer.from([1, 2, 3]) }),
+      });
+      expect(ok).toBe(true);
+    });
+
+    it("returns false for an empty or non-string URL without fetching", async () => {
+      let called = false;
+      const httpGet = async () => {
+        called = true;
+        return { status: 200, headers: pngHeaders, data: Buffer.from([1]) };
+      };
+      expect(await isBrandLogoFetchable("", { httpGet })).toBe(false);
+      expect(await isBrandLogoFetchable("   ", { httpGet })).toBe(false);
+      expect(await isBrandLogoFetchable(undefined as any, { httpGet })).toBe(false);
+      expect(called).toBe(false);
     });
   });
 
