@@ -57,6 +57,18 @@ export interface GeminiRequestOptions {
  * agentModeService.ts) for these exact keywords, because dynamically-discovered
  * MCP tool schemas (GitHub, etc. — arbitrary, not authored in this repo) can
  * carry them even though no hand-written tool here currently does.
+ *
+ * ENG-826: also normalizes a JSON-Schema union `type` array (e.g.
+ * `type: ['array', 'string']`, as used by emma/tools.ts — get_meta_ads_metrics
+ * campaign_ids, gmail send to/cc/bcc). Gemini's function-declaration `Schema.type`
+ * is a SINGLE OpenAPI type; a union array 400s the ENTIRE request the moment such
+ * a tool is attached, so every gemini-3.5-flash agent turn carrying one terminated
+ * with zero assistant output and null tokens (the ENG-826 silent-failure
+ * signature) while Claude/Bedrock — which accept the union — ran fine. We collapse
+ * the union to a single type: `array` is kept when present (so `items` stays
+ * meaningful and the model can pass a list), otherwise the first non-`null` member;
+ * a `null` member becomes `nullable: true`. Array-only keywords are dropped when
+ * the resolved type is not `array`.
  */
 export function sanitizeGeminiSchema(schema: any): any {
   if (Array.isArray(schema)) return schema.map(sanitizeGeminiSchema);
@@ -70,6 +82,18 @@ export function sanitizeGeminiSchema(schema: any): any {
   for (const [key, value] of Object.entries(schema)) {
     if (DROP.has(key) || key.startsWith('x-')) continue;
     out[key] = sanitizeGeminiSchema(value);
+  }
+  if (Array.isArray(out.type)) {
+    const members = out.type.filter((t: any) => typeof t === 'string');
+    const nonNull = members.filter((t: string) => t !== 'null');
+    const resolved = nonNull.includes('array') ? 'array' : (nonNull[0] || 'string');
+    out.type = resolved;
+    if (members.length !== nonNull.length) out.nullable = true;
+    if (resolved !== 'array') {
+      delete out.items;
+      delete out.minItems;
+      delete out.maxItems;
+    }
   }
   return out;
 }
