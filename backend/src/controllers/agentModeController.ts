@@ -745,6 +745,39 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
   return INCOMPLETE_WORK_PATTERNS.some((re) => re.test(content));
 }
 
+// ENG-844: Deterministic detector for a scheduled run that LEGITIMATELY
+// short-circuited on a conditional guard — e.g. a schedule that runs DAILY but
+// is instructed to publish only on Mon/Wed/Fri, running on a non-publishing day.
+// Such a run correctly produces ZERO write calls (post_on_connected_account /
+// generate_image) BY DESIGN and reports a skip.
+//
+// Without recognising this, runVerifiedChat keeps retrying to satisfy the
+// schedule's requiredFunctionCalls, re-sending an identical "Please try again.
+// Make sure to <write tool> (1 more time needed)" prompt. That pressure is aimed
+// at IRREVERSIBLE, live-publishing tools, and repeating the identical prompt
+// eventually trips the anti-loop override in agentModeService — pushing a
+// correctly-behaving agent toward off-cadence publishing or fabricating success.
+//
+// This is DISTINCT from scheduledRunSignalsIncompleteWork (which detects a run
+// that left SOME items undone and should continue). Here the WHOLE run is a
+// deliberate no-op, so the patterns anchor strictly on an explicit whole-run
+// skip decision ("non-publishing day", "skipping today", "nothing to publish
+// today") — never on a normal publishing turn or a partial-progress admission.
+const CONDITIONAL_SKIP_PATTERNS: RegExp[] = [
+  /\bnon-?publishing\s+day\b/i,
+  /\bnot\s+a\s+(?:publishing|posting)\s+day\b/i,
+  /\btoday\s+is\s+(?:not\s+a\s+(?:publishing|posting)\s+day|a\s+(?:non-?publishing|skip|rest)\s+day)\b/i,
+  /\bskipp?(?:ing|ed)?\s+(?:today|this\s+(?:run|cycle|schedule))\b/i,
+  /\bno\s+(?:post|publishing|publish)\s+(?:today|scheduled\s+(?:for\s+)?today)\b/i,
+  /\bnothing\s+to\s+(?:post|publish)\s+today\b/i,
+  /\bcreat(?:e|ing)\s+and\s+publish(?:ing)?\s+nothing\b/i,
+];
+
+export function scheduledRunSignalsConditionalSkip(content: string): boolean {
+  if (!content || typeof content !== 'string') return false;
+  return CONDITIONAL_SKIP_PATTERNS.some((re) => re.test(content));
+}
+
 // Deterministic, TOOL-CALL-based completion detector for scheduled runs (ENG-518).
 //
 // Some workflows split a mutation into a dry-run PREVIEW tool and a write-back
@@ -1060,6 +1093,11 @@ type RunVerifiedChatResult = {
   // confirm). `success` stays true (a deliverable existed for HTTP callers), but the
   // SCHEDULED path treats this as a failed run (records failure + oncall).
   deferredUnresolved?: boolean;
+  // ENG-844: set when a scheduled run legitimately short-circuited on a conditional
+  // guard (e.g. a Mon/Wed/Fri schedule running on a non-publishing day) and correctly
+  // produced zero write calls. The run is a SUCCESSFUL skip — required write-call
+  // minimums are waived instead of retry-pressed toward irreversible publishing.
+  conditionalSkip?: boolean;
 };
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -1618,6 +1656,42 @@ export async function runVerifiedChat(
         return countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount;
       });
       const allRequirementsMet = (!workPlan || workPlanCompleted) && allKeywordsMet && allFunctionCallsMet;
+
+      // ENG-844: A scheduled run that legitimately short-circuited on a conditional
+      // guard (e.g. a "publish only Mon/Wed/Fri" schedule running on a non-publishing
+      // day) produces zero write calls BY DESIGN and reports a clean skip. Do NOT keep
+      // retrying to satisfy requiredFunctionCalls — that pressure is aimed at
+      // IRREVERSIBLE publishing tools (post_on_connected_account / generate_image) and,
+      // because each retry re-sends an identical prompt, eventually trips the anti-loop
+      // override. Treat it as a SUCCESSFUL skip: waive the unmet write-call minimums and
+      // exit cleanly. Scoped to scheduled runs (completionGate) so interactive/image/
+      // revision callers are unaffected, and only fires when a required call is actually
+      // unmet — a run that DID publish flows through the normal success path below.
+      if (completionGate && !allFunctionCallsMet && scheduledRunSignalsConditionalSkip(allContent)) {
+        console.log(
+          `AgentMode runVerifiedChat: session ${sessionId} legitimately short-circuited on a conditional ` +
+          `skip day — recording a successful skip without pressing for required write calls.`
+        );
+        const skipFunctionStatus = requiredFunctions.map((reqFunc) => {
+          const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
+          return { functionName: reqFunc.functionName, requiredCount: reqFunc.minCount, actualCount, met: actualCount >= reqFunc.minCount };
+        });
+        return {
+          success: true,
+          conditionalSkip: true,
+          content: allContent,
+          toolCalls: allToolCalls,
+          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+          keywordMisses: [],
+          functionCallMatches: requiredFunctions.filter(reqFunc =>
+            countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount
+          ).map(reqFunc => reqFunc.functionName),
+          functionCallMisses: [],
+          functionStatus: skipFunctionStatus,
+          attempts: attempt,
+          workPlanCompleted: workPlanCompleted || !workPlan,
+        };
+      }
 
       // Deterministic completion gate (opt-in, scheduled runs only): if all other
       // requirements are met but the latest turn admits it left work unfinished,
