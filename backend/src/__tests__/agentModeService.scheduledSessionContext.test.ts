@@ -338,6 +338,55 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(nonAdmin).toContain('PER-ENTITY COMPLETION LOOP');
     expect(adminDirective).toContain('PER-ENTITY COMPLETION LOOP');
   });
+
+  // ── (8) Publish authorization signal (ENG-827) ──────────────────────────────
+  // Regression coverage for sessions 1b28ae36 / a924892d (Kevin — Daily LinkedIn
+  // / X posts): the agent drafted a 5/5 post, then refused post_on_connected_account
+  // in an unattended run because it had no machine-readable signal that the
+  // schedule authorized live publishing, so it fell back to refusing and the
+  // required-tool checker nudged it in a loop that burned the run. The directive
+  // must carry an explicit, deterministic publish-authorization block — not leave
+  // it to the model to guess.
+  const publishAuthorizedDirective = getUnattendedExecutionDirective('scheduled', false, true);
+  const publishGatedDirective = getUnattendedExecutionDirective('scheduled', false, false);
+
+  it('always carries an explicit PUBLISH AUTHORIZATION block on scheduled runs', () => {
+    expect(publishAuthorizedDirective).toContain('PUBLISH AUTHORIZATION');
+    expect(publishGatedDirective).toContain('PUBLISH AUTHORIZATION');
+    // default (no publishAuthorized arg) is the safe, publish-gated variant
+    expect(directive).toContain('PUBLISH AUTHORIZATION');
+  });
+
+  it('AUTHORIZES publishing (satisfies the approval gate, requires the publish tool) when pre-authorized', () => {
+    expect(publishAuthorizedDirective).toContain('PRE-AUTHORIZED to publish');
+    expect(publishAuthorizedDirective).toContain('ALREADY SATISFIED');
+    // it must name the concrete publishing tool the run was refusing to call
+    expect(publishAuthorizedDirective).toContain('post_on_connected_account');
+    expect(publishAuthorizedDirective.toLowerCase()).toContain('must call the publishing tool');
+    // and it must NOT tell the run to withhold / seek sign-off
+    expect(publishAuthorizedDirective.toLowerCase()).not.toContain('awaiting the owner');
+  });
+
+  it('WITHHOLDS publishing deterministically (draft + notify once, no loop) when NOT pre-authorized', () => {
+    expect(publishGatedDirective).toContain('NOT pre-authorized to publish');
+    expect(publishGatedDirective.toLowerCase()).toContain('do not call a live-publishing tool');
+    expect(publishGatedDirective).toContain('post_on_connected_account');
+    // draft-and-notify is the correct COMPLETE terminal state, not a failure
+    expect(publishGatedDirective.toLowerCase()).toContain('awaiting the owner');
+    expect(publishGatedDirective.toLowerCase()).toContain('not unfinished');
+    // and it must stop the nudge loop rather than re-attempting the withheld publish
+    expect(publishGatedDirective.toLowerCase()).toContain('do not repeatedly');
+  });
+
+  it('safe-by-default: omitting publishAuthorized yields the publish-GATED block, never the authorized one', () => {
+    expect(directive).toContain('NOT pre-authorized to publish');
+    expect(directive).not.toContain('PRE-AUTHORIZED to publish');
+  });
+
+  it('still returns empty (no publish block) for non-scheduled sessions even when publishAuthorized is true', () => {
+    expect(getUnattendedExecutionDirective('regular', false, true)).toBe('');
+    expect(getUnattendedExecutionDirective(undefined, true, true)).toBe('');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

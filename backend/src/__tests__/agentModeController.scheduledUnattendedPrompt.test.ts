@@ -23,7 +23,7 @@ import { Request, Response } from 'express';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { userDb } from '../services/db';
+import { userDb, scheduleDb } from '../services/db';
 
 // ── Mocks (mirror agentModeController.errorHandling.test.ts) ──────────────────
 jest.mock('../services/chatbotService', () => ({
@@ -140,6 +140,10 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     // Default owner-admin lookup to a deterministic non-admin so the base suite
     // never makes a real DB call; admin-gating cases below override this per-test.
     jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: USER_ID, isAdmin: false } as any);
+    // ENG-827: publish authorization is derived from the schedule's fullAutonomy
+    // flag. Default the lookup to a non-autonomous schedule (draft-and-notify);
+    // publish-authorized cases below override this per-test.
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: false } as any);
     // Worker returns a normal success so generateResponse completes without error.
     mockWorker.runInWorker.mockResolvedValue({
       content: 'Report delivered.',
@@ -277,5 +281,37 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).toBeDefined();
     expect(sp!).toContain('[AUTOMATED UNATTENDED EXECUTION]');
     expect(sp!).not.toContain('IDENTITY RESOLUTION');
+  });
+
+  // ── Publish authorization signal (ENG-827) ───────────────────────────────────
+  // The controller resolves the schedule's fullAutonomy flag into the publish
+  // authorization block. Cover the authorize / withhold / lookup-failure branches
+  // end-to-end so a regression in the wiring can't silently drop the signal.
+  it('AUTHORIZES publishing when the schedule is fullAutonomy (pre-authorized)', async () => {
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: true } as any);
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('PUBLISH AUTHORIZATION');
+    expect(sp).toContain('PRE-AUTHORIZED to publish');
+    expect(sp).toContain('post_on_connected_account');
+    expect(sp).not.toContain('NOT pre-authorized to publish');
+  });
+
+  it('WITHHOLDS publishing (draft & notify) when the schedule is not fullAutonomy', async () => {
+    // beforeEach already defaults fullAutonomy:false
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('PUBLISH AUTHORIZATION');
+    expect(sp).toContain('NOT pre-authorized to publish');
+    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
+  });
+
+  it('defaults to WITHHOLD (safe) when the schedule lookup THROWS', async () => {
+    jest.spyOn(scheduleDb, 'getScheduleById').mockRejectedValue(new Error('DynamoDB throttled'));
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('[AUTOMATED UNATTENDED EXECUTION]');
+    expect(sp).toContain('NOT pre-authorized to publish');
+    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
   });
 });
