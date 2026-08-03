@@ -52,6 +52,17 @@ if [ "${1:-}" = "run" ] && [ "${2:-}" = "list" ]; then
   exit 0
 fi
 
+if [ "${1:-}" = "api" ]; then
+  # Resolving the trunk head commit. `trunk_head_sha` absent => simulate a
+  # failure, which the gate must treat as non-fatal.
+  if [ -f "${MOCK_DIR}/trunk_head_sha" ]; then
+    cat "${MOCK_DIR}/trunk_head_sha"
+    exit 0
+  fi
+  printf 'mock gh: simulated api failure\n' >&2
+  exit 1
+fi
+
 printf 'mock gh: unexpected invocation: %s\n' "$*" >&2
 exit 64
 MOCK
@@ -208,6 +219,85 @@ check 'a deploy in flight above a success does not block' 0 'state=DEPLOYABLE'
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_CANCELLED}]"
 run_gate "${d}" --require-deployable
 check 'a cancelled deploy is not a successful deploy' 1 'TRUNK_NOT_DEPLOYABLE'
+
+# ---------------------------------------------------------------------------
+# The verdict is bound to a COMMIT, not merely to recency (Greptile P1 on #2254)
+# ---------------------------------------------------------------------------
+#
+# `gh run list` orders by creation time, so a run created earlier but finishing
+# later cannot displace a newer one — ordering alone is sound. What ordering
+# cannot express is WHICH COMMIT the verdict describes. A re-run of an older
+# deploy, or a branch that was reset, leaves a newest-completed run whose
+# headSha is not on the current trunk, and the gate would then report on a
+# different line of history while sounding authoritative.
+#
+# So a completed run at the current trunk head wins outright.
+
+TRUNK_SHA='9db4d5947aa11bb2200cc33dd4400ee55ff660011'
+
+RUN_OTHER_SUCCESS='{"databaseId":30900000009,"status":"completed","conclusion":"success",
+                    "url":"https://github.com/AgentWebPro/agentweb/actions/runs/30900000009",
+                    "headSha":"ffffffffffffffffffffffffffffffffffffffff"}'
+
+RUN_TRUNK_FAILED='{"databaseId":30900000010,"status":"completed","conclusion":"failure",
+                   "url":"https://github.com/AgentWebPro/agentweb/actions/runs/30900000010",
+                   "headSha":"9db4d5947aa11bb2200cc33dd4400ee55ff660011"}'
+
+RUN_TRUNK_SUCCESS='{"databaseId":30900000011,"status":"completed","conclusion":"success",
+                    "url":"https://github.com/AgentWebPro/agentweb/actions/runs/30900000011",
+                    "headSha":"9db4d5947aa11bb2200cc33dd4400ee55ff660011"}'
+
+# The defect Greptile named: a newer completed run for a DIFFERENT commit
+# succeeded, while the current trunk head's own deploy failed. Recency alone
+# says DEPLOYABLE and would wave a merge onto a trunk that cannot ship.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OTHER_SUCCESS},${RUN_TRUNK_FAILED}]"
+printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+run_gate "${d}" --require-deployable
+check 'SHA-bound: the trunk head run decides, not merely the newest' 1 'TRUNK_NOT_DEPLOYABLE'
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OTHER_SUCCESS},${RUN_TRUNK_FAILED}]"
+printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+run_gate "${d}"
+check 'SHA-bound: it names the trunk head run, not the unrelated one' 0 'run_id=30900000010'
+
+# The converse must also hold, or the fix trades one wrong answer for another:
+# an unrelated FAILED run must not block a trunk whose own deploy succeeded.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED},${RUN_TRUNK_SUCCESS}]"
+printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+run_gate "${d}" --require-deployable
+check 'SHA-bound: an unrelated failure does not block a healthy trunk head' 0 'state=DEPLOYABLE'
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_TRUNK_SUCCESS}]"
+printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+run_gate "${d}"
+check 'SHA-bound: a match is reported as such' 0 'head_sha_matches_trunk=true'
+
+# Main moves faster than deploys, so "no run at the current head" is the NORMAL
+# case, not an error. It must still produce a verdict — and say out loud that
+# the verdict is older than the trunk rather than implying otherwise.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
+printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+run_gate "${d}" --require-deployable
+check 'SHA-bound: no run at trunk head still yields a verdict' 0 'state=DEPLOYABLE'
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
+printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+run_gate "${d}"
+check 'SHA-bound: and it discloses that the verdict is not at trunk head' 0 'not the current main head'
+
+# Resolving the trunk head is best-effort. If that call fails the gate must
+# still work — degrading to recency — and must not silently imply a SHA match.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
+run_gate "${d}" --require-deployable
+check 'SHA-bound: an unresolvable trunk head degrades rather than breaking' 0 'state=DEPLOYABLE'
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
+run_gate "${d}"
+check 'SHA-bound: and says the verdict is not commit-bound' 0 'not bound to a specific commit'
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
+run_gate "${d}"
+check 'SHA-bound: never claims a match it could not verify' 0 'head_sha_matches_trunk=false'
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ]

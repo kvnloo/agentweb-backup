@@ -43,6 +43,7 @@
 #   TRUNK_DEPLOY_WORKFLOW         default Deploy
 #   TRUNK_DEPLOY_LOOKBACK         runs to inspect, default 20
 #   TRUNK_DEPLOY_OVERRIDE_REASON  non-empty text unblocks --require-deployable
+#   TRUNK_HEAD_SHA                override the resolved trunk head (testing)
 #
 # Exit status:
 #   0  DEPLOYABLE, or report mode, or an accepted override
@@ -81,6 +82,8 @@ RUN_URL=''
 RUN_ID=''
 CONCLUSION=''
 IN_FLIGHT='false'
+RUN_HEAD_SHA=''
+HEAD_SHA_MATCHES_TRUNK='false'
 
 emit() {
   printf 'state=%s\n' "${STATE}"
@@ -89,6 +92,9 @@ emit() {
   printf 'run_url=%s\n' "${RUN_URL}"
   printf 'conclusion=%s\n' "${CONCLUSION}"
   printf 'in_flight=%s\n' "${IN_FLIGHT}"
+  printf 'run_head_sha=%s\n' "${RUN_HEAD_SHA}"
+  printf 'trunk_head_sha=%s\n' "${TRUNK_HEAD_SHA:-}"
+  printf 'head_sha_matches_trunk=%s\n' "${HEAD_SHA_MATCHES_TRUNK}"
   printf 'repo=%s\n' "${TRUNK_REPO}"
   printf 'branch=%s\n' "${TRUNK_BRANCH}"
 }
@@ -153,8 +159,36 @@ if printf '%s' "${RUNS}" | jq -e '[.[] | select(.status != "completed")] | lengt
   IN_FLIGHT='true'
 fi
 
-# `gh run list` returns newest first; the newest COMPLETED run is the verdict.
-LATEST="$(printf '%s' "${RUNS}" | jq -c '[.[] | select(.status == "completed")][0] // empty' 2>/dev/null)"
+# Bind the verdict to a commit, not just to recency.
+#
+# `gh run list` orders by creation time, so a run created earlier but finishing
+# later does not displace a newer one — the ordering alone is sound. What it
+# cannot express is *which commit* the verdict describes. A re-run of an old
+# deploy, or a branch that was reset, produces a newest-completed run whose
+# `headSha` is not on the current trunk at all, and the gate would then report
+# on a different line of history while sounding authoritative.
+#
+# So: a completed run for the CURRENT trunk head wins outright. Otherwise fall
+# back to newest-completed and say plainly that the verdict is older than the
+# trunk, which is normal (main moves faster than deploys) but must be visible
+# rather than implied.
+TRUNK_HEAD_SHA="${TRUNK_HEAD_SHA:-}"
+if [ -z "${TRUNK_HEAD_SHA}" ]; then
+  # Non-fatal: without it the gate still works, it just cannot claim SHA match.
+  TRUNK_HEAD_SHA="$(gh api "repos/${TRUNK_REPO}/commits/${TRUNK_BRANCH}" -q '.sha' 2>/dev/null || printf '')"
+fi
+
+LATEST=''
+if [ -n "${TRUNK_HEAD_SHA}" ]; then
+  LATEST="$(printf '%s' "${RUNS}" \
+    | jq -c --arg sha "${TRUNK_HEAD_SHA}" \
+      '[.[] | select(.status == "completed") | select((.headSha // "") == $sha)][0] // empty' 2>/dev/null)"
+  [ -n "${LATEST}" ] && HEAD_SHA_MATCHES_TRUNK='true'
+fi
+
+if [ -z "${LATEST}" ]; then
+  LATEST="$(printf '%s' "${RUNS}" | jq -c '[.[] | select(.status == "completed")][0] // empty' 2>/dev/null)"
+fi
 
 if [ -z "${LATEST}" ]; then
   REASON="no completed ${TRUNK_DEPLOY_WORKFLOW} run found on ${TRUNK_REPO}@${TRUNK_BRANCH}, so deployability is unproven."
@@ -164,11 +198,21 @@ fi
 RUN_ID="$(printf '%s' "${LATEST}" | jq -r '.databaseId // ""')"
 RUN_URL="$(printf '%s' "${LATEST}" | jq -r '.url // ""')"
 CONCLUSION="$(printf '%s' "${LATEST}" | jq -r '.conclusion // ""')"
+RUN_HEAD_SHA="$(printf '%s' "${LATEST}" | jq -r '.headSha // ""')"
+
+SHA_NOTE=''
+if [ "${HEAD_SHA_MATCHES_TRUNK}" != 'true' ]; then
+  if [ -z "${TRUNK_HEAD_SHA}" ]; then
+    SHA_NOTE=" Could not resolve ${TRUNK_BRANCH}'s head commit, so this verdict is not bound to a specific commit."
+  else
+    SHA_NOTE=" This verdict describes commit ${RUN_HEAD_SHA:-unknown}, not the current ${TRUNK_BRANCH} head ${TRUNK_HEAD_SHA}."
+  fi
+fi
 
 case "${CONCLUSION}" in
   success)
     STATE='DEPLOYABLE'
-    REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} succeeded."
+    REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} succeeded.${SHA_NOTE}"
     ;;
   '' | null)
     REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run (${RUN_ID}) reported no conclusion."
@@ -178,7 +222,7 @@ case "${CONCLUSION}" in
     # Only `success` means the trunk shipped. A cancelled deploy never reached
     # production, so counting it as fine is how a trunk goes quietly unshipped.
     STATE='BLOCKED'
-    REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} ended '${CONCLUSION}', so ${TRUNK_BRANCH} is not known to be deployable."
+    REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} ended '${CONCLUSION}', so ${TRUNK_BRANCH} is not known to be deployable.${SHA_NOTE}"
     ;;
 esac
 
