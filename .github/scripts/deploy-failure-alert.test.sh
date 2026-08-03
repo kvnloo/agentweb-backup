@@ -343,7 +343,12 @@ check_no_canary() {
 grep_effective() {
   # grep_effective <file...> -- <pattern>
   local pattern="${*: -1}" files=( "${@:1:$#-1}" )
-  sed -e 's/^[[:space:]]*#.*$//' "${files[@]}" | grep -qE "${pattern}"
+  # NOT `grep -q`: with `set -o pipefail`, grep exiting early on the first
+  # match can SIGPIPE the upstream sed, and the pipeline then reports the
+  # sed's 141 instead of grep's 0 — a TRUE match read as a miss. It is a race,
+  # so it passes locally on a small file and fails on CI. Plain grep reads its
+  # input to EOF, so the upstream never sees a closed pipe.
+  sed -e 's/^[[:space:]]*#.*$//' "${files[@]}" | grep -E "${pattern}" >/dev/null
 }
 
 # check_workflow <description> <grep -E pattern> <expected: present|absent>
@@ -728,7 +733,11 @@ check_no_canary 'the token appears nowhere except the ::add-mask:: line'
 # test suite itself runs outside Actions. Reproduced with a canary before the
 # fix; this pins it.
 M=$(new_mock_dir)
-run_alert "$M"          # GITHUB_ACTIONS deliberately UNSET
+# GITHUB_ACTIONS pinned EMPTY, not merely left unset: this suite itself runs
+# inside GitHub Actions, where the variable is already `true` in the ambient
+# environment. Relying on it being absent passed locally and failed in CI —
+# the test was asserting a property of my laptop, not of the script.
+run_alert "$M" GITHUB_ACTIONS=''
 TESTS_RUN=$(( TESTS_RUN + 1 ))
 if grep -qF "${CANARY_TOKEN}" "${WORKDIR}/out.txt"; then
   record_fail 'outside GitHub Actions the token is never printed at all' \
