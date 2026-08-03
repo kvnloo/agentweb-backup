@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { normalizeLinkedInUrl } from './enrichmentGroups';
 
 /**
@@ -244,19 +245,38 @@ export async function mirrorLinkedInInviteToCrm(
 
   let created = false;
   if (!leadId) {
-    // createLead stores the LinkedIn URL verbatim, so pass the already-normalized value
-    // to keep it consistent with the LinkedinLookupIndex GSI reads above.
-    const newLead = await crmDb.createLead(listId, {
-      linkedin: normalized,
-      firstName: params.firstName,
-      lastName: params.lastName,
-      company: params.company,
-      title: params.title,
-      status: 'contacted',
-      userId: params.userId,
-    });
-    leadId = (newLead as any)?.leadId as string;
-    created = true;
+    // No lead in the target list yet. Create it under a leadId DETERMINISTICALLY
+    // derived from the (list, normalized URL) identity, with a fail-if-exists
+    // guard, so two mirrors racing on the same brand-new invitee — the send-time
+    // mirror and the pending-invitation reconciliation, say — collide on the same
+    // item instead of each inserting a duplicate contacted lead. The loser adopts
+    // the winner's lead and falls through to the idempotent engagement append.
+    // (pass the already-normalized URL so it stays consistent with the GSI reads.)
+    const deterministicLeadId = `lead_li_${createHash('sha1')
+      .update(`${listId}\n${normalized}`)
+      .digest('hex')
+      .slice(0, 20)}`;
+    try {
+      const newLead = await crmDb.createLead(listId, {
+        linkedin: normalized,
+        firstName: params.firstName,
+        lastName: params.lastName,
+        company: params.company,
+        title: params.title,
+        status: 'contacted',
+        userId: params.userId,
+        leadId: deterministicLeadId,
+        failIfExists: true,
+      });
+      leadId = (newLead as any)?.leadId as string;
+      existing = newLead;
+      created = true;
+    } catch (err: any) {
+      if (!err?.leadAlreadyExists) throw err;
+      // A concurrent mirror created this invitee first — adopt that lead.
+      existing = await crmDb.getLeadById(listId, deterministicLeadId);
+      leadId = existing ? (existing.leadId as string) : deterministicLeadId;
+    }
   }
 
   if (!leadId) return null;
@@ -287,11 +307,12 @@ export async function mirrorLinkedInInviteToCrm(
     createdAt: sentAt,
   };
 
-  // A brand-new lead has no engagements and nothing else can be racing it yet.
-  if (created) {
-    await crmDb.addLeadEngagement(listId, leadId, engagement);
-    return { leadId, listId, created, engagementLogged: true };
-  }
+  // Every path — freshly created, adopted from a racing create, or a pre-existing
+  // lead — appends through the SAME idempotent CAS loop below. A brand-new lead
+  // starts from an empty snapshot so the first attempt simply appends; but a lead
+  // adopted from a concurrent create may already carry the winner's engagement, so
+  // it must be dedup-checked too. Not special-casing `created` closes the window
+  // where a race-loser would have appended a second copy of the same invitation.
 
   // "Is it already recorded?" is a read and the append is a write, so on their own
   // two overlapping mirrors — the sync cron reconciling while an outreach run sends,

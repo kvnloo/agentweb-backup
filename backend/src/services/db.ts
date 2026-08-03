@@ -5311,9 +5311,16 @@ export const crmDb = {
     // metadata. Lookup GSIs partition on email/linkedin/nameCompanyKey, not
     // userId, so userId is not load-bearing for retrieval — only audit.
     userId?: string;
+    // ENG-787: caller-supplied deterministic leadId + fail-if-exists conditional
+    // create. Lets a caller that keys a lead on a stable identity (the invite
+    // mirror keys on the normalized LinkedIn URL) dedup two concurrent creates:
+    // both target the SAME (listId, leadId) item, so the second's conditional put
+    // fails with `leadAlreadyExists` instead of spawning a duplicate lead.
+    leadId?: string;
+    failIfExists?: boolean;
   }) {
     try {
-      const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const leadId = leadData.leadId?.trim() || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
       // Check for duplicate email if email is provided
       if (leadData.email && leadData.email.trim()) {
@@ -5449,10 +5456,16 @@ export const crmDb = {
       });
       Object.assign(item, attributionFields);
 
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Item: item,
       };
+      // ENG-787: when the caller keys the lead on a deterministic id, create it
+      // only if that (listId, leadId) item does not already exist, so two
+      // concurrent creates of the same identity resolve to one lead.
+      if (leadData.failIfExists) {
+        params.ConditionExpression = 'attribute_not_exists(leadId)';
+      }
 
       await dynamodb.put(params).promise();
 
@@ -5516,7 +5529,15 @@ export const crmDb = {
       }
 
       return params.Item;
-    } catch (error) {
+    } catch (error: any) {
+      // ENG-787: a fail-if-exists create that loses the race is not an error the
+      // caller should treat as a DB fault — surface it as a tagged signal so the
+      // invite mirror can adopt the winning lead instead of duplicating it.
+      if (leadData.failIfExists && error?.code === 'ConditionalCheckFailedException') {
+        const raceError: any = new Error('Lead already exists for this deterministic key');
+        raceError.leadAlreadyExists = true;
+        throw raceError;
+      }
       handleDynamoDbError(error, "createLead");
       throw error;
     }
