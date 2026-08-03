@@ -185,18 +185,19 @@ fi
 # on merge, but it is a throughput decision for a human, not something to
 # smuggle in via a CI script. What matters here is that the answer describes
 # the newest commit that HAS been tested, and says so.
-TRUNK_HEAD_SHA="${TRUNK_HEAD_SHA:-}"
-if [ -z "${TRUNK_HEAD_SHA}" ]; then
-  # Non-fatal: without it the gate degrades to run-recency and says so.
-  TRUNK_HEAD_SHA="$(gh api "repos/${TRUNK_REPO}/commits/${TRUNK_BRANCH}" -q '.sha' 2>/dev/null || printf '')"
-fi
-
-# Trunk commits, newest first. Supplied directly in tests; one API call live.
+# One call does both jobs: the commit list is trunk history, and its first entry
+# IS the head. Resolving the head separately was a redundant API call and an
+# extra failure mode — if it failed, history was never fetched at all.
 TRUNK_COMMITS="${TRUNK_COMMITS:-}"
-if [ -z "${TRUNK_COMMITS}" ] && [ -n "${TRUNK_HEAD_SHA}" ]; then
+if [ -z "${TRUNK_COMMITS}" ]; then
   TRUNK_COMMITS="$(gh api \
     "repos/${TRUNK_REPO}/commits?sha=${TRUNK_BRANCH}&per_page=${TRUNK_COMMIT_LOOKBACK}" \
     -q '.[].sha' 2>/dev/null || printf '')"
+fi
+
+TRUNK_HEAD_SHA="${TRUNK_HEAD_SHA:-}"
+if [ -z "${TRUNK_HEAD_SHA}" ] && [ -n "${TRUNK_COMMITS}" ]; then
+  TRUNK_HEAD_SHA="$(printf '%s\n' "${TRUNK_COMMITS}" | head -n 1)"
 fi
 
 LATEST=''
@@ -241,8 +242,22 @@ fi
 
 case "${CONCLUSION}" in
   success)
-    STATE='DEPLOYABLE'
-    REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} succeeded.${SHA_NOTE}"
+    # A success only proves the trunk is shippable if it was chosen by walking
+    # trunk history. Without that ranking an ancestor re-run can be masking a
+    # newer commit's failed deploy, so the honest state is UNKNOWN rather than
+    # DEPLOYABLE — and UNKNOWN fails closed under enforcement, exactly as a
+    # missing run or an unreadable payload does. Reporting mode still shows the
+    # recency reading so a human can see what was found.
+    #
+    # A FAILURE needs no such caveat and stays BLOCKED either way: a failed
+    # deploy is positive evidence, and ranking cannot make it less true.
+    if [ "${COMMIT_RANKED}" = 'true' ]; then
+      STATE='DEPLOYABLE'
+      REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} succeeded.${SHA_NOTE}"
+    else
+      STATE='UNKNOWN'
+      REASON="a ${TRUNK_DEPLOY_WORKFLOW} run on ${TRUNK_BRANCH} succeeded, but it could not be ranked against trunk history, so it does not prove ${TRUNK_BRANCH} is deployable.${SHA_NOTE}"
+    fi
     ;;
   '' | null)
     REASON="the most recent completed ${TRUNK_DEPLOY_WORKFLOW} run (${RUN_ID}) reported no conclusion."

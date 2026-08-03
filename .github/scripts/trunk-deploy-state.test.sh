@@ -148,6 +148,7 @@ install_mock_gh
 # ---------------------------------------------------------------------------
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
+printf '%s\n' '9db4d5947' >"${d}/trunk_commits"
 run_gate "${d}"
 check 'AC4: a healthy trunk reports DEPLOYABLE and exits 0' 0 'state=DEPLOYABLE'
 
@@ -174,6 +175,7 @@ run_gate "${d}" --require-deployable
 check 'AC2: the refusal names the failing run so it is actionable' 1 '30712345678'
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
+printf '%s\n' '9db4d5947' >"${d}/trunk_commits"
 run_gate "${d}" --require-deployable
 check 'AC2: a healthy trunk passes enforcement' 0 'state=DEPLOYABLE'
 
@@ -225,6 +227,7 @@ run_gate "${d}"
 check 'an in-flight run is reported rather than hidden' 0 'in_flight=true'
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_INFLIGHT},${RUN_OK}]"
+printf '%s\n' '9db4d5947' >"${d}/trunk_commits"
 run_gate "${d}" --require-deployable
 check 'a deploy in flight above a success does not block' 0 'state=DEPLOYABLE'
 
@@ -295,6 +298,7 @@ check 'SHA-bound: a match is reported as such' 0 'head_sha_matches_trunk=true'
 # the verdict is older than the trunk rather than implying otherwise.
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
 printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
+printf '%s\n%s\n' "${TRUNK_SHA}" '9db4d5947' >"${d}/trunk_commits"
 run_gate "${d}" --require-deployable
 check 'SHA-bound: no run at trunk head still yields a verdict' 0 'state=DEPLOYABLE'
 
@@ -306,9 +310,11 @@ check 'SHA-bound: and it discloses that the verdict is not at trunk head' 0 'has
 
 # Resolving the trunk head is best-effort. If that call fails the gate must
 # still work — degrading to recency — and must not silently imply a SHA match.
+# Fail-closed, and this is the case Greptile pushed on: an unrankable success
+# is not evidence. Report mode still shows what was found; ENFORCEMENT refuses.
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
 run_gate "${d}" --require-deployable
-check 'SHA-bound: an unresolvable trunk head degrades rather than breaking' 0 'state=DEPLOYABLE'
+check 'SHA-bound: an unrankable success does NOT pass enforcement' 2 'UNKNOWN'
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
 run_gate "${d}"
