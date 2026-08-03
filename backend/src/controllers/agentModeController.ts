@@ -864,13 +864,41 @@ const WEEKDAY_ABBREV_TO_INDEX: Record<string, number> = {
   sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
 };
 
+// Every ACCEPTED spelling of a weekday → 0–6. Matched only as whole tokens (see
+// WEEKDAY_TOKEN) so "monetary"/"wedding"/"satisfaction" are NOT read as Mon/Wed/Sat
+// (Greptile P1: a loose `(mon|tue|…)[a-z]*` prefix invented cadences, ENG-844).
+const WEEKDAY_WORD_TO_INDEX: Record<string, number> = {
+  sunday: 0, sun: 0,
+  monday: 1, mon: 1,
+  tuesday: 2, tue: 2, tues: 2,
+  wednesday: 3, wed: 3, weds: 3,
+  thursday: 4, thu: 4, thur: 4, thurs: 4,
+  friday: 5, fri: 5,
+  saturday: 6, sat: 6,
+};
+// Whole-token weekday matcher — full names or the exact accepted abbreviations,
+// never an arbitrary word that merely starts with those three letters.
+const WEEKDAY_TOKEN = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
+// A range like "Mon-Fri" / "Monday to Friday" / "Monday through Friday".
+const WEEKDAY_RANGE = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b\s*(?:-|–|—|to|through|thru|till|until)\s*\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
+
 // Extract every weekday named in a text fragment (Mon, Tuesday, THU, …) as 0–6
-// indices, plus the "weekend"/"weekday" shorthands the owner may use instead of
-// listing days. Order/dupes don't matter — callers collect into a Set.
+// indices, expanding inclusive ranges ("Mon-Fri" → Mon,Tue,Wed,Thu,Fri, wrapping
+// Sun..Sat) and the "weekend"/"weekday" shorthands. Order/dupes don't matter —
+// callers collect into a Set.
 function weekdaysInFragment(fragment: string): number[] {
   const out: number[] = [];
-  for (const m of fragment.matchAll(/\b(sun|mon|tue|wed|thu|fri|sat)[a-z]*\b/gi)) {
-    const idx = WEEKDAY_ABBREV_TO_INDEX[m[1].toLowerCase()];
+  for (const m of fragment.matchAll(WEEKDAY_RANGE)) {
+    const a = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
+    const b = WEEKDAY_WORD_TO_INDEX[m[2].toLowerCase()];
+    if (a === undefined || b === undefined) continue;
+    for (let i = a, steps = 0; steps < 7; i = (i + 1) % 7, steps++) {
+      out.push(i);
+      if (i === b) break;
+    }
+  }
+  for (const m of fragment.matchAll(WEEKDAY_TOKEN)) {
+    const idx = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
     if (idx !== undefined) out.push(idx);
   }
   if (/\bweekends?\b/i.test(fragment)) out.push(0, 6);
@@ -926,15 +954,27 @@ function weekdayInTimeZone(when: Date, timeZone?: string): number {
 
 // A legitimate cadence skip makes NO write of consequence — not just none of the
 // schedule's REQUIRED minimums. A run can call other side-effecting tools not in
-// requiredFunctions (send_email_from_sender, post_on_connected_account, …); any
-// such call means the run was not a clean no-op and must not be laundered into a
-// successful skip (Greptile P1, ENG-844). Classify by the tool name's leading verb
-// so new write tools are covered without an enumerated registry; read/context
-// tools (read_*, get_*, describe_image, you_search_web) do not match.
-const WRITE_TOOL_VERB = /(?:^|_)(?:post|publish|send|generate|create|update|delete|remove|upload|submit|schedule|enrich)(?:_|$)/i;
+// requiredFunctions (send_email_from_sender, add_leads_to_list, launch_campaign,
+// save_*, set_*, …); any such call means the run was not a clean no-op and must
+// not be laundered into a successful skip (Greptile P1, ENG-844).
+//
+// Detection is fail-SAFE: rather than enumerate write verbs (an allowlist that
+// leaks — `email`, `add_*`, `assign_*`, `manage_*`, `freeze_*` all slipped past an
+// earlier verb list), we allowlist READ/CONTEXT tools and treat EVERYTHING ELSE as
+// a side effect. A new or unrecognized tool therefore counts as a write until
+// proven read-only, so no write can be silently concealed.
+// Reads are named verb-FIRST (get_*, read_*, list_*, describe_*, analyze_*), so
+// anchor to the leading token — otherwise a write like `add_leads_to_list` or
+// `create_lead_list` would be mistaken for a read because it merely CONTAINS a read
+// word. Irregular read names that don't lead with a read verb are listed exactly.
+const READ_ONLY_TOOL = /^(?:get|read|list|fetch|search|describe|analy[sz]e|ask|audit|lookup|view|show|load|query|count|retrieve|summari[sz]e|inspect)(?:_|$)/i;
+const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search']);
+function isReadOnlyToolName(name: string): boolean {
+  return READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name);
+}
 function isWriteToolCall(toolCall: any): boolean {
   const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
-  return name.length > 0 && WRITE_TOOL_VERB.test(name);
+  return name.length > 0 && !isReadOnlyToolName(name);
 }
 
 export function scheduledRunSignalsConditionalSkip(
