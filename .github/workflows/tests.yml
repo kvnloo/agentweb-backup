@@ -230,6 +230,9 @@ jobs:
       - name: Run merge-evidence.sh regression suite
         run: bash .github/scripts/merge-evidence.test.sh
 
+      - name: Run trunk-deploy-state.sh regression suite
+        run: bash .github/scripts/trunk-deploy-state.test.sh
+
   # This job used to poll Greptile's own `Greptile Review` check-run and pass on
   # conclusion=success. Greptile marks that check-run success for every completed
   # review regardless of confidence score, so the job went green on 3/5 and 4/5

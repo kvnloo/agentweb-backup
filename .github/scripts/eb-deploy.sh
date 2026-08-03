@@ -41,14 +41,39 @@ EB_SETTLE_TIMEOUT_SECONDS="${EB_SETTLE_TIMEOUT_SECONDS:-600}"
 EB_HEALTH_SETTLE_SECONDS="${EB_HEALTH_SETTLE_SECONDS:-180}"
 EB_POLL_INTERVAL_SECONDS="${EB_POLL_INTERVAL_SECONDS:-15}"
 EB_UPDATE_MAX_ATTEMPTS="${EB_UPDATE_MAX_ATTEMPTS:-3}"
+EB_REJECTION_GRACE_SECONDS="${EB_REJECTION_GRACE_SECONDS:-180}"
 
 # Absolute epoch deadline for the whole run; set in main().
 EB_RUN_DEADLINE=0
+
+# Epoch at which update-environment was accepted; anchors the event scan so a
+# stale ERROR from a previous deploy cannot fail this one.
+EB_UPDATE_ACCEPTED_AT=0
 
 # Populated by read_environment_state.
 EB_STATUS=''
 EB_HEALTH=''
 EB_CURRENT_VERSION=''
+
+# ERROR-severity EB events that mean this update can never succeed (ENG-837).
+#
+# EB accepts `update-environment` and only THEN validates. On 2026-08-01 PR
+# #2237 was accepted, rejected asynchronously with the first pattern below, and
+# the environment stayed Ready on its previous version — so verify_deployment
+# polled a perfectly healthy environment for the full 2700s budget and then
+# reported a generic timeout. The cause was in the EB event log the whole time,
+# and the failure was misattributed twice (to the ENG-777 autoscaling race)
+# because nothing surfaced it.
+#
+# Deliberately narrow. Only conditions that cannot self-resolve belong here: a
+# gate that fails a recoverable deploy gets switched off within a week. Every
+# other ERROR event is logged for attribution but does not fail the job.
+EB_TERMINAL_EVENT_PATTERNS=(
+  'Cannot update resource configuration and instance configuration simultaneously'
+  'Configuration validation exception'
+  'Failed to deploy configuration'
+  'You cannot configure a load balancer'
+)
 
 log() {
   echo "[eb-deploy] $*"
@@ -128,6 +153,53 @@ fail_on_terminal_status() {
   esac
 }
 
+# Reads ERROR-severity events raised since update-environment was accepted and
+# fails immediately on one that can never resolve (ENG-837 AC3).
+#
+# The scan is anchored to EB_UPDATE_ACCEPTED_AT so an ERROR from an earlier
+# deploy cannot fail this one. Non-terminal errors are logged rather than acted
+# on: they are usually the real story behind an eventual timeout, and having
+# them in the job output is what stops the next failure being misattributed.
+#
+# A describe-events failure is NOT fatal. This is a diagnostic overlay on top of
+# the existing status polling, and an IAM gap or throttle here must not take
+# down a deploy that would otherwise verify correctly.
+scan_for_terminal_events() {
+  [ "${EB_UPDATE_ACCEPTED_AT}" -eq 0 ] && return 0
+
+  local since out pattern
+  # EB wants an ISO-8601 timestamp; both BSD and GNU date are in play (macOS
+  # locally, Linux on the runner), so try the BSD form first and fall back.
+  since="$(date -u -r "${EB_UPDATE_ACCEPTED_AT}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -d "@${EB_UPDATE_ACCEPTED_AT}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -z "${since}" ] && return 0
+
+  if ! out=$(aws elasticbeanstalk describe-events \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --severity ERROR \
+    --start-time "${since}" \
+    --max-items 25 \
+    --query 'Events[].Message' \
+    --output text 2>&1); then
+    log "[events] could not read EB events (non-fatal, status polling continues). AWS reported: ${out}"
+    return 0
+  fi
+
+  [ -z "${out}" ] && return 0
+  [ "${out}" = "None" ] && return 0
+
+  log "[events] EB reported ERROR-severity events since the update was accepted:"
+  log "[events] ${out}"
+
+  for pattern in "${EB_TERMINAL_EVENT_PATTERNS[@]}"; do
+    if printf '%s' "${out}" | grep -qF "${pattern}"; then
+      fail "Elastic Beanstalk REJECTED this update and it cannot succeed. EB reported: '${pattern}'. Version '${EB_VERSION_LABEL}' was NOT applied and '${EB_ENVIRONMENT_NAME}' is still running '${EB_CURRENT_VERSION}'. Full event text: ${out}"
+    fi
+  done
+
+  return 0
+}
+
 # Creates the application version. A genuine failure fails the job; the single
 # tolerated case is the version already existing (a re-run of the same commit),
 # which is logged with the reason AWS gave.
@@ -194,6 +266,9 @@ update_environment() {
       --environment-name "${EB_ENVIRONMENT_NAME}" \
       --version-label "${EB_VERSION_LABEL}" 2>&1); then
       log "update-environment accepted version '${EB_VERSION_LABEL}'."
+      # Anchors the ERROR-event scan. "Accepted" is not "validated" — EB
+      # validates asynchronously and can still reject this (ENG-837).
+      EB_UPDATE_ACCEPTED_AT=$(now_seconds)
       return 0
     fi
 
@@ -215,13 +290,36 @@ update_environment() {
 # The gate that makes a green check mean something: poll until the environment
 # is Ready AND reports this exact version, then assert health is not Red.
 verify_deployment() {
-  local ready_since
+  local ready_since stale_ready_since
   ready_since=0
+  # When the environment first went Ready on a version that is NOT ours.
+  stale_ready_since=0
 
   while :; do
     read_environment_state
     log "[verify] Status=${EB_STATUS} Health=${EB_HEALTH} Version=${EB_CURRENT_VERSION} (expecting Version=${EB_VERSION_LABEL})"
     fail_on_terminal_status "deployment verification"
+    scan_for_terminal_events
+
+    # Ready on the PREVIOUS version is a terminal rejection wearing a healthy
+    # face, not a slow success (ENG-837 AC3). EB has finished — it just finished
+    # by declining the update and keeping what it had. Without this the script
+    # polls a permanently healthy environment until the budget dies.
+    #
+    # The grace window matters: for a few seconds after update-environment is
+    # accepted the environment legitimately still reports Ready on the old
+    # version, before it transitions to Updating.
+    if [ "${EB_STATUS}" = "Ready" ] && [ "${EB_CURRENT_VERSION}" != "${EB_VERSION_LABEL}" ] \
+      && [ "${EB_UPDATE_ACCEPTED_AT}" -ne 0 ]; then
+      if [ "${stale_ready_since}" -eq 0 ]; then
+        stale_ready_since=$(now_seconds)
+        log "Environment is Ready but still running '${EB_CURRENT_VERSION}'; allowing ${EB_REJECTION_GRACE_SECONDS}s for the update to begin."
+      elif [ "$(( $(now_seconds) - stale_ready_since ))" -ge "${EB_REJECTION_GRACE_SECONDS}" ]; then
+        fail "environment '${EB_ENVIRONMENT_NAME}' has been Ready on version '${EB_CURRENT_VERSION}' for ${EB_REJECTION_GRACE_SECONDS}s after update-environment accepted '${EB_VERSION_LABEL}'. Elastic Beanstalk took the request and then declined to apply it, so this will never converge. Check the environment's ERROR events for the rejection reason."
+      fi
+    else
+      stale_ready_since=0
+    fi
 
     if [ "${EB_STATUS}" = "Ready" ] && [ "${EB_CURRENT_VERSION}" = "${EB_VERSION_LABEL}" ]; then
       if [ "${ready_since}" -eq 0 ]; then
