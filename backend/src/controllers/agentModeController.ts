@@ -889,7 +889,12 @@ const WEEKDAY_RANGE = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|frid
 // approval" or "publish only on the Monday team" (an approval gate that merely
 // names a day), which would otherwise invent a cadence and waive required calls
 // (Greptile P1, ENG-844).
-const AFTER_CADENCE_DAY = /^\s*(?:$|[,/&.;:!?()]|-|–|—|(?:and|or|through|thru|to|till|until|then|otherwise|else|per|please|publish\w*|post\w*|posting|only|nothing|create|creating|skip\w*|days?|weekly|week|schedule|cadence)\b|(?:sun|mon|tue|wed|thu|fri|sat))/i;
+// NB: range connectives (-, –, —, to, through, thru, till, until) are deliberately
+// NOT "listy" here. A day followed by one is a RANGE start — handled by WEEKDAY_RANGE
+// with its OWN trailing-context check — so if the whole range is bound to a noun
+// ("Monday to Friday team approves") both the range AND its endpoint singletons are
+// rejected, instead of the leading day leaking through (Greptile P1, ENG-844).
+const AFTER_CADENCE_DAY = /^\s*(?:$|[,/&.;:!?()]|(?:and|or|then|otherwise|else|per|please|publish\w*|post\w*|posting|only|nothing|create|creating|skip\w*|days?|weekly|week|schedule|cadence)\b|(?:sun|mon|tue|wed|thu|fri|sat))/i;
 function followsAsCadenceDay(after: string): boolean {
   if (/^['’]/.test(after)) return false; // possessive: "Monday's approval"
   return AFTER_CADENCE_DAY.test(after);
@@ -897,16 +902,20 @@ function followsAsCadenceDay(after: string): boolean {
 
 // Extract every weekday named in a text fragment (Mon, Tuesday, THU, …) as 0–6
 // indices, expanding inclusive ranges ("Mon-Fri" → Mon,Tue,Wed,Thu,Fri, wrapping
-// Sun..Sat) and the "weekend"/"weekday" shorthands. Singleton days are accepted
-// only when positioned as a list item (see followsAsCadenceDay); range endpoints
-// and the weekend/weekday shorthands are list-structured by construction. Order/
-// dupes don't matter — callers collect into a Set.
+// Sun..Sat) and the "weekend"/"weekday" shorthands. EVERY path — singletons,
+// ranges, and shorthands — must pass the grammatical-context guard
+// (followsAsCadenceDay), so an approval clause that merely contains a range or
+// shorthand ("publish only on Mon-Fri's approval", "weekend approvals") does not
+// get reinterpreted as a cadence (Greptile P1, ENG-844). Order/dupes don't matter —
+// callers collect into a Set.
 function weekdaysInFragment(fragment: string): number[] {
   const out: number[] = [];
+  const followsHere = (matchEnd: number) => followsAsCadenceDay(fragment.slice(matchEnd));
   for (const m of fragment.matchAll(WEEKDAY_RANGE)) {
     const a = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
     const b = WEEKDAY_WORD_TO_INDEX[m[2].toLowerCase()];
     if (a === undefined || b === undefined) continue;
+    if (!followsHere((m.index ?? 0) + m[0].length)) continue;
     for (let i = a, steps = 0; steps < 7; i = (i + 1) % 7, steps++) {
       out.push(i);
       if (i === b) break;
@@ -915,11 +924,15 @@ function weekdaysInFragment(fragment: string): number[] {
   for (const m of fragment.matchAll(WEEKDAY_TOKEN)) {
     const idx = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
     if (idx === undefined) continue;
-    if (!followsAsCadenceDay(fragment.slice((m.index ?? 0) + m[0].length))) continue;
+    if (!followsHere((m.index ?? 0) + m[0].length)) continue;
     out.push(idx);
   }
-  if (/\bweekends?\b/i.test(fragment)) out.push(0, 6);
-  if (/\bweekdays?\b/i.test(fragment)) out.push(1, 2, 3, 4, 5);
+  for (const m of fragment.matchAll(/\bweekends?\b/gi)) {
+    if (followsHere(m.index + m[0].length)) out.push(0, 6);
+  }
+  for (const m of fragment.matchAll(/\bweekdays?\b/gi)) {
+    if (followsHere(m.index + m[0].length)) out.push(1, 2, 3, 4, 5);
+  }
   return out;
 }
 
