@@ -982,24 +982,26 @@ export function scheduledRunSignalsConditionalSkip(
     return false;
   }
 
-  // (4) Weekday cross-check: if the turn names a weekday as "today", it must agree
-  // with the actual weekday. Anchor to UTC (getUTCDay) — the model is handed its
-  // "Current date" as a UTC calendar date (new Date().toISOString(), see
-  // generateMarketingResponse), so its weekday reasoning is UTC-based. Comparing
-  // against a server-LOCAL weekday (getDay) would desync on any non-UTC host, and
-  // scheduled chats carry no timezone of their own, so UTC is the single reference
-  // both sides share. This catches a grossly mis-dated skip without false rejects.
+  // (4) Weekday cross-check — VETO ONLY. If the turn names a weekday as "today" it
+  // must agree with the actual UTC weekday (getUTCDay — the model is handed its
+  // "Current date" as a UTC calendar date via new Date().toISOString(), see
+  // generateMarketingResponse; a server-LOCAL getDay would desync on a non-UTC
+  // host, and scheduled chats carry no timezone of their own). This catches a
+  // grossly mis-dated skip. It does NOT corroborate the waiver: the model naming
+  // today's weekday only proves it knows the date, not that today is genuinely a
+  // non-publishing day. For a schedule whose cadence is not weekday-based (e.g.
+  // "publish only when approved"), a correctly-named weekday says nothing about
+  // whether a skip is legitimate — so authorization to skip must come only from
+  // the OWNER's parsed weekday cadence in step (0), never the model's self-report
+  // (Greptile, ENG-844).
   const asserted = assertedTodayWeekday(text);
-  if (asserted !== null) {
-    if (asserted !== todayIdx) return false;
-    runDateCorroborated = true;
-  }
+  if (asserted !== null && asserted !== todayIdx) return false;
 
   // (5) When the schedule instruction is provided (the real scheduled path always
-  // provides it), the skip MUST be corroborated against the run date — by the
-  // parsed cadence and/or the model naming today's weekday. If neither could
-  // confirm today is genuinely a non-publishing day, fail closed rather than waive
-  // a possibly-missed publication on an audited pipeline (Greptile P1, ENG-844).
+  // provides it), the skip MUST be corroborated against the run date by the OWNER's
+  // parsed weekday cadence (step 0). If the instruction authorizes a skip but names
+  // no weekday cadence we can evaluate against today, fail closed rather than waive
+  // a possibly-missed publication on an audited pipeline (Greptile, ENG-844).
   if (instructionProvided && !runDateCorroborated) return false;
 
   return true;
