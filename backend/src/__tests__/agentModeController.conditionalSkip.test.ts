@@ -315,17 +315,52 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     const skipProse = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
 
     // Read/context tool calls do not make it a non-skip.
-    expect(scheduledRunSignalsConditionalSkip(skipProse, {
-      now: sunday, instruction: instr,
-      toolCalls: [{ name: 'read_brand_guidelines' }, { name: 'read_market_strategy' }, { name: 'you_search_web' }],
-    })).toBe(true);
+    for (const readTool of ['read_brand_guidelines', 'read_market_strategy', 'you_search_web',
+      'get_leads', 'describe_image', 'analyze_crm_data', 'ask_crm', 'audit_ad_utm_coverage', 'account_summary']) {
+      expect(scheduledRunSignalsConditionalSkip(skipProse, {
+        now: sunday, instruction: instr, toolCalls: [{ name: readTool }],
+      })).toBe(true);
+    }
 
-    // A write tool NOT in requiredFunctions still means an external side effect →
-    // not a clean skip.
-    for (const writeTool of ['send_email_from_sender', 'post_on_connected_account', 'generate_image', 'update_lead', 'create_lead']) {
+    // Any NON-read tool is treated as a side effect → not a clean skip. Includes
+    // the verbs an allowlist would leak (email, add_, assign_, manage_, launch_,
+    // freeze_, set_, save_, configure_, call_*_api, and even unknown tools).
+    for (const writeTool of ['send_email_from_sender', 'post_on_connected_account', 'generate_image',
+      'update_lead', 'create_lead', 'email', 'add_leads_to_list', 'assign_lead', 'launch_campaign',
+      'manage_campaign', 'freeze_budget', 'set_lead_status', 'save_draft', 'configure_lead_statuses',
+      'call_google_ads_api', 'coding_agent', 'some_brand_new_tool']) {
       expect(scheduledRunSignalsConditionalSkip(skipProse, {
         now: sunday, instruction: instr, toolCalls: [{ name: writeTool }],
       })).toBe(false);
+    }
+  });
+
+  it('does not let a weekday PREFIX in an unrelated word invent a cadence (Greptile P1)', () => {
+    const sunday = new Date('2026-08-02T12:00:00Z');
+    const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
+    // "monetary"/"wedding"/"satisfaction"/"future" merely START with mon/wed/sat/… —
+    // none is a weekday, so the instruction yields NO cadence day-sets and the skip
+    // fails closed (no run-date corroboration) on every day.
+    for (const instr of [
+      'Publish only on monetary approval.',
+      'Publish only when the wedding campaign is satisfied.',
+      'Post only on satisfactory review of the friendly draft.',
+    ]) {
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: sunday, instruction: instr })).toBe(false);
+      expect(scheduledRunSignalsConditionalSkip(
+        'Today is Sunday, a non-publishing day. Skipping.', { now: sunday, instruction: instr })).toBe(false);
+    }
+  });
+
+  it('expands weekday RANGES so a mid-range day is a publishing day (Greptile P1)', () => {
+    const skipProse = 'This is a non-publishing day per the cadence. Skipping this run.';
+    const wednesday = new Date('2026-08-05T12:00:00Z'); // getUTCDay() === 3
+    const saturday = new Date('2026-08-08T12:00:00Z'); // getUTCDay() === 6
+    for (const instr of ['Publish only on Mon-Fri.', 'Publish only on Monday through Friday.', 'Post only on Mon to Fri.']) {
+      // Wednesday is inside Mon–Fri → a publishing day → a skip must NOT be waived.
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: wednesday, instruction: instr })).toBe(false);
+      // Saturday is outside Mon–Fri → a genuine non-publishing day → waived.
+      expect(scheduledRunSignalsConditionalSkip(skipProse, { now: saturday, instruction: instr })).toBe(true);
     }
   });
 
