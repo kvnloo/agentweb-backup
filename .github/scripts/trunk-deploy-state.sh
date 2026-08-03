@@ -257,8 +257,23 @@ if [ "${COMMIT_RANKED}" != 'true' ]; then
 else
   case "${CONCLUSION}" in
     success)
-      STATE='DEPLOYABLE'
-      REASON="the newest ${TRUNK_BRANCH} commit with a completed ${TRUNK_DEPLOY_WORKFLOW} run succeeded.${SHA_NOTE}"
+      # A success at an ANCESTOR does not authorize the current head. The head
+      # carries commits whose deploy has not been observed, and "the previous
+      # commit shipped fine" is exactly the reasoning that let merges stack
+      # onto a trunk that could not ship on 2026-08-01.
+      #
+      # The throughput cost is real and deliberate: after each merge the trunk
+      # reads UNKNOWN until that merge's deploy completes, so merges serialise
+      # behind deploy verification. On a repo where merging IS deploying to
+      # production, that is the behaviour the name --require-deployable claims.
+      # TRUNK_DEPLOY_OVERRIDE_REASON remains the documented way through.
+      if [ "${HEAD_SHA_MATCHES_TRUNK}" = 'true' ]; then
+        STATE='DEPLOYABLE'
+        REASON="the current ${TRUNK_BRANCH} head deployed successfully."
+      else
+        STATE='UNKNOWN'
+        REASON="the newest ${TRUNK_BRANCH} commit with a completed ${TRUNK_DEPLOY_WORKFLOW} run succeeded, but that is an ancestor — the current head has not been deployed, so ${TRUNK_BRANCH} is not PROVEN deployable.${SHA_NOTE}"
+      fi
       ;;
     '' | null)
       STATE='UNKNOWN'

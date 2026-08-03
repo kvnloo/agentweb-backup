@@ -305,11 +305,14 @@ check 'SHA-bound: a match is reported as such' 0 'head_sha_matches_trunk=true'
 # Main moves faster than deploys, so "no run at the current head" is the NORMAL
 # case, not an error. It must still produce a verdict — and say out loud that
 # the verdict is older than the trunk rather than implying otherwise.
+# An ancestor's success does NOT authorize the current head. The head carries
+# commits whose deploy has not been observed, and "the previous commit shipped
+# fine" is the reasoning that let merges stack on 2026-08-01.
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
 printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
 printf '%s\n%s\n' "${TRUNK_SHA}" '9db4d5947' >"${d}/trunk_commits"
 run_gate "${d}" --require-deployable
-check 'SHA-bound: no run at trunk head still yields a verdict' 0 'state=DEPLOYABLE'
+check 'head-bound: an ancestor success does NOT authorize an undeployed head' 2 'UNKNOWN'
 
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_OK}]"
 printf '%s' "${TRUNK_SHA}" >"${d}/trunk_head_sha"
@@ -360,6 +363,10 @@ RUN_X_RERUN_SUCCESS='{"databaseId":31000000001,"status":"completed","conclusion"
 RUN_Y_FAILED='{"databaseId":31000000002,"status":"completed","conclusion":"failure",
                "url":"https://github.com/AgentWebPro/agentweb/actions/runs/31000000002",
                "headSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
+RUN_Z_SUCCESS='{"databaseId":31000000004,"status":"completed","conclusion":"success",
+                "url":"https://github.com/AgentWebPro/agentweb/actions/runs/31000000004",
+                "headSha":"cccccccccccccccccccccccccccccccccccccccc"}'
+
 RUN_Y_SUCCESS='{"databaseId":31000000003,"status":"completed","conclusion":"success",
                 "url":"https://github.com/AgentWebPro/agentweb/actions/runs/31000000003",
                 "headSha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}'
@@ -378,11 +385,14 @@ STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_COMMITS="${TRUNK_HISTORY}" \
 check 'commit-ranked: it names the newer commit run, not the newer-created one' 0 'run_id=31000000002'
 
 # The converse: with Y green, X's older state is irrelevant and must not block.
-d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED},${RUN_Y_SUCCESS}]"
+# An off-trunk failure must still not block a trunk whose HEAD deployed green —
+# otherwise the head-binding rule above would just trade one wrong answer for
+# another.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED},${RUN_Z_SUCCESS}]"
 printf '%s' "${SHA_Z}" >"${d}/trunk_head_sha"
 STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_COMMITS="${TRUNK_HISTORY}" \
   bash "${GATE_SCRIPT}" --require-deployable 2>&1)"; STATUS=$?
-check 'commit-ranked: an off-trunk failure does not block a green trunk commit' 0 'state=DEPLOYABLE'
+check 'commit-ranked: an off-trunk failure does not block a green trunk HEAD' 0 'state=DEPLOYABLE'
 
 # "Head has not deployed yet" is the normal steady state and must stay
 # non-blocking, but it has to be stated rather than implied.
@@ -441,6 +451,41 @@ check 'symmetry: an unrankable run still fails closed under enforcement' 2 'TRUN
 d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_FAILED}]"; history "${d}" 'ffffffff'
 run_gate "${d}"
 check 'symmetry: the observed conclusion is still reported' 0 "ended 'failure'"
+
+# ---------------------------------------------------------------------------
+# DEPLOYABLE means the CURRENT HEAD deployed, not an ancestor
+# ---------------------------------------------------------------------------
+#
+# The gate is called --require-deployable. If it answers "yes" while the head
+# carries undeployed commits, the name is a lie and it re-permits the exact
+# stacking that ENG-837 documents.
+#
+# The throughput cost is real and accepted: after each merge the trunk reads
+# UNKNOWN until that merge's deploy completes, so merges serialise behind
+# deploy verification. On a repo where merging IS deploying to production that
+# is the intended behaviour, and TRUNK_DEPLOY_OVERRIDE_REASON is the documented
+# way through when a fix must land immediately.
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_Z_SUCCESS}]"
+printf '%s' "${SHA_Z}" >"${d}/trunk_head_sha"
+STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_COMMITS="${TRUNK_HISTORY}" \
+  bash "${GATE_SCRIPT}" --require-deployable 2>&1)"; STATUS=$?
+check 'head-bound: a success AT the head is DEPLOYABLE' 0 'state=DEPLOYABLE'
+
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_Y_SUCCESS}]"
+printf '%s' "${SHA_Z}" >"${d}/trunk_head_sha"
+STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_COMMITS="${TRUNK_HISTORY}" \
+  bash "${GATE_SCRIPT}" 2>&1)"; STATUS=$?
+check 'head-bound: the ancestor reading is still reported, not discarded' 0 'is an ancestor'
+
+# The override must still get a repair through while the head is undeployed,
+# or the strictness deadlocks the fix for a broken trunk.
+d="$(new_fixture_dir)"; runlist "${d}" "[${RUN_Y_SUCCESS}]"
+printf '%s' "${SHA_Z}" >"${d}/trunk_head_sha"
+STDOUT="$(TRUNK_STATE_MOCK_DIR="${d}" TRUNK_COMMITS="${TRUNK_HISTORY}" \
+  TRUNK_DEPLOY_OVERRIDE_REASON='urgent revert of the deploy that broke trunk' \
+  bash "${GATE_SCRIPT}" --require-deployable 2>&1)"; STATUS=$?
+check 'head-bound: the override still lets a repair through' 0 'override=urgent revert'
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ]
