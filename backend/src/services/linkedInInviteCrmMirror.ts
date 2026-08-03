@@ -294,7 +294,12 @@ export async function mirrorLinkedInInviteToCrm(
   if (!created && UNCONTACTED_STATUSES.has(currentStatus)) {
     leadUpdate.status = 'contacted';
   }
-  await crmDb.updateLead(listId, leadId, leadUpdate);
+  // Keep the post-update item (updateLead returns ALL_NEW): it carries the fresh
+  // updatedAt this call just stamped, plus the current engagements. Seeding the
+  // CAS append below from it gives even a legacy lead — one whose loaded snapshot
+  // had no updatedAt — a real precondition, so two concurrent mirrors can't both
+  // fall to the unguarded path and double-log the same invitation (ENG-787).
+  const afterUpdate = await crmDb.updateLead(listId, leadId, leadUpdate);
 
   // Lead-level engagement record — provenance + so follow-up cadence can fire.
   // Skipped when this invitation is already on the lead, so re-mirroring a
@@ -324,14 +329,19 @@ export async function mirrorLinkedInInviteToCrm(
   // being unchanged since the read that decided it, and on a lost race re-read and
   // re-decide: the loser then sees the winner's engagement and skips.
   const MAX_ATTEMPTS = 3;
-  let snapshot: any = existing;
+  // Seed from the post-update item so the very first attempt CASes against the
+  // updatedAt this mirror just stamped, not the pre-update snapshot (which a
+  // legacy lead may carry without an updatedAt at all). Merge over `existing` so
+  // a partial return still falls back to the loaded snapshot's fields.
+  let snapshot: any = afterUpdate ? { ...existing, ...afterUpdate } : existing;
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     if (hasInviteEngagement(snapshot, { linkedin: normalized, accountId, invitationId })) {
       return { leadId, listId, created, engagementLogged: false };
     }
-    // A lead with no updatedAt cannot be compared against; append unguarded rather
-    // than CAS against '' and fail every retry, which would drop the attribution
-    // entirely. The guard is hardening — losing the record is the worse outcome.
+    // With updatedAt seeded from updateLead's ALL_NEW return this is effectively
+    // always set; the unguarded fallback survives only for the pathological case
+    // of an item that reports no updatedAt, where dropping attribution would be
+    // worse than a theoretical duplicate.
     const expectedUpdatedAt = snapshot?.updatedAt ? String(snapshot.updatedAt) : undefined;
     try {
       await crmDb.addLeadEngagement(
