@@ -1299,6 +1299,27 @@ describe('ENG-763 anti-loop directive in the live system prompt', () => {
     expect(systemText.toLowerCase()).toContain('attribute');
   });
 
+  it('does NOT inject the directive when the assistant made progress (tool calls) between identical requests (ENG-763/Greptile)', async () => {
+    // A user repeating the same *substantive* request that the assistant actually
+    // serviced each time (tool calls in between) is not a stuck clarification loop —
+    // firing the directive would wrongly refuse/park a legitimate repeated request.
+    makeCallbacks();
+    mockGetMessagesFromMessagesTable.mockResolvedValueOnce([
+      { role: 'user', content: 'post my weekly update' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 't1', function: { name: 'post_on_connected_account', arguments: '{}' } }] },
+      { role: 'assistant', content: 'Posted your update.' },
+      { role: 'user', content: 'post my weekly update' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 't2', function: { name: 'post_on_connected_account', arguments: '{}' } }] },
+      { role: 'assistant', content: 'Posted again.' },
+      { role: 'user', content: 'post my weekly update' },
+    ]);
+
+    await startLiveSession('session-progress', 'socket-progress', jest.fn(), 'test-user-id');
+
+    const systemText = mockLiveConnect.mock.calls[0][0].config.systemInstruction.parts[0].text;
+    expect(systemText).not.toContain('ANTI-LOOP DIRECTIVE');
+  });
+
   it('does not inject the anti-loop directive for a normal, non-repetitive conversation', async () => {
     makeCallbacks();
     mockGetMessagesFromMessagesTable.mockResolvedValueOnce([
