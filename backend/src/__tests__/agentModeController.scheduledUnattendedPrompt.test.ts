@@ -218,6 +218,12 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).not.toContain('[Schedule Context]');
     expect(sp).toContain('[AUTOMATED UNATTENDED EXECUTION]');
     expect(sp).toContain('PER-ENTITY COMPLETION LOOP');
+    // ENG-827: without a scheduleId there is nothing to look up, so the run must
+    // skip getScheduleById entirely and fall back to the safe withhold default —
+    // guarding against a regression in the `if (scheduleIdMatch)` guard (a default
+    // to true, or a lookup on a bad id, would flip publish authorization on).
+    expect(scheduleDb.getScheduleById).not.toHaveBeenCalled();
+    expect(sp).toContain('NOT pre-authorized to publish');
   });
 
   it('does NOT inject the unattended directive for a regular (non-scheduled) session', async () => {
