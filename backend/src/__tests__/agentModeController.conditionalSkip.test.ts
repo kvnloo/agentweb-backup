@@ -185,39 +185,24 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     expect(scheduledRunSignalsConditionalSkip(c, { now: MONDAY })).toBe(false);
   });
 
-  it('cross-checks the asserted weekday in the SCHEDULE timezone, not server UTC', () => {
-    // 2026-08-03T05:00Z is MONDAY in UTC but SUNDAY 22:00 in America/Los_Angeles
-    // (PDT, UTC-7). A "Today is Sunday" skip is legitimate for an LA-based owner.
-    const nearLocalMidnight = new Date('2026-08-03T05:00:00Z');
-    const sundaySkip = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
+  it('anchors the weekday cross-check to UTC, matching the model\'s UTC "Current date"', () => {
+    // The model is handed its "Current date" as a UTC calendar date
+    // (new Date().toISOString()), so its weekday reasoning is UTC-based. The
+    // cross-check must use the SAME reference (getUTCDay), not a server-local
+    // weekday — otherwise a non-UTC host would desync and mis-judge the skip.
+    // 2026-08-03T02:00Z is Sunday evening in the US but already MONDAY in UTC, so
+    // the model (seeing the UTC date) would assert Monday, not Sunday.
+    const utcMonday = new Date('2026-08-03T02:00:00Z');
+    expect(utcMonday.getUTCDay()).toBe(1); // sanity: Monday in UTC
 
-    // WITHOUT the timezone it wrongly compares against the server's UTC weekday
-    // (Monday) and rejects the legitimate skip — the bug this fix closes.
-    expect(scheduledRunSignalsConditionalSkip(sundaySkip, { now: nearLocalMidnight })).toBe(false);
-
-    // WITH the owner's timezone it evaluates the LOCAL weekday (Sunday) and accepts.
+    // A Monday claim at this instant agrees with the model's UTC date → accepted.
     expect(
-      scheduledRunSignalsConditionalSkip(sundaySkip, { now: nearLocalMidnight, timezone: 'America/Los_Angeles' })
+      scheduledRunSignalsConditionalSkip('Today is Monday, a non-publishing day. Skipping — no post created.', { now: utcMonday })
     ).toBe(true);
-  });
-
-  it('still rejects a genuinely hallucinated weekday even with a timezone', () => {
-    // Local weekday (LA) is Sunday, but the turn claims Wednesday — a mis-dated
-    // skip of a real publishing day must still be rejected.
-    const nearLocalMidnight = new Date('2026-08-03T05:00:00Z');
-    const wrongDaySkip = 'Today is Wednesday, a non-publishing day. Skipping — no post created.';
+    // A Sunday claim contradicts the UTC date the model was given → rejected.
     expect(
-      scheduledRunSignalsConditionalSkip(wrongDaySkip, { now: nearLocalMidnight, timezone: 'America/Los_Angeles' })
+      scheduledRunSignalsConditionalSkip('Today is Sunday, a non-publishing day. Skipping — no post created.', { now: utcMonday })
     ).toBe(false);
-  });
-
-  it('falls back to the server weekday when the timezone is invalid/unknown', () => {
-    // An unparseable IANA zone must not crash and must not silently pass — it
-    // falls back to the server-local comparison (unchanged strict behavior).
-    const c = 'Today is Sunday, a non-publishing day. Skipping — no post created.';
-    expect(scheduledRunSignalsConditionalSkip(c, { now: SUNDAY, timezone: 'Not/AZone' })).toBe(true);
-    const MONDAY = new Date('2026-08-03T12:00:00Z');
-    expect(scheduledRunSignalsConditionalSkip(c, { now: MONDAY, timezone: 'Not/AZone' })).toBe(false);
   });
 });
 
