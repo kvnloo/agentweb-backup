@@ -415,12 +415,24 @@ describe('mirrorLinkedInInviteToCrm', () => {
       }), expect.objectContaining({ expectedUpdatedAt: expect.any(String) }));
     });
 
-    it('treats an id-less legacy row as the same invitation rather than duplicating', async () => {
+    it('records an incoming invite id even when only an id-less legacy row exists — a real re-invite is never masked', async () => {
       findLeadByLinkedinInList.mockResolvedValue(leadWith(undefined));
       const res = await mirrorLinkedInInviteToCrm({
         listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1', invitationId: 'inv_1',
       });
+      expect(res?.engagementLogged).toBe(true);
+      expect(addLeadEngagement).toHaveBeenCalledWith(LIST, 'lead_existing', expect.objectContaining({
+        eventData: expect.objectContaining({ invitationId: 'inv_1' }),
+      }), expect.objectContaining({ expectedUpdatedAt: expect.any(String) }));
+    });
+
+    it('skips when neither the incoming invite nor the recorded event carries an id', async () => {
+      findLeadByLinkedinInList.mockResolvedValue(leadWith(undefined));
+      const res = await mirrorLinkedInInviteToCrm({
+        listId: LIST, linkedinUrl: PROFILE, accountId: 'acct_1',
+      });
       expect(res?.engagementLogged).toBe(false);
+      expect(addLeadEngagement).not.toHaveBeenCalled();
     });
   });
 

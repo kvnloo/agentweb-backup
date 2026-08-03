@@ -176,7 +176,9 @@ describe('reconcileSentInvitationsToCrm', () => {
       engagements: [{
         eventType: 'linkedin.invite.sent',
         createdAt: pending.sentAt,
-        eventData: { note: '', accountId: ACCOUNT, linkedin: 'https://www.linkedin.com/in/existing' },
+        // A prior reconcile pass records the invitation id (the pending cache is
+        // keyed by it), so a re-run matches by id and skips re-appending.
+        eventData: { note: '', accountId: ACCOUNT, linkedin: 'https://www.linkedin.com/in/existing', invitationId: pending.invitationId },
       }],
     });
 
