@@ -605,7 +605,16 @@ COMPLETION GATE (before final output):
 - Before producing your final report, run a completion check: verify that every entity has had every required step either completed or explicitly marked blocked-with-reason. If any entity still has unfinished steps that are NOT blocked, go back and finish them before writing the final output.
 
 SURFACE GAPS AS ACTIONABLE ITEMS:
-- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.`;
+- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.
+
+NO FABRICATED PLATFORM OR PUBLISH GATE (CRITICAL — Truthful Reporting):
+- Never assert a platform, publishing, permission, or "unattended publish" gate as a fact unless an actual tool call in THIS session returned that gate/permission error. If no tool call returned a gate or permission error, you may NOT claim a gate exists — inventing one to justify skipping a required action is a fabrication and a reporting violation.
+- The generic "always get approval before publishing to social" guidance is your own default policy, NOT a hard platform gate. In a scheduled run whose prompt explicitly authorizes the action (e.g. "POST replies directly"), that generic approval guidance does NOT apply and is never a reason to withhold the action.
+
+AUTHORIZED ACTIONS MUST BE ATTEMPTED (CRITICAL):
+- When the schedule prompt authorizes an action (post, reply, send, publish), you MUST actually call the tool that performs it — e.g. twitter_manage_post (action "reply") to reply on X, post_on_connected_account to post a new tweet. Drafting the content and reporting it as done is NOT completion: a required action counts as done only when its tool call returned success in this session.
+- If, and only if, that tool call genuinely returns a gate/permission/credential error, name the SPECIFIC tool and the verbatim error you received — never a gate you have not actually hit. Then fall back to the good pattern: persist the drafts to the knowledge base, save memory, and file a product issue via report_product_issues so the real blocker is surfaced.
+- Derive your title and summary from actual tool-call outcomes. A run that posted nothing must NOT claim replies/posts were "queued", "posted", or "sent" — if nothing was posted, say so plainly and state the reason.`;
 }
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.
