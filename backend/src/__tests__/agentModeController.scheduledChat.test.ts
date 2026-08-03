@@ -95,6 +95,7 @@ jest.mock('../services/emailService', () => ({
     sendScheduledChatVariableRequestEmail: jest.fn(),
     sendScheduledChatErrorEmail: jest.fn(),
     sendScheduledChatTokenLimitEmail: jest.fn(),
+    sendScheduledRunFailedEmail: jest.fn(),
   },
 }));
 
@@ -936,6 +937,76 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       const retryAt = new Date(nextRunTime as string).getTime();
       expect(retryAt).toBeGreaterThanOrEqual(beforeRun + 14 * 60 * 1000);
       expect(retryAt).toBeLessThanOrEqual(Date.now() + 16 * 60 * 1000);
+    });
+
+    // ENG-826 #1: proactively notify the owner once the automatic retries are exhausted.
+    const zeroOutputWorkerResponse = {
+      content: '', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [],
+    };
+
+    it('notifies the owner (falling back to account email) once the requeue cap is exhausted', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+
+      // retryCount already at the cap (3) -> this failure is over the limit -> no requeue, notify.
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3 } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalledTimes(1);
+      const [recipients, name, id, opts] = mockEmailService.sendScheduledRunFailedEmail.mock.calls[0];
+      expect(recipients).toEqual(['owner@example.com']);
+      expect(id).toBe(baseSchedule.scheduleId);
+      expect(opts).toEqual(expect.objectContaining({ failedAttempts: 4, failureClass: expect.any(String) }));
+      // Exhausted -> must NOT schedule another retry.
+      const requeue = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantRetryCount === 4);
+      expect(requeue).toBeUndefined();
+    });
+
+    it('prefers the schedule\'s configured emailNotifications over the account email', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3,
+          emailNotifications: ['ops@example.com', 'lead@example.com'] } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalledTimes(1);
+      expect(mockEmailService.sendScheduledRunFailedEmail.mock.calls[0][0]).toEqual(['ops@example.com', 'lead@example.com']);
+    });
+
+    it('does NOT notify while retries are still available (only on exhaustion)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+        mockUserId,
+        false,
+      );
+
+      // Still within the cap -> requeues, no owner alert yet.
+      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        baseSchedule.scheduleId,
+        expect.objectContaining({ zeroAssistantRetryCount: 1 }),
+      );
+    });
+
+    it('does NOT notify on a test run even when the cap is exhausted', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3 } as any,
+        mockUserId,
+        true, // isTest
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
     });
 
     it('should persist a structured incomplete-job assistant message so the session is never left silent after zero assistant output', async () => {

@@ -498,3 +498,46 @@ describe('emailService.sendScheduledChatPausedForInputEmail (ENG-396)', () => {
 });
 
 
+
+describe('emailService.sendScheduledRunFailedEmail (ENG-826 #1)', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  const opts = {
+    failedAttempts: 4,
+    failureClass: 'system' as const,
+    userMessage: 'It ran into an unexpected system error — not a time or size limit.',
+  };
+
+  it('sends ONE email to all recipients with a keeps-failing subject', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+
+    await emailService.sendScheduledRunFailedEmail(
+      ['ops@example.com', 'lead@example.com'],
+      'LinkedIn Post Factory',
+      'sched-1',
+      opts,
+    );
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    const [recipients, subject, text, html] = spy.mock.calls[0];
+    expect(recipients).toEqual(['ops@example.com', 'lead@example.com']);
+    expect(subject).toContain('LinkedIn Post Factory');
+    expect(subject.toLowerCase()).toContain('failing');
+    // The honest, class-specific user message is carried into the body.
+    expect(text).toContain(opts.userMessage);
+    expect(html).toContain('4 times in a row');
+  });
+
+  it('normalizes a single recipient string to a one-element list', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
+    await emailService.sendScheduledRunFailedEmail('solo@example.com', 'Daily Digest', 'sched-2', opts);
+    expect(spy.mock.calls[0][0]).toEqual(['solo@example.com']);
+  });
+
+  it('never throws when the transport fails (best-effort)', async () => {
+    jest.spyOn(emailService, 'sendEmail').mockRejectedValue(new Error('SMTP down'));
+    await expect(
+      emailService.sendScheduledRunFailedEmail(['x@example.com'], 'S', 'sched-3', opts),
+    ).resolves.toBeUndefined();
+  });
+});
