@@ -342,15 +342,19 @@ async function openGeminiSession(
       // Enable automatic transcription so transcripts are available in audio-only mode
       inputAudioTranscription: {},
       outputAudioTranscription: {},
-      // Harsha speaks in long, pause-heavy thoughts. Require sustained speech
-      // before barge-in and a full 1.2s pause before committing the turn.
+      // ENG-525: previously tuned LOW/LOW/1200ms for one heavy dogfooder's
+      // pause-heavy speech, which made ordinary turn-taking and barge-in feel
+      // sluggish next to ChatGPT's voice mode. Tightened to HIGH sensitivity
+      // and a sub-second silence window for snappier turn-taking; the 600ms
+      // floor still leaves room for a normal in-sentence breath before Emma
+      // reads it as end-of-turn.
       realtimeInputConfig: {
         automaticActivityDetection: {
           disabled: false,
-          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
-          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
           prefixPaddingMs: 200,
-          silenceDurationMs: 1_200,
+          silenceDurationMs: 600,
         },
         activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
       },
