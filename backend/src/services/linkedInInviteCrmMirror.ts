@@ -31,12 +31,16 @@ const INVITE_SENT_EVENT = 'linkedin.invite.sent';
  * logged the same invitation once per source.
  *
  * A different `invitationId` means a genuinely new invitation — the invitee was
- * re-invited after the first was accepted or withdrawn — and is recorded. Rows
- * written before ids were carried have no `invitationId`; they match anything for
- * the same account and invitee, which errs toward not duplicating.
+ * re-invited after the first was accepted or withdrawn — and is recorded, even
+ * when an older id-less event already exists for the same account and invitee.
+ * An id-less recorded event therefore only matches an incoming invite that ALSO
+ * carries no id (handled below); it never masks an incoming id. Suppressing a
+ * genuine re-invite would drop it from the follow-up cadence — the exact
+ * under-reporting ENG-787 fixes — which is worse than the rare double-log of a
+ * single invitation first written id-less and later reconciled with its id.
  *
- * With no `invitationId` on the incoming side either, any prior invite-sent
- * engagement for this account and invitee counts as already recorded.
+ * With no `invitationId` on the incoming side, any prior invite-sent engagement
+ * for this account and invitee counts as already recorded.
  */
 function hasInviteEngagement(
   lead: any,
@@ -54,7 +58,7 @@ function hasInviteEngagement(
   if (!incomingId) return true;
   return candidates.some((e: any) => {
     const recordedId = String(e?.eventData?.invitationId ?? '').trim();
-    return recordedId === incomingId || recordedId === '';
+    return recordedId === incomingId;
   });
 }
 
