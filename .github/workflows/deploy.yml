@@ -300,10 +300,21 @@ jobs:
     #     touches no deployable code — including this one. Verified against real
     #     run 30823838490 (#2254), where both deploy jobs were `skipped` and the
     #     run still concluded success.
+    #
+    # `cancelled` IS included, but only inside the `!cancelled()` guard, and the
+    # distinction is the whole point:
+    #   - a human cancels the RUN      -> !cancelled() is false -> silent. Right:
+    #     they know, and paging them for their own action is how alerts get muted.
+    #   - a deploy JOB is cancelled on its own (runner death, job-level timeout,
+    #     an admin cancelling one job) while the run lives -> !cancelled() is
+    #     true -> ALERT. That is a real deploy that did not happen, and dropping
+    #     it was a silent hole.
     if: >-
       ${{ !cancelled() && (
       needs.backend-deploy.result == 'failure' ||
-      needs.partner-deploy.result == 'failure') }}
+      needs.backend-deploy.result == 'cancelled' ||
+      needs.partner-deploy.result == 'failure' ||
+      needs.partner-deploy.result == 'cancelled') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # REQUIRED, not decoration: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY exist

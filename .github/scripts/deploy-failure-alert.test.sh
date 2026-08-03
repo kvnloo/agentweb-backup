@@ -97,6 +97,14 @@ case "$path" in
       printf 'gh: mock annotations failure (HTTP 403)\n' >&2
       exit "$(cat "${MOCK_DIR}/gh_annotations_exit")"
     fi
+    # Per-job fixture wins when present, so a test can give one failed job an
+    # EB_DEPLOY_FAILED annotation and another none. Without this every job
+    # returns the same annotations and multi-job behaviour is untestable.
+    job_id="${path##*/check-runs/}"; job_id="${job_id%%/*}"
+    if [ -f "${MOCK_DIR}/gh_annotations_${job_id}.json" ]; then
+      cat "${MOCK_DIR}/gh_annotations_${job_id}.json"
+      exit 0
+    fi
     if [ -f "${MOCK_DIR}/gh_annotations.json" ]; then
       cat "${MOCK_DIR}/gh_annotations.json"
     else
@@ -806,12 +814,18 @@ check_workflow 'it fires on a failed backend deploy' \
 check_workflow 'it fires on a failed partner deploy' \
   "needs\.partner-deploy\.result == 'failure'" 'present'
 
-# Crying wolf is the same outcome as no alert, because a muted alert is muted.
-# These three are NEGATIVE assertions: each names a case that must NOT fire.
-check_workflow 'it does NOT fire on a cancelled backend deploy (a human did that on purpose)' \
-  "needs\.backend-deploy\.result == 'cancelled'" 'absent'
-check_workflow 'it does NOT fire on a cancelled partner deploy' \
-  "needs\.partner-deploy\.result == 'cancelled'" 'absent'
+# Cancellation is two different events wearing one word, and the gate has to
+# tell them apart:
+#   - a human cancels the RUN            -> !cancelled() false -> silent
+#   - a deploy JOB dies on its own       -> !cancelled() true  -> ALERT
+# An earlier cut excluded `cancelled` entirely, which silenced the second case:
+# a real deploy that did not happen, reported as nothing. Greptile caught it.
+check_workflow 'it fires on an independently cancelled backend deploy' \
+  "needs\.backend-deploy\.result == 'cancelled'" 'present'
+check_workflow 'it fires on an independently cancelled partner deploy' \
+  "needs\.partner-deploy\.result == 'cancelled'" 'present'
+check_workflow 'but a human cancelling the whole run stays silent' \
+  '!cancelled\(\) &&' 'present'
 # Scoped to the `if:` CONDITION, not the whole file. `DETECT_RESULT` is still
 # passed to the script on purpose — it is a fail-closed guard that refuses
 # loudly if the condition ever misfires — so a file-wide grep would fail on
@@ -857,6 +871,61 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Multi-job failure: a classified reason anywhere beats a generic fallback
+# ---------------------------------------------------------------------------
+#
+# When BOTH deploy jobs fail and only the second carries EB_DEPLOY_FAILED, the
+# loop used to break on the first job's generic fallback and discard the
+# classification — throwing away the one thing the alert exists to deliver.
+# Found by Greptile review on #2256.
+
+printf '\nmulti-job failure (a classified reason must not be lost)\n'
+
+M=$(new_mock_dir)
+cat >"$M/gh_jobs.json" <<'JOBS'
+{
+  "total_count": 3,
+  "jobs": [
+    {"id": 800000001, "name": "Partner portal deploy to production", "conclusion": "failure",
+     "steps": [{"name": "Build", "conclusion": "failure"}]},
+    {"id": 800000002, "name": "Backend deploy to production", "conclusion": "failure",
+     "steps": [{"name": "Deploy to Elastic Beanstalk and verify the environment took it", "conclusion": "failure"}]},
+    {"id": 800000003, "name": "Detect changed projects", "conclusion": "success", "steps": []}
+  ]
+}
+JOBS
+# First failed job: no classification. Second: the real one.
+jq -n '[{"level":"failure","message":"Process completed with exit code 1."}]' \
+  >"$M/gh_annotations_800000001.json"
+jq -n '[{"level":"failure","message":"EB_DEPLOY_FAILED: environment took the version but its health stayed Red for 180s."}]' \
+  >"$M/gh_annotations_800000002.json"
+run_alert "$M" BACKEND_RESULT='failure' PARTNER_RESULT='failure'
+check_posted 'the classified reason on a later job wins over an earlier generic fallback' \
+  'health stayed Red'
+check_posted 'and the alert names the job that carried it' \
+  'Backend deploy to production'
+
+# The converse must still hold: with no classification anywhere, the generic
+# fallback is still reported rather than the alert going out reasonless.
+M=$(new_mock_dir)
+cat >"$M/gh_jobs.json" <<'JOBS'
+{
+  "total_count": 2,
+  "jobs": [
+    {"id": 800000004, "name": "Partner portal deploy to production", "conclusion": "failure",
+     "steps": [{"name": "Build", "conclusion": "failure"}]},
+    {"id": 800000005, "name": "Backend deploy to production", "conclusion": "failure",
+     "steps": [{"name": "Install dependencies", "conclusion": "failure"}]}
+  ]
+}
+JOBS
+jq -n '[{"level":"failure","message":"Process completed with exit code 1."}]' >"$M/gh_annotations_800000004.json"
+jq -n '[{"level":"failure","message":"Process completed with exit code 1."}]' >"$M/gh_annotations_800000005.json"
+run_alert "$M" BACKEND_RESULT='failure' PARTNER_RESULT='failure'
+check_posted 'with no classification anywhere, the generic fallback is still reported' \
+  'No EB_DEPLOY_FAILED annotation'
 
 printf '\n%s checks run, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ] || exit 1

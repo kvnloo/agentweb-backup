@@ -256,7 +256,7 @@ load_slack_secret() {
 resolve_failure_reason() {
   local jobs_file="${WORKDIR}/jobs.json"
   local err_file="${WORKDIR}/gh.err"
-  local job_id job_name conclusion annotation step reason
+  local job_id job_name conclusion annotation step reason fallback
 
   if [ -z "${GH_TOKEN:-}" ]; then
     printf 'unavailable — GH_TOKEN is not set, so the run annotations could not be read. Open the run for the cause.'
@@ -276,6 +276,7 @@ resolve_failure_reason() {
   fi
 
   reason=''
+  fallback=''
   while IFS=$'\t' read -r job_id job_name conclusion; do
     if [ -z "${job_id}" ]; then
       continue
@@ -305,13 +306,27 @@ resolve_failure_reason() {
       '(.jobs // [])[] | select((.id|tostring) == $id) | (.steps // [])[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | .name' \
       "${jobs_file}" 2>/dev/null | head -n 1)"
 
-    if [ -n "${step}" ]; then
-      reason="${job_name}: ${conclusion} at step '${step}'. No EB_DEPLOY_FAILED annotation, so the run failed before or outside eb-deploy.sh."
-    else
-      reason="${job_name}: ${conclusion}, with no EB_DEPLOY_FAILED annotation and no failed step recorded — the job was most likely killed by the runner or a job-level timeout."
+    # NO `break` here, deliberately. A classified EB_DEPLOY_FAILED annotation on
+    # ANY failed job beats a generic fallback from whichever job the API happened
+    # to list first. Breaking on the first fallback meant that when both deploy
+    # jobs failed and only the second carried the classification, the alert
+    # reported "failed at step X" and silently discarded the actual reason —
+    # which is the entire value this alert delivers.
+    #
+    # So: remember the FIRST fallback, keep scanning for an annotation, and only
+    # fall back if no job has one.
+    if [ -z "${fallback}" ]; then
+      if [ -n "${step}" ]; then
+        fallback="${job_name}: ${conclusion} at step '${step}'. No EB_DEPLOY_FAILED annotation, so the run failed before or outside eb-deploy.sh."
+      else
+        fallback="${job_name}: ${conclusion}, with no EB_DEPLOY_FAILED annotation and no failed step recorded — the job was most likely killed by the runner or a job-level timeout."
+      fi
     fi
-    break
   done < <(jq -r '(.jobs // [])[] | select(.conclusion == "failure" or .conclusion == "cancelled" or .conclusion == "timed_out") | "\(.id)\t\(.name)\t\(.conclusion)"' "${jobs_file}" 2>/dev/null)
+
+  if [ -z "${reason}" ]; then
+    reason="${fallback}"
+  fi
 
   if [ -z "${reason}" ]; then
     printf "unavailable — the run's job list reported no failed job, which contradicts the job results this alert was triggered with. Open the run for the cause."
