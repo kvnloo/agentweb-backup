@@ -106,6 +106,24 @@ case "$operation" in
     exit 0
     ;;
 
+  describe-events)
+    # ENG-837: ERROR-severity events are how an ASYNCHRONOUS EB rejection
+    # becomes visible. Fixtures: `events` (message text, one per line),
+    # `events_exit` (simulate an API/IAM failure).
+    code=0
+    [ -f "${MOCK_DIR}/events_exit" ] && code=$(cat "${MOCK_DIR}/events_exit")
+    if [ "$code" != "0" ]; then
+      printf 'mock aws: simulated describe-events failure\n' >&2
+      exit "$code"
+    fi
+    if [ -f "${MOCK_DIR}/events" ]; then
+      cat "${MOCK_DIR}/events"
+    else
+      printf 'None\n'
+    fi
+    exit 0
+    ;;
+
   *)
     printf 'mock aws: unhandled operation %s\n' "$operation" >&2
     exit 64
@@ -431,6 +449,86 @@ set_update_results "$M" '255|An error occurred (AccessDenied) when calling the U
 set_describe_states "$M" 'Ready|Green|old-version'
 run_deploy "$M"
 check 'NEW logic fails on the identical fixture' 1 'EB_DEPLOY_FAILED: update-environment failed'
+
+# ---------------------------------------------------------------------------
+# ENG-837 — an ASYNCHRONOUS EB rejection must fail fast and say why
+# ---------------------------------------------------------------------------
+#
+# The 2026-08-01 production incident, reproduced. PR #2237 changed resource
+# configuration (.ebextensions ALB IdleTimeout) and instance configuration
+# (.platform nginx + app bundle) in one deploy. EB ACCEPTED update-environment,
+# validated asynchronously, rejected it, and left the environment Ready on its
+# previous version.
+#
+# The old script therefore polled a perfectly healthy environment for the full
+# 2700s budget and reported a generic "did not come up Ready" timeout. The real
+# reason sat in the EB event log the entire time, and the failure was
+# misattributed twice to the ENG-777 autoscaling race because nothing surfaced
+# it. Production stayed undeployable for ~17 hours.
+
+printf '\nENG-837 (asynchronous EB rejection)\n'
+
+IMMUTABLE_REJECTION='Service:AmazonCloudFormation, Message:Cannot update resource configuration and instance configuration simultaneously with immutable deployments.'
+
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${IMMUTABLE_REJECTION}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1'
+check 'ENG-837: an EB rejection fails the deploy' 1 'Elastic Beanstalk REJECTED this update'
+check 'ENG-837: EB own error text is surfaced, not a generic timeout' 1 \
+  'Cannot update resource configuration and instance configuration simultaneously'
+check 'ENG-837: the failure states the version was not applied' 1 \
+  "Version 'backend-20260729-pr2216' was NOT applied"
+
+# AC3 states the rejection must surface "not after the full 2700s budget".
+# The budget above is 60s; a correct fail-fast lands in a couple of seconds.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ "${LAST_DURATION}" -lt 15 ]; then
+  printf "  ok   ENG-837: it fails FAST (%ss) rather than burning the 60s budget\n" "${LAST_DURATION}"
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf "  FAIL ENG-837: took %ss — a rejection must not burn the deploy budget\n" "${LAST_DURATION}"
+fi
+
+# Without any event to read, the same state is still terminal: Ready on the old
+# version long after the update was accepted means EB took the request and
+# declined to apply it. This is the backstop for a rejection EB never events,
+# or one whose wording is not in the terminal-pattern list.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1'
+check 'ENG-837: Ready on the old version is terminal even with no ERROR event' 1 \
+  'declined to apply it, so this will never converge'
+
+# A gate that fails recoverable deploys gets switched off within a week, so the
+# terminal-pattern list is deliberately narrow. An unrelated ERROR event must be
+# logged for attribution and must NOT fail a deploy that then succeeds.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+printf '%s\n' 'Service:Amazon EC2, Message:Instance i-0abc has been health-check flagged and replaced.' >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1'
+check 'ENG-837: a NON-terminal ERROR event does not fail a recoverable deploy' 0 \
+  'SUCCESS: environment'
+check 'ENG-837: but it is logged, so the next failure is not misattributed' 0 \
+  'health-check flagged and replaced'
+
+# The event scan is a diagnostic overlay. An IAM gap or a throttle on
+# describe-events must never take down a deploy that verifies correctly.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+printf '255' >"$M/events_exit"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1'
+check 'ENG-837: an unreadable event log is non-fatal' 0 'SUCCESS: environment'
+check 'ENG-837: and the inability to read it is stated plainly' 0 'could not read EB events'
+
+# The grace window exists because immediately after update-environment is
+# accepted the environment legitimately still reports Ready on the old version
+# for a few seconds. A deploy that transitions normally must not be killed.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='120'
+check 'ENG-837: a normal deploy passing through Ready-on-old-version is not killed' 0 \
+  'SUCCESS: environment'
 
 # ---------------------------------------------------------------------------
 
