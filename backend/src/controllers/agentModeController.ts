@@ -832,26 +832,9 @@ function assertedTodayWeekday(content: string): number | null {
   return WEEKDAY_NAMES.indexOf(m[1].toLowerCase());
 }
 
-// Resolve the weekday (0=Sun..6=Sat) of `now` in an IANA timezone. Returns null
-// when no zone is given or the zone is invalid, so the caller can fall back to
-// the server-local weekday.
-function weekdayInZone(now: Date, timezone?: string): number | null {
-  if (!timezone) return null;
-  try {
-    const wd = new Intl.DateTimeFormat('en-US', { timeZone: timezone, weekday: 'long' })
-      .format(now)
-      .toLowerCase();
-    const idx = WEEKDAY_NAMES.indexOf(wd);
-    return idx >= 0 ? idx : null;
-  } catch {
-    // Invalid IANA zone string → treat as unknown (fall back to server weekday).
-    return null;
-  }
-}
-
 export function scheduledRunSignalsConditionalSkip(
   content: string,
-  options: { toolCalls?: any[]; now?: Date; timezone?: string } = {}
+  options: { toolCalls?: any[]; now?: Date } = {}
 ): boolean {
   if (!content || typeof content !== 'string') return false;
 
@@ -873,16 +856,16 @@ export function scheduledRunSignalsConditionalSkip(
   }
 
   // (4) Weekday cross-check: if the turn names a weekday as "today", it must agree
-  // with the ACTUAL weekday. Evaluate in the schedule's timezone when known — a
-  // scheduled run near local midnight is a different UTC weekday, so a server-UTC
-  // comparison would spuriously reject a legitimate non-publishing-day skip for a
-  // non-UTC owner. When the timezone is unknown/invalid, fall back to the server's
-  // weekday (unchanged behavior), which still catches a grossly hallucinated day.
+  // with the actual weekday. Anchor to UTC (getUTCDay) — the model is handed its
+  // "Current date" as a UTC calendar date (new Date().toISOString(), see
+  // generateMarketingResponse), so its weekday reasoning is UTC-based. Comparing
+  // against a server-LOCAL weekday (getDay) would desync on any non-UTC host, and
+  // scheduled chats carry no timezone of their own, so UTC is the single reference
+  // both sides share. This catches a grossly mis-dated skip without false rejects.
   const asserted = assertedTodayWeekday(content);
   if (asserted !== null) {
     const now = options.now ?? new Date();
-    const actualDay = weekdayInZone(now, options.timezone) ?? now.getDay();
-    if (asserted !== actualDay) return false;
+    if (asserted !== now.getUTCDay()) return false;
   }
 
   return true;
@@ -1250,12 +1233,6 @@ export async function runVerifiedChat(
     // `passed: false` for calls it made before the interruption, and the verify
     // retry loop could re-prompt the model into re-running a completed side-effect.
     priorToolCalls?: Array<{ name: string }>;
-    // ENG-844: the SCHEDULE'S IANA timezone. Used by the conditional-cadence-skip
-    // detector to evaluate a "today is <weekday>" skip assertion against the
-    // owner's LOCAL weekday, not the server's UTC weekday — a scheduled run near
-    // local midnight is a different UTC day, so a UTC comparison would spuriously
-    // reject a legitimate non-publishing-day skip for a non-UTC owner.
-    timezone?: string;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -1269,8 +1246,7 @@ export async function runVerifiedChat(
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
-    parkNotifiable = false,
-    timezone
+    parkNotifiable = false
   } = params;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
@@ -1784,7 +1760,7 @@ export async function runVerifiedChat(
       // exit cleanly. Scoped to scheduled runs (completionGate) so interactive/image/
       // revision callers are unaffected, and only fires when a required call is actually
       // unmet — a run that DID publish flows through the normal success path below.
-      if (completionGate && !allFunctionCallsMet && scheduledRunSignalsConditionalSkip(allContent, { toolCalls: allToolCalls, timezone })) {
+      if (completionGate && !allFunctionCallsMet && scheduledRunSignalsConditionalSkip(allContent, { toolCalls: allToolCalls })) {
         // Low-severity breadcrumb: a conditional skip is a SUCCESSFUL run, but it is
         // waiving write-call minimums on an audited publishing pipeline, so keep it
         // observable (and threaded into runResults via `conditionalSkip`) rather than
@@ -2595,11 +2571,6 @@ export async function runScheduledChat(
       maxAttempts: 20,
       attachments: fileAttachments,
       llmModel: schedule.llmModel || defaultModel,
-      // ENG-844: the owner's timezone, so a conditional-cadence-skip ("today is a
-      // non-publishing day") is cross-checked against the owner's LOCAL weekday
-      // rather than the server's UTC weekday (a run near local midnight is a
-      // different UTC day and would otherwise be wrongly rejected as a skip).
-      timezone: schedule.timezone,
       // ENG-657: on a resume, count the abandoned portion's tool calls in
       // verification so requiredFunctionCalls isn't falsely missed (empty otherwise).
       priorToolCalls: resumePriorToolCalls,
