@@ -882,10 +882,25 @@ const WEEKDAY_TOKEN = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|frid
 // A range like "Mon-Fri" / "Monday to Friday" / "Monday through Friday".
 const WEEKDAY_RANGE = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b\s*(?:-|–|—|to|through|thru|till|until)\s*\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
 
+// A singleton weekday counts as a cadence day only if what immediately follows it
+// marks it as a LIST ITEM — end of clause, a separator/connective, or a cadence
+// keyword — and NOT a possessive or an unrelated noun. This is what distinguishes
+// "publish only on Mon/Wed/Fri" (a cadence) from "publish only on Monday's
+// approval" or "publish only on the Monday team" (an approval gate that merely
+// names a day), which would otherwise invent a cadence and waive required calls
+// (Greptile P1, ENG-844).
+const AFTER_CADENCE_DAY = /^\s*(?:$|[,/&.;:!?()]|-|–|—|(?:and|or|through|thru|to|till|until|then|otherwise|else|per|please|publish\w*|post\w*|posting|only|nothing|create|creating|skip\w*|days?|weekly|week|schedule|cadence)\b|(?:sun|mon|tue|wed|thu|fri|sat))/i;
+function followsAsCadenceDay(after: string): boolean {
+  if (/^['’]/.test(after)) return false; // possessive: "Monday's approval"
+  return AFTER_CADENCE_DAY.test(after);
+}
+
 // Extract every weekday named in a text fragment (Mon, Tuesday, THU, …) as 0–6
 // indices, expanding inclusive ranges ("Mon-Fri" → Mon,Tue,Wed,Thu,Fri, wrapping
-// Sun..Sat) and the "weekend"/"weekday" shorthands. Order/dupes don't matter —
-// callers collect into a Set.
+// Sun..Sat) and the "weekend"/"weekday" shorthands. Singleton days are accepted
+// only when positioned as a list item (see followsAsCadenceDay); range endpoints
+// and the weekend/weekday shorthands are list-structured by construction. Order/
+// dupes don't matter — callers collect into a Set.
 function weekdaysInFragment(fragment: string): number[] {
   const out: number[] = [];
   for (const m of fragment.matchAll(WEEKDAY_RANGE)) {
@@ -899,7 +914,9 @@ function weekdaysInFragment(fragment: string): number[] {
   }
   for (const m of fragment.matchAll(WEEKDAY_TOKEN)) {
     const idx = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
-    if (idx !== undefined) out.push(idx);
+    if (idx === undefined) continue;
+    if (!followsAsCadenceDay(fragment.slice((m.index ?? 0) + m[0].length))) continue;
+    out.push(idx);
   }
   if (/\bweekends?\b/i.test(fragment)) out.push(0, 6);
   if (/\bweekdays?\b/i.test(fragment)) out.push(1, 2, 3, 4, 5);
