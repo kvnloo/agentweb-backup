@@ -507,17 +507,16 @@ describe('emailService.sendScheduledRunFailedEmail (ENG-826 #1)', () => {
     failureClass: 'system' as const,
   };
 
-  it('sends ONE email to all recipients with a keeps-failing subject and returns true on delivery', async () => {
-    const spy = jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'm1' });
+  it('sends ONE email to all recipients with a keeps-failing subject', async () => {
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
 
-    const sent = await emailService.sendScheduledRunFailedEmail(
+    await emailService.sendScheduledRunFailedEmail(
       ['ops@example.com', 'lead@example.com'],
       'LinkedIn Post Factory',
       'sched-1',
       opts,
     );
 
-    expect(sent).toBe(true);
     expect(spy).toHaveBeenCalledTimes(1);
     const [recipients, subject, text, html] = spy.mock.calls[0];
     expect(recipients).toEqual(['ops@example.com', 'lead@example.com']);
@@ -531,13 +530,13 @@ describe('emailService.sendScheduledRunFailedEmail (ENG-826 #1)', () => {
   });
 
   it('normalizes a single recipient string to a one-element list', async () => {
-    const spy = jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'm2' });
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
     await emailService.sendScheduledRunFailedEmail('solo@example.com', 'Daily Digest', 'sched-2', opts);
     expect(spy.mock.calls[0][0]).toEqual(['solo@example.com']);
   });
 
   it('HTML-escapes the schedule name to prevent injection into the email body', async () => {
-    const spy = jest.spyOn(emailService, 'sendEmailStrict').mockResolvedValue({ messageId: 'm3' });
+    const spy = jest.spyOn(emailService, 'sendEmail').mockResolvedValue();
     await emailService.sendScheduledRunFailedEmail(
       ['x@example.com'],
       'Evil <img src=x onerror=alert(1)> Schedule',
@@ -549,10 +548,10 @@ describe('emailService.sendScheduledRunFailedEmail (ENG-826 #1)', () => {
     expect(html).toContain('&lt;img src=x');
   });
 
-  it('returns false (never throws) when delivery fails, so the caller does not suppress future alerts', async () => {
-    jest.spyOn(emailService, 'sendEmailStrict').mockRejectedValue(new Error('SMTP down'));
+  it('never throws when the transport fails (best-effort)', async () => {
+    jest.spyOn(emailService, 'sendEmail').mockRejectedValue(new Error('SMTP down'));
     await expect(
       emailService.sendScheduledRunFailedEmail(['x@example.com'], 'S', 'sched-5', opts),
-    ).resolves.toBe(false);
+    ).resolves.toBeUndefined();
   });
 });

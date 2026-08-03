@@ -962,16 +962,14 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
   // consistently failing and will NOT be auto-retried again until its next scheduled
   // slot. Previously this state only produced a server log the owner never saw, so a
   // customer's schedule (e.g. the gemini-3.5-flash "LinkedIn Post Factory" runs in
-  // ENG-826) could keep failing silently. Best-effort: never throws. Returns true ONLY
-  // if the provider actually accepted the email — the caller gates its once-per-episode
-  // suppression flag on this, so a failed delivery is retried on the next failing run
-  // instead of silently suppressing every future alert.
+  // ENG-826) could keep failing silently. Best-effort: never throws (a notification
+  // failure must not break the run).
   async sendScheduledRunFailedEmail(
     toEmails: string | string[],
     scheduleName: string,
     scheduleId: string,
     opts: { failedAttempts: number; failureClass: 'budget' | 'transient' | 'system' }
-  ): Promise<boolean> {
+  ) {
     try {
       const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
       const currentDate = new Date().toLocaleDateString('en-US', {
@@ -1042,17 +1040,12 @@ Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
 
       const subject = `⚠️ Scheduled Chat Keeps Failing: ${scheduleName}`;
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
-      // Strict send so a real delivery failure is observable here (sendEmail swallows
-      // errors, which would let us mark the episode alerted without actually notifying).
-      await this.sendEmailStrict(emailList, subject, text, html);
+      await this.sendEmail(emailList, subject, text, html);
       console.log(`Scheduled run-failed email sent to recipients: ${emailList.join(', ')} (schedule ${scheduleId})`);
-      return true;
     } catch (error) {
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled run-failed email to ${emailList.join(', ')}:`, error);
-      // Don't throw — a notification failure must not break the scheduled chat flow —
-      // but report it so the caller does NOT suppress future alerts for this episode.
-      return false;
+      // Don't throw — a notification failure must not break the scheduled chat flow.
     }
   },
 

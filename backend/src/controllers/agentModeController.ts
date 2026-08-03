@@ -2715,9 +2715,6 @@ export async function runScheduledChat(
           zeroAssistantRetryCount: 0,
           lastZeroAssistantOutputAt: '',
           lastZeroAssistantOutputSessionId: '',
-          // ENG-826 #1: a success ends the failing episode — re-arm the owner alert so a
-          // future break (after recovery) emails again rather than staying suppressed.
-          zeroAssistantOwnerAlerted: false,
           updatedAt: new Date().toISOString(),
         });
       } catch (resetError) {
@@ -2837,68 +2834,41 @@ export async function runScheduledChat(
           // owner's account email. Best-effort — a notification failure must never break
           // the run.
           //
-          // Send at most ONCE per failing episode: the exhaustion branch is re-entered on
-          // EVERY subsequent failing run (zeroAssistantRetryCount stays at the cap until a
-          // success resets it), so without this guard a schedule stuck failing would email
-          // the owner on every slot — 24×/day for an hourly schedule. zeroAssistantOwnerAlerted
-          // is set here and cleared on the next success (below), so the owner gets one alert
-          // per episode and a fresh one only after the schedule recovers and breaks again.
-          if (schedule.zeroAssistantOwnerAlerted) {
-            console.log(
-              `Owner already alerted for repeatedly-failing schedule ${schedule.scheduleId}; suppressing duplicate until it recovers.`
-            );
-          } else {
-            try {
-              let recipients: string[] = Array.isArray(schedule.emailNotifications)
-                ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
-                : [];
-              if (recipients.length === 0) {
-                const owner = await userDb.getUserById(userId);
-                if (owner?.email) recipients = [owner.email];
-              }
-              if (recipients.length > 0) {
-                const alertSent = await emailService.sendScheduledRunFailedEmail(
-                  recipients,
-                  schedule.scheduleName,
-                  schedule.scheduleId,
-                  {
-                    failedAttempts: nextRetryCount,
-                    failureClass: classifyZeroAssistantFailure(error),
-                  }
-                );
-                // Mark alerted ONLY after the email was actually delivered. If delivery
-                // failed, leave the flag unset so the next failing slot re-attempts the
-                // alert rather than suppressing every future notification for this episode.
-                if (alertSent) {
-                  try {
-                    await scheduleDb.updateSchedule(schedule.scheduleId, {
-                      zeroAssistantOwnerAlerted: true,
-                      updatedAt: new Date().toISOString(),
-                    });
-                  } catch (flagError) {
-                    console.error(
-                      `Failed to set zeroAssistantOwnerAlerted for schedule ${schedule.scheduleId}:`,
-                      flagError
-                    );
-                  }
-                } else {
-                  console.error(
-                    `Owner failure alert not delivered for schedule ${schedule.scheduleId}; will retry on the next failing run.`
-                  );
+          // The alert fires on each exhausted failing run. Past the requeue cap the
+          // schedule is NOT requeued, so this is at most once per natural slot while it
+          // stays broken — standard "notify while failing" behavior. We deliberately do
+          // NOT persist a separate "already alerted" flag for dedup: that write can't be
+          // atomic with the email send, so any such flag inevitably diverges from actual
+          // delivery (a duplicate alert if the write fails after a send, or a missed alert
+          // if the ordering is inverted). No dedup state means no divergence to get wrong.
+          try {
+            let recipients: string[] = Array.isArray(schedule.emailNotifications)
+              ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+              : [];
+            if (recipients.length === 0) {
+              const owner = await userDb.getUserById(userId);
+              if (owner?.email) recipients = [owner.email];
+            }
+            if (recipients.length > 0) {
+              await emailService.sendScheduledRunFailedEmail(
+                recipients,
+                schedule.scheduleName,
+                schedule.scheduleId,
+                {
+                  failedAttempts: nextRetryCount,
+                  failureClass: classifyZeroAssistantFailure(error),
                 }
-              } else {
-                // No recipients yet — do NOT mark alerted, so if the owner later adds a
-                // notification address they still get the alert.
-                console.error(
-                  `No notification recipients for repeatedly-failing schedule ${schedule.scheduleId}; owner alert skipped.`
-                );
-              }
-            } catch (notifyError) {
+              );
+            } else {
               console.error(
-                `Failed to send owner failure alert for schedule ${schedule.scheduleId}:`,
-                notifyError
+                `No notification recipients for repeatedly-failing schedule ${schedule.scheduleId}; owner alert skipped.`
               );
             }
+          } catch (notifyError) {
+            console.error(
+              `Failed to send owner failure alert for schedule ${schedule.scheduleId}:`,
+              notifyError
+            );
           }
         }
       }

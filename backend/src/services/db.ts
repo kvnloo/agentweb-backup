@@ -3114,7 +3114,6 @@ export const scheduleDb = {
       zeroAssistantRetryCount: number;
       lastZeroAssistantOutputAt: string;
       lastZeroAssistantOutputSessionId: string;
-      zeroAssistantOwnerAlerted: boolean; // ENG-826 #1: owner emailed for the current failing episode (once-per-episode dedup)
     }>
   ) {
     try {
