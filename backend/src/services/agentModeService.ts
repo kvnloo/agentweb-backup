@@ -172,6 +172,26 @@ export function isCompleteHtmlDocument(draft: string): boolean {
   const hasClose = s.includes('</html>');
   return hasOpen && hasClose;
 }
+
+// ENG-844: tools that publish LIVE / perform an irreversible external write. A
+// scheduled run that legitimately withholds one of these on a non-publishing day
+// gets pressed by verification retries ("Please try again. Make sure to
+// post_on_connected_account (1 more time needed)"). When that identical prompt
+// repeats enough to trip the anti-loop override, the override's remedy ("proceed
+// with placeholders / always make progress") is WRONG here: the blocker is
+// authorization, not missing information, and no placeholder can stand in for
+// consent to publish. This predicate lets the override step DETERMINISTICALLY
+// decline to fire on such a press, so a correctly-behaving agent is never pushed
+// toward an off-cadence live publish or into fabricating that it published.
+const IRREVERSIBLE_PUBLISH_TOOLS = ['post_on_connected_account', 'post_thread', 'publish_blog_article'];
+
+export function isIrreversibleWriteRetryPress(text: string): boolean {
+  if (!text || typeof text !== 'string') return false;
+  // Only the verification harness's write-call retry prompt (agentModeController
+  // runVerifiedChat) has this shape; a human never phrases a request this way.
+  if (!/please try again\.\s*make sure to /i.test(text)) return false;
+  return IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
+}
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService, runWithXActingUser } from './twitterService';
@@ -3075,7 +3095,18 @@ export class AgentModeService {
         m => (m.content || '').trim().toLowerCase() === normalizedCurrent
       ).length;
 
-      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD) {
+      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && isIrreversibleWriteRetryPress(messageContent)) {
+        // ENG-844: the repeated prompt is a verification retry pressing an
+        // irreversible/publishing write, not a human withholding information. The
+        // anti-loop override's "proceed with placeholders" remedy is designed for
+        // MISSING INFORMATION and must never become license to publish live. Do
+        // NOT inject it; let the run retry/exit through its normal path (the
+        // scheduled verifier records a failure + alerts) rather than pushing a
+        // correctly-withheld publish or a fabricated success.
+        console.warn(
+          `AgentMode: anti-loop override SUPPRESSED for session ${sessionId} — the repeated prompt presses an irreversible/publishing write; not injecting a 'proceed anyway' instruction (ENG-844).`
+        );
+      } else if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD) {
         messages.push({
           role: 'user',
           content: `[SYSTEM OVERRIDE - ANTI-LOOP TRIGGERED] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
