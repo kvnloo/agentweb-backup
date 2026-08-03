@@ -50,12 +50,14 @@ const mockAddMessagesToSession = jest.fn();
 // These tests all drive sessions owned by 'test-user-id'. Cross-user rejection
 // is covered separately in liveVoiceService.sessionOwnership.test.ts.
 const mockGetChatSessionRecord = jest.fn();
+const mockGetMessagesFromMessagesTable = jest.fn().mockResolvedValue([]);
 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     addMessageToSession: mockAddMessageToSession,
     addMessagesToSession: mockAddMessagesToSession,
     getChatSessionRecord: mockGetChatSessionRecord,
+    getMessagesFromMessagesTable: mockGetMessagesFromMessagesTable,
   },
 }));
 
@@ -1189,5 +1191,125 @@ describe('tool call surfacing', () => {
     const messages: any[] = saveCall?.[1] ?? [];
     const assistantMsg = messages.find((m: any) => m.role === 'assistant');
     expect(assistantMsg?.metadata?.toolCalls).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ENG-763: onboarding guardrail + anti-loop directive on the live-voice path
+// ---------------------------------------------------------------------------
+
+describe('ENG-763 onboarding install_skills tool-gate (live path)', () => {
+  it('blocks install_skills during onboarding and never executes it', async () => {
+    const callbacks = makeCallbacks();
+    await startLiveSession(
+      'session-onboarding-gate',
+      'socket-gate',
+      jest.fn(),
+      'test-user-id',
+      'onboarding',
+    );
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{ id: 'fc-install', name: 'install_skills', args: {} }],
+      },
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // The forbidden tool must never reach execution.
+    expect(mockExecuteTool).not.toHaveBeenCalled();
+    // Gemini is told the tool is unavailable during onboarding.
+    expect(mockSessionSendToolResponse).toHaveBeenCalledWith({
+      functionResponses: [
+        expect.objectContaining({
+          id: 'fc-install',
+          name: 'install_skills',
+          response: expect.objectContaining({ error: expect.stringMatching(/not available during onboarding/i) }),
+        }),
+      ],
+    });
+  });
+
+  it('still executes onboarding-safe tools during onboarding', async () => {
+    const callbacks = makeCallbacks();
+    mockExecuteTool.mockResolvedValueOnce({ ok: true });
+    await startLiveSession(
+      'session-onboarding-allowed',
+      'socket-allowed',
+      jest.fn(),
+      'test-user-id',
+      'onboarding',
+    );
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{ id: 'fc-brand', name: 'read_brand_guidelines', args: {} }],
+      },
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(mockExecuteTool).toHaveBeenCalledWith(
+      expect.any(String), 'read_brand_guidelines', {}, 'test-user-id', 'session-onboarding-allowed', false,
+    );
+  });
+
+  it('does not gate non-onboarding tools in the default profile', async () => {
+    const callbacks = makeCallbacks();
+    mockExecuteTool.mockResolvedValueOnce({ ok: true });
+    await startLiveSession('session-default-gate', 'socket-default', jest.fn(), 'test-user-id');
+
+    callbacks['onmessage']?.({
+      toolCall: {
+        functionCalls: [{ id: 'fc-install-default', name: 'install_skills', args: {} }],
+      },
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Default (non-onboarding) sessions are unaffected by the onboarding gate.
+    expect(mockExecuteTool).toHaveBeenCalledWith(
+      expect.any(String), 'install_skills', {}, 'test-user-id', 'session-default-gate', false,
+    );
+  });
+});
+
+describe('ENG-763 anti-loop directive in the live system prompt', () => {
+  it('injects a non-attributable anti-loop directive after repeated identical user turns', async () => {
+    makeCallbacks();
+    mockGetMessagesFromMessagesTable.mockResolvedValueOnce([
+      { role: 'user', content: 'qa exactly once check' },
+      { role: 'assistant', content: 'I need a target first.' },
+      { role: 'user', content: 'qa exactly once check' },
+      { role: 'assistant', content: 'Still need a target.' },
+      { role: 'user', content: 'qa exactly once check' },
+    ]);
+
+    await startLiveSession('session-loop', 'socket-loop', jest.fn(), 'test-user-id');
+
+    const systemText = mockLiveConnect.mock.calls[0][0].config.systemInstruction.parts[0].text;
+    expect(systemText).toContain('ANTI-LOOP DIRECTIVE');
+    // Never re-introduce the "[SYSTEM OVERRIDE]" wording the model echoed back.
+    expect(systemText).not.toMatch(/SYSTEM OVERRIDE/i);
+    // Explicitly forbids attributing system-authored text to the user.
+    expect(systemText.toLowerCase()).toContain('attribute');
+  });
+
+  it('does not inject the anti-loop directive for a normal, non-repetitive conversation', async () => {
+    makeCallbacks();
+    mockGetMessagesFromMessagesTable.mockResolvedValueOnce([
+      { role: 'user', content: 'What campaigns are running?' },
+      { role: 'assistant', content: 'Here are your campaigns.' },
+      { role: 'user', content: 'Great, draft a follow-up email.' },
+    ]);
+
+    await startLiveSession('session-noloop', 'socket-noloop', jest.fn(), 'test-user-id');
+
+    const systemText = mockLiveConnect.mock.calls[0][0].config.systemInstruction.parts[0].text;
+    expect(systemText).not.toContain('ANTI-LOOP DIRECTIVE');
   });
 });
