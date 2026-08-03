@@ -439,6 +439,38 @@ describe('sanitizeGeminiSchema', () => {
     });
   });
 
+  it('normalizes a union `type` array to a single Gemini type + nullable (ENG-826)', () => {
+    // Real prod shape from emma/tools.ts (get_meta_ads_metrics.campaign_ids,
+    // gmail send to/cc/bcc): a JSON-Schema union `type: ['array', 'string']`.
+    // Gemini's function-declaration Schema.type is a SINGLE OpenAPI type — a
+    // union array 400s the ENTIRE request the moment the tool is attached, so
+    // every gemini-3.5-flash agent turn carrying such a tool failed with zero
+    // assistant output (the ENG-826 silent-failure signature). 'array' is kept
+    // when `items` is present so the element schema stays meaningful.
+    const input = {
+      type: 'object',
+      properties: {
+        campaign_ids: { type: ['array', 'string'], items: { type: 'string' }, minItems: 1 },
+        note: { type: ['string', 'null'] },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        campaign_ids: { type: 'array', items: { type: 'string' }, minItems: 1 },
+        note: { type: 'string', nullable: true },
+      },
+    });
+  });
+
+  it('drops array-only keywords when a union `type` resolves to a non-array type', () => {
+    // A union with no `array` member resolves to a scalar and must not keep
+    // array-only constraints (items/minItems/maxItems) — Gemini rejects those
+    // on a non-array type.
+    const input = { type: ['string', 'number'], items: { type: 'string' }, maxItems: 5 };
+    expect(sanitizeGeminiSchema(input)).toEqual({ type: 'string' });
+  });
+
   it('drops oneOf/allOf/const (absent from the genai Schema type, e.g. dynamic MCP tool schemas)', () => {
     const input = {
       type: 'object',
