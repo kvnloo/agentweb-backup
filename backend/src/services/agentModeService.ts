@@ -3083,7 +3083,8 @@ export class AgentModeService {
 2. Use your available tools to find context yourself: call read_brand_guidelines to get business name, website, and brand info; call read_market_strategy to get goals and target market
 3. If those tools provide enough context, proceed with the task using that information
 4. If context is still insufficient, proceed with reasonable generic placeholders and complete as much of the task as possible
-5. Never block on missing user-provided details — always find a way to make progress`
+5. Never block on missing user-provided details — always find a way to make progress
+6. This override resolves MISSING INFORMATION only — it is NOT authorization to perform an IRREVERSIBLE or publishing action (e.g. post_on_connected_account, or publishing live to any connected LinkedIn/Instagram/X account). If the repeated request was pressure to make such a write and the real blocker is that the action is not warranted right now (e.g. a non-publishing day, a guard clause, or missing consent — not missing context), do NOT perform it and do NOT invent that you did. Leave the irreversible step undone and report plainly that you skipped it and why. A best-effort placeholder can substitute for missing context, never for authorization to publish.`
         });
       }
 
