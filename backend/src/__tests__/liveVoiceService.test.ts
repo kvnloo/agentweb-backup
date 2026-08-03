@@ -1278,8 +1278,13 @@ describe('ENG-763 onboarding install_skills tool-gate (live path)', () => {
   });
 });
 
-describe('ENG-763 anti-loop directive in the live system prompt', () => {
-  it('injects a non-attributable anti-loop directive after repeated identical user turns', async () => {
+describe('ENG-763 live-voice path does NOT inject a cross-message anti-loop directive', () => {
+  it('never injects an anti-loop directive, even after repeated identical user turns', async () => {
+    // The live path deliberately has no structural loop detector: "3 identical user
+    // turns" cannot distinguish a stuck clarification loop from a legitimate repeated
+    // request answered with text-only turns, so firing it would park valid repeats.
+    // The reported bug is fixed on the agentMode text path; the live path keeps only
+    // its anti-attribution guidance and the install_skills onboarding tool-gate.
     makeCallbacks();
     mockGetMessagesFromMessagesTable.mockResolvedValueOnce([
       { role: 'user', content: 'qa exactly once check' },
@@ -1292,46 +1297,9 @@ describe('ENG-763 anti-loop directive in the live system prompt', () => {
     await startLiveSession('session-loop', 'socket-loop', jest.fn(), 'test-user-id');
 
     const systemText = mockLiveConnect.mock.calls[0][0].config.systemInstruction.parts[0].text;
-    expect(systemText).toContain('ANTI-LOOP DIRECTIVE');
-    // Never re-introduce the "[SYSTEM OVERRIDE]" wording the model echoed back.
-    expect(systemText).not.toMatch(/SYSTEM OVERRIDE/i);
-    // Explicitly forbids attributing system-authored text to the user.
+    expect(systemText).not.toContain('ANTI-LOOP DIRECTIVE');
+    // The retained anti-attribution guidance still forbids quoting system text as the user's.
     expect(systemText.toLowerCase()).toContain('attribute');
-  });
-
-  it('does NOT inject the directive when the assistant made progress (tool calls) between identical requests (ENG-763/Greptile)', async () => {
-    // A user repeating the same *substantive* request that the assistant actually
-    // serviced each time (tool calls in between) is not a stuck clarification loop —
-    // firing the directive would wrongly refuse/park a legitimate repeated request.
-    makeCallbacks();
-    // Live turns persist executed tools under `metadata.toolCalls` — the shape the
-    // guard must recognize on reload (Greptile). One turn uses that shape; another
-    // uses top-level `tool_calls` so the guard is proven to accept both.
-    mockGetMessagesFromMessagesTable.mockResolvedValueOnce([
-      { role: 'user', content: 'post my weekly update' },
-      { role: 'assistant', content: 'Posted your update.', metadata: { toolCalls: [{ name: 'post_on_connected_account' }] } },
-      { role: 'user', content: 'post my weekly update' },
-      { role: 'assistant', content: 'Posted again.', tool_calls: [{ id: 't2', function: { name: 'post_on_connected_account', arguments: '{}' } }] },
-      { role: 'user', content: 'post my weekly update' },
-    ]);
-
-    await startLiveSession('session-progress', 'socket-progress', jest.fn(), 'test-user-id');
-
-    const systemText = mockLiveConnect.mock.calls[0][0].config.systemInstruction.parts[0].text;
-    expect(systemText).not.toContain('ANTI-LOOP DIRECTIVE');
-  });
-
-  it('does not inject the anti-loop directive for a normal, non-repetitive conversation', async () => {
-    makeCallbacks();
-    mockGetMessagesFromMessagesTable.mockResolvedValueOnce([
-      { role: 'user', content: 'What campaigns are running?' },
-      { role: 'assistant', content: 'Here are your campaigns.' },
-      { role: 'user', content: 'Great, draft a follow-up email.' },
-    ]);
-
-    await startLiveSession('session-noloop', 'socket-noloop', jest.fn(), 'test-user-id');
-
-    const systemText = mockLiveConnect.mock.calls[0][0].config.systemInstruction.parts[0].text;
-    expect(systemText).not.toContain('ANTI-LOOP DIRECTIVE');
+    expect(systemText).not.toMatch(/SYSTEM OVERRIDE/i);
   });
 });
