@@ -155,6 +155,51 @@ describe('AgentModeService - Cross-message Loop Detection', () => {
     expect(antiLoopMsg.content).toContain('read_market_strategy');
   });
 
+  it('injects the anti-loop directive as a system message, never as a user turn (ENG-763)', async () => {
+    // The directive used to be pushed with role:'user'. On Gemini consecutive user
+    // parts are merged, so the model read the system-authored "[SYSTEM OVERRIDE]" text
+    // as the user's own words and quoted it back — hallucinating that the user sent it.
+    mockDeps();
+    const callLLMSpy = jest
+      .spyOn(agentModeService as any, 'callLLM')
+      .mockResolvedValue(makeLLMResponse());
+
+    const repeatedMessage = 'qa exactly once check';
+    const sessionHistory = [
+      { role: 'user', content: repeatedMessage },
+      { role: 'assistant', content: 'I need a target first.' },
+      { role: 'user', content: repeatedMessage },
+      { role: 'assistant', content: 'Still need a target.' },
+      { role: 'user', content: repeatedMessage },
+      { role: 'assistant', content: 'Cannot proceed without a target.' },
+    ];
+
+    await agentModeService.generateMarketingResponse(
+      repeatedMessage,
+      sessionHistory as any,
+      'test-user',
+      agentModeService.default_model,
+      'test-session'
+    );
+
+    const messagesArg = callLLMSpy.mock.calls[0][1] as any[];
+    const antiLoopMsg = messagesArg.find(
+      (m: any) => typeof m.content === 'string' && m.content.includes('ANTI-LOOP')
+    );
+    expect(antiLoopMsg).toBeDefined();
+    // Must not be attributable to the user.
+    expect(antiLoopMsg.role).toBe('system');
+    // Must not leak the "[SYSTEM OVERRIDE]" phrasing the model was echoing back.
+    expect(antiLoopMsg.content).not.toMatch(/SYSTEM OVERRIDE/i);
+    // No user-role message may carry the internal directive text.
+    const userCarryingDirective = messagesArg.find(
+      (m: any) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('ANTI-LOOP')
+    );
+    expect(userCarryingDirective).toBeUndefined();
+    // Explicitly instructs the model not to attribute the directive to the user.
+    expect(antiLoopMsg.content.toLowerCase()).toContain('attribute');
+  });
+
   it('loop detection is case-insensitive and whitespace-tolerant', async () => {
     mockDeps();
     const callLLMSpy = jest
