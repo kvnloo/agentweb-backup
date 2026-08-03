@@ -471,6 +471,15 @@ describe('sanitizeGeminiSchema', () => {
     expect(sanitizeGeminiSchema(input)).toEqual({ type: 'string' });
   });
 
+  it('falls back to a scalar `string` for a degenerate union with no non-null member', () => {
+    // The `nonNull[0] || 'string'` fallback (geminiNativeClient.ts): a `type: []`
+    // (empty union) or `type: ['null']` (only null) has no resolvable member, so
+    // it must default to a concrete Gemini type rather than leaving `type`
+    // undefined/array — both of which Gemini rejects.
+    expect(sanitizeGeminiSchema({ type: [] })).toEqual({ type: 'string' });
+    expect(sanitizeGeminiSchema({ type: ['null'] })).toEqual({ type: 'string', nullable: true });
+  });
+
   it('drops oneOf/allOf/const (absent from the genai Schema type, e.g. dynamic MCP tool schemas)', () => {
     const input = {
       type: 'object',
