@@ -941,6 +941,20 @@ function parseScheduleCadence(instruction: string): { publishDays: Set<number>; 
 // (Greptile P1, ENG-844). Falls back to UTC when no/invalid timezone is given.
 // NB: the model-asserted-weekday VETO stays UTC on purpose — the model is handed
 // its "Current date" as a UTC calendar date, so that is the reference IT reasons in.
+// True iff `tz` is a valid IANA timezone identifier (e.g. "America/Los_Angeles").
+// Intl.DateTimeFormat throws RangeError on an unknown zone. Used to validate the
+// timezone persisted on a schedule so the cadence check has a trustworthy value
+// (ENG-844).
+export function isValidIanaTimeZone(tz: unknown): tz is string {
+  if (typeof tz !== 'string' || tz.trim().length === 0) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function weekdayInTimeZone(when: Date, timeZone?: string): number {
   if (!timeZone) return when.getUTCDay();
   try {
@@ -6445,7 +6459,8 @@ export const agentModeController = {
         variableValues,
         frequencyIntervalDays,
         selfImprove,
-        fullAutonomy
+        fullAutonomy,
+        timezone
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -6469,6 +6484,14 @@ export const agentModeController = {
         if (!Number.isInteger(runCount) || (runCount !== -1 && runCount < 1)) {
           return res.status(400).json({ error: 'runCount must be -1 (unlimited) or a positive integer' });
         }
+      }
+
+      // ENG-844: an optional IANA timezone. Persisted so scheduled-run cadence
+      // checks (e.g. "publish only Mon/Wed/Fri") are evaluated on the owner's local
+      // calendar day rather than UTC. Reject a malformed value loudly rather than
+      // silently storing garbage the cadence check would ignore.
+      if (timezone !== undefined && !isValidIanaTimeZone(timezone)) {
+        return res.status(400).json({ error: 'timezone must be a valid IANA timezone identifier (e.g. America/Los_Angeles)' });
       }
 
       // If sessionId is provided, verify it exists and belongs to user
@@ -6517,6 +6540,9 @@ export const agentModeController = {
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
         fullAutonomy: fullAutonomy === true,
+        // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
+        // client didn't send one — the cadence check then falls back to UTC).
+        ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
         status: 'active',
         nextRunTime: scheduledNextRunTime,
         createdAt: now.toISOString(),
@@ -6633,7 +6659,8 @@ export const agentModeController = {
         variableValues,
         frequencyIntervalDays,
         selfImprove,
-        fullAutonomy
+        fullAutonomy,
+        timezone
       } = req.body;
 
       // Verify schedule exists and belongs to user (before validation so we can merge)
@@ -6671,6 +6698,11 @@ export const agentModeController = {
         }
       }
 
+      // ENG-844: validate an optional IANA timezone update (persisted for cadence).
+      if (timezone !== undefined && !isValidIanaTimeZone(timezone)) {
+        return res.status(400).json({ error: 'timezone must be a valid IANA timezone identifier (e.g. America/Los_Angeles)' });
+      }
+
       const now = new Date();
 
       // Determine nextRunTime: use provided value or keep existing
@@ -6703,6 +6735,11 @@ export const agentModeController = {
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
+        // ENG-844: update the owner's timezone when a valid one is supplied; keep
+        // the existing value otherwise (partial-update safe).
+        ...(isValidIanaTimeZone(timezone)
+          ? { timezone }
+          : ((existingSchedule as any).timezone ? { timezone: (existingSchedule as any).timezone } : {})),
       };
 
       // Whenever the prompt actually changes, snapshot the PREVIOUS prompt into the
