@@ -7121,6 +7121,18 @@ export const crmDb = {
       // engagement is never removed by this path), so a matching new event sets it
       // and a non-matching one leaves whatever earlier events established.
       const raisesEngaged = engagementMatchesKeyword(engagementWithId);
+      // The CAS token IS updatedAt. new Date() is millisecond-resolution, so an
+      // append landing in the same millisecond as the updatedAt it guards against
+      // could rewrite the identical value — leaving the token unchanged and
+      // letting a second concurrent CAS append satisfy the first writer's
+      // precondition too, double-recording the engagement. Force the replacement
+      // strictly past the precondition so any successful append MOVES the token,
+      // which makes a losing racer's condition fail and re-decide (ENG-787).
+      let stampedUpdatedAt = new Date().toISOString();
+      if (opts.expectedUpdatedAt !== undefined && stampedUpdatedAt <= opts.expectedUpdatedAt) {
+        const bumped = new Date(new Date(opts.expectedUpdatedAt).getTime() + 1);
+        if (!Number.isNaN(bumped.getTime())) stampedUpdatedAt = bumped.toISOString();
+      }
       const setClauses = [
         'engagements = list_append(if_not_exists(engagements, :empty), :new)',
         'updatedAt = :updatedAt',
@@ -7128,7 +7140,7 @@ export const crmDb = {
       const expressionAttributeValues: Record<string, any> = {
         ':empty': [],
         ':new': [engagementWithId],
-        ':updatedAt': new Date().toISOString(),
+        ':updatedAt': stampedUpdatedAt,
       };
       if (raisesEngaged) {
         setClauses.push('isEngaged = :isEngaged');
