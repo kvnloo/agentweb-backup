@@ -95,6 +95,7 @@ jest.mock('../services/emailService', () => ({
     sendScheduledChatVariableRequestEmail: jest.fn(),
     sendScheduledChatErrorEmail: jest.fn(),
     sendScheduledChatTokenLimitEmail: jest.fn(),
+    sendScheduledRunFailedEmail: jest.fn(),
   },
 }));
 
@@ -936,6 +937,111 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       const retryAt = new Date(nextRunTime as string).getTime();
       expect(retryAt).toBeGreaterThanOrEqual(beforeRun + 14 * 60 * 1000);
       expect(retryAt).toBeLessThanOrEqual(Date.now() + 16 * 60 * 1000);
+    });
+
+    // ENG-826 #1: proactively notify the owner once the automatic retries are exhausted.
+    const zeroOutputWorkerResponse = {
+      content: '', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [],
+    };
+
+    it('notifies the owner (falling back to account email) once the requeue cap is exhausted', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+      mockEmailService.sendScheduledRunFailedEmail.mockResolvedValue(true as any); // delivered
+
+      // retryCount already at the cap (3) -> this failure is over the limit -> no requeue, notify.
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3 } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalledTimes(1);
+      const [recipients, name, id, opts] = mockEmailService.sendScheduledRunFailedEmail.mock.calls[0];
+      expect(recipients).toEqual(['owner@example.com']);
+      expect(id).toBe(baseSchedule.scheduleId);
+      expect(opts).toEqual(expect.objectContaining({ failedAttempts: 4, failureClass: expect.any(String) }));
+      // Exhausted -> must NOT schedule another retry.
+      const requeue = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantRetryCount === 4);
+      expect(requeue).toBeUndefined();
+      // No dedup-flag write — the notification carries no persisted "already alerted" state.
+      const flagWrite = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => 'zeroAssistantOwnerAlerted' in (c[1] || {}));
+      expect(flagWrite).toBeUndefined();
+    });
+
+    it('alerts on each exhausted failing slot (no persisted dedup state to diverge)', async () => {
+      // No "already alerted" flag is persisted, so there is no state to get out of sync
+      // with delivery — every exhausted run notifies (a stale flag value is ignored).
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3,
+          zeroAssistantOwnerAlerted: true } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalledTimes(1);
+      const flagWrite = mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => 'zeroAssistantOwnerAlerted' in (c[1] || {}));
+      expect(flagWrite).toBeUndefined();
+    });
+
+    it('skips the alert when there are no recipients', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue(null as any); // no owner email, no emailNotifications
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3 } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+    });
+
+    it('prefers the schedule\'s configured emailNotifications over the account email', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+      mockUserDb.getUserById.mockResolvedValue({ userId: mockUserId, email: 'owner@example.com' } as any);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3,
+          emailNotifications: ['ops@example.com', 'lead@example.com'] } as any,
+        mockUserId,
+        false,
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalledTimes(1);
+      expect(mockEmailService.sendScheduledRunFailedEmail.mock.calls[0][0]).toEqual(['ops@example.com', 'lead@example.com']);
+    });
+
+    it('does NOT notify while retries are still available (only on exhaustion)', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+        mockUserId,
+        false,
+      );
+
+      // Still within the cap -> requeues, no owner alert yet.
+      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        baseSchedule.scheduleId,
+        expect.objectContaining({ zeroAssistantRetryCount: 1 }),
+      );
+    });
+
+    it('does NOT notify on a test run even when the cap is exhausted', async () => {
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutputWorkerResponse);
+
+      await runScheduledChat(
+        { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 3 } as any,
+        mockUserId,
+        true, // isTest
+      );
+
+      expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
     });
 
     it('should persist a structured incomplete-job assistant message so the session is never left silent after zero assistant output', async () => {
@@ -3000,6 +3106,14 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       mockScheduleDb.getSchedulesByUserId = jest.fn();
     });
 
+    // ENG-826 #4: getScheduledChats now attaches a computed runHealth summary to each
+    // returned schedule (empty runResults -> the zero-state below). These sorting/
+    // filtering assertions compare the full response, so mirror that added field.
+    const withHealth = (s: any) => ({
+      ...s,
+      runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 },
+    });
+
     it('should sort scheduled chats by createdAt descending (newest first)', async () => {
       const oldSchedule = {
         scheduleId: 'old-schedule',
@@ -3054,9 +3168,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
       // Verify the response is sorted by createdAt descending
       expect(mockRes.json).toHaveBeenCalledWith([
-        newSchedule,    // 2026-01-26 (newest)
-        middleSchedule, // 2026-01-15
-        oldSchedule,    // 2026-01-01 (oldest)
+        withHealth(newSchedule),    // 2026-01-26 (newest)
+        withHealth(middleSchedule), // 2026-01-15
+        withHealth(oldSchedule),    // 2026-01-01 (oldest)
       ]);
     });
 
@@ -3102,8 +3216,8 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       // Schedule with createdAt should come first (newest)
       // Schedule without createdAt should be treated as epoch 0 (oldest)
       expect(mockRes.json).toHaveBeenCalledWith([
-        scheduleWithCreatedAt,
-        scheduleWithoutCreatedAt,
+        withHealth(scheduleWithCreatedAt),
+        withHealth(scheduleWithoutCreatedAt),
       ]);
     });
 
@@ -3147,7 +3261,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       await agentModeController.getScheduledChats(mockReq, mockRes);
 
       // Should only return scheduled_chat type
-      expect(mockRes.json).toHaveBeenCalledWith([scheduledChat]);
+      expect(mockRes.json).toHaveBeenCalledWith([withHealth(scheduledChat)]);
     });
   });
 
