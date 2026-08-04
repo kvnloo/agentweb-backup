@@ -64,14 +64,17 @@ export class WorkPlanThumbnailService {
   async generateAIThumbnail(
     plan: WorkPlan,
     opts: { supersedeInFlight?: boolean } = {},
-  ): Promise<WorkPlan> {
+  ): Promise<WorkPlan | null> {
     // The plan as this job observed it. No claim write for background jobs: a
     // claim is a second unconditioned write that races the actions it is meant
     // to order. A user action is different — it is allowed to supersede.
     let basedOn = plan.updatedAt;
     if (opts.supersedeInFlight) {
       const superseded = await workPlanService.updateThumbnail(plan.planId, {});
-      if (superseded) basedOn = superseded;
+      // Unconditional apart from attribute_exists, so null here means the plan
+      // is gone. Bail before spending ~40s rendering a thumbnail for nothing.
+      if (!superseded) return null;
+      basedOn = superseded;
     }
     const description = plan.description || 'A professional marketing automation tool';
     const prompt = THUMBNAIL_PROMPT_TEMPLATE.replace('{title}', plan.title).replace(
@@ -115,7 +118,9 @@ export class WorkPlanThumbnailService {
         thumbnail_source: 'ai',
         thumbnail_alt_text: updated.thumbnail_alt_text,
       }, { expectedUpdatedAt: basedOn });
-      if (!writtenAt) return (await workPlanService.getWorkPlan(plan.planId)) ?? plan;
+      // A newer action won, or the plan was deleted. Report what is actually
+      // stored — null when there is nothing left, never the stale input.
+      if (!writtenAt) return await workPlanService.getWorkPlan(plan.planId);
       return { ...updated, updatedAt: writtenAt };
     } catch (err) {
       console.error(
@@ -186,7 +191,7 @@ export class WorkPlanThumbnailService {
     return cleared;
   }
 
-  private async setNoThumbnail(plan: WorkPlan, basedOn?: string): Promise<WorkPlan> {
+  private async setNoThumbnail(plan: WorkPlan, basedOn?: string): Promise<WorkPlan | null> {
     const updated: WorkPlan = { ...plan, thumbnail_source: 'none' };
     // Preserve any existing thumbnail_url when just setting source to 'none' on
     // failure. Carries the generation's ordering, so a failed background job
@@ -196,7 +201,7 @@ export class WorkPlanThumbnailService {
       { thumbnail_source: 'none' },
       basedOn !== undefined ? { expectedUpdatedAt: basedOn } : {},
     );
-    if (!writtenAt) return (await workPlanService.getWorkPlan(plan.planId)) ?? plan;
+    if (!writtenAt) return await workPlanService.getWorkPlan(plan.planId);
     return { ...updated, updatedAt: writtenAt };
   }
 }

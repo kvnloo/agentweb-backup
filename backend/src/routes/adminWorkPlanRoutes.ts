@@ -211,6 +211,9 @@ router.post("/:planId/thumbnail/generate", async (req, res) => {
     // User-initiated: supersede any generation already running so the admin's
     // request wins rather than racing an older job for the same baseline.
     const updated = await workPlanThumbnailService.generateAIThumbnail(plan, { supersedeInFlight: true });
+    // null means the plan was deleted while the thumbnail was rendering. Saying
+    // 200 with the caller's stale copy would report a plan that no longer exists.
+    if (!updated) return res.status(404).json({ message: "Work plan not found" });
     res.json(updated);
   } catch (error) {
     console.error("Error generating thumbnail:", error);
