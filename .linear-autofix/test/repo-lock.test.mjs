@@ -6,11 +6,13 @@
 //     error: unable to write upstream branch configuration
 // which autofix recorded as a permanent `setup_failed`. The pure predicates + the injectable
 // gitRepoOp runner are exercised directly. Run: node test/repo-lock.test.mjs
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   isTransientGitLockError, backoffMs, repoLockId, isStaleGitLock,
-  acquireRepoLock, releaseRepoLock, gitRepoOp,
+  acquireRepoLock, releaseRepoLock, gitRepoOp, commonRepoRootOf,
 } from '../repo-lock.mjs';
 
 let pass = 0, fail = 0;
@@ -158,6 +160,40 @@ console.log('gitRepoOp holds the repo lock while running, and always releases it
   const after = acquireRepoLock(root, { timeoutMs: 0 });
   ok(!!after, 'the lock is released even when the git call THROWS (no permanent wedge)');
   releaseRepoLock(after);
+}
+
+// Not every shared-.git write is issued FROM the repo root. `git -C <worktree> config extensions.*`
+// (git-identity.mjs) writes the SHARED config while running inside a linked worktree — it raced with
+// `worktree add` even after the first fix. So the lock key (repo root) and the cwd must be separable.
+console.log('gitRepoOp cwd — lock the shared repo, run the command somewhere else');
+{
+  const seen = [];
+  const r = gitRepoOp('/repo', ['config', 'extensions.worktreeConfig', 'true'], {
+    cwd: '/repo/../wt/ENG-1', sleep: () => {},
+    run: (root, args, cwd) => { seen.push({ root, args, cwd }); return { status: 0, stdout: '', stderr: '' }; },
+  });
+  ok(r.status === 0, 'runs fine with a cwd override');
+  ok(seen[0].root === '/repo', 'the LOCK is still keyed by the shared repo root');
+  ok(seen[0].cwd === '/repo/../wt/ENG-1', 'the COMMAND runs in the worktree');
+  const dflt = [];
+  gitRepoOp('/repo', ['fetch'], { sleep: () => {}, run: (root, args, cwd) => { dflt.push(cwd); return { status: 0 }; } });
+  ok(dflt[0] === '/repo', 'cwd defaults to the repo root (unchanged for existing callers)');
+}
+
+console.log('commonRepoRootOf — a linked worktree resolves to the repo whose .git it shares');
+{
+  const base = mkdtempSync(path.join(tmpdir(), 'repo-lock-common-'));
+  const root = path.join(base, 'repo'), wt = path.join(base, 'wt1');
+  const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+  spawnSync('git', ['init', '-b', 'main', root], { env });
+  spawnSync('git', ['-C', root, 'commit', '--allow-empty', '-m', 'x'], { env });
+  spawnSync('git', ['-C', root, 'worktree', 'add', '-b', 'side', wt], { env });
+
+  ok(commonRepoRootOf(root) === root, 'a normal repo root resolves to itself');
+  ok(commonRepoRootOf(wt) === root, 'a LINKED worktree resolves to the shared repo root, not itself');
+  ok(repoLockId(commonRepoRootOf(wt)) === repoLockId(root), 'so it takes the SAME lock as the poller does');
+  ok(commonRepoRootOf(base) === null, 'a non-repo path → null (caller falls back gracefully)');
+  rmSync(base, { recursive: true, force: true });
 }
 
 console.log(fail ? `\n❌ ${fail} failed, ${pass} passed` : `\n✅ ALL PASSED — ${pass} passed, 0 failed`);
