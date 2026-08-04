@@ -151,6 +151,18 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
       expect(res.body.plan).toBeDefined();
     });
 
+    it('answers 409 when a FAILED generation is also superseded', async () => {
+      // The failure fallback ("mark it none") is conditioned exactly like the
+      // success write, so it loses the same races. Labelling that as applied
+      // would slip a superseded result past the route's conflict response.
+      mockGetWorkPlan.mockResolvedValue(mockPlan);
+      mockGenerateAIThumbnailDetailed.mockResolvedValue({ outcome: 'superseded', plan: mockPlan });
+
+      const res = await request(app).post('/api/admin/work-plans/plan-123/thumbnail/generate');
+
+      expect(res.status).toBe(409);
+    });
+
     it('answers 404 when the plan was deleted while rendering', async () => {
       mockGetWorkPlan.mockResolvedValue(mockPlan);
       mockGenerateAIThumbnailDetailed.mockResolvedValue({ outcome: 'gone', plan: null });

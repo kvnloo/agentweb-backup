@@ -108,7 +108,7 @@ export class WorkPlanThumbnailService {
           `[ThumbnailService] AI generation failed for plan ${plan.planId}:`,
           result.error,
         );
-        return { outcome: 'applied', plan: await this.setNoThumbnail(plan, basedOn) };
+        return this.setNoThumbnail(plan, basedOn);
       }
 
       const imageBuffer = await downloadBuffer(result.imageUrl);
@@ -143,7 +143,7 @@ export class WorkPlanThumbnailService {
         `[ThumbnailService] Error generating thumbnail for plan ${plan.planId}:`,
         err,
       );
-      return { outcome: 'applied', plan: await this.setNoThumbnail(plan, basedOn) };
+      return this.setNoThumbnail(plan, basedOn);
     }
   }
 
@@ -214,7 +214,10 @@ export class WorkPlanThumbnailService {
     return cleared;
   }
 
-  private async setNoThumbnail(plan: WorkPlan, basedOn?: string): Promise<WorkPlan | null> {
+  private async setNoThumbnail(
+    plan: WorkPlan,
+    basedOn?: string,
+  ): Promise<{ outcome: 'applied' | 'superseded' | 'gone'; plan: WorkPlan | null }> {
     const updated: WorkPlan = { ...plan, thumbnail_source: 'none' };
     // Preserve any existing thumbnail_url when just setting source to 'none' on
     // failure. Carries the generation's ordering, so a failed background job
@@ -224,8 +227,13 @@ export class WorkPlanThumbnailService {
       { thumbnail_source: 'none' },
       basedOn !== undefined ? { expectedUpdatedAt: basedOn } : {},
     );
-    if (!writtenAt) return await workPlanService.getWorkPlan(plan.planId);
-    return { ...updated, updatedAt: writtenAt };
+    // The fallback write is conditioned exactly like the success write, so it
+    // can lose the same races. Derive the outcome rather than assuming applied.
+    if (!writtenAt) {
+      const current = await workPlanService.getWorkPlan(plan.planId);
+      return { outcome: current ? 'superseded' : 'gone', plan: current };
+    }
+    return { outcome: 'applied', plan: { ...updated, updatedAt: writtenAt } };
   }
 }
 
