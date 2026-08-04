@@ -214,12 +214,23 @@ export interface RedirectFetchDeps {
   request?: (
     url: string,
     pinned: { address: string; family: number },
-    timeoutMs: number
+    timeoutMs: number,
+    maxBytes: number
   ) => Promise<HttpResponseLike>;
 }
 
 export const DEFAULT_MAX_REDIRECTS = 5;
 const DEFAULT_TIMEOUT_MS = 30000;
+
+/**
+ * Hard ceiling on a fetched image. The caller feeds this agent-supplied URLs, so
+ * a hostile (or merely careless) origin could otherwise stream an unbounded body
+ * that we buffer whole and hand to sharp — memory/CPU exhaustion that can take
+ * the backend down. 40MB leaves generous headroom over the largest images we
+ * actually see (~17MB from gemini-3.1-flash-image at 4K) while keeping a single
+ * describe_image call's footprint bounded.
+ */
+export const DEFAULT_MAX_IMAGE_BYTES = 40 * 1024 * 1024;
 
 /**
  * Fetch a URL's bytes SSRF-safely, following redirects hop by hop.
@@ -247,7 +258,8 @@ export async function fetchBufferFollowingRedirects(
   startUrl: string,
   deps: RedirectFetchDeps = {},
   maxRedirects: number = DEFAULT_MAX_REDIRECTS,
-  timeoutMs: number = DEFAULT_TIMEOUT_MS
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  maxBytes: number = DEFAULT_MAX_IMAGE_BYTES
 ): Promise<{ buffer: Buffer; contentType: string; finalUrl: string }> {
   const resolvePinned = deps.resolvePinned ?? resolvePinnedPublicAddress;
   const request = deps.request ?? defaultPinnedRequest;
@@ -267,12 +279,24 @@ export async function fetchBufferFollowingRedirects(
     }
     // Re-validate the resolved host at EVERY hop, not just the first.
     const pinned = await resolvePinned(url);
-    const res = await request(url, pinned, remainingMs);
+    const res = await request(url, pinned, remainingMs, maxBytes);
 
     if (res.status >= 200 && res.status < 300) {
+      // The transport already caps the response, but re-check here so an injected
+      // or future transport that ignores the cap still cannot hand an unbounded
+      // buffer to sharp. Declared Content-Length is checked first because it
+      // rejects without inspecting the body at all.
+      const declared = Number(res.headers?.['content-length'] ?? res.headers?.['Content-Length']);
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        throw new Error(`Image too large: declared ${declared} bytes exceeds the ${maxBytes}-byte limit`);
+      }
+      const buffer = Buffer.isBuffer(res.data) ? res.data : Buffer.from(res.data ?? []);
+      if (buffer.length > maxBytes) {
+        throw new Error(`Image too large: ${buffer.length} bytes exceeds the ${maxBytes}-byte limit`);
+      }
       const rawType = res.headers?.['content-type'] ?? res.headers?.['Content-Type'] ?? '';
       return {
-        buffer: Buffer.isBuffer(res.data) ? res.data : Buffer.from(res.data ?? []),
+        buffer,
         contentType: String(rawType).split(';')[0].trim(),
         finalUrl: url,
       };
@@ -298,12 +322,17 @@ export async function fetchBufferFollowingRedirects(
 async function defaultPinnedRequest(
   url: string,
   pinned: { address: string; family: number },
-  timeoutMs: number
+  timeoutMs: number,
+  maxBytes: number
 ): Promise<HttpResponseLike> {
   const axios = (await import('axios')).default;
   return axios.get(url, {
     responseType: 'arraybuffer',
     timeout: timeoutMs,
+    // Abort mid-stream once the body exceeds the cap, so an unbounded response
+    // is never fully buffered into memory (Greptile P1).
+    maxContentLength: maxBytes,
+    maxBodyLength: maxBytes,
     // This transport handles redirects itself (above) so it can re-validate each
     // hop; axios must therefore never follow one on its own.
     maxRedirects: 0,

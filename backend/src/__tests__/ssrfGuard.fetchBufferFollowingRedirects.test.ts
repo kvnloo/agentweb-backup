@@ -206,3 +206,62 @@ describe('fetchBufferFollowingRedirects — total time budget', () => {
     await expect(fetchBufferFollowingRedirects(start, deps, 5, 50)).rejects.toThrow(/timed out/i);
   });
 });
+
+/**
+ * Greptile P1 (security): an agent-supplied image URL is untrusted, so a hostile
+ * or merely huge origin could stream an unbounded body that we buffer whole and
+ * then hand to sharp — excessive memory/CPU that can destabilise the backend.
+ * The transport caps the response, and the loop refuses an oversized body (and
+ * an oversized declared Content-Length) as a second line of defence in case a
+ * transport ignores the cap.
+ */
+describe('fetchBufferFollowingRedirects — response size cap', () => {
+  const CAP = 1024;
+  const pinned = async () => ({ hostname: 'example.com', address: '93.184.216.34', family: 4 });
+
+  it('passes the byte cap down to the transport so the body is never fully buffered', async () => {
+    let seenCap: number | undefined;
+    const deps: RedirectFetchDeps = {
+      resolvePinned: pinned,
+      request: async (_url: string, _pinned: any, _timeoutMs: number, maxBytes?: number) => {
+        seenCap = maxBytes;
+        return { status: 200, headers: { 'content-type': 'image/png' }, data: Buffer.alloc(10) };
+      },
+    };
+    await fetchBufferFollowingRedirects('https://example.com/big.png', deps, 5, 30000, CAP);
+    expect(seenCap).toBe(CAP);
+  });
+
+  it('rejects a body larger than the cap', async () => {
+    const deps: RedirectFetchDeps = {
+      resolvePinned: pinned,
+      request: async () => ({ status: 200, headers: { 'content-type': 'image/png' }, data: Buffer.alloc(CAP + 1) }),
+    };
+    await expect(
+      fetchBufferFollowingRedirects('https://example.com/big.png', deps, 5, 30000, CAP)
+    ).rejects.toThrow(/too large/i);
+  });
+
+  it('rejects on a declared Content-Length over the cap', async () => {
+    const deps: RedirectFetchDeps = {
+      resolvePinned: pinned,
+      request: async () => ({
+        status: 200,
+        headers: { 'content-type': 'image/png', 'content-length': String(CAP * 100) },
+        data: Buffer.alloc(4),
+      }),
+    };
+    await expect(
+      fetchBufferFollowingRedirects('https://example.com/big.png', deps, 5, 30000, CAP)
+    ).rejects.toThrow(/too large/i);
+  });
+
+  it('accepts a body exactly at the cap', async () => {
+    const deps: RedirectFetchDeps = {
+      resolvePinned: pinned,
+      request: async () => ({ status: 200, headers: { 'content-type': 'image/png' }, data: Buffer.alloc(CAP) }),
+    };
+    const out = await fetchBufferFollowingRedirects('https://example.com/ok.png', deps, 5, 30000, CAP);
+    expect(out.buffer.length).toBe(CAP);
+  });
+});
