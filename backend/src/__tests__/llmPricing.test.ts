@@ -18,6 +18,7 @@ import {
   videoGenerationCostUsd,
   __resetUnknownModelWarnsForTests,
 } from '../utils/llmPricing';
+import { BEDROCK_EXTENDED_CACHE_TTL_MODELS } from '../utils/bedrockInferenceProfiles';
 
 function parseLlmModelsRegistryKeys(): string[] {
   const srcPath = path.join(__dirname, '..', 'services', 'agentModeService.ts');
@@ -185,9 +186,24 @@ describe('llmPricing', () => {
       for (const [model, price] of Object.entries(MODEL_PRICING)) {
         if (price.outPerM === 0) continue; // embeddings have no cache convention
         if (explicitCacheOverrides.has(model)) continue;
+        // ENG-893: models we invoke with the extended (1-hour) prompt-cache TTL
+        // bill cache writes at 2x, not 1.25x. Read stays on the 10% convention.
+        if (BEDROCK_EXTENDED_CACHE_TTL_MODELS.has(model)) continue;
         expect(price.cacheReadPerM).toBeCloseTo(price.inPerM * 0.1, 10);
         expect(price.cacheWritePerM).toBeCloseTo(price.inPerM * 1.25, 10);
         expect(model).toBeTruthy();
+      }
+    });
+
+    it('prices the extended-TTL (1-hour) models at a 2x cache-write rate', () => {
+      // The write rate follows the ttl we actually send on the Converse
+      // cachePoint — see BEDROCK_EXTENDED_CACHE_TTL_MODELS (ENG-893).
+      expect(BEDROCK_EXTENDED_CACHE_TTL_MODELS.size).toBeGreaterThan(0);
+      for (const model of BEDROCK_EXTENDED_CACHE_TTL_MODELS) {
+        const price = getModelPrice(model);
+        expect(price).not.toBeNull();
+        expect(price!.cacheReadPerM).toBeCloseTo(price!.inPerM * 0.1, 10);
+        expect(price!.cacheWritePerM).toBeCloseTo(price!.inPerM * 2, 10);
       }
     });
 
