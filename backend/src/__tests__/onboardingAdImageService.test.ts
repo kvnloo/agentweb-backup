@@ -805,9 +805,12 @@ describe("onboardingAdImageService", () => {
       expect(written.adImageResult.variants).toHaveLength(3);
     });
 
-    it("drops a total failure silently when a newer run owns the state", async () => {
-      // Staleness convention mirrors adImageReadyPatch (which returns null off
-      // 'running'): a late-finishing run must not stomp a newer one's status.
+    it("drops a terminal failure when a strictly newer run owns the axis", async () => {
+      // A slow run must not stomp a newer one. Run identity is
+      // adImageStartedAt: this run entered on `older`, but by the time it
+      // finished the axis had been restarted at `newer`.
+      const older = "2026-08-04T00:00:00.000Z";
+      const newer = "2026-08-04T00:05:00.000Z";
       userDb.getUserById
         .mockResolvedValueOnce({
           userId: "u1",
@@ -815,9 +818,15 @@ describe("onboardingAdImageService", () => {
           creativeDirResult: creativeDir,
           icpResult: [onePersona],
           brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: older,
         })
-        .mockResolvedValueOnce({ userId: "u1", adImageStatus: "ready" });
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: newer,
+        });
       userDb.updateUser.mockResolvedValue({});
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
       const throwingGen = {
         generateImage: async () => {
           throw new Error("hard crash inside generator");
@@ -827,6 +836,39 @@ describe("onboardingAdImageService", () => {
         imageGen: throwingGen as any,
         verifyLogoUrl: async () => true,
       });
+      warnSpy.mockRestore();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("drops a stale LOGO-GATE failure when a newer run owns the axis (Greptile)", async () => {
+      // The gates that fire before generation had the same race: a slow
+      // preflight resolving late would terminate whatever run currently held
+      // the axis. Only the owning run may publish a terminal state.
+      const older = "2026-08-04T00:00:00.000Z";
+      const newer = "2026-08-04T00:05:00.000Z";
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: {
+            brandData: { logoUrl: "https://dead/logo.png" },
+          },
+          adImageStartedAt: older,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: newer,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      warnSpy.mockRestore();
       expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
