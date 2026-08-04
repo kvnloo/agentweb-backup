@@ -112,6 +112,22 @@ const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
   "It has been recorded and will be retried automatically, and a transient issue like this usually " +
   "clears on its own. If it keeps happening, please contact support.";
 
+// ENG-764: a run ABANDONED because its owning process died (prod-verified: an EB
+// immutable deploy terminated the instance mid-run) is not a budget overrun either.
+// The reconciler used to persist the budget copy here, telling the user their job was
+// too large and to split it into smaller batches — a misdiagnosis of the user's own
+// workload for an outage on our side, and a direct contradiction of the accurate
+// "the owning process terminated mid-run" that the same recovery writes to
+// session.error. Splitting the request genuinely cannot help: the next deploy would
+// interrupt a smaller run just the same. Be honest about the cause, and reassure —
+// the requeue (and, on a safe boundary, the ENG-657 resume) recovers it unattended.
+const SCHEDULED_RUN_ABANDONED_MESSAGE =
+  "This scheduled run was interrupted before it could finish — the server process running it stopped " +
+  "mid-run, which normally happens during a routine deployment or restart on our side. " +
+  "Nothing is wrong with your request, and splitting it into smaller batches would not have helped. " +
+  "The run has been recorded as failed and will be retried automatically. " +
+  "If it keeps happening, please contact support.";
+
 // ENG-826: classify a zero-output scheduled-run failure so the persisted message and
 // the `failureClass` metadata match the ACTUAL cause. Precedence:
 //  1) 'budget' — context-limit, generation timeout, worker OOM/replacement, or a run
@@ -135,8 +151,9 @@ export function classifyZeroAssistantFailure(error: unknown): ScheduledRunFailur
   return 'system';
 }
 
-// The reconciler path (a dead process, with no error object to classify) deliberately
-// keeps SCHEDULED_JOB_INCOMPLETE_MESSAGE.
+// The reconciler path has no error object to classify, but it does not need one: a
+// stale lease means the owning process died, so it uses SCHEDULED_RUN_ABANDONED_MESSAGE
+// directly rather than falling back to the budget copy (ENG-764).
 export function zeroAssistantIncompleteMessage(error: unknown): string {
   switch (classifyZeroAssistantFailure(error)) {
     case 'budget':
@@ -3547,7 +3564,10 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
       } else {
         await chatbotDb.addMessageToSession(lease.sessionId, {
           role: 'assistant',
-          content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+          // ENG-764: honest cause — the process died, this was not a budget overrun.
+          // The jobIncomplete/isErrorMessage markers are unchanged: sessionScoringService
+          // and resumePlan both detect this placeholder by metadata, never by its text.
+          content: SCHEDULED_RUN_ABANDONED_MESSAGE,
           timestamp: nowIso,
           metadata: { timestamp: nowIso, isErrorMessage: true, jobIncomplete: true },
         });
