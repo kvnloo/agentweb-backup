@@ -2937,9 +2937,15 @@ export async function runScheduledChat(
     // Set the session title to the schedule name
     await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
 
-    // Update the session with the selected model from the schedule
+    // Update the session with the selected model from the schedule.
+    // ENG-892: schedule.llmModel is written straight from an admin request body
+    // with no allow-list check, and this is an internal db call, so it bypasses
+    // the validation on the picker endpoints. Stamping it raw recorded a model
+    // that never ran whenever generation fell back — on exactly the scheduled
+    // sessions the daily reports analyse. Resolve first so the stored value is
+    // what generation will resolve to.
     const defaultModel = await agentModeService.getScheduledChatsDefaultModel();
-    const modelToUse = schedule.llmModel || defaultModel;
+    const modelToUse = agentModeService.resolveGenerationModel(schedule.llmModel || defaultModel).model;
     await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
 
     // Convert schedule format to runVerifiedChat format
