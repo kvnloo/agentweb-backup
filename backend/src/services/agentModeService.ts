@@ -28966,8 +28966,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // Unipile for linkedin_sections=* (full profile incl. experience /
           // education / skills) and strips viewer-relative fields before
           // persisting — see unipileProfileService.ts.
+          // force_refresh bypasses the 30-day profile cache and reads live from the
+          // authenticated Unipile account (ENG-508). The Founder LinkedIn audit and any
+          // "what is my headline right now?" read must pass it so a months-stale cached
+          // headline is never presented as current; high-volume outreach loops keep the
+          // cache-first default for their dedup/rate-limit benefit. This is a pass-through
+          // boolean — it never introduces a non-authenticated fallback.
+          const forceRefresh = !!args.force_refresh;
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
-          const profileResult = await getUnipileProfileService().getProfile(target, account_id);
+          const profileResult = await getUnipileProfileService().getProfile(target, account_id, { forceRefresh });
           const raw = profileResult.rawData;
 
           // The global profile cache strips is_relationship / connected_at because
