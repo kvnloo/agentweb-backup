@@ -640,6 +640,109 @@ describe('apiTools', () => {
       expect(session.maxHeapMB).toBeNull();
     });
 
+    // ENG-892: `llmModel` is only the model picker's selection — it records what a
+    // client PATCHed, not what generated the text. The per-message `llm` written after
+    // model resolution is the real provenance, and the two diverge often enough to
+    // mis-label the daily satisfaction and cost reports.
+    it('should report the models that actually generated turns, not just the picker', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-picker-mismatch',
+          userId: 'user-4',
+          title: 'Picker says one thing, transcript says another',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          // A live voice model: callLLM throws for these, so it cannot have produced a token.
+          llmModel: 'gemini-3.1-flash-live-preview',
+          messages: [
+            { role: 'user', content: 'Analyse my funnel' },
+            { role: 'assistant', content: 'Working on it', llm: 'anthropic.claude-opus-5' },
+            { role: 'tool', content: '{}', name: 'get_website_analytics' },
+            { role: 'assistant', content: 'Here are the results', llm: 'anthropic.claude-opus-5' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // Both kept — the mismatch between them is itself signal.
+      expect(session.llmModel).toBe('gemini-3.1-flash-live-preview');
+      expect(session.generationModels).toEqual(['anthropic.claude-opus-5']);
+    });
+
+    it('should list every generation model when a session switches mid-run', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-backup-switch',
+          userId: 'user-5',
+          title: 'Backup model kicked in',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          llmModel: 'claude-sonnet-4-5',
+          messages: [
+            { role: 'user', content: 'Go' },
+            { role: 'assistant', content: 'First', llm: 'anthropic.claude-opus-5' },
+            { role: 'assistant', content: 'Second', llm: 'gpt-5-chat-2' },
+            // Deduped, not repeated.
+            { role: 'assistant', content: 'Third', llm: 'anthropic.claude-opus-5' },
+            // Assistant turns with no recorded provenance contribute nothing.
+            { role: 'assistant', content: 'Fourth' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.generationModels).toEqual(['anthropic.claude-opus-5', 'gpt-5-chat-2']);
+    });
+
+    it('should return null generationModels when no message records a model', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-no-provenance',
+          userId: 'user-6',
+          title: 'Legacy session',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          llmModel: 'gpt-4o',
+          messages: [
+            { role: 'user', content: 'Hello' },
+            { role: 'assistant', content: 'Hi' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // null, not [] — degrades to the pre-ENG-892 behaviour of reporting only the picker.
+      expect(session.generationModels).toBeNull();
+      expect(session.llmModel).toBe('gpt-4o');
+    });
+
+    it('should document that llmModel is the selection and generationModels is what ran', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      expect(description).toContain('llmModel');
+      expect(description).toContain('generationModels');
+    });
+
     it('should include delegateInfo when session was started by admin delegation', async () => {
       mockMcpFetch.mockResolvedValue({
         sessions: [{
