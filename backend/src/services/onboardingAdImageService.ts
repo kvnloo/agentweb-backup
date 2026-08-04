@@ -728,6 +728,28 @@ export async function isBrandLogoFetchable(
 }
 
 /**
+ * Restate "the axis still looks exactly as it did when I read it" as a
+ * DynamoDB condition, so an ownership check made from a read and the terminal
+ * write it authorises land as ONE decision. `adImageStartedAt` is only ever
+ * rewritten by `adImageStartPatch`, i.e. by a newer run, so an unmet condition
+ * means precisely one thing: someone else now owns the axis.
+ */
+function axisOwnershipCondition(axisStartAtRead: unknown) {
+  const names = { "#axisStart": "adImageStartedAt" };
+  return axisStartAtRead === undefined || axisStartAtRead === null
+    ? { expression: "attribute_not_exists(#axisStart)", names }
+    : {
+        expression: "#axisStart = :axisStart",
+        names,
+        values: { ":axisStart": axisStartAtRead },
+      };
+}
+
+function isConditionalCheckFailure(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === "ConditionalCheckFailedException";
+}
+
+/**
  * Terminally fail the ad-image axis on behalf of ONE specific run.
  *
  * Every gate in `triggerAdImageGenerationForUser` used to patch
@@ -751,6 +773,11 @@ export async function isBrandLogoFetchable(
  *
  * Deliberately not a `status === "running"` check: that would silently drop
  * every legitimate failure on the eager path.
+ *
+ * The ownership decision comes from a read, so the write restates it as a
+ * DynamoDB condition (`axisOwnershipCondition`) — otherwise a run that starts
+ * in the window between the two is still stomped by the very write this guard
+ * exists to prevent.
  *
  * Returns true when the failure was written, false when dropped as stale.
  */
@@ -786,10 +813,24 @@ async function failAdImageRunIfOwned(
     );
     return false;
   }
-  await userDb.updateUser(
-    userId,
-    adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
-  );
+  try {
+    await userDb.updateUser(
+      userId,
+      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any,
+      { condition: axisOwnershipCondition(axisStartRaw) }
+    );
+  } catch (err) {
+    if (!isConditionalCheckFailure(err)) throw err;
+    // A run started between the read above and this write, so the axis is no
+    // longer ours after all. Same outcome as the stale branch, decided
+    // atomically by DynamoDB instead of by a stale snapshot.
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[onboardingAdImageService] dropping stale failure — the axis was restarted mid-write",
+      { userId, reason, ourStart: runStartedAt, axisStart: axisStartRaw },
+    );
+    return false;
+  }
   // eslint-disable-next-line no-console
   console.error(logMessage, { userId, ...logContext, reason });
   void reportUIError({
@@ -1057,7 +1098,23 @@ export async function triggerAdImageGenerationForUser(
   const finalPatch: any = chatSessionId
     ? { ...patch, adImageChatSessionId: chatSessionId }
     : patch;
-  await userDb.updateUser(userId, finalPatch);
+  try {
+    // `adImageReadyPatch` decided this run may publish from `current`, and the
+    // mirror above can spend seconds on network I/O before we get here — the
+    // widest read-to-write window on the axis. Condition the publish on the
+    // identity we read, so a run started in between keeps its `running` state
+    // instead of being overwritten with this (older) run's results.
+    await userDb.updateUser(userId, finalPatch, {
+      condition: axisOwnershipCondition((current as any)?.adImageStartedAt),
+    });
+  } catch (err) {
+    if (!isConditionalCheckFailure(err)) throw err;
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[onboardingAdImageService] dropping stale completion — the axis was restarted mid-write",
+      { userId, axisStart: (current as any)?.adImageStartedAt },
+    );
+  }
 }
 
 /**
