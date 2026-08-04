@@ -517,6 +517,116 @@ describe('sanitizeGeminiSchema', () => {
       },
     });
   });
+
+  it('drops `propertyNames` — the live @playwright/mcp browser_drop shape (ENG-845)', () => {
+    // Verbatim `data` property of browser_drop from `@playwright/mcp@latest`, the
+    // MCP server registered in the prod `mcp_servers` setting. Confirmed against the
+    // real API: this schema 400s the ENTIRE request with
+    //   Unknown name "propertyNames" at '...parameters.properties[3].value'
+    // which is exactly the ENG-845 zero-assistant-output / null-token signature.
+    const input = {
+      type: 'object',
+      properties: {
+        data: {
+          description: 'Data to drop, as a map of MIME type to string value.',
+          type: 'object',
+          propertyNames: { type: 'string' },
+          additionalProperties: { type: 'string' },
+        },
+      },
+      required: ['target'],
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        data: { description: 'Data to drop, as a map of MIME type to string value.', type: 'object' },
+      },
+      required: ['target'],
+    });
+  });
+
+  it('drops every keyword outside the genai Schema field set, not just known-bad ones (ENG-845)', () => {
+    // The sanitizer is an ALLOWLIST because Gemini rejects any unknown field
+    // outright. Each keyword below was confirmed to 400 the whole request live;
+    // none of them was on the previous denylist. Third-party MCP tool schemas are
+    // arbitrary input, so enumerating bad keywords can never be complete.
+    const input = {
+      type: 'object',
+      properties: {
+        a: { type: 'string', examples: ['x'], contentEncoding: 'base64', readOnly: true },
+        b: { type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 10, multipleOf: 2 },
+        c: { type: 'array', items: { type: 'string' }, uniqueItems: true, contains: { type: 'string' } },
+        d: { type: 'string', deprecated: true, not: { const: 'x' }, $comment: 'note' },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        a: { type: 'string' },
+        b: { type: 'number' },
+        c: { type: 'array', items: { type: 'string' } },
+        d: { type: 'string' },
+      },
+    });
+  });
+
+  it('never filters property NAMES that collide with schema keywords (ENG-845)', () => {
+    // `properties` maps NAMES to schemas, so the keyword filter must not be applied
+    // to its keys. A tool with a parameter literally called `const`, `not` or
+    // `additionalProperties` (legal, and present in real third-party MCP schemas)
+    // would otherwise have that parameter silently deleted from its declaration —
+    // the model then can never supply it.
+    const input = {
+      type: 'object',
+      properties: {
+        const: { type: 'string' },
+        not: { type: 'string' },
+        additionalProperties: { type: 'boolean' },
+        'x-request-id': { type: 'string' },
+      },
+      required: ['const'],
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        const: { type: 'string' },
+        not: { type: 'string' },
+        additionalProperties: { type: 'boolean' },
+        'x-request-id': { type: 'string' },
+      },
+      required: ['const'],
+    });
+  });
+
+  it('collapses a draft-07 tuple `items` array to its first schema (ENG-845)', () => {
+    // Gemini's `items` is a SINGLE Schema; a tuple array 400s with
+    // `Unknown name "0" at '...value.items'`. Keep the first element so the
+    // parameter stays usable rather than dropping `items` entirely.
+    const input = { type: 'object', properties: { pair: { type: 'array', items: [{ type: 'string' }, { type: 'number' }] } } };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: { pair: { type: 'array', items: { type: 'string' } } },
+    });
+  });
+
+  it('passes `default`/`example` instance values through untouched', () => {
+    // These hold literal INSTANCE data, not sub-schemas, so the keyword filter must
+    // not be applied to their contents — Gemini accepts an arbitrary object there.
+    const input = {
+      type: 'object',
+      properties: {
+        cfg: { type: 'object', properties: { mode: { type: 'string' } }, default: { mode: 'fast', const: 1 } },
+        tag: { type: 'string', example: 'beta' },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        cfg: { type: 'object', properties: { mode: { type: 'string' } }, default: { mode: 'fast', const: 1 } },
+        tag: { type: 'string', example: 'beta' },
+      },
+    });
+  });
 });
 
 describe('createGeminiNativeClient (end-to-end wiring)', () => {

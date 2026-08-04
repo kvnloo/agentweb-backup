@@ -168,4 +168,50 @@ describeLive('ENG-737 live native gemini adapter', () => {
       expect(typeof choice.message.content).toBe('string');
     }
   });
+
+  it('accepts a third-party MCP schema carrying keywords no denylist covered (ENG-845)', async () => {
+    // Verbatim `browser_drop` schema from `@playwright/mcp@latest` — the MCP server
+    // registered in the prod `mcp_servers` setting, whose tools are passed through
+    // to the model exactly as `tools/list` returns them. Before the allowlist this
+    // 400'd live with `Unknown name "propertyNames"`, killing the whole turn with
+    // zero assistant output. The extra draft-2020 keywords alongside it (`examples`,
+    // `exclusiveMinimum`, `uniqueItems`) were each confirmed to 400 the same way.
+    const client = makeClient();
+    const res: any = await client.chat.completions.create({
+      model: MODEL,
+      messages: [{ role: 'user', content: 'Use browser_drop to drop the text "hello" onto the target "e5".' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'browser_drop',
+          description: 'Drop data onto an element',
+          parameters: {
+            $schema: 'https://json-schema.org/draft/2020-12/schema',
+            type: 'object',
+            properties: {
+              target: { type: 'string', description: 'Target element reference' },
+              data: {
+                description: 'Data to drop, as a map of MIME type to string value.',
+                type: 'object',
+                propertyNames: { type: 'string' },
+                additionalProperties: { type: 'string' },
+              },
+              paths: { type: 'array', items: { type: 'string' }, uniqueItems: true },
+              retries: { type: 'number', exclusiveMinimum: 0, examples: [1, 2] },
+            },
+            required: ['target'],
+            additionalProperties: false,
+          },
+        },
+      }],
+      tool_choice: 'auto',
+    });
+    // No ApiError thrown = the sanitized schema was accepted by the real API.
+    const choice = res.choices[0];
+    if (choice.message.tool_calls) {
+      expect(choice.message.tool_calls[0].function.name).toBe('browser_drop');
+    } else {
+      expect(typeof choice.message.content).toBe('string');
+    }
+  });
 });
