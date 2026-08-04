@@ -942,6 +942,50 @@ export async function triggerAdImageGenerationForUser(
 
   const current = await userDb.getUserById(userId);
 
+  // ENG-792: every variant came back a placeholder, so the run produced ZERO
+  // usable creatives. Reporting "ready" here is what let the reported account
+  // finish onboarding believing it had three ad images: the cards fell back to
+  // gradients, and because the chat-session mirror below is gated on live
+  // variants, nothing was ever written — /images showed "No images found".
+  // Fail the run instead, so the UI renders the error + Retry it already has
+  // for the missing-/unfetchable-logo gates above.
+  //
+  // Scoped to TOTAL failure on purpose: a partial failure (liveCount >= 1)
+  // still ships as "ready" — degraded but genuinely usable, and blocking
+  // onboarding over one flaky variant would be worse than shipping two.
+  if (liveCount === 0 && variantCount > 0) {
+    if ((current as any)?.adImageStatus !== "running") {
+      // A newer run owns the state — drop silently, same staleness convention
+      // as the adImageReadyPatch path below (which returns null off-`running`).
+      return;
+    }
+    const reason =
+      "ad image generation produced no usable images — all " +
+      `${variantCount} variants failed. This is usually a temporary problem ` +
+      "with the image model, or a brand logo that can no longer be loaded. " +
+      "Retry, and if it keeps failing re-upload your logo in brand config.";
+    await userDb.updateUser(
+      userId,
+      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
+    );
+    // eslint-disable-next-line no-console
+    console.error("[onboardingAdImageService] all variants failed", {
+      userId,
+      variantCount,
+      durationMs,
+    });
+    void reportUIError({
+      operation: "onboarding:ad-image:all-variants-failed",
+      errorMessage: reason,
+      userId,
+      context: {
+        Source: "backend",
+        Step: "adImage",
+      },
+    });
+    return;
+  }
+
   const patch = adImageReadyPatch(((current as any) || {}) as AdImageStatusFields, result);
   if (!patch) {
     // Stale completion (user is no longer in `running` or current is missing)
