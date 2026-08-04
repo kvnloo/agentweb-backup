@@ -28,6 +28,9 @@ jest.mock('../services/chatbotService', () => ({
 
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
+    // ENG-892: model resolution is orthogonal to what this suite asserts —
+    // pass the requested id through unchanged.
+    resolveGenerationModel: jest.fn((model: string) => ({ model, fellBack: false, requestedModel: model })),
     default_model: 'gpt-5-chat-2',
     getDefaultModel: jest.fn(),
     getScheduledChatsDefaultModel: jest.fn(),
