@@ -124,6 +124,9 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         owned: acc.userId === userId,
         // LinkedIn Outreach (unipile) only: Premium accounts allow 300-char invites.
         is_premium: acc.platform === 'unipile' ? ((acc.config as any).is_premium === true) : undefined,
+        // Calendly only: false when the connecting account's plan doesn't support
+        // webhooks (Free tier) — OAuth succeeded but no booking events will arrive (ENG-524).
+        booking_tracking_active: acc.platform === 'calendly' ? ((acc.config as any).booking_tracking_active === true) : undefined,
         // Status fields
         status,
         expires_at: acc.config.token_expires_at,
