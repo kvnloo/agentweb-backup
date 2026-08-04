@@ -9,6 +9,17 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-08-03',
+    changes: [
+      'Fixed: Scheduled Chats on Gemini 3.5 Flash No Longer Fail Silently',
+      '- Some scheduled runs on Gemini 3.5 Flash (for example, a daily post pipeline) could stop within a few seconds with no reply and no explanation, and would fail the same way on every retry',
+      '- The cause was a tool-definition mismatch specific to Gemini; those tools are now sent in a format Gemini accepts, so the run proceeds normally',
+      '- When a scheduled run does end without a result, the note left in the chat now matches the real cause — a genuine system error is no longer mislabeled as the job being "too large," so the advice you see is actually relevant',
+      '- Your schedule list now flags a schedule that has failed several times in a row, so you can spot a consistently failing automation at a glance without opening its run history',
+      '- If a scheduled chat keeps failing after its automatic retries, we now email you (or your configured notification recipients) so you find out right away instead of discovering it later',
+    ],
+  },
+  {
     date: '2026-07-27',
     changes: [
       'Fixed: Multi-Variant Image Requests No Longer Come Back Empty After a Long Run',
