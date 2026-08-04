@@ -89,6 +89,17 @@ export function acquireRepoLock(repoRoot, { timeoutMs = DEFAULT_WAIT_MS, pollMs 
 
 export const releaseRepoLock = releaseLock;
 
+// The repo root whose `.git` a path SHARES. For a linked worktree that's the original repo, not the
+// worktree — which is the whole point: `git -C <worktree> config extensions.worktreeConfig true`
+// writes the SHARED config, so it must take the same lock the poller's `worktree add` takes.
+// Returns null when the path isn't in a repo, so callers can fall back instead of crashing.
+export function commonRepoRootOf(somePath) {
+  const r = spawnSync('git', ['-C', somePath, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { encoding: 'utf8' });
+  if (r.status !== 0 || !r.stdout.trim()) return null;
+  const gitDir = r.stdout.trim();
+  return path.basename(gitDir) === '.git' ? path.dirname(gitDir) : gitDir; // bare repo → the git dir itself
+}
+
 // Resolve the real .git DIRECTORY for a repo root (a worktree's `.git` is a file, and has no config
 // lock of its own). Returns null when there's nothing sweepable.
 function gitDirOf(repoRoot) {
@@ -120,9 +131,13 @@ function sweepStaleLocks(repoRoot, log, now = Date.now()) {
 // `beforeRetry(attempt)` lets the caller clean up a partial side effect between tries — `git worktree
 // add` can leave a half-created worktree behind when it dies on the config write, and the retry would
 // then fail with the non-transient "already exists".
+//
+// `cwd` separates WHERE the command runs from WHAT it locks: a `git config extensions.*` issued inside
+// a linked worktree still writes the shared repo's config, so it locks the repo root but runs in the
+// worktree. Defaults to the repo root.
 export function gitRepoOp(repoRoot, args, {
-  attempts = DEFAULT_ATTEMPTS, baseMs = DEFAULT_BASE_MS, waitMs = DEFAULT_WAIT_MS,
-  run = (root, a) => spawnSync('git', ['-C', root, ...a], { encoding: 'utf8' }),
+  attempts = DEFAULT_ATTEMPTS, baseMs = DEFAULT_BASE_MS, waitMs = DEFAULT_WAIT_MS, cwd = repoRoot,
+  run = (root, a, c) => spawnSync('git', ['-C', c, ...a], { encoding: 'utf8' }),
   sleep = sleepSync, beforeRetry = null, log = () => {}, now = () => Date.now(),
 } = {}) {
   let last = null;
@@ -134,7 +149,7 @@ export function gitRepoOp(repoRoot, args, {
     // is what actually makes the command safe.
     const lock = acquireRepoLock(repoRoot, { timeoutMs: waitMs, sleep });
     if (!lock) log(`proceeding without the repo lock for ${repoRoot} (held >${Math.round(waitMs / 1000)}s); relying on retry`);
-    try { last = run(repoRoot, args); } finally { releaseRepoLock(lock); } // never leak the lock on a throw
+    try { last = run(repoRoot, args, cwd); } finally { releaseRepoLock(lock); } // never leak the lock on a throw
 
     if (last && last.status === 0) return last;
     if (!isTransientGitLockError(last?.stderr)) return last; // a real error — surface it now, unretried
@@ -145,7 +160,7 @@ export function gitRepoOp(repoRoot, args, {
     if (isLastAttempt) {
       if (sweepStaleLocks(repoRoot, log, now())) {
         const lock2 = acquireRepoLock(repoRoot, { timeoutMs: waitMs, sleep });
-        try { last = run(repoRoot, args); } finally { releaseRepoLock(lock2); }
+        try { last = run(repoRoot, args, cwd); } finally { releaseRepoLock(lock2); }
       }
       return last;
     }

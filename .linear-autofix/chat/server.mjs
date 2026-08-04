@@ -21,6 +21,7 @@ import { config } from '../config.mjs';
 import { resolveIssue } from '../linear.mjs';
 import { gitIdentityEnv, resolveAssigneeGhToken, resolveAssigneeIdentity, applyWorktreeIdentity } from '../git-identity.mjs';
 import { acquireLock, releaseLock } from '../lock.mjs';
+import { gitRepoOp } from '../repo-lock.mjs';
 import { transcriptContextUsed, pickResumeBase } from './context-usage.mjs';
 import { usageSnapshot } from './usage.mjs';
 import { makeEditableDecision, buildEditableBranch, promotedOutcome } from './editable.mjs';
@@ -262,10 +263,13 @@ function closeChat(identifier) {
     try { spawnSync('node', [previewScript, 'down', identifier], { stdio: 'ignore' }); } catch { /* best-effort */ }
     const WT = path.join(worktreesDir, identifier);
     const branch = found.entry.branch;
+    // Serialized against the poller's assemble() — closing a chat while another issue is being set up
+    // hits the same shared .git the ENG-890 race did. See repo-lock.mjs.
     for (const repo of [...config.repos].reverse()) {
-      spawnSync('git', ['-C', repoRootOf(repo), 'worktree', 'remove', '--force', wtPathOf(WT, repo)], { encoding: 'utf8' });
-      spawnSync('git', ['-C', repoRootOf(repo), 'worktree', 'prune'], { encoding: 'utf8' });
-      if (branch) spawnSync('git', ['-C', repoRootOf(repo), 'branch', '-D', branch], { encoding: 'utf8' });
+      const root = repoRootOf(repo);
+      gitRepoOp(root, ['worktree', 'remove', '--force', wtPathOf(WT, repo)]);
+      gitRepoOp(root, ['worktree', 'prune']);
+      if (branch) gitRepoOp(root, ['branch', '-D', branch]);
     }
     try { rmSync(WT, { recursive: true, force: true }); } catch { /* already gone */ }
     const s = loadState();

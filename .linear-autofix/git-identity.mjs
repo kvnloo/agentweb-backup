@@ -9,6 +9,7 @@
 import { config } from './config.mjs';
 import { spawnSync } from 'child_process';
 import path from 'path';
+import { gitRepoOp, commonRepoRootOf } from './repo-lock.mjs';
 
 // Resolve a Linear assignee to the git { name, email } their commits should carry:
 //   1. an explicit per-person override in config.assigneeGitIdentity (keyed by Linear email), else
@@ -94,7 +95,14 @@ export function resolveAssigneeGhToken(assignee) {
 export function setWorktreeIdentity(wt, identity, log = () => {}) {
   if (!identity?.name || !identity?.email) return false;
   const cfg = (...args) => spawnSync('git', ['-C', wt, 'config', ...args], { encoding: 'utf8' });
-  const en = cfg('extensions.worktreeConfig', 'true'); // enable per-worktree config (idempotent)
+  // ENG-890: this one write lands in the SHARED $GIT_DIR/config (no `--worktree` — it's the switch that
+  // ENABLES per-worktree config), so it contends for the very same .git/config.lock that a concurrent
+  // run's `git worktree add` needs. Take the repo lock and ride out contention; the `--worktree` writes
+  // below go to this worktree's private config.worktree and race with nobody.
+  const sharedRoot = commonRepoRootOf(wt);
+  const en = sharedRoot
+    ? gitRepoOp(sharedRoot, ['config', 'extensions.worktreeConfig', 'true'], { cwd: wt, log })
+    : cfg('extensions.worktreeConfig', 'true');
   if (en.status !== 0) { log(`worktree identity: could not enable worktreeConfig in ${wt}: ${(en.stderr || '').trim()}`); return false; }
   const n = cfg('--worktree', 'user.name', identity.name);
   const e = cfg('--worktree', 'user.email', identity.email);
