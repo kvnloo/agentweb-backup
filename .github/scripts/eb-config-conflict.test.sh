@@ -134,29 +134,39 @@ check 'ENG-836: and emits a GitHub error annotation' 1 \
 # Resource-only: this is the FIRST of the two sequential deploys and must pass.
 R=$(new_root); write_resource_config "$R"
 run_check "$R" backend/.ebextensions/timeout.config
-check 'ENG-836: a resource-only change passes (deploy 1 of 2)' 0 \
+check 'ENG-836: a resource-only change is not blocked by the file check' 0 \
   'no instance-config change alongside'
+# ENG-818 #2277: a PR of exactly this shape passed this gate and was then
+# REJECTED in production, leaving main undeployable for ~50 minutes. The pass is
+# real (it is not the known-bad file pair) but it is not a clearance, and the
+# output must say so or the next person merges on it exactly as I did.
+check 'ENG-818: and it warns instead of declaring the deploy safe' 0 \
+  'NOT PASSING THIS AS SAFE'
+check 'ENG-818: and it names how to check the live value' 0 \
+  'describe-configuration-settings'
 
 # Instance-only: the SECOND deploy. Must also pass.
 R=$(new_root); write_platform_conf "$R"
 run_check "$R" backend/.platform/nginx/conf.d/agent-mode-timeout.conf
 check 'ENG-836: an instance-only change passes (deploy 2 of 2)' 0 \
-  'No Elastic Beanstalk resource-config change'
+  'No Elastic Beanstalk resource-config file changed'
 
 # Ordinary application code must never be flagged. A gate that fires on normal
 # PRs gets switched off within a week and then protects nothing.
 R=$(new_root)
 run_check "$R" backend/src/services/agentModeService.ts backend/package.json README.md
 check 'ENG-836: an ordinary code-only PR is not flagged' 0 \
-  'No Elastic Beanstalk resource-config change'
+  'No Elastic Beanstalk resource-config file changed'
+check 'ENG-818: and a clean pass still refuses to claim deployability' 0 \
+  'does NOT verify deployability'
 
 # Code alongside a resource-only config change still passes. We have evidence
 # that resource+INSTANCE-CONFIG fails; we do not have evidence that shipping app
 # code with it does, and inventing that rule would block routine work.
 R=$(new_root); write_resource_config "$R"
 run_check "$R" backend/.ebextensions/timeout.config backend/src/index.ts
-check 'ENG-836: app code alongside a resource-only change is not flagged' 0 \
-  'Safe: an immutable deploy accepts a resource-only update'
+check 'ENG-836: app code alongside a resource-only change is not blocked' 0 \
+  'NOT PASSING THIS AS SAFE'
 
 # Two .ebextensions files, one of each class, is the same conflict.
 R=$(new_root); write_resource_config "$R"; write_instance_config "$R"
@@ -323,7 +333,7 @@ run_check_with_base "$R" \
   backend/.ebextensions/alb.config \
   backend/.platform/nginx/conf.d/agent-mode-timeout.conf
 check 'ENG-836: destination-only (rename detection ON) is why --no-renames is required' 0 \
-  'No Elastic Beanstalk resource-config change'
+  'No Elastic Beanstalk resource-config file changed'
 
 # Content genuinely unrecoverable (deleted, and no base ref supplied). We
 # cannot tell which side it was, so it counts as BOTH rather than neither.
