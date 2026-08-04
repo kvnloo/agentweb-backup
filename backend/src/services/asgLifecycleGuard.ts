@@ -21,6 +21,19 @@
  *   3. Call CompleteLifecycleAction(CONTINUE) so the instance terminates immediately
  *      once drained, rather than sitting out the hook's full heartbeat timeout.
  *
+ * STATUS: the hook itself is NOT deployed yet. Creating it requires an IAM grant on
+ * the EB instance role, and the CI deploy user (github-actions-deploy-backend) has no
+ * IAM write access — the staging attempt rolled back with "not authorized to perform:
+ * iam:GetRolePolicy" (the hook resource itself created fine). The hook must NOT ship
+ * before that grant exists: EB waits for old-instance removal before reporting the
+ * update complete (prod 2026-07-29: "Removed instance" 10:22:06 → "Environment update
+ * completed" 10:23:37), so a hook nobody can answer would add its full heartbeat to
+ * every deploy and blow EB's own 900s command timeout.
+ *
+ * Until then this module is still a net win and is safe on its own: with no hook, the
+ * `Terminated` signal simply starts the drain a few seconds EARLIER than the SIGTERM
+ * would have, and the completion call fails harmlessly into the logged catch below.
+ *
  * Fail-safe by construction — every failure mode degrades to today's behavior or
  * better, never worse:
  *   - Not in an ASG / IMDS disabled (local dev, ECS, the test box): the metadata
