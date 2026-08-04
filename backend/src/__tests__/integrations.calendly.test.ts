@@ -55,7 +55,14 @@ describe('getCalendlyConfig', () => {
 
     const config = await getCalendlyConfig();
 
-    expect(config.scopes.sort()).toEqual(['scheduled_events:read', 'users:read', 'webhooks:write']);
+    // webhooks:read is included even though the code never calls it — Calendly's dashboard
+    // force-selects it alongside webhooks:write, so it's granted either way (ENG-524).
+    expect(config.scopes.sort()).toEqual([
+      'scheduled_events:read',
+      'users:read',
+      'webhooks:read',
+      'webhooks:write',
+    ]);
   });
 
   it('points at the api.calendly.com users/me and webhook_subscriptions endpoints', async () => {

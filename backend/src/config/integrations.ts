@@ -112,8 +112,9 @@ export const INTEGRATION_CONFIG = {
     meUrl: 'https://api.calendly.com/users/me',
     webhookSubscriptionsUrl: 'https://api.calendly.com/webhook_subscriptions',
     scopes: [
-      'users:read',           // GET /users/me — resolves user_uri/organization_uri
-      'webhooks:write',       // POST /webhook_subscriptions — provisions the booking webhook
+      'users:read',            // GET /users/me — resolves user_uri/organization_uri
+      'webhooks:write',        // POST /webhook_subscriptions — provisions the booking webhook
+      'webhooks:read',         // Calendly's dashboard force-selects this alongside webhooks:write; we don't call it, but it will be granted regardless
       'scheduled_events:read', // required alongside webhooks:write for invitee.created events
     ],
   },
