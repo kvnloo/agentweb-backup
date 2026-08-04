@@ -129,6 +129,79 @@ export class WorkPlanService {
     }).promise();
   }
 
+  /**
+   * Write only the thumbnail attributes of a plan, and only if nothing has
+   * changed the plan since the caller observed it.
+   *
+   * updateWorkPlan is a whole-item put, which is unsafe for the thumbnail
+   * pipeline: AI generation is fired and forgotten at create time holding the
+   * plan as it looked then, and finishes seconds-to-minutes later. Putting that
+   * snapshot back silently reverted any edit made in between — an admin fixing
+   * a step right after creating a plan watched the fix disappear, with no error
+   * (found while live-testing ENG-889).
+   *
+   * Ordering is a single conditional write on `updatedAt`, deliberately not a
+   * claim-then-write token protocol: a claim is a second unconditioned write
+   * and races the very actions it is meant to order. Because every write bumps
+   * updatedAt, one condition covers uploads, clears, regenerations AND ordinary
+   * plan edits. It is fail-safe — a losing generation is dropped rather than
+   * allowed to overwrite newer state, and the admin can regenerate.
+   *
+   * @returns the new updatedAt when the write landed, or null when a newer
+   *   action won the race (callers must not report that as success).
+   */
+  async updateThumbnail(
+    planId: string,
+    fields: Partial<Pick<WorkPlan, 'thumbnail_url' | 'thumbnail_source' | 'thumbnail_alt_text'>>,
+    opts: { expectedUpdatedAt?: string } = {},
+  ): Promise<string | null> {
+    const updatedAt = new Date().toISOString();
+    const sets = ['#updatedAt = :updatedAt'];
+    const removes: string[] = [];
+    const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
+    const values: Record<string, any> = { ':updatedAt': updatedAt };
+
+    const KEYS = ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_text'] as const;
+    for (const key of KEYS) {
+      if (!(key in fields)) continue;
+      names[`#${key}`] = key;
+      const value = fields[key];
+      if (value === undefined) {
+        removes.push(`#${key}`);
+      } else {
+        sets.push(`#${key} = :${key}`);
+        values[`:${key}`] = value;
+      }
+    }
+
+    // update is an upsert, so without attribute_exists a plan deleted while a
+    // generation was running would come back as a stub holding only planId and
+    // the thumbnail fields — no title, no steps — which breaks every consumer
+    // that maps over plan.steps.
+    let condition = 'attribute_exists(planId)';
+    if (opts.expectedUpdatedAt !== undefined) {
+      values[':expectedUpdatedAt'] = opts.expectedUpdatedAt;
+      condition += ' AND #updatedAt = :expectedUpdatedAt';
+    }
+
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { planId },
+        UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        ConditionExpression: condition,
+      }).promise();
+      return updatedAt;
+    } catch (err: any) {
+      // Either the plan is gone, or something newer touched it. Both mean
+      // "this write does not apply", not "this write failed".
+      if (err?.code === 'ConditionalCheckFailedException') return null;
+      throw err;
+    }
+  }
+
   async deleteWorkPlan(planId: string): Promise<void> {
     await dynamodb.delete({
       TableName: this.tableName,

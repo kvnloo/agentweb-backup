@@ -55,6 +55,9 @@ export class WorkPlanThumbnailService {
   }
 
   async generateAIThumbnail(plan: WorkPlan): Promise<WorkPlan> {
+    // The plan as this job observed it. No claim write: a claim is a second
+    // unconditioned write that races the actions it is meant to order.
+    const basedOn = plan.updatedAt;
     const description = plan.description || 'A professional marketing automation tool';
     const prompt = THUMBNAIL_PROMPT_TEMPLATE.replace('{title}', plan.title).replace(
       '{description}',
@@ -75,7 +78,7 @@ export class WorkPlanThumbnailService {
           `[ThumbnailService] AI generation failed for plan ${plan.planId}:`,
           result.error,
         );
-        return this.setNoThumbnail(plan);
+        return this.setNoThumbnail(plan, basedOn);
       }
 
       const imageBuffer = await downloadBuffer(result.imageUrl);
@@ -89,14 +92,22 @@ export class WorkPlanThumbnailService {
         thumbnail_source: 'ai',
         thumbnail_alt_text: `Thumbnail for ${plan.title}`,
       };
-      await workPlanService.updateWorkPlan(updated);
-      return updated;
+      // Ordered against the plan as it looked when this generation began, and
+      // scoped to the thumbnail attributes, so a ~40s render cannot revert an
+      // edit or a newer thumbnail action made meanwhile (ENG-889).
+      const writtenAt = await workPlanService.updateThumbnail(plan.planId, {
+        thumbnail_url: url,
+        thumbnail_source: 'ai',
+        thumbnail_alt_text: updated.thumbnail_alt_text,
+      }, { expectedUpdatedAt: basedOn });
+      if (!writtenAt) return (await workPlanService.getWorkPlan(plan.planId)) ?? plan;
+      return { ...updated, updatedAt: writtenAt };
     } catch (err) {
       console.error(
         `[ThumbnailService] Error generating thumbnail for plan ${plan.planId}:`,
         err,
       );
-      return this.setNoThumbnail(plan);
+      return this.setNoThumbnail(plan, basedOn);
     }
   }
 
@@ -122,8 +133,14 @@ export class WorkPlanThumbnailService {
       thumbnail_source: 'upload',
       thumbnail_alt_text: `Thumbnail for ${plan.title}`,
     };
-    await workPlanService.updateWorkPlan(updated);
-    return updated;
+    // User-initiated: unconditional, and bumping updatedAt invalidates any
+    // generation still in flight.
+    const writtenAt = await workPlanService.updateThumbnail(plan.planId, {
+      thumbnail_url: url,
+      thumbnail_source: 'upload',
+      thumbnail_alt_text: updated.thumbnail_alt_text,
+    });
+    return { ...updated, ...(writtenAt && { updatedAt: writtenAt }) };
   }
 
   async removeThumbnail(plan: WorkPlan): Promise<WorkPlan> {
@@ -134,9 +151,16 @@ export class WorkPlanThumbnailService {
       thumbnail_source: 'none',
       thumbnail_alt_text: undefined,
     };
-    await workPlanService.updateWorkPlan(cleared);
+    const clearedAt = await workPlanService.updateThumbnail(plan.planId, {
+      thumbnail_url: undefined,
+      thumbnail_source: 'none',
+      thumbnail_alt_text: undefined,
+    });
+    if (clearedAt) cleared.updatedAt = clearedAt;
 
-    // Trigger AI regeneration asynchronously — caller gets the cleared state immediately
+    // Trigger AI regeneration asynchronously — caller gets the cleared state
+    // immediately. `cleared` carries the post-clear updatedAt, so this job is
+    // ordered against the clear rather than against the pre-clear state.
     this.generateAIThumbnail(cleared).catch((err) =>
       console.error(
         `[ThumbnailService] Background AI regen failed for plan ${plan.planId}:`,
@@ -147,11 +171,18 @@ export class WorkPlanThumbnailService {
     return cleared;
   }
 
-  private async setNoThumbnail(plan: WorkPlan): Promise<WorkPlan> {
+  private async setNoThumbnail(plan: WorkPlan, basedOn?: string): Promise<WorkPlan> {
     const updated: WorkPlan = { ...plan, thumbnail_source: 'none' };
-    // Preserve any existing thumbnail_url when just setting source to 'none' on failure
-    await workPlanService.updateWorkPlan(updated);
-    return updated;
+    // Preserve any existing thumbnail_url when just setting source to 'none' on
+    // failure. Carries the generation's ordering, so a failed background job
+    // cannot stamp 'none' over a newer upload or clear.
+    const writtenAt = await workPlanService.updateThumbnail(
+      plan.planId,
+      { thumbnail_source: 'none' },
+      basedOn !== undefined ? { expectedUpdatedAt: basedOn } : {},
+    );
+    if (!writtenAt) return (await workPlanService.getWorkPlan(plan.planId)) ?? plan;
+    return { ...updated, updatedAt: writtenAt };
   }
 }
 

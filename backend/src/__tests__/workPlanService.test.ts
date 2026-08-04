@@ -4,6 +4,7 @@ describe('WorkPlanService', () => {
   let mockGet: jest.Mock;
   let mockQuery: jest.Mock;
   let mockDelete: jest.Mock;
+  let mockUpdate: jest.Mock;
   let mockPromise: jest.Mock;
 
   const mockTimestamp = '2026-03-24T10:00:00.000Z';
@@ -16,6 +17,7 @@ describe('WorkPlanService', () => {
     mockGet = jest.fn(() => ({ promise: mockPromise }));
     mockQuery = jest.fn(() => ({ promise: mockPromise }));
     mockDelete = jest.fn(() => ({ promise: mockPromise }));
+    mockUpdate = jest.fn(() => ({ promise: mockPromise }));
 
     jest.doMock('aws-sdk', () => ({
       DynamoDB: {
@@ -25,6 +27,7 @@ describe('WorkPlanService', () => {
           query: mockQuery,
           scan: jest.fn(() => ({ promise: mockPromise })),
           delete: mockDelete,
+          update: mockUpdate,
         })),
       },
     }));
@@ -246,6 +249,96 @@ describe('WorkPlanService', () => {
       mockGet.mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Item: plan }) });
 
       await expect(workPlanService.rejectWorkPlan('p1', 'feedback')).rejects.toThrow('Plan is not pending review');
+    });
+  });
+
+  // ENG-889. The AI thumbnail job holds the plan as it looked at create (or at a
+  // clear) and lands ~40s later; a whole-item put of that snapshot reverted any
+  // edit made meanwhile, silently. Ordering is ONE conditional write on
+  // updatedAt — not a claim-then-write token, because the claim is itself an
+  // unconditioned write that races the actions it is meant to order.
+  describe('updateThumbnail', () => {
+    it('writes only the thumbnail attributes, never a whole-item put', async () => {
+      await workPlanService.updateThumbnail('p1', { thumbnail_url: 'https://x/y.png', thumbnail_source: 'ai' });
+
+      expect(mockPut).not.toHaveBeenCalled();
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.Key).toEqual({ planId: 'p1' });
+      expect(arg.UpdateExpression).toContain('#thumbnail_url = :thumbnail_url');
+      expect(arg.ExpressionAttributeValues[':thumbnail_url']).toBe('https://x/y.png');
+    });
+
+    it('leaves fields the caller did not supply alone', async () => {
+      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'none' });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).not.toContain('thumbnail_url');
+      expect(arg.UpdateExpression).not.toContain('thumbnail_alt_text');
+    });
+
+    it('REMOVEs an attribute explicitly set to undefined', async () => {
+      await workPlanService.updateThumbnail('p1', {
+        thumbnail_url: undefined,
+        thumbnail_source: 'none',
+        thumbnail_alt_text: undefined,
+      });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).toMatch(/REMOVE .*#thumbnail_url/);
+      expect(arg.UpdateExpression).toMatch(/REMOVE .*#thumbnail_alt_text/);
+    });
+
+    it('never resurrects a deleted plan as a stub item', async () => {
+      // update is an upsert; a plan deleted mid-generation would otherwise come
+      // back holding only planId and thumbnail fields, which crashes every
+      // consumer that maps over plan.steps.
+      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' });
+
+      expect(mockUpdate.mock.calls[0][0].ConditionExpression).toBe('attribute_exists(planId)');
+    });
+
+    it('orders a generation against the plan it observed', async () => {
+      await workPlanService.updateThumbnail(
+        'p1',
+        { thumbnail_url: 'https://x/ai.png', thumbnail_source: 'ai' },
+        { expectedUpdatedAt: '2026-08-04T10:00:00.000Z' },
+      );
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.ConditionExpression).toContain('attribute_exists(planId)');
+      expect(arg.ConditionExpression).toContain('#updatedAt = :expectedUpdatedAt');
+      expect(arg.ExpressionAttributeValues[':expectedUpdatedAt']).toBe('2026-08-04T10:00:00.000Z');
+    });
+
+    it('leaves user-initiated writes unordered so they always win', async () => {
+      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'upload' });
+
+      expect(mockUpdate.mock.calls[0][0].ConditionExpression).toBe('attribute_exists(planId)');
+    });
+
+    it('returns the new updatedAt so a follow-up job can order against it', async () => {
+      const result = await workPlanService.updateThumbnail('p1', { thumbnail_source: 'none' });
+
+      expect(result).toEqual(expect.any(String));
+      expect(result).toBe(mockUpdate.mock.calls[0][0].ExpressionAttributeValues[':updatedAt']);
+    });
+
+    it('returns null — not a throw, and not a false success — when a newer action won', async () => {
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPromise.mockRejectedValueOnce(err);
+
+      await expect(
+        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }, { expectedUpdatedAt: 'stale' }),
+      ).resolves.toBeNull();
+    });
+
+    it('still surfaces any other write failure', async () => {
+      mockPromise.mockRejectedValueOnce(new Error('ProvisionedThroughputExceeded'));
+
+      await expect(
+        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }),
+      ).rejects.toThrow('ProvisionedThroughputExceeded');
     });
   });
 
