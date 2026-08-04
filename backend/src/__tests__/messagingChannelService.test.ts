@@ -72,19 +72,10 @@ describe('messaging channel registry', () => {
 });
 
 /**
- * Channels the bootstrap wires up today. WhatsApp is in MESSAGING_CHANNELS (the type
- * union is correct — it IS a supported channel) but its adapter lands in Phase 2;
- * that phase widens these two loops back to MESSAGING_CHANNELS.
+ * Every declared channel now has an adapter, so these loops cover the full set.
+ * A new channel added to MESSAGING_CHANNELS without a bootstrap entry fails here.
  */
-const BOOTSTRAPPED_CHANNELS: MessagingChannel[] = ['slack'];
-
-it('declares every bootstrapped channel as a supported channel', () => {
-  // Guards the Phase 1/2 boundary in both directions: a channel can be declared
-  // before its adapter exists, but never registered without being declared.
-  for (const channel of BOOTSTRAPPED_CHANNELS) {
-    expect(MESSAGING_CHANNELS).toContain(channel);
-  }
-});
+const BOOTSTRAPPED_CHANNELS: MessagingChannel[] = MESSAGING_CHANNELS;
 
 describe('bootstrapMessagingChannels — concurrency (ENG-300 shape)', () => {
   it('gives every concurrent first-caller a populated registry', async () => {
