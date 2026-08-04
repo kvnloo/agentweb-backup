@@ -192,6 +192,119 @@ describe('Predefined Work Plan MCP Tools', () => {
     });
   });
 
+  // ─── ENG-889: step fields are documented snake_case but the admin route
+  // reads them camelCase. Both casings must reach the route as camelCase.
+  describe('manage_predefined_work_plan - step field casing', () => {
+    const stepBodyOf = (call: number) => ((mockMcpFetch.mock.calls[call][0] as any).body.steps);
+
+    it('maps the documented snake_case required_function_calls to requiredFunctionCalls on create', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{ title: 'Step 1', required_function_calls: ['list_connected_accounts'] }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['list_connected_accounts'] },
+      ]);
+    });
+
+    it('maps snake_case skill_ids, user_instructions and step_count on create', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{
+          title: 'Step 1',
+          skill_ids: ['skill-1'],
+          user_instructions: 'Do this',
+          step_count: 2,
+        }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', skillIds: ['skill-1'], userInstructions: 'Do this', stepCount: 2 },
+      ]);
+    });
+
+    it('maps snake_case step fields on update', async () => {
+      mockMcpFetch.mockResolvedValue({ message: 'Updated' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        title: 'Gate Plan',
+        steps: [{ title: 'Step 1', required_function_calls: ['list_skills'], skill_ids: ['skill-1'] }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['list_skills'], skillIds: ['skill-1'] },
+      ]);
+    });
+
+    it('still accepts the camelCase form unchanged', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{ title: 'Step 1', requiredFunctionCalls: ['list_skills'], skillIds: ['skill-1'] }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['list_skills'], skillIds: ['skill-1'] },
+      ]);
+    });
+
+    it('prefers the camelCase value when both casings are supplied', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{
+          title: 'Step 1',
+          requiredFunctionCalls: ['camel'],
+          required_function_calls: ['snake'],
+        }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['camel'] },
+      ]);
+    });
+
+    it('leaves a missing or malformed steps value untouched', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: ['not-an-object', null],
+      }, context);
+      expect(stepBodyOf(0)).toEqual(['not-an-object', null]);
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        title: 'Gate Plan',
+      }, context);
+      expect(stepBodyOf(1)).toBeUndefined();
+    });
+
+    it('documents the field names the route actually reads', () => {
+      const def: any = mcpToolRegistry.getTool('manage_predefined_work_plan')!.definition;
+      const stepProps = def.inputSchema.properties.steps.items.properties;
+      expect(Object.keys(stepProps)).toEqual(
+        expect.arrayContaining(['requiredFunctionCalls', 'skillIds'])
+      );
+      expect(stepProps.required_function_calls).toBeUndefined();
+    });
+  });
+
   describe('manage_predefined_work_plan - update', () => {
     it('should call PUT with plan_id in path', async () => {
       mockMcpFetch.mockResolvedValue({ message: 'Updated' });
