@@ -870,6 +870,107 @@ describe('apiTools', () => {
       expect(session.cacheTokens).toBeNull();
     });
 
+    // Greptile P1: attributedModels listed every model but totalCost stayed a single
+    // session-wide number, so a per-model cost breakdown had to guess, duplicate or
+    // drop the cost. The per-turn data to split it already exists.
+    it('should allocate cost per model on a multi-model session', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-multi',
+          userId: 'user-11',
+          title: 'Mixed-model session',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 1.5,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 1.0 } },
+            { role: 'assistant', content: 'b', llm: 'gemini-3.5-flash', usage: { estimated_cost: 0.3 } },
+            { role: 'assistant', content: 'c', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 0.2 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.costByModel).toEqual({
+        'anthropic.claude-opus-5': 1.2,
+        'gemini-3.5-flash': 0.3,
+      });
+      expect(session.unattributedCost).toBeNull();
+    });
+
+    // Greptile P1: a session mixing labelled and unlabelled assistant turns still
+    // returned a non-null generationModels, so a partial set read as complete.
+    // Surface the unattributed spend instead of silently dropping it.
+    it('should surface spend on turns that recorded no model', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-partial',
+          userId: 'user-12',
+          title: 'Partially labelled',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 1.0 } },
+            { role: 'assistant', content: 'b', usage: { estimated_cost: 0.4 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.costByModel).toEqual({ 'anthropic.claude-opus-5': 1.0 });
+      // Non-null means the model list does NOT account for all spend.
+      expect(session.unattributedCost).toBe(0.4);
+    });
+
+    it('should null costByModel and unattributedCost when no turn records cost', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-nocost',
+          userId: 'user-13',
+          title: 'No usage',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [
+            { role: 'user', content: 'hi' },
+            { role: 'assistant', content: 'hello', llm: 'gpt-5-chat-2' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.costByModel).toBeNull();
+      expect(session.unattributedCost).toBeNull();
+    });
+
+    it('should tell consumers to split cost with costByModel, not the model list', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      expect(description).toContain('costByModel');
+      expect(description).toContain('unattributedCost');
+    });
+
     it('should warn that totalTokens excludes billed cache tokens', () => {
       const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
       expect(description).toContain('totalTokens EXCLUDES');

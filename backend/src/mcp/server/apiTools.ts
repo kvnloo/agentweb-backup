@@ -2203,6 +2203,8 @@ The two underlying fields are also returned, and they are NOT interchangeable:
 
 TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly; when reporting volume, add cacheTokens to totalTokens and say you did.
 
+PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost (null when zero) is spend on turns that recorded no model: when it is non-null the model list does NOT account for all of this session's cost, so treat the attribution as partial and say so.
+
 Whenever you name a model — reports, cost/usage breakdowns, per-model groupings, routing recommendations, filed tickets — use attributedModels. Never group or attribute cost by llmModel: it is a selection, so it books spend to models that never ran. This supersedes any earlier note, prior report, or saved memory that tells you to group cost by llmModel. If llmModel and generationModels disagree, that mismatch is itself worth reporting.`,
     inputSchema: {
       type: 'object',
@@ -2268,9 +2270,23 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // tokens for $2.94). Surface them so cost and tokens can be reconciled.
       let cacheCreationTokens = 0;
       let cacheReadTokens = 0;
+      // Per-model cost split. totalCost is one session-wide number, so a multi-model
+      // session gave a per-model breakdown nothing to divide by — the per-turn cost
+      // and model are both already here, so allocate rather than make callers guess.
+      const costByModel: Record<string, number> = {};
+      // Spend on assistant turns that recorded no model. Non-null means the model
+      // list does NOT account for all of this session's cost, so a partial set can
+      // no longer read as complete.
+      let unattributedCost = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
-        if (typeof msg?.llm === 'string' && msg.llm) generationModels.add(msg.llm);
+        const turnCost = msg?.usage?.estimated_cost || 0;
+        if (typeof msg?.llm === 'string' && msg.llm) {
+          generationModels.add(msg.llm);
+          if (turnCost) costByModel[msg.llm] = (costByModel[msg.llm] || 0) + turnCost;
+        } else if (turnCost) {
+          unattributedCost += turnCost;
+        }
         cacheCreationTokens += msg?.usage?.cache_creation_input_tokens || 0;
         cacheReadTokens += msg?.usage?.cache_read_input_tokens || 0;
         if (msg?.metadata?.feedback?.type === 'like') likes++;
@@ -2327,6 +2343,12 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         cacheTokens: (cacheCreationTokens > 0 || cacheReadTokens > 0)
           ? { creation: cacheCreationTokens, read: cacheReadTokens }
           : null,
+        costByModel: Object.keys(costByModel).length > 0
+          ? Object.fromEntries(
+              Object.entries(costByModel).map(([m, c]) => [m, Number(c.toFixed(6))])
+            )
+          : null,
+        unattributedCost: unattributedCost > 0 ? Number(unattributedCost.toFixed(6)) : null,
         totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,
