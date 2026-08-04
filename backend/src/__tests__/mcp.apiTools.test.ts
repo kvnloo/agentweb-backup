@@ -796,6 +796,86 @@ describe('apiTools', () => {
       expect(session.attributionBasis).toBeNull();
     });
 
+    // Cache tokens are billed but excluded from total_tokens, so cost/token ratios
+    // computed from totalTokens alone are off by ~100x on cache-heavy scheduled runs
+    // (a real session: 371 total_tokens, 156,013 cache-creation tokens, $2.94).
+    it('should surface cache tokens so cost is reconcilable against tokens', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-cache-heavy',
+          userId: 'user-9',
+          title: 'Scheduled: connection watcher',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [
+            { role: 'user', content: 'run' },
+            {
+              role: 'assistant', content: 'ok', llm: 'anthropic.claude-opus-4-8',
+              usage: {
+                prompt_tokens: 299, completion_tokens: 72, total_tokens: 371,
+                cache_creation_input_tokens: 156013, cache_read_input_tokens: 0,
+                estimated_cost: 2.93512875,
+              },
+            },
+            {
+              role: 'assistant', content: 'done', llm: 'anthropic.claude-opus-4-8',
+              usage: {
+                prompt_tokens: 98, completion_tokens: 542, total_tokens: 640,
+                cache_creation_input_tokens: 0, cache_read_input_tokens: 4000,
+                estimated_cost: 0.28309575,
+              },
+            },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.cacheTokens).toEqual({ creation: 156013, read: 4000 });
+    });
+
+    it('should return null cacheTokens when no turn recorded any cache usage', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-no-cache',
+          userId: 'user-10',
+          title: 'No caching',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [
+            { role: 'user', content: 'hi' },
+            {
+              role: 'assistant', content: 'hello', llm: 'gpt-5-chat-2',
+              usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15, estimated_cost: 0.001 },
+            },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // null, not {creation:0,read:0} — nothing to explain for non-caching sessions.
+      expect(session.cacheTokens).toBeNull();
+    });
+
+    it('should warn that totalTokens excludes billed cache tokens', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      expect(description).toContain('totalTokens EXCLUDES');
+      expect(description).toContain('cacheTokens');
+    });
+
     it('should direct attribution to attributedModels and override stale cost-grouping guidance', () => {
       const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
       // The guidance, not just the field names — the reports name a model because the

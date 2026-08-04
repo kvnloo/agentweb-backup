@@ -2201,6 +2201,8 @@ The two underlying fields are also returned, and they are NOT interchangeable:
 - llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
 - generationModels: the models that actually generated the assistant turns, derived from the transcript. Null when no message recorded one.
 
+TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly; when reporting volume, add cacheTokens to totalTokens and say you did.
+
 Whenever you name a model — reports, cost/usage breakdowns, per-model groupings, routing recommendations, filed tickets — use attributedModels. Never group or attribute cost by llmModel: it is a selection, so it books spend to models that never ran. This supersedes any earlier note, prior report, or saved memory that tells you to group cost by llmModel. If llmModel and generationModels disagree, that mismatch is itself worth reporting.`,
     inputSchema: {
       type: 'object',
@@ -2260,9 +2262,17 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // actually produced it (written after model resolution and any backup-model
       // switch), so derive real attribution from the transcript.
       const generationModels = new Set<string>();
+      // ENG-892 follow-on: estimated_cost bills cache tokens, but total_tokens
+      // excludes them, so cost/token on a cache-heavy scheduled run reads ~100x
+      // the real rate (a live session: 371 total_tokens vs 156,013 cache-creation
+      // tokens for $2.94). Surface them so cost and tokens can be reconciled.
+      let cacheCreationTokens = 0;
+      let cacheReadTokens = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
         if (typeof msg?.llm === 'string' && msg.llm) generationModels.add(msg.llm);
+        cacheCreationTokens += msg?.usage?.cache_creation_input_tokens || 0;
+        cacheReadTokens += msg?.usage?.cache_read_input_tokens || 0;
         if (msg?.metadata?.feedback?.type === 'like') likes++;
         if (msg?.metadata?.feedback?.type === 'dislike') dislikes++;
         if (Array.isArray(msg?.metadata?.iterationTimings)) {
@@ -2314,6 +2324,9 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
           : (session.llmModel ? 'selection-only' : null),
         messageCount: messages.length,
         totalTokens: session.totalTokens || null,
+        cacheTokens: (cacheCreationTokens > 0 || cacheReadTokens > 0)
+          ? { creation: cacheCreationTokens, read: cacheReadTokens }
+          : null,
         totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,
