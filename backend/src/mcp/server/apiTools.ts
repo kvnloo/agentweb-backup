@@ -2195,7 +2195,7 @@ mcpToolRegistry.register({
 
 MODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.
 - attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.
-- attributionBasis: 'transcript' when attributedModels came from the actual assistant turns (trustworthy provenance), 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
+- attributionBasis: 'transcript' when EVERY assistant turn recorded a model (trustworthy provenance); 'partial-transcript' when only some did — the model list is real but incomplete, so do not present it as the session's full attribution; 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
 
 The two underlying fields are also returned, and they are NOT interchangeable:
 - llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
@@ -2203,7 +2203,7 @@ The two underlying fields are also returned, and they are NOT interchangeable:
 
 TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly; when reporting volume, add cacheTokens to totalTokens and say you did.
 
-PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost (null when zero) is spend on turns that recorded no model: when it is non-null the model list does NOT account for all of this session's cost, so treat the attribution as partial and say so.
+PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost (null when zero) is the exact residual: sum(costByModel) + unattributedCost === totalCost. It covers both spend on turns that recorded no model AND cost that never lands on a turn at all (tool/image spend counts toward totalCost but belongs to no model). When it is non-null the per-model split does NOT account for all of this session's cost — report it as its own line rather than folding it into a model, or your model percentages will not sum to the total.
 
 Whenever you name a model — reports, cost/usage breakdowns, per-model groupings, routing recommendations, filed tickets — use attributedModels. Never group or attribute cost by llmModel: it is a selection, so it books spend to models that never ran. This supersedes any earlier note, prior report, or saved memory that tells you to group cost by llmModel. If llmModel and generationModels disagree, that mismatch is itself worth reporting.`,
     inputSchema: {
@@ -2274,18 +2274,18 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // session gave a per-model breakdown nothing to divide by — the per-turn cost
       // and model are both already here, so allocate rather than make callers guess.
       const costByModel: Record<string, number> = {};
-      // Spend on assistant turns that recorded no model. Non-null means the model
-      // list does NOT account for all of this session's cost, so a partial set can
-      // no longer read as complete.
-      let unattributedCost = 0;
+      // Assistant turns carrying no model, counted regardless of cost: a turn with
+      // no recorded spend still means the transcript is only partially labelled, and
+      // keying that off cost alone let a partial set read as authoritative.
+      let unlabelledAssistantTurns = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
         const turnCost = msg?.usage?.estimated_cost || 0;
         if (typeof msg?.llm === 'string' && msg.llm) {
           generationModels.add(msg.llm);
           if (turnCost) costByModel[msg.llm] = (costByModel[msg.llm] || 0) + turnCost;
-        } else if (turnCost) {
-          unattributedCost += turnCost;
+        } else {
+          unlabelledAssistantTurns++;
         }
         cacheCreationTokens += msg?.usage?.cache_creation_input_tokens || 0;
         cacheReadTokens += msg?.usage?.cache_read_input_tokens || 0;
@@ -2336,7 +2336,7 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
           ? [...generationModels]
           : (session.llmModel ? [session.llmModel] : null),
         attributionBasis: generationModels.size > 0
-          ? 'transcript'
+          ? (unlabelledAssistantTurns > 0 ? 'partial-transcript' : 'transcript')
           : (session.llmModel ? 'selection-only' : null),
         messageCount: messages.length,
         totalTokens: session.totalTokens || null,
@@ -2348,7 +2348,17 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
               Object.entries(costByModel).map(([m, c]) => [m, Number(c.toFixed(6))])
             )
           : null,
-        unattributedCost: unattributedCost > 0 ? Number(unattributedCost.toFixed(6)) : null,
+        // The exact residual, so sum(costByModel) + unattributedCost === totalCost.
+        // This captures BOTH spend on unlabelled turns and cost that never lands on
+        // an assistant turn at all (tool/image spend is in totalCost but not in any
+        // turn's usage — measured at $1.92 on a real $100 session), which a
+        // turn-only sum would silently drop from a per-model breakdown.
+        unattributedCost: (() => {
+          if (session.totalCost == null) return null;
+          const attributed = Object.values(costByModel).reduce((a, b) => a + b, 0);
+          const residual = Number(session.totalCost) - attributed;
+          return residual > 5e-7 ? Number(residual.toFixed(6)) : null;
+        })(),
         totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,

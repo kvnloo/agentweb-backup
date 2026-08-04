@@ -917,6 +917,7 @@ describe('apiTools', () => {
           title: 'Partially labelled',
           createdAt: '2026-03-28T00:00:00Z',
           updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 1.4,
           messages: [
             { role: 'user', content: 'go' },
             { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 1.0 } },
@@ -936,6 +937,76 @@ describe('apiTools', () => {
       expect(session.costByModel).toEqual({ 'anthropic.claude-opus-5': 1.0 });
       // Non-null means the model list does NOT account for all spend.
       expect(session.unattributedCost).toBe(0.4);
+      expect(session.attributionBasis).toBe('partial-transcript');
+    });
+
+    // Greptile 4/5 follow-up: an unlabelled turn carrying no cost left
+    // unattributedCost null, so a partial transcript still claimed 'transcript'.
+    // Real shape — prod session 8fb98376 has 2 unlabelled turns and a ~$0 delta.
+    it('should mark attribution partial even when the unlabelled turn has no cost', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-partial-nocost',
+          userId: 'user-14',
+          title: 'Partial, no cost on the gap',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 1.0,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 1.0 } },
+            { role: 'assistant', content: 'b' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.attributionBasis).toBe('partial-transcript');
+      expect(session.unattributedCost).toBeNull();
+    });
+
+    // Greptile 4/5 follow-up: totalCost includes tool spend that never lands on an
+    // assistant turn, so costByModel alone understates the session. Real shape —
+    // prod session 7cac004d: $100.19 total vs $98.28 across turns.
+    it('should count non-turn (tool) spend as unattributed', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-tool-cost',
+          userId: 'user-15',
+          title: 'Tool spend outside the turns',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 3.0,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'anthropic.claude-opus-5', usage: { estimated_cost: 2.0 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // Every assistant turn is labelled, so attribution is not partial...
+      expect(session.attributionBasis).toBe('transcript');
+      // ...but $1.00 of session spend still is not attributable to any model.
+      expect(session.unattributedCost).toBe(1.0);
+      // The invariant consumers can rely on: sum(costByModel) + unattributed = totalCost.
+      const summed = Object.values(session.costByModel as Record<string, number>)
+        .reduce((a, b) => a + b, 0);
+      expect(summed + session.unattributedCost).toBeCloseTo(session.totalCost, 6);
     });
 
     it('should null costByModel and unattributedCost when no turn records cost', async () => {
