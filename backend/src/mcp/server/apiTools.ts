@@ -2193,11 +2193,15 @@ mcpToolRegistry.register({
     name: 'get_chat_history',
     description: `Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don't have them (slower but ensures all scores are present).
 
-Two model fields are returned, and they are NOT interchangeable:
-- llmModel: the model *selected* in the picker. It records a client-side selection only — the session may never have run on it (it can even name a model that is not in the registry, or a live voice model that cannot generate text at all).
-- generationModels: the models that *actually generated* the assistant turns, derived from the transcript. This is the real provenance. Null when no message recorded one.
+MODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.
+- attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.
+- attributionBasis: 'transcript' when attributedModels came from the actual assistant turns (trustworthy provenance), 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
 
-When naming or attributing a model — in reports, cost/usage breakdowns, routing recommendations, or filed tickets — use generationModels. Only fall back to llmModel when generationModels is null, and say so. If the two disagree, that mismatch is itself worth reporting.`,
+The two underlying fields are also returned, and they are NOT interchangeable:
+- llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
+- generationModels: the models that actually generated the assistant turns, derived from the transcript. Null when no message recorded one.
+
+Whenever you name a model — reports, cost/usage breakdowns, per-model groupings, routing recommendations, filed tickets — use attributedModels. Never group or attribute cost by llmModel: it is a selection, so it books spend to models that never ran. This supersedes any earlier note, prior report, or saved memory that tells you to group cost by llmModel. If llmModel and generationModels disagree, that mismatch is itself worth reporting.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -2296,6 +2300,18 @@ When naming or attributing a model — in reports, cost/usage breakdowns, routin
         sessionType: session.sessionType || null,
         llmModel: session.llmModel || null,
         generationModels: generationModels.size > 0 ? [...generationModels] : null,
+        // ENG-892: pre-resolve the attribution so the agent never has to choose
+        // between two model-shaped fields. The original mis-report happened
+        // because a field named `llmModel` sat in the payload and got named on
+        // sight; a stored account memory still instructs grouping cost by it.
+        // Emitting the answer (plus how trustworthy it is) removes that judgement
+        // call rather than relying on the agent to make it correctly.
+        attributedModels: generationModels.size > 0
+          ? [...generationModels]
+          : (session.llmModel ? [session.llmModel] : null),
+        attributionBasis: generationModels.size > 0
+          ? 'transcript'
+          : (session.llmModel ? 'selection-only' : null),
         messageCount: messages.length,
         totalTokens: session.totalTokens || null,
         totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,

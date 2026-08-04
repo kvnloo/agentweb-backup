@@ -735,14 +735,76 @@ describe('apiTools', () => {
       // null, not [] — degrades to the pre-ENG-892 behaviour of reporting only the picker.
       expect(session.generationModels).toBeNull();
       expect(session.llmModel).toBe('gpt-4o');
+      // ...but attribution still resolves, flagged as unverified.
+      expect(session.attributedModels).toEqual(['gpt-4o']);
+      expect(session.attributionBasis).toBe('selection-only');
     });
 
-    it('should document that llmModel is the selection and generationModels is what ran', () => {
+    it('should pre-resolve attributedModels from the transcript when provenance exists', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-eng829',
+          userId: 'user-7',
+          title: 'GA4 Upstream Funnel Tracking',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          // The ENG-829 shape: picker holds a live voice model that cannot emit a token.
+          llmModel: 'gemini-3.1-flash-live-preview',
+          messages: [
+            { role: 'user', content: 'Hello' },
+            { role: 'assistant', content: 'Hi', llm: 'anthropic.claude-opus-5' },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // The agent is handed the answer, not a choice between two model-shaped fields.
+      expect(session.attributedModels).toEqual(['anthropic.claude-opus-5']);
+      expect(session.attributionBasis).toBe('transcript');
+      // Both underlying fields stay available — the mismatch is still signal.
+      expect(session.llmModel).toBe('gemini-3.1-flash-live-preview');
+    });
+
+    it('should null both attribution fields when nothing is recorded at all', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-empty',
+          userId: 'user-8',
+          title: 'No model anywhere',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [{ role: 'user', content: 'Hello' }],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.attributedModels).toBeNull();
+      expect(session.attributionBasis).toBeNull();
+    });
+
+    it('should direct attribution to attributedModels and override stale cost-grouping guidance', () => {
       const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
       // The guidance, not just the field names — the reports name a model because the
       // payload label invites it, so the primacy instruction is the fix's mechanism.
-      expect(description).toContain('use generationModels');
-      expect(description).toContain('Only fall back to llmModel when generationModels is null');
+      expect(description).toContain('use attributedModels');
+      // A live account memory on the reporting account still tells the agent to group
+      // cost by llmModel; the description has to outrank it explicitly.
+      expect(description).toContain('Never group or attribute cost by llmModel');
+      expect(description).toContain('saved memory');
     });
 
     it('should include delegateInfo when session was started by admin delegation', async () => {
