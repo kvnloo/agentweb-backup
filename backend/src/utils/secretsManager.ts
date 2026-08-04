@@ -957,3 +957,53 @@ export async function getLandingPagesConfig(): Promise<LandingPagesConfig | null
   }
 }
 
+
+export interface WhatsAppCredentials {
+  /** Cloud API phone number id — the sender. Not the display phone number. */
+  phoneNumberId: string;
+  /** WhatsApp Business Account id — needed for template management. */
+  wabaId: string;
+  /** System-user token with whatsapp_business_messaging + whatsapp_business_management. */
+  accessToken: string;
+  /** Meta app secret — verifies the X-Hub-Signature-256 on inbound webhooks. */
+  appSecret: string;
+  /** Shared token echoed back on the webhook's GET subscription challenge. */
+  webhookVerifyToken: string;
+}
+
+/**
+ * Get WhatsApp Cloud API credentials from AWS Secrets Manager (ENG-273).
+ *
+ * Secret location: dev/AgentWeb/WhatsApp (or prod/... for production).
+ *
+ * Throws rather than returning a partial object: a missing appSecret would silently
+ * disable inbound webhook signature verification, and a missing phoneNumberId would
+ * send to the wrong number. Both fail closed.
+ */
+export async function getWhatsAppCredentials(): Promise<WhatsAppCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/WhatsApp'
+      : 'dev/AgentWeb/WhatsApp';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('WhatsApp credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as WhatsAppCredentials;
+
+    const missing = (['phoneNumberId', 'wabaId', 'accessToken', 'appSecret', 'webhookVerifyToken'] as const)
+      .filter((k) => !credentials[k]);
+    if (missing.length > 0) {
+      throw new Error(`WhatsApp credentials missing: ${missing.join(', ')}`);
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching WhatsApp credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch WhatsApp credentials from Secrets Manager');
+  }
+}

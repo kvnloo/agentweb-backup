@@ -139,8 +139,12 @@ let bootstrapPromise: Promise<void> | null = null;
 export async function bootstrapMessagingChannels(): Promise<void> {
   if (!bootstrapPromise) {
     bootstrapPromise = (async () => {
-      const { slackChannelAdapter } = await import('./slackChannelAdapter');
+      const [{ slackChannelAdapter }, { whatsappChannelAdapter }] = await Promise.all([
+        import('./slackChannelAdapter'),
+        import('./whatsappChannelAdapter'),
+      ]);
       registerMessagingChannel('slack', slackChannelAdapter);
+      registerMessagingChannel('whatsapp', whatsappChannelAdapter);
     })().catch((error) => {
       // Don't cache a failed bootstrap — let the next caller retry.
       bootstrapPromise = null;
