@@ -31,8 +31,22 @@
 # mid-poll by the runner.
 #
 # Exit status: 0 only when the environment is Ready, reports EB_VERSION_LABEL as
-# its running version, and its health is neither Grey nor Red. Anything else
-# exits non-zero.
+# its running version, and is healthy. Anything else exits non-zero.
+#
+# "Healthy" means the environment health rollup is neither Grey nor Red — OR
+# (ENG-878) the rollup is still Grey/Red after EB_HEALTH_SETTLE_SECONDS but
+# every instance reports Ok and every load-balancer target reports healthy, in
+# which case the rollup is a lagging aggregate and is not the deploy's verdict.
+# If that probe cannot be completed the original failure stands: an unreadable
+# probe is never read as proof of health.
+#
+# Extra IAM needed for that probe, beyond what the deploy already used:
+#   elasticbeanstalk:DescribeInstancesHealth
+#   elasticbeanstalk:DescribeEnvironmentResources
+#   elbv2:DescribeTargetGroups
+#   elbv2:DescribeTargetHealth
+# Missing any of them degrades to today's behaviour (fail on a Red rollup) and
+# names the denied call in the failure message.
 
 set -euo pipefail
 
@@ -139,6 +153,130 @@ read_environment_state() {
   if [ -z "${EB_STATUS}" ] || [ -z "${EB_HEALTH}" ] || [ -z "${EB_CURRENT_VERSION}" ]; then
     fail "environment '${EB_ENVIRONMENT_NAME}' was not found, or describe-environments returned an unusable response: '${out}'"
   fi
+}
+
+# Both set by underlying_health_verdict. It assigns globals rather than echoing
+# its verdict because a command substitution runs in a SUBSHELL, so the detail
+# string would be discarded and every failure would read "no detail available"
+# — which is precisely the uninformative message ENG-878 AC3 exists to kill.
+EB_UNHEALTHY_DETAIL=''
+EB_HEALTH_VERDICT=''
+
+# Is the environment's Red/Grey rollup real, or is it lagging? (ENG-878)
+#
+# EB's environment Health is an AGGREGATE and it lags. After an immutable
+# deploy terminates the old instance the rollup can sit at Red for minutes
+# while every underlying signal is already healthy. On 2026-08-03 that failed
+# a deploy of #2252 whose instance was `Ok`, whose target group was `healthy`,
+# which served 100% 2xx throughout, and which went Green on its own minutes
+# later with no intervention. Because ENG-837's trunk gate keys off the deploy
+# run's conclusion, that one false failure blocked every merge onto main.
+#
+# So before calling a Red rollup a failure, ask the two signals that do NOT
+# lag: per-instance health, and target-group health.
+#
+# Sets EB_HEALTH_VERDICT to one of:
+#   LAGGING   every instance Ok and every target healthy — the rollup is stale
+#   UNHEALTHY something is genuinely wrong; EB_UNHEALTHY_DETAIL names it
+#   UNKNOWN   the probe could not be completed
+#
+# UNKNOWN deliberately keeps the old failure. A probe that cannot see the
+# instances must never be read as proof they are fine — that would convert this
+# from "stop crying wolf" into "never bark", which is the far worse bug.
+underlying_health_verdict() {
+  local out instances unhealthy='' lb_arns tg_arns arn targets
+
+  EB_UNHEALTHY_DETAIL=''
+
+  if ! out=$(aws elasticbeanstalk describe-instances-health \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --attribute-names HealthStatus \
+    --query 'InstanceHealthList[*].[InstanceId,HealthStatus]' \
+    --output text 2>&1); then
+    EB_UNHEALTHY_DETAIL="describe-instances-health failed: ${out}"
+    EB_HEALTH_VERDICT='UNKNOWN'
+    return 0
+  fi
+
+  instances=$(printf '%s' "${out}" | grep -v '^None$' | grep -v '^[[:space:]]*$' || true)
+  if [ -z "${instances}" ]; then
+    # No instances at all is not a lagging rollup, it is an empty environment.
+    EB_UNHEALTHY_DETAIL='describe-instances-health returned no instances'
+    EB_HEALTH_VERDICT='UNKNOWN'
+    return 0
+  fi
+
+  # Only `Ok` counts. Warning/Degraded/Severe/Info/Pending/Unknown/NoData all
+  # mean "not proven healthy", and this function's whole job is proving it.
+  while IFS=$'\t' read -r iid ihealth; do
+    [ -z "${iid}" ] && continue
+    if [ "${ihealth}" != "Ok" ]; then
+      unhealthy="${unhealthy}instance ${iid}=${ihealth} "
+    fi
+  done <<<"${instances}"
+
+  if ! lb_arns=$(aws elasticbeanstalk describe-environment-resources \
+    --environment-name "${EB_ENVIRONMENT_NAME}" \
+    --query 'EnvironmentResources.LoadBalancers[*].Name' \
+    --output text 2>&1); then
+    EB_UNHEALTHY_DETAIL="describe-environment-resources failed: ${lb_arns}"
+    EB_HEALTH_VERDICT='UNKNOWN'
+    return 0
+  fi
+
+  lb_arns=$(printf '%s' "${lb_arns}" | tr '\t' '\n' | grep '^arn:' || true)
+  if [ -z "${lb_arns}" ]; then
+    # A classic (non-ALB) load balancer reports a bare name, so there is no
+    # target group to interrogate and this probe cannot speak for the ALB path.
+    EB_UNHEALTHY_DETAIL='no Application Load Balancer ARN on this environment'
+    EB_HEALTH_VERDICT='UNKNOWN'
+    return 0
+  fi
+
+  while IFS= read -r lb; do
+    [ -z "${lb}" ] && continue
+    if ! tg_arns=$(aws elbv2 describe-target-groups \
+      --load-balancer-arn "${lb}" \
+      --query 'TargetGroups[*].TargetGroupArn' \
+      --output text 2>&1); then
+      EB_UNHEALTHY_DETAIL="describe-target-groups failed for ${lb}: ${tg_arns}"
+      EB_HEALTH_VERDICT='UNKNOWN'
+      return 0
+    fi
+
+    for arn in $(printf '%s' "${tg_arns}" | tr '\t' '\n' | grep '^arn:' || true); do
+      if ! targets=$(aws elbv2 describe-target-health \
+        --target-group-arn "${arn}" \
+        --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State]' \
+        --output text 2>&1); then
+        EB_UNHEALTHY_DETAIL="describe-target-health failed for ${arn}: ${targets}"
+        EB_HEALTH_VERDICT='UNKNOWN'
+        return 0
+      fi
+
+      targets=$(printf '%s' "${targets}" | grep -v '^None$' | grep -v '^[[:space:]]*$' || true)
+      if [ -z "${targets}" ]; then
+        EB_UNHEALTHY_DETAIL="target group ${arn##*/} has no registered targets"
+        EB_HEALTH_VERDICT='UNKNOWN'
+        return 0
+      fi
+
+      while IFS=$'\t' read -r tid tstate; do
+        [ -z "${tid}" ] && continue
+        if [ "${tstate}" != "healthy" ]; then
+          unhealthy="${unhealthy}target ${tid}=${tstate} "
+        fi
+      done <<<"${targets}"
+    done
+  done <<<"${lb_arns}"
+
+  if [ -n "${unhealthy}" ]; then
+    EB_UNHEALTHY_DETAIL="${unhealthy% }"
+    EB_HEALTH_VERDICT='UNHEALTHY'
+    return 0
+  fi
+
+  EB_HEALTH_VERDICT='LAGGING'
 }
 
 # Fails immediately on a status the environment cannot recover from, so a dead
@@ -336,7 +474,21 @@ verify_deployment() {
       fi
 
       if [ "$(( $(now_seconds) - ready_since ))" -ge "${EB_HEALTH_SETTLE_SECONDS}" ]; then
-        fail "environment '${EB_ENVIRONMENT_NAME}' took version '${EB_VERSION_LABEL}' but its health stayed ${EB_HEALTH} for ${EB_HEALTH_SETTLE_SECONDS}s after becoming Ready."
+        # The rollup is still Red/Grey. Before failing, ask the signals that do
+        # not lag — a stale aggregate must not fail a healthy deploy (ENG-878).
+        underlying_health_verdict
+        case "${EB_HEALTH_VERDICT}" in
+          LAGGING)
+            log "SUCCESS: environment '${EB_ENVIRONMENT_NAME}' is Ready on version '${EB_VERSION_LABEL}' and every instance is Ok and every load-balancer target is healthy, but its environment health rollup still reads ${EB_HEALTH} after ${EB_HEALTH_SETTLE_SECONDS}s. EB's environment health is a lagging aggregate and this one is stale; the deploy succeeded."
+            return 0
+            ;;
+          UNHEALTHY)
+            fail "environment '${EB_ENVIRONMENT_NAME}' took version '${EB_VERSION_LABEL}' but its health stayed ${EB_HEALTH} for ${EB_HEALTH_SETTLE_SECONDS}s after becoming Ready, and the underlying signals agree something is wrong: ${EB_UNHEALTHY_DETAIL}."
+            ;;
+          *)
+            fail "environment '${EB_ENVIRONMENT_NAME}' took version '${EB_VERSION_LABEL}' but its health stayed ${EB_HEALTH} for ${EB_HEALTH_SETTLE_SECONDS}s after becoming Ready, and the underlying instance/target health could not be established, so the deploy is NOT confirmed: ${EB_UNHEALTHY_DETAIL:-no detail available}."
+            ;;
+        esac
       fi
     else
       # The environment left Ready (or is reporting another version) again, so
