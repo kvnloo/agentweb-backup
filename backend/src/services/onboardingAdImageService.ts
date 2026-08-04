@@ -728,6 +728,73 @@ export async function isBrandLogoFetchable(
 }
 
 /**
+ * Terminally fail the ad-image axis on behalf of ONE specific run.
+ *
+ * Every gate in `triggerAdImageGenerationForUser` used to patch
+ * `adImageFailedPatch` unconditionally. That let a run which had already lost
+ * the race — say a slow logo preflight finally resolving — stomp a NEWER run
+ * that had since reset the axis to `running`, or clobber a `ready` the newer
+ * run had already published. `adImageReadyPatch` has always refused to write
+ * off a run it does not own; the failure paths simply never got the same
+ * treatment.
+ *
+ * Identity is `adImageStartedAt`, the timestamp `adImageStartPatch` stamps at
+ * the top of every run. We drop the write only when the axis carries a
+ * STRICTLY NEWER start than the one this run entered with — i.e. only when a
+ * newer run demonstrably exists. Anything inconclusive (either timestamp
+ * missing or unparseable) still writes, which keeps two things working: the
+ * eager DAG, which invokes the trigger without going through
+ * `startAdImageGenerationForUser` and so may carry no start stamp at all, and
+ * the plain "never started" case. Same conservative rule as
+ * `throwIfStepFailed` in onboardingOrchestratorWiring — a swallowed real
+ * failure is the more costly error, since it reproduces this very ticket.
+ *
+ * Deliberately not a `status === "running"` check: that would silently drop
+ * every legitimate failure on the eager path.
+ *
+ * Returns true when the failure was written, false when dropped as stale.
+ */
+async function failAdImageRunIfOwned(
+  userId: string,
+  runStartedAt: unknown,
+  reason: string,
+  operation: string,
+  logMessage: string,
+  logContext: Record<string, unknown> = {}
+): Promise<boolean> {
+  const current = await userDb.getUserById(userId);
+  const ourStart =
+    typeof runStartedAt === "string" ? Date.parse(runStartedAt) : NaN;
+  const axisStartRaw = (current as any)?.adImageStartedAt;
+  const axisStart =
+    typeof axisStartRaw === "string" ? Date.parse(axisStartRaw) : NaN;
+  if (Number.isFinite(ourStart) && Number.isFinite(axisStart) && axisStart > ourStart) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[onboardingAdImageService] dropping stale failure — a newer run owns the axis",
+      { userId, reason, ourStart: runStartedAt, axisStart: axisStartRaw },
+    );
+    return false;
+  }
+  await userDb.updateUser(
+    userId,
+    adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
+  );
+  // eslint-disable-next-line no-console
+  console.error(logMessage, { userId, ...logContext, reason });
+  void reportUIError({
+    operation,
+    errorMessage: reason,
+    userId,
+    context: {
+      Source: "backend",
+      Step: "adImage",
+    },
+  });
+  return true;
+}
+
+/**
  * Fire-and-forget orchestrator. Reads the User record, gates on
  * `creativeDirStatus === 'ready'`, runs the parallel image-generation loop,
  * and patches the User with the result.
@@ -752,30 +819,20 @@ export async function triggerAdImageGenerationForUser(
   if (!user) return;
 
   const u = user as any;
+  // Run identity for every terminal write below — see failAdImageRunIfOwned.
+  const runStartedAt = u.adImageStartedAt ?? undefined;
   const creativeDirStatus =
     typeof u.creativeDirStatus === "string" ? u.creativeDirStatus : "idle";
   if (creativeDirStatus !== "ready") {
     const reason = `creative direction not ready (status=${creativeDirStatus})`;
-    const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
+    await failAdImageRunIfOwned(
       userId,
-      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
-    );
-    // eslint-disable-next-line no-console
-    console.error("[onboardingAdImageService] gated by creative-dir step", {
-      userId,
+      runStartedAt,
       reason,
-    });
-    void reportUIError({
-      operation: "onboarding:ad-image:gated-creative-dir",
-      errorMessage: reason,
-      userId,
-      context: {
-        Source: "backend",
-        Step: "adImage",
-        creativeDirStatus,
-      },
-    });
+      "onboarding:ad-image:gated-creative-dir",
+      "[onboardingAdImageService] gated by creative-dir step",
+      { creativeDirStatus },
+    );
     return;
   }
 
@@ -805,25 +862,13 @@ export async function triggerAdImageGenerationForUser(
     const reason =
       "no brand logo is saved in Brand Guidelines — upload your logo in brand config, then regenerate. " +
       "Ad images are never generated with an invented or approximate logo (ENG-326).";
-    const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
+    await failAdImageRunIfOwned(
       userId,
-      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
-    );
-    // eslint-disable-next-line no-console
-    console.error("[onboardingAdImageService] gated on missing brand logo", {
-      userId,
+      runStartedAt,
       reason,
-    });
-    void reportUIError({
-      operation: "onboarding:ad-image:missing-brand-logo",
-      errorMessage: reason,
-      userId,
-      context: {
-        Source: "backend",
-        Step: "adImage",
-      },
-    });
+      "onboarding:ad-image:missing-brand-logo",
+      "[onboardingAdImageService] gated on missing brand logo",
+    );
     return;
   }
 
@@ -842,25 +887,13 @@ export async function triggerAdImageGenerationForUser(
       "unreachable (for example a favicon-service link that returns 404). " +
       "Re-upload your logo in brand config, then regenerate. Ad images are " +
       "never generated with a broken, invented, or approximate logo (ENG-326).";
-    const current = await userDb.getUserById(userId);
-    await userDb.updateUser(
+    await failAdImageRunIfOwned(
       userId,
-      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
-    );
-    // eslint-disable-next-line no-console
-    console.error("[onboardingAdImageService] gated on unfetchable brand logo", {
-      userId,
+      runStartedAt,
       reason,
-    });
-    void reportUIError({
-      operation: "onboarding:ad-image:unfetchable-brand-logo",
-      errorMessage: reason,
-      userId,
-      context: {
-        Source: "backend",
-        Step: "adImage",
-      },
-    });
+      "onboarding:ad-image:unfetchable-brand-logo",
+      "[onboardingAdImageService] gated on unfetchable brand logo",
+    );
     return;
   }
 
@@ -940,8 +973,6 @@ export async function triggerAdImageGenerationForUser(
     });
   }
 
-  const current = await userDb.getUserById(userId);
-
   // ENG-792: every variant came back a placeholder, so the run produced ZERO
   // usable creatives. Reporting "ready" here is what let the reported account
   // finish onboarding believing it had three ad images: the cards fell back to
@@ -954,38 +985,25 @@ export async function triggerAdImageGenerationForUser(
   // still ships as "ready" — degraded but genuinely usable, and blocking
   // onboarding over one flaky variant would be worse than shipping two.
   if (liveCount === 0 && variantCount > 0) {
-    if ((current as any)?.adImageStatus !== "running") {
-      // A newer run owns the state — drop silently, same staleness convention
-      // as the adImageReadyPatch path below (which returns null off-`running`).
-      return;
-    }
     const reason =
       "ad image generation produced no usable images — all " +
       `${variantCount} variants failed. This is usually a temporary problem ` +
       "with the image model, or a brand logo that can no longer be loaded. " +
       "Retry, and if it keeps failing re-upload your logo in brand config.";
-    await userDb.updateUser(
+    await failAdImageRunIfOwned(
       userId,
-      adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any
+      runStartedAt,
+      reason,
+      "onboarding:ad-image:all-variants-failed",
+      "[onboardingAdImageService] all variants failed",
+      { variantCount, durationMs },
     );
-    // eslint-disable-next-line no-console
-    console.error("[onboardingAdImageService] all variants failed", {
-      userId,
-      variantCount,
-      durationMs,
-    });
-    void reportUIError({
-      operation: "onboarding:ad-image:all-variants-failed",
-      errorMessage: reason,
-      userId,
-      context: {
-        Source: "backend",
-        Step: "adImage",
-      },
-    });
     return;
   }
 
+  // Read only now: the failure path above does its own owning-run read, and
+  // hoisting this above it would cost every failed run a redundant fetch.
+  const current = await userDb.getUserById(userId);
   const patch = adImageReadyPatch(((current as any) || {}) as AdImageStatusFields, result);
   if (!patch) {
     // Stale completion (user is no longer in `running` or current is missing)
