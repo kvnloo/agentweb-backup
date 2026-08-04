@@ -81,6 +81,10 @@ jest.mock('../services/db', () => ({
 
 jest.mock('uuid', () => ({ v4: jest.fn(() => 'mock-run-id-123') }));
 
+jest.mock('../utils/agentModeAlerts', () => ({
+  sendAgentModeOncallAlert: jest.fn().mockResolvedValue(undefined),
+}));
+
 jest.mock('../services/emailService', () => ({
   emailService: {
     sendScheduledChatResultEmail: jest.fn(),
@@ -104,6 +108,9 @@ import { agentModeService } from '../services/agentModeService';
 import { scheduleDb } from '../services/db';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { runScheduledChat } from '../controllers/agentModeController';
+import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
+
+const mockAlert = sendAgentModeOncallAlert as jest.MockedFunction<typeof sendAgentModeOncallAlert>;
 
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
@@ -185,5 +192,27 @@ describe('runScheduledChat — stamps the model that will actually run (ENG-892)
     await runScheduledChat({ ...baseSchedule } as any, 'test-user-123', false);
 
     expect(stampedModel()).toBe('anthropic.claude-opus-5');
+  });
+
+  // A dead pin is silent otherwise: the run succeeds on the fallback and the admin
+  // UI keeps showing the model they chose. Same failure mode as ENG-806, where an
+  // alias-valued AW-Settings row sat inert for two months. The settings path alerts
+  // on an unserved value; the schedule path only console.warn'd.
+  it('alerts when a schedule pins a model that is not served', async () => {
+    await runScheduledChat({ ...baseSchedule, llmModel: 'claude-sonnet-4-5' } as any, 'test-user-123', false);
+
+    expect(mockAlert).toHaveBeenCalledTimes(1);
+    const alert = mockAlert.mock.calls[0][0];
+    expect(alert.subject).toContain('unsupported');
+    expect(alert.message).toContain('claude-sonnet-4-5');
+    expect(alert.message).toContain(FALLBACK);
+    // Deduped per (schedule, bad value) so a daily schedule cannot flood oncall.
+    expect(alert.dedupeKey).toBe('schedule_model_invalid:sched-1:claude-sonnet-4-5');
+  });
+
+  it('does not alert when the pinned model is served', async () => {
+    await runScheduledChat({ ...baseSchedule, llmModel: 'anthropic.claude-opus-5' } as any, 'test-user-123', false);
+
+    expect(mockAlert).not.toHaveBeenCalled();
   });
 });

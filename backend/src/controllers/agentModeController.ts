@@ -2945,7 +2945,34 @@ export async function runScheduledChat(
     // sessions the daily reports analyse. Resolve first so the stored value is
     // what generation will resolve to.
     const defaultModel = await agentModeService.getScheduledChatsDefaultModel();
-    const modelToUse = agentModeService.resolveGenerationModel(schedule.llmModel || defaultModel).model;
+    const requestedModel = schedule.llmModel || defaultModel;
+    const scheduleModelResolution = agentModeService.resolveGenerationModel(requestedModel);
+    const modelToUse = scheduleModelResolution.model;
+    if (scheduleModelResolution.fellBack) {
+      // Fail loud, not partial. The run still completes on the fallback, but the
+      // admin's pin is dead and the UI keeps showing the model they chose — the
+      // ENG-806 failure mode, where an alias-valued setting sat inert for two
+      // months. resolveConfiguredModel alerts for AW-Settings; schedules only
+      // console.warn'd. Fire-and-forget so the run never blocks on it.
+      void sendAgentModeOncallAlert({
+        subject: 'AgentMode: unsupported model pinned on a scheduled chat',
+        message:
+          `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${requestedModel}", which is ` +
+          `not a served model even after legacy-alias resolution. The run fell back to "${modelToUse}", so the ` +
+          `pin is inert and every run of this schedule is using a model nobody chose.`,
+        context: {
+          Schedule: schedule.scheduleId,
+          'Pinned Model': requestedModel,
+          'Actually Used': modelToUse,
+        },
+        // One alert per (schedule, bad value) per hour: a daily schedule with a
+        // permanently bad pin must not flood oncall.
+        dedupeKey: `schedule_model_invalid:${schedule.scheduleId}:${requestedModel}`,
+        dedupeWindowMs: 60 * 60 * 1000,
+      }).catch((alertError) => {
+        console.error('AgentMode: Failed to send unsupported schedule-model alert:', alertError);
+      });
+    }
     await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
 
     // Convert schedule format to runVerifiedChat format
