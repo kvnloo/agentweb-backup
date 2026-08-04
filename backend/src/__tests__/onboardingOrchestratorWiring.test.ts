@@ -225,6 +225,100 @@ describe("reconcileForUser", () => {
     });
   });
 
+  it("records adImage as FAILED when the service failed the run (ENG-792)", async () => {
+    // The ad-image service signals business failures by patching
+    // adImageStatus, never by throwing. The orchestrator only marks a step
+    // failed when its runner throws, so without the re-raise in runAdImage
+    // this was recorded as "ready" with a null output.
+    delete process.env.EAGER_ONBOARDING_PIPELINE_ENABLED;
+
+    await jest.isolateModulesAsync(async () => {
+      const persisted: Record<string, any> = {
+        userId: "u-eng792",
+        useEagerPipeline: true,
+        companyUrl: "https://acme.test",
+        companyName: "Acme",
+        goal: "growth",
+      };
+
+      const triggerBrandBuild = jest.fn(async () => {
+        persisted.brandGuidelines = { tone: "punchy" };
+      });
+      const triggerIcp = jest.fn(async () => {
+        persisted.icpResult = [{ name: "P1" }];
+      });
+      const triggerCompetitor = jest.fn(async () => {
+        persisted.competitorResult = { per_icp: [] };
+      });
+      const triggerCreativeDir = jest.fn(async () => {
+        persisted.creativeDirResult = { concepts: [] };
+      });
+      // Mirrors the real service on a total-variant failure: status flipped
+      // to failed, no adImageResult written.
+      const triggerAdImage = jest.fn(async () => {
+        persisted.adImageStatus = "failed";
+        persisted.adImageError = "all 3 variants failed";
+      });
+      const triggerAdCopy = jest.fn(async () => {
+        persisted.adCopyResult = { copies: [] };
+      });
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn(async () => ({ ...persisted })),
+          updateUser: jest.fn(async (_id: string, patch: any) => {
+            if (patch && patch.steps) {
+              persisted.steps = patch.steps;
+            } else if (patch) {
+              Object.assign(persisted, patch);
+            }
+          }),
+        },
+      }));
+      jest.doMock("../services/onboardingIcpService", () => ({
+        triggerIcpDiscoveryForUser: triggerIcp,
+      }));
+      jest.doMock("../services/onboardingCompetitorService", () => ({
+        triggerCompetitorStrategyForUser: triggerCompetitor,
+      }));
+      jest.doMock("../services/onboardingCreativeDirService", () => ({
+        triggerCreativeDirForUser: triggerCreativeDir,
+      }));
+      jest.doMock("../services/onboardingAdImageService", () => ({
+        triggerAdImageGenerationForUser: triggerAdImage,
+      }));
+      jest.doMock("../services/onboardingAdCopyService", () => ({
+        triggerAdCopyForUser: triggerAdCopy,
+      }));
+      jest.doMock("../services/onboardingBrandBuildService", () => ({
+        triggerBrandBuildForUser: triggerBrandBuild,
+      }));
+
+      const {
+        reconcileForUser,
+        _resetOrchestratorForTests,
+      } = require("../services/onboardingOrchestratorWiring");
+      _resetOrchestratorForTests();
+      const {
+        _resetRateLimitState,
+      } = require("../services/onboardingPipelineOrchestrator");
+      _resetRateLimitState();
+      const report = await reconcileForUser("u-eng792");
+
+      expect(triggerAdImage).toHaveBeenCalledWith("u-eng792");
+      expect(persisted.steps?.adImage?.status).toBe("failed");
+      expect(persisted.steps?.adImage?.failedReason).toMatch(/all 3 variants failed/);
+      const fired = (report.fired as Array<{ step: string; status: string }>);
+      expect(fired.find((f) => f.step === "adImage")?.status).toBe("failed");
+      // Ad copy is a SIBLING of ad images (both dep on creativeDir), not a
+      // dependent — the Epic deliberately splits image and copy into
+      // independent axes so one failing does not block the other. It must
+      // still run and still succeed.
+      expect(triggerAdCopy).toHaveBeenCalledWith("u-eng792");
+      expect(fired.find((f) => f.step === "adCopy")?.status).toBe("ready");
+    });
+  });
+
   it("walks the DAG when the env flag is on, regardless of per-user opt-in", async () => {
     process.env.EAGER_ONBOARDING_PIPELINE_ENABLED = "true";
 
