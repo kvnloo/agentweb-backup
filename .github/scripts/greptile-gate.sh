@@ -106,13 +106,29 @@ while :; do
     last_state="GitHub API call failed (exit ${gh_exit}): $(tr '\n' ' ' <"${stderr_file}")"
     last_body="$(cat "${stderr_file}")"
   else
+    # Prefer the newest Greptile comment that actually carries a verdict footer,
+    # falling back to the newest Greptile comment of any kind so the "exists but
+    # no verdict yet" pending message still works.
+    #
+    # The header above assumed Greptile only ever edits one comment in place, so
+    # `last` was safe. That is not true: replying to a Greptile finding makes it
+    # post a threaded REPLY, which is newer than the edited-in-place summary and
+    # carries no footer. `last` then locked onto the reply and the gate polled
+    # for the full 20 minutes and timed out — on a PR Greptile had already
+    # scored 5/5. Any PR whose author converses with Greptile hit this.
+    #
+    # No loss of strictness: the selected body is still required to carry a
+    # footer pointing at THIS head, exactly one Confidence Score, denominator 5,
+    # and a score at or above the minimum.
     body="$(printf '%s' "${comments_json}" | jq -r '
         [ .[]
           | select((.user.type // "") == "Bot")
           | select(((.user.login // "") | ascii_downcase | startswith("greptile")))
-        ]
-        | last
-        | if . == null then "" else (.body // "") end
+          | (.body // "")
+        ] as $bodies
+        | ( [ $bodies[] | select(test("last reviewed commit"; "i")) ] | last )
+          // ( $bodies | last )
+          // ""
       ' 2>/dev/null)"
     jq_exit=$?
 
