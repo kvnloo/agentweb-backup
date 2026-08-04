@@ -650,11 +650,20 @@ export default function WorkPlans() {
                                 {step.stepCount}. <strong>{step.title}</strong>
                                 {step.description && <span> — {step.description}</span>}
                               </Typography>
-                              {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
+                              {((step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) || step.expectedAssetCount) && (
                                 <Box sx={{ ml: 2 }}>
-                                  {step.requiredFunctionCalls.map((fc, j) => (
+                                  {step.requiredFunctionCalls?.map((fc, j) => (
                                     <Chip key={j} label={fc} size="small" variant="outlined" sx={{ mr: 0.5, mb: 0.5, fontFamily: "monospace", fontSize: "0.7rem" }} />
                                   ))}
+                                  {step.expectedAssetCount ? (
+                                    <Chip
+                                      label={`${step.expectedAssetCount} assets required`}
+                                      size="small"
+                                      color="warning"
+                                      variant="outlined"
+                                      sx={{ mr: 0.5, mb: 0.5, fontSize: "0.7rem" }}
+                                    />
+                                  ) : null}
                                 </Box>
                               )}
                             </Box>
