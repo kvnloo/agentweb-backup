@@ -56,11 +56,13 @@ class SlackChannelAdapter implements IMessagingChannel {
       // postThreadResponse: that one also runs markdown→mrkdwn conversion and
       // chunking for Emma's long-form replies, which would change what a plain
       // notification looks like.
-      const result = await postSlackMessage(
-        params.destination,
-        params.text,
-        params.replyToMessageId,
-      );
+      // Pass the thread arg only when there IS one. Sending an explicit `undefined`
+      // is behaviorally identical for Slack, but it changes the call arity that the
+      // existing Slack suites assert against — and those suites passing untouched is
+      // the evidence that introducing this seam left Slack alone.
+      const result = params.replyToMessageId
+        ? await postSlackMessage(params.destination, params.text, params.replyToMessageId)
+        : await postSlackMessage(params.destination, params.text);
       return { messageId: result.ts || null };
     } catch (e) {
       throw new SlackChannelError(
