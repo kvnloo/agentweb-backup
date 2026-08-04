@@ -345,16 +345,22 @@ async function openGeminiSession(
       // ENG-525: previously tuned LOW/LOW/1200ms for one heavy dogfooder's
       // pause-heavy speech, which made ordinary turn-taking and barge-in feel
       // sluggish next to ChatGPT's voice mode. Tightened to HIGH sensitivity
-      // and a sub-second silence window for snappier turn-taking; the 600ms
-      // floor still leaves room for a normal in-sentence breath before Emma
-      // reads it as end-of-turn.
+      // and a sub-second silence window for snappier turn-taking. 800ms
+      // (rather than a more aggressive ~600ms) is a deliberate hedge: this
+      // tuning hasn't been validated against real speech, and the ORIGINAL
+      // 1200ms value existed specifically to stop Emma cutting off
+      // pause-heavy speakers mid-thought — going too aggressive risks
+      // reintroducing that exact failure mode for a different set of users.
+      // Watch the voiceInterrupted / voiceTurnCompleted / responseLatencyMs
+      // telemetry (onboardingTelemetry.ts) after shipping before tightening
+      // further.
       realtimeInputConfig: {
         automaticActivityDetection: {
           disabled: false,
           startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
           endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
           prefixPaddingMs: 200,
-          silenceDurationMs: 600,
+          silenceDurationMs: 800,
         },
         activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
       },

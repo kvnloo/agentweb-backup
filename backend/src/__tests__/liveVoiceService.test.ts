@@ -252,10 +252,13 @@ describe('startLiveSession', () => {
       startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
       endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
     }));
-    // Snappy, but not a hair-trigger: keep a small floor above 0 so a normal
-    // in-sentence breath doesn't get read as end-of-turn.
-    expect(detection.silenceDurationMs).toBeGreaterThanOrEqual(400);
-    expect(detection.silenceDurationMs).toBeLessThanOrEqual(800);
+    // Snappy, but not a hair-trigger: keep enough of a floor that a normal
+    // in-sentence breath (or a pause-heavy speaker mid-thought) doesn't get
+    // read as end-of-turn — unvalidated with real speech at ship time, so
+    // biased toward the safer end of "snappier than the old 1200ms" rather
+    // than the most aggressive value tested.
+    expect(detection.silenceDurationMs).toBeGreaterThanOrEqual(700);
+    expect(detection.silenceDurationMs).toBeLessThanOrEqual(900);
   });
 
   it('starting a second session for the same sessionId replaces the old one', async () => {
