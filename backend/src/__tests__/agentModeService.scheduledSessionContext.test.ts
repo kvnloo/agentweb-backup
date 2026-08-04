@@ -387,6 +387,21 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(getUnattendedExecutionDirective('regular', false, true)).toBe('');
     expect(getUnattendedExecutionDirective(undefined, true, true)).toBe('');
   });
+
+  it('names the exact publish tools the owner designated when they are supplied', () => {
+    const scoped = getUnattendedExecutionDirective('scheduled', false, true, ['post_on_connected_account']);
+    expect(scoped).toContain('they explicitly designated post_on_connected_account');
+    expect(scoped).toContain('(post_on_connected_account)');
+    // authorization must be scoped — it does not silently cover other publish tools
+    expect(scoped).not.toContain('publish_landing_page_changes');
+    expect(scoped).toContain('does not waive any other limit');
+  });
+
+  it('falls back to the full-autonomy wording when authorized with no tools named', () => {
+    const broad = getUnattendedExecutionDirective('scheduled', false, true, []);
+    expect(broad).toContain('marked it fully autonomous');
+    expect(broad).toContain('PRE-AUTHORIZED to publish');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

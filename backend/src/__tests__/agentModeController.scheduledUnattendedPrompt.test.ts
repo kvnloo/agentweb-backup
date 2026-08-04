@@ -320,4 +320,36 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).toContain('NOT pre-authorized to publish');
     expect(sp).not.toContain('PRE-AUTHORIZED to publish');
   });
+
+  // ── The actual production shape (ENG-827) ────────────────────────────────────
+  // Every reported session ran on a schedule with requiredFunctionCalls naming
+  // post_on_connected_account and fullAutonomy OFF — the toggle is surfaced as
+  // governing mid-run questions, so no owner automating a daily post ticks it.
+  // Authorization MUST come from the required-tool declaration, or the fix never
+  // fires for a single real schedule.
+  it('AUTHORIZES publishing when the owner required the publish tool, even with fullAutonomy OFF', async () => {
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
+      scheduleId: SCHEDULE_ID,
+      fullAutonomy: false,
+      requiredFunctionCalls: ['post_on_connected_account'],
+    } as any);
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('PRE-AUTHORIZED to publish');
+    expect(sp).not.toContain('NOT pre-authorized to publish');
+    // the directive must name the exact tool the owner designated
+    expect(sp).toContain('they explicitly designated post_on_connected_account');
+  });
+
+  it('still WITHHOLDS when the required functions contain no publishing tool', async () => {
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
+      scheduleId: SCHEDULE_ID,
+      fullAutonomy: false,
+      requiredFunctionCalls: ['you_search_web', 'create_social_media_posts', 'send_email'],
+    } as any);
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('NOT pre-authorized to publish');
+    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
+  });
 });
