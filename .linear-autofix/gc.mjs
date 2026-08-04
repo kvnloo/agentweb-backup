@@ -11,6 +11,7 @@ import path from 'node:path';
 import { config } from './config.mjs';
 import { resolveIssue, addComment } from './linear.mjs';
 import { lockActive } from './lock.mjs';
+import { gitRepoOp, pruneRepoLocks } from './repo-lock.mjs';
 import { admissionWithdrawal } from './admission.mjs';
 import { evictIdlePreviews, evictUnderMemoryPressure, stalePreviews } from './preview/policy.mjs';
 
@@ -50,10 +51,13 @@ function removeWorktree(id) {
   let branch = null;
   const main = config.repos.find((r) => r.mount === '.');
   if (main) { const r = gitIn(wtPathOf(WT, main), ['rev-parse', '--abbrev-ref', 'HEAD']); if (r.status === 0) branch = r.stdout.trim(); }
+  // Serialized against the poller's assemble()/teardown() — a reap landing mid-`worktree add` is the
+  // same shared-.git race that killed ENG-890, just from the other side. See repo-lock.mjs.
   for (const repo of [...config.repos].reverse()) {
-    spawnSync('git', ['-C', repoRootOf(repo), 'worktree', 'remove', '--force', wtPathOf(WT, repo)]);
-    spawnSync('git', ['-C', repoRootOf(repo), 'worktree', 'prune']);
-    if (branch) spawnSync('git', ['-C', repoRootOf(repo), 'branch', '-D', branch]);
+    const root = repoRootOf(repo);
+    gitRepoOp(root, ['worktree', 'remove', '--force', wtPathOf(WT, repo)], { log });
+    gitRepoOp(root, ['worktree', 'prune'], { log });
+    if (branch) gitRepoOp(root, ['branch', '-D', branch], { log });
   }
   rmSync(WT, { recursive: true, force: true });
 }
@@ -194,6 +198,10 @@ async function main() {
       }
     } catch (e) { log(`preview auto-refresh failed: ${e.message}`); }
   }
+
+  // Repo-level git locks are keyed by repo root, not issue id, so the issue sweep below never sees them.
+  // acquireLock already reclaims a dead holder's file; this just stops abandoned ones accumulating.
+  pruneRepoLocks(locksDir);
 
   // Worktree dirs (may be empty). Even with none, we still reconcile worktree-less state entries below,
   // so this no longer early-returns.

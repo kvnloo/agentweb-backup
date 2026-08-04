@@ -15,6 +15,8 @@ import { assigneeRefreshPatch } from './git-identity.mjs';
 import { admitSnapshot } from './admission.mjs';
 import { abortWithdrawnInFlight } from './gc.mjs';
 import { recoveryDecision } from './recovery.mjs';
+import { knownIdentifiers } from './processed-gate.mjs';
+import { lockActive } from './lock.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const statePath = path.join(__dirname, 'state.json');
@@ -46,7 +48,10 @@ async function runBugs(queue, width = Math.max(1, config.maxConcurrent || 1)) {
 }
 
 async function processNewBugs() {
-  const known = new Set(Object.values(loadState()).filter((e) => e && e.identifier).map((e) => e.identifier));
+  // Every issue already in state.json is skipped — EXCEPT one whose last run died assembling its
+  // workspace with retries left. That failure is about the box (a shared-.git race, a disk hiccup), not
+  // the bug, and it left no work behind, so it gets re-admitted (ENG-890). See processed-gate.mjs.
+  const known = knownIdentifiers(Object.values(loadState()), { isLocked: lockActive });
   let eligibleCount = 0; // # new+forced bugs SEEN this cycle before the WIP cap trims how many we take
 
   // 0) Forced pickups. A human tagged these with `forceLabel` ("autofix") to demand an immediate fix —

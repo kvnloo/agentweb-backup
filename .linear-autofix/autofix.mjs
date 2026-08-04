@@ -16,8 +16,9 @@ import { applyAssigneeIdentity, applyWorktreeIdentity, resolveAssigneeGhToken } 
 import { findSessionId, fetchItem, summarizeSession } from './tools/session.mjs';
 import { evictPreviewsToFit, atConcurrentPreviewCap } from './preview/policy.mjs';
 import { acquireLock, releaseLock } from './lock.mjs';
+import { gitRepoOp } from './repo-lock.mjs';
 import { admissionWithdrawal, signalSuppressionVerdict } from './admission.mjs';
-import { isAlreadyProcessed } from './processed-gate.mjs';
+import { isAlreadyProcessed, MAX_SETUP_ATTEMPTS } from './processed-gate.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..'); // the agentweb (main) repo root
@@ -65,7 +66,9 @@ function saveState(s) { writeFileSync(statePath, JSON.stringify(s, null, 2)); }
 // git identity (commit attribution) and their raw Linear email (keys the per-assignee PR-token map,
 // which may differ from the commit email when a git-identity override is used). Both are needed by
 // the chat UI to attribute its own commits/PRs, so they must survive every rewrite.
-const STICKY_FIELDS = ['assignee', 'assigneeEmail', 'admit'];
+// `setupFailures` is sticky so the retry budget survives the 'started' rewrite each retry performs —
+// without that the counter resets every attempt and a broken repo retries forever (ENG-890).
+const STICKY_FIELDS = ['assignee', 'assigneeEmail', 'admit', 'setupFailures'];
 
 // The in-flight run's abort context (ENG-654): so a between-stage admission re-check OR an external
 // SIGTERM (from gc/poll) can kill THIS run's detached claude process group and tear its workspace down.
@@ -140,13 +143,29 @@ export function claudeArgs({ model, maxTurns, mcp, skipPermissions = config.skip
   return a;
 }
 
+// Every git call below mutates a repo ROOT that all issues share (worktree metadata, refs, and — the
+// ENG-890 killer — `.git/config`, which `worktree add` rewrites to set the new branch's upstream). Two
+// forced bugs starting in the same poll cycle used to collide there and one died with
+// "could not lock config file .git/config: File exists". gitRepoOp serializes these across processes
+// and rides out contention from anyone we can't lock against. See repo-lock.mjs.
+const gitRepo = (repo, args, opts) => gitRepoOp(repoRootOf(repo), args, { log: (m) => log(m), ...opts });
+
 // Remove a previous workspace: nested repo worktrees first, then the root, then the dir.
 function teardown(WT) {
   for (const repo of [...config.repos].reverse()) {
-    spawnSync('git', ['-C', repoRootOf(repo), 'worktree', 'remove', '--force', wtPathOf(WT, repo)]);
-    spawnSync('git', ['-C', repoRootOf(repo), 'worktree', 'prune']);
+    gitRepo(repo, ['worktree', 'remove', '--force', wtPathOf(WT, repo)]);
+    gitRepo(repo, ['worktree', 'prune']);
   }
   rmSync(WT, { recursive: true, force: true });
+}
+
+// Drop whatever `git worktree add` managed to create before it died, so a retry doesn't hit the
+// non-transient "'<path>' already exists". It fails on the config write AFTER laying down the
+// directory, so without this the second attempt would fail for a brand-new reason.
+function clearPartialWorktree(repo, wt) {
+  gitRepo(repo, ['worktree', 'remove', '--force', wt], { attempts: 2 });
+  gitRepo(repo, ['worktree', 'prune'], { attempts: 2 });
+  rmSync(wt, { recursive: true, force: true });
 }
 
 // Build the full-project workspace: root repo first, then each nested repo on the same branch.
@@ -154,9 +173,11 @@ function assemble(WT, branch) {
   teardown(WT);
   for (const repo of config.repos) {
     const wt = wtPathOf(WT, repo);
-    gitIn(repoRootOf(repo), ['fetch', 'origin', repo.base]);
+    gitRepo(repo, ['fetch', 'origin', repo.base]);
     mkdirSync(path.dirname(wt), { recursive: true });
-    const add = gitIn(repoRootOf(repo), ['worktree', 'add', '-B', branch, wt, `origin/${repo.base}`]);
+    const add = gitRepo(repo, ['worktree', 'add', '-B', branch, wt, `origin/${repo.base}`], {
+      beforeRetry: () => clearPartialWorktree(repo, wt),
+    });
     if (add.status !== 0) return { ok: false, repo: repo.key, err: add.stderr };
   }
   return { ok: true };
@@ -168,12 +189,13 @@ export function assembleFromBranch(WT, branch) {
   teardown(WT);
   for (const repo of config.repos) {
     const wt = wtPathOf(WT, repo);
-    const root = repoRootOf(repo);
-    const hasRemoteBranch = gitIn(root, ['fetch', 'origin', branch]).status === 0;
-    gitIn(root, ['fetch', 'origin', repo.base]);
+    const hasRemoteBranch = gitRepo(repo, ['fetch', 'origin', branch]).status === 0;
+    gitRepo(repo, ['fetch', 'origin', repo.base]);
     mkdirSync(path.dirname(wt), { recursive: true });
     const start = hasRemoteBranch ? `origin/${branch}` : `origin/${repo.base}`;
-    const add = gitIn(root, ['worktree', 'add', '-B', branch, wt, start]);
+    const add = gitRepo(repo, ['worktree', 'add', '-B', branch, wt, start], {
+      beforeRetry: () => clearPartialWorktree(repo, wt),
+    });
     if (add.status !== 0) return { ok: false, repo: repo.key, err: add.stderr };
   }
   return { ok: true };
@@ -351,11 +373,19 @@ async function main() {
   log('Assembling full project workspace...');
   const asm = assemble(WT, branch);
   if (!asm.ok) {
+    // ENG-890: a setup failure is about the BOX, not the bug, so it must not bury the issue. Count the
+    // attempt (the counter is sticky across the 'started' rewrite) and let the poller re-admit it until
+    // the budget in processed-gate.mjs runs out.
+    const attempts = (Number(state[issue.id]?.setupFailures) || 0) + 1;
+    const left = Math.max(0, MAX_SETUP_ATTEMPTS - attempts);
     log(`Failed to set up worktree (${asm.repo}):`, asm.err);
-    await addComment(issue.id, `⚠️ Auto-fix could not start: failed to create the \`${asm.repo}\` worktree.\n\n\`\`\`\n${asm.err}\n\`\`\``);
-    updateState(issue.id, { identifier: id, title: issue.title || '', outcome: 'setup_failed', at: new Date().toISOString() });
+    log(`Setup attempt ${attempts}/${MAX_SETUP_ATTEMPTS} — ${left ? `${left} retr${left === 1 ? 'y' : 'ies'} left; the poller will pick this up again` : 'budget exhausted; needs a human'}`);
+    await addComment(issue.id, `⚠️ Auto-fix could not start: failed to create the \`${asm.repo}\` worktree (attempt ${attempts} of ${MAX_SETUP_ATTEMPTS}).\n\n\`\`\`\n${asm.err}\n\`\`\`\n\n${left ? `This is an infrastructure failure, not a problem with this issue — the poller will retry automatically on its next cycle.` : `Retry budget exhausted — this needs a look from a human.`}`);
+    updateState(issue.id, { identifier: id, title: issue.title || '', outcome: 'setup_failed', setupFailures: attempts, at: new Date().toISOString() });
     return;
   }
+  // Assembly worked — clear the failure budget so an unrelated failure months from now starts fresh.
+  if (state[issue.id]?.setupFailures) updateState(issue.id, { ...loadState()[issue.id], setupFailures: 0 });
   log(`Workspace ready at ${WT} on ${branch} (${config.repos.map((r) => r.key).join(', ')})`);
   // Also persist the assignee's identity into each worktree's own git config (not just the GIT_* env),
   // so a manual commit made in the worktree is attributed to them too, not to the box default.
