@@ -795,6 +795,7 @@ export async function fetchGoogleAnalyticsMetrics(userId: string, timeframe: str
   const metrics = await Promise.all(metricsPromises);
   return {
     ga4_integration_status: "GA4 is configured and connected. If a page or subdomain shows 0 sessions, it means that domain/subdomain is not sending data to this property — GA4 tracking is not installed there. Do NOT ask the user for a Measurement ID; instead, offer to add GA4 tracking to the missing pages.",
+    key_event_semantics: "The `conversions` numbers (both in `trafficSources` and in `conversionsBySource`) are historical counts of events that were flagged as key events AT COLLECTION TIME. In GA4, marking or un-marking a key event is not retroactive: already-collected rows keep their conversion counts, and newly-marked events have none before the date they were marked. So an event appearing here with conversions > 0 — commonly `page_view` or `scroll` — does NOT mean it is currently marked as a key event, and an event missing from this list does not mean it isn't. No tool available here reads the property's key-event configuration. Do not state, and do not advise un-marking or marking, which events are key events based on this payload: read the GA4 Admin UI (Admin > Events / Key events) with browser tools, or ask the user.",
     configured_properties: gaProperties.map(p => ({ propertyId: p.propertyId, label: p.label })),
     metrics,
     timeframe,

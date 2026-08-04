@@ -492,7 +492,7 @@ emmaToolRegistry.register({
 
 Actions:
 - search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person.
-- get-profile: Get detailed profile info (headline, location, network_distance, is_open_profile, etc.) for a LinkedIn user by provider_id.
+- get-profile: Get detailed profile info (headline, About, location, network_distance, is_open_profile, etc.) for a LinkedIn user by profile_url or provider_id. This reads the LIVE profile from the connected/platform-wide Unipile account — it is the ONLY authoritative source for a person's current headline/About. NEVER take a headline, About, or other profile-identity field from a you_search_web snippet or a page-source scrape: search caches lag LinkedIn edits by many months and will report a stale headline as if current. When you specifically need the CURRENT profile — a founder/profile readiness audit, or a "what is my headline right now?" question — pass force_refresh=true to bypass the profile cache and read live. If no LinkedIn account can be resolved, get-profile fails with an explicit connect-LinkedIn error; surface that and prompt the user to connect LinkedIn rather than substituting search-snippet text.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
@@ -621,6 +621,10 @@ For target person identification (send-invite, send-message, get-profile, update
         cursor: {
           type: 'string',
           description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations.'
+        },
+        force_refresh: {
+          type: 'boolean',
+          description: 'For get-profile ONLY. Set true to bypass the 30-day profile cache and read the CURRENT profile live from the connected Unipile account — use it for a founder/profile readiness audit or any "what is my headline/About right now?" read so a months-stale cached value is never returned as current. Omit (cache-first) for high-volume outreach where an occasionally-cached profile is acceptable and dedup/rate-limit matter.'
         }
       },
       required: ['action']
@@ -6599,7 +6603,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), key-event/conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement, and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement, and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {
