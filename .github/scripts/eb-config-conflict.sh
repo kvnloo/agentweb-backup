@@ -72,23 +72,34 @@ INSTANCE_KEYS=(
 
 log() { printf '[eb-config-conflict] %s\n' "$1"; }
 
-# Content of a changed file, for classification.
+# Content of a changed file for classification: the UNION of what it said
+# before and what it says now.
 #
-# A DELETED or renamed config still carries a delta: removing a file that
-# declared `aws:elbv2:loadbalancer` is a resource change, and removing one that
-# declared `commands:` is an instance change. Guessing which is unnecessary —
-# the content is still in git. Read it from the base ref and classify the
-# removal by exactly what it removed.
+# A change carries a delta in BOTH directions, so either revision alone is
+# blind to half of them:
 #
-# Echoes the content, or nothing if it cannot be recovered.
+#   added declaration      only in head   (edit adds aws:elbv2:loadbalancer)
+#   REMOVED declaration    only in base   (edit deletes that block in place)
+#   deleted file           only in base   (whole file removed)
+#   new file               only in head
+#
+# Reading head alone missed whole-file deletions. Reading head, plus base only
+# for absent paths, still missed an in-place removal — a file that keeps
+# existing while dropping its `aws:elbv2:loadbalancer` block contributed no
+# resource hit, so pairing that with an instance change sailed through. Both
+# were Greptile findings on #2267.
+#
+# The union is the honest answer: removing a declaration is as much a delta as
+# adding one, and classification should not care which direction it went.
+#
+# Echoes the combined content, or nothing if neither revision is readable.
 content_of() {
   local f="$1" path="${REPO_ROOT%/}/$1"
-  if [ -f "${path}" ]; then
-    cat "${path}"
-    return 0
-  fi
   if [ -n "${BASE_REF}" ]; then
     git -C "${REPO_ROOT}" show "${BASE_REF}:${f}" 2>/dev/null || true
+  fi
+  if [ -f "${path}" ]; then
+    cat "${path}"
   fi
 }
 
@@ -145,6 +156,11 @@ main() {
 
     local origin=''
     [ -f "${REPO_ROOT%/}/${f}" ] || origin=' (deleted — classified from its removed content)'
+    if [ -n "${origin}" ]; then
+      :
+    elif [ -n "${BASE_REF}" ]; then
+      origin=' (classified from base+head, so removed declarations count too)'
+    fi
 
     if contains_any "${content}" "${RESOURCE_NAMESPACES[@]}"; then
       resource_hits="${resource_hits}  ${f} (resource namespace)${origin}"$'\n'

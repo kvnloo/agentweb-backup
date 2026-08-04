@@ -241,6 +241,49 @@ run_check_with_base "$R" backend/.ebextensions/timeout.config
 check 'ENG-836: a deleted resource config on its own still passes' 0 \
   'no instance-config change alongside'
 
+# Greptile's third finding on #2267: an IN-PLACE removal. The file still
+# exists, so head-only classification sees no resource declaration — but the
+# edit deleted the `aws:elbv2:loadbalancer` block, which is a resource delta
+# just as much as adding one. Paired with an instance change that is the
+# forbidden combination, and it passed.
+R=$(new_root); write_resource_config "$R"; write_platform_conf "$R"
+commit_root "$R"
+cat >"$R/backend/.ebextensions/timeout.config" <<'EOF'
+# the resource declaration was removed in place; the file lives on.
+option_settings:
+  aws:elasticbeanstalk:application:environment:
+    SOME_FLAG: "1"
+EOF
+run_check_with_base "$R" \
+  backend/.ebextensions/timeout.config \
+  backend/.platform/nginx/conf.d/agent-mode-timeout.conf
+check 'ENG-836: a declaration removed IN PLACE still counts as a resource delta' 1 \
+  'EB_CONFIG_CONFLICT'
+check 'ENG-836: and the output says it was classified from base+head' 1 \
+  'removed declarations count too'
+
+# The mirror: an in-place removal of instance config paired with a resource edit.
+R=$(new_root); write_resource_config "$R"; write_instance_config "$R"
+commit_root "$R"
+cat >"$R/backend/.ebextensions/chromium.config" <<'EOF'
+# the instance-side declarations were removed in place; the file lives on.
+# NB: this comment deliberately avoids naming those keys - the classifier
+# matches on literal text, so writing them here would make the fixture
+# classify as instance config and the test would pass for the wrong reason.
+option_settings:
+  aws:elasticbeanstalk:application:environment:
+    CHROME: "0"
+EOF
+run_check_with_base "$R" \
+  backend/.ebextensions/timeout.config \
+  backend/.ebextensions/chromium.config
+check 'ENG-836: an in-place instance removal beside a resource edit is rejected' 1 \
+  'EB_CONFIG_CONFLICT'
+# Pin WHY it fails: the removed files:/commands: must be attributed to the
+# instance side. Without this the check could pass for an unrelated reason.
+check 'ENG-836: and the in-place removal is attributed to the instance side' 1 \
+  'chromium.config (instance config)'
+
 # Content genuinely unrecoverable (deleted, and no base ref supplied). We
 # cannot tell which side it was, so it counts as BOTH rather than neither.
 R=$(new_root); write_resource_config "$R"
