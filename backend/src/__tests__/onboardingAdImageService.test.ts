@@ -934,6 +934,220 @@ describe("onboardingAdImageService", () => {
       expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
+    // The ownership checks above all decide from a READ. Between that read and
+    // the write they authorise, a newer run can stamp the axis — so the write
+    // must restate the decision as a DynamoDB condition, and treat an unmet
+    // condition exactly like the stale branch (Greptile round 3).
+    const conditionOf = (call: any[]) => call[2]?.condition;
+
+    it("conditions a terminal failure on the axis identity it read", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      errSpy.mockRestore();
+
+      const condition = conditionOf(userDb.updateUser.mock.calls[0]);
+      expect(condition.expression).toBe("#axisStart = :axisStart");
+      expect(condition.names).toEqual({ "#axisStart": "adImageStartedAt" });
+      expect(condition.values).toEqual({ ":axisStart": RUN_AT });
+    });
+
+    it("conditions a terminal failure on ABSENCE when the axis it read was unstamped", async () => {
+      // Writing `#axisStart = :axisStart` with an undefined value would be an
+      // invalid expression; an unstamped axis must assert non-existence so a
+      // run that stamps one mid-write still wins.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+        })
+        .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
+      userDb.updateUser.mockResolvedValue({});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      errSpy.mockRestore();
+
+      const condition = conditionOf(userDb.updateUser.mock.calls[0]);
+      expect(condition.expression).toBe("attribute_not_exists(#axisStart)");
+      expect(condition.values).toBeUndefined();
+    });
+
+    it("swallows a ConditionalCheckFailedException on the failure write — a run started mid-write", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("The conditional request failed"), {
+          code: "ConditionalCheckFailedException",
+        }),
+      );
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+      await expect(
+        triggerAdImageGenerationForUser("u1", {
+          imageGen: new FakeImageGen(okResponder) as any,
+          verifyLogoUrl: async () => false,
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("restarted mid-write"),
+        expect.objectContaining({ userId: "u1" }),
+      );
+      warnSpy.mockRestore();
+      errSpy.mockRestore();
+    });
+
+    it("re-throws a non-conditional failure-write error instead of hiding it", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "running",
+          icpResult: [onePersona],
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockRejectedValue(new Error("dynamo exploded"));
+
+      await expect(
+        triggerAdImageGenerationForUser("u1", {
+          imageGen: new FakeImageGen(okResponder) as any,
+          verifyLogoUrl: async () => true,
+        }),
+      ).rejects.toThrow("dynamo exploded");
+    });
+
+    it("conditions the READY publish on the axis identity it read", async () => {
+      // Widest window on the axis: the chat-session mirror runs between the
+      // read that authorises the publish and the publish itself.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => true,
+      });
+
+      expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("ready");
+      expect(conditionOf(userDb.updateUser.mock.calls[0])).toEqual({
+        expression: "#axisStart = :axisStart",
+        names: { "#axisStart": "adImageStartedAt" },
+        values: { ":axisStart": RUN_AT },
+      });
+    });
+
+    it("swallows a ConditionalCheckFailedException on the ready write", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("The conditional request failed"), {
+          code: "ConditionalCheckFailedException",
+        }),
+      );
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+      await expect(
+        triggerAdImageGenerationForUser("u1", {
+          imageGen: new FakeImageGen(okResponder) as any,
+          verifyLogoUrl: async () => true,
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("stale completion"),
+        expect.objectContaining({ userId: "u1" }),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("re-throws a non-conditional ready-write error instead of hiding it", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockRejectedValue(new Error("dynamo exploded"));
+
+      await expect(
+        triggerAdImageGenerationForUser("u1", {
+          imageGen: new FakeImageGen(okResponder) as any,
+          verifyLogoUrl: async () => true,
+        }),
+      ).rejects.toThrow("dynamo exploded");
+    });
+
     it("falls back to empty personas when icpResult is non-array", async () => {
       userDb.getUserById
         .mockResolvedValueOnce({
