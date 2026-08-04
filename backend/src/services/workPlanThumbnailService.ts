@@ -54,7 +54,20 @@ export class WorkPlanThumbnailService {
     return crypto.randomBytes(6).toString('hex');
   }
 
-  async generateAIThumbnail(plan: WorkPlan): Promise<WorkPlan> {
+  /**
+   * @param opts.enforceOrdering Default true, for the fire-and-forget jobs kicked
+   *   off at create and at a clear: those must not land if the thumbnail moved on
+   *   while they ran. Pass false for a user-initiated regenerate, where the admin
+   *   is waiting on the result — a skipped write there would be reported to them
+   *   as success while the database kept the old thumbnail.
+   */
+  async generateAIThumbnail(
+    plan: WorkPlan,
+    opts: { enforceOrdering?: boolean } = {},
+  ): Promise<WorkPlan> {
+    const ordering = opts.enforceOrdering === false
+      ? {}
+      : { expectedSource: plan.thumbnail_source ?? null };
     const description = plan.description || 'A professional marketing automation tool';
     const prompt = THUMBNAIL_PROMPT_TEMPLATE.replace('{title}', plan.title).replace(
       '{description}',
@@ -75,7 +88,7 @@ export class WorkPlanThumbnailService {
           `[ThumbnailService] AI generation failed for plan ${plan.planId}:`,
           result.error,
         );
-        return this.setNoThumbnail(plan);
+        return this.setNoThumbnail(plan, ordering);
       }
 
       const imageBuffer = await downloadBuffer(result.imageUrl);
@@ -95,16 +108,14 @@ export class WorkPlanThumbnailService {
         thumbnail_url: url,
         thumbnail_source: 'ai',
         thumbnail_alt_text: updated.thumbnail_alt_text,
-      // Automatic: only write if the thumbnail is still what this job started
-      // from, so an upload or a clear made meanwhile is not undone.
-      }, { expectedSource: plan.thumbnail_source ?? null });
+      }, ordering);
       return updated;
     } catch (err) {
       console.error(
         `[ThumbnailService] Error generating thumbnail for plan ${plan.planId}:`,
         err,
       );
-      return this.setNoThumbnail(plan);
+      return this.setNoThumbnail(plan, ordering);
     }
   }
 
@@ -163,16 +174,16 @@ export class WorkPlanThumbnailService {
     return cleared;
   }
 
-  private async setNoThumbnail(plan: WorkPlan): Promise<WorkPlan> {
+  private async setNoThumbnail(
+    plan: WorkPlan,
+    ordering: { expectedSource?: string | null },
+  ): Promise<WorkPlan> {
     const updated: WorkPlan = { ...plan, thumbnail_source: 'none' };
-    // Preserve any existing thumbnail_url when just setting source to 'none' on failure
-    // Also automatic — the AI failure path must not stamp 'none' over an upload
-    // or a clear the admin made while generation was running.
-    await workPlanService.updateThumbnail(
-      plan.planId,
-      { thumbnail_source: 'none' },
-      { expectedSource: plan.thumbnail_source ?? null },
-    );
+    // Preserve any existing thumbnail_url when just setting source to 'none' on
+    // failure. Carries the same ordering as the generation attempt it belongs to,
+    // so a background failure cannot stamp 'none' over an upload or a clear made
+    // while it ran — but a user-initiated regenerate still records its failure.
+    await workPlanService.updateThumbnail(plan.planId, { thumbnail_source: 'none' }, ordering);
     return updated;
   }
 }

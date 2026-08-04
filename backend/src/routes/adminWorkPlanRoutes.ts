@@ -208,7 +208,9 @@ router.post("/:planId/thumbnail/generate", async (req, res) => {
     const plan = await workPlanService.getWorkPlan(req.params.planId);
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
 
-    const updated = await workPlanThumbnailService.generateAIThumbnail(plan);
+    // User-initiated and synchronous: the admin is waiting on this result, so it
+    // must not be silently skipped by the background-write ordering (ENG-889).
+    const updated = await workPlanThumbnailService.generateAIThumbnail(plan, { enforceOrdering: false });
     res.json(updated);
   } catch (error) {
     console.error("Error generating thumbnail:", error);
