@@ -3310,17 +3310,30 @@ export async function generateSessionResponse(
           // ENG-827: resolve the owner's standing publish authorization for this
           // schedule — primarily the publish tools they designated as required at
           // schedule-creation time (see resolveSchedulePublishAuthorization). A
-          // failed read degrades to the safe default (not authorized → draft &
-          // notify), and a prompt-enrichment lookup must never break the run.
-          let publishAuth = resolveSchedulePublishAuthorization(null);
+          // prompt-enrichment lookup must never break the run.
+          //
+          // A schedule we successfully READ and that withholds authorization →
+          // 'withheld' (draft & notify). A schedule we could NOT read → 'unknown',
+          // which emits no publish block at all. That distinction matters: this
+          // prompt is rebuilt on every verification attempt and re-reads the
+          // schedule each time, whereas runScheduledChat fixes the required-function
+          // list once from its own snapshot. Treating an unreadable schedule as
+          // "forbidden" would let one throttled read assert a prohibition against a
+          // tool the checker still requires — re-creating the very nudge-loop
+          // contradiction this ticket exists to remove (Greptile P1).
+          let publishAuthorization: 'authorized' | 'withheld' | 'unknown' = 'withheld';
+          let authorizedPublishTools: string[] = [];
           if (scheduleIdMatch) {
             try {
-              publishAuth = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleIdMatch[1]));
+              const auth = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleIdMatch[1]));
+              publishAuthorization = auth.authorized ? 'authorized' : 'withheld';
+              authorizedPublishTools = auth.tools;
             } catch (scheduleLookupError) {
-              console.error(`AgentMode: failed to resolve publish authorization for scheduled session ${session.sessionId}; defaulting to draft-and-notify:`, scheduleLookupError);
+              publishAuthorization = 'unknown';
+              console.error(`AgentMode: failed to resolve publish authorization for scheduled session ${session.sessionId}; omitting the publish directive for this turn rather than asserting a prohibition:`, scheduleLookupError);
             }
           }
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, publishAuth.authorized, publishAuth.tools);
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, publishAuthorization, authorizedPublishTools);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma

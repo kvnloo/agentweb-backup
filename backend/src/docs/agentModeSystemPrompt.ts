@@ -573,12 +573,23 @@ export function getScheduledSessionOverride(sessionType?: string): string {
 // the publish tools the owner listed in the schedule's `requiredFunctionCalls` —
 // see that helper for why `fullAutonomy` alone is not a sufficient signal.
 // `authorizedPublishTools` names those exact tools so the directive authorizes
-// precisely what the owner asked for and nothing more. Default false → the safe,
-// draft-and-notify behaviour; never inferred by the model.
+// precisely what the owner asked for and nothing more.
+//
+// The signal is deliberately TRI-STATE, not a boolean:
+//   'authorized' → publish; the owner's standing configuration is the approval.
+//   'withheld'   → do not publish; draft and notify once. The safe default.
+//   'unknown'    → we could not read the schedule, so emit NO publish block at all.
+// 'unknown' exists because the prompt is re-assembled on every verification attempt
+// and re-reads the schedule each time, while the required-function checker decides
+// once from its own start-of-run snapshot. A single transient read failure must not
+// make the prompt FORBID a tool the checker still requires — that manufactures
+// exactly the contradiction this ticket is about (Greptile P1). Staying silent on an
+// unreadable schedule leaves the model's own cautious default in charge, which is
+// safe, instead of asserting a prohibition we cannot actually justify.
 export function getUnattendedExecutionDirective(
   sessionType?: string,
   isAdmin?: boolean,
-  publishAuthorized?: boolean,
+  publishAuthorization?: 'authorized' | 'withheld' | 'unknown',
   authorizedPublishTools?: string[]
 ): string {
   if (sessionType !== 'scheduled') return '';
@@ -625,7 +636,9 @@ COMPLETION GATE (before final output):
 - Before producing your final report, run a completion check: verify that every entity has had every required step either completed or explicitly marked blocked-with-reason. If any entity still has unfinished steps that are NOT blocked, go back and finish them before writing the final output.
 
 SURFACE GAPS AS ACTIONABLE ITEMS:
-- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.${publishAuthorized
+- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.${publishAuthorization === 'unknown'
+  ? ''
+  : publishAuthorization === 'authorized'
   ? `
 
 PUBLISH AUTHORIZATION — this schedule is PRE-AUTHORIZED to publish (CRITICAL):
