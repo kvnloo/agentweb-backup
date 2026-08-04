@@ -50,6 +50,7 @@ If a production bug happens:
 | Integration | Contract | Status | Notes |
 | --- | --- | --- | --- |
 | Meta Ads / Facebook Marketing API | [meta-ads-contract.md](./meta-ads-contract.md) | Filled | Highest priority. Many shipped bugs came from payload shape, account resolution, and creative semantics. |
+| WhatsApp Business Platform (Cloud API) | [whatsapp-contract.md](./whatsapp-contract.md) | Filled | Two platform rules make correct-looking code undeliverable: the 24-hour service window, and Meta's pause on marketing templates to US numbers. |
 | PR research index | [pr-research-index.md](./pr-research-index.md) | Filled | Traceability from shipped integration PRs to contract rules. |
 | Other integrations | [external-integrations-map.md](./external-integrations-map.md) | Map only | Source files and risks are identified; full contracts should be added as those areas are touched. |
 
