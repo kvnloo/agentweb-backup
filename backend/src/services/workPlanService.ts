@@ -129,6 +129,50 @@ export class WorkPlanService {
     }).promise();
   }
 
+  /**
+   * Write only the thumbnail attributes of a plan.
+   *
+   * updateWorkPlan is a whole-item put, so it is unsafe for the thumbnail
+   * pipeline: AI generation is fired and forgotten at create time holding the
+   * plan as it looked then, and finishes seconds-to-minutes later. Putting that
+   * snapshot back silently reverted any edit made in the meantime — an admin
+   * fixing a step right after creating a plan would watch the fix disappear
+   * with no error (found while live-testing ENG-889).
+   *
+   * A field is left untouched when its key is absent, and REMOVEd when the key
+   * is present with an undefined value.
+   */
+  async updateThumbnail(
+    planId: string,
+    fields: Partial<Pick<WorkPlan, 'thumbnail_url' | 'thumbnail_source' | 'thumbnail_alt_text'>>,
+  ): Promise<void> {
+    const sets = ['#updatedAt = :updatedAt'];
+    const removes: string[] = [];
+    const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
+    const values: Record<string, any> = { ':updatedAt': new Date().toISOString() };
+
+    const KEYS = ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_text'] as const;
+    for (const key of KEYS) {
+      if (!(key in fields)) continue;
+      names[`#${key}`] = key;
+      const value = fields[key];
+      if (value === undefined) {
+        removes.push(`#${key}`);
+      } else {
+        sets.push(`#${key} = :${key}`);
+        values[`:${key}`] = value;
+      }
+    }
+
+    await dynamodb.update({
+      TableName: this.tableName,
+      Key: { planId },
+      UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+    }).promise();
+  }
+
   async deleteWorkPlan(planId: string): Promise<void> {
     await dynamodb.delete({
       TableName: this.tableName,

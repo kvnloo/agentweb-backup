@@ -89,7 +89,13 @@ export class WorkPlanThumbnailService {
         thumbnail_source: 'ai',
         thumbnail_alt_text: `Thumbnail for ${plan.title}`,
       };
-      await workPlanService.updateWorkPlan(updated);
+      // Attribute-scoped write: this runs long after create, so putting the
+      // whole snapshot back would revert edits made in the meantime (ENG-889).
+      await workPlanService.updateThumbnail(plan.planId, {
+        thumbnail_url: url,
+        thumbnail_source: 'ai',
+        thumbnail_alt_text: updated.thumbnail_alt_text,
+      });
       return updated;
     } catch (err) {
       console.error(
@@ -122,7 +128,11 @@ export class WorkPlanThumbnailService {
       thumbnail_source: 'upload',
       thumbnail_alt_text: `Thumbnail for ${plan.title}`,
     };
-    await workPlanService.updateWorkPlan(updated);
+    await workPlanService.updateThumbnail(plan.planId, {
+      thumbnail_url: url,
+      thumbnail_source: 'upload',
+      thumbnail_alt_text: updated.thumbnail_alt_text,
+    });
     return updated;
   }
 
@@ -134,7 +144,11 @@ export class WorkPlanThumbnailService {
       thumbnail_source: 'none',
       thumbnail_alt_text: undefined,
     };
-    await workPlanService.updateWorkPlan(cleared);
+    await workPlanService.updateThumbnail(plan.planId, {
+      thumbnail_url: undefined,
+      thumbnail_source: 'none',
+      thumbnail_alt_text: undefined,
+    });
 
     // Trigger AI regeneration asynchronously — caller gets the cleared state immediately
     this.generateAIThumbnail(cleared).catch((err) =>
@@ -150,7 +164,7 @@ export class WorkPlanThumbnailService {
   private async setNoThumbnail(plan: WorkPlan): Promise<WorkPlan> {
     const updated: WorkPlan = { ...plan, thumbnail_source: 'none' };
     // Preserve any existing thumbnail_url when just setting source to 'none' on failure
-    await workPlanService.updateWorkPlan(updated);
+    await workPlanService.updateThumbnail(plan.planId, { thumbnail_source: 'none' });
     return updated;
   }
 }
