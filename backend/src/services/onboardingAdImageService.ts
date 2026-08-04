@@ -768,7 +768,17 @@ async function failAdImageRunIfOwned(
   const axisStartRaw = (current as any)?.adImageStartedAt;
   const axisStart =
     typeof axisStartRaw === "string" ? Date.parse(axisStartRaw) : NaN;
-  if (Number.isFinite(ourStart) && Number.isFinite(axisStart) && axisStart > ourStart) {
+  // Drop when the axis carries a start that is provably not ours:
+  //   - it is strictly newer than the one we entered with, or
+  //   - we have no parseable start at all, so a stamp being there means one
+  //     was written after we began (the eager-invocation case: a run that
+  //     never went through adImageStartPatch must not outrank one that did).
+  // Only a completely unstamped axis is inconclusive, and there we still
+  // write — swallowing a real failure is what produced this ticket.
+  const axisIsNotOurs =
+    Number.isFinite(axisStart) &&
+    (!Number.isFinite(ourStart) || axisStart > ourStart);
+  if (axisIsNotOurs) {
     // eslint-disable-next-line no-console
     console.warn(
       "[onboardingAdImageService] dropping stale failure — a newer run owns the axis",
