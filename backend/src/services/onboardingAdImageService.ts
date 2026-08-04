@@ -55,9 +55,11 @@ import {
   IcpBrandContext,
 } from "./onboardingIcpService";
 import {
+  classifyBrandLogoUrl,
   getPersistedBrandLogoUrl,
   resolveBrandGuidelinesForLoadedUser,
 } from "./agentMode/brandLogo";
+import type { BrandLogoProbeDeps } from "./agentMode/brandLogo";
 import type { ICPPersona } from "./icpStatusService";
 import type { CreativeDirResult } from "./creativeDirStatusService";
 import {
@@ -77,9 +79,6 @@ type AdImageFormat = "1080x1080" | "1080x1350";
 
 /** Hard per-variant timeout. Beyond this we patch with placeholder. */
 const PER_VARIANT_TIMEOUT_MS = 180_000;
-
-/** Timeout for the one-shot logo preflight fetch (ENG-792). */
-const LOGO_PREFLIGHT_TIMEOUT_MS = 15_000;
 
 /** Default Gemini Pro image model — supports 1080x1080 + 1080x1350. */
 const DEFAULT_IMAGE_MODEL = "gemini-3-pro-image-preview";
@@ -714,72 +713,18 @@ export async function generateAdImagesForUser(
  * instead of shipping broken placeholders (consistent with the ENG-326 gate —
  * ad images are never generated with a broken/invented/approximate logo).
  *
- * Returns true when the URL responds 2xx with a non-empty body whose
- * content-type is not clearly textual (an image, a generic binary type, or
- * unknown — `processInputImage`'s getImageMimeType sniffs the extension and
- * defaults to image/png in those cases). Only textual/document error bodies
- * (text/*, application/json) are rejected. Never throws.
+ * Thin fail-CLOSED wrapper over `classifyBrandLogoUrl` (the shared probe in
+ * agentMode/brandLogo, which also backs the brand-build rediscovery gate).
+ * Only an outright `'usable'` verdict lets the run proceed: an inconclusive
+ * probe (timeout / DNS / 5xx) blocks too, because the alternative is burning
+ * three Gemini calls to produce three placeholders. The user gets an
+ * actionable error and a Retry button instead. Never throws.
  */
 export async function isBrandLogoFetchable(
   logoUrl: string,
-  deps: {
-    httpGet?: (url: string) => Promise<{
-      status?: number;
-      headers?: Record<string, unknown>;
-      data?: unknown;
-    }>;
-  } = {}
+  deps: BrandLogoProbeDeps = {}
 ): Promise<boolean> {
-  if (typeof logoUrl !== "string" || logoUrl.trim() === "") return false;
-  const httpGet =
-    deps.httpGet ??
-    (async (url: string) => {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const axios = (await import("axios")).default;
-      return axios.get(url, {
-        responseType: "arraybuffer",
-        timeout: LOGO_PREFLIGHT_TIMEOUT_MS,
-        headers: { "User-Agent": "Mozilla/5.0 (compatible; AgentWeb/1.0)" },
-      });
-    });
-  try {
-    const resp = await httpGet(logoUrl);
-    // axios rejects non-2xx by default, but an injected fetcher (or a custom
-    // validateStatus) might not — reject explicitly.
-    if (
-      typeof resp?.status === "number" &&
-      (resp.status < 200 || resp.status >= 300)
-    ) {
-      return false;
-    }
-    const data: any = resp?.data;
-    const byteLength =
-      data == null
-        ? 0
-        : typeof data.byteLength === "number"
-          ? data.byteLength
-          : typeof data.length === "number"
-            ? data.length
-            : 0;
-    if (byteLength <= 0) return false;
-    const contentType = String(
-      (resp?.headers as any)?.["content-type"] || ""
-    ).toLowerCase();
-    // Only reject clearly-textual/document error bodies served with 200 (an
-    // HTML/JSON/text response is not a usable logo). Generic binary types
-    // (application/octet-stream, binary/octet-stream) and empty/unknown
-    // content-types are allowed through — processInputImage's getImageMimeType
-    // tolerates those by sniffing the URL extension and defaulting to
-    // image/png, so gating them here would regress logos that generate fine
-    // today (e.g. S3 objects lacking ContentType metadata).
-    const isTextualContentType =
-      contentType.startsWith("text/") ||
-      contentType.startsWith("application/json");
-    if (isTextualContentType) return false;
-    return true;
-  } catch {
-    return false;
-  }
+  return (await classifyBrandLogoUrl(logoUrl, deps)) === "usable";
 }
 
 /**
@@ -996,6 +941,7 @@ export async function triggerAdImageGenerationForUser(
   }
 
   const current = await userDb.getUserById(userId);
+
   const patch = adImageReadyPatch(((current as any) || {}) as AdImageStatusFields, result);
   if (!patch) {
     // Stale completion (user is no longer in `running` or current is missing)
