@@ -135,7 +135,7 @@ export class WorkPlanThumbnailService {
     plan: WorkPlan,
     buffer: Buffer,
     mimeType: string,
-  ): Promise<WorkPlan> {
+  ): Promise<WorkPlan | null> {
     const extMap: Record<string, string> = {
       'image/jpeg': 'jpg',
       'image/jpg': 'jpg',
@@ -160,10 +160,14 @@ export class WorkPlanThumbnailService {
       thumbnail_source: 'upload',
       thumbnail_alt_text: updated.thumbnail_alt_text,
     });
-    return { ...updated, ...(writtenAt && { updatedAt: writtenAt }) };
+    // Unconditional apart from attribute_exists, so null means the plan was
+    // deleted while the image was uploading. Returning the locally built object
+    // would report a 200 for a plan that no longer exists.
+    if (!writtenAt) return null;
+    return { ...updated, updatedAt: writtenAt };
   }
 
-  async removeThumbnail(plan: WorkPlan): Promise<WorkPlan> {
+  async removeThumbnail(plan: WorkPlan): Promise<WorkPlan | null> {
     // Clear the current thumbnail fields first
     const cleared: WorkPlan = {
       ...plan,
@@ -176,7 +180,10 @@ export class WorkPlanThumbnailService {
       thumbnail_source: 'none',
       thumbnail_alt_text: undefined,
     });
-    if (clearedAt) cleared.updatedAt = clearedAt;
+    // Same as above: null here means the plan is gone, so there is nothing to
+    // clear and nothing to regenerate.
+    if (!clearedAt) return null;
+    cleared.updatedAt = clearedAt;
 
     // Trigger AI regeneration asynchronously — caller gets the cleared state
     // immediately. `cleared` carries the post-clear updatedAt, so this job is

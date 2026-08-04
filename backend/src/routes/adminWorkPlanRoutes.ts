@@ -256,6 +256,8 @@ router.post(
         buffer,
         mimetype,
       );
+      // null means the plan was deleted while the upload was in flight.
+      if (!updated) return res.status(404).json({ message: "Work plan not found" });
       res.json(updated);
     } catch (error: any) {
       // multer file-size limit throws a specific error
@@ -275,6 +277,8 @@ router.delete("/:planId/thumbnail", async (req, res) => {
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
 
     const updated = await workPlanThumbnailService.removeThumbnail(plan);
+    // null means the plan was deleted while the clear was in flight.
+    if (!updated) return res.status(404).json({ message: "Work plan not found" });
     res.json(updated);
   } catch (error) {
     console.error("Error removing thumbnail:", error);
