@@ -737,7 +737,13 @@ describe("onboardingAdImageService", () => {
       expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
-    it("patches with adImageFailedPatch when image generator throws", async () => {
+    it("fails the run when EVERY variant fails (ENG-792 — no 'ready' with zero images)", async () => {
+      // Regression for the reported account. Each variant is individually
+      // caught and folded into a placeholder, and the run used to ship as
+      // "ready" on that basis. But zero live variants also means the
+      // chat-session mirror never runs, so /images renders "No images found"
+      // while onboarding reports three ad images — the exact reported
+      // symptom. Total failure must be a failed run.
       userDb.getUserById
         .mockResolvedValueOnce({
           userId: "u1",
@@ -754,19 +760,74 @@ describe("onboardingAdImageService", () => {
           throw new Error("hard crash inside generator");
         },
       };
-      // The orchestrator wraps each variant in its own try/catch — a thrown
-      // error becomes a placeholder, NOT a failed run. Verify the run still
-      // ends in 'ready' with placeholders. (Hard failures are routed via the
-      // partial-failure path because we always want the UI to render
-      // something.)
       await triggerAdImageGenerationForUser("u1", {
         imageGen: throwingGen as any,
         verifyLogoUrl: async () => true,
       });
       errSpy.mockRestore();
       const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("failed");
+      expect(written.adImageError).toMatch(/no usable images/i);
+      // A failed run must not leave placeholder variants behind for the UI to
+      // try to render.
+      expect(written.adImageResult).toBeUndefined();
+    });
+
+    it("still ships 'ready' on a PARTIAL failure (ENG-792 scope guard)", async () => {
+      // Only total failure is fatal. One good variant is degraded-but-usable,
+      // and blocking onboarding over a single flaky variant would be worse
+      // than shipping what did land.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+        })
+        .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
+      userDb.updateUser.mockResolvedValue({});
+      let call = 0;
+      const flakyGen = {
+        generateImage: async () => {
+          call += 1;
+          return call === 1
+            ? { success: true, imageUrl: "https://s3/real-1.png" }
+            : { success: false, error: "model flaked" };
+        },
+      };
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: flakyGen as any,
+        verifyLogoUrl: async () => true,
+      });
+      const written = userDb.updateUser.mock.calls[0][1];
       expect(written.adImageStatus).toBe("ready");
       expect(written.adImageResult.variants).toHaveLength(3);
+    });
+
+    it("drops a total failure silently when a newer run owns the state", async () => {
+      // Staleness convention mirrors adImageReadyPatch (which returns null off
+      // 'running'): a late-finishing run must not stomp a newer one's status.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+        })
+        .mockResolvedValueOnce({ userId: "u1", adImageStatus: "ready" });
+      userDb.updateUser.mockResolvedValue({});
+      const throwingGen = {
+        generateImage: async () => {
+          throw new Error("hard crash inside generator");
+        },
+      };
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: throwingGen as any,
+        verifyLogoUrl: async () => true,
+      });
+      expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
     it("falls back to empty personas when icpResult is non-array", async () => {
