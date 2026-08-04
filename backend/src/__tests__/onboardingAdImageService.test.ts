@@ -442,6 +442,9 @@ describe("onboardingAdImageService", () => {
     // both reads — that is what marks the run as owning the axis. Fixtures
     // that stamp only the second read would look like a foreign newer run.
     const RUN_AT = "2026-08-04T00:00:00.000Z";
+    // The nonce adImageStartPatch mints alongside RUN_AT. This, not the
+    // timestamp, is what proves ownership.
+    const RUN_ID = "adimg_11111111-1111-4111-8111-111111111111";
 
     it("returns silently when user is missing", async () => {
       userDb.getUserById.mockResolvedValue(null);
@@ -940,7 +943,73 @@ describe("onboardingAdImageService", () => {
     // condition exactly like the stale branch (Greptile round 3).
     const conditionOf = (call: any[]) => call[2]?.condition;
 
-    it("conditions a terminal failure on the axis identity it read", async () => {
+    it("drops a terminal failure from a DIFFERENT run that shares our start timestamp (Greptile)", async () => {
+      // adImageStartedAt is millisecond-resolution, so two runs starting in
+      // the same millisecond carry byte-identical stamps. Ordering alone
+      // cannot separate them — each would be authorised to write the other
+      // off. The nonce can, and does.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+          adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT, // same millisecond…
+          adImageRunId: "adimg_22222222-2222-4222-8222-222222222222", // …different run
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      warnSpy.mockRestore();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("conditions a terminal failure on the run nonce it read", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+          adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      errSpy.mockRestore();
+
+      const condition = conditionOf(userDb.updateUser.mock.calls[0]);
+      expect(condition.expression).toBe("#axisRun = :axisRun");
+      expect(condition.names).toEqual({ "#axisRun": "adImageRunId" });
+      expect(condition.values).toEqual({ ":axisRun": RUN_ID });
+    });
+
+    it("conditions a nonce-less (legacy) axis on the timestamp AND the nonce still being absent", async () => {
+      // Records written before the nonce shipped only have a timestamp. The
+      // extra attribute_not_exists is what stops a run that starts mid-write
+      // — and therefore mints a nonce — from being overwritten on the
+      // strength of a colliding millisecond.
       userDb.getUserById
         .mockResolvedValueOnce({
           userId: "u1",
@@ -964,8 +1033,13 @@ describe("onboardingAdImageService", () => {
       errSpy.mockRestore();
 
       const condition = conditionOf(userDb.updateUser.mock.calls[0]);
-      expect(condition.expression).toBe("#axisStart = :axisStart");
-      expect(condition.names).toEqual({ "#axisStart": "adImageStartedAt" });
+      expect(condition.expression).toBe(
+        "attribute_not_exists(#axisRun) AND #axisStart = :axisStart",
+      );
+      expect(condition.names).toEqual({
+        "#axisRun": "adImageRunId",
+        "#axisStart": "adImageStartedAt",
+      });
       expect(condition.values).toEqual({ ":axisStart": RUN_AT });
     });
 
@@ -991,7 +1065,9 @@ describe("onboardingAdImageService", () => {
       errSpy.mockRestore();
 
       const condition = conditionOf(userDb.updateUser.mock.calls[0]);
-      expect(condition.expression).toBe("attribute_not_exists(#axisStart)");
+      expect(condition.expression).toBe(
+        "attribute_not_exists(#axisRun) AND attribute_not_exists(#axisStart)",
+      );
       expect(condition.values).toBeUndefined();
     });
 
@@ -1067,11 +1143,13 @@ describe("onboardingAdImageService", () => {
           icpResult: [onePersona],
           brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
           adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
         })
         .mockResolvedValueOnce({
           userId: "u1",
           adImageStatus: "running",
           adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
         });
       userDb.updateUser.mockResolvedValue({});
       await triggerAdImageGenerationForUser("u1", {
@@ -1081,9 +1159,9 @@ describe("onboardingAdImageService", () => {
 
       expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("ready");
       expect(conditionOf(userDb.updateUser.mock.calls[0])).toEqual({
-        expression: "#axisStart = :axisStart",
-        names: { "#axisStart": "adImageStartedAt" },
-        values: { ":axisStart": RUN_AT },
+        expression: "#axisRun = :axisRun",
+        names: { "#axisRun": "adImageRunId" },
+        values: { ":axisRun": RUN_ID },
       });
     });
 
