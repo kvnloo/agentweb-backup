@@ -201,3 +201,145 @@ export async function resolvePinnedPublicAddress(rawUrl: string): Promise<{ host
 export async function assertPublicHostname(rawUrl: string): Promise<void> {
   await resolvePinnedPublicAddress(rawUrl);
 }
+
+/** Minimal response shape shared by the injected and real HTTP transports. */
+export interface HttpResponseLike {
+  status: number;
+  headers: Record<string, any>;
+  data: any;
+}
+
+export interface RedirectFetchDeps {
+  resolvePinned?: (url: string) => Promise<{ hostname: string; address: string; family: number }>;
+  request?: (
+    url: string,
+    pinned: { address: string; family: number },
+    timeoutMs: number,
+    maxBytes: number
+  ) => Promise<HttpResponseLike>;
+}
+
+export const DEFAULT_MAX_REDIRECTS = 5;
+const DEFAULT_TIMEOUT_MS = 30000;
+
+/**
+ * Hard ceiling on a fetched image. The caller feeds this agent-supplied URLs, so
+ * a hostile (or merely careless) origin could otherwise stream an unbounded body
+ * that we buffer whole and hand to sharp — memory/CPU exhaustion that can take
+ * the backend down. 40MB leaves generous headroom over the largest images we
+ * actually see (~17MB from gemini-3.1-flash-image at 4K) while keeping a single
+ * describe_image call's footprint bounded.
+ */
+export const DEFAULT_MAX_IMAGE_BYTES = 40 * 1024 * 1024;
+
+/**
+ * Fetch a URL's bytes SSRF-safely, following redirects hop by hop.
+ *
+ * Pinning the connection to a pre-validated address (resolvePinnedPublicAddress)
+ * is DNS-rebinding-safe but only for the hop it validated: a public URL that
+ * 302s to 169.254.169.254 walks straight past it, which is why the naive guard
+ * pairs pinning with `maxRedirects: 0`. Refusing all redirects closes that hole
+ * and simultaneously false-blocks every legitimate one-hop URL — Google Drive
+ * `uc?export=view` links 303 once to drive.usercontent.google.com, and
+ * describe_image was failing on exactly those (ENG-834).
+ *
+ * Following hop-by-hop with a fresh resolvePinned on EVERY hop keeps both
+ * properties: SSRF-safe across redirects, and correct for legitimately
+ * redirecting media URLs. Same shape as
+ * googleAdsTrackingPreflight.fetchHtmlFollowingRedirects, which learned this
+ * lesson first — this is its byte-returning sibling.
+ *
+ * Deps are injectable so redirect/SSRF behaviour is unit-testable without real
+ * network or DNS. Content-type is returned verbatim (params stripped) and is
+ * NEVER defaulted — fabricating a media type would short-circuit sharp's format
+ * detection downstream (ENG-370).
+ */
+export async function fetchBufferFollowingRedirects(
+  startUrl: string,
+  deps: RedirectFetchDeps = {},
+  maxRedirects: number = DEFAULT_MAX_REDIRECTS,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  maxBytes: number = DEFAULT_MAX_IMAGE_BYTES
+): Promise<{ buffer: Buffer; contentType: string; finalUrl: string }> {
+  const resolvePinned = deps.resolvePinned ?? resolvePinnedPublicAddress;
+  const request = deps.request ?? defaultPinnedRequest;
+
+  // timeoutMs bounds the WHOLE fetch, not each hop. Per-hop it would multiply by
+  // the redirect limit (6 hops x 30s = 180s), and this download runs OUTSIDE
+  // describe_image's 90s vision bound — so a slow chain could stall a tool call
+  // for minutes and eat the run's generation budget (the unbounded-media-call
+  // failure ENG-294 exists to prevent).
+  const deadline = Date.now() + timeoutMs;
+
+  let url = startUrl;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error(`Timed out following redirects after ${timeoutMs}ms`);
+    }
+    // Re-validate the resolved host at EVERY hop, not just the first.
+    const pinned = await resolvePinned(url);
+    const res = await request(url, pinned, remainingMs, maxBytes);
+
+    if (res.status >= 200 && res.status < 300) {
+      // The transport already caps the response, but re-check here so an injected
+      // or future transport that ignores the cap still cannot hand an unbounded
+      // buffer to sharp. Declared Content-Length is checked first because it
+      // rejects without inspecting the body at all.
+      const declared = Number(res.headers?.['content-length'] ?? res.headers?.['Content-Length']);
+      if (Number.isFinite(declared) && declared > maxBytes) {
+        throw new Error(`Image too large: declared ${declared} bytes exceeds the ${maxBytes}-byte limit`);
+      }
+      const buffer = Buffer.isBuffer(res.data) ? res.data : Buffer.from(res.data ?? []);
+      if (buffer.length > maxBytes) {
+        throw new Error(`Image too large: ${buffer.length} bytes exceeds the ${maxBytes}-byte limit`);
+      }
+      const rawType = res.headers?.['content-type'] ?? res.headers?.['Content-Type'] ?? '';
+      return {
+        buffer,
+        contentType: String(rawType).split(';')[0].trim(),
+        finalUrl: url,
+      };
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers?.location ?? res.headers?.Location;
+      if (!location) throw new Error(`Redirect ${res.status} with no Location header`);
+      const next = new URL(String(location), url); // resolve relative Location against current URL
+      if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+        throw new Error(`Refusing to follow non-http(s) redirect to ${next.protocol}`);
+      }
+      url = next.toString();
+      continue;
+    }
+
+    throw new Error(`Request failed with status code ${res.status}`);
+  }
+  throw new Error(`Too many redirects (>${maxRedirects})`);
+}
+
+/* istanbul ignore next — network boundary; unit tests inject `request` instead. */
+async function defaultPinnedRequest(
+  url: string,
+  pinned: { address: string; family: number },
+  timeoutMs: number,
+  maxBytes: number
+): Promise<HttpResponseLike> {
+  const axios = (await import('axios')).default;
+  return axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: timeoutMs,
+    // Abort mid-stream once the body exceeds the cap, so an unbounded response
+    // is never fully buffered into memory (Greptile P1).
+    maxContentLength: maxBytes,
+    maxBodyLength: maxBytes,
+    // This transport handles redirects itself (above) so it can re-validate each
+    // hop; axios must therefore never follow one on its own.
+    maxRedirects: 0,
+    validateStatus: (s: number) => s >= 200 && s < 400,
+    lookup: (_hostname: string, options: any, callback: any) => {
+      if (typeof options === 'function') callback = options;
+      callback(null, pinned.address, pinned.family);
+    },
+  } as any);
+}
