@@ -4,6 +4,7 @@ describe('WorkPlanService', () => {
   let mockGet: jest.Mock;
   let mockQuery: jest.Mock;
   let mockDelete: jest.Mock;
+  let mockUpdate: jest.Mock;
   let mockPromise: jest.Mock;
 
   const mockTimestamp = '2026-03-24T10:00:00.000Z';
@@ -16,6 +17,7 @@ describe('WorkPlanService', () => {
     mockGet = jest.fn(() => ({ promise: mockPromise }));
     mockQuery = jest.fn(() => ({ promise: mockPromise }));
     mockDelete = jest.fn(() => ({ promise: mockPromise }));
+    mockUpdate = jest.fn(() => ({ promise: mockPromise }));
 
     jest.doMock('aws-sdk', () => ({
       DynamoDB: {
@@ -25,6 +27,7 @@ describe('WorkPlanService', () => {
           query: mockQuery,
           scan: jest.fn(() => ({ promise: mockPromise })),
           delete: mockDelete,
+          update: mockUpdate,
         })),
       },
     }));
@@ -255,6 +258,54 @@ describe('WorkPlanService', () => {
       expect(mockDelete).toHaveBeenCalledWith(expect.objectContaining({
         Key: { planId: 'p1' },
       }));
+    });
+  });
+
+  // ─── ENG-889 (found in live testing) ──────────────────────────────────────
+  // updateWorkPlan is a whole-item put, so the fire-and-forget thumbnail job —
+  // which holds the plan as it looked at creation — used to write that stale
+  // snapshot back minutes later and silently revert any edit made in between.
+  // Thumbnail writes must touch only the thumbnail attributes.
+  describe('updateThumbnail', () => {
+    it('issues a targeted update, never a whole-item put', async () => {
+      await workPlanService.updateThumbnail('p1', { thumbnail_url: 'https://x/y.png', thumbnail_source: 'ai' });
+
+      expect(mockPut).not.toHaveBeenCalled();
+      expect(mockUpdate).toHaveBeenCalledTimes(1);
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.Key).toEqual({ planId: 'p1' });
+      expect(arg.UpdateExpression).toContain('#thumbnail_url = :thumbnail_url');
+      expect(arg.UpdateExpression).toContain('#thumbnail_source = :thumbnail_source');
+      expect(arg.ExpressionAttributeValues[':thumbnail_url']).toBe('https://x/y.png');
+    });
+
+    it('does not touch fields the caller did not supply', async () => {
+      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'none' });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).not.toContain('thumbnail_url');
+      expect(arg.UpdateExpression).not.toContain('thumbnail_alt_text');
+    });
+
+    it('removes an attribute explicitly set to undefined', async () => {
+      await workPlanService.updateThumbnail('p1', {
+        thumbnail_url: undefined,
+        thumbnail_source: 'none',
+        thumbnail_alt_text: undefined,
+      });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).toMatch(/REMOVE .*#thumbnail_url/);
+      expect(arg.UpdateExpression).toMatch(/REMOVE .*#thumbnail_alt_text/);
+      expect(arg.ExpressionAttributeValues[':thumbnail_url']).toBeUndefined();
+    });
+
+    it('always refreshes updatedAt', async () => {
+      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).toContain('#updatedAt = :updatedAt');
+      expect(arg.ExpressionAttributeValues[':updatedAt']).toEqual(expect.any(String));
     });
   });
 });
