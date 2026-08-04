@@ -164,13 +164,24 @@ export class WorkPlanService {
       }
     }
 
-    await dynamodb.update({
-      TableName: this.tableName,
-      Key: { planId },
-      UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
-      ExpressionAttributeNames: names,
-      ExpressionAttributeValues: values,
-    }).promise();
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { planId },
+        UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        // update is an upsert. The thumbnail job runs long after create, so the
+        // plan may be deleted mid-flight; without this we would write back an
+        // item holding only planId and the thumbnail fields — no title, no
+        // steps — which breaks every consumer that maps over plan.steps.
+        ConditionExpression: 'attribute_exists(planId)',
+      }).promise();
+    } catch (err: any) {
+      // The plan is gone; a thumbnail for it is meaningless, not an error.
+      if (err?.code === 'ConditionalCheckFailedException') return;
+      throw err;
+    }
   }
 
   async deleteWorkPlan(planId: string): Promise<void> {

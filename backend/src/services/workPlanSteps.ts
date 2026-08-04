@@ -49,14 +49,33 @@ export function normalizeWorkPlanSteps(steps: any[]): NormalizedWorkPlanSteps {
       );
     }
 
+    // A wrong-shaped value is worse than a missing one: it stores without
+    // complaint and every consumer then skips it. setWorkPlanStatus gates on
+    // `typeof expectedAssetCount === 'number'`, so "18" would save and the gate
+    // would never fire — the silent no-op this issue is about. Report and drop.
+    const listOf = (key: 'requiredFunctionCalls' | 'skillIds') => {
+      const value = s[key];
+      if (value === undefined || Array.isArray(value)) return value || [];
+      warnings.push(`step ${i + 1}: ignored ${key} — expected an array`);
+      return [];
+    };
+
+    const assetCount = s.expectedAssetCount;
+    let keepAssetCount = assetCount !== undefined;
+    if (assetCount !== undefined
+      && (typeof assetCount !== 'number' || !Number.isFinite(assetCount) || assetCount < 0)) {
+      warnings.push(`step ${i + 1}: ignored expectedAssetCount — expected a non-negative number`);
+      keepAssetCount = false;
+    }
+
     return {
       stepCount: s.stepCount || i + 1,
       title: s.title || `Step ${i + 1}`,
       description: s.description,
       ...(s.userInstructions !== undefined && { userInstructions: s.userInstructions }),
-      requiredFunctionCalls: s.requiredFunctionCalls || [],
-      skillIds: s.skillIds || [],
-      ...(s.expectedAssetCount !== undefined && { expectedAssetCount: s.expectedAssetCount }),
+      requiredFunctionCalls: listOf('requiredFunctionCalls'),
+      skillIds: listOf('skillIds'),
+      ...(keepAssetCount && { expectedAssetCount: assetCount }),
     };
   });
 

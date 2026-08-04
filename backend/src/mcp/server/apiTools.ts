@@ -1985,13 +1985,21 @@ const normalizeWorkPlanSteps = (steps: any): any => {
   return steps.map((step: any) => {
     if (!step || typeof step !== 'object' || Array.isArray(step)) return step;
     const normalized: any = {};
+    // Copy everything that is already canonical first, then fill the gaps from
+    // snake_case aliases. Two passes rather than one because a single pass is
+    // key-order dependent: with `{required_function_calls, requiredFunctionCalls}`
+    // the later key would overwrite whatever the earlier one resolved to.
+    for (const [key, value] of Object.entries(step)) {
+      if (!WORK_PLAN_STEP_ALIASES[key]) normalized[key] = value;
+    }
     for (const [key, value] of Object.entries(step)) {
       const alias = WORK_PLAN_STEP_ALIASES[key];
-      // A camelCase value supplied alongside its snake_case twin wins.
-      if (alias) {
-        if (step[alias] === undefined) normalized[alias] = value;
-      } else {
-        normalized[key] = value;
+      if (!alias) continue;
+      // A camelCase value supplied alongside its snake_case twin wins — but
+      // JSON has no undefined, so a model emitting an unset field emits null.
+      // Treating that null as "present" would shadow a good snake_case value.
+      if (normalized[alias] === undefined || normalized[alias] === null) {
+        normalized[alias] = value;
       }
     }
     return normalized;
