@@ -54,7 +54,7 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
-import { BEDROCK_BEARER_TOKEN_MODELS, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
+import { BEDROCK_BEARER_TOKEN_MODELS, bedrockCacheTtl, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
   imageGenerationCostUsd,
@@ -1960,6 +1960,17 @@ export class AgentModeService {
     // Note: Newer Claude models require using inference profiles for cross-region access
     const actualModelId = resolveBedrockModelId(modelId);
 
+    // ENG-893: agent-mode conversations are human-paced, so the default
+    // 5-minute prompt-cache TTL expires between turns and the whole prefix is
+    // re-written at 1.25x input instead of read back at 0.1x. Ask for the
+    // 1-hour TTL on the models that support it. `undefined` (5m-only or
+    // non-Bedrock models) sends the bare block — Bedrock rejects `ttl` there.
+    const cacheTtl = bedrockCacheTtl(modelId);
+    // A fresh object per call site: the two checkpoints must not alias.
+    const cachePointBlock = () => ({
+      cachePoint: cacheTtl ? { type: 'default', ttl: cacheTtl } : { type: 'default' },
+    });
+
     // Create OpenAI-compatible wrapper using direct Converse API
     return {
       chat: {
@@ -1971,14 +1982,17 @@ export class AgentModeService {
             // --- Prompt caching ---
             // Add cache point after system prompt (~3.5K tokens cached on every call)
             if (system.length > 0) {
-              system.push({ cachePoint: { type: 'default' } });
+              system.push(cachePointBlock());
             }
             // Add cache point before the last message to cache the conversation prefix.
             // Within the tool-call iteration loop, each subsequent call only pays full
             // price for the newest exchange; all prior turns hit the cache.
+            // Both checkpoints carry the SAME ttl: Bedrock requires longer-TTL
+            // checkpoints to precede shorter ones, and mixing them here would
+            // leave the (much larger) history on the 5-minute expiry anyway.
             if (messages.length > 2) {
               const pivotMsg = messages[messages.length - 2];
-              pivotMsg.content = [...pivotMsg.content, { cachePoint: { type: 'default' } }];
+              pivotMsg.content = [...pivotMsg.content, cachePointBlock()];
             }
 
             // Convert tools to Bedrock toolConfig format
@@ -2046,7 +2060,13 @@ export class AgentModeService {
             const cacheWriteTokens = usage.cacheWriteInputTokens || 0;
 
             if (cacheReadTokens > 0 || cacheWriteTokens > 0) {
-              console.log(`AgentMode: Bedrock cache — read: ${cacheReadTokens}, write: ${cacheWriteTokens}, uncached input: ${inputTokens}, output: ${outputTokens}`);
+              // ENG-893: cacheDetails breaks the write down by the TTL Bedrock
+              // actually applied — the only way to confirm from prod logs that
+              // the 1-hour checkpoint was honoured rather than silently ignored.
+              const ttlBreakdown = (usage.cacheDetails || [])
+                .map((d: any) => `${d?.ttl}:${d?.inputTokens}`)
+                .join(',');
+              console.log(`AgentMode: Bedrock cache — read: ${cacheReadTokens}, write: ${cacheWriteTokens}${ttlBreakdown ? ` (${ttlBreakdown})` : ''}, uncached input: ${inputTokens}, output: ${outputTokens}`);
             }
 
             const stopReason: string = response.stopReason || '';
