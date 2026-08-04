@@ -360,9 +360,22 @@ process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) =>
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-// Graceful shutdown handler
-const gracefulShutdown = async (signal: string) => {
-  console.log(`\n${signal} received. Shutting down gracefully...`);
+// Drain every in-flight unit of work, WITHOUT exiting.
+//
+// Split out of gracefulShutdown for ENG-764: the ASG termination guard needs to
+// drain and then still be alive to answer its lifecycle hook (an exit here would
+// strand the instance in Terminating:Wait until the hook timed out). Memoized on
+// the promise, so the SIGTERM that follows an ASG-initiated drain joins the
+// in-progress drain instead of starting a second one.
+let drainPromise: Promise<void> | null = null;
+
+const drainForShutdown = (reason: string): Promise<void> => {
+  drainPromise ??= runDrain(reason);
+  return drainPromise;
+};
+
+const runDrain = async (reason: string): Promise<void> => {
+  console.log(`\n${reason}: draining in-flight work...`);
 
   // Register force-exit FIRST so it's always set, even if an await below hangs.
   // Force-exit buffer = drain ceiling + 3 min.
@@ -424,8 +437,14 @@ const gracefulShutdown = async (signal: string) => {
   // 6.5. Flush OTel spans (ENG-141) — best-effort, never rejects, no-op when
   //      tracing is off. Deploy-killed runs are exactly the traces we need.
   await (await import('./observability/tracing')).flushTelemetry();
+};
 
-  // 7. Clean exit
+// Graceful shutdown handler
+const gracefulShutdown = async (signal: string) => {
+  console.log(`\n${signal} received. Shutting down gracefully...`);
+  await drainForShutdown(signal);
+
+  // Clean exit
   process.exit(0);
 };
 
@@ -508,6 +527,16 @@ createTestAccount().then(async () => {
     console.log(`Server is running on port ${port}`);
     console.log(`WebSocket server is ready`);
     console.log(`Test account email: ${process.env.TEST_EMAIL}`);
+
+    // ENG-764: an EB deploy terminates this instance without waiting for the
+    // drain, killing any in-flight scheduled run. Watch for the ASG's termination
+    // signal, drain first, then release the instance. Self-disables off-ASG (local
+    // dev, the test box) where the IMDS lifecycle path 404s.
+    import('./services/asgLifecycleGuard')
+      .then(({ startAsgTerminationGuard }) =>
+        startAsgTerminationGuard(() => drainForShutdown('ASG termination'))
+      )
+      .catch((error) => console.error('Failed to start the ASG termination guard:', error));
 
     // Self-heal the telemetry/loop tables if missing — fire-and-forget, non-fatal.
     // Prevents the silent-no-op class of bug where a writer swallows
