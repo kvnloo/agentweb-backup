@@ -11,11 +11,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-08-04',
     changes: [
-      'Fixed: A Scheduled Run Interrupted by a Deployment Now Says So',
-      '- If we deployed an update while one of your scheduled runs was working, the run could stop partway through — and the note left in the chat told you the job was too large and to split it into smaller batches',
-      '- That advice was wrong: nothing was wrong with your request, and a smaller batch would have been interrupted in exactly the same way',
-      '- The note now states the real cause — the run was interrupted on our side — and confirms it is retried automatically, so you are not sent off rewriting a schedule that was never the problem',
-      '- These interrupted runs are also no longer counted as poor-quality results in our internal quality reporting, so genuine issues stand out instead of being buried',
+      'Fixed: Our Deployments No Longer Interrupt a Running Scheduled Task',
+      '- If we shipped an update while one of your scheduled runs was working, the server handling that run could be replaced mid-task — the run stopped partway through and only completed later, on a retry',
+      '- Deployments now wait for a scheduled run that is already in progress to finish before that server is retired, so an update no longer cuts your run short',
+      '- If a run is still interrupted for any other reason, the note left in the chat now states the real cause instead of telling you the job was too large and to split it into smaller batches — that advice was wrong, and a smaller batch would have been interrupted in exactly the same way',
+      '- Interrupted runs are also no longer counted as poor-quality results in our internal quality reporting, so genuine issues stand out instead of being buried',
     ],
   },
   {
