@@ -8811,8 +8811,22 @@ export const agentModeController = {
         return res.status(400).json({ error: 'llmModel is required' });
       }
 
+      // ENG-892: the picker used to persist whatever string arrived, so ids that
+      // are not served at all (e.g. 'claude-sonnet-4-5') were stored and later
+      // reported as the model a session ran on. Accept only what generation would
+      // accept — `fellBack` is true exactly when the id is not in the allow-list
+      // after legacy-alias resolution — and store the canonical id so the field
+      // stays comparable to the per-message `llm` provenance.
+      const resolution = agentModeService.resolveGenerationModel(llmModel);
+      if (resolution.fellBack) {
+        return res.status(400).json({
+          error: `Unsupported model '${llmModel}'. Choose a model returned by the supported-models endpoint.`,
+        });
+      }
+      const canonicalModel = resolution.model;
+
       // Block non-admins from using opus models
-      if (llmModel.includes('opus') && !user.isAdmin) {
+      if (canonicalModel.includes('opus') && !user.isAdmin) {
         return res.status(403).json({ error: 'Opus models are not available for your account' });
       }
 
@@ -8828,7 +8842,7 @@ export const agentModeController = {
       }
 
       // Update the session's llmModel
-      const updatedSession = await chatbotDb.updateSessionLlmModel(sessionId, llmModel);
+      const updatedSession = await chatbotDb.updateSessionLlmModel(sessionId, canonicalModel);
 
       res.json({ llmModel: updatedSession.llmModel });
     } catch (error) {
@@ -8848,8 +8862,20 @@ export const agentModeController = {
         return res.status(400).json({ error: 'llmModel is required' });
       }
 
+      // ENG-892: same allow-list guard as the authenticated picker. This path
+      // matters more, not less — an interactive-share viewer writes to the
+      // owner's real session, so an unserved id here mislabels someone else's
+      // session.
+      const resolution = agentModeService.resolveGenerationModel(llmModel);
+      if (resolution.fellBack) {
+        return res.status(400).json({
+          error: `Unsupported model '${llmModel}'. Choose a model returned by the supported-models endpoint.`,
+        });
+      }
+      const canonicalModel = resolution.model;
+
       // Shared sessions are non-admin; block opus models
-      if (llmModel.includes('opus')) {
+      if (canonicalModel.includes('opus')) {
         return res.status(403).json({ error: 'Opus models are not available for shared sessions' });
       }
 
@@ -8876,7 +8902,7 @@ export const agentModeController = {
       }
 
       // Update the session's llmModel
-      const updatedSession = await chatbotDb.updateSessionLlmModel(shareId, llmModel);
+      const updatedSession = await chatbotDb.updateSessionLlmModel(shareId, canonicalModel);
 
       res.json({ llmModel: updatedSession.llmModel });
     } catch (error) {
