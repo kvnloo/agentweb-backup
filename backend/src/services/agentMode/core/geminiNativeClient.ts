@@ -37,51 +37,74 @@ export interface GeminiRequestOptions {
 }
 
 /**
- * Strip JSON-Schema keywords the Gemini function-declaration schema rejects.
- * Gemini accepts an OpenAPI-3.0 subset; meta/compositional keywords like
- * `$schema`, `$ref`, `$defs`, and `additionalProperties` cause a 400. Applied
- * recursively; everything else (type/properties/items/required/enum/description/
- * anyOf/nullable) is preserved.
+ * Every field the `@google/genai` `Schema` type models — i.e. the complete set of
+ * keywords a Gemini function declaration accepts. Kept in sync with `Schema` in
+ * `@google/genai/dist/genai.d.ts`.
+ */
+const GEMINI_SCHEMA_KEYWORDS = new Set([
+  'anyOf', 'default', 'description', 'enum', 'example', 'format', 'items',
+  'maxItems', 'maxLength', 'maxProperties', 'maximum', 'minItems', 'minLength',
+  'minProperties', 'minimum', 'nullable', 'pattern', 'properties',
+  'propertyOrdering', 'required', 'title', 'type',
+]);
+
+/**
+ * Reduce a JSON Schema to the OpenAPI-3.0 subset a Gemini function declaration
+ * accepts. Gemini's validator rejects ANY unknown field outright — the whole
+ * request 400s the moment one offending tool is attached, so the agent turn dies
+ * before the first token with zero assistant output and null tokens/cost.
  *
- * Also drops any `x-*` vendor-extension keyword (e.g. `x-aliases`, used across
- * many tool schemas — search_tool_response, read_tool_response, etc. — to let
- * the model call a param by an alternate name). Gemini's schema validator
- * rejects unknown properties outright, so every tool carrying one 400s the
- * whole request the moment tools are attached — this broke 100% of real
- * gemini-3.5-flash tool-calling turns in prod (never caught by unit tests,
- * whose fixture schemas didn't happen to use an x-* keyword).
+ * ENG-845: this is an ALLOWLIST of the keywords `@google/genai`'s `Schema` models,
+ * not a denylist of known-bad ones. The denylist form regressed three times — it
+ * grew `x-*` (ENG-737: `x-aliases` on search_tool_response et al broke 100% of
+ * gemini tool turns), then `oneOf`/`allOf`/`const`, then union `type` arrays
+ * (ENG-826) — and was still incomplete: `@playwright/mcp@latest`, the MCP server
+ * registered in the prod `mcp_servers` setting, exposes `browser_drop` whose `data`
+ * property carries `propertyNames`, which 400s live today. MCP tool schemas are
+ * third-party input pinned to `@latest` (mcpClientService registers `tool.inputSchema`
+ * verbatim), so no enumeration of bad keywords can stay complete — only an allowlist
+ * closes the class. Confirmed live to 400: `propertyNames`, `examples`,
+ * `exclusiveMinimum`/`exclusiveMaximum`, `multipleOf`, `uniqueItems`, `readOnly`,
+ * `deprecated`, `contentEncoding`, `not`.
  *
- * Also drops `oneOf`/`allOf`/`const` — confirmed absent from the `@google/genai`
- * `Schema` type (only `anyOf` is supported), same class of bug as `x-aliases`.
- * Bedrock already needed an equivalent sanitizer (sanitizeSchemaForBedrock in
- * agentModeService.ts) for these exact keywords, because dynamically-discovered
- * MCP tool schemas (GitHub, etc. — arbitrary, not authored in this repo) can
- * carry them even though no hand-written tool here currently does.
+ * The filter is POSITION-AWARE: `properties` maps parameter NAMES to sub-schemas, so
+ * its keys must never be keyword-filtered (a parameter legitimately named `const` or
+ * `additionalProperties` would otherwise be deleted from the declaration, leaving the
+ * model unable to supply it). Only `properties` values, `items` and `anyOf` hold
+ * sub-schemas and are recursed into; `default`/`example` hold literal instance data
+ * and pass through untouched.
  *
- * ENG-826: also normalizes a JSON-Schema union `type` array (e.g.
- * `type: ['array', 'string']`, as used by emma/tools.ts — get_meta_ads_metrics
- * campaign_ids, gmail send to/cc/bcc). Gemini's function-declaration `Schema.type`
- * is a SINGLE OpenAPI type; a union array 400s the ENTIRE request the moment such
- * a tool is attached, so every gemini-3.5-flash agent turn carrying one terminated
- * with zero assistant output and null tokens (the ENG-826 silent-failure
- * signature) while Claude/Bedrock — which accept the union — ran fine. We collapse
- * the union to a single type: `array` is kept when present (so `items` stays
- * meaningful and the model can pass a list), otherwise the first non-`null` member;
- * a `null` member becomes `nullable: true`. Array-only keywords are dropped when
- * the resolved type is not `array`.
+ * ENG-826: a JSON-Schema union `type` array (e.g. `type: ['array', 'string']`, as
+ * used by emma/tools.ts — get_meta_ads_metrics campaign_ids, gmail send to/cc/bcc)
+ * is collapsed to the SINGLE OpenAPI type Gemini's `Schema.type` allows: `array` is
+ * kept when present (so `items` stays meaningful and the model can pass a list),
+ * else `object` when the node actually carries `properties`, else the first non-`null`
+ * member; a `null` member becomes `nullable: true`. Array-only keywords are dropped
+ * when the resolved type is not `array`. Claude/Bedrock accept the union, which is
+ * why only gemini-3.5-flash runs failed.
  */
 export function sanitizeGeminiSchema(schema: any): any {
   if (Array.isArray(schema)) return schema.map(sanitizeGeminiSchema);
   if (!schema || typeof schema !== 'object') return schema;
-  const DROP = new Set([
-    '$schema', '$id', '$ref', '$defs', 'definitions',
-    'additionalProperties', 'unevaluatedProperties', 'patternProperties',
-    'oneOf', 'allOf', 'const',
-  ]);
   const out: any = {};
   for (const [key, value] of Object.entries(schema)) {
-    if (DROP.has(key) || key.startsWith('x-')) continue;
-    out[key] = sanitizeGeminiSchema(value);
+    if (!GEMINI_SCHEMA_KEYWORDS.has(key)) continue;
+    if (key === 'properties') {
+      // Keys here are parameter names, not keywords — recurse into the values only.
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      const properties: any = {};
+      for (const [name, sub] of Object.entries(value)) properties[name] = sanitizeGeminiSchema(sub);
+      out.properties = properties;
+    } else if (key === 'items') {
+      // Gemini's `items` is a single Schema; a draft-07 tuple array 400s with
+      // `Unknown name "0" at ...items`. Keep the first element so the parameter
+      // stays usable instead of dropping the element schema outright.
+      out.items = sanitizeGeminiSchema(Array.isArray(value) ? value[0] : value);
+    } else if (key === 'anyOf') {
+      out.anyOf = sanitizeGeminiSchema(value);
+    } else {
+      out[key] = value;
+    }
   }
   if (Array.isArray(out.type)) {
     const members = out.type.filter((t: any) => typeof t === 'string');
