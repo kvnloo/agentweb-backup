@@ -2051,7 +2051,10 @@ mcpToolRegistry.register({
         show_login_signup: { type: 'string', enum: ['after_plan_completed', 'always'], description: 'When to show login/signup (create/update)' },
         default_model: { type: 'string', description: 'Default LLM model (create/update)' },
         category: { type: 'string', description: 'Plan category shown in the admin list, e.g. Paid Ads, Strategy, Content (create/update)' },
-        visibility: { type: 'string', enum: ['system', 'private', 'public', 'pending_review'], description: 'Who can see the plan. Defaults to system on create (create/update)' },
+        // Deliberately no `visibility` parameter. The route accepts it, but
+        // exposing it here would let a model publish a draft plan to every user
+        // — or unpublish a live one — off a single misread instruction. Leave
+        // that transition to a human in the portal (ENG-889).
         steps: {
           type: 'array',
           items: {
@@ -2086,7 +2089,6 @@ mcpToolRegistry.register({
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
         if (args.category !== undefined) body.category = args.category;
-        if (args.visibility !== undefined) body.visibility = args.visibility;
         const data = await mcpFetch({ method: 'POST', path: '/api/admin/work-plans', context: c, body });
         return jsonResult(data);
       }
@@ -2100,7 +2102,6 @@ mcpToolRegistry.register({
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
         if (args.category !== undefined) body.category = args.category;
-        if (args.visibility !== undefined) body.visibility = args.visibility;
         const data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
         return jsonResult(data);
       }

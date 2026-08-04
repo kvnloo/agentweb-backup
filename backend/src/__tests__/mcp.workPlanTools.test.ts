@@ -358,11 +358,12 @@ describe('Predefined Work Plan MCP Tools', () => {
     });
   });
 
-  // The admin route reads category and visibility, and the portal sets both —
-  // but they were absent from the tool, so an API-only caller had to open the
-  // portal to finish a plan it had just created (ENG-889).
-  describe('manage_predefined_work_plan - category and visibility', () => {
-    it('maps category and visibility on create', async () => {
+  // The admin route reads category, and the portal sets it — but it was absent
+  // from the tool, so an API-only caller had to open the portal to finish a plan
+  // it had just created (ENG-889). visibility is deliberately NOT exposed: it
+  // publishes to, or hides from, every user.
+  describe('manage_predefined_work_plan - category', () => {
+    it('maps category on create', async () => {
       mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
 
       await mcpToolRegistry.execute('manage_predefined_work_plan', {
@@ -370,30 +371,24 @@ describe('Predefined Work Plan MCP Tools', () => {
         title: 'Paid Ads Plan',
         steps: [{ title: 'Step 1' }],
         category: 'Paid Ads',
-        visibility: 'system',
       }, context);
 
-      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
-      expect(body.category).toBe('Paid Ads');
-      expect(body.visibility).toBe('system');
+      expect((mockMcpFetch.mock.calls[0][0] as any).body.category).toBe('Paid Ads');
     });
 
-    it('maps category and visibility on update', async () => {
+    it('maps category on update', async () => {
       mockMcpFetch.mockResolvedValue({ message: 'Updated' });
 
       await mcpToolRegistry.execute('manage_predefined_work_plan', {
         action: 'update',
         plan_id: 'wp-1',
         category: 'Strategy',
-        visibility: 'private',
       }, context);
 
-      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
-      expect(body.category).toBe('Strategy');
-      expect(body.visibility).toBe('private');
+      expect((mockMcpFetch.mock.calls[0][0] as any).body.category).toBe('Strategy');
     });
 
-    it('omits both when not supplied, leaving the route defaults alone', async () => {
+    it('omits category when not supplied, leaving the route default alone', async () => {
       mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
 
       await mcpToolRegistry.execute('manage_predefined_work_plan', {
@@ -402,19 +397,31 @@ describe('Predefined Work Plan MCP Tools', () => {
         steps: [{ title: 'Step 1' }],
       }, context);
 
-      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
-      expect('category' in body).toBe(false);
-      expect('visibility' in body).toBe(false);
+      expect('category' in (mockMcpFetch.mock.calls[0][0] as any).body).toBe(false);
     });
 
-    it('documents both on the tool', () => {
+    it('does not expose visibility on the tool', () => {
       const def: any = mcpToolRegistry.getTool('manage_predefined_work_plan')!.definition;
-      const props = def.inputSchema.properties;
-      expect(props.category).toBeDefined();
-      expect(props.visibility.enum).toEqual(
-        expect.arrayContaining(['system', 'private', 'public', 'pending_review']),
-      );
+      expect(def.inputSchema.properties.category).toBeDefined();
+      expect(def.inputSchema.properties.visibility).toBeUndefined();
     });
+
+    it.each([['create'], ['update']])(
+      'never forwards visibility to the route on %s, even if a caller sends it',
+      async (action) => {
+        mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action,
+          plan_id: 'wp-1',
+          title: 'Plan',
+          steps: [{ title: 'Step 1' }],
+          visibility: 'public',
+        }, context);
+
+        expect('visibility' in (mockMcpFetch.mock.calls[0][0] as any).body).toBe(false);
+      },
+    );
   });
 
   describe('manage_predefined_work_plan - update', () => {
