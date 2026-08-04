@@ -438,6 +438,7 @@ function buildPipeline(identifier, entry) {
     steps.push({
       key: stage, title: STAGE_TITLES[stage] || stage,
       turns: meta.turns ?? null, ms: meta.ms ?? null, timedOut: !!meta.timedOut,
+      cost: meta.cost ?? null, tokens: meta.tokens ?? null, // per-stage token/cost stamp (older cards lack this)
       report: stageReport(identifier, stage),
     });
   }

@@ -1063,7 +1063,12 @@ function renderPipeline(d) {
     const el = document.createElement('div');
     el.className = 'stage';
     const meta = [s.turns ? `${s.turns} turns` : '', fmtMs(s.ms), s.timedOut ? '⚠ timed out' : '', runAt].filter(Boolean).join(' · ');
-    el.innerHTML = `<div class="shead"><span class="arrow">▶</span><b>${esc(s.title)}</b><span class="smeta">${esc(meta)}</span></div>`
+    // Same token stamp the message bubbles show — the stage's total burn (older cards have no tokens/cost).
+    const t = s.tokens || {};
+    const stamp = (s.tokens || s.cost != null)
+      ? `${fmtTok(t.fresh || 0)}${(t.cacheRead || t.cacheWrite) ? ` (${fmtTok((t.cacheRead || 0) + (t.cacheWrite || 0))} cached)` : ''} ↑ · ${fmtTok(t.out || 0)} ↓${s.cost != null ? ` · $${s.cost.toFixed(2)}` : ''}`
+      : '';
+    el.innerHTML = `<div class="shead"><span class="arrow">▶</span><b>${esc(s.title)}</b><span class="smeta">${esc(meta)}${stamp ? ` · ${esc(stamp)}` : ''}</span></div>`
       + `<div class="sbody">${s.report ? md(s.report) : '<span class="nolog">(transcript not available on this machine)</span>'}</div>`;
     el.querySelector('.shead').onclick = () => el.classList.toggle('open');
     wrap.appendChild(el);

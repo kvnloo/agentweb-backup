@@ -574,7 +574,18 @@ export function runClaude(args, prompt, cwd, timeoutMs = config.timeoutMs, stage
         try {
           if (stageLogDir) writeFileSync(path.join(stageLogDir, `${stage}.txt`), out);
           let meta = {};
-          try { const j = JSON.parse(out); meta = { turns: j.num_turns, ms: j.duration_ms, sessionId: j.session_id }; logStageStats(stage, j); } catch { /* not the CLI JSON envelope */ }
+          try {
+            const j = JSON.parse(out); const u = j.usage || {};
+            // Per-stage token/cost so the chat's "what the automation did" accordion can show the same
+            // stamp the message bubbles do. j.usage is the stage's AGGREGATE across all its turns — i.e.
+            // what the whole stage burned (cache-read balloons over a many-turn stage; that's expected).
+            meta = {
+              turns: j.num_turns, ms: j.duration_ms, sessionId: j.session_id,
+              cost: j.total_cost_usd ?? null,
+              tokens: { fresh: u.input_tokens || 0, cacheRead: u.cache_read_input_tokens || 0, cacheWrite: u.cache_creation_input_tokens || 0, out: u.output_tokens || 0 },
+            };
+            logStageStats(stage, j);
+          } catch { /* not the CLI JSON envelope */ }
           stages[stage] = { timedOut, ...meta };
         } catch { /* stage logging is best-effort */ }
       }
