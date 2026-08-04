@@ -7089,11 +7089,21 @@ export class AgentModeService {
       //  - Anthropic-on-Vertex (claude-*) can take a url source, but our images are
       //    typically private S3 objects Anthropic's fetcher cannot reach, so we
       //    download and presign them into a base64 data URI here.
-      //  - Gemini (gemini-*) receives a non-data URL as `fileData.fileUri`, which it
-      //    cannot fetch for a private S3 object, and it rejects an un-downscaled 4K
-      //    image (e.g. 3072x5504 ~16MB from gemini-3.1-flash-image) with a hard
-      //    400 INVALID_ARGUMENT. Downloading + downscaling + inlining here keeps the
-      //    payload self-contained and within Gemini's inline limits (ENG-834).
+      //  - Gemini (gemini-*) receives a non-data URL as `fileData.fileUri`. Gemini
+      //    DOES fetch these URLs successfully for ordinary screenshots (verified in
+      //    prod: 100+ sessions served by gemini-3.5-flash straight from an S3 URL),
+      //    but it rejects an un-downscaled 4K image (3072x5504, ~16MB from
+      //    gemini-3.1-flash-image) with a hard 400 INVALID_ARGUMENT. In prod that
+      //    oversize class failed on Gemini 100% of the time across every session
+      //    that attempted it. Downloading + downscaling + inlining here keeps the
+      //    payload self-contained and within Gemini's limits (ENG-834).
+      //    NOTE: until the native Gemini adapter landed (ENG-737, 2026-07-30) the
+      //    OpenAI-compat transport reported this as "400 status code (no body)",
+      //    which isRetryableMediaToolError() treats as retryable — so the Claude
+      //    fallback below silently rescued every one of these. The native adapter
+      //    surfaces Google's raw "...INVALID_ARGUMENT" JSON, which matches that
+      //    method's /invalid/i non-retryable pattern, so the fallback stopped
+      //    firing and the long-standing oversize bug became user-visible.
       // Download the image and convert to a (downscaled) data URI for these models.
       let resolvedImageUrl = imageUrl;
       if (

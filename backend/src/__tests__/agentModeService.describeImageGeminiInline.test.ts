@@ -6,10 +6,19 @@
  * Root cause: describeImage only downloaded + normalized + downscaled the image
  * (inlining it as a base64 data URI) for `anthropic.*` / `claude-*` vision models.
  * For Gemini models the raw S3 URL was passed straight through, so the Gemini
- * native client sent it as `fileData.fileUri`. Gemini cannot fetch an arbitrary
- * private S3 URL, and the un-downscaled 4K image (3072x5504, ~16MB) blows the
- * inline size/dimension limits — both surface as 400 INVALID_ARGUMENT with no
- * fallback.
+ * native client sent it as `fileData.fileUri`. Gemini fetches such URLs fine for
+ * ordinary screenshots, but rejects the un-downscaled 4K image (3072x5504, ~16MB)
+ * with 400 INVALID_ARGUMENT. Prod evidence: that oversize class failed on Gemini
+ * in 100% of the sessions that attempted it (2026-06-11 through 2026-08-02), while
+ * sub-MB images on the identical code path succeeded — so size, not URL fetching,
+ * is the discriminator.
+ *
+ * Why it only became user-visible in August: before the native Gemini adapter
+ * (ENG-737, 2026-07-30) the error read "400 status code (no body)", which
+ * isRetryableMediaToolError() classifies as retryable, so the Claude vision
+ * fallback silently rescued every occurrence. The native adapter surfaces
+ * Google's raw "...INVALID_ARGUMENT" JSON, which trips that method's /invalid/i
+ * non-retryable pattern — so the fallback stopped firing and the failure went hard.
  *
  * Fix: download + normalize + downscale-and-inline for the Gemini path too, so
  * the vision call always receives a small, self-contained data URI.
