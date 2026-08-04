@@ -216,7 +216,7 @@ import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
-import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects } from '../utils/ssrfGuard';
+import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -7158,11 +7158,19 @@ export class AgentModeService {
           let contentType: string;
           let imageBuffer: Buffer;
           if (isOwnS3) {
-            // Our own presigned S3 object: no redirects, no SSRF surface.
+            // Our own presigned S3 object: no redirects, no SSRF surface. Still
+            // size-capped — a user can put an arbitrarily large object in their
+            // own bucket, and the >4MB resize below only runs once the whole
+            // thing is already resident in memory, so the cap has to be enforced
+            // by the transport rather than after the fact (Greptile).
+            // `as any`: this repo's axios typings predate maxContentLength on the
+            // config interface (same workaround as the guarded fetch helper).
             const imgResp = await axios.get<ArrayBuffer>(fetchUrl, {
               responseType: 'arraybuffer',
               timeout: 30000,
-            });
+              maxContentLength: DEFAULT_MAX_IMAGE_BYTES,
+              maxBodyLength: DEFAULT_MAX_IMAGE_BYTES,
+            } as any);
             contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
             imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
           } else {

@@ -83,7 +83,7 @@ import sharp from 'sharp';
 import { randomBytes } from 'crypto';
 import { AgentModeService } from '../services/agentModeService';
 import { isS3Url } from '../utils/s3Utils';
-import { SsrfBlockedError } from '../utils/ssrfGuard';
+import { SsrfBlockedError, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 
 const S3_URL =
   'https://agentweb-user-files.s3.us-west-2.amazonaws.com/users/x/files/1/y/cover.png';
@@ -252,5 +252,39 @@ describe('describeImage — Gemini vision path inlines + downscales (ENG-834)', 
     expect(imgBlock.image_url.url).toBe(externalUrl);
 
     consoleError.mockRestore();
+  });
+});
+
+/**
+ * Greptile: the external-URL path is capped, but our own presigned S3 download
+ * was still an uncapped arraybuffer read. A user can put an arbitrarily large
+ * object in their own bucket, and the existing >4MB resize only runs AFTER the
+ * whole thing is resident in memory — so the backend-exhaustion path stayed open
+ * on the branch that carries almost all real traffic. The transport must refuse
+ * an oversized body rather than buffer it and shrink it afterwards.
+ */
+describe('describeImage — the S3 download is size-capped too (ENG-834)', () => {
+  let service: AgentModeService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+  });
+
+  it('caps the presigned S3 download at the shared image byte limit', async () => {
+    const pngBytes = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+      'base64'
+    );
+    mockAxiosGet.mockResolvedValue({ status: 200, data: pngBytes, headers: { 'content-type': 'image/png' } });
+    jest.spyOn(service, 'callLLM').mockResolvedValue({ choices: [{ message: { content: 'ok' } }] } as any);
+
+    await service.describeImage('gemini-3.5-flash', S3_URL);
+
+    const [, cfg] = mockAxiosGet.mock.calls[0];
+    // Enforced by the transport so an oversized body is aborted mid-stream,
+    // never fully buffered and handed to sharp.
+    expect(cfg.maxContentLength).toBe(DEFAULT_MAX_IMAGE_BYTES);
+    expect(cfg.maxBodyLength).toBe(DEFAULT_MAX_IMAGE_BYTES);
   });
 });
