@@ -388,25 +388,43 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     }
   });
 
-  // The authorized-action override rides ONLY on the machine-readable
-  // publishAuthorized signal — never inferred from the prompt's wording.
-  it('emits the authorized-action override ONLY when publishAuthorized is true', () => {
-    const lower = authorizedDirective.toLowerCase();
-    expect(lower).toContain('authorized actions must be attempted');
-    expect(lower).toContain('twitter_manage_post');
-    expect(lower).toContain('drafting the content and reporting it as done is not completion');
-    // the generic get-approval default is treated as already satisfied — but only
-    // because the owner opted in, not because the prompt "said so".
-    expect(lower).toContain('generic "always get approval before publishing to social" default');
+  // The mandated-action rule is UNCONDITIONAL. Verified against prod on
+  // 2026-08-04: 0 of 897 schedules have fullAutonomy=true, so gating the rule on
+  // that signal made it dead code — the reported schedule (081d18dd, "Harsha X
+  // Reply Guy") has no fullAutonomy attribute at all and would never have
+  // received it. Publish AUTHORIZATION stays gated (ENG-827 owns that policy);
+  // "don't silently substitute a draft for the action you were told to take"
+  // does not, because it is instruction-following, not new authorization.
+  it('requires the mandated action and forbids draft-substitution — unconditionally', () => {
+    for (const d of [directive, authorizedDirective, unauthorizedDirective]) {
+      const lower = d.toLowerCase();
+      expect(lower).toContain('never substitute a draft for a mandated action');
+      expect(lower).toContain('twitter_manage_post');
+      expect(lower).toContain('is not completion');
+    }
   });
 
-  it('withholds the authorized-action override when the schedule is NOT publish-authorized', () => {
-    // default (no signal) and explicit-false both keep the safe draft-and-notify
-    // default: the override never authorizes publishing off free-text wording.
-    for (const d of [directive, unauthorizedDirective]) {
+  // The escape hatches are closed-set and evidence-bound: an injected
+  // authorization block, or a real tool error. Self-imposed caution and "this run
+  // is unattended" — the two rationalisations session 0fe2e743 actually used —
+  // are named and rejected explicitly.
+  it('allows exactly two cited reasons to skip the action, and rejects self-imposed caution', () => {
+    for (const d of [directive, authorizedDirective, unauthorizedDirective]) {
       const lower = d.toLowerCase();
-      expect(lower).not.toContain('authorized actions must be attempted');
-      expect(lower).not.toContain('drafting the content and reporting it as done is not completion');
+      expect(lower).toContain('authorization block in this system prompt');
+      expect(lower).toContain('actually made returned an error');
+      expect(lower).toContain('your own caution is not a reason');
+      expect(lower).toContain('unattended" is not by itself a reason');
+    }
+  });
+
+  // Publish AUTHORIZATION (not the action requirement) remains gated on the
+  // machine-readable owner opt-in, so this composes with ENG-827 rather than
+  // conflicting with it.
+  it('emits the publish-authorization block ONLY when publishAuthorized is true', () => {
+    expect(authorizedDirective.toLowerCase()).toContain('publish authorization');
+    for (const d of [directive, unauthorizedDirective]) {
+      expect(d.toLowerCase()).not.toContain('publish authorization —');
     }
   });
 });

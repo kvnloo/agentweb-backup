@@ -284,58 +284,62 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp!).not.toContain('IDENTITY RESOLUTION');
   });
 
-  // ── ENG-803: publish-authorization signal drives the authorized-action override ──
-  // Behavioral/wiring probe for the fabricated-publish-gate fix. The controller
-  // must resolve the schedule's machine-readable fullAutonomy opt-in (via
-  // getScheduleById) and thread it into the directive so that the "you MUST
-  // attempt the authorized action / the generic get-approval default does NOT
-  // apply" override appears ONLY for an owner-authorized schedule — never from
-  // the model's reading of the prompt's free text. This exercises the full
-  // assembly path end-to-end (controller → getScheduleById → directive → prompt),
-  // asserting the resolved signal changes the injected outcome, not merely that
-  // the string is present. The truthful-reporting / no-fabricated-gate guidance
-  // must be present on EVERY scheduled run regardless of the signal.
+  // ── ENG-803: fabricated publish gate + silent non-execution ───────────────────
+  // Wiring probe for the fix, exercising the full assembly path end-to-end
+  // (controller → getScheduleById → directive → prompt).
+  //
+  // The reported schedule (081d18dd, "Harsha X Reply Guy") carries NO
+  // fullAutonomy attribute, and a prod scan on 2026-08-04 found 0 of 897
+  // schedules with it set. So the anti-fabrication rules AND the
+  // "don't substitute a draft for the action you were told to take" rule must
+  // ride on EVERY scheduled run regardless of the signal — gating them on
+  // fullAutonomy would make them dead code for 100% of real traffic. Only the
+  // publish-AUTHORIZATION block stays gated (ENG-827 owns that policy).
 
-  it('always injects the no-fabricated-gate truthful-reporting guidance (signal-independent)', async () => {
-    // even a NOT-authorized schedule must carry the fabrication ban.
+  it('injects the fabrication ban and the mandated-action rule on a NON-authorized schedule', async () => {
+    // this is the reported schedule's exact shape — the fix must reach it.
     (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: false });
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
     expect(sp).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
     expect(sp).toContain('report_product_issues');
-    // and never emits the authorized-action override for a non-authorized run
-    expect(sp).not.toContain('AUTHORIZED ACTIONS MUST BE ATTEMPTED');
+    expect(sp).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
+    expect(sp).toContain('twitter_manage_post');
+    // …but a non-authorized schedule still gets no publish authorization.
+    expect(sp).not.toContain('PUBLISH AUTHORIZATION —');
   });
 
-  it('injects the authorized-action override when the schedule opted into fullAutonomy', async () => {
+  it('adds the publish-authorization block when the schedule opted into fullAutonomy', async () => {
     (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: true });
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
-    // the machine-readable owner opt-in flips the override ON
-    expect(sp).toContain('AUTHORIZED ACTIONS MUST BE ATTEMPTED');
-    expect(sp).toContain('twitter_manage_post');
-    // truthful reporting still rides alongside it
+    // the machine-readable owner opt-in adds authorization on top…
+    expect(sp).toContain('PUBLISH AUTHORIZATION —');
+    // …and the unconditional rules still ride alongside it.
+    expect(sp).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
     expect(sp).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
   });
 
-  it('withholds the authorized-action override when fullAutonomy is absent (safe default)', async () => {
-    // owner never opted in → schedule item lacks the flag → draft-and-notify default.
+  it('withholds only the authorization block when fullAutonomy is absent (safe default)', async () => {
+    // owner never opted in → schedule item lacks the flag entirely.
     (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID });
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
-    expect(sp).not.toContain('AUTHORIZED ACTIONS MUST BE ATTEMPTED');
+    expect(sp).not.toContain('PUBLISH AUTHORIZATION —');
+    expect(sp).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
     expect(sp).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
   });
 
-  it('degrades to NOT-authorized (withholds the override) when the schedule lookup THROWS', async () => {
+  it('degrades to NOT-authorized when the schedule lookup THROWS, keeping the unconditional rules', async () => {
     (scheduleDb.getScheduleById as jest.Mock).mockRejectedValue(new Error('DynamoDB throttled'));
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt();
     // a prompt-enrichment lookup failure must never break the run, and must fail
-    // closed to the safe draft-and-notify default.
+    // closed on authorization while still shipping the truthful-reporting rules.
     expect(sp).toBeDefined();
     expect(sp!).toContain('[AUTOMATED UNATTENDED EXECUTION]');
-    expect(sp!).not.toContain('AUTHORIZED ACTIONS MUST BE ATTEMPTED');
+    expect(sp!).not.toContain('PUBLISH AUTHORIZATION —');
     expect(sp!).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
+    expect(sp!).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
   });
 });
