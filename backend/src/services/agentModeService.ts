@@ -13678,16 +13678,22 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
-  async generateScheduledChatSummary(startingMessage: string, response: string): Promise<string | null> {
+  async generateScheduledChatSummary(startingMessage: string, response: string, executedToolNames?: string[]): Promise<string | null> {
     try {
+      // ENG-803: the summary becomes the run's title suffix, so it must describe
+      // what the run DID, not what its prose claimed. Previously this saw only the
+      // request and the response text, which let a run that posted nothing be
+      // titled "Replies queued". Ground it in the tools that actually executed.
+      const executed = Array.from(new Set((executedToolNames || []).filter(Boolean))).slice(0, 40);
+      const evidence = executed.length > 0 ? executed.join(', ') : 'none';
       const response_ = await this.callLLM(DIAGNOSIS_MODEL, [
         {
           role: 'system',
-          content: `You are a task summarizer. Given a user's request and the agent's response, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). Return ONLY the summary, nothing else.`
+          content: `You are a task summarizer. Given a user's request, the agent's response, and the list of tools the agent ACTUALLY executed, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). The summary must reflect the executed tools, not the response's claims: if no tool that posts, publishes, or sends was executed, do NOT use words like "Posted", "Published", "Sent", or "Queued" — describe what actually happened instead (e.g. "Drafts Prepared", "Nothing Posted"). Return ONLY the summary, nothing else.`
         },
         {
           role: 'user',
-          content: `Request: ${startingMessage.slice(0, 300)}\n\nResult: ${response.slice(0, 500)}`
+          content: `Request: ${startingMessage.slice(0, 300)}\n\nTools actually executed: ${evidence}\n\nResult: ${response.slice(0, 500)}`
         }
       ], {
         max_completion_tokens: 20,

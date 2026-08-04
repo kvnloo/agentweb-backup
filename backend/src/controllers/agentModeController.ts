@@ -2477,7 +2477,10 @@ export async function runScheduledChat(
 
     // Generate a 2-3 word summary and update the session title
     try {
-      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content);
+      // ENG-803: ground the title suffix in the tools that actually ran, so a run
+      // that posted nothing cannot be titled "Replies queued".
+      const executedToolNames = (result.toolCalls || []).map((call: any) => call?.name).filter(Boolean);
+      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content, executedToolNames);
       if (summary) {
         generatedSummary = summary;
         const summaryTitle = `${sessionTitle} — ${summary}`;
