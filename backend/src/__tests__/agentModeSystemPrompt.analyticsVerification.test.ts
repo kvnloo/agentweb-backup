@@ -38,6 +38,16 @@ describe('Agent Mode system prompt — analytics verify-before-assert discipline
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('not as a correction after the user pushes back');
   });
 
+  // The same session recommended UTM-tagging the site's own CTA links to fix
+  // "(direct)"-heavy attribution — which would have overwritten the real source.
+  // The actual cause was a HubSpot script missing from the originating page.
+  it('forbids recommending UTM parameters on internal links', () => {
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'Never recommend adding UTM parameters to internal links'
+    );
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('overwrites the visitor\'s original source');
+  });
+
   it('requires saying so plainly when no tool can verify a claim', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
       'say plainly that you cannot verify it and do not characterise it in either direction'
