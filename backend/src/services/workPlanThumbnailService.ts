@@ -65,9 +65,13 @@ export class WorkPlanThumbnailService {
     plan: WorkPlan,
     opts: { enforceOrdering?: boolean } = {},
   ): Promise<WorkPlan> {
-    const ordering = opts.enforceOrdering === false
-      ? {}
-      : { expectedSource: plan.thumbnail_source ?? null };
+    // Claim this generation. Any newer user action drops the token, so the
+    // write at the end of this ~40s render is simply rejected (ENG-889).
+    const jobToken = opts.enforceOrdering === false ? undefined : crypto.randomUUID();
+    if (jobToken) {
+      await workPlanService.updateThumbnail(plan.planId, {}, { jobToken });
+    }
+    const ordering = jobToken ? { expectedJobToken: jobToken } : {};
     const description = plan.description || 'A professional marketing automation tool';
     const prompt = THUMBNAIL_PROMPT_TEMPLATE.replace('{title}', plan.title).replace(
       '{description}',
@@ -145,7 +149,8 @@ export class WorkPlanThumbnailService {
       thumbnail_url: url,
       thumbnail_source: 'upload',
       thumbnail_alt_text: updated.thumbnail_alt_text,
-    });
+    // User action: invalidate any generation still in flight.
+    }, { clearJobToken: true });
     return updated;
   }
 
@@ -161,7 +166,9 @@ export class WorkPlanThumbnailService {
       thumbnail_url: undefined,
       thumbnail_source: 'none',
       thumbnail_alt_text: undefined,
-    });
+    // User action: invalidate any generation still in flight, so only the
+    // regeneration kicked off just below can land.
+    }, { clearJobToken: true });
 
     // Trigger AI regeneration asynchronously — caller gets the cleared state immediately
     this.generateAIThumbnail(cleared).catch((err) =>
@@ -176,7 +183,7 @@ export class WorkPlanThumbnailService {
 
   private async setNoThumbnail(
     plan: WorkPlan,
-    ordering: { expectedSource?: string | null },
+    ordering: { expectedJobToken?: string },
   ): Promise<WorkPlan> {
     const updated: WorkPlan = { ...plan, thumbnail_source: 'none' };
     // Preserve any existing thumbnail_url when just setting source to 'none' on

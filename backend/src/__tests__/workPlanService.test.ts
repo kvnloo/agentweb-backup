@@ -329,83 +329,61 @@ describe('WorkPlanService', () => {
       ).rejects.toThrow('ProvisionedThroughputExceeded');
     });
 
-    // Greptile P1/P2 on PR #2266. AI generation starts at create (or at a
-    // clear) and lands ~40s later. Anything that changes the thumbnail in that
-    // window — an admin upload, a clear — makes the in-flight job stale, and
-    // letting it write silently undoes the newer action. Each automatic write
-    // is therefore conditioned on the thumbnail state it was started from.
-    // Deliberately keyed on thumbnail_source rather than updatedAt: an
-    // unrelated edit to the plan's steps must not throw away a good thumbnail.
-    it('conditions an automatic write on the thumbnail state it started from', async () => {
+    // Greptile P1/P2/P3 on PR #2266. AI generation starts at create or at a
+    // clear and lands ~40s later; anything that touches the thumbnail meanwhile
+    // makes the in-flight job stale. Conditioning on thumbnail_source was not
+    // enough — the value is reusable, so clear -> upload -> clear restores
+    // 'none' and a job from the FIRST clear beats the second clear's fresh one
+    // (an ABA race). Each generation therefore claims a unique token, and only
+    // writes while that token is still the current one. Any user action drops
+    // the token, invalidating every job in flight.
+    it('claims a token before generating and writes only while it still holds', async () => {
+      await workPlanService.updateThumbnail('p1', {}, { jobToken: 'tok-1' });
+      const claim = mockUpdate.mock.calls[0][0];
+      expect(claim.UpdateExpression).toContain('#thumbnail_job = :thumbnail_job');
+      expect(claim.ExpressionAttributeValues[':thumbnail_job']).toBe('tok-1');
+
+      mockUpdate.mockClear();
       await workPlanService.updateThumbnail(
         'p1',
         { thumbnail_url: 'https://x/ai.png', thumbnail_source: 'ai' },
-        { expectedSource: 'none' },
+        { expectedJobToken: 'tok-1' },
       );
-
-      const arg = mockUpdate.mock.calls[0][0];
-      expect(arg.ConditionExpression).toContain('attribute_exists(planId)');
-      expect(arg.ConditionExpression).toContain('#thumbnail_source = :expectedSource');
-      expect(arg.ExpressionAttributeValues[':expectedSource']).toBe('none');
+      const write = mockUpdate.mock.calls[0][0];
+      expect(write.ConditionExpression).toContain('attribute_exists(planId)');
+      expect(write.ConditionExpression).toContain('#thumbnail_job = :expectedJobToken');
+      expect(write.ExpressionAttributeValues[':expectedJobToken']).toBe('tok-1');
     });
 
-    it('expects the attribute to be absent when it started from no thumbnail at all', async () => {
+    it('drops the token on a user-initiated write, invalidating jobs in flight', async () => {
       await workPlanService.updateThumbnail(
         'p1',
-        { thumbnail_url: 'https://x/ai.png', thumbnail_source: 'ai' },
-        { expectedSource: null },
+        { thumbnail_url: 'https://x/up.png', thumbnail_source: 'upload' },
+        { clearJobToken: true },
       );
 
       const arg = mockUpdate.mock.calls[0][0];
-      expect(arg.ConditionExpression).toContain('attribute_not_exists(#thumbnail_source)');
-      expect(arg.ExpressionAttributeValues[':expectedSource']).toBeUndefined();
-    });
-
-    it('leaves user-initiated writes unordered so they always win', async () => {
-      await workPlanService.updateThumbnail('p1', { thumbnail_url: 'https://x/up.png', thumbnail_source: 'upload' });
-
-      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).toMatch(/REMOVE .*#thumbnail_job/);
+      // User actions are never themselves conditioned on a job token.
       expect(arg.ConditionExpression).toBe('attribute_exists(planId)');
     });
 
-    it('treats a stale automatic write as a no-op, not an error', async () => {
+    it('rejects a generation whose token has been superseded', async () => {
       const err: any = new Error('The conditional request failed');
       err.code = 'ConditionalCheckFailedException';
       mockPromise.mockRejectedValueOnce(err);
 
       await expect(
-        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }, { expectedSource: null }),
+        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }, { expectedJobToken: 'stale' }),
       ).resolves.toBeUndefined();
     });
 
-    // Two background jobs can be in flight from the same state — e.g. Remove
-    // clicked twice, each kicking its own regeneration. The ordering condition
-    // already resolves this: whichever lands first flips the source, and the
-    // other's condition no longer holds, so exactly one write survives. Pinned
-    // because the alternative reading ("both write, last wins") is the obvious
-    // assumption and is wrong.
-    it('lets only the first of two same-baseline automatic writes land', async () => {
-      // First job: the plan is still 'none', so its write goes through.
-      await workPlanService.updateThumbnail(
-        'p1',
-        { thumbnail_url: 'https://x/first.png', thumbnail_source: 'ai' },
-        { expectedSource: 'none' },
-      );
-      expect(mockUpdate).toHaveBeenCalledTimes(1);
-      expect(mockUpdate.mock.calls[0][0].ConditionExpression).toContain('#thumbnail_source = :expectedSource');
+    it('leaves an unordered write with no token condition at all', async () => {
+      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' });
 
-      // Second job, same baseline, but the row now reads 'ai' — DynamoDB rejects it.
-      const err: any = new Error('The conditional request failed');
-      err.code = 'ConditionalCheckFailedException';
-      mockPromise.mockRejectedValueOnce(err);
-
-      await expect(
-        workPlanService.updateThumbnail(
-          'p1',
-          { thumbnail_url: 'https://x/second.png', thumbnail_source: 'ai' },
-          { expectedSource: 'none' },
-        ),
-      ).resolves.toBeUndefined();
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.ConditionExpression).toBe('attribute_exists(planId)');
+      expect(arg.UpdateExpression).not.toContain('thumbnail_job');
     });
 
     it('always refreshes updatedAt', async () => {

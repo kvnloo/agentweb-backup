@@ -146,16 +146,20 @@ export class WorkPlanService {
     planId: string,
     fields: Partial<Pick<WorkPlan, 'thumbnail_url' | 'thumbnail_source' | 'thumbnail_alt_text'>>,
     opts: {
-      /** The thumbnail_source this write was started from, for automatic (AI)
-       *  writes only — `null` meaning "the plan had no thumbnail yet". AI
-       *  generation starts at create or at a clear and lands ~40s later; if the
-       *  thumbnail changed in that window the job is stale, and letting it write
-       *  silently undoes the newer action (an admin's upload, or their clear).
-       *  Omit on user-initiated writes so they always win.
+      /** Claim this generation: stamps thumbnail_job so the eventual write can
+       *  prove it is still the current job. */
+      jobToken?: string;
+      /** Write only while this token is still the plan's current thumbnail_job.
+       *  AI generation starts at create or at a clear and lands ~40s later; any
+       *  newer action drops the token, so the stale job is rejected.
        *
-       *  Keyed on thumbnail_source rather than updatedAt on purpose: an
-       *  unrelated edit to the plan's steps must not discard a good thumbnail. */
-      expectedSource?: string | null;
+       *  A token rather than thumbnail_source, because source values repeat:
+       *  clear -> upload -> clear puts 'none' back, and a source-only condition
+       *  would let the FIRST clear's job beat the second clear's fresh one. */
+      expectedJobToken?: string;
+      /** Set on user-initiated writes. Drops the token so every generation
+       *  currently in flight is invalidated and the user's action stands. */
+      clearJobToken?: boolean;
     } = {},
   ): Promise<void> {
     const sets = ['#updatedAt = :updatedAt'];
@@ -180,15 +184,20 @@ export class WorkPlanService {
     // may be deleted mid-flight; without attribute_exists we would write back an
     // item holding only planId and the thumbnail fields — no title, no steps —
     // which breaks every consumer that maps over plan.steps.
+    if (opts.jobToken !== undefined) {
+      names['#thumbnail_job'] = 'thumbnail_job';
+      values[':thumbnail_job'] = opts.jobToken;
+      sets.push('#thumbnail_job = :thumbnail_job');
+    } else if (opts.clearJobToken) {
+      names['#thumbnail_job'] = 'thumbnail_job';
+      removes.push('#thumbnail_job');
+    }
+
     let condition = 'attribute_exists(planId)';
-    if ('expectedSource' in opts) {
-      names['#thumbnail_source'] = 'thumbnail_source';
-      if (opts.expectedSource === null || opts.expectedSource === undefined) {
-        condition += ' AND attribute_not_exists(#thumbnail_source)';
-      } else {
-        values[':expectedSource'] = opts.expectedSource;
-        condition += ' AND #thumbnail_source = :expectedSource';
-      }
+    if (opts.expectedJobToken !== undefined) {
+      names['#thumbnail_job'] = 'thumbnail_job';
+      values[':expectedJobToken'] = opts.expectedJobToken;
+      condition += ' AND #thumbnail_job = :expectedJobToken';
     }
 
     try {
