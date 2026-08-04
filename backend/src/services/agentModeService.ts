@@ -12,6 +12,7 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import {
@@ -3102,29 +3103,56 @@ export class AgentModeService {
         m => (m.content || '').trim().toLowerCase() === normalizedCurrent
       ).length;
 
-      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && isVerificationFunctionCallRetryPress(messageContent)) {
-        // ENG-844: the repeated prompt is a verification retry pressing a required
-        // tool CALL, not a human withholding information. The anti-loop override's
-        // "proceed with placeholders / make progress" remedy is for MISSING
-        // INFORMATION and cannot satisfy a tool call — and for an irreversible/
-        // publishing write it becomes pressure to publish off-cadence or fabricate
-        // success. Do NOT inject it; let the run retry/exit through its normal path
-        // (the scheduled verifier records a failure + alerts).
+      const isScheduledSession = currentSession?.sessionType === 'scheduled';
+      // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
+      // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
+      // human withholding information. The anti-loop remedy cannot satisfy a tool call
+      // and — for an irreversible/publishing write — becomes pressure to publish
+      // off-cadence or fabricate success. ENG-763 already gates scheduled sessions out
+      // of the loop-breaker entirely; also suppress it for ANY verification press so a
+      // non-scheduled verified-generate run is covered too.
+      const isVerificationPress = isVerificationFunctionCallRetryPress(messageContent);
+      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && isVerificationPress) {
         console.warn(
           `AgentMode: anti-loop override SUPPRESSED for session ${sessionId} — the repeated prompt is a verification tool-call retry press` +
           `${pressesIrreversiblePublishWrite(messageContent) ? ' for an IRREVERSIBLE/publishing write' : ''}; ` +
           `not injecting a 'proceed anyway' instruction (ENG-844).`
         );
-      } else if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD) {
+      }
+      // ENG-763: the loop-breaker is an INTERACTIVE-ONLY construct — it reacts to a
+      // human sending the same message 3+ times. Scheduled/headless runs get a fresh
+      // session per run (one user turn), so this can never legitimately trigger there;
+      // gating it out explicitly is defense-in-depth against any future path and, more
+      // importantly, guarantees a headless run is NEVER told to "hold and wait for the
+      // user" (which would park an autonomous delivery — the ENG-517/634 class) and
+      // that a scheduled run's install_skills gateway is never stripped.
+      //
+      // When the loop-breaker fires, also hard-gate `install_skills` for this turn
+      // (see the tool-build block below). On the agentMode path install_skills is the
+      // legitimate skill gateway, so it is only stripped while a loop is active — a
+      // stuck user should never trigger skill installation, and the read-only
+      // foundation context tools (read_brand_guidelines / read_market_strategy) remain
+      // available so the model is never starved of a way to make progress.
+      const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && !isVerificationPress;
+      if (loopBreakerActive) {
+        // ENG-763: inject as a `system` directive, NOT a `user` turn. Provider
+        // converters hoist role:'system' into the system instruction, so the model
+        // never sees this control text as part of the user's message. Injecting it
+        // as role:'user' (with the old "[SYSTEM OVERRIDE]" wording) caused the model
+        // — Gemini merges consecutive user parts — to read the directive as the
+        // user's own words and quote "[SYSTEM OVERRIDE]" back, attributing text to
+        // the user that they never sent. The directive also no longer tells the
+        // model to "proceed with reasonable generic placeholders" — for a task with
+        // no target (e.g. a QA check) that is an instruction to fabricate, which the
+        // model refuses and then falls back to re-asking, sustaining the loop.
         messages.push({
-          role: 'user',
-          content: `[SYSTEM OVERRIDE - ANTI-LOOP TRIGGERED] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
-1. STOP asking for that information immediately — do not repeat it again under any circumstances
-2. Use your available tools to find context yourself: call read_brand_guidelines to get business name, website, and brand info; call read_market_strategy to get goals and target market
-3. If those tools provide enough context, proceed with the task using that information
-4. If context is still insufficient, proceed with reasonable generic placeholders and complete as much of the task as possible
-5. Never block on missing user-provided details — always find a way to make progress
-6. This override resolves MISSING INFORMATION only — it is NOT authorization to perform an IRREVERSIBLE or publishing action (e.g. post_on_connected_account, or publishing live to any connected LinkedIn/Instagram/X account). If the repeated request was pressure to make such a write and the real blocker is that the action is not warranted right now (e.g. a non-publishing day, a guard clause, or missing consent — not missing context), do NOT perform it and do NOT invent that you did. Leave the irreversible step undone and report plainly that you skipped it and why. A best-effort placeholder can substitute for missing context, never for authorization to publish.`
+          role: 'system',
+          content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
+1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
+2. To gather context on your own, you may ONLY call the read-only context tools read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Do NOT call install_skills or any other setup/configuration tool, and do NOT take any irreversible action, just to appear productive.
+3. If that context is enough to complete the task, do so using it.
+4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
+5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
         });
       }
 
@@ -3346,6 +3374,18 @@ export class AgentModeService {
           if (excludeTools?.length && filteredToolsCache) {
             const excludeSet = new Set(excludeTools);
             filteredToolsCache = filteredToolsCache.filter((t: any) => !excludeSet.has(t.function?.name));
+          }
+
+          // ENG-763: hard tool-gate for the anti-loop path. While a repetition loop
+          // is active, a stuck user must never trigger skill installation — the model
+          // was calling install_skills to "make progress", violating the onboarding
+          // guardrail. This is not a prompt hint (which the model ignored) but a real
+          // gate, and it is scoped to loop-active turns only so normal onboarding
+          // (where install_skills is the intended gateway) is unaffected.
+          if (loopBreakerActive && filteredToolsCache) {
+            filteredToolsCache = filteredToolsCache.filter(
+              (t: any) => t.function?.name !== 'install_skills'
+            );
           }
         }
 
@@ -3907,6 +3947,27 @@ export class AgentModeService {
           // Guard is advisory — a guard bug must never block delivery. Loud, not
           // silent: recorded as claim_check_error (same contract as judge failure).
           recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError);
+        }
+      }
+
+      // ENG-736: truthful-reporting reconciliation for landing-page deployments.
+      // Deterministic and always-on (unlike the flag-gated finalize guard above): if a
+      // landing-deployment tool returned a genuinely live URL this run but the final
+      // message omits it — the exact failure where the model fixates on an earlier
+      // transient timeout and reports "deployment timed out", withholding the URL — surface
+      // the URL. It only ADDS the true deliverable, never rewrites the model's text, so it
+      // cannot invent a false success. Mirrors the finalize guard's in-place last-assistant
+      // patch so the persisted transcript matches what the user sees.
+      if (content && !wasCancelled) {
+        const reconciledContent = reconcileLandingDeploymentReport(content, toolCalls);
+        if (reconciledContent !== content) {
+          content = reconciledContent;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if ((messages[i] as any).role === 'assistant') {
+              (messages[i] as any).content = content;
+              break;
+            }
+          }
         }
       }
 
@@ -5618,6 +5679,40 @@ export class AgentModeService {
     // For navigation/connect tools, preserve the full result so the frontend can act on it
     if (toolName === 'navigate_to' || toolName === 'connect_account') {
       return result;
+    }
+
+    // ENG-736: landing-page deployment tools — preserve the small deployment-outcome
+    // fields (status/buildStatus + the live URL + name/ids) so the tool ledger the
+    // truthful-reporting reconciler reads can tell a genuinely-deployed page (and its
+    // URL) from a failed/in-flight one. Without this the default `{}` below strips the
+    // deployedUrl, and a final message that falsely claims the deploy "timed out" would
+    // have no ledger evidence to reconcile against.
+    if (
+      toolName === 'generate_landing_page' ||
+      toolName === 'deploy_landing_page' ||
+      toolName === 'duplicate_landing_page' ||
+      toolName === 'get_deployment_status' ||
+      toolName === 'get_landing_page_preview_url'
+    ) {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse ${toolName} result.content as JSON:`, e);
+        }
+      }
+      const a = actualResult || {};
+      return {
+        ...(a.status !== undefined ? { status: a.status } : {}),
+        ...(a.buildStatus !== undefined ? { buildStatus: a.buildStatus } : {}),
+        ...(a.deployedUrl !== undefined ? { deployedUrl: a.deployedUrl } : {}),
+        ...(a.customDomainUrl !== undefined ? { customDomainUrl: a.customDomainUrl } : {}),
+        ...(a.previewUrl !== undefined ? { previewUrl: a.previewUrl } : {}),
+        ...(a.name !== undefined ? { name: a.name } : {}),
+        ...(a.id !== undefined ? { id: a.id } : {}),
+        ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
+      };
     }
 
     // For other tools, return empty object to minimize storage

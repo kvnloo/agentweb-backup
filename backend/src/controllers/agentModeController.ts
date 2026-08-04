@@ -70,16 +70,115 @@ export const RECONCILE_INTERVAL_MS = 2 * 60 * 1000; // reconciler sweep cadence
 const SCHEDULED_RUN_INSTANCE_ID: string = require('uuid').v4();
 
 // User-facing fallback shown when a scheduled run terminates with zero assistant
-// output (crash/timeout/context-limit). A silent, empty session reads as a total
-// failure to the user (ENG-209: a 40-competitor report produced no output). This
-// guarantees the session is never left blank — the user always sees a structured
-// "job incomplete" message with a concrete next step (split into smaller batches).
+// output because it genuinely ran out of its time/memory/size budget (a big job
+// that timed out, hit the context limit, was OOM-killed, or ran but emitted no
+// assistant turn). A silent, empty session reads as a total failure to the user
+// (ENG-209: a 40-competitor report produced no output). The "split into smaller
+// batches" next step only makes sense for THIS class of failure — see
+// SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE for the deterministic-error class.
 const SCHEDULED_JOB_INCOMPLETE_MESSAGE =
   "This scheduled run stopped before it could produce a response, so no results were generated. " +
   "Large jobs that research many items in a single run — for example, dozens of competitors in one report — " +
   "can exceed the run's time or memory budget and end without finishing. " +
   "The run will be retried automatically. If this keeps happening, split the request into smaller batches " +
   "(fewer items per run) so each run can complete and report its results.";
+
+// ENG-826: user-facing fallback for a zero-output run that failed on a DETERMINISTIC
+// system/provider error (e.g. a schema-validation 400, an auth failure, a content
+// filter), NOT a time/memory budget overrun. Blaming job size here is misleading and
+// the "split into smaller batches" advice is useless — the run would fail identically
+// however small it is. The failing session's stored assistant message used to assert
+// the budget cause unconditionally, sending anyone debugging from the transcript down
+// the wrong path (the ENG-826 gemini-3.5-flash union-schema 400 read as a size limit).
+// Wording note: this per-run message is shown for EVERY failed attempt (including the
+// early ones that will still auto-retry), so it only promises recording + automatic
+// retry + a support contact. The proactive owner email (ENG-826 #1) is sent separately
+// and ONLY once the retries are exhausted (see the requeue-exhaustion branch below), so
+// it is not claimed here — that would over-promise on attempts that haven't exhausted yet.
+const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
+  "This scheduled run stopped before it could produce a response, so no results were generated. " +
+  "It ran into an unexpected system error — not a time or size limit — so retrying or splitting the " +
+  "request into smaller batches won't help on its own. The run has been recorded as failed and will " +
+  "be retried automatically. If it keeps failing, please contact support.";
+
+// ENG-826 edge case: a TRANSIENT failure (rate limit, 429/5xx, timeout, dropped
+// connection) is neither a size/budget overrun nor a deterministic error. It really
+// does recover on retry — so it must NOT get the system-error copy that says "retrying
+// won't help" (that copy is only true for deterministic errors). Give it its own honest
+// message: temporary, auto-retried, usually self-clearing.
+const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
+  "This scheduled run stopped before it could produce a response, so no results were generated. " +
+  "It hit a temporary problem — a rate limit or a brief service hiccup — not a time or size limit. " +
+  "It has been recorded and will be retried automatically, and a transient issue like this usually " +
+  "clears on its own. If it keeps happening, please contact support.";
+
+// ENG-826: classify a zero-output scheduled-run failure so the persisted message and
+// the `failureClass` metadata match the ACTUAL cause. Precedence:
+//  1) 'budget' — context-limit, generation timeout, worker OOM/replacement, or a run
+//     that emitted no assistant turn: the "split into smaller batches" guidance applies.
+//  2) 'transient' — rate limit / 5xx / timeout / dropped connection: recovers on the
+//     automatic retry (checked AFTER budget because isContextLimitError is excluded
+//     from transient, and worker-shutdown/zero-output are budget-shaped by definition).
+//  3) 'system' — everything else (deterministic provider/validation errors like the
+//     gemini union-schema 400, auth, content filters): retrying won't help on its own.
+// Exported for direct unit testing.
+export type ScheduledRunFailureClass = 'budget' | 'transient' | 'system';
+
+export function classifyZeroAssistantFailure(error: unknown): ScheduledRunFailureClass {
+  const budgetShaped =
+    isContextLimitError(error) ||
+    isWorkerShutdownError(error) ||
+    isZeroAssistantOutputError(error) ||
+    Boolean((error as any)?.isGenerationTimeout);
+  if (budgetShaped) return 'budget';
+  if (isTransientLLMError(error)) return 'transient';
+  return 'system';
+}
+
+// The reconciler path (a dead process, with no error object to classify) deliberately
+// keeps SCHEDULED_JOB_INCOMPLETE_MESSAGE.
+export function zeroAssistantIncompleteMessage(error: unknown): string {
+  switch (classifyZeroAssistantFailure(error)) {
+    case 'budget':
+      return SCHEDULED_JOB_INCOMPLETE_MESSAGE;
+    case 'transient':
+      return SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE;
+    default:
+      return SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE;
+  }
+}
+
+// ENG-826 (recommendation #4): compact run-health summary surfaced on each schedule
+// in the list so an owner can see a run of consecutive failures — e.g. the 3 silent
+// gemini-3.5-flash failures in this issue — straight on the card, without opening the
+// run-history panel. getScheduledChats deliberately strips the full runResults array
+// for payload size, so the client can't derive this itself; we compute it server-side.
+export interface ScheduleRunHealth {
+  lastRunStatus: 'success' | 'failure' | 'pending_user_input' | null;
+  lastRunAt: string | null;
+  // Failures counted back from the MOST RECENT run, stopping at the first non-failure.
+  // A 'success' or a 'pending_user_input' (parked, awaiting a human) breaks the streak —
+  // a park is not a failure. So this reflects an ongoing, unresolved failure run only.
+  consecutiveFailures: number;
+}
+
+export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
+  const results = Array.isArray(runResults) ? runResults : [];
+  if (results.length === 0) {
+    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 };
+  }
+  const last = results[results.length - 1] || {};
+  let consecutiveFailures = 0;
+  for (let i = results.length - 1; i >= 0; i--) {
+    if (results[i]?.status === 'failure') consecutiveFailures++;
+    else break;
+  }
+  return {
+    lastRunStatus: last.status ?? null,
+    lastRunAt: last.createdAt ?? null,
+    consecutiveFailures,
+  };
+}
 
 // ENG-657: injected as the user turn when RESUMING an abandoned scheduled run
 // (its instance was terminated mid-flight, e.g. by a deploy). The full transcript
@@ -3171,15 +3270,23 @@ export async function runScheduledChat(
       // instead of an empty session. Done BEFORE requeue so the failed session
       // is self-explanatory; the requeue (below) runs in a fresh session.
       if (sessionId) {
+        // ENG-826: pick the message that matches the ACTUAL failure. A deterministic
+        // provider/validation error (e.g. the gemini-3.5-flash union-schema 400) must
+        // not be reported as a time/memory-budget overrun with "split into smaller
+        // batches" advice that can't help — that mislabels the transcript for anyone
+        // debugging it. Budget-shaped failures keep the original guidance.
+        const failureClass = classifyZeroAssistantFailure(error);
+        const incompleteMessage = zeroAssistantIncompleteMessage(error);
         try {
           await chatbotDb.addMessageToSession(sessionId, {
             role: 'assistant',
-            content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+            content: incompleteMessage,
             timestamp: new Date().toISOString(),
             metadata: {
               timestamp: new Date().toISOString(),
               isErrorMessage: true,
               jobIncomplete: true,
+              failureClass,
             },
           });
         } catch (persistError) {
@@ -3219,8 +3326,51 @@ export async function runScheduledChat(
           }
         } else {
           console.error(
-            `Scheduled chat ${schedule.scheduleId} exceeded zero-output requeue limit (${ZERO_ASSISTANT_MAX_REQUEUES}); alerting without requeue.`
+            `Scheduled chat ${schedule.scheduleId} exceeded zero-output requeue limit (${ZERO_ASSISTANT_MAX_REQUEUES}); notifying owner.`
           );
+          // ENG-826 (#1): the automatic retries are exhausted — the schedule is
+          // consistently failing and won't auto-retry until its next slot. Proactively
+          // notify the owner instead of only logging (the old behaviour left the owner
+          // unaware). Recipients: the schedule's configured notification list, else the
+          // owner's account email. Best-effort — a notification failure must never break
+          // the run.
+          //
+          // The alert fires on each exhausted failing run. Past the requeue cap the
+          // schedule is NOT requeued, so this is at most once per natural slot while it
+          // stays broken — standard "notify while failing" behavior. We deliberately do
+          // NOT persist a separate "already alerted" flag for dedup: that write can't be
+          // atomic with the email send, so any such flag inevitably diverges from actual
+          // delivery (a duplicate alert if the write fails after a send, or a missed alert
+          // if the ordering is inverted). No dedup state means no divergence to get wrong.
+          try {
+            let recipients: string[] = Array.isArray(schedule.emailNotifications)
+              ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+              : [];
+            if (recipients.length === 0) {
+              const owner = await userDb.getUserById(userId);
+              if (owner?.email) recipients = [owner.email];
+            }
+            if (recipients.length > 0) {
+              await emailService.sendScheduledRunFailedEmail(
+                recipients,
+                schedule.scheduleName,
+                schedule.scheduleId,
+                {
+                  failedAttempts: nextRetryCount,
+                  failureClass: classifyZeroAssistantFailure(error),
+                }
+              );
+            } else {
+              console.error(
+                `No notification recipients for repeatedly-failing schedule ${schedule.scheduleId}; owner alert skipped.`
+              );
+            }
+          } catch (notifyError) {
+            console.error(
+              `Failed to send owner failure alert for schedule ${schedule.scheduleId}:`,
+              notifyError
+            );
+          }
         }
       }
     }
@@ -6683,10 +6833,15 @@ export const agentModeController = {
       });
 
       // Exclude runResults to keep response size manageable (run history is
-      // available via the dedicated GET /scheduled-chats/:id/test-history endpoint)
-      const scheduledChatsWithoutRunResults = scheduledChats.map(({ runResults, ...rest }: any) => rest);
+      // available via the dedicated GET /scheduled-chats/:id/test-history endpoint),
+      // but first derive a compact runHealth summary (ENG-826 #4) so the list can
+      // flag consecutive failures on the card without fetching full history.
+      const scheduledChatsWithHealth = scheduledChats.map(({ runResults, ...rest }: any) => ({
+        ...rest,
+        runHealth: computeScheduleRunHealth(runResults),
+      }));
 
-      res.json(scheduledChatsWithoutRunResults);
+      res.json(scheduledChatsWithHealth);
     } catch (error) {
       console.error('AgentMode: Get scheduled chats error:', error);
       res.status(500).json({ error: 'Failed to get scheduled chats' });
