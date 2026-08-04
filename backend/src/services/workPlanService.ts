@@ -145,6 +145,13 @@ export class WorkPlanService {
   async updateThumbnail(
     planId: string,
     fields: Partial<Pick<WorkPlan, 'thumbnail_url' | 'thumbnail_source' | 'thumbnail_alt_text'>>,
+    opts: {
+      /** Set on automatic (AI) writes. Generation starts at create time and lands
+       *  ~40s later, so an admin can upload their own thumbnail in the window;
+       *  without this the older automatic result silently replaces their choice.
+       *  User-initiated writes leave it off and always win. */
+      skipIfUserUploaded?: boolean;
+    } = {},
   ): Promise<void> {
     const sets = ['#updatedAt = :updatedAt'];
     const removes: string[] = [];
@@ -164,6 +171,17 @@ export class WorkPlanService {
       }
     }
 
+    // update is an upsert. The thumbnail job runs long after create, so the plan
+    // may be deleted mid-flight; without attribute_exists we would write back an
+    // item holding only planId and the thumbnail fields — no title, no steps —
+    // which breaks every consumer that maps over plan.steps.
+    let condition = 'attribute_exists(planId)';
+    if (opts.skipIfUserUploaded) {
+      names['#thumbnail_source'] = 'thumbnail_source';
+      values[':uploadedSource'] = 'upload';
+      condition += ' AND (attribute_not_exists(#thumbnail_source) OR #thumbnail_source <> :uploadedSource)';
+    }
+
     try {
       await dynamodb.update({
         TableName: this.tableName,
@@ -171,14 +189,11 @@ export class WorkPlanService {
         UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
-        // update is an upsert. The thumbnail job runs long after create, so the
-        // plan may be deleted mid-flight; without this we would write back an
-        // item holding only planId and the thumbnail fields — no title, no
-        // steps — which breaks every consumer that maps over plan.steps.
-        ConditionExpression: 'attribute_exists(planId)',
+        ConditionExpression: condition,
       }).promise();
     } catch (err: any) {
-      // The plan is gone; a thumbnail for it is meaningless, not an error.
+      // Either the plan is gone, or an admin uploaded their own thumbnail while
+      // this automatic job was running. Both mean "do nothing", not "fail".
       if (err?.code === 'ConditionalCheckFailedException') return;
       throw err;
     }
