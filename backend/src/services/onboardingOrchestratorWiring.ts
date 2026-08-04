@@ -67,19 +67,62 @@ import { userDb } from "./db";
 // imports — the legacy services will import this file once they wrap
 // their cascades in the flag check.
 
+/**
+ * Re-raise a step's business failure so the orchestrator can see it (ENG-792).
+ *
+ * Every onboarding step service reports failure the same way — by patching
+ * `<step>Status = "failed"` / `<step>Error` on the User record — and never by
+ * throwing. The orchestrator only records a step as `failed` when its runner
+ * throws, so without this every failed run was stamped `ready` with a null
+ * output: the same "reports success, delivered nothing" shape ENG-792 is
+ * about, one layer up.
+ *
+ * Only a failure THIS run produced counts. The DAG invokes the
+ * `triggerXForUser` services directly, while the `<step>StartPatch` that
+ * flips status to `running` lives in the `startXForUser` route wrappers — so
+ * a stale `failed` from an earlier attempt can still be sitting on the record
+ * when a fresh run begins. Attribute it via `<step>CompletedAt` (every
+ * failed-patch builder stamps one): throw only when the terminal write landed
+ * at or after this run started.
+ *
+ * When we cannot prove the failure is ours we return normally. A false
+ * positive is the more expensive error here — marking `icp` failed would gate
+ * both `competitor` and `creativeDir`, and everything below them.
+ */
+function throwIfStepFailed(
+  user: Record<string, unknown> | null,
+  field: string,
+  startedAtMs: number,
+  fallbackMessage: string,
+): void {
+  if (user?.[`${field}Status`] !== "failed") return;
+  const completedAt = user[`${field}CompletedAt`];
+  const completedMs =
+    typeof completedAt === "string" ? Date.parse(completedAt) : NaN;
+  if (!Number.isFinite(completedMs) || completedMs < startedAtMs) return;
+  const error = user[`${field}Error`];
+  throw new Error(
+    typeof error === "string" && error ? error : fallbackMessage,
+  );
+}
+
 async function runBrandDna(userId: string): Promise<unknown> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { triggerBrandBuildForUser } = require("./onboardingBrandBuildService");
+  const startedAtMs = Date.now();
   await triggerBrandBuildForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+  throwIfStepFailed(user, "brandBuild", startedAtMs, "brand build failed");
   return user?.brandGuidelines ?? null;
 }
 
 async function runIcp(userId: string): Promise<unknown> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { triggerIcpDiscoveryForUser } = require("./onboardingIcpService");
+  const startedAtMs = Date.now();
   await triggerIcpDiscoveryForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+  throwIfStepFailed(user, "icp", startedAtMs, "ICP discovery failed");
   return user?.icpResult ?? null;
 }
 
@@ -88,16 +131,20 @@ async function runCompetitor(userId: string): Promise<unknown> {
   const {
     triggerCompetitorStrategyForUser,
   } = require("./onboardingCompetitorService");
+  const startedAtMs = Date.now();
   await triggerCompetitorStrategyForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+  throwIfStepFailed(user, "competitor", startedAtMs, "competitor strategy failed");
   return user?.competitorResult ?? null;
 }
 
 async function runCreativeDir(userId: string): Promise<unknown> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { triggerCreativeDirForUser } = require("./onboardingCreativeDirService");
+  const startedAtMs = Date.now();
   await triggerCreativeDirForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+  throwIfStepFailed(user, "creativeDir", startedAtMs, "creative direction failed");
   return user?.creativeDirResult ?? null;
 }
 
@@ -106,35 +153,24 @@ async function runAdImage(userId: string): Promise<unknown> {
   const {
     triggerAdImageGenerationForUser,
   } = require("./onboardingAdImageService");
+  const startedAtMs = Date.now();
   await triggerAdImageGenerationForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
-  // ENG-792: the service signals every business failure by patching
-  // adImageStatus (missing logo, unfetchable logo, all variants failed) and
-  // never by throwing. The orchestrator only records a step as `failed` when
-  // its runner throws, so without this re-raise the DAG stamped adImage
-  // "ready" with a null output — the same "reports success, delivered
-  // nothing" shape this ticket is about, one layer up.
-  //
-  // This does NOT gate ad copy: adCopy deps on creativeDir, not adImage, so
-  // the two remain independent axes by design (see adImageStatusService).
-  // What it fixes is the step record itself — a failed run is now visible as
-  // failed, with its reason, instead of masquerading as a ready step whose
-  // output happens to be null.
-  if (user?.adImageStatus === "failed") {
-    throw new Error(
-      typeof user.adImageError === "string" && user.adImageError
-        ? user.adImageError
-        : "ad image generation failed",
-    );
-  }
+  // Covers all three ad-image gates: missing logo, unfetchable logo, and
+  // every variant failing. Note this does NOT gate ad copy — adCopy deps on
+  // creativeDir, not adImage, so the two stay independent axes by design
+  // (see adImageStatusService). What it fixes is the step record itself.
+  throwIfStepFailed(user, "adImage", startedAtMs, "ad image generation failed");
   return user?.adImageResult ?? null;
 }
 
 async function runAdCopy(userId: string): Promise<unknown> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { triggerAdCopyForUser } = require("./onboardingAdCopyService");
+  const startedAtMs = Date.now();
   await triggerAdCopyForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+  throwIfStepFailed(user, "adCopy", startedAtMs, "ad copy generation failed");
   return user?.adCopyResult ?? null;
 }
 
