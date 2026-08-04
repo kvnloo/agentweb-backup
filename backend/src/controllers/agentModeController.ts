@@ -22,7 +22,7 @@ import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } fro
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { isPublishName } from '../utils/hardeningGaps';
-import { resolveSchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
+import { resolveSchedulePublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -1104,6 +1104,14 @@ export async function runVerifiedChat(
     // `passed: false` for calls it made before the interruption, and the verify
     // retry loop could re-prompt the model into re-running a completed side-effect.
     priorToolCalls?: Array<{ name: string }>;
+    // ENG-827: the publish authorization this run was ADMITTED under, resolved ONCE
+    // by the caller from the SAME schedule snapshot it used to build
+    // `requiredFunctions`. Threaded into every turn's system prompt so the prompt
+    // states the identical decision the required-function checker is enforcing,
+    // instead of independently re-reading the schedule per attempt and risking a
+    // split verdict (Greptile P1). Undefined for callers with no schedule, which
+    // fall back to the per-turn lookup inside generateSessionResponse.
+    publishAuthorization?: SchedulePublishAuthorization;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -1117,7 +1125,8 @@ export async function runVerifiedChat(
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
-    parkNotifiable = false
+    parkNotifiable = false,
+    publishAuthorization
   } = params;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
@@ -1418,7 +1427,9 @@ export async function runVerifiedChat(
           userMessage,
           userId,
           defaultModel,
-          []
+          [],
+          undefined, undefined, undefined, undefined, undefined, undefined,
+          publishAuthorization
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -1545,7 +1556,9 @@ export async function runVerifiedChat(
         userMessage,
         userId,
         defaultModel,
-        attachmentsForThisAttempt
+        attachmentsForThisAttempt,
+        undefined, undefined, undefined, undefined, undefined, undefined,
+        publishAuthorization
       );
 
       if (!hasAssistantOutput(response)) {
@@ -2361,16 +2374,17 @@ export async function runScheduledChat(
     const expectedKeywords = schedule.keywords || [];
     const functionCallMinCalls = schedule.functionCallMinCalls || {};
 
-    // ENG-827: keep the deterministic required-function checker in lockstep with the
-    // PUBLISH AUTHORIZATION directive, which is derived from the SAME schedule via
-    // resolveSchedulePublishAuthorization. This enforces the invariant structurally:
-    // the checker may never nudge for a publish tool the system prompt has told the
-    // model NOT to call — the contradiction that looped the reported runs ~21 times.
-    // (With authorization keyed on requiredFunctionCalls this filter is normally a
-    // no-op; it stays as the guard that keeps the two sides from ever drifting.)
-    const publishAuthorized = resolveSchedulePublishAuthorization(schedule).authorized;
+    // ENG-827: resolve this run's publish authorization exactly ONCE, here, from the
+    // schedule snapshot this run was admitted under. The SAME object drives both
+    // consumers — the deterministic required-function checker below, and (threaded
+    // through runVerifiedChat) the PUBLISH AUTHORIZATION directive in every turn's
+    // system prompt. Deriving them from one value is what makes the invariant
+    // structural: the checker can never nudge for a publish tool the prompt told the
+    // model not to call, which is the contradiction that looped the reported runs ~21
+    // times. Two independent reads could disagree — that was Greptile's P1.
+    const publishAuthorization = resolveSchedulePublishAuthorization(schedule);
     const requiredFunctions = expectedFunctionCalls
-      .filter((funcName: string) => publishAuthorized || !isPublishName(funcName))
+      .filter((funcName: string) => publishAuthorization.authorized || !isPublishName(funcName))
       .map((funcName: string) => ({
         functionName: funcName,
         minCount: functionCallMinCalls[funcName] || 1
@@ -2418,6 +2432,9 @@ export async function runScheduledChat(
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
       fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-827: same object that filtered `requiredFunctions` above, so the prompt
+      // and the checker state one decision rather than two independent reads.
+      publishAuthorization,
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true
@@ -3175,7 +3192,13 @@ export async function generateSessionResponse(
   answerAck?: string,
   // ENG-396: the structured selection stamped on this reply's metadata, so a card can
   // show which option was CLICKED (never inferred from the message text).
-  answeredQuestionMeta?: { questionId: string; optionId: string; delegated: boolean }
+  answeredQuestionMeta?: { questionId: string; optionId: string; delegated: boolean },
+  // ENG-827: publish authorization already resolved by the caller (runVerifiedChat,
+  // from runScheduledChat's single schedule snapshot). When supplied it is used
+  // verbatim, so the prompt and the required-function checker can never disagree.
+  // When absent — the interactive route, or a resumed run entered directly — fall
+  // back to reading the schedule for this turn.
+  publishAuthorizationOverride?: SchedulePublishAuthorization
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -3312,18 +3335,23 @@ export async function generateSessionResponse(
           // schedule-creation time (see resolveSchedulePublishAuthorization). A
           // prompt-enrichment lookup must never break the run.
           //
-          // A schedule we successfully READ and that withholds authorization →
-          // 'withheld' (draft & notify). A schedule we could NOT read → 'unknown',
-          // which emits no publish block at all. That distinction matters: this
-          // prompt is rebuilt on every verification attempt and re-reads the
-          // schedule each time, whereas runScheduledChat fixes the required-function
-          // list once from its own snapshot. Treating an unreadable schedule as
-          // "forbidden" would let one throttled read assert a prohibition against a
-          // tool the checker still requires — re-creating the very nudge-loop
-          // contradiction this ticket exists to remove (Greptile P1).
+          // PREFERRED PATH (Greptile P1): a scheduled run threads the authorization it
+          // was ADMITTED under down from runScheduledChat, which resolved it once from
+          // the same schedule snapshot it used to build the required-function list. Use
+          // it verbatim — then the prompt and the checker are the same decision by
+          // construction, not two reads that happen to agree.
+          //
+          // FALLBACK (no override — interactive route, or a run entered directly): read
+          // the schedule for this turn. A schedule we READ that withholds authorization
+          // → 'withheld' (draft & notify). A schedule we could NOT read → 'unknown',
+          // which emits no publish block at all, so a throttled read can never assert a
+          // prohibition against a tool a checker might still require.
           let publishAuthorization: 'authorized' | 'withheld' | 'unknown' = 'withheld';
           let authorizedPublishTools: string[] = [];
-          if (scheduleIdMatch) {
+          if (publishAuthorizationOverride) {
+            publishAuthorization = publishAuthorizationOverride.authorized ? 'authorized' : 'withheld';
+            authorizedPublishTools = publishAuthorizationOverride.tools;
+          } else if (scheduleIdMatch) {
             try {
               const auth = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleIdMatch[1]));
               publishAuthorization = auth.authorized ? 'authorized' : 'withheld';
