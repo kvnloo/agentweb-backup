@@ -739,8 +739,10 @@ describe('apiTools', () => {
 
     it('should document that llmModel is the selection and generationModels is what ran', () => {
       const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
-      expect(description).toContain('llmModel');
-      expect(description).toContain('generationModels');
+      // The guidance, not just the field names — the reports name a model because the
+      // payload label invites it, so the primacy instruction is the fix's mechanism.
+      expect(description).toContain('use generationModels');
+      expect(description).toContain('Only fall back to llmModel when generationModels is null');
     });
 
     it('should include delegateInfo when session was started by admin delegation', async () => {
