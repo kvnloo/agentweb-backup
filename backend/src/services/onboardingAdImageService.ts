@@ -913,6 +913,18 @@ export async function triggerAdImageGenerationForUser(
      * same actionable "upload your logo" failure path as a missing logo.
      */
     verifyLogoUrl?: (logoUrl: string) => Promise<boolean>;
+    /**
+     * The identity minted for THIS run by `startAdImageGenerationForUser`.
+     * Passed in hand-to-hand rather than re-read from the User record,
+     * because the record is shared state: if two starts overlap so that both
+     * start patches land before either worker reads, both workers would read
+     * — and adopt — the second run's nonce, and each would then be authorised
+     * to overwrite the other's creatives (Greptile).
+     *
+     * Absent for eager-DAG invocations, which never go through the start
+     * patch; those fall back to whatever the record says, as before.
+     */
+    run?: AdImageRunIdentity;
   } = {}
 ): Promise<void> {
   const user = await userDb.getUserById(userId);
@@ -920,7 +932,19 @@ export async function triggerAdImageGenerationForUser(
 
   const u = user as any;
   // Run identity for every terminal write below — see failAdImageRunIfOwned.
-  const ourRun = readAxisIdentity(u);
+  const ourRun = deps.run ?? readAxisIdentity(u);
+  if (axisIsNotOurs(readAxisIdentity(u), ourRun)) {
+    // A newer run already owns the axis and this one has not generated
+    // anything yet — stop here rather than burn an image-generation cycle
+    // whose every terminal write is destined to be dropped. A no-op when the
+    // identity came from the record, since that compares it against itself.
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[onboardingAdImageService] abandoning run — a newer run owns the axis",
+      { userId, ours: ourRun, axis: readAxisIdentity(u) },
+    );
+    return;
+  }
   const creativeDirStatus =
     typeof u.creativeDirStatus === "string" ? u.creativeDirStatus : "idle";
   if (creativeDirStatus !== "ready") {
@@ -1172,9 +1196,19 @@ export async function triggerAdImageGenerationForUser(
  */
 export async function startAdImageGenerationForUser(
   userId: string,
-  deps: { imageGen?: AdImageGeneratorDep; timeoutMs?: number } = {}
+  deps: {
+    imageGen?: AdImageGeneratorDep;
+    timeoutMs?: number;
+    // Forwarded verbatim to the worker below; `run` is not accepted here
+    // because this function is the thing that mints it.
+    verifyLogoUrl?: (logoUrl: string) => Promise<boolean>;
+  } = {}
 ): Promise<void> {
-  await userDb.updateUser(userId, adImageStartPatch() as any);
+  // Keep the nonce this start minted: it is what makes the worker below THIS
+  // run rather than "whichever run the record happens to name by the time the
+  // worker reads it" (see the `run` dep on triggerAdImageGenerationForUser).
+  const startPatch = adImageStartPatch();
+  await userDb.updateUser(userId, startPatch as any);
   // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
   // users; cheap no-op gated inside the orchestrator for everyone else.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -1189,5 +1223,11 @@ export async function startAdImageGenerationForUser(
     void reconcileForUser(userId);
     return;
   }
-  void triggerAdImageGenerationForUser(userId, deps);
+  void triggerAdImageGenerationForUser(userId, {
+    ...deps,
+    run: {
+      runId: startPatch.adImageRunId,
+      startedAt: startPatch.adImageStartedAt,
+    },
+  });
 }
