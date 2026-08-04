@@ -214,6 +214,163 @@ describe('Predefined Work Plan MCP Tools', () => {
     });
   });
 
+  // ─── ENG-890: partial step payloads must not silently wipe the plan ──────
+  describe('manage_predefined_work_plan - update step safety', () => {
+    const existingPlan = {
+      planId: 'wp-1',
+      title: 'Meta Launch Gate',
+      steps: [
+        { stepCount: 1, title: 'Step 1: Scope', description: 'old scope', requiredFunctionCalls: ['a'], skillIds: ['s1'] },
+        { stepCount: 2, title: 'Step 2: Inventory', description: 'inventory', requiredFunctionCalls: [], skillIds: [] },
+        { stepCount: 3, title: 'Step 3: Placements', description: 'placements', requiredFunctionCalls: [], skillIds: [] },
+        { stepCount: 4, title: 'Step 4: Audit', description: 'audit', requiredFunctionCalls: [], skillIds: [] },
+        { stepCount: 5, title: 'Step 5: Journey', description: 'journey', requiredFunctionCalls: [], skillIds: [] },
+        { stepCount: 6, title: 'Step 6: Verdict', description: 'verdict', requiredFunctionCalls: [], skillIds: [] },
+        { stepCount: 7, title: 'Step 7: Hand-off', description: 'handoff', requiredFunctionCalls: [], skillIds: [] },
+      ],
+    };
+
+    /** GET returns the current plan; PUT returns the saved plan. */
+    function mockPlanFetches(saved: any = { planId: 'wp-1', message: 'Updated' }) {
+      mockMcpFetch.mockImplementation(async (opts: any) =>
+        opts.method === 'GET' ? JSON.parse(JSON.stringify(existingPlan)) : saved
+      );
+    }
+    const putCalls = () => mockMcpFetch.mock.calls.filter((c: any) => c[0].method === 'PUT');
+
+    it('refuses a shrinking replace and does NOT issue the PUT', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: [{ title: 'Step 1: Scope', description: 'amended scope' }],
+      }, context);
+
+      expect(putCalls()).toHaveLength(0);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toBeDefined();
+      expect(payload.stepsWouldBeRemoved).toBe(6);
+      expect(payload.removedStepTitles).toContain('Step 7: Hand-off');
+    });
+
+    it('rejects a non-array steps payload without calling the API', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: { title: 'Step 1: Scope' },
+      }, context);
+
+      expect(putCalls()).toHaveLength(0);
+      expect(JSON.parse(result.content[0].text).error).toMatch(/array/i);
+    });
+
+    it('merge mode amends the targeted step and keeps every other step', async () => {
+      mockPlanFetches();
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps_mode: 'merge',
+        steps: [{ title: 'Step 1: Scope', description: 'amended scope' }],
+      }, context);
+
+      const body = (putCalls()[0][0] as any).body;
+      expect(body.steps).toHaveLength(7);
+      expect(body.steps[0].description).toBe('amended scope');
+      expect(body.steps[0].requiredFunctionCalls).toEqual(['a']);
+      expect(body.steps[0].skillIds).toEqual(['s1']);
+      expect(body.steps[6].title).toBe('Step 7: Hand-off');
+    });
+
+    it('merge mode targets by step_count when titles are being renamed', async () => {
+      mockPlanFetches();
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps_mode: 'merge',
+        steps: [{ step_count: 3, title: 'Step 3: Placement settings' }],
+      }, context);
+
+      const body = (putCalls()[0][0] as any).body;
+      expect(body.steps).toHaveLength(7);
+      expect(body.steps[2].title).toBe('Step 3: Placement settings');
+      expect(body.steps[2].description).toBe('placements');
+    });
+
+    it('merge mode appends steps that match nothing existing', async () => {
+      mockPlanFetches();
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps_mode: 'merge',
+        steps: [{ title: 'Step 8: Retro', description: 'new step' }],
+      }, context);
+
+      const body = (putCalls()[0][0] as any).body;
+      expect(body.steps).toHaveLength(8);
+      expect(body.steps[7]).toEqual(expect.objectContaining({ stepCount: 8, title: 'Step 8: Retro' }));
+    });
+
+    it('allows a shrinking replace when confirm_step_removal is true and reports the diff', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        confirm_step_removal: true,
+        steps: [{ title: 'Step 1: Scope', description: 'amended scope' }],
+      }, context);
+
+      expect(putCalls()).toHaveLength(1);
+      expect((putCalls()[0][0] as any).body.steps).toHaveLength(1);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.stepsChange).toEqual(expect.objectContaining({
+        mode: 'replace', stepsBefore: 7, stepsAfter: 1, stepsRemoved: 6,
+      }));
+    });
+
+    it('replaces without confirmation when no step is dropped', async () => {
+      mockPlanFetches();
+
+      const rewritten = existingPlan.steps.map((s) => ({ title: s.title, description: 'rewritten' }));
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: rewritten,
+      }, context);
+
+      expect(putCalls()).toHaveLength(1);
+      expect((putCalls()[0][0] as any).body.steps).toHaveLength(7);
+      expect(JSON.parse(result.content[0].text).stepsChange.stepsRemoved).toBe(0);
+    });
+
+    it('does not read the plan when steps are not being changed', async () => {
+      mockPlanFetches();
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        title: 'Renamed plan',
+      }, context);
+
+      expect(mockMcpFetch.mock.calls.filter((c: any) => c[0].method === 'GET')).toHaveLength(0);
+      expect(putCalls()).toHaveLength(1);
+      expect((putCalls()[0][0] as any).body.steps).toBeUndefined();
+    });
+
+    it('documents the replace semantics and the merge escape hatch in the tool description', () => {
+      const def = mcpToolRegistry.getTool('manage_predefined_work_plan')!.definition as any;
+      expect(def.description).toMatch(/replaces the entire/i);
+      expect(def.inputSchema.properties.steps_mode).toBeDefined();
+      expect(def.inputSchema.properties.confirm_step_removal).toBeDefined();
+    });
+  });
+
   describe('manage_predefined_work_plan - delete', () => {
     it('should call DELETE with plan_id in path', async () => {
       mockMcpFetch.mockResolvedValue({ message: 'Deleted' });
