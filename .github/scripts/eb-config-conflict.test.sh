@@ -284,6 +284,47 @@ check 'ENG-836: an in-place instance removal beside a resource edit is rejected'
 check 'ENG-836: and the in-place removal is attributed to the instance side' 1 \
   'chromium.config (instance config)'
 
+# Greptile's fourth finding on #2267: a RENAME. `git diff --name-only` applies
+# rename detection and reports only the DESTINATION path, so looking that path
+# up in base finds nothing and every declaration at the source is lost. The
+# workflow now passes --no-renames, which reports a rename as a delete plus an
+# add. This proves the classifier handles that two-path form: the source is
+# recovered from base, and the pair is caught alongside an instance change.
+R=$(new_root); write_resource_config "$R"; write_platform_conf "$R"
+commit_root "$R"
+git -C "$R" mv backend/.ebextensions/timeout.config backend/.ebextensions/alb.config
+cat >"$R/backend/.ebextensions/alb.config" <<'EOF'
+# renamed AND the resource declaration dropped in the same edit
+option_settings:
+  aws:elasticbeanstalk:application:environment:
+    RENAMED: "1"
+EOF
+run_check_with_base "$R" \
+  backend/.ebextensions/timeout.config \
+  backend/.ebextensions/alb.config \
+  backend/.platform/nginx/conf.d/agent-mode-timeout.conf
+check 'ENG-836: a renamed config (delete+add form) is classified from its source' 1 \
+  'EB_CONFIG_CONFLICT'
+check 'ENG-836: and the rename SOURCE is named on the resource side' 1 \
+  'timeout.config (resource namespace)'
+
+# The failure mode --no-renames prevents: given only the destination path, the
+# source declarations are invisible and the conflict is missed. Documented as a
+# test so nobody "simplifies" the flag away.
+R=$(new_root); write_resource_config "$R"; write_platform_conf "$R"
+commit_root "$R"
+git -C "$R" mv backend/.ebextensions/timeout.config backend/.ebextensions/alb.config
+cat >"$R/backend/.ebextensions/alb.config" <<'EOF'
+option_settings:
+  aws:elasticbeanstalk:application:environment:
+    RENAMED: "1"
+EOF
+run_check_with_base "$R" \
+  backend/.ebextensions/alb.config \
+  backend/.platform/nginx/conf.d/agent-mode-timeout.conf
+check 'ENG-836: destination-only (rename detection ON) is why --no-renames is required' 0 \
+  'No Elastic Beanstalk resource-config change'
+
 # Content genuinely unrecoverable (deleted, and no base ref supplied). We
 # cannot tell which side it was, so it counts as BOTH rather than neither.
 R=$(new_root); write_resource_config "$R"

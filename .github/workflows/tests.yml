@@ -281,7 +281,15 @@ jobs:
           # Three dots: only what this PR changed relative to the merge base,
           # so commits that landed on the base branch meanwhile are not blamed
           # on this PR.
-          git diff --name-only "${BASE_SHA}...${HEAD_SHA}" \
+          #
+          # --no-renames: with rename detection ON, git reports a rename as the
+          # DESTINATION path only. The classifier would then look that path up
+          # in the base revision, find nothing, and lose every declaration that
+          # existed at the source — so renaming a config while dropping its
+          # resource block, alongside an instance change, would pass. Turning
+          # detection off reports the rename as a delete plus an add, and both
+          # sides get classified: the old path from base, the new from head.
+          git diff --name-only --no-renames "${BASE_SHA}...${HEAD_SHA}" \
             | bash .github/scripts/eb-config-conflict.sh
 
   # This job used to poll Greptile's own `Greptile Review` check-run and pass on
