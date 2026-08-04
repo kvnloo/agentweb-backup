@@ -146,11 +146,16 @@ export class WorkPlanService {
     planId: string,
     fields: Partial<Pick<WorkPlan, 'thumbnail_url' | 'thumbnail_source' | 'thumbnail_alt_text'>>,
     opts: {
-      /** Set on automatic (AI) writes. Generation starts at create time and lands
-       *  ~40s later, so an admin can upload their own thumbnail in the window;
-       *  without this the older automatic result silently replaces their choice.
-       *  User-initiated writes leave it off and always win. */
-      skipIfUserUploaded?: boolean;
+      /** The thumbnail_source this write was started from, for automatic (AI)
+       *  writes only — `null` meaning "the plan had no thumbnail yet". AI
+       *  generation starts at create or at a clear and lands ~40s later; if the
+       *  thumbnail changed in that window the job is stale, and letting it write
+       *  silently undoes the newer action (an admin's upload, or their clear).
+       *  Omit on user-initiated writes so they always win.
+       *
+       *  Keyed on thumbnail_source rather than updatedAt on purpose: an
+       *  unrelated edit to the plan's steps must not discard a good thumbnail. */
+      expectedSource?: string | null;
     } = {},
   ): Promise<void> {
     const sets = ['#updatedAt = :updatedAt'];
@@ -176,10 +181,14 @@ export class WorkPlanService {
     // item holding only planId and the thumbnail fields — no title, no steps —
     // which breaks every consumer that maps over plan.steps.
     let condition = 'attribute_exists(planId)';
-    if (opts.skipIfUserUploaded) {
+    if ('expectedSource' in opts) {
       names['#thumbnail_source'] = 'thumbnail_source';
-      values[':uploadedSource'] = 'upload';
-      condition += ' AND (attribute_not_exists(#thumbnail_source) OR #thumbnail_source <> :uploadedSource)';
+      if (opts.expectedSource === null || opts.expectedSource === undefined) {
+        condition += ' AND attribute_not_exists(#thumbnail_source)';
+      } else {
+        values[':expectedSource'] = opts.expectedSource;
+        condition += ' AND #thumbnail_source = :expectedSource';
+      }
     }
 
     try {
@@ -192,8 +201,8 @@ export class WorkPlanService {
         ConditionExpression: condition,
       }).promise();
     } catch (err: any) {
-      // Either the plan is gone, or an admin uploaded their own thumbnail while
-      // this automatic job was running. Both mean "do nothing", not "fail".
+      // Either the plan is gone, or its thumbnail moved on while this automatic
+      // job was running. Both mean "do nothing", not "fail".
       if (err?.code === 'ConditionalCheckFailedException') return;
       throw err;
     }

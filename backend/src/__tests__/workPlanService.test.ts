@@ -329,39 +329,52 @@ describe('WorkPlanService', () => {
       ).rejects.toThrow('ProvisionedThroughputExceeded');
     });
 
-    // Greptile P1 on PR #2266: AI generation is kicked off at create time and
-    // finishes ~40s later. If an admin uploads their own thumbnail in that
-    // window, the older automatic job used to land afterwards and silently
-    // replace their choice. An automatic default must never beat an explicit
-    // human action.
-    it('guards automatic writes so they cannot replace a user upload', async () => {
+    // Greptile P1/P2 on PR #2266. AI generation starts at create (or at a
+    // clear) and lands ~40s later. Anything that changes the thumbnail in that
+    // window — an admin upload, a clear — makes the in-flight job stale, and
+    // letting it write silently undoes the newer action. Each automatic write
+    // is therefore conditioned on the thumbnail state it was started from.
+    // Deliberately keyed on thumbnail_source rather than updatedAt: an
+    // unrelated edit to the plan's steps must not throw away a good thumbnail.
+    it('conditions an automatic write on the thumbnail state it started from', async () => {
       await workPlanService.updateThumbnail(
         'p1',
         { thumbnail_url: 'https://x/ai.png', thumbnail_source: 'ai' },
-        { skipIfUserUploaded: true },
+        { expectedSource: 'none' },
       );
 
       const arg = mockUpdate.mock.calls[0][0];
       expect(arg.ConditionExpression).toContain('attribute_exists(planId)');
-      expect(arg.ConditionExpression).toMatch(/thumbnail_source\s*<>\s*:uploadedSource/);
-      expect(arg.ExpressionAttributeValues[':uploadedSource']).toBe('upload');
+      expect(arg.ConditionExpression).toContain('#thumbnail_source = :expectedSource');
+      expect(arg.ExpressionAttributeValues[':expectedSource']).toBe('none');
     });
 
-    it('leaves user-initiated writes unguarded so they always win', async () => {
+    it('expects the attribute to be absent when it started from no thumbnail at all', async () => {
+      await workPlanService.updateThumbnail(
+        'p1',
+        { thumbnail_url: 'https://x/ai.png', thumbnail_source: 'ai' },
+        { expectedSource: null },
+      );
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.ConditionExpression).toContain('attribute_not_exists(#thumbnail_source)');
+      expect(arg.ExpressionAttributeValues[':expectedSource']).toBeUndefined();
+    });
+
+    it('leaves user-initiated writes unordered so they always win', async () => {
       await workPlanService.updateThumbnail('p1', { thumbnail_url: 'https://x/up.png', thumbnail_source: 'upload' });
 
       const arg = mockUpdate.mock.calls[0][0];
       expect(arg.ConditionExpression).toBe('attribute_exists(planId)');
-      expect(arg.ExpressionAttributeValues[':uploadedSource']).toBeUndefined();
     });
 
-    it('treats a skipped automatic write as a no-op, not an error', async () => {
+    it('treats a stale automatic write as a no-op, not an error', async () => {
       const err: any = new Error('The conditional request failed');
       err.code = 'ConditionalCheckFailedException';
       mockPromise.mockRejectedValueOnce(err);
 
       await expect(
-        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }, { skipIfUserUploaded: true }),
+        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }, { expectedSource: null }),
       ).resolves.toBeUndefined();
     });
 

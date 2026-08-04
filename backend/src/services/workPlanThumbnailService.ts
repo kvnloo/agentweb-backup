@@ -95,8 +95,9 @@ export class WorkPlanThumbnailService {
         thumbnail_url: url,
         thumbnail_source: 'ai',
         thumbnail_alt_text: updated.thumbnail_alt_text,
-      // Automatic: must not clobber a thumbnail the admin uploaded while this ran.
-      }, { skipIfUserUploaded: true });
+      // Automatic: only write if the thumbnail is still what this job started
+      // from, so an upload or a clear made meanwhile is not undone.
+      }, { expectedSource: plan.thumbnail_source ?? null });
       return updated;
     } catch (err) {
       console.error(
@@ -165,9 +166,13 @@ export class WorkPlanThumbnailService {
   private async setNoThumbnail(plan: WorkPlan): Promise<WorkPlan> {
     const updated: WorkPlan = { ...plan, thumbnail_source: 'none' };
     // Preserve any existing thumbnail_url when just setting source to 'none' on failure
-    // Also automatic — this is the AI failure path, so it must not stamp
-    // 'none' over an upload the admin made while generation was running.
-    await workPlanService.updateThumbnail(plan.planId, { thumbnail_source: 'none' }, { skipIfUserUploaded: true });
+    // Also automatic — the AI failure path must not stamp 'none' over an upload
+    // or a clear the admin made while generation was running.
+    await workPlanService.updateThumbnail(
+      plan.planId,
+      { thumbnail_source: 'none' },
+      { expectedSource: plan.thumbnail_source ?? null },
+    );
     return updated;
   }
 }
