@@ -56,6 +56,7 @@ import youtubeAuthRoutes from "./routes/youtubeAuth";
 import googleAdsAuthRoutes from "./routes/googleAdsAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
+import whatsappWebhookRoutes from "./routes/whatsappWebhook";
 import fathomOnboardingAdminRoutes from "./routes/fathomOnboardingAdmin";
 import hubspotAuthRoutes from "./routes/hubspotAuth";
 import attioAuthRoutes from "./routes/attioAuth";
@@ -259,6 +260,9 @@ app.use("/api/webhooks/hubspot", express.raw({ type: "application/json" }));
 app.use("/api/integrations/linear/webhook", express.raw({ type: "application/json" }));
 // Featurebase webhook (Slack ship-notify) signs the raw body too — before express.json().
 app.use("/api/integrations/featurebase/webhook", express.raw({ type: "application/json" }));
+// WhatsApp Cloud API webhook: Meta signs the exact payload bytes as X-Hub-Signature-256,
+// so the HMAC must be computed over the raw Buffer, not a re-serialized parse (ENG-273).
+app.use("/api/webhooks/whatsapp", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ limit: "50mb", extended: true }));
 app.use(passport.initialize());
@@ -314,6 +318,7 @@ app.use("/api/settings", settingsRoutes);
 app.use("/api/image-models", imageModelsRoutes);
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
+app.use("/api/webhooks/whatsapp", whatsappWebhookRoutes);
 app.use("/api", devEnvRoutes);
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
