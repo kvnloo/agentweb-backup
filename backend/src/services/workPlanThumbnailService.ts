@@ -77,10 +77,10 @@ export class WorkPlanThumbnailService {
     plan: WorkPlan,
     opts: { supersedeInFlight?: boolean } = {},
   ): Promise<{ outcome: 'applied' | 'superseded' | 'gone'; plan: WorkPlan | null }> {
-    // The plan as this job observed it. No claim write for background jobs: a
-    // claim is a second unconditioned write that races the actions it is meant
-    // to order. A user action is different — it is allowed to supersede.
-    let basedOn = plan.updatedAt;
+    // The thumbnail revision this job observed. Scoped to the thumbnail, so an
+    // unrelated title/step/owner edit during the ~40s render no longer discards
+    // the result — only a competing thumbnail action does.
+    let basedOn: string | null = plan.thumbnail_rev ?? null;
     if (opts.supersedeInFlight) {
       const superseded = await workPlanService.updateThumbnail(plan.planId, {});
       // Unconditional apart from attribute_exists, so null here means the plan
@@ -125,19 +125,19 @@ export class WorkPlanThumbnailService {
       // Ordered against the plan as it looked when this generation began, and
       // scoped to the thumbnail attributes, so a ~40s render cannot revert an
       // edit or a newer thumbnail action made meanwhile (ENG-889).
-      const writtenAt = await workPlanService.updateThumbnail(plan.planId, {
+      const writtenRev = await workPlanService.updateThumbnail(plan.planId, {
         thumbnail_url: url,
         thumbnail_source: 'ai',
         thumbnail_alt_text: updated.thumbnail_alt_text,
-      }, { expectedUpdatedAt: basedOn });
+      }, { expectedRev: basedOn });
       // A newer action won, or the plan was deleted. Report what is actually
       // stored — never the stale input — and say which happened, so a caller
       // that an admin is waiting on does not present a no-op as success.
-      if (!writtenAt) {
+      if (!writtenRev) {
         const current = await workPlanService.getWorkPlan(plan.planId);
         return { outcome: current ? 'superseded' : 'gone', plan: current };
       }
-      return { outcome: 'applied', plan: { ...updated, updatedAt: writtenAt } };
+      return { outcome: 'applied', plan: { ...updated, thumbnail_rev: writtenRev } };
     } catch (err) {
       console.error(
         `[ThumbnailService] Error generating thumbnail for plan ${plan.planId}:`,
@@ -169,9 +169,9 @@ export class WorkPlanThumbnailService {
       thumbnail_source: 'upload',
       thumbnail_alt_text: `Thumbnail for ${plan.title}`,
     };
-    // User-initiated: unconditional, and bumping updatedAt invalidates any
+    // User-initiated: unconditional, and bumping thumbnail_rev invalidates any
     // generation still in flight.
-    const writtenAt = await workPlanService.updateThumbnail(plan.planId, {
+    const writtenRev = await workPlanService.updateThumbnail(plan.planId, {
       thumbnail_url: url,
       thumbnail_source: 'upload',
       thumbnail_alt_text: updated.thumbnail_alt_text,
@@ -179,8 +179,8 @@ export class WorkPlanThumbnailService {
     // Unconditional apart from attribute_exists, so null means the plan was
     // deleted while the image was uploading. Returning the locally built object
     // would report a 200 for a plan that no longer exists.
-    if (!writtenAt) return null;
-    return { ...updated, updatedAt: writtenAt };
+    if (!writtenRev) return null;
+    return { ...updated, thumbnail_rev: writtenRev };
   }
 
   async removeThumbnail(plan: WorkPlan): Promise<WorkPlan | null> {
@@ -191,15 +191,15 @@ export class WorkPlanThumbnailService {
       thumbnail_source: 'none',
       thumbnail_alt_text: undefined,
     };
-    const clearedAt = await workPlanService.updateThumbnail(plan.planId, {
+    const clearedRev = await workPlanService.updateThumbnail(plan.planId, {
       thumbnail_url: undefined,
       thumbnail_source: 'none',
       thumbnail_alt_text: undefined,
     });
     // Same as above: null here means the plan is gone, so there is nothing to
     // clear and nothing to regenerate.
-    if (!clearedAt) return null;
-    cleared.updatedAt = clearedAt;
+    if (!clearedRev) return null;
+    cleared.thumbnail_rev = clearedRev;
 
     // Trigger AI regeneration asynchronously — caller gets the cleared state
     // immediately. `cleared` carries the post-clear updatedAt, so this job is
@@ -216,24 +216,24 @@ export class WorkPlanThumbnailService {
 
   private async setNoThumbnail(
     plan: WorkPlan,
-    basedOn?: string,
+    basedOn?: string | null,
   ): Promise<{ outcome: 'applied' | 'superseded' | 'gone'; plan: WorkPlan | null }> {
     const updated: WorkPlan = { ...plan, thumbnail_source: 'none' };
     // Preserve any existing thumbnail_url when just setting source to 'none' on
     // failure. Carries the generation's ordering, so a failed background job
     // cannot stamp 'none' over a newer upload or clear.
-    const writtenAt = await workPlanService.updateThumbnail(
+    const writtenRev = await workPlanService.updateThumbnail(
       plan.planId,
       { thumbnail_source: 'none' },
-      basedOn !== undefined ? { expectedUpdatedAt: basedOn } : {},
+      basedOn !== undefined ? { expectedRev: basedOn } : {},
     );
     // The fallback write is conditioned exactly like the success write, so it
     // can lose the same races. Derive the outcome rather than assuming applied.
-    if (!writtenAt) {
+    if (!writtenRev) {
       const current = await workPlanService.getWorkPlan(plan.planId);
       return { outcome: current ? 'superseded' : 'gone', plan: current };
     }
-    return { outcome: 'applied', plan: { ...updated, updatedAt: writtenAt } };
+    return { outcome: 'applied', plan: { ...updated, thumbnail_rev: writtenRev } };
   }
 }
 

@@ -257,6 +257,37 @@ describe('WorkPlanService', () => {
   // edit made meanwhile, silently. Ordering is ONE conditional write on
   // updatedAt — not a claim-then-write token, because the claim is itself an
   // unconditioned write that races the actions it is meant to order.
+  // ENG-889: updateWorkPlan was a whole-item put, so an ordinary plan save wrote
+  // back whatever thumbnail the caller happened to hold. It is attribute-scoped
+  // now and must never touch the thumbnail fields, which is what makes a
+  // thumbnail-scoped revision trustworthy.
+  describe('updateWorkPlan leaves the thumbnail alone', () => {
+    const plan: any = {
+      planId: 'p1', title: 'T', steps: [], visibility: 'system', isBuiltIn: true,
+      createdAt: 'c', updatedAt: 'u', description: 'd',
+      thumbnail_url: 'https://stale/old.png', thumbnail_source: 'ai', thumbnail_rev: 'rev-old',
+    };
+
+    it('never writes any thumbnail attribute', async () => {
+      await workPlanService.updateWorkPlan(plan);
+
+      const arg = mockUpdate.mock.calls[0][0];
+      for (const field of ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_text', 'thumbnail_rev']) {
+        expect(arg.UpdateExpression).not.toContain(field);
+      }
+      expect(mockPut).not.toHaveBeenCalled();
+    });
+
+    it('still writes the plan fields, and removes ones the caller cleared', async () => {
+      await workPlanService.updateWorkPlan({ ...plan, description: undefined });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).toContain('#title = :title');
+      expect(arg.UpdateExpression).toContain('#steps = :steps');
+      expect(arg.UpdateExpression).toMatch(/REMOVE .*#description/);
+    });
+  });
+
   describe('updateThumbnail', () => {
     it('writes only the thumbnail attributes, never a whole-item put', async () => {
       await workPlanService.updateThumbnail('p1', { thumbnail_url: 'https://x/y.png', thumbnail_source: 'ai' });
@@ -301,13 +332,13 @@ describe('WorkPlanService', () => {
       await workPlanService.updateThumbnail(
         'p1',
         { thumbnail_url: 'https://x/ai.png', thumbnail_source: 'ai' },
-        { expectedUpdatedAt: '2026-08-04T10:00:00.000Z' },
+        { expectedRev: 'rev-1' },
       );
 
       const arg = mockUpdate.mock.calls[0][0];
       expect(arg.ConditionExpression).toContain('attribute_exists(planId)');
-      expect(arg.ConditionExpression).toContain('#updatedAt = :expectedUpdatedAt');
-      expect(arg.ExpressionAttributeValues[':expectedUpdatedAt']).toBe('2026-08-04T10:00:00.000Z');
+      expect(arg.ConditionExpression).toContain('#thumbnail_rev = :expectedRev');
+      expect(arg.ExpressionAttributeValues[':expectedRev']).toBe('rev-1');
     });
 
     it('leaves user-initiated writes unordered so they always win', async () => {
@@ -316,11 +347,25 @@ describe('WorkPlanService', () => {
       expect(mockUpdate.mock.calls[0][0].ConditionExpression).toBe('attribute_exists(planId)');
     });
 
-    it('returns the new updatedAt so a follow-up job can order against it', async () => {
+    it('returns the new revision so a follow-up job can order against it', async () => {
       const result = await workPlanService.updateThumbnail('p1', { thumbnail_source: 'none' });
 
       expect(result).toEqual(expect.any(String));
-      expect(result).toBe(mockUpdate.mock.calls[0][0].ExpressionAttributeValues[':updatedAt']);
+      expect(result).toBe(mockUpdate.mock.calls[0][0].ExpressionAttributeValues[':thumbnail_rev']);
+    });
+
+    it('bumps thumbnail_rev on every write so competing actions are ordered', async () => {
+      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'upload' });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).toContain('#thumbnail_rev = :thumbnail_rev');
+    });
+
+    it('expects no revision at all when the plan never had a thumbnail', async () => {
+      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }, { expectedRev: null });
+
+      expect(mockUpdate.mock.calls[0][0].ConditionExpression)
+        .toContain('attribute_not_exists(#thumbnail_rev)');
     });
 
     it('returns null — not a throw, and not a false success — when a newer action won', async () => {
@@ -329,7 +374,7 @@ describe('WorkPlanService', () => {
       mockPromise.mockRejectedValueOnce(err);
 
       await expect(
-        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }, { expectedUpdatedAt: 'stale' }),
+        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }, { expectedRev: 'stale' }),
       ).resolves.toBeNull();
     });
 

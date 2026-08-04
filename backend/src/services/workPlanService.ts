@@ -66,7 +66,26 @@ export interface WorkPlan {
   thumbnail_url?: string;
   thumbnail_source?: 'ai' | 'upload' | 'none';
   thumbnail_alt_text?: string;
+  /** Bumped by every thumbnail write and by nothing else. Thumbnail generations
+   *  condition on it, so a concurrent title/step/owner edit cannot discard a
+   *  generated thumbnail while a concurrent thumbnail action still does. */
+  thumbnail_rev?: string;
 }
+
+/** Owned exclusively by updateThumbnail. updateWorkPlan must never write these,
+ *  or an ordinary plan save would clobber a newer thumbnail — the same
+ *  lost-update class this pipeline already had (ENG-889). */
+const THUMBNAIL_FIELDS = ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_text', 'thumbnail_rev'] as const;
+
+/** Optional plan fields: set when present, REMOVEd when the caller cleared them
+ *  (a whole-item put used to give us that for free). */
+const OPTIONAL_PLAN_FIELDS = [
+  'description', 'welcomeMessage', 'autocomplete', 'requireLogin', 'showLoginSignup',
+  'showInAgentMode', 'defaultModel', 'category', 'ownerId', 'orgId', 'reviewFeedback',
+] as const;
+
+/** Always written. */
+const REQUIRED_PLAN_FIELDS = ['title', 'steps', 'visibility', 'isBuiltIn', 'createdAt'] as const;
 
 export class WorkPlanService {
   private tableName: string;
@@ -121,48 +140,83 @@ export class WorkPlanService {
     return (result.Item as WorkPlan) || null;
   }
 
+  /**
+   * Update a plan without touching its thumbnail.
+   *
+   * This was a whole-item put, which meant an ordinary save wrote back whatever
+   * thumbnail the caller happened to be holding — clobbering a newer one, and
+   * making any thumbnail-scoped version attribute impossible to keep. It is now
+   * attribute-scoped: every non-thumbnail field is written, fields the caller
+   * cleared are REMOVEd (which the put gave us for free), and the thumbnail
+   * attributes are left entirely alone (ENG-889).
+   */
   async updateWorkPlan(plan: WorkPlan): Promise<void> {
     this.validateSteps(plan.steps);
-    await dynamodb.put({
+
+    const sets = ['#updatedAt = :updatedAt'];
+    const removes: string[] = [];
+    const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
+    const values: Record<string, any> = { ':updatedAt': new Date().toISOString() };
+
+    for (const key of REQUIRED_PLAN_FIELDS) {
+      names[`#${key}`] = key;
+      values[`:${key}`] = (plan as any)[key];
+      sets.push(`#${key} = :${key}`);
+    }
+    for (const key of OPTIONAL_PLAN_FIELDS) {
+      names[`#${key}`] = key;
+      const value = (plan as any)[key];
+      if (value === undefined) {
+        removes.push(`#${key}`);
+      } else {
+        values[`:${key}`] = value;
+        sets.push(`#${key} = :${key}`);
+      }
+    }
+
+    await dynamodb.update({
       TableName: this.tableName,
-      Item: { ...plan, updatedAt: new Date().toISOString() },
+      Key: { planId: plan.planId },
+      UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+      ConditionExpression: 'attribute_exists(planId)',
     }).promise();
   }
 
   /**
-   * Write only the thumbnail attributes of a plan, and only if nothing has
-   * changed the plan since the caller observed it.
+   * Write only the thumbnail attributes of a plan, and only if no other
+   * thumbnail action has happened since the caller observed it.
    *
-   * updateWorkPlan is a whole-item put, which is unsafe for the thumbnail
-   * pipeline: AI generation is fired and forgotten at create time holding the
-   * plan as it looked then, and finishes seconds-to-minutes later. Putting that
-   * snapshot back silently reverted any edit made in between — an admin fixing
-   * a step right after creating a plan watched the fix disappear, with no error
-   * (found while live-testing ENG-889).
+   * Ordering is one conditional write on `thumbnail_rev`, an attribute only
+   * this method writes. Not a claim-then-write token — a claim is a second
+   * unconditioned write that races the actions it exists to order. Not the
+   * plan-wide `updatedAt` either: that made an unrelated title or step edit
+   * discard a perfectly good generated thumbnail. Scoping the version to the
+   * thumbnail means only a competing thumbnail action invalidates a generation.
    *
-   * Ordering is a single conditional write on `updatedAt`, deliberately not a
-   * claim-then-write token protocol: a claim is a second unconditioned write
-   * and races the very actions it is meant to order. Because every write bumps
-   * updatedAt, one condition covers uploads, clears, regenerations AND ordinary
-   * plan edits. It is fail-safe — a losing generation is dropped rather than
-   * allowed to overwrite newer state, and the admin can regenerate.
+   * Safe because updateWorkPlan is attribute-scoped and never writes these
+   * fields, so an ordinary plan save cannot roll the revision back.
    *
-   * @returns the new updatedAt when the write landed, or null when a newer
-   *   action won the race (callers must not report that as success).
+   * @param opts.expectedRev the revision observed when the work began; `null`
+   *   for "the plan had no thumbnail revision yet". Omit for user-initiated
+   *   writes, which are unconditional and always win.
+   * @returns the new revision when the write landed, or null when a newer
+   *   thumbnail action won, or the plan is gone. Callers must not report null
+   *   as success.
    */
   async updateThumbnail(
     planId: string,
     fields: Partial<Pick<WorkPlan, 'thumbnail_url' | 'thumbnail_source' | 'thumbnail_alt_text'>>,
-    opts: { expectedUpdatedAt?: string } = {},
+    opts: { expectedRev?: string | null } = {},
   ): Promise<string | null> {
-    const updatedAt = new Date().toISOString();
-    const sets = ['#updatedAt = :updatedAt'];
+    const rev = uuidv4();
+    const sets = ['#updatedAt = :updatedAt', '#thumbnail_rev = :thumbnail_rev'];
     const removes: string[] = [];
-    const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
-    const values: Record<string, any> = { ':updatedAt': updatedAt };
+    const names: Record<string, string> = { '#updatedAt': 'updatedAt', '#thumbnail_rev': 'thumbnail_rev' };
+    const values: Record<string, any> = { ':updatedAt': new Date().toISOString(), ':thumbnail_rev': rev };
 
-    const KEYS = ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_text'] as const;
-    for (const key of KEYS) {
+    for (const key of ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_text'] as const) {
       if (!(key in fields)) continue;
       names[`#${key}`] = key;
       const value = fields[key];
@@ -179,9 +233,13 @@ export class WorkPlanService {
     // the thumbnail fields — no title, no steps — which breaks every consumer
     // that maps over plan.steps.
     let condition = 'attribute_exists(planId)';
-    if (opts.expectedUpdatedAt !== undefined) {
-      values[':expectedUpdatedAt'] = opts.expectedUpdatedAt;
-      condition += ' AND #updatedAt = :expectedUpdatedAt';
+    if ('expectedRev' in opts) {
+      if (opts.expectedRev === null || opts.expectedRev === undefined) {
+        condition += ' AND attribute_not_exists(#thumbnail_rev)';
+      } else {
+        values[':expectedRev'] = opts.expectedRev;
+        condition += ' AND #thumbnail_rev = :expectedRev';
+      }
     }
 
     try {
@@ -193,9 +251,9 @@ export class WorkPlanService {
         ExpressionAttributeValues: values,
         ConditionExpression: condition,
       }).promise();
-      return updatedAt;
+      return rev;
     } catch (err: any) {
-      // Either the plan is gone, or something newer touched it. Both mean
+      // Either the plan is gone, or a newer thumbnail action won. Both mean
       // "this write does not apply", not "this write failed".
       if (err?.code === 'ConditionalCheckFailedException') return null;
       throw err;
