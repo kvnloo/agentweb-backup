@@ -1968,6 +1968,35 @@ mcpToolRegistry.register({
 
 // ─── Predefined Work Plans (admin-only) ─────────────────────────────────────
 
+// This tool's own parameters are snake_case, but /api/admin/work-plans reads the
+// step fields in camelCase, so a snake_case step field used to be silently
+// dropped (the plan saved with requiredFunctionCalls: [] and no error). Accept
+// either casing and hand the route the camelCase names it reads (ENG-889).
+const WORK_PLAN_STEP_ALIASES: Record<string, string> = {
+  required_function_calls: 'requiredFunctionCalls',
+  skill_ids: 'skillIds',
+  user_instructions: 'userInstructions',
+  step_count: 'stepCount',
+};
+
+const normalizeWorkPlanSteps = (steps: any): any => {
+  if (!Array.isArray(steps)) return steps;
+  return steps.map((step: any) => {
+    if (!step || typeof step !== 'object' || Array.isArray(step)) return step;
+    const normalized: any = {};
+    for (const [key, value] of Object.entries(step)) {
+      const alias = WORK_PLAN_STEP_ALIASES[key];
+      // A camelCase value supplied alongside its snake_case twin wins.
+      if (alias) {
+        if (step[alias] === undefined) normalized[alias] = value;
+      } else {
+        normalized[key] = value;
+      }
+    }
+    return normalized;
+  });
+};
+
 mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
@@ -2019,11 +2048,14 @@ mcpToolRegistry.register({
             properties: {
               title: { type: 'string' },
               description: { type: 'string' },
-              required_function_calls: { type: 'array', items: { type: 'string' } }
+              requiredFunctionCalls: { type: 'array', items: { type: 'string' }, description: 'Tool names the step must call before it can complete. Note the camelCase name; the snake_case alias required_function_calls is also accepted.' },
+              skillIds: { type: 'array', items: { type: 'string' }, description: 'Skill IDs attached to this step (from list_skills / resolve_skill). Alias: skill_ids.' },
+              userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
+              stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. Alias: step_count.' }
             },
             required: ['title']
           },
-          description: 'Work plan steps (create/update)'
+          description: 'Work plan steps (create/update). Step fields are camelCase (unlike the snake_case top-level parameters); snake_case aliases are accepted too.'
         }
       },
       required: ['action']
@@ -2033,7 +2065,7 @@ mcpToolRegistry.register({
     const c = ctx(context);
     switch (args.action) {
       case 'create': {
-        const body: any = { title: args.title, steps: args.steps };
+        const body: any = { title: args.title, steps: normalizeWorkPlanSteps(args.steps) };
         if (args.description !== undefined) body.description = args.description;
         if (args.welcome_message !== undefined) body.welcomeMessage = args.welcome_message;
         if (args.autocomplete !== undefined) body.autocomplete = args.autocomplete;
@@ -2045,7 +2077,7 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'update': {
-        const body: any = { title: args.title, steps: args.steps };
+        const body: any = { title: args.title, steps: normalizeWorkPlanSteps(args.steps) };
         if (args.description !== undefined) body.description = args.description;
         if (args.welcome_message !== undefined) body.welcomeMessage = args.welcome_message;
         if (args.autocomplete !== undefined) body.autocomplete = args.autocomplete;
