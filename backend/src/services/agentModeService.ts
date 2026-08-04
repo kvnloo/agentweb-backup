@@ -2807,6 +2807,39 @@ export class AgentModeService {
     return isTransientLLMError(error) || /timed out|timeout|overloaded|upstream|network/i.test(message);
   }
 
+  /**
+   * Should describe_image retry a failed vision call on the OTHER provider?
+   *
+   * This is a superset of isRetryableMediaToolError, and deliberately local to
+   * describe_image. That classifier answers "would this same call succeed if
+   * repeated", so it rejects credential/permission failures — correctly, since
+   * hammering the same model with a bad key is pointless. But describe_image's
+   * fallback switches providers entirely (Gemini -> Bedrock Claude), which
+   * authenticate separately, so a provider-scoped 401/403 is precisely the case
+   * where the other provider WOULD answer. Without this, one bad Gemini key
+   * hard-fails every describe_image call while Bedrock sits healthy beside it —
+   * the same "provider rejection surfaces as a broken tool" shape as ENG-834.
+   *
+   * NOT widened in the shared classifier: image generation relies on its current
+   * narrowness (ENG-510), and switching image models changes output semantics in
+   * a way switching vision models does not.
+   *
+   * Payload rejections (400 INVALID_ARGUMENT) stay excluded — the image is
+   * already normalised and downscaled by the time we call, so a second provider
+   * would only double the latency and cost. Recovery is still observable:
+   * describeImage returns fallbackUsed + primaryError, so a broken key is
+   * diagnosable from the session record rather than silently papered over.
+   */
+  private isVisionFallbackWorthy(error: unknown): boolean {
+    if (this.isRetryableMediaToolError(error)) return true;
+    if (!error) return false;
+    const e = error as any;
+    const status = e?.status ?? e?.$metadata?.httpStatusCode ?? e?.response?.status;
+    if (status === 401 || status === 403) return true;
+    const message = error instanceof Error ? error.message : String(error);
+    return /permission.?denied|unauthenticated|api key not valid/i.test(message);
+  }
+
   private getImageGenerationFallbackModel(
     currentModel: string | undefined,
     inputImages: string[] | undefined,
@@ -7219,7 +7252,7 @@ export class AgentModeService {
       } catch (primaryFailure: any) {
         primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
         const fallbackModel = this.getVisionFallbackModel(visionModelUsed);
-        if (!fallbackModel || !this.isRetryableMediaToolError(primaryFailure)) {
+        if (!fallbackModel || !this.isVisionFallbackWorthy(primaryFailure)) {
           throw primaryFailure;
         }
 
