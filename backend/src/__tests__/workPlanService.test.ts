@@ -378,6 +378,36 @@ describe('WorkPlanService', () => {
       ).resolves.toBeUndefined();
     });
 
+    // Two background jobs can be in flight from the same state — e.g. Remove
+    // clicked twice, each kicking its own regeneration. The ordering condition
+    // already resolves this: whichever lands first flips the source, and the
+    // other's condition no longer holds, so exactly one write survives. Pinned
+    // because the alternative reading ("both write, last wins") is the obvious
+    // assumption and is wrong.
+    it('lets only the first of two same-baseline automatic writes land', async () => {
+      // First job: the plan is still 'none', so its write goes through.
+      await workPlanService.updateThumbnail(
+        'p1',
+        { thumbnail_url: 'https://x/first.png', thumbnail_source: 'ai' },
+        { expectedSource: 'none' },
+      );
+      expect(mockUpdate).toHaveBeenCalledTimes(1);
+      expect(mockUpdate.mock.calls[0][0].ConditionExpression).toContain('#thumbnail_source = :expectedSource');
+
+      // Second job, same baseline, but the row now reads 'ai' — DynamoDB rejects it.
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPromise.mockRejectedValueOnce(err);
+
+      await expect(
+        workPlanService.updateThumbnail(
+          'p1',
+          { thumbnail_url: 'https://x/second.png', thumbnail_source: 'ai' },
+          { expectedSource: 'none' },
+        ),
+      ).resolves.toBeUndefined();
+    });
+
     it('always refreshes updatedAt', async () => {
       await workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' });
 
