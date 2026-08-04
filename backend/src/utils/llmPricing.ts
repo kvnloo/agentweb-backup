@@ -35,6 +35,26 @@ function withDerivedCache(inPerM: number, outPerM: number): ModelPrice {
   };
 }
 
+/**
+ * Same as withDerivedCache, but for models we invoke with the EXTENDED (1-hour)
+ * prompt-cache TTL. A 1-hour cache write costs 2x the input rate instead of the
+ * default TTL's 1.25x; reads are 0.1x either way.
+ *
+ * ENG-893: only `agentModeService`'s Bedrock Converse wrapper emits cache
+ * checkpoints for these ids, and it always asks for `ttl: '1h'` on them, so 2x
+ * is their real effective write rate everywhere in the ledger. Every model here
+ * MUST be in `BEDROCK_EXTENDED_CACHE_TTL_MODELS` and vice versa — the drift
+ * guard is in `__tests__/agentModeService.promptCacheTtl.test.ts`.
+ */
+function withExtendedTtlCache(inPerM: number, outPerM: number): ModelPrice {
+  return {
+    inPerM,
+    outPerM,
+    cacheReadPerM: inPerM * 0.1,
+    cacheWritePerM: inPerM * 2,
+  };
+}
+
 // Fable 5 / Haiku 4.5 list prices, confirmed against Anthropic's official pricing
 // (Fable $10/$50, Haiku $1/$5). Defined once and registered under BOTH the bare
 // Vertex id (e.g. claude-fable-5) and the anthropic.-prefixed Bedrock id, because
@@ -54,10 +74,14 @@ const HAIKU_4_5_PRICE = withDerivedCache(1, 5);
  */
 export const MODEL_PRICING: Record<string, ModelPrice> = {
   // ── AWS Bedrock Anthropic (ported from estimateCost) ───────────────────────
-  'anthropic.claude-sonnet-4-5-20250929-v1:0': withDerivedCache(3, 15),
+  // ENG-893: the *-v1:0 Sonnet 4.5, Opus 4.8, Opus 5, Sonnet 5, and Haiku 4.5
+  // ids below use withExtendedTtlCache because we invoke them with the 1-hour
+  // prompt-cache TTL (2x cache-write rate). Sonnet 4.6 and Opus 4.6 are
+  // 5-minute-only on Bedrock and stay on the 1.25x default.
+  'anthropic.claude-sonnet-4-5-20250929-v1:0': withExtendedTtlCache(3, 15),
   'anthropic.claude-sonnet-4-6': withDerivedCache(3, 15),
   'anthropic.claude-opus-4-6-v1': withDerivedCache(5, 25),
-  'anthropic.claude-opus-4-8': withDerivedCache(5, 25),
+  'anthropic.claude-opus-4-8': withExtendedTtlCache(5, 25),
   // Anthropic dropped Opus to $5/$25 at the 4.5 generation; the old $15/$75 rate
   // above was stale (ported from estimateCost) and overcharged the cost cap 3x.
   // Fable 5 is ENG-200's target model — staged here so the cost cap is accurate
@@ -71,15 +95,18 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // invokes so the ENG-693 usage ledger books real cost instead of $0.
   // Rates are Anthropic's published list prices, the same convention every
   // Bedrock Anthropic row above already uses (Opus 4.8 = $5/$25 here too).
-  'anthropic.claude-opus-5': withDerivedCache(5, 25),
+  'anthropic.claude-opus-5': withExtendedTtlCache(5, 25),
   // Sonnet 5 standard rate. Anthropic also runs a $2/$10 introductory rate
   // through 2026-08-31, but that is first-party-API only and temporary —
   // metering at the standard rate cannot under-bill when it lapses.
-  'anthropic.claude-sonnet-5': withDerivedCache(3, 15),
+  'anthropic.claude-sonnet-5': withExtendedTtlCache(3, 15),
   // The bare 'anthropic.claude-haiku-4-5' key above does NOT cover this id:
   // canonicalModelId strips only a trailing bare -YYYY-MM-DD, and this one ends
   // in '-20251001-v1:0'. Without its own key the lookup misses and records $0.
-  'anthropic.claude-haiku-4-5-20251001-v1:0': HAIKU_4_5_PRICE,
+  // Its own object, NOT the shared HAIKU_4_5_PRICE: this is the id the Bedrock
+  // registry invokes, so it carries the 1-hour-TTL (2x) cache-write rate, while
+  // the bare ids above stay on the 1.25x default (ENG-893).
+  'anthropic.claude-haiku-4-5-20251001-v1:0': withExtendedTtlCache(1, 5),
 
   // ── Azure OpenAI chat deployments ───────────────────────────────────────────
   'gpt-5-chat-2': withDerivedCache(2.5, 10), // ported from estimateCost
