@@ -173,6 +173,33 @@ export function isCompleteHtmlDocument(draft: string): boolean {
   const hasClose = s.includes('</html>');
   return hasOpen && hasClose;
 }
+
+// ENG-844: the anti-loop override ("stop asking, find context yourself, proceed
+// with placeholders, always make progress") is a remedy for a HUMAN who keeps
+// repeating a message without supplying requested information. A scheduled
+// verification RETRY press — "Please try again. Make sure to <tool> (N more
+// time(s) needed)." (agentModeController.runVerifiedChat) — is neither: no human
+// authored it, and nothing is missing except a tool CALL, which a placeholder
+// can never substitute for. Letting the override fire on such a press pressures
+// the model to make the call or fabricate that it did — and when the call is an
+// irreversible/publishing write, that means an off-cadence live post. So the
+// override step DETERMINISTICALLY declines to fire on any function-call press.
+//
+// The "(N more time(s) needed)" suffix is emitted ONLY for unmet required
+// FUNCTION calls, never for keyword-only reminders, so it reliably marks such a
+// press without over-matching an ordinary human message.
+const IRREVERSIBLE_PUBLISH_TOOLS = ['post_on_connected_account', 'post_thread', 'publish_blog_article'];
+
+export function isVerificationFunctionCallRetryPress(text: string): boolean {
+  if (!text || typeof text !== 'string') return false;
+  return /please try again\.\s*make sure to /i.test(text) && /\(\d+\s+more\s+times?\s+needed\)/i.test(text);
+}
+
+// Does that press target an irreversible/publishing write (vs. a reversible tool
+// like generate_image)? Used only to sharpen the suppression log line.
+export function pressesIrreversiblePublishWrite(text: string): boolean {
+  return isVerificationFunctionCallRetryPress(text) && IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
+}
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService, runWithXActingUser } from './twitterService';
@@ -3076,6 +3103,22 @@ export class AgentModeService {
         m => (m.content || '').trim().toLowerCase() === normalizedCurrent
       ).length;
 
+      const isScheduledSession = currentSession?.sessionType === 'scheduled';
+      // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
+      // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
+      // human withholding information. The anti-loop remedy cannot satisfy a tool call
+      // and — for an irreversible/publishing write — becomes pressure to publish
+      // off-cadence or fabricate success. ENG-763 already gates scheduled sessions out
+      // of the loop-breaker entirely; also suppress it for ANY verification press so a
+      // non-scheduled verified-generate run is covered too.
+      const isVerificationPress = isVerificationFunctionCallRetryPress(messageContent);
+      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && isVerificationPress) {
+        console.warn(
+          `AgentMode: anti-loop override SUPPRESSED for session ${sessionId} — the repeated prompt is a verification tool-call retry press` +
+          `${pressesIrreversiblePublishWrite(messageContent) ? ' for an IRREVERSIBLE/publishing write' : ''}; ` +
+          `not injecting a 'proceed anyway' instruction (ENG-844).`
+        );
+      }
       // ENG-763: the loop-breaker is an INTERACTIVE-ONLY construct — it reacts to a
       // human sending the same message 3+ times. Scheduled/headless runs get a fresh
       // session per run (one user turn), so this can never legitimately trigger there;
@@ -3083,7 +3126,6 @@ export class AgentModeService {
       // importantly, guarantees a headless run is NEVER told to "hold and wait for the
       // user" (which would park an autonomous delivery — the ENG-517/634 class) and
       // that a scheduled run's install_skills gateway is never stripped.
-      const isScheduledSession = currentSession?.sessionType === 'scheduled';
       //
       // When the loop-breaker fires, also hard-gate `install_skills` for this turn
       // (see the tool-build block below). On the agentMode path install_skills is the
@@ -3091,7 +3133,7 @@ export class AgentModeService {
       // stuck user should never trigger skill installation, and the read-only
       // foundation context tools (read_brand_guidelines / read_market_strategy) remain
       // available so the model is never starved of a way to make progress.
-      const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession;
+      const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && !isVerificationPress;
       if (loopBreakerActive) {
         // ENG-763: inject as a `system` directive, NOT a `user` turn. Provider
         // converters hoist role:'system' into the system instruction, so the model
@@ -28849,8 +28891,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // Unipile for linkedin_sections=* (full profile incl. experience /
           // education / skills) and strips viewer-relative fields before
           // persisting — see unipileProfileService.ts.
+          // force_refresh bypasses the 30-day profile cache and reads live from the
+          // authenticated Unipile account (ENG-508). The Founder LinkedIn audit and any
+          // "what is my headline right now?" read must pass it so a months-stale cached
+          // headline is never presented as current; high-volume outreach loops keep the
+          // cache-first default for their dedup/rate-limit benefit. This is a pass-through
+          // boolean — it never introduces a non-authenticated fallback.
+          const forceRefresh = !!args.force_refresh;
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
-          const profileResult = await getUnipileProfileService().getProfile(target, account_id);
+          const profileResult = await getUnipileProfileService().getProfile(target, account_id, { forceRefresh });
           const raw = profileResult.rawData;
 
           // The global profile cache strips is_relationship / connected_at because

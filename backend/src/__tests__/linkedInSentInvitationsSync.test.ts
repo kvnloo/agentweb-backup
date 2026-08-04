@@ -169,6 +169,14 @@ describe('syncSentInvitationsForAccount', () => {
     const count = await syncSentInvitationsForAccount('acct-1');
 
     expect(count).toBe(0);
-    expect(mockPruneStaleSentInvitations).toHaveBeenCalledWith('acct-1', expect.any(Set));
+    // Third arg (ENG-875): the rows preloaded this cycle, handed to the prune so
+    // it need not re-read the account. `[]` here means the preload SUCCEEDED and
+    // found nothing cached — distinct from `undefined`, which means the preload
+    // failed and the prune must read for itself rather than delete everything.
+    expect(mockPruneStaleSentInvitations).toHaveBeenCalledWith(
+      'acct-1',
+      expect.any(Set),
+      expect.any(Array),
+    );
   });
 });
