@@ -314,6 +314,8 @@ export interface User {
   // ── Ad image axis ──
   adImageStatus?: "idle" | "running" | "ready" | "failed";
   adImageStartedAt?: string;
+  /** Per-run nonce identifying the run that owns the axis — see AdImageStatusFields. */
+  adImageRunId?: string;
   adImageCompletedAt?: string;
   adImageDurationMs?: number;
   adImageError?: string;

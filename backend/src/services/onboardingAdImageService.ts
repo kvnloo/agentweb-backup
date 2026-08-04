@@ -728,20 +728,85 @@ export async function isBrandLogoFetchable(
 }
 
 /**
+ * Who a run is, for the purposes of owning the ad-image axis.
+ *
+ * `runId` is the authority — a per-run nonce minted by `adImageStartPatch`.
+ * `startedAt` is the legacy fallback, used only when the axis carries no
+ * nonce: records written before the nonce shipped, and eager-DAG invocations
+ * that never went through the start patch. It cannot be the authority because
+ * it is a millisecond timestamp — two runs that start inside the same
+ * millisecond get byte-identical stamps, and every comparison below
+ * (including the DynamoDB equality condition) would then authorise each to
+ * write off the other (Greptile).
+ */
+interface AdImageRunIdentity {
+  runId?: unknown;
+  startedAt?: unknown;
+}
+
+function readAxisIdentity(record: unknown): AdImageRunIdentity {
+  return {
+    runId: (record as any)?.adImageRunId,
+    startedAt: (record as any)?.adImageStartedAt,
+  };
+}
+
+/**
+ * True when the axis provably belongs to someone else, so this run must not
+ * publish a terminal state over it.
+ */
+function axisIsNotOurs(axis: AdImageRunIdentity, ours: AdImageRunIdentity): boolean {
+  if (typeof axis.runId === "string") {
+    // The axis names its owner outright. An invocation carrying no nonce of
+    // its own cannot outrank one that does.
+    return axis.runId !== ours.runId;
+  }
+  // No nonce on the axis — fall back to timestamp ordering. Drop only when a
+  // newer run demonstrably exists; anything inconclusive (either timestamp
+  // missing or unparseable) still writes, because swallowing a real failure
+  // is what produced this ticket. Same conservative rule as `throwIfStepFailed`
+  // in onboardingOrchestratorWiring.
+  const ourStart =
+    typeof ours.startedAt === "string" ? Date.parse(ours.startedAt) : NaN;
+  const axisStart =
+    typeof axis.startedAt === "string" ? Date.parse(axis.startedAt) : NaN;
+  return (
+    Number.isFinite(axisStart) &&
+    (!Number.isFinite(ourStart) || axisStart > ourStart)
+  );
+}
+
+/**
  * Restate "the axis still looks exactly as it did when I read it" as a
  * DynamoDB condition, so an ownership check made from a read and the terminal
- * write it authorises land as ONE decision. `adImageStartedAt` is only ever
- * rewritten by `adImageStartPatch`, i.e. by a newer run, so an unmet condition
- * means precisely one thing: someone else now owns the axis.
+ * write it authorises land as ONE decision. Both identity attributes are only
+ * ever written by `adImageStartPatch`, i.e. by a newer run, so an unmet
+ * condition means precisely one thing: someone else now owns the axis.
+ *
+ * Conditions on whichever attribute `axisIsNotOurs` just judged on. The
+ * fallback branch also asserts the nonce is still ABSENT: a run that starts in
+ * the window mints one, and without that clause the ms-resolution timestamp
+ * could still match and let this write through.
  */
-function axisOwnershipCondition(axisStartAtRead: unknown) {
-  const names = { "#axisStart": "adImageStartedAt" };
-  return axisStartAtRead === undefined || axisStartAtRead === null
-    ? { expression: "attribute_not_exists(#axisStart)", names }
-    : {
-        expression: "#axisStart = :axisStart",
+function axisOwnershipCondition(axis: AdImageRunIdentity) {
+  if (typeof axis.runId === "string") {
+    return {
+      expression: "#axisRun = :axisRun",
+      names: { "#axisRun": "adImageRunId" },
+      values: { ":axisRun": axis.runId },
+    };
+  }
+  const names = { "#axisRun": "adImageRunId", "#axisStart": "adImageStartedAt" };
+  return typeof axis.startedAt === "string"
+    ? {
+        expression: "attribute_not_exists(#axisRun) AND #axisStart = :axisStart",
         names,
-        values: { ":axisStart": axisStartAtRead },
+        values: { ":axisStart": axis.startedAt },
+      }
+    : {
+        expression:
+          "attribute_not_exists(#axisRun) AND attribute_not_exists(#axisStart)",
+        names,
       };
 }
 
@@ -760,16 +825,14 @@ function isConditionalCheckFailure(err: unknown): boolean {
  * off a run it does not own; the failure paths simply never got the same
  * treatment.
  *
- * Identity is `adImageStartedAt`, the timestamp `adImageStartPatch` stamps at
- * the top of every run. We drop the write only when the axis carries a
- * STRICTLY NEWER start than the one this run entered with — i.e. only when a
- * newer run demonstrably exists. Anything inconclusive (either timestamp
- * missing or unparseable) still writes, which keeps two things working: the
- * eager DAG, which invokes the trigger without going through
- * `startAdImageGenerationForUser` and so may carry no start stamp at all, and
- * the plain "never started" case. Same conservative rule as
- * `throwIfStepFailed` in onboardingOrchestratorWiring — a swallowed real
- * failure is the more costly error, since it reproduces this very ticket.
+ * Identity is `adImageRunId`, the nonce `adImageStartPatch` mints at the top of
+ * every run, with `adImageStartedAt` ordering as the legacy fallback — see
+ * `axisIsNotOurs` for the full rule and why the timestamp alone will not do.
+ * An inconclusive axis still writes: that keeps the eager DAG working (it
+ * invokes the trigger without going through `startAdImageGenerationForUser`,
+ * so it carries no identity at all) along with the plain "never started" case,
+ * and a swallowed real failure is the more costly error — it reproduces this
+ * very ticket.
  *
  * Deliberately not a `status === "running"` check: that would silently drop
  * every legitimate failure on the eager path.
@@ -783,33 +846,19 @@ function isConditionalCheckFailure(err: unknown): boolean {
  */
 async function failAdImageRunIfOwned(
   userId: string,
-  runStartedAt: unknown,
+  ours: AdImageRunIdentity,
   reason: string,
   operation: string,
   logMessage: string,
   logContext: Record<string, unknown> = {}
 ): Promise<boolean> {
   const current = await userDb.getUserById(userId);
-  const ourStart =
-    typeof runStartedAt === "string" ? Date.parse(runStartedAt) : NaN;
-  const axisStartRaw = (current as any)?.adImageStartedAt;
-  const axisStart =
-    typeof axisStartRaw === "string" ? Date.parse(axisStartRaw) : NaN;
-  // Drop when the axis carries a start that is provably not ours:
-  //   - it is strictly newer than the one we entered with, or
-  //   - we have no parseable start at all, so a stamp being there means one
-  //     was written after we began (the eager-invocation case: a run that
-  //     never went through adImageStartPatch must not outrank one that did).
-  // Only a completely unstamped axis is inconclusive, and there we still
-  // write — swallowing a real failure is what produced this ticket.
-  const axisIsNotOurs =
-    Number.isFinite(axisStart) &&
-    (!Number.isFinite(ourStart) || axisStart > ourStart);
-  if (axisIsNotOurs) {
+  const axis = readAxisIdentity(current);
+  if (axisIsNotOurs(axis, ours)) {
     // eslint-disable-next-line no-console
     console.warn(
       "[onboardingAdImageService] dropping stale failure — a newer run owns the axis",
-      { userId, reason, ourStart: runStartedAt, axisStart: axisStartRaw },
+      { userId, reason, ours, axis },
     );
     return false;
   }
@@ -817,7 +866,7 @@ async function failAdImageRunIfOwned(
     await userDb.updateUser(
       userId,
       adImageFailedPatch(((current as any) || {}) as AdImageStatusFields, reason) as any,
-      { condition: axisOwnershipCondition(axisStartRaw) }
+      { condition: axisOwnershipCondition(axis) }
     );
   } catch (err) {
     if (!isConditionalCheckFailure(err)) throw err;
@@ -827,7 +876,7 @@ async function failAdImageRunIfOwned(
     // eslint-disable-next-line no-console
     console.warn(
       "[onboardingAdImageService] dropping stale failure — the axis was restarted mid-write",
-      { userId, reason, ourStart: runStartedAt, axisStart: axisStartRaw },
+      { userId, reason, ours, axis },
     );
     return false;
   }
@@ -871,14 +920,14 @@ export async function triggerAdImageGenerationForUser(
 
   const u = user as any;
   // Run identity for every terminal write below — see failAdImageRunIfOwned.
-  const runStartedAt = u.adImageStartedAt ?? undefined;
+  const ourRun = readAxisIdentity(u);
   const creativeDirStatus =
     typeof u.creativeDirStatus === "string" ? u.creativeDirStatus : "idle";
   if (creativeDirStatus !== "ready") {
     const reason = `creative direction not ready (status=${creativeDirStatus})`;
     await failAdImageRunIfOwned(
       userId,
-      runStartedAt,
+      ourRun,
       reason,
       "onboarding:ad-image:gated-creative-dir",
       "[onboardingAdImageService] gated by creative-dir step",
@@ -915,7 +964,7 @@ export async function triggerAdImageGenerationForUser(
       "Ad images are never generated with an invented or approximate logo (ENG-326).";
     await failAdImageRunIfOwned(
       userId,
-      runStartedAt,
+      ourRun,
       reason,
       "onboarding:ad-image:missing-brand-logo",
       "[onboardingAdImageService] gated on missing brand logo",
@@ -940,7 +989,7 @@ export async function triggerAdImageGenerationForUser(
       "never generated with a broken, invented, or approximate logo (ENG-326).";
     await failAdImageRunIfOwned(
       userId,
-      runStartedAt,
+      ourRun,
       reason,
       "onboarding:ad-image:unfetchable-brand-logo",
       "[onboardingAdImageService] gated on unfetchable brand logo",
@@ -1043,7 +1092,7 @@ export async function triggerAdImageGenerationForUser(
       "Retry, and if it keeps failing re-upload your logo in brand config.";
     await failAdImageRunIfOwned(
       userId,
-      runStartedAt,
+      ourRun,
       reason,
       "onboarding:ad-image:all-variants-failed",
       "[onboardingAdImageService] all variants failed",
@@ -1105,14 +1154,14 @@ export async function triggerAdImageGenerationForUser(
     // identity we read, so a run started in between keeps its `running` state
     // instead of being overwritten with this (older) run's results.
     await userDb.updateUser(userId, finalPatch, {
-      condition: axisOwnershipCondition((current as any)?.adImageStartedAt),
+      condition: axisOwnershipCondition(readAxisIdentity(current)),
     });
   } catch (err) {
     if (!isConditionalCheckFailure(err)) throw err;
     // eslint-disable-next-line no-console
     console.warn(
       "[onboardingAdImageService] dropping stale completion — the axis was restarted mid-write",
-      { userId, axisStart: (current as any)?.adImageStartedAt },
+      { userId, axis: readAxisIdentity(current) },
     );
   }
 }
