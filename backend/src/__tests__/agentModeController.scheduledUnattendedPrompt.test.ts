@@ -20,7 +20,7 @@
  */
 
 import { Request, Response } from 'express';
-import { agentModeController } from '../controllers/agentModeController';
+import { agentModeController, generateSessionResponse } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
 import { userDb, scheduleDb } from '../services/db';
@@ -346,6 +346,56 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).not.toContain('NOT pre-authorized to publish');
     // the directive must name the exact tool the owner designated
     expect(sp).toContain('they explicitly designated post_on_connected_account');
+  });
+
+  // ── Single-source authorization (Greptile P1) ────────────────────────────────
+  // A scheduled run threads the authorization it was ADMITTED under down from
+  // runScheduledChat, which resolved it once from the same schedule snapshot it
+  // used to build `requiredFunctions`. When that override is supplied the prompt
+  // MUST use it verbatim and never re-read the schedule — otherwise the prompt and
+  // the required-function checker are two independent reads that can disagree.
+  const callWithOverride = (auth: { authorized: boolean; tools: string[] }) =>
+    generateSessionResponse(
+      SESSION_ID,
+      'Draft and publish the daily post.',
+      USER_ID,
+      'anthropic.claude-opus-4-8',
+      [],
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      auth
+    );
+
+  it('uses the caller-supplied AUTHORIZED decision and never re-reads the schedule', async () => {
+    // DB disagrees (and would say withheld) — the override must win outright.
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: false } as any);
+    await callWithOverride({ authorized: true, tools: ['post_on_connected_account'] });
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('PRE-AUTHORIZED to publish');
+    expect(sp).not.toContain('NOT pre-authorized to publish');
+    expect(sp).toContain('they explicitly designated post_on_connected_account');
+    expect(scheduleDb.getScheduleById).not.toHaveBeenCalled();
+  });
+
+  it('uses the caller-supplied WITHHELD decision even when the schedule would authorize', async () => {
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
+      scheduleId: SCHEDULE_ID,
+      requiredFunctionCalls: ['post_on_connected_account'],
+    } as any);
+    await callWithOverride({ authorized: false, tools: [] });
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('NOT pre-authorized to publish');
+    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
+    expect(scheduleDb.getScheduleById).not.toHaveBeenCalled();
+  });
+
+  it('is immune to a schedule-lookup failure once the decision is threaded in', async () => {
+    // The exact P1 scenario: a throttled read can no longer flip the prompt away
+    // from the decision the required-function checker is already enforcing.
+    jest.spyOn(scheduleDb, 'getScheduleById').mockRejectedValue(new Error('DynamoDB throttled'));
+    await callWithOverride({ authorized: true, tools: ['post_on_connected_account'] });
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('PRE-AUTHORIZED to publish');
+    expect(sp).not.toContain('NOT pre-authorized to publish');
   });
 
   it('still WITHHOLDS when the required functions contain no publishing tool', async () => {
