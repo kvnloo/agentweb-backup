@@ -683,6 +683,62 @@ describe('AgentModeService - Skills', () => {
     });
   });
 
+  // ENG-508 / ENG-867: the "LinkedIn Profile Reader" skill grants exactly one tool,
+  // linkedin_outreach. Prove that installing it makes that tool reach a session's
+  // toolbox — even for a user whose subscription does NOT include it (the Founder
+  // audit case) — and that WITHOUT the skill the tool is excluded, which is the
+  // stale-headline pre-fix state. This exercises the real getFilteredTools gating.
+  describe('LinkedIn Profile Reader skill grant (ENG-508)', () => {
+    beforeEach(async () => {
+      const mockTools = [
+        { name: 'install_skills', definition: { function: { name: 'install_skills', description: 'infra' } } },
+        { name: 'you_search_web', definition: { function: { name: 'you_search_web', description: 'Search the web' } } },
+        { name: 'linkedin_outreach', definition: { function: { name: 'linkedin_outreach', description: 'LinkedIn outreach incl. get-profile' } } },
+      ];
+      jest.spyOn(agentModeService['toolRegistry'], 'getAllTools').mockReturnValue(mockTools as any);
+      await agentModeService.initialize();
+
+      // Realistic subscription filter: only the explicitly-allowed names survive.
+      const { filterFunctionCalls: mockFilterFn } = require('../services/subscriptionService');
+      (mockFilterFn as jest.Mock).mockImplementation((tools: any[], allowed: string[]) => {
+        if (allowed.includes('*')) return tools;
+        return tools.filter((t: any) => {
+          const name = t.function?.name || t.name;
+          return !name || allowed.includes(name);
+        });
+      });
+    });
+
+    it('exposes linkedin_outreach when the skill is installed, even under a subscription that omits it', async () => {
+      const { resolveSkillsToToolNames } = require('../services/subscriptionService');
+      // Subscription grants NOTHING extra — the tool must come solely from the
+      // session-installed skill's toolNames (getFilteredTools session-tool bypass).
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce([]);
+
+      // Precomputed allowed set = what buildSkillContext produces once the
+      // "LinkedIn Profile Reader" skill (toolNames: ['linkedin_outreach']) is associated.
+      const withSkill = new Set(['install_skills', 'linkedin_outreach']);
+      const result = await agentModeService.getFilteredTools('user-123', withSkill, []);
+
+      const toolNames = result.map((t: any) => t.function?.name || t.name);
+      expect(toolNames).toContain('linkedin_outreach');
+    });
+
+    it('excludes linkedin_outreach when the skill is NOT installed (pre-fix stale-headline state)', async () => {
+      const { resolveSkillsToToolNames } = require('../services/subscriptionService');
+      (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce([]);
+
+      // No LinkedIn skill associated → the authenticated tool is unreachable and the
+      // model can only fall back to you_search_web (the stale search cache).
+      const withoutSkill = new Set(['install_skills', 'you_search_web']);
+      const result = await agentModeService.getFilteredTools('user-123', withoutSkill, []);
+
+      const toolNames = result.map((t: any) => t.function?.name || t.name);
+      expect(toolNames).not.toContain('linkedin_outreach');
+      expect(toolNames).toContain('you_search_web');
+    });
+  });
+
   describe('updateConversationContext', () => {
     it('should add/update Installed Skills message', () => {
       const messages: any[] = [
