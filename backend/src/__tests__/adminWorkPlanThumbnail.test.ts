@@ -5,6 +5,7 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
   let mockGetWorkPlan: jest.Mock;
   let mockUpdateWorkPlan: jest.Mock;
   let mockGenerateAIThumbnail: jest.Mock;
+  let mockGenerateAIThumbnailDetailed: jest.Mock;
   let mockUploadCustomThumbnail: jest.Mock;
   let mockRemoveThumbnail: jest.Mock;
   let mockSharpMetadata: jest.Mock;
@@ -33,6 +34,7 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
     mockGetWorkPlan = jest.fn();
     mockUpdateWorkPlan = jest.fn();
     mockGenerateAIThumbnail = jest.fn();
+    mockGenerateAIThumbnailDetailed = jest.fn();
     mockUploadCustomThumbnail = jest.fn();
     mockRemoveThumbnail = jest.fn();
     mockSharpMetadata = jest.fn();
@@ -49,6 +51,7 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
     jest.doMock('../services/workPlanThumbnailService', () => ({
       workPlanThumbnailService: {
         generateAIThumbnail: mockGenerateAIThumbnail,
+        generateAIThumbnailDetailed: mockGenerateAIThumbnailDetailed,
         uploadCustomThumbnail: mockUploadCustomThumbnail,
         removeThumbnail: mockRemoveThumbnail,
       },
@@ -97,7 +100,7 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
 
     it('returns updated plan with thumbnail_url on success', async () => {
       mockGetWorkPlan.mockResolvedValue(mockPlan);
-      mockGenerateAIThumbnail.mockResolvedValue(mockPlanWithThumbnail);
+      mockGenerateAIThumbnailDetailed.mockResolvedValue({ outcome: 'applied', plan: mockPlanWithThumbnail });
 
       const res = await request(app).post('/api/admin/work-plans/plan-123/thumbnail/generate');
 
@@ -107,13 +110,13 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
       // Manual regeneration must supersede any background job already running,
       // otherwise both race the same baseline and the admin can silently get
       // the older job's image back instead of their own.
-      expect(mockGenerateAIThumbnail).toHaveBeenCalledWith(mockPlan, { supersedeInFlight: true });
+      expect(mockGenerateAIThumbnailDetailed).toHaveBeenCalledWith(mockPlan, { supersedeInFlight: true });
     });
 
     it('returns plan with source=none when AI generation fails gracefully', async () => {
       const planWithNoThumbnail = { ...mockPlan, thumbnail_source: 'none' };
       mockGetWorkPlan.mockResolvedValue(mockPlan);
-      mockGenerateAIThumbnail.mockResolvedValue(planWithNoThumbnail);
+      mockGenerateAIThumbnailDetailed.mockResolvedValue({ outcome: 'applied', plan: planWithNoThumbnail });
 
       const res = await request(app).post('/api/admin/work-plans/plan-123/thumbnail/generate');
 
@@ -123,7 +126,7 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
 
     it('returns 500 when service throws an unexpected error', async () => {
       mockGetWorkPlan.mockResolvedValue(mockPlan);
-      mockGenerateAIThumbnail.mockRejectedValue(new Error('Unexpected error'));
+      mockGenerateAIThumbnailDetailed.mockRejectedValue(new Error('Unexpected error'));
 
       const res = await request(app).post('/api/admin/work-plans/plan-123/thumbnail/generate');
 
@@ -133,6 +136,30 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
   });
 
   // ── POST /:planId/thumbnail/upload ────────────────────────────────────────
+
+  describe('POST /:planId/thumbnail/generate — concurrent outcomes', () => {
+    it('answers 409, not 200, when a concurrent change discarded the generation', async () => {
+      // The admin is waiting on this. The discard is correct — it protects newer
+      // state — but reporting it as success would be a silent no-op (ENG-889).
+      mockGetWorkPlan.mockResolvedValue(mockPlan);
+      mockGenerateAIThumbnailDetailed.mockResolvedValue({ outcome: 'superseded', plan: mockPlan });
+
+      const res = await request(app).post('/api/admin/work-plans/plan-123/thumbnail/generate');
+
+      expect(res.status).toBe(409);
+      expect(res.body.message).toMatch(/changed while the thumbnail was generating/i);
+      expect(res.body.plan).toBeDefined();
+    });
+
+    it('answers 404 when the plan was deleted while rendering', async () => {
+      mockGetWorkPlan.mockResolvedValue(mockPlan);
+      mockGenerateAIThumbnailDetailed.mockResolvedValue({ outcome: 'gone', plan: null });
+
+      const res = await request(app).post('/api/admin/work-plans/plan-123/thumbnail/generate');
+
+      expect(res.status).toBe(404);
+    });
+  });
 
   describe('POST /:planId/thumbnail/upload', () => {
     it('returns 404 when plan does not exist', async () => {

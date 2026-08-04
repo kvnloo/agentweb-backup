@@ -61,10 +61,22 @@ export class WorkPlanThumbnailService {
    *   the same baseline. Background callers leave it off — they have nothing to
    *   supersede, and touching the plan would defeat their own ordering.
    */
+  /**
+   * Thin wrapper for fire-and-forget callers that only want the plan.
+   * Callers that must tell "applied" from "a newer action won" — the manual
+   * regenerate, where an admin is waiting — use generateAIThumbnailDetailed.
+   */
   async generateAIThumbnail(
     plan: WorkPlan,
     opts: { supersedeInFlight?: boolean } = {},
   ): Promise<WorkPlan | null> {
+    return (await this.generateAIThumbnailDetailed(plan, opts)).plan;
+  }
+
+  async generateAIThumbnailDetailed(
+    plan: WorkPlan,
+    opts: { supersedeInFlight?: boolean } = {},
+  ): Promise<{ outcome: 'applied' | 'superseded' | 'gone'; plan: WorkPlan | null }> {
     // The plan as this job observed it. No claim write for background jobs: a
     // claim is a second unconditioned write that races the actions it is meant
     // to order. A user action is different — it is allowed to supersede.
@@ -73,7 +85,7 @@ export class WorkPlanThumbnailService {
       const superseded = await workPlanService.updateThumbnail(plan.planId, {});
       // Unconditional apart from attribute_exists, so null here means the plan
       // is gone. Bail before spending ~40s rendering a thumbnail for nothing.
-      if (!superseded) return null;
+      if (!superseded) return { outcome: 'gone', plan: null };
       basedOn = superseded;
     }
     const description = plan.description || 'A professional marketing automation tool';
@@ -96,7 +108,7 @@ export class WorkPlanThumbnailService {
           `[ThumbnailService] AI generation failed for plan ${plan.planId}:`,
           result.error,
         );
-        return this.setNoThumbnail(plan, basedOn);
+        return { outcome: 'applied', plan: await this.setNoThumbnail(plan, basedOn) };
       }
 
       const imageBuffer = await downloadBuffer(result.imageUrl);
@@ -119,15 +131,19 @@ export class WorkPlanThumbnailService {
         thumbnail_alt_text: updated.thumbnail_alt_text,
       }, { expectedUpdatedAt: basedOn });
       // A newer action won, or the plan was deleted. Report what is actually
-      // stored — null when there is nothing left, never the stale input.
-      if (!writtenAt) return await workPlanService.getWorkPlan(plan.planId);
-      return { ...updated, updatedAt: writtenAt };
+      // stored — never the stale input — and say which happened, so a caller
+      // that an admin is waiting on does not present a no-op as success.
+      if (!writtenAt) {
+        const current = await workPlanService.getWorkPlan(plan.planId);
+        return { outcome: current ? 'superseded' : 'gone', plan: current };
+      }
+      return { outcome: 'applied', plan: { ...updated, updatedAt: writtenAt } };
     } catch (err) {
       console.error(
         `[ThumbnailService] Error generating thumbnail for plan ${plan.planId}:`,
         err,
       );
-      return this.setNoThumbnail(plan, basedOn);
+      return { outcome: 'applied', plan: await this.setNoThumbnail(plan, basedOn) };
     }
   }
 
