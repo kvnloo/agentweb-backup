@@ -347,8 +347,8 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   // required-tool checker nudged it in a loop that burned the run. The directive
   // must carry an explicit, deterministic publish-authorization block — not leave
   // it to the model to guess.
-  const publishAuthorizedDirective = getUnattendedExecutionDirective('scheduled', false, true);
-  const publishGatedDirective = getUnattendedExecutionDirective('scheduled', false, false);
+  const publishAuthorizedDirective = getUnattendedExecutionDirective('scheduled', false, 'authorized');
+  const publishGatedDirective = getUnattendedExecutionDirective('scheduled', false, 'withheld');
 
   it('always carries an explicit PUBLISH AUTHORIZATION block on scheduled runs', () => {
     expect(publishAuthorizedDirective).toContain('PUBLISH AUTHORIZATION');
@@ -384,12 +384,12 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   });
 
   it('still returns empty (no publish block) for non-scheduled sessions even when publishAuthorized is true', () => {
-    expect(getUnattendedExecutionDirective('regular', false, true)).toBe('');
-    expect(getUnattendedExecutionDirective(undefined, true, true)).toBe('');
+    expect(getUnattendedExecutionDirective('regular', false, 'authorized')).toBe('');
+    expect(getUnattendedExecutionDirective(undefined, true, 'authorized')).toBe('');
   });
 
   it('names the exact publish tools the owner designated when they are supplied', () => {
-    const scoped = getUnattendedExecutionDirective('scheduled', false, true, ['post_on_connected_account']);
+    const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
     expect(scoped).toContain('they explicitly designated post_on_connected_account');
     expect(scoped).toContain('(post_on_connected_account)');
     // authorization must be scoped — it does not silently cover other publish tools
@@ -398,9 +398,24 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   });
 
   it('falls back to the full-autonomy wording when authorized with no tools named', () => {
-    const broad = getUnattendedExecutionDirective('scheduled', false, true, []);
+    const broad = getUnattendedExecutionDirective('scheduled', false, 'authorized', []);
     expect(broad).toContain('marked it fully autonomous');
     expect(broad).toContain('PRE-AUTHORIZED to publish');
+  });
+
+  // Greptile P1: the prompt is rebuilt (and the schedule re-read) on EVERY
+  // verification attempt, while the required-function checker fixes its list once
+  // from its own snapshot. If an unreadable schedule emitted the prohibition, a
+  // single throttled read would forbid a tool the checker still demands —
+  // re-creating the nudge-loop contradiction. 'unknown' must stay silent.
+  it('emits NO publish block when authorization could not be determined', () => {
+    const unknown = getUnattendedExecutionDirective('scheduled', false, 'unknown');
+    expect(unknown).not.toContain('PUBLISH AUTHORIZATION');
+    expect(unknown).not.toContain('NOT pre-authorized to publish');
+    expect(unknown).not.toContain('PRE-AUTHORIZED to publish');
+    expect(unknown.toLowerCase()).not.toContain('do not call a live-publishing tool');
+    // the rest of the unattended directive is unaffected
+    expect(unknown).toContain('PER-ENTITY COMPLETION LOOP');
   });
 });
 

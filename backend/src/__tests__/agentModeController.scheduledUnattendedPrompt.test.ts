@@ -312,12 +312,19 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).not.toContain('PRE-AUTHORIZED to publish');
   });
 
-  it('defaults to WITHHOLD (safe) when the schedule lookup THROWS', async () => {
+  // Greptile P1: runScheduledChat fixes the required-function list once from its
+  // own schedule snapshot, while this prompt re-reads the schedule on every
+  // verification attempt. If a throttled read emitted the prohibition, the prompt
+  // would forbid a publish tool the checker still requires — the exact nudge-loop
+  // contradiction. An unreadable schedule must emit NO publish block instead.
+  it('emits NO publish block (not a prohibition) when the schedule lookup THROWS', async () => {
     jest.spyOn(scheduleDb, 'getScheduleById').mockRejectedValue(new Error('DynamoDB throttled'));
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
+    // the run still proceeds with the rest of the unattended directive
     expect(sp).toContain('[AUTOMATED UNATTENDED EXECUTION]');
-    expect(sp).toContain('NOT pre-authorized to publish');
+    expect(sp).not.toContain('PUBLISH AUTHORIZATION');
+    expect(sp).not.toContain('NOT pre-authorized to publish');
     expect(sp).not.toContain('PRE-AUTHORIZED to publish');
   });
 
