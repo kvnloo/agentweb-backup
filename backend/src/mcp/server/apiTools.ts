@@ -1968,6 +1968,77 @@ mcpToolRegistry.register({
 
 // ─── Predefined Work Plans (admin-only) ─────────────────────────────────────
 
+/**
+ * Work plan steps are stored as a whole array, so PUT /api/admin/work-plans/:id
+ * replaces every step with the payload. Callers amending a single step used to
+ * silently delete the rest (ENG-890); the helpers below add merge semantics and
+ * a fail-closed guard around destructive replacements.
+ */
+
+function normalizeStepTitle(value: unknown): string {
+  return String(value ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/** Apply the caller-supplied fields of `incoming` on top of an existing step. */
+function mergeWorkPlanStep(existing: any, incoming: any): any {
+  const merged = { ...existing };
+  if (incoming.title !== undefined) merged.title = incoming.title;
+  if (incoming.description !== undefined) merged.description = incoming.description;
+  if (incoming.userInstructions !== undefined) merged.userInstructions = incoming.userInstructions;
+  const requiredFunctionCalls = incoming.requiredFunctionCalls ?? incoming.required_function_calls;
+  if (requiredFunctionCalls !== undefined) merged.requiredFunctionCalls = requiredFunctionCalls;
+  const skillIds = incoming.skillIds ?? incoming.skill_ids;
+  if (skillIds !== undefined) merged.skillIds = skillIds;
+  return merged;
+}
+
+/**
+ * Merge partial steps into the plan's current steps. Each incoming step targets
+ * an existing step by step_count first, then by (normalized) title; anything
+ * that matches nothing is appended. Never removes a step.
+ */
+function mergeWorkPlanSteps(existingSteps: any[], incomingSteps: any[]): any[] {
+  const merged = existingSteps.map((s: any) => ({ ...s }));
+
+  for (const incoming of incomingSteps) {
+    const targetCount = incoming.stepCount ?? incoming.step_count;
+    let index = -1;
+    if (targetCount !== undefined) {
+      index = merged.findIndex((s: any) => Number(s.stepCount) === Number(targetCount));
+    }
+    if (index === -1 && incoming.title !== undefined) {
+      const title = normalizeStepTitle(incoming.title);
+      index = merged.findIndex((s: any) => normalizeStepTitle(s.title) === title);
+    }
+
+    if (index === -1) {
+      merged.push(mergeWorkPlanStep({ stepCount: merged.length + 1 }, incoming));
+    } else {
+      merged[index] = mergeWorkPlanStep(merged[index], incoming);
+    }
+  }
+
+  return merged;
+}
+
+/** Diff summary returned to the caller so step removals can never go unnoticed. */
+function summarizeStepChange(before: any[], after: any[], mode: 'merge' | 'replace') {
+  const afterTitles = new Set(after.map((s: any) => normalizeStepTitle(s.title)));
+  const beforeTitles = new Set(before.map((s: any) => normalizeStepTitle(s.title)));
+  return {
+    mode,
+    stepsBefore: before.length,
+    stepsAfter: after.length,
+    stepsRemoved: Math.max(0, before.length - after.length),
+    droppedStepTitles: before
+      .filter((s: any) => !afterTitles.has(normalizeStepTitle(s.title)))
+      .map((s: any) => s.title),
+    addedStepTitles: after
+      .filter((s: any) => !beforeTitles.has(normalizeStepTitle(s.title)))
+      .map((s: any) => s.title),
+  };
+}
+
 mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
@@ -1998,7 +2069,7 @@ mcpToolRegistry.register({
   name: 'manage_predefined_work_plan',
   definition: {
     name: 'manage_predefined_work_plan',
-    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes.',
+    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes. STEPS ARE DESTRUCTIVE ON UPDATE: sending "steps" with action=update replaces the entire steps array, it does not patch individual steps. To amend one step without touching the others, pass steps_mode="merge" with just the step(s) you are changing. To intentionally rewrite the plan with fewer steps, send the complete new array plus confirm_step_removal=true. An update that would drop steps is rejected unless confirmed, and every step change comes back as a stepsChange diff summary.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2017,13 +2088,23 @@ mcpToolRegistry.register({
           items: {
             type: 'object',
             properties: {
+              step_count: { type: 'number', description: '1-based position of the step. In steps_mode="merge" this targets the existing step to amend.' },
               title: { type: 'string' },
               description: { type: 'string' },
               required_function_calls: { type: 'array', items: { type: 'string' } }
             },
             required: ['title']
           },
-          description: 'Work plan steps (create/update)'
+          description: 'Work plan steps. On create this is the full plan. On update this REPLACES the entire steps array unless steps_mode="merge".'
+        },
+        steps_mode: {
+          type: 'string',
+          enum: ['replace', 'merge'],
+          description: 'How to apply "steps" on update. "replace" (default) overwrites the whole array. "merge" patches the supplied steps into the existing plan by step_count (or title) and appends unmatched ones, leaving every other step intact.'
+        },
+        confirm_step_removal: {
+          type: 'boolean',
+          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now. Without it the update is rejected instead of silently deleting steps.'
         }
       },
       required: ['action']
@@ -2045,7 +2126,7 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'update': {
-        const body: any = { title: args.title, steps: args.steps };
+        const body: any = { title: args.title };
         if (args.description !== undefined) body.description = args.description;
         if (args.welcome_message !== undefined) body.welcomeMessage = args.welcome_message;
         if (args.autocomplete !== undefined) body.autocomplete = args.autocomplete;
@@ -2053,7 +2134,52 @@ mcpToolRegistry.register({
         if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
+
+        // Steps replace the whole array server-side, so read the current plan
+        // first and either merge into it or refuse an unconfirmed shrink.
+        let stepsChange: ReturnType<typeof summarizeStepChange> | undefined;
+        if (args.steps !== undefined) {
+          if (!Array.isArray(args.steps)) {
+            return jsonResult({ error: 'steps must be an array of step objects' });
+          }
+          const mode: 'merge' | 'replace' = args.steps_mode === 'merge' ? 'merge' : 'replace';
+
+          let existingSteps: any[] | undefined;
+          try {
+            const current = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
+            existingSteps = Array.isArray(current?.steps) ? current.steps : [];
+          } catch (error: any) {
+            if (mode === 'merge') {
+              return jsonResult({ error: `Cannot merge steps: failed to read work plan ${args.plan_id} (${error?.message || error})` });
+            }
+          }
+
+          if (mode === 'merge') {
+            body.steps = mergeWorkPlanSteps(existingSteps || [], args.steps);
+          } else {
+            body.steps = args.steps;
+            if (existingSteps && body.steps.length < existingSteps.length && args.confirm_step_removal !== true) {
+              const preview = summarizeStepChange(existingSteps, body.steps, 'replace');
+              return jsonResult({
+                error: `Refusing to update work plan ${args.plan_id}: action=update replaces the entire steps array, and this payload would take the plan from ${preview.stepsBefore} steps to ${preview.stepsAfter}, removing ${preview.stepsRemoved}.`,
+                stepsWouldBeRemoved: preview.stepsRemoved,
+                removedStepTitles: preview.droppedStepTitles,
+                howToProceed: [
+                  'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+                  'To intentionally rewrite the plan with fewer steps, retry with confirm_step_removal=true (send the complete new steps array).',
+                ],
+              });
+            }
+          }
+          if (existingSteps) {
+            stepsChange = summarizeStepChange(existingSteps, body.steps, mode);
+          }
+        }
+
         const data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+        if (stepsChange && data && typeof data === 'object' && !Array.isArray(data)) {
+          return jsonResult({ ...data, stepsChange });
+        }
         return jsonResult(data);
       }
       case 'delete': {
