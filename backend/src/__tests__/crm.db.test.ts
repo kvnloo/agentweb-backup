@@ -199,6 +199,30 @@ describe('CRM Database Service', () => {
       expect(result.email).toBe(leadData.email.toLowerCase());
     });
 
+    it('stores the linkedin field in canonical form so the lookup GSI stays canonical (ENG-787)', async () => {
+      const listId = 'list_123';
+      // Differently-formatted URL: http scheme, mixed case, trailing slash, tracking query.
+      const leadData = {
+        firstName: 'Jane',
+        linkedin: 'http://LinkedIn.com/in/JaneDoe/?miniProfileUrn=abc',
+      };
+
+      mockDocumentClientMethods.put.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.createLead(listId, leadData);
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.Item.linkedin).toBe('https://www.linkedin.com/in/janedoe');
+    });
+
     it('should handle leads without email', async () => {
       const listId = 'list_123';
       const leadData = {
@@ -513,6 +537,25 @@ describe('CRM Database Service', () => {
       // Verify email is normalized in the update expression
       const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
       expect(updateCall.ExpressionAttributeValues[':email']).toBe('newemail@example.com');
+    });
+
+    it('canonicalizes the linkedin field so the lookup GSI stays canonical (ENG-787)', async () => {
+      const listId = 'list_123';
+      const leadId = 'lead_123';
+      const updates = {
+        linkedin: 'http://LinkedIn.com/in/JaneDoe/?miniProfileUrn=abc',
+      };
+
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Attributes: { leadId, listId },
+        }),
+      });
+
+      await crmDb.updateLead(listId, leadId, updates);
+
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(updateCall.ExpressionAttributeValues[':linkedin']).toBe('https://www.linkedin.com/in/janedoe');
     });
 
     it('should handle customFields updates', async () => {
@@ -1844,6 +1887,233 @@ describe('CRM Database Service', () => {
     it('returns false when the caller record is missing entirely', async () => {
       mockUsers({ [OWNER]: { userId: OWNER, orgId: 'org-A' } });
       expect(await crmDb.canOrgMemberAccessList('ghost-5', list)).toBe(false);
+    });
+  });
+  // ENG-787: findLeadsByLinkedin caps at 10 items across ALL tenants, so a profile
+  // present in many lists could page past the caller's list and be reported absent —
+  // which makes the invite mirror create a duplicate lead. findLeadByLinkedinInList
+  // filters server-side and pages until it finds the match.
+  describe('findLeadByLinkedinInList', () => {
+    const LIST = 'list_target';
+    const URL = 'https://www.linkedin.com/in/david-yao';
+
+    it('returns null without querying when listId or linkedin is blank', async () => {
+      expect(await crmDb.findLeadByLinkedinInList('', URL)).toBeNull();
+      expect(await crmDb.findLeadByLinkedinInList(LIST, '   ')).toBeNull();
+      expect(mockDocumentClientMethods.query).not.toHaveBeenCalled();
+    });
+
+    it('filters on listId server-side rather than post-filtering a capped page', async () => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [{ leadId: 'lead_1', listId: LIST }] }),
+      });
+      const hit = await crmDb.findLeadByLinkedinInList(LIST, URL);
+      expect(hit).toEqual({ leadId: 'lead_1', listId: LIST });
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledWith(expect.objectContaining({
+        IndexName: 'LinkedinLookupIndex',
+        KeyConditionExpression: 'linkedin = :linkedin',
+        FilterExpression: 'listId = :listId',
+        ExpressionAttributeValues: { ':linkedin': URL, ':listId': LIST },
+      }));
+      // A per-page Limit bounds read units, but unlike the old fixed cap of 10 it
+      // does not bound the search — pagination below walks the rest of the partition.
+      expect(mockDocumentClientMethods.query.mock.calls[0][0]).toHaveProperty('Limit', 100);
+    });
+
+    it('pages past filtered-out matches instead of giving up on the first page', async () => {
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { k: 1 } }),
+        })
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({ Items: [{ leadId: 'lead_deep', listId: LIST }] }),
+        });
+      const hit = await crmDb.findLeadByLinkedinInList(LIST, URL);
+      expect(hit).toEqual({ leadId: 'lead_deep', listId: LIST });
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(2);
+      expect(mockDocumentClientMethods.query.mock.calls[1][0]).toEqual(
+        expect.objectContaining({ ExclusiveStartKey: { k: 1 } }),
+      );
+    });
+
+    it('returns null when the profile exists only in other lists', async () => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [] }),
+      });
+      expect(await crmDb.findLeadByLinkedinInList(LIST, URL)).toBeNull();
+    });
+
+    it('stops paging at the bound instead of spinning forever', async () => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [], LastEvaluatedKey: { k: 1 } }),
+      });
+      expect(await crmDb.findLeadByLinkedinInList(LIST, URL)).toBeNull();
+      expect(mockDocumentClientMethods.query).toHaveBeenCalledTimes(20);
+    });
+  });
+  // ENG-787 hardening: addLeadEngagement used to read-modify-write the whole
+  // engagements array, so two concurrent appends both read the same base and the
+  // second silently dropped the first.
+  describe('addLeadEngagement', () => {
+    const LIST = 'list_1';
+    const LEAD = 'lead_1';
+    const ev = { eventType: 'linkedin.invite.sent', eventData: { linkedin: 'x' }, createdAt: '2026-07-31T00:00:00.000Z' };
+
+    it('appends server-side with list_append instead of rewriting the array', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { engagements: [ev] } }),
+      });
+
+      await crmDb.addLeadEngagement(LIST, LEAD, ev);
+
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toContain('list_append(if_not_exists(engagements, :empty), :new)');
+      expect(params.ExpressionAttributeValues[':new']).toHaveLength(1);
+      expect(params.ExpressionAttributeValues[':new'][0]).toEqual(expect.objectContaining({
+        eventType: 'linkedin.invite.sent',
+        eventId: expect.any(String),
+      }));
+      // No pre-read of the lead — existence is enforced by the condition instead.
+      expect(params.ConditionExpression).toBe('attribute_exists(leadId)');
+      expect(mockDocumentClientMethods.get).not.toHaveBeenCalled();
+    });
+
+    it('raises isEngaged for a matching event', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, { ...ev, eventType: 'email.replied' });
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toContain('isEngaged = :isEngaged');
+      expect(params.ExpressionAttributeValues[':isEngaged']).toBe(1);
+    });
+
+    it('never lowers isEngaged for a non-matching event', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev);
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.UpdateExpression).not.toContain('isEngaged');
+      expect(params.ExpressionAttributeValues).not.toHaveProperty(':isEngaged');
+    });
+
+    it('reports a missing lead when the condition fails', async () => {
+      const err: any = new Error('conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(err),
+      });
+      await expect(crmDb.addLeadEngagement(LIST, LEAD, ev)).rejects.toThrow('Lead not found');
+    });
+
+    it('adds no CAS condition when no expectedUpdatedAt is given', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev);
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.ConditionExpression).toBe('attribute_exists(leadId)');
+      expect(params.ExpressionAttributeValues).not.toHaveProperty(':expectedUpdatedAt');
+    });
+
+    it('guards on updatedAt when the caller passes expectedUpdatedAt', async () => {
+      // Callers that decide whether to append by inspecting current engagements need
+      // this: the read and the append are separate, so two of them could otherwise
+      // both see "not present" and both append.
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev, { expectedUpdatedAt: '2026-07-31T10:00:00.000Z' });
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.ConditionExpression).toBe('attribute_exists(leadId) AND updatedAt = :expectedUpdatedAt');
+      expect(params.ExpressionAttributeValues[':expectedUpdatedAt']).toBe('2026-07-31T10:00:00.000Z');
+    });
+
+    it('advances updatedAt strictly past the CAS token when the clock is in the same millisecond', async () => {
+      // Otherwise a successful append could rewrite the identical updatedAt, leaving
+      // the CAS token unchanged so a second concurrent append still satisfies it and
+      // double-records the engagement (ENG-787).
+      const expected = '2026-07-31T10:00:00.000Z';
+      jest.useFakeTimers().setSystemTime(new Date(expected));
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev, { expectedUpdatedAt: expected });
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.ExpressionAttributeValues[':updatedAt']).toBe('2026-07-31T10:00:00.001Z');
+      expect(params.ExpressionAttributeValues[':updatedAt'] > expected).toBe(true);
+      jest.useRealTimers();
+    });
+
+    it('keeps the real timestamp when the clock is already past the CAS token', async () => {
+      const expected = '2026-07-31T10:00:00.000Z';
+      const now = '2026-07-31T10:00:05.000Z';
+      jest.useFakeTimers().setSystemTime(new Date(now));
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: {} }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev, { expectedUpdatedAt: expected });
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.ExpressionAttributeValues[':updatedAt']).toBe(now);
+      jest.useRealTimers();
+    });
+
+    it('flags a lost CAS race distinctly from a missing lead', async () => {
+      const err: any = new Error('conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(err),
+      });
+      await expect(
+        crmDb.addLeadEngagement(LIST, LEAD, ev, { expectedUpdatedAt: 'x' }),
+      ).rejects.toMatchObject({ preconditionFailed: true });
+    });
+
+    it('warns when the engagements array approaches the item-size ceiling', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Attributes: { engagements: new Array(500).fill(ev) } }),
+      });
+      await crmDb.addLeadEngagement(LIST, LEAD, ev);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('approaching the DynamoDB item-size ceiling'));
+      warn.mockRestore();
+    });
+  });
+
+  // ENG-787 hardening: canonicalization must never discard a value it cannot
+  // canonicalize — normalizeLinkedInUrl returns '' for non-personal URLs.
+  describe('LinkedIn canonicalization preserves un-canonicalizable values', () => {
+    it('createLead keeps a company URL rather than dropping the field', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+      mockDocumentClientMethods.get.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Item: null }) });
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Attributes: {} }) });
+
+      await crmDb.createLead('list_1', { linkedin: '  https://www.linkedin.com/company/acme  ' });
+
+      const item = mockDocumentClientMethods.put.mock.calls[0][0].Item;
+      expect(item.linkedin).toBe('https://www.linkedin.com/company/acme');
+    });
+
+    it('updateLead keeps a company URL rather than REMOVEing it', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Attributes: {} }) });
+
+      await crmDb.updateLead('list_1', 'lead_1', { linkedin: 'https://www.linkedin.com/company/acme' });
+
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toContain('linkedin = :linkedin');
+      expect(params.UpdateExpression).not.toMatch(/REMOVE[^A-Za-z]*linkedin/);
+      expect(params.ExpressionAttributeValues[':linkedin']).toBe('https://www.linkedin.com/company/acme');
+    });
+
+    it('updateLead still REMOVEs linkedin when the caller sends an empty value', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({ promise: jest.fn().mockResolvedValue({ Attributes: {} }) });
+
+      await crmDb.updateLead('list_1', 'lead_1', { linkedin: '   ' });
+
+      const params = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(params.UpdateExpression).toMatch(/REMOVE/);
+      expect(params.ExpressionAttributeValues).not.toHaveProperty(':linkedin');
     });
   });
 });
