@@ -7317,7 +7317,7 @@ emmaToolRegistry.register({
               },
               expectedAssetCount: {
                 type: 'number',
-                description: 'Number of media assets this step must produce before it can be completed (e.g. 18 for "generate 3 images per hook, 18 total"). Carried over from the session work plan when omitted.'
+                description: 'Number of media assets that must have been generated in the run before this step can be completed (e.g. 18 for "generate 3 images per hook, 18 total"). Counted per run, not per step. Carried over from the session work plan when omitted.'
               },
             },
             required: ['stepCount', 'title']
