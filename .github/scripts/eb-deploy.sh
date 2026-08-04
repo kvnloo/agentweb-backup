@@ -244,7 +244,18 @@ underlying_health_verdict() {
       return 0
     fi
 
-    for arn in $(printf '%s' "${tg_arns}" | tr '\t' '\n' | grep '^arn:' || true); do
+    # A load balancer with zero target groups would give this loop zero
+    # iterations, leaving `unhealthy` empty and returning LAGGING — i.e.
+    # vouching for a deploy without having checked a single target. Same hole
+    # as the no-instances and no-registered-targets cases below and above.
+    tg_arns=$(printf '%s' "${tg_arns}" | tr '\t' '\n' | grep '^arn:' || true)
+    if [ -z "${tg_arns}" ]; then
+      EB_UNHEALTHY_DETAIL="describe-target-groups returned no target groups for ${lb}"
+      EB_HEALTH_VERDICT='UNKNOWN'
+      return 0
+    fi
+
+    for arn in ${tg_arns}; do
       if ! targets=$(aws elbv2 describe-target-health \
         --target-group-arn "${arn}" \
         --query 'TargetHealthDescriptions[*].[Target.Id,TargetHealth.State]' \

@@ -686,6 +686,18 @@ run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
 check 'ENG-878: zero instances is not treated as "nothing unhealthy"' 1 \
   'returned no instances'
 
+# An ALB with zero target groups gave the target loop zero iterations, so
+# `unhealthy` stayed empty and the verdict came back LAGGING — vouching for the
+# deploy without having checked a single target. Greptile P1 on #2264; the same
+# hole the no-instances and no-registered-targets guards already covered.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'None\n' >"$M/tg_arns"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878: an ALB with zero target groups does not silently pass' 1 \
+  'returned no target groups'
+
 # A classic (non-ALB) load balancer exposes no target-group ARN, so the probe
 # cannot speak for it and must not vouch for the deploy.
 M=$(new_mock_dir)
