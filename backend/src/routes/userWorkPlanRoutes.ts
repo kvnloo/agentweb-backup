@@ -155,7 +155,11 @@ router.put("/:planId", async (req, res) => {
     };
     await workPlanService.updateWorkPlan(updated);
     res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
-  } catch (error) {
+  } catch (error: any) {
+    // The plan was deleted between the read above and the write.
+    if (error?.message === "Work plan not found") {
+      return res.status(404).json({ message: "Work plan not found" });
+    }
     console.error("Error updating user work plan:", error);
     res.status(500).json({ message: "Failed to update work plan" });
   }

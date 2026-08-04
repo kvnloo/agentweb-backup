@@ -174,14 +174,26 @@ export class WorkPlanService {
       }
     }
 
-    await dynamodb.update({
-      TableName: this.tableName,
-      Key: { planId: plan.planId },
-      UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
-      ExpressionAttributeNames: names,
-      ExpressionAttributeValues: values,
-      ConditionExpression: 'attribute_exists(planId)',
-    }).promise();
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { planId: plan.planId },
+        UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        // update is an upsert. Callers read the plan first, so a failure here
+        // means it was deleted in between — the old whole-item put silently
+        // resurrected it, which is worse than failing.
+        ConditionExpression: 'attribute_exists(planId)',
+      }).promise();
+    } catch (err: any) {
+      if (err?.code === 'ConditionalCheckFailedException') {
+        // Same message approveWorkPlan/rejectWorkPlan already throw, which the
+        // routes map to 404 — a deleted plan is not an internal error.
+        throw new Error('Work plan not found');
+      }
+      throw err;
+    }
   }
 
   /**
