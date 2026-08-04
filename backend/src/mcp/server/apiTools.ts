@@ -1977,6 +1977,7 @@ const WORK_PLAN_STEP_ALIASES: Record<string, string> = {
   skill_ids: 'skillIds',
   user_instructions: 'userInstructions',
   step_count: 'stepCount',
+  expected_asset_count: 'expectedAssetCount',
 };
 
 const normalizeWorkPlanSteps = (steps: any): any => {
@@ -2051,11 +2052,12 @@ mcpToolRegistry.register({
               requiredFunctionCalls: { type: 'array', items: { type: 'string' }, description: 'Tool names the step must call before it can complete. Note the camelCase name; the snake_case alias required_function_calls is also accepted.' },
               skillIds: { type: 'array', items: { type: 'string' }, description: 'Skill IDs attached to this step (from list_skills / resolve_skill). Alias: skill_ids.' },
               userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
-              stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. Alias: step_count.' }
+              stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. Alias: step_count.' },
+              expectedAssetCount: { type: 'number', description: 'For a step that must produce a fixed number of media assets (e.g. "generate 18 images"), the required count. The step cannot be marked completed until that many images/videos have actually been generated in the run, which stops it being closed with only some produced. Omit for steps with no fixed asset count. Alias: expected_asset_count.' }
             },
             required: ['title']
           },
-          description: 'Work plan steps (create/update). Step fields are camelCase (unlike the snake_case top-level parameters); snake_case aliases are accepted too.'
+          description: 'Work plan steps (create/update). Step fields are camelCase (unlike the snake_case top-level parameters); snake_case aliases are accepted too. Any field outside this list is not stored — the response lists such fields under "warnings".'
         }
       },
       required: ['action']

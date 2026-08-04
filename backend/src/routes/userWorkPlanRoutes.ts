@@ -1,5 +1,6 @@
 import express from "express";
 import { workPlanService, WorkPlan } from "../services/workPlanService";
+import { normalizeWorkPlanSteps } from "../services/workPlanSteps";
 import { userDb, orgDb } from "../services/db";
 import {
   canEditItem,
@@ -73,14 +74,7 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Title and at least one step are required" });
     }
 
-    const normalizedSteps = steps.map((s: any, i: number) => ({
-      stepCount: s.stepCount || i + 1,
-      title: s.title || `Step ${i + 1}`,
-      description: s.description,
-      ...(s.userInstructions !== undefined && { userInstructions: s.userInstructions }),
-      requiredFunctionCalls: s.requiredFunctionCalls || [],
-      skillIds: s.skillIds || [],
-    }));
+    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
 
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
@@ -104,7 +98,7 @@ router.post("/", async (req, res) => {
       isBuiltIn: false,
     });
 
-    res.status(201).json(plan);
+    res.status(201).json(warnings.length > 0 ? { ...plan, warnings } : plan);
   } catch (error) {
     console.error("Error creating user work plan:", error);
     res.status(500).json({ message: "Failed to create work plan" });

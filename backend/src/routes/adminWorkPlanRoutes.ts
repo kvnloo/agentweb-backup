@@ -2,6 +2,7 @@ import express from "express";
 import multer from "multer";
 import sharp from "sharp";
 import { workPlanService } from "../services/workPlanService";
+import { normalizeWorkPlanSteps } from "../services/workPlanSteps";
 import { workPlanThumbnailService } from "../services/workPlanThumbnailService";
 
 const THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024; // 2 MB
@@ -69,14 +70,7 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Title and at least one step are required" });
     }
 
-    const normalizedSteps = steps.map((s: any, i: number) => ({
-      stepCount: s.stepCount || i + 1,
-      title: s.title || `Step ${i + 1}`,
-      description: s.description,
-      ...(s.userInstructions !== undefined && { userInstructions: s.userInstructions }),
-      requiredFunctionCalls: s.requiredFunctionCalls || [],
-      skillIds: s.skillIds || [],
-    }));
+    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
 
     const plan = await workPlanService.createWorkPlan({
       title,
@@ -97,7 +91,7 @@ router.post("/", async (req, res) => {
       console.error(`[AdminWorkPlans] Auto thumbnail generation failed for ${plan.planId}:`, err)
     );
 
-    res.status(201).json(plan);
+    res.status(201).json(warnings.length > 0 ? { ...plan, warnings } : plan);
   } catch (error) {
     console.error("Error creating admin work plan:", error);
     res.status(500).json({ message: "Failed to create work plan" });
@@ -111,14 +105,9 @@ router.put("/:planId", async (req, res) => {
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
 
     const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, showInAgentMode, defaultModel, category, visibility } = req.body;
-    const normalizedSteps = steps !== undefined ? steps.map((s: any, i: number) => ({
-      stepCount: s.stepCount || i + 1,
-      title: s.title || `Step ${i + 1}`,
-      description: s.description,
-      ...(s.userInstructions !== undefined && { userInstructions: s.userInstructions }),
-      requiredFunctionCalls: s.requiredFunctionCalls || [],
-      skillIds: s.skillIds || [],
-    })) : undefined;
+    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
+    const normalizedSteps = normalized?.steps;
+    const warnings = normalized?.warnings ?? [];
     const updated = {
       ...plan,
       ...(title !== undefined && { title }),
@@ -134,7 +123,7 @@ router.put("/:planId", async (req, res) => {
       ...(visibility !== undefined && { visibility }),
     };
     await workPlanService.updateWorkPlan(updated);
-    res.json(updated);
+    res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
   } catch (error) {
     console.error("Error updating admin work plan:", error);
     res.status(500).json({ message: "Failed to update work plan" });
