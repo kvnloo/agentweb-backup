@@ -144,6 +144,34 @@ check 'ENG-818: and it warns instead of declaring the deploy safe' 0 \
   'NOT PASSING THIS AS SAFE'
 check 'ENG-818: and it names how to check the live value' 0 \
   'describe-configuration-settings'
+# Greptile P1 on #2280: the example query used to hardcode
+# aws:elbv2:loadbalancer, so a PR changing aws:autoscaling:asg was told to look
+# somewhere its setting could not appear — misleading guidance, the exact thing
+# this PR removes elsewhere.
+check 'ENG-818: and the live query targets the namespace THIS diff touches' 0 \
+  "starts_with(Namespace, 'aws:elbv2:')"
+
+# A non-load-balancer resource namespace must be named instead, not in addition.
+R=$(new_root)
+cat >"$R/backend/.ebextensions/asg.config" <<'EOF'
+option_settings:
+  aws:autoscaling:asg:
+    MinSize: 2
+EOF
+run_check "$R" backend/.ebextensions/asg.config
+check 'ENG-836: an autoscaling-only change queries the autoscaling namespace' 0 \
+  "starts_with(Namespace, 'aws:autoscaling:asg')"
+check 'ENG-836: and does NOT send them to the load-balancer namespace' 0 \
+  'NOT PASSING THIS AS SAFE'
+LB_IN_OUTPUT=$(printf '%s' "${LAST_OUTPUT}" | grep -c "aws:elbv2" || true)
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+if [ "${LB_IN_OUTPUT}" -eq 0 ]; then
+  printf '  ok   %s\n' 'ENG-836: the load-balancer namespace is absent from an autoscaling-only warning'
+else
+  printf '  FAIL %s\n       output mentioned aws:elbv2 %s times\n' \
+    'ENG-836: the load-balancer namespace is absent from an autoscaling-only warning' "${LB_IN_OUTPUT}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+fi
 
 # Instance-only: the SECOND deploy. Must also pass.
 R=$(new_root); write_platform_conf "$R"

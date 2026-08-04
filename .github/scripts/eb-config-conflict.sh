@@ -133,6 +133,21 @@ content_of() {
   fi
 }
 
+# Echoes every needle from the named array that appears in $1, one per line.
+# The warning below names the namespaces a PR actually touches, rather than
+# assuming the load-balancer one: a PR changing `aws:autoscaling:asg` that was
+# told to inspect `aws:elbv2:loadbalancer` would find nothing and conclude it
+# was safe — the exact misleading-guidance failure this file exists to remove.
+matched_needles() {
+  local content="$1" needle
+  shift
+  for needle in "$@"; do
+    if printf '%s' "${content}" | grep -qF "${needle}"; then
+      printf '%s\n' "${needle}"
+    fi
+  done
+}
+
 # Does $1 (a blob of content) contain any needle from the named array?
 contains_any() {
   local content="$1" needle
@@ -161,6 +176,7 @@ main() {
   fi
 
   local resource_hits='' instance_hits='' unclassified='' f content
+  local touched_namespaces=''
 
   for f in "${changed[@]}"; do
     case "${f}" in
@@ -194,6 +210,7 @@ main() {
 
     if contains_any "${content}" "${RESOURCE_NAMESPACES[@]}"; then
       resource_hits="${resource_hits}  ${f} (resource namespace)${origin}"$'\n'
+      touched_namespaces="${touched_namespaces}$(matched_needles "${content}" "${RESOURCE_NAMESPACES[@]}")"$'\n'
     fi
 
     if contains_any "${content}" "${INSTANCE_NAMESPACES[@]}" || \
@@ -220,12 +237,27 @@ main() {
     log "exactly like this one (#2277) was rejected in production and left main"
     log "undeployable for ~50 minutes."
     log ""
+    # Filter to the namespaces THIS diff touches. A generic example naming only
+    # the load-balancer namespace would send an autoscaling or RDS change
+    # looking in the wrong place and finding nothing.
+    local ns filter=''
+    while IFS= read -r ns; do
+      [ -z "${ns}" ] && continue
+      case "${filter}" in
+        *"'${ns}'"*) continue ;;
+      esac
+      [ -n "${filter}" ] && filter="${filter} || "
+      filter="${filter}starts_with(Namespace, '${ns}')"
+    done <<<"${touched_namespaces}"
+    [ -z "${filter}" ] && filter="starts_with(Namespace, 'aws:')"
+
     log "This gate cannot tell whether your value differs from the environment's"
-    log "LIVE setting, which is what actually decides. Before merging, check:"
+    log "LIVE setting, which is what actually decides. Before merging, check the"
+    log "namespaces this diff touches:"
     log "  aws elasticbeanstalk describe-configuration-settings \\"
     log "    --application-name agentweb-backend \\"
     log "    --environment-name Agentweb-backend-env-prod-3 \\"
-    log "    --query \"ConfigurationSettings[0].OptionSettings[?Namespace=='aws:elbv2:loadbalancer']\""
+    log "    --query \"ConfigurationSettings[0].OptionSettings[?${filter}]\""
     log ""
     log "If the live value already matches, there is no delta and the deploy is"
     log "fine. If it differs, apply it with 'update-environment --option-settings'"
