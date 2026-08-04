@@ -54,10 +54,25 @@ export class WorkPlanThumbnailService {
     return crypto.randomBytes(6).toString('hex');
   }
 
-  async generateAIThumbnail(plan: WorkPlan): Promise<WorkPlan> {
-    // The plan as this job observed it. No claim write: a claim is a second
-    // unconditioned write that races the actions it is meant to order.
-    const basedOn = plan.updatedAt;
+  /**
+   * @param opts.supersedeInFlight Set by user-initiated regeneration. Bumps
+   *   updatedAt before rendering, which invalidates any generation already
+   *   running, so the admin's request wins instead of racing an older job for
+   *   the same baseline. Background callers leave it off — they have nothing to
+   *   supersede, and touching the plan would defeat their own ordering.
+   */
+  async generateAIThumbnail(
+    plan: WorkPlan,
+    opts: { supersedeInFlight?: boolean } = {},
+  ): Promise<WorkPlan> {
+    // The plan as this job observed it. No claim write for background jobs: a
+    // claim is a second unconditioned write that races the actions it is meant
+    // to order. A user action is different — it is allowed to supersede.
+    let basedOn = plan.updatedAt;
+    if (opts.supersedeInFlight) {
+      const superseded = await workPlanService.updateThumbnail(plan.planId, {});
+      if (superseded) basedOn = superseded;
+    }
     const description = plan.description || 'A professional marketing automation tool';
     const prompt = THUMBNAIL_PROMPT_TEMPLATE.replace('{title}', plan.title).replace(
       '{description}',

@@ -208,7 +208,9 @@ router.post("/:planId/thumbnail/generate", async (req, res) => {
     const plan = await workPlanService.getWorkPlan(req.params.planId);
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
 
-    const updated = await workPlanThumbnailService.generateAIThumbnail(plan);
+    // User-initiated: supersede any generation already running so the admin's
+    // request wins rather than racing an older job for the same baseline.
+    const updated = await workPlanThumbnailService.generateAIThumbnail(plan, { supersedeInFlight: true });
     res.json(updated);
   } catch (error) {
     console.error("Error generating thumbnail:", error);

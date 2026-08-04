@@ -104,7 +104,10 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
       expect(res.status).toBe(200);
       expect(res.body.thumbnail_url).toBe(mockPlanWithThumbnail.thumbnail_url);
       expect(res.body.thumbnail_source).toBe('ai');
-      expect(mockGenerateAIThumbnail).toHaveBeenCalledWith(mockPlan);
+      // Manual regeneration must supersede any background job already running,
+      // otherwise both race the same baseline and the admin can silently get
+      // the older job's image back instead of their own.
+      expect(mockGenerateAIThumbnail).toHaveBeenCalledWith(mockPlan, { supersedeInFlight: true });
     });
 
     it('returns plan with source=none when AI generation fails gracefully', async () => {
