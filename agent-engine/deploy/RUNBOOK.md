@@ -56,6 +56,7 @@ VM is ever rebuilt.
    read/execute-only — see "Design decisions" in the Monitoring section
    below for why this is separate from the main checkout):
    ```
+   sudo useradd -r -s /usr/sbin/nologin agentengine-alert
    sudo mkdir -p /opt/agent-engine-alert
    sudo python3 -m venv /opt/agent-engine-alert/venv
    sudo /opt/agent-engine-alert/venv/bin/pip install google-cloud-secret-manager
@@ -63,6 +64,20 @@ VM is ever rebuilt.
    sudo chown -R root:root /opt/agent-engine-alert
    sudo chmod -R a+rX,go-w /opt/agent-engine-alert
    ```
+   Then place the `agentengine-alerter@...` service account key (get this
+   from whoever ran `gcloud iam service-accounts keys create` — you need
+   `iam.serviceAccountKeys.create`, which is deliberately not granted to the
+   `gcp-agent-engine-eng389` group; ask Harsha) at
+   `/opt/agent-engine-alert/alerter-sa-key.json`, then lock it down so only
+   `agentengine-alert` (not `agentengine`) can read it:
+   ```
+   sudo chown agentengine-alert:agentengine-alert /opt/agent-engine-alert/alerter-sa-key.json
+   sudo chmod 400 /opt/agent-engine-alert/alerter-sa-key.json
+   ```
+   This is the step that actually closes the Greptile finding — everything
+   else in this section is defense-in-depth, but a compromised `agentengine`
+   that can still read this key file can still forge/suppress alerts
+   regardless of which OS user the unit runs as.
 9. Install and enable the systemd units:
    ```
    sudo cp agent-engine/deploy/agent-engine.service /etc/systemd/system/
@@ -99,7 +114,8 @@ All agent-engine secrets live in **GCP Secret Manager** (project
 | `agentengine-prod-aws-credentials` | JSON | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` for a dedicated `aw_agentengine_user` IAM user (DynamoDB/S3/Bedrock only, least-privilege) |
 | `agentengine-prod-azure-openai`, `-2`, `-3` | JSON | `apiKey`, `endpoint`, `apiVersion` per Azure OpenAI config slot |
 | `agentengine-prod-openai`, `-gemini`, `-google-image`, `-deepseek`, `-pld-deepseek`, `-resend`, `-google-search`, `-runway`, `-reelmind`, `-openai-image`, `-github`, `-jwt-secret`, `-scheduled-chats-service-secret` | plain string | corresponding API key/secret |
-| `agentengine-prod-smtp` | JSON | `user`, `pass` |
+| `agentengine-prod-smtp` | JSON | `user`, `pass` — used by task-level (in-process) email notifications only, readable by the main VM service account |
+| `agentengine-prod-alert-smtp` | JSON | `user`, `pass` — separate copy, used ONLY by `alert_oncall.py`'s process-failure alert. Scoped to the `agentengine-alerter@...` SA alone; the main VM service account has no access. Deliberately a different secret from `agentengine-prod-smtp` even though the credentials may be the same mailbox — the isolation is about which identity can *read* it, not the content |
 | `agentengine-prod-github-deploy-token` | JSON | `username`, `token` — GitHub PAT for `git clone`/`pull` of the private `AgentWebPro/agentweb` repo |
 
 Local dev is unaffected: every secret has an env-var-first fallback (see
