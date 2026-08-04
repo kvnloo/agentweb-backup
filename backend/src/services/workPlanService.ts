@@ -161,7 +161,7 @@ export class WorkPlanService {
        *  currently in flight is invalidated and the user's action stands. */
       clearJobToken?: boolean;
     } = {},
-  ): Promise<void> {
+  ): Promise<boolean> {
     const sets = ['#updatedAt = :updatedAt'];
     const removes: string[] = [];
     const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
@@ -209,10 +209,11 @@ export class WorkPlanService {
         ExpressionAttributeValues: values,
         ConditionExpression: condition,
       }).promise();
+      return true;
     } catch (err: any) {
       // Either the plan is gone, or its thumbnail moved on while this automatic
       // job was running. Both mean "do nothing", not "fail".
-      if (err?.code === 'ConditionalCheckFailedException') return;
+      if (err?.code === 'ConditionalCheckFailedException') return false;
       throw err;
     }
   }

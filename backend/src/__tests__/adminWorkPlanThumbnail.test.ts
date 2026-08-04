@@ -104,10 +104,10 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
       expect(res.status).toBe(200);
       expect(res.body.thumbnail_url).toBe(mockPlanWithThumbnail.thumbnail_url);
       expect(res.body.thumbnail_source).toBe('ai');
-      // The manual regenerate is user-initiated and synchronous, so it must opt
-      // out of the background write ordering — otherwise a concurrent thumbnail
-      // change silently skips the write while the admin is told it succeeded.
-      expect(mockGenerateAIThumbnail).toHaveBeenCalledWith(mockPlan, { enforceOrdering: false });
+      // Every generation is ordered by a job token now, including this one. The
+      // manual path stays honest by returning the actually-stored plan when a
+      // newer action wins the race, rather than opting out of ordering.
+      expect(mockGenerateAIThumbnail).toHaveBeenCalledWith(mockPlan);
     });
 
     it('returns plan with source=none when AI generation fails gracefully', async () => {

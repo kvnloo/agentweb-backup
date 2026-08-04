@@ -318,7 +318,7 @@ describe('WorkPlanService', () => {
 
       await expect(
         workPlanService.updateThumbnail('gone', { thumbnail_source: 'ai' }),
-      ).resolves.toBeUndefined();
+      ).resolves.toBe(false);
     });
 
     it('still surfaces any other write failure', async () => {
@@ -375,7 +375,7 @@ describe('WorkPlanService', () => {
 
       await expect(
         workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }, { expectedJobToken: 'stale' }),
-      ).resolves.toBeUndefined();
+      ).resolves.toBe(false);
     });
 
     it('leaves an unordered write with no token condition at all', async () => {

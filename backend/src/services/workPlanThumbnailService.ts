@@ -55,23 +55,18 @@ export class WorkPlanThumbnailService {
   }
 
   /**
-   * @param opts.enforceOrdering Default true, for the fire-and-forget jobs kicked
-   *   off at create and at a clear: those must not land if the thumbnail moved on
-   *   while they ran. Pass false for a user-initiated regenerate, where the admin
-   *   is waiting on the result — a skipped write there would be reported to them
-   *   as success while the database kept the old thumbnail.
+   * Every generation is ordered by a job token, including the user-initiated
+   * regenerate. Claiming a token also invalidates any generation already in
+   * flight, so a manual regenerate cannot be overwritten by an older background
+   * job afterwards. When a newer action wins the race the write is skipped and
+   * the CURRENT stored plan is returned — never a fabricated success (ENG-889).
    */
-  async generateAIThumbnail(
-    plan: WorkPlan,
-    opts: { enforceOrdering?: boolean } = {},
-  ): Promise<WorkPlan> {
-    // Claim this generation. Any newer user action drops the token, so the
-    // write at the end of this ~40s render is simply rejected (ENG-889).
-    const jobToken = opts.enforceOrdering === false ? undefined : crypto.randomUUID();
-    if (jobToken) {
-      await workPlanService.updateThumbnail(plan.planId, {}, { jobToken });
-    }
-    const ordering = jobToken ? { expectedJobToken: jobToken } : {};
+  async generateAIThumbnail(plan: WorkPlan): Promise<WorkPlan> {
+    // Claim this generation. The claim supersedes any token already in flight,
+    // so an older job can no longer land after this one.
+    const jobToken = crypto.randomUUID();
+    await workPlanService.updateThumbnail(plan.planId, {}, { jobToken });
+    const ordering = { expectedJobToken: jobToken };
     const description = plan.description || 'A professional marketing automation tool';
     const prompt = THUMBNAIL_PROMPT_TEMPLATE.replace('{title}', plan.title).replace(
       '{description}',
@@ -108,11 +103,12 @@ export class WorkPlanThumbnailService {
       };
       // Attribute-scoped write: this runs long after create, so putting the
       // whole snapshot back would revert edits made in the meantime (ENG-889).
-      await workPlanService.updateThumbnail(plan.planId, {
+      const wrote = await workPlanService.updateThumbnail(plan.planId, {
         thumbnail_url: url,
         thumbnail_source: 'ai',
         thumbnail_alt_text: updated.thumbnail_alt_text,
       }, ordering);
+      if (!wrote) return (await workPlanService.getWorkPlan(plan.planId)) ?? plan;
       return updated;
     } catch (err) {
       console.error(
@@ -190,7 +186,8 @@ export class WorkPlanThumbnailService {
     // failure. Carries the same ordering as the generation attempt it belongs to,
     // so a background failure cannot stamp 'none' over an upload or a clear made
     // while it ran — but a user-initiated regenerate still records its failure.
-    await workPlanService.updateThumbnail(plan.planId, { thumbnail_source: 'none' }, ordering);
+    const wrote = await workPlanService.updateThumbnail(plan.planId, { thumbnail_source: 'none' }, ordering);
+    if (!wrote) return (await workPlanService.getWorkPlan(plan.planId)) ?? plan;
     return updated;
   }
 }
