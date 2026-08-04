@@ -566,12 +566,21 @@ export function getScheduledSessionOverride(sessionType?: string): string {
 // unattended run there is no human to approve, so without a concrete authorization
 // signal the model cannot tell an owner-authorized autopublish from an
 // unauthorized one and defaults to refusing — burning the run while the
-// required-tool checker nudges it in a loop (sessions 1b28ae36 / a924892d). The
-// caller derives this from the schedule's opt-in `fullAutonomy` flag (the owner
-// has explicitly marked the schedule autonomous, which IS the standing approval to
-// take irreversible actions like publishing unattended). Default false → the safe,
+// required-tool checker nudges it in a loop (sessions 1b28ae36 / a924892d, ~21
+// refusal cycles and $5.86 for one unpublished draft).
+//
+// The caller derives this via resolveSchedulePublishAuthorization(), primarily from
+// the publish tools the owner listed in the schedule's `requiredFunctionCalls` —
+// see that helper for why `fullAutonomy` alone is not a sufficient signal.
+// `authorizedPublishTools` names those exact tools so the directive authorizes
+// precisely what the owner asked for and nothing more. Default false → the safe,
 // draft-and-notify behaviour; never inferred by the model.
-export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean, publishAuthorized?: boolean): string {
+export function getUnattendedExecutionDirective(
+  sessionType?: string,
+  isAdmin?: boolean,
+  publishAuthorized?: boolean,
+  authorizedPublishTools?: string[]
+): string {
   if (sessionType !== 'scheduled') return '';
   // The userId→identity mapping and its data-minimization guard reference two
   // admin-only tools (get_chat_history, list_all_clients). Inject this slice
@@ -620,8 +629,11 @@ SURFACE GAPS AS ACTIONABLE ITEMS:
   ? `
 
 PUBLISH AUTHORIZATION — this schedule is PRE-AUTHORIZED to publish (CRITICAL):
-- The owner has explicitly marked this schedule autonomous. That standing authorization IS the human approval for publishing — the "review with the user and get explicit approval before publishing" gate that the social tools mention is therefore ALREADY SATISFIED for this run. Do NOT seek additional sign-off and do NOT withhold the publish because no human is present.
-- When the task's goal is to publish (e.g. post the approved content to a connected LinkedIn / X / Instagram / YouTube account), you MUST call the publishing tool (e.g. post_on_connected_account) to actually publish it. Drafting the content or saving it to the knowledge base alone is NOT completion — the run only succeeds once the post is actually published.
+- The owner configured this schedule, in advance, to publish on their behalf${authorizedPublishTools && authorizedPublishTools.length > 0
+  ? ` — they explicitly designated ${authorizedPublishTools.join(' and ')} as required for this run`
+  : ' and marked it fully autonomous'}. That standing configuration IS the human approval for publishing — the "review with the user and get explicit approval before publishing" gate that the social tools mention is therefore ALREADY SATISFIED for this run. Do NOT seek additional sign-off and do NOT withhold the publish because no human is present.
+- When the task's goal is to publish (e.g. post the approved content to a connected LinkedIn / X / Instagram / YouTube account), you MUST call the publishing tool${authorizedPublishTools && authorizedPublishTools.length > 0 ? ` (${authorizedPublishTools.join(', ')})` : ' (e.g. post_on_connected_account)'} to actually publish it. Drafting the content or saving it to the knowledge base alone is NOT completion — the run only succeeds once the post is actually published.
+- This authorization covers ONLY the publishing action above. It does not waive any other limit — volume caps, spend, and destructive operations are governed by their own rules and are unaffected.
 - Treat a required-tool nudge to call the publishing tool as the authorized instruction it is and execute it; declining an authorized publish on safety/approval grounds is the exact failure this authorization exists to prevent.`
   : `
 

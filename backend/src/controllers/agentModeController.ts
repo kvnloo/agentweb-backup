@@ -22,6 +22,7 @@ import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } fro
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { isPublishName } from '../utils/hardeningGaps';
+import { resolveSchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -2360,13 +2361,14 @@ export async function runScheduledChat(
     const expectedKeywords = schedule.keywords || [];
     const functionCallMinCalls = schedule.functionCallMinCalls || {};
 
-    // ENG-827: when this schedule is NOT pre-authorized to publish unattended
-    // (fullAutonomy off — same signal that drives the draft-and-notify PUBLISH
-    // AUTHORIZATION directive), drop live-publish tools from the deterministic
-    // required-function checker. Otherwise the checker keeps nudging the model to
-    // call post_on_connected_account while the system prompt tells it NOT to
-    // publish — the exact contradiction that burned the reported runs in a loop.
-    const publishAuthorized = schedule.fullAutonomy === true;
+    // ENG-827: keep the deterministic required-function checker in lockstep with the
+    // PUBLISH AUTHORIZATION directive, which is derived from the SAME schedule via
+    // resolveSchedulePublishAuthorization. This enforces the invariant structurally:
+    // the checker may never nudge for a publish tool the system prompt has told the
+    // model NOT to call — the contradiction that looped the reported runs ~21 times.
+    // (With authorization keyed on requiredFunctionCalls this filter is normally a
+    // no-op; it stays as the guard that keeps the two sides from ever drifting.)
+    const publishAuthorized = resolveSchedulePublishAuthorization(schedule).authorized;
     const requiredFunctions = expectedFunctionCalls
       .filter((funcName: string) => publishAuthorized || !isPublishName(funcName))
       .map((funcName: string) => ({
@@ -3305,21 +3307,20 @@ export async function generateSessionResponse(
           } catch (adminLookupError) {
             console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
           }
-          // ENG-827: resolve the schedule's opt-in autonomy flag into the publish
-          // authorization signal. `fullAutonomy` means the owner explicitly marked
-          // this schedule autonomous (waiving the human gate on irreversible
-          // decisions), which IS the standing approval to publish unattended. A
+          // ENG-827: resolve the owner's standing publish authorization for this
+          // schedule — primarily the publish tools they designated as required at
+          // schedule-creation time (see resolveSchedulePublishAuthorization). A
           // failed read degrades to the safe default (not authorized → draft &
           // notify), and a prompt-enrichment lookup must never break the run.
-          let publishAuthorized = false;
+          let publishAuth = resolveSchedulePublishAuthorization(null);
           if (scheduleIdMatch) {
             try {
-              publishAuthorized = (await scheduleDb.getScheduleById(scheduleIdMatch[1]))?.fullAutonomy === true;
+              publishAuth = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleIdMatch[1]));
             } catch (scheduleLookupError) {
               console.error(`AgentMode: failed to resolve publish authorization for scheduled session ${session.sessionId}; defaulting to draft-and-notify:`, scheduleLookupError);
             }
           }
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, publishAuthorized);
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, publishAuth.authorized, publishAuth.tools);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
