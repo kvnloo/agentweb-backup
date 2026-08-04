@@ -108,6 +108,25 @@ async function runAdImage(userId: string): Promise<unknown> {
   } = require("./onboardingAdImageService");
   await triggerAdImageGenerationForUser(userId);
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
+  // ENG-792: the service signals every business failure by patching
+  // adImageStatus (missing logo, unfetchable logo, all variants failed) and
+  // never by throwing. The orchestrator only records a step as `failed` when
+  // its runner throws, so without this re-raise the DAG stamped adImage
+  // "ready" with a null output — the same "reports success, delivered
+  // nothing" shape this ticket is about, one layer up.
+  //
+  // This does NOT gate ad copy: adCopy deps on creativeDir, not adImage, so
+  // the two remain independent axes by design (see adImageStatusService).
+  // What it fixes is the step record itself — a failed run is now visible as
+  // failed, with its reason, instead of masquerading as a ready step whose
+  // output happens to be null.
+  if (user?.adImageStatus === "failed") {
+    throw new Error(
+      typeof user.adImageError === "string" && user.adImageError
+        ? user.adImageError
+        : "ad image generation failed",
+    );
+  }
   return user?.adImageResult ?? null;
 }
 
