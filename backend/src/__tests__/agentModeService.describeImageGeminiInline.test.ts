@@ -218,4 +218,39 @@ describe('describeImage — Gemini vision path inlines + downscales (ENG-834)', 
     const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
     expect(imgBlock.image_url.url).toBe(internalUrl);
   });
+
+  /**
+   * Graceful-degradation contract: routing this fetch through our own server
+   * introduced a failure mode the pre-fix code did not have (the download itself
+   * can fail — timeout, DNS, 404, redirect loop). Whenever that happens the
+   * vision call MUST still be attempted with the original URL, exactly as it was
+   * before the guard existed, so the guarded fetch can never make describe_image
+   * worse than it was. These pin that contract for the non-SSRF failures; the
+   * SsrfBlockedError case is covered above.
+   */
+  it.each([
+    ['a network/timeout error', new Error('timeout of 30000ms exceeded')],
+    ['an unreachable host', Object.assign(new Error('getaddrinfo ENOTFOUND img.example.com'), { code: 'ENOTFOUND' })],
+    ['a 404 from the origin', new Error('Request failed with status code 404')],
+    ['an exhausted redirect chain', new Error('Too many redirects (>5)')],
+  ])('still attempts the vision call with the raw URL when the fetch fails with %s', async (_label, err) => {
+    (isS3Url as jest.Mock).mockReturnValueOnce(false);
+    mockGuardedFetch.mockRejectedValueOnce(err);
+    const consoleError = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const callLLMSpy = jest
+      .spyOn(service, 'callLLM')
+      .mockResolvedValue({ choices: [{ message: { content: 'ok' } }] } as any);
+
+    const externalUrl = 'https://img.example.com/cover.png';
+    const result = await service.describeImage('gemini-3.5-flash', externalUrl);
+
+    // Degrades to the pre-fix behaviour rather than surfacing a hard tool error.
+    expect(result.success).toBe(true);
+    expect(callLLMSpy).toHaveBeenCalled();
+    const [, messages] = callLLMSpy.mock.calls[0];
+    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    expect(imgBlock.image_url.url).toBe(externalUrl);
+
+    consoleError.mockRestore();
+  });
 });
