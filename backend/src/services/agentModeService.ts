@@ -216,7 +216,7 @@ import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
-import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
+import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -7118,29 +7118,34 @@ export class AgentModeService {
           const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
           const isOwnS3 = isS3Url(imageUrl);
           const fetchUrl = isOwnS3 ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
-          const requestConfig: any = { responseType: 'arraybuffer', timeout: 30000 };
-          if (!isOwnS3) {
-            // describe_image is an agent-callable foundation tool fed image URLs
-            // from untrusted content, so this server-side fetch of an
-            // agent-supplied URL is a reachable SSRF vector (cloud metadata,
-            // RFC1918/loopback). Guard non-S3 URLs exactly as fetchAndParseCsvRows
-            // does: validate the host resolves to a public IP, pin the connection
-            // to that exact address (DNS-rebinding safe), and refuse redirects so
-            // the guard can't be bypassed (ENG-834).
-            const { address, family } = await resolvePinnedPublicAddress(fetchUrl);
-            requestConfig.maxRedirects = 0;
-            requestConfig.lookup = (_hostname: string, options: any, callback: any) => {
-              if (typeof options === 'function') callback = options;
-              callback(null, address, family);
-            };
-          }
-          const imgResp = await axios.get<ArrayBuffer>(fetchUrl, requestConfig);
           // Normalize content-type: strip any charset/extra params and trim whitespace.
           // Do NOT default a missing/empty header to a native type here — that would
           // short-circuit sharp detection and embed non-PNG bytes as image/png (ENG-370).
           // Pass the raw/empty type through so normalizeImageForVision decodes via sharp.
-          const contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
-          let imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          let contentType: string;
+          let imageBuffer: Buffer;
+          if (isOwnS3) {
+            // Our own presigned S3 object: no redirects, no SSRF surface.
+            const imgResp = await axios.get<ArrayBuffer>(fetchUrl, {
+              responseType: 'arraybuffer',
+              timeout: 30000,
+            });
+            contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
+            imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          } else {
+            // describe_image is an agent-callable foundation tool fed image URLs
+            // from untrusted content, so this server-side fetch of an agent-supplied
+            // URL is a reachable SSRF vector (cloud metadata, RFC1918/loopback).
+            // fetchBufferFollowingRedirects validates that the host resolves to a
+            // public IP and pins the connection to that exact address (DNS-rebinding
+            // safe) on EVERY hop — so redirects can be followed without reopening
+            // the bypass. Flatly refusing redirects would be safe but false-blocks
+            // ordinary one-hop image links such as Google Drive `uc?export=view`
+            // (ENG-834).
+            const fetched = await fetchBufferFollowingRedirects(fetchUrl);
+            contentType = fetched.contentType;
+            imageBuffer = fetched.buffer;
+          }
           let finalContentType = contentType;
           // Normalize to a vision-decodable format so the declared media type always
           // matches the bytes. Fixes HEIC/AVIF/TIFF/BMP/SVG logos and mislabeled or

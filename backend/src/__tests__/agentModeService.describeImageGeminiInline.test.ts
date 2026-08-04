@@ -62,14 +62,16 @@ jest.mock('../utils/s3Utils', () => ({
 }));
 
 // describe_image is agent-callable and fed URLs from untrusted content, so the
-// non-S3 fetch path must go through the repo's SSRF guard. Mock it to avoid real
-// DNS while asserting it is invoked and that a blocked URL is not fetched.
-const mockResolvePinned = jest.fn();
+// non-S3 fetch path must go through the repo's SSRF-guarded fetch rather than a
+// bare axios.get. Mock that helper to avoid real DNS/network and assert the
+// delegation; its hop-by-hop guard semantics are covered exhaustively in
+// ssrfGuard.fetchBufferFollowingRedirects.test.ts.
+const mockGuardedFetch = jest.fn();
 jest.mock('../utils/ssrfGuard', () => {
   const actual = jest.requireActual('../utils/ssrfGuard');
   return {
     ...actual,
-    resolvePinnedPublicAddress: (...a: any[]) => mockResolvePinned(...a),
+    fetchBufferFollowingRedirects: (...a: any[]) => mockGuardedFetch(...a),
   };
 });
 
@@ -144,40 +146,63 @@ describe('describeImage — Gemini vision path inlines + downscales (ENG-834)', 
     expect(inlinedBytes.length).toBeLessThan(4 * 1024 * 1024);
   }, 20000);
 
-  it('SSRF-guards a non-S3 image URL: validates the host and pins the connection (no redirects)', async () => {
+  it('routes a non-S3 image URL through the SSRF-guarded fetch, never a bare axios.get', async () => {
     (isS3Url as jest.Mock).mockReturnValueOnce(false);
-    mockResolvePinned.mockResolvedValueOnce({ hostname: 'example.com', address: '93.184.216.34', family: 4 });
     const pngBytes = Buffer.from(
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
       'base64'
     );
-    mockAxiosGet.mockResolvedValue({ data: pngBytes, headers: { 'content-type': 'image/png' } });
+    const externalUrl = 'https://example.com/cover.png';
+    mockGuardedFetch.mockResolvedValueOnce({
+      buffer: pngBytes,
+      contentType: 'image/png',
+      finalUrl: externalUrl,
+    });
     const callLLMSpy = jest
       .spyOn(service, 'callLLM')
       .mockResolvedValue({ choices: [{ message: { content: 'ok' } }] } as any);
 
-    const externalUrl = 'https://example.com/cover.png';
     const result = await service.describeImage('gemini-3.5-flash', externalUrl);
 
     expect(result.success).toBe(true);
-    // Guard ran against the external URL before any fetch.
-    expect(mockResolvePinned).toHaveBeenCalledWith(externalUrl);
-    // axios.get must pin the connection to the validated address and refuse redirects.
-    const [, cfg] = mockAxiosGet.mock.calls[0];
-    expect(cfg.maxRedirects).toBe(0);
-    expect(typeof cfg.lookup).toBe('function');
-    const cb = jest.fn();
-    cfg.lookup('example.com', {}, cb);
-    expect(cb).toHaveBeenCalledWith(null, '93.184.216.34', 4);
+    // The guarded fetch owns the request; an unguarded axios.get would be the bug.
+    expect(mockGuardedFetch).toHaveBeenCalledWith(externalUrl);
+    expect(mockAxiosGet).not.toHaveBeenCalled();
     // Image was still inlined for the Gemini path.
     const [, messages] = callLLMSpy.mock.calls[0];
     const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
     expect(imgBlock.image_url.url).toMatch(/^data:image\//);
   });
 
+  it('follows a redirecting non-S3 URL and inlines the final image (Google Drive, ENG-834)', async () => {
+    // Refusing redirects outright false-blocked ordinary one-hop image links:
+    // drive.google.com/uc?export=view 303s once to drive.usercontent.google.com.
+    (isS3Url as jest.Mock).mockReturnValueOnce(false);
+    const webpBytes = Buffer.from('UklGRh4AAABXRUJQVlA4', 'base64');
+    const driveUrl = 'https://drive.google.com/uc?export=view&id=ABC';
+    mockGuardedFetch.mockResolvedValueOnce({
+      buffer: webpBytes,
+      contentType: 'image/webp',
+      finalUrl: 'https://drive.usercontent.google.com/download?id=ABC&export=view',
+    });
+    const callLLMSpy = jest
+      .spyOn(service, 'callLLM')
+      .mockResolvedValue({ choices: [{ message: { content: 'ok' } }] } as any);
+
+    const result = await service.describeImage('gemini-3.5-flash', driveUrl);
+
+    expect(result.success).toBe(true);
+    expect(mockGuardedFetch).toHaveBeenCalledWith(driveUrl);
+    // Inlined, not handed to Gemini as a bare URL it cannot follow.
+    const [, messages] = callLLMSpy.mock.calls[0];
+    const imgBlock = (messages[0].content as any[]).find((c: any) => c.type === 'image_url');
+    expect(imgBlock.image_url.url).toMatch(/^data:image\//);
+    expect(imgBlock.image_url.url).not.toBe(driveUrl);
+  });
+
   it('does not fetch a non-S3 URL that the SSRF guard blocks (falls back to the raw URL)', async () => {
     (isS3Url as jest.Mock).mockReturnValueOnce(false);
-    mockResolvePinned.mockRejectedValueOnce(new SsrfBlockedError());
+    mockGuardedFetch.mockRejectedValueOnce(new SsrfBlockedError());
     const callLLMSpy = jest
       .spyOn(service, 'callLLM')
       .mockResolvedValue({ choices: [{ message: { content: 'ok' } }] } as any);

@@ -62,6 +62,7 @@ describe('describeImage — fast-fail on an undecodable upload (ENG-370)', () =>
     // the native-passthrough short-circuit does not apply.
     const garbage = Buffer.from('this is definitely not an image file at all', 'utf8');
     mockAxiosGet.mockResolvedValue({
+      status: 200,
       data: garbage,
       headers: { 'content-type': 'application/octet-stream' },
     });
@@ -87,7 +88,7 @@ describe('describeImage — fast-fail on an undecodable upload (ENG-370)', () =>
     const pngBase64 =
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
     const pngBytes = Buffer.from(pngBase64, 'base64');
-    mockAxiosGet.mockResolvedValue({ data: pngBytes, headers: { 'content-type': 'application/octet-stream' } });
+    mockAxiosGet.mockResolvedValue({ status: 200, data: pngBytes, headers: { 'content-type': 'application/octet-stream' } });
     const callLLMSpy = jest
       .spyOn(service, 'callLLM')
       .mockResolvedValue({ choices: [{ message: { content: 'a tiny logo' } }] } as any);
