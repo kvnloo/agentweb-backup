@@ -105,6 +105,9 @@ router.put("/:planId", async (req, res) => {
     if (!plan) return res.status(404).json({ message: "Work plan not found" });
 
     const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, showInAgentMode, defaultModel, category, visibility } = req.body;
+    if (steps !== undefined && !Array.isArray(steps)) {
+      return res.status(400).json({ message: "steps must be an array" });
+    }
     const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
     const normalizedSteps = normalized?.steps;
     const warnings = normalized?.warnings ?? [];

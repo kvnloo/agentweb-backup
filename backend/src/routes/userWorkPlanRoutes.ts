@@ -134,11 +134,19 @@ router.put("/:planId", async (req, res) => {
     }
 
     const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, defaultModel } = req.body;
+    if (steps !== undefined && !Array.isArray(steps)) {
+      return res.status(400).json({ message: "steps must be an array" });
+    }
+    // Normalize here too. This path used to store the caller's step objects
+    // verbatim, which made the same resource behave differently by verb and
+    // left it the one write path with no report of what it discarded (ENG-889).
+    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
+    const warnings = normalized?.warnings ?? [];
     const updated = {
       ...plan,
       ...(title !== undefined && { title }),
       ...(description !== undefined && { description }),
-      ...(steps !== undefined && { steps }),
+      ...(normalized !== undefined && { steps: normalized.steps }),
       ...(welcomeMessage !== undefined && { welcomeMessage }),
       ...(autocomplete !== undefined && { autocomplete }),
       ...(requireLogin !== undefined && { requireLogin }),
@@ -146,7 +154,7 @@ router.put("/:planId", async (req, res) => {
       ...(defaultModel !== undefined && { defaultModel }),
     };
     await workPlanService.updateWorkPlan(updated);
-    res.json(updated);
+    res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
   } catch (error) {
     console.error("Error updating user work plan:", error);
     res.status(500).json({ message: "Failed to update work plan" });

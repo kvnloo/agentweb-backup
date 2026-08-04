@@ -55,9 +55,21 @@ export function normalizeWorkPlanSteps(steps: any[]): NormalizedWorkPlanSteps {
     // would never fire — the silent no-op this issue is about. Report and drop.
     const listOf = (key: 'requiredFunctionCalls' | 'skillIds') => {
       const value = s[key];
-      if (value === undefined || Array.isArray(value)) return value || [];
-      warnings.push(`step ${i + 1}: ignored ${key} — expected an array`);
-      return [];
+      if (value === undefined) return [];
+      if (!Array.isArray(value)) {
+        warnings.push(`step ${i + 1}: ignored ${key} — expected an array`);
+        return [];
+      }
+      // Both lists are looked up by string — a tool name or a skill id. A
+      // non-string entry can never match, so keeping it would just be another
+      // value that stores cleanly and is then skipped downstream.
+      const usable = value.filter((entry: unknown) => typeof entry === 'string' && entry !== '');
+      if (usable.length !== value.length) {
+        warnings.push(
+          `step ${i + 1}: dropped ${value.length - usable.length} non-string entries from ${key}`,
+        );
+      }
+      return usable;
     };
 
     const assetCount = s.expectedAssetCount;
