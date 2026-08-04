@@ -252,11 +252,22 @@ export async function fetchBufferFollowingRedirects(
   const resolvePinned = deps.resolvePinned ?? resolvePinnedPublicAddress;
   const request = deps.request ?? defaultPinnedRequest;
 
+  // timeoutMs bounds the WHOLE fetch, not each hop. Per-hop it would multiply by
+  // the redirect limit (6 hops x 30s = 180s), and this download runs OUTSIDE
+  // describe_image's 90s vision bound — so a slow chain could stall a tool call
+  // for minutes and eat the run's generation budget (the unbounded-media-call
+  // failure ENG-294 exists to prevent).
+  const deadline = Date.now() + timeoutMs;
+
   let url = startUrl;
   for (let hop = 0; hop <= maxRedirects; hop++) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      throw new Error(`Timed out following redirects after ${timeoutMs}ms`);
+    }
     // Re-validate the resolved host at EVERY hop, not just the first.
     const pinned = await resolvePinned(url);
-    const res = await request(url, pinned, timeoutMs);
+    const res = await request(url, pinned, remainingMs);
 
     if (res.status >= 200 && res.status < 300) {
       const rawType = res.headers?.['content-type'] ?? res.headers?.['Content-Type'] ?? '';

@@ -163,3 +163,46 @@ describe('fetchBufferFollowingRedirects', () => {
     expect(out.contentType).toBe('');
   });
 });
+
+/**
+ * The 30s timeout must bound the WHOLE fetch, not each hop. Applied per hop it
+ * multiplies by the redirect limit (6 hops x 30s = 180s), and this download sits
+ * OUTSIDE describe_image's 90s vision bound — so a slow redirect chain could stall
+ * a tool call for minutes and eat the run's generation budget. That is exactly the
+ * unbounded-media-call failure ENG-294 exists to prevent.
+ */
+describe('fetchBufferFollowingRedirects — total time budget', () => {
+  const IMG = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+
+  it('shares one budget across hops instead of restarting it each hop', async () => {
+    const a = 'https://example.com/a';
+    const b = 'https://example.com/b';
+    const seen: number[] = [];
+    const deps: RedirectFetchDeps = {
+      resolvePinned: async () => ({ hostname: 'example.com', address: '93.184.216.34', family: 4 }),
+      request: async (url: string, _pinned: any, timeoutMs: number) => {
+        seen.push(timeoutMs);
+        await new Promise((r) => setTimeout(r, 40));
+        return url === a
+          ? { status: 302, headers: { location: b }, data: Buffer.alloc(0) }
+          : { status: 200, headers: { 'content-type': 'image/png' }, data: IMG };
+      },
+    };
+    await fetchBufferFollowingRedirects(a, deps, 5, 400);
+    expect(seen).toHaveLength(2);
+    // Second hop must get the REMAINING budget, strictly less than the first.
+    expect(seen[1]).toBeLessThan(seen[0]);
+  });
+
+  it('gives up once the budget is exhausted rather than starting another hop', async () => {
+    const start = 'https://example.com/slow';
+    const deps: RedirectFetchDeps = {
+      resolvePinned: async () => ({ hostname: 'example.com', address: '93.184.216.34', family: 4 }),
+      request: async () => {
+        await new Promise((r) => setTimeout(r, 30));
+        return { status: 302, headers: { location: start }, data: Buffer.alloc(0) };
+      },
+    };
+    await expect(fetchBufferFollowingRedirects(start, deps, 5, 50)).rejects.toThrow(/timed out/i);
+  });
+});
