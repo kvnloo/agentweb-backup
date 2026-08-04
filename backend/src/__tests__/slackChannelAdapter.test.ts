@@ -24,7 +24,9 @@ beforeEach(() => {
 describe('slackChannelAdapter.sendMessage', () => {
   it('posts to the destination channel and returns the provider message handle', async () => {
     const result = await slackChannelAdapter.sendMessage({ destination: 'C1', text: 'hi' });
-    expect(postSlackMessage).toHaveBeenCalledWith('C1', 'hi', undefined);
+    // Two args, not three-with-undefined: the pre-existing Slack suites assert this
+    // exact arity, and keeping them untouched is what proves the seam is inert.
+    expect(postSlackMessage).toHaveBeenCalledWith('C1', 'hi');
     expect(result).toEqual({ messageId: '1712.0001' });
   });
 
