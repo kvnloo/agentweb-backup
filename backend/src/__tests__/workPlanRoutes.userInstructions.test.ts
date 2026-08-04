@@ -385,3 +385,67 @@ describe("unrecognized step fields are reported, not silently dropped", () => {
     expect("warnings" in res.body).toBe(false);
   });
 });
+
+describe("user PUT is consistent with every other write path", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "plan-user",
+      title: "Mine",
+      steps: [],
+      ownerId: "user-1",
+      visibility: "private",
+      isBuiltIn: false,
+      createdAt: "2026-08-04T00:00:00Z",
+      updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.updateWorkPlan.mockResolvedValue(undefined);
+  });
+
+  it("normalizes steps rather than storing the caller's object verbatim", async () => {
+    const res = await request(app)
+      .put("/api/user-work-plans/plan-user")
+      .send({ steps: [{ title: "Step", expectedAssetCount: 4, mystery: 1 }] });
+
+    expect(res.status).toBe(200);
+    const arg = workPlanService.updateWorkPlan.mock.calls[0][0];
+    expect(arg.steps[0]).toMatchObject({ stepCount: 1, title: "Step", expectedAssetCount: 4 });
+    expect("mystery" in arg.steps[0]).toBe(false);
+  });
+
+  it("reports the discarded field instead of persisting it silently", async () => {
+    const res = await request(app)
+      .put("/api/user-work-plans/plan-user")
+      .send({ steps: [{ title: "Step", mystery: 1 }] });
+
+    expect(res.body.warnings).toEqual(["step 1: ignored unrecognized field 'mystery'"]);
+  });
+});
+
+describe("a non-array steps payload is rejected, not crashed on", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Owned + private, so the user route's ownership check passes and we reach
+    // the payload validation this describe is actually about.
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "p", title: "T", steps: [], ownerId: "user-1",
+      visibility: "private", isBuiltIn: false,
+      createdAt: "2026-08-04T00:00:00Z", updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.updateWorkPlan.mockResolvedValue(undefined);
+  });
+
+  it("returns 400 from the admin PUT instead of a 500 from inside .map", async () => {
+    const res = await request(app).put("/api/admin/work-plans/p").send({ steps: "not an array" });
+
+    expect(res.status).toBe(400);
+    expect(workPlanService.updateWorkPlan).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 from the user PUT too", async () => {
+    const res = await request(app).put("/api/user-work-plans/p").send({ steps: { a: 1 } });
+
+    expect(res.status).toBe(400);
+    expect(workPlanService.updateWorkPlan).not.toHaveBeenCalled();
+  });
+});

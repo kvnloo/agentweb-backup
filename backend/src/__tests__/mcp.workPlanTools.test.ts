@@ -358,6 +358,65 @@ describe('Predefined Work Plan MCP Tools', () => {
     });
   });
 
+  // The admin route reads category and visibility, and the portal sets both —
+  // but they were absent from the tool, so an API-only caller had to open the
+  // portal to finish a plan it had just created (ENG-889).
+  describe('manage_predefined_work_plan - category and visibility', () => {
+    it('maps category and visibility on create', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Paid Ads Plan',
+        steps: [{ title: 'Step 1' }],
+        category: 'Paid Ads',
+        visibility: 'system',
+      }, context);
+
+      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(body.category).toBe('Paid Ads');
+      expect(body.visibility).toBe('system');
+    });
+
+    it('maps category and visibility on update', async () => {
+      mockMcpFetch.mockResolvedValue({ message: 'Updated' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        category: 'Strategy',
+        visibility: 'private',
+      }, context);
+
+      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(body.category).toBe('Strategy');
+      expect(body.visibility).toBe('private');
+    });
+
+    it('omits both when not supplied, leaving the route defaults alone', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Plain',
+        steps: [{ title: 'Step 1' }],
+      }, context);
+
+      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect('category' in body).toBe(false);
+      expect('visibility' in body).toBe(false);
+    });
+
+    it('documents both on the tool', () => {
+      const def: any = mcpToolRegistry.getTool('manage_predefined_work_plan')!.definition;
+      const props = def.inputSchema.properties;
+      expect(props.category).toBeDefined();
+      expect(props.visibility.enum).toEqual(
+        expect.arrayContaining(['system', 'private', 'public', 'pending_review']),
+      );
+    });
+  });
+
   describe('manage_predefined_work_plan - update', () => {
     it('should call PUT with plan_id in path', async () => {
       mockMcpFetch.mockResolvedValue({ message: 'Updated' });

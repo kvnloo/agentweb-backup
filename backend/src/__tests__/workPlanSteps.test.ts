@@ -113,6 +113,29 @@ describe("normalizeWorkPlanSteps", () => {
     });
 
     it.each([
+      ["requiredFunctionCalls"],
+      ["skillIds"],
+    ])("keeps the usable strings in %s and reports the rest", (field) => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", [field]: ["good", 123, {}, null, "also_good", ""] },
+      ]);
+
+      expect((steps[0] as any)[field]).toEqual(["good", "also_good"]);
+      expect(warnings).toEqual([
+        `step 1: dropped 4 non-string entries from ${field}`,
+      ]);
+    });
+
+    it("reports nothing when every entry is a usable string", () => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", requiredFunctionCalls: ["a", "b"] },
+      ]);
+
+      expect(steps[0].requiredFunctionCalls).toEqual(["a", "b"]);
+      expect(warnings).toEqual([]);
+    });
+
+    it.each([
       ["requiredFunctionCalls", "list_skills"],
       ["skillIds", "skill-1"],
     ])("falls back to an empty list and reports %s given a non-array", (field, value) => {
