@@ -201,3 +201,105 @@ export async function resolvePinnedPublicAddress(rawUrl: string): Promise<{ host
 export async function assertPublicHostname(rawUrl: string): Promise<void> {
   await resolvePinnedPublicAddress(rawUrl);
 }
+
+/** Minimal response shape shared by the injected and real HTTP transports. */
+export interface HttpResponseLike {
+  status: number;
+  headers: Record<string, any>;
+  data: any;
+}
+
+export interface RedirectFetchDeps {
+  resolvePinned?: (url: string) => Promise<{ hostname: string; address: string; family: number }>;
+  request?: (
+    url: string,
+    pinned: { address: string; family: number },
+    timeoutMs: number
+  ) => Promise<HttpResponseLike>;
+}
+
+export const DEFAULT_MAX_REDIRECTS = 5;
+const DEFAULT_TIMEOUT_MS = 30000;
+
+/**
+ * Fetch a URL's bytes SSRF-safely, following redirects hop by hop.
+ *
+ * Pinning the connection to a pre-validated address (resolvePinnedPublicAddress)
+ * is DNS-rebinding-safe but only for the hop it validated: a public URL that
+ * 302s to 169.254.169.254 walks straight past it, which is why the naive guard
+ * pairs pinning with `maxRedirects: 0`. Refusing all redirects closes that hole
+ * and simultaneously false-blocks every legitimate one-hop URL — Google Drive
+ * `uc?export=view` links 303 once to drive.usercontent.google.com, and
+ * describe_image was failing on exactly those (ENG-834).
+ *
+ * Following hop-by-hop with a fresh resolvePinned on EVERY hop keeps both
+ * properties: SSRF-safe across redirects, and correct for legitimately
+ * redirecting media URLs. Same shape as
+ * googleAdsTrackingPreflight.fetchHtmlFollowingRedirects, which learned this
+ * lesson first — this is its byte-returning sibling.
+ *
+ * Deps are injectable so redirect/SSRF behaviour is unit-testable without real
+ * network or DNS. Content-type is returned verbatim (params stripped) and is
+ * NEVER defaulted — fabricating a media type would short-circuit sharp's format
+ * detection downstream (ENG-370).
+ */
+export async function fetchBufferFollowingRedirects(
+  startUrl: string,
+  deps: RedirectFetchDeps = {},
+  maxRedirects: number = DEFAULT_MAX_REDIRECTS,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
+): Promise<{ buffer: Buffer; contentType: string; finalUrl: string }> {
+  const resolvePinned = deps.resolvePinned ?? resolvePinnedPublicAddress;
+  const request = deps.request ?? defaultPinnedRequest;
+
+  let url = startUrl;
+  for (let hop = 0; hop <= maxRedirects; hop++) {
+    // Re-validate the resolved host at EVERY hop, not just the first.
+    const pinned = await resolvePinned(url);
+    const res = await request(url, pinned, timeoutMs);
+
+    if (res.status >= 200 && res.status < 300) {
+      const rawType = res.headers?.['content-type'] ?? res.headers?.['Content-Type'] ?? '';
+      return {
+        buffer: Buffer.isBuffer(res.data) ? res.data : Buffer.from(res.data ?? []),
+        contentType: String(rawType).split(';')[0].trim(),
+        finalUrl: url,
+      };
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers?.location ?? res.headers?.Location;
+      if (!location) throw new Error(`Redirect ${res.status} with no Location header`);
+      const next = new URL(String(location), url); // resolve relative Location against current URL
+      if (next.protocol !== 'http:' && next.protocol !== 'https:') {
+        throw new Error(`Refusing to follow non-http(s) redirect to ${next.protocol}`);
+      }
+      url = next.toString();
+      continue;
+    }
+
+    throw new Error(`Request failed with status code ${res.status}`);
+  }
+  throw new Error(`Too many redirects (>${maxRedirects})`);
+}
+
+/* istanbul ignore next — network boundary; unit tests inject `request` instead. */
+async function defaultPinnedRequest(
+  url: string,
+  pinned: { address: string; family: number },
+  timeoutMs: number
+): Promise<HttpResponseLike> {
+  const axios = (await import('axios')).default;
+  return axios.get(url, {
+    responseType: 'arraybuffer',
+    timeout: timeoutMs,
+    // This transport handles redirects itself (above) so it can re-validate each
+    // hop; axios must therefore never follow one on its own.
+    maxRedirects: 0,
+    validateStatus: (s: number) => s >= 200 && s < 400,
+    lookup: (_hostname: string, options: any, callback: any) => {
+      if (typeof options === 'function') callback = options;
+      callback(null, pinned.address, pinned.family);
+    },
+  } as any);
+}
