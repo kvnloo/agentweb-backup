@@ -265,3 +265,84 @@ describe('fetchBufferFollowingRedirects — response size cap', () => {
     expect(out.buffer.length).toBe(CAP);
   });
 });
+
+/**
+ * Header-casing, body-shape and default-wiring branches. HTTP header names are
+ * case-insensitive and different transports normalise them differently, so both
+ * spellings must work; and a transport may hand back a non-Buffer body. These
+ * also cover the default deps wiring, which real callers rely on.
+ */
+describe('fetchBufferFollowingRedirects — header casing, body shapes and defaults', () => {
+  const pinned = async () => ({ hostname: 'example.com', address: '93.184.216.34', family: 4 });
+  const URL_OK = 'https://example.com/pic.png';
+
+  it('honours a capitalised Content-Length when enforcing the cap', async () => {
+    const deps: RedirectFetchDeps = {
+      resolvePinned: pinned,
+      request: async () => ({
+        status: 200,
+        headers: { 'Content-Type': 'image/png', 'Content-Length': '99999' },
+        data: Buffer.alloc(4),
+      }),
+    };
+    await expect(fetchBufferFollowingRedirects(URL_OK, deps, 5, 30000, 1024)).rejects.toThrow(/too large/i);
+  });
+
+  it('reads a capitalised Content-Type', async () => {
+    const deps: RedirectFetchDeps = {
+      resolvePinned: pinned,
+      request: async () => ({ status: 200, headers: { 'Content-Type': 'image/webp' }, data: Buffer.alloc(4) }),
+    };
+    const out = await fetchBufferFollowingRedirects(URL_OK, deps);
+    expect(out.contentType).toBe('image/webp');
+  });
+
+  it('converts a non-Buffer body (e.g. a raw ArrayBuffer) into a Buffer', async () => {
+    const deps: RedirectFetchDeps = {
+      resolvePinned: pinned,
+      request: async () => ({
+        status: 200,
+        headers: { 'content-type': 'image/png' },
+        data: new Uint8Array([1, 2, 3]),
+      }),
+    };
+    const out = await fetchBufferFollowingRedirects(URL_OK, deps);
+    expect(Buffer.isBuffer(out.buffer)).toBe(true);
+    expect(Array.from(out.buffer)).toEqual([1, 2, 3]);
+  });
+
+  it('treats a missing body as empty rather than throwing', async () => {
+    const deps: RedirectFetchDeps = {
+      resolvePinned: pinned,
+      request: async () => ({ status: 200, headers: { 'content-type': 'image/png' }, data: undefined }),
+    };
+    const out = await fetchBufferFollowingRedirects(URL_OK, deps);
+    expect(out.buffer.length).toBe(0);
+  });
+
+  it('tolerates a response with no headers at all', async () => {
+    const deps: RedirectFetchDeps = {
+      resolvePinned: pinned,
+      request: async () => ({ status: 200, headers: undefined as any, data: Buffer.alloc(2) }),
+    };
+    const out = await fetchBufferFollowingRedirects(URL_OK, deps);
+    expect(out.contentType).toBe('');
+  });
+
+  it('treats a redirect with no headers as a missing Location', async () => {
+    const deps: RedirectFetchDeps = {
+      resolvePinned: pinned,
+      request: async () => ({ status: 302, headers: undefined as any, data: Buffer.alloc(0) }),
+    };
+    await expect(fetchBufferFollowingRedirects(URL_OK, deps)).rejects.toThrow(/no Location/i);
+  });
+
+  it('falls back to the real SSRF guard when no deps are supplied', async () => {
+    // No deps at all: exercises the default resolvePinned/request wiring real
+    // callers use. `localhost` is refused from the hostname denylist, so this
+    // needs neither DNS nor network.
+    await expect(fetchBufferFollowingRedirects('http://localhost/secret.png')).rejects.toBeInstanceOf(
+      SsrfBlockedError
+    );
+  });
+});
