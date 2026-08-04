@@ -18,6 +18,7 @@ import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/age
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
+import { isPublishName } from '../utils/hardeningGaps';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -912,10 +913,61 @@ export function scheduledRunAwaitsConfirmation(content: string): boolean {
   return AWAITING_CONFIRMATION_PATTERNS.some((re) => re.test(normalized));
 }
 
+// ENG-803: a scheduled run that parks its output for a human to publish. Drawn
+// from the verbatim wording of session 0fe2e743 ("5 queued for manual approval",
+// "the active X publishing gate requires human approval", "I did not auto-post
+// replies"), which the existing confirmation detector scores as null — the run
+// never asks a question, it just declines to act and reports the decline.
+const DEFERRED_PUBLISH_PATTERNS: RegExp[] = [
+  /\b(?:queued|saved|drafted|held|parked)\b[^.\n]{0,60}\bfor\s+(?:manual|human|your)\s+(?:approval|review|sign-?off)/i,
+  /\b(?:pending|awaiting)\s+(?:manual\s+|human\s+|your\s+)?(?:approval|review|sign-?off)/i,
+  /\brequires?\s+(?:human|manual|your)\s+approval/i,
+  /\b(?:publish(?:ing)?|posting|unattended\s+publish)\s+gate\b/i,
+  /\bdid\s+not\s+(?:auto-?)?(?:post|publish|reply)\b/i,
+];
+
+// The tools that actually publish content to an external destination. Reuses the
+// canonical publish set (publish_*, post_on_*) and adds the *_manage_post family
+// — twitter_manage_post is the ONLY way to post a tweet or reply, so a run that
+// never called it demonstrably never attempted to publish. Deliberately EXCLUDES
+// twitter_outreach/linkedin_outreach: those are mixed read/write dispatchers
+// (search_tweets alongside send_dm), so their presence proves nothing either way.
+function isPublishAttemptTool(name?: string): boolean {
+  if (!name || typeof name !== 'string') return false;
+  return isPublishName(name) || /_manage_post$/.test(name);
+}
+
+/**
+ * ENG-803: the run declined to publish and told the owner to do it by hand, but
+ * never actually invoked a publishing tool — so whatever blocker it cited was
+ * never tested against reality.
+ *
+ * The conjunction is what makes this safe. Calling the tool AT ALL clears the
+ * gate, error or not:
+ *   - a run that published → tool called → never fires;
+ *   - a run that hit a GENUINE gate (expired credentials, missing permission)
+ *     → tool called, error returned → never fires, and the run correctly reports
+ *     the real error;
+ *   - only a run asserting a block it never attempted → fires.
+ * That is exactly the fabricated-gate case, and nothing else.
+ */
+export function scheduledRunDeferredPublishWithoutAttempt(
+  content: string,
+  toolCalls: any[]
+): boolean {
+  if (!content || typeof content !== 'string') return false;
+  const normalized = stripMarkdownEmphasis(content);
+  if (!DEFERRED_PUBLISH_PATTERNS.some((re) => re.test(normalized))) return false;
+  const attempted = (Array.isArray(toolCalls) ? toolCalls : []).some((tc) =>
+    isPublishAttemptTool(tc?.name)
+  );
+  return !attempted;
+}
+
 // The distinct reasons a scheduled run's latest turn needs one more
 // continuation before it can be considered finished. null = no continuation
 // needed. Ordered by precedence when more than one signal is present.
-export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmation' | 'unfinished';
+export type ScheduledContinuationReason = 'preview-only' | 'unattempted-publish' | 'budget' | 'confirmation' | 'unfinished';
 
 // Classify why (if at all) a scheduled run's latest turn needs a continuation:
 //   (a) 'budget' — the run was truncated because it exhausted its step budget
@@ -929,6 +981,13 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 //       before proceeding, with no human present to answer (ENG-369); or
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
 //       (scheduledRunSignalsIncompleteWork).
+// An 'unattempted-publish' deferral (ENG-803) sits directly below 'preview-only'
+// and above the state/text signals, for the same reason: it is anchored in a hard
+// tool-call fact (no publishing tool was ever invoked) that stays true whatever
+// the closing text said, and its continuation message is more specific than the
+// generic ones — "actually call the posting tool now". Session 0fe2e743 scored
+// null under every reason below it, because the run never asked a question and
+// never admitted unfinished work; it calmly reported a blocker it had invented.
 // A 'preview-only' write-back gap (ENG-518) takes precedence over everything: it
 // is a hard, tool-call-based fact (a list was previewed as enrichable but its
 // execute counterpart never committed it) that stays true whatever the closing
@@ -942,6 +1001,7 @@ export function classifyScheduledContinuation(response: {
   toolCalls?: any[];
 }): ScheduledContinuationReason | null {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
+  if (scheduledRunDeferredPublishWithoutAttempt(response?.content || '', response?.toolCalls || [])) return 'unattempted-publish';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
@@ -1020,6 +1080,7 @@ export async function classifyScheduledContinuationAsync(response: {
   toolCalls?: any[];
 }): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
+  if (scheduledRunDeferredPublishWithoutAttempt(response?.content || '', response?.toolCalls || [])) return 'unattempted-publish';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (await scheduledTurnDefersToUser(content)) return 'confirmation';
@@ -1392,6 +1453,17 @@ export async function runVerifiedChat(
               'enrich_leads_execute — deliver that preview report instead.\n' +
               'Then complete the rest of the requested workflow (e.g. recommendations, ' +
               'drafts) and produce the final report.'
+          : completionGateReason === 'unattempted-publish'
+            ? 'Your previous response deferred publishing to a human — it queued or ' +
+              'drafted the output for manual approval, or cited a publishing/approval ' +
+              'gate — but you never actually called the tool that performs the publish ' +
+              '(e.g. twitter_manage_post, post_on_connected_account), so that blocker ' +
+              'was never tested. This is an automated run with no human present: nobody ' +
+              'will approve the queue. Do NOT restate the blocker. Call the publishing ' +
+              'tool now for each item the task asked you to publish, respecting any cap ' +
+              'or eligibility rule the task specified. If a call genuinely fails, report ' +
+              'the tool name and its verbatim error, and only then fall back to saving ' +
+              'the drafts. Never assert a gate you have not actually hit.'
           : completionGateReason === 'budget'
             ? 'The previous run was cut short because it exhausted its processing-step ' +
               'budget before it could produce the final deliverable. Using the data ' +
