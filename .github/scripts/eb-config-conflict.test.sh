@@ -179,14 +179,27 @@ LAST_EXIT=$?
 set -e
 check 'ENG-836: an empty changed-file list passes' 0 'nothing to check'
 
-# A deleted config cannot be classified from content. Say so rather than
-# silently treating it as safe or as a conflict.
+# Greptile P1 on #2267. A deleted or renamed config has no content left to
+# classify, but its REMOVAL is still a delta: deleting a file that declared
+# `aws:elbv2:loadbalancer` is a resource change just as surely as editing it.
+# The first version logged "not classified" and exited 0, so a delete paired
+# with an instance change sailed through to the immutable deploy.
 R=$(new_root); write_platform_conf "$R"
 run_check "$R" \
   backend/.ebextensions/deleted.config \
   backend/.platform/nginx/conf.d/agent-mode-timeout.conf
-check 'ENG-836: a deleted .ebextensions file is reported as unclassified' 0 \
-  'not classified'
+check 'ENG-836: a DELETED config alongside an instance change is rejected' 1 \
+  'EB_CONFIG_CONFLICT'
+check 'ENG-836: and it is named as possibly-resource, not silently dropped' 1 \
+  'deleted or renamed'
+
+# On its own a deleted config is harmless — it is only a risk paired with an
+# instance change. Failing here too would make the gate fire on ordinary
+# cleanup, which is how a gate gets switched off.
+R=$(new_root)
+run_check "$R" backend/.ebextensions/deleted.config
+check 'ENG-836: a deleted config on its own still passes' 0 \
+  'no instance-config change alongside'
 
 # The real repo must pass against itself — if this gate would fail main today,
 # it is unshippable.

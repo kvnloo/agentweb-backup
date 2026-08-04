@@ -95,7 +95,7 @@ main() {
     return 0
   fi
 
-  local resource_hits='' instance_hits='' f path
+  local resource_hits='' instance_hits='' unclassified='' f path
 
   for f in "${changed[@]}"; do
     case "${f}" in
@@ -109,10 +109,18 @@ main() {
     esac
 
     path="${REPO_ROOT%/}/${f}"
-    # A deleted file has no content to classify. Its removal still carries a
-    # delta, but we cannot tell which kind, so say so rather than guess.
+    # A deleted or renamed config has no content left to classify, but its
+    # REMOVAL is still a delta — deleting a file that declared
+    # `aws:elbv2:loadbalancer` is a resource change just as surely as editing
+    # it. Treating that as "nothing to see" let an incompatible combined delta
+    # through (Greptile P1 on #2267).
+    #
+    # It is counted as unclassified, and unclassified is treated as
+    # possibly-resource below. Same rule the rest of this pipeline follows: a
+    # check that cannot see what changed must never be read as proof that
+    # nothing did.
     if [ ! -f "${path}" ]; then
-      log "NOTE: ${f} changed but is not present at ${path} (deleted or renamed); not classified."
+      unclassified="${unclassified}  ${f} (deleted or renamed — content unavailable to classify)"$'\n'
       continue
     fi
 
@@ -126,22 +134,30 @@ main() {
     fi
   done
 
-  if [ -z "${resource_hits}" ]; then
+  # An unclassifiable config counts as possibly-resource. On its own it is
+  # harmless; only paired with an instance change does it become a risk.
+  if [ -z "${resource_hits}" ] && [ -z "${unclassified}" ]; then
     log "No Elastic Beanstalk resource-config change in this diff; safe to deploy in one operation."
     return 0
   fi
 
   if [ -z "${instance_hits}" ]; then
     log "Resource-config change detected, with no instance-config change alongside it:"
-    printf '%s' "${resource_hits}"
+    printf '%s' "${resource_hits}${unclassified}"
     log "Safe: an immutable deploy accepts a resource-only update."
     return 0
   fi
 
   printf '::error::EB_CONFIG_CONFLICT: this PR changes Elastic Beanstalk resource config AND instance config in the same deploy. Production deploys immutable, which forbids that combination, so the deploy will be accepted and then refused — burning its full timeout while production silently stays on the previous version (ENG-836). Split it into two sequential PRs: resource-only first, then instance-only.\n'
   log 'EB_CONFIG_CONFLICT — resource config and instance config changed together.'
-  log 'Resource-config changes:'
-  printf '%s' "${resource_hits}"
+  if [ -n "${resource_hits}" ]; then
+    log 'Resource-config changes:'
+    printf '%s' "${resource_hits}"
+  fi
+  if [ -n "${unclassified}" ]; then
+    log 'Possibly-resource changes (could not be classified, treated as resource):'
+    printf '%s' "${unclassified}"
+  fi
   log 'Instance-config changes:'
   printf '%s' "${instance_hits}"
   log 'Fix: split into two sequential deploys. Resource-only lands first and'
