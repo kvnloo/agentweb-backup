@@ -70,12 +70,24 @@ export async function upsertSentInvitations(invs: UnipileSentInvitation[]): Prom
  * Reconcile the cache for an account to exactly the given set of still-pending
  * public ids: delete any cached rows whose invitedUserPublicId is no longer in
  * the set (accepted/withdrawn invitations drop off Unipile's sent feed).
+ *
+ * `known` lets a caller that has ALREADY loaded the account's rows hand them in
+ * rather than making this function scan the same account a second time in the
+ * same cycle (ENG-875 — the sync cron read every account twice per 10-minute
+ * tick). Omit it and the read happens here exactly as before, so a caller that
+ * failed to preload stays correct.
+ *
+ * The caller must pass the rows as they were BEFORE this cycle's upserts. That
+ * is what the sync cron does, and it is safe because pruning is decided purely
+ * by key membership in `stillPendingPublicIds` — a row this cycle rewrote is
+ * still pending, so it is never a prune candidate regardless of its contents.
  */
 export async function pruneStaleSentInvitations(
   accountId: string,
   stillPendingPublicIds: Set<string>,
+  known?: UnipileSentInvitation[],
 ): Promise<number> {
-  const existing = await getAllSentInvitationsByAccount(accountId);
+  const existing = known ?? (await getAllSentInvitationsByAccount(accountId));
   const stale = existing.filter((inv) => !stillPendingPublicIds.has(inv.invitedUserPublicId));
   const BATCH = 25;
   for (let i = 0; i < stale.length; i += BATCH) {
