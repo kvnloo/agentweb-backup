@@ -31,6 +31,15 @@ Comments:
 
 {{SESSION_CONTEXT}}
 
+**Pull the full context before you trust the repro.** The description/comments name a session ID — but
+that's usually the session where the bug was *reported*. Inside that session's conversation you'll find
+the ID(s) of the session(s) where the bug actually *surfaced* — pull the full conversation of **both**
+the reported session and the surfaced session(s) for richer context. You have **read-only access to the
+prod DB and the prod logs — use them.** The prod logs are worth checking; if the session is old they
+take extra effort to pull because logs rotate, but **retrieval is still possible — don't assume they're
+gone.** If screenshots are attached, go through them too. If the issue links related cards, read those
+as well.
+
 ## Investigating with production data (read-only)
 
 This machine has READ-ONLY AWS access to the production DynamoDB tables (`AW-*`) and Elastic
@@ -42,7 +51,7 @@ when the bug names a Session ID, User ID, or execution ID.
 - Query any prod table directly, e.g.:
   `aws dynamodb get-item --table-name AW-ChatSessions --key '{"sessionId":{"S":"<id>"}}'`
   (useful tables: `AW-ChatSessions`, `AW-TaskExecutions`, `AW-Tasks`, `AW-Users`, `AW-Configs`).
-- Recent backend logs (best-effort; they rotate fast, so only useful for a just-reported bug):
+- Recent backend logs (best-effort):
   `request-environment-info`, wait ~40s, then retrieve the NEWEST bundle — do NOT take `[0]`, which
   can be a stale entry from a terminated instance:
   ```
