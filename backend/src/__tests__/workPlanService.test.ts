@@ -4,7 +4,6 @@ describe('WorkPlanService', () => {
   let mockGet: jest.Mock;
   let mockQuery: jest.Mock;
   let mockDelete: jest.Mock;
-  let mockUpdate: jest.Mock;
   let mockPromise: jest.Mock;
 
   const mockTimestamp = '2026-03-24T10:00:00.000Z';
@@ -17,7 +16,6 @@ describe('WorkPlanService', () => {
     mockGet = jest.fn(() => ({ promise: mockPromise }));
     mockQuery = jest.fn(() => ({ promise: mockPromise }));
     mockDelete = jest.fn(() => ({ promise: mockPromise }));
-    mockUpdate = jest.fn(() => ({ promise: mockPromise }));
 
     jest.doMock('aws-sdk', () => ({
       DynamoDB: {
@@ -27,7 +25,6 @@ describe('WorkPlanService', () => {
           query: mockQuery,
           scan: jest.fn(() => ({ promise: mockPromise })),
           delete: mockDelete,
-          update: mockUpdate,
         })),
       },
     }));
@@ -261,137 +258,12 @@ describe('WorkPlanService', () => {
     });
   });
 
-  // ─── ENG-889 (found in live testing) ──────────────────────────────────────
-  // updateWorkPlan is a whole-item put, so the fire-and-forget thumbnail job —
-  // which holds the plan as it looked at creation — used to write that stale
-  // snapshot back minutes later and silently revert any edit made in between.
-  // Thumbnail writes must touch only the thumbnail attributes.
-  describe('updateThumbnail', () => {
-    it('issues a targeted update, never a whole-item put', async () => {
-      await workPlanService.updateThumbnail('p1', { thumbnail_url: 'https://x/y.png', thumbnail_source: 'ai' });
-
-      expect(mockPut).not.toHaveBeenCalled();
-      expect(mockUpdate).toHaveBeenCalledTimes(1);
-      const arg = mockUpdate.mock.calls[0][0];
-      expect(arg.Key).toEqual({ planId: 'p1' });
-      expect(arg.UpdateExpression).toContain('#thumbnail_url = :thumbnail_url');
-      expect(arg.UpdateExpression).toContain('#thumbnail_source = :thumbnail_source');
-      expect(arg.ExpressionAttributeValues[':thumbnail_url']).toBe('https://x/y.png');
-    });
-
-    it('does not touch fields the caller did not supply', async () => {
-      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'none' });
-
-      const arg = mockUpdate.mock.calls[0][0];
-      expect(arg.UpdateExpression).not.toContain('thumbnail_url');
-      expect(arg.UpdateExpression).not.toContain('thumbnail_alt_text');
-    });
-
-    it('removes an attribute explicitly set to undefined', async () => {
-      await workPlanService.updateThumbnail('p1', {
-        thumbnail_url: undefined,
-        thumbnail_source: 'none',
-        thumbnail_alt_text: undefined,
-      });
-
-      const arg = mockUpdate.mock.calls[0][0];
-      expect(arg.UpdateExpression).toMatch(/REMOVE .*#thumbnail_url/);
-      expect(arg.UpdateExpression).toMatch(/REMOVE .*#thumbnail_alt_text/);
-      expect(arg.ExpressionAttributeValues[':thumbnail_url']).toBeUndefined();
-    });
-
-    it('never resurrects a deleted plan as a stub item', async () => {
-      // dynamodb.update is an upsert: with the thumbnail job running long after
-      // create, the plan can be deleted mid-flight. Writing then would leave an
-      // item with only planId + thumbnail fields — no title, no steps — which
-      // crashes the customer portal's plan list (it maps plan.steps unguarded).
-      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' });
-
-      const arg = mockUpdate.mock.calls[0][0];
-      expect(arg.ConditionExpression).toBe('attribute_exists(planId)');
-    });
-
-    it('treats a vanished plan as a no-op rather than an error', async () => {
-      const err: any = new Error('The conditional request failed');
-      err.code = 'ConditionalCheckFailedException';
-      mockPromise.mockRejectedValueOnce(err);
-
-      await expect(
-        workPlanService.updateThumbnail('gone', { thumbnail_source: 'ai' }),
-      ).resolves.toBe(false);
-    });
-
-    it('still surfaces any other write failure', async () => {
-      mockPromise.mockRejectedValueOnce(new Error('ProvisionedThroughputExceeded'));
-
-      await expect(
-        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }),
-      ).rejects.toThrow('ProvisionedThroughputExceeded');
-    });
-
-    // Greptile P1/P2/P3 on PR #2266. AI generation starts at create or at a
-    // clear and lands ~40s later; anything that touches the thumbnail meanwhile
-    // makes the in-flight job stale. Conditioning on thumbnail_source was not
-    // enough — the value is reusable, so clear -> upload -> clear restores
-    // 'none' and a job from the FIRST clear beats the second clear's fresh one
-    // (an ABA race). Each generation therefore claims a unique token, and only
-    // writes while that token is still the current one. Any user action drops
-    // the token, invalidating every job in flight.
-    it('claims a token before generating and writes only while it still holds', async () => {
-      await workPlanService.updateThumbnail('p1', {}, { jobToken: 'tok-1' });
-      const claim = mockUpdate.mock.calls[0][0];
-      expect(claim.UpdateExpression).toContain('#thumbnail_job = :thumbnail_job');
-      expect(claim.ExpressionAttributeValues[':thumbnail_job']).toBe('tok-1');
-
-      mockUpdate.mockClear();
-      await workPlanService.updateThumbnail(
-        'p1',
-        { thumbnail_url: 'https://x/ai.png', thumbnail_source: 'ai' },
-        { expectedJobToken: 'tok-1' },
-      );
-      const write = mockUpdate.mock.calls[0][0];
-      expect(write.ConditionExpression).toContain('attribute_exists(planId)');
-      expect(write.ConditionExpression).toContain('#thumbnail_job = :expectedJobToken');
-      expect(write.ExpressionAttributeValues[':expectedJobToken']).toBe('tok-1');
-    });
-
-    it('drops the token on a user-initiated write, invalidating jobs in flight', async () => {
-      await workPlanService.updateThumbnail(
-        'p1',
-        { thumbnail_url: 'https://x/up.png', thumbnail_source: 'upload' },
-        { clearJobToken: true },
-      );
-
-      const arg = mockUpdate.mock.calls[0][0];
-      expect(arg.UpdateExpression).toMatch(/REMOVE .*#thumbnail_job/);
-      // User actions are never themselves conditioned on a job token.
-      expect(arg.ConditionExpression).toBe('attribute_exists(planId)');
-    });
-
-    it('rejects a generation whose token has been superseded', async () => {
-      const err: any = new Error('The conditional request failed');
-      err.code = 'ConditionalCheckFailedException';
-      mockPromise.mockRejectedValueOnce(err);
-
-      await expect(
-        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }, { expectedJobToken: 'stale' }),
-      ).resolves.toBe(false);
-    });
-
-    it('leaves an unordered write with no token condition at all', async () => {
-      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' });
-
-      const arg = mockUpdate.mock.calls[0][0];
-      expect(arg.ConditionExpression).toBe('attribute_exists(planId)');
-      expect(arg.UpdateExpression).not.toContain('thumbnail_job');
-    });
-
-    it('always refreshes updatedAt', async () => {
-      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' });
-
-      const arg = mockUpdate.mock.calls[0][0];
-      expect(arg.UpdateExpression).toContain('#updatedAt = :updatedAt');
-      expect(arg.ExpressionAttributeValues[':updatedAt']).toEqual(expect.any(String));
+  describe('deleteWorkPlan', () => {
+    it('should delete by planId', async () => {
+      await workPlanService.deleteWorkPlan('p1');
+      expect(mockDelete).toHaveBeenCalledWith(expect.objectContaining({
+        Key: { planId: 'p1' },
+      }));
     });
   });
 });

@@ -104,9 +104,6 @@ describe('Admin WorkPlan Thumbnail Endpoints', () => {
       expect(res.status).toBe(200);
       expect(res.body.thumbnail_url).toBe(mockPlanWithThumbnail.thumbnail_url);
       expect(res.body.thumbnail_source).toBe('ai');
-      // Every generation is ordered by a job token now, including this one. The
-      // manual path stays honest by returning the actually-stored plan when a
-      // newer action wins the race, rather than opting out of ordering.
       expect(mockGenerateAIThumbnail).toHaveBeenCalledWith(mockPlan);
     });
 

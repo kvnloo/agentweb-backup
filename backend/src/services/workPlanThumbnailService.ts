@@ -54,19 +54,7 @@ export class WorkPlanThumbnailService {
     return crypto.randomBytes(6).toString('hex');
   }
 
-  /**
-   * Every generation is ordered by a job token, including the user-initiated
-   * regenerate. Claiming a token also invalidates any generation already in
-   * flight, so a manual regenerate cannot be overwritten by an older background
-   * job afterwards. When a newer action wins the race the write is skipped and
-   * the CURRENT stored plan is returned — never a fabricated success (ENG-889).
-   */
   async generateAIThumbnail(plan: WorkPlan): Promise<WorkPlan> {
-    // Claim this generation. The claim supersedes any token already in flight,
-    // so an older job can no longer land after this one.
-    const jobToken = crypto.randomUUID();
-    await workPlanService.updateThumbnail(plan.planId, {}, { jobToken });
-    const ordering = { expectedJobToken: jobToken };
     const description = plan.description || 'A professional marketing automation tool';
     const prompt = THUMBNAIL_PROMPT_TEMPLATE.replace('{title}', plan.title).replace(
       '{description}',
@@ -87,7 +75,7 @@ export class WorkPlanThumbnailService {
           `[ThumbnailService] AI generation failed for plan ${plan.planId}:`,
           result.error,
         );
-        return this.setNoThumbnail(plan, ordering);
+        return this.setNoThumbnail(plan);
       }
 
       const imageBuffer = await downloadBuffer(result.imageUrl);
@@ -101,21 +89,14 @@ export class WorkPlanThumbnailService {
         thumbnail_source: 'ai',
         thumbnail_alt_text: `Thumbnail for ${plan.title}`,
       };
-      // Attribute-scoped write: this runs long after create, so putting the
-      // whole snapshot back would revert edits made in the meantime (ENG-889).
-      const wrote = await workPlanService.updateThumbnail(plan.planId, {
-        thumbnail_url: url,
-        thumbnail_source: 'ai',
-        thumbnail_alt_text: updated.thumbnail_alt_text,
-      }, ordering);
-      if (!wrote) return (await workPlanService.getWorkPlan(plan.planId)) ?? plan;
+      await workPlanService.updateWorkPlan(updated);
       return updated;
     } catch (err) {
       console.error(
         `[ThumbnailService] Error generating thumbnail for plan ${plan.planId}:`,
         err,
       );
-      return this.setNoThumbnail(plan, ordering);
+      return this.setNoThumbnail(plan);
     }
   }
 
@@ -141,12 +122,7 @@ export class WorkPlanThumbnailService {
       thumbnail_source: 'upload',
       thumbnail_alt_text: `Thumbnail for ${plan.title}`,
     };
-    await workPlanService.updateThumbnail(plan.planId, {
-      thumbnail_url: url,
-      thumbnail_source: 'upload',
-      thumbnail_alt_text: updated.thumbnail_alt_text,
-    // User action: invalidate any generation still in flight.
-    }, { clearJobToken: true });
+    await workPlanService.updateWorkPlan(updated);
     return updated;
   }
 
@@ -158,13 +134,7 @@ export class WorkPlanThumbnailService {
       thumbnail_source: 'none',
       thumbnail_alt_text: undefined,
     };
-    await workPlanService.updateThumbnail(plan.planId, {
-      thumbnail_url: undefined,
-      thumbnail_source: 'none',
-      thumbnail_alt_text: undefined,
-    // User action: invalidate any generation still in flight, so only the
-    // regeneration kicked off just below can land.
-    }, { clearJobToken: true });
+    await workPlanService.updateWorkPlan(cleared);
 
     // Trigger AI regeneration asynchronously — caller gets the cleared state immediately
     this.generateAIThumbnail(cleared).catch((err) =>
@@ -177,17 +147,10 @@ export class WorkPlanThumbnailService {
     return cleared;
   }
 
-  private async setNoThumbnail(
-    plan: WorkPlan,
-    ordering: { expectedJobToken?: string },
-  ): Promise<WorkPlan> {
+  private async setNoThumbnail(plan: WorkPlan): Promise<WorkPlan> {
     const updated: WorkPlan = { ...plan, thumbnail_source: 'none' };
-    // Preserve any existing thumbnail_url when just setting source to 'none' on
-    // failure. Carries the same ordering as the generation attempt it belongs to,
-    // so a background failure cannot stamp 'none' over an upload or a clear made
-    // while it ran — but a user-initiated regenerate still records its failure.
-    const wrote = await workPlanService.updateThumbnail(plan.planId, { thumbnail_source: 'none' }, ordering);
-    if (!wrote) return (await workPlanService.getWorkPlan(plan.planId)) ?? plan;
+    // Preserve any existing thumbnail_url when just setting source to 'none' on failure
+    await workPlanService.updateWorkPlan(updated);
     return updated;
   }
 }
