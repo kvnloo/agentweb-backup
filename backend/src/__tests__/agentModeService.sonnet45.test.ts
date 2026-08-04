@@ -169,7 +169,25 @@ describe('AgentModeService - Claude Sonnet 4.5 Support', () => {
        * re-route caused by a future catalog addition).
        */
       it('AC #5 — default model only moves by explicit decision (now Opus 5, ENG-759)', async () => {
-        expect((agentModeService as any).default_model).toBe('anthropic.claude-opus-5');
+        // `default_model` is a field initializer and
+        // AZURE_OPENAI_DEPLOYMENT_AGENT_MODE takes precedence over the literal,
+        // so any runner exporting a deployment override (backend/.env sets one)
+        // silently defeated this guard — it asserted the environment rather than
+        // the code. Establish the no-override state and construct AFTER clearing,
+        // or the field is already resolved. Same reasoning as the ENG-759 suite
+        // in agentModeService.defaultModelOpus5.test.ts.
+        const envOverride = 'AZURE_OPENAI_DEPLOYMENT_AGENT_MODE';
+        const savedOverride = process.env[envOverride];
+        delete process.env[envOverride];
+        try {
+          expect(new AgentModeService().default_model).toBe('anthropic.claude-opus-5');
+        } finally {
+          if (savedOverride === undefined) {
+            delete process.env[envOverride];
+          } else {
+            process.env[envOverride] = savedOverride;
+          }
+        }
       });
 
       it('AC #6 — leaves the live voice model untouched', () => {

@@ -2240,7 +2240,21 @@ mcpToolRegistry.register({
   name: 'get_chat_history',
   definition: {
     name: 'get_chat_history',
-    description: 'Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don\'t have them (slower but ensures all scores are present).',
+    description: `Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don't have them (slower but ensures all scores are present).
+
+MODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.
+- attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.
+- attributionBasis: 'transcript' when EVERY assistant turn recorded a model (trustworthy provenance); 'partial-transcript' when only some did — the model list is real but incomplete, so do not present it as the session's full attribution; 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
+
+The two underlying fields are also returned, and they are NOT interchangeable:
+- llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
+- generationModels: the models that actually generated the assistant turns, derived from the transcript. Null when no message recorded one.
+
+TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly; when reporting volume, add cacheTokens to totalTokens and say you did.
+
+PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost is the residual, on the same micro-USD basis as costByModel and totalCost: sum(costByModel) + unattributedCost reconciles to totalCost, exactly whenever there is spend left to attribute. It is null when the residual is not positive — in that case the per-model buckets already account for the whole session and may exceed totalCost by a few micro-dollars of per-turn rounding, which is noise, not missing money. Never treat a null as licence to rescale the buckets. It covers both spend on turns that recorded no model AND cost that never lands on a turn at all (tool/image spend counts toward totalCost but belongs to no model). When it is non-null the per-model split does NOT account for all of this session's cost — report it as its own line rather than folding it into a model, or your model percentages will not sum to the total.
+
+Whenever you name a model — reports, cost/usage breakdowns, per-model groupings, routing recommendations, filed tickets — use attributedModels. Never group or attribute cost by llmModel: it is a selection, so it books spend to models that never ran. This supersedes any earlier note, prior report, or saved memory that tells you to group cost by llmModel. If llmModel and generationModels disagree, that mismatch is itself worth reporting.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -2294,8 +2308,43 @@ mcpToolRegistry.register({
       let dislikes = 0;
       let longestWaitMs = 0;
       let maxHeapMB = 0;
+      // ENG-892: session.llmModel is only what the model picker last stored — a
+      // selection, not provenance. Each assistant message carries the model that
+      // actually produced it (written after model resolution and any backup-model
+      // switch), so derive real attribution from the transcript.
+      const generationModels = new Set<string>();
+      // ENG-892 follow-on: estimated_cost bills cache tokens, but total_tokens
+      // excludes them, so cost/token on a cache-heavy scheduled run reads ~100x
+      // the real rate (a live session: 371 total_tokens vs 156,013 cache-creation
+      // tokens for $2.94). Surface them so cost and tokens can be reconciled.
+      let cacheCreationTokens = 0;
+      let cacheReadTokens = 0;
+      // Per-model cost split. totalCost is one session-wide number, so a multi-model
+      // session gave a per-model breakdown nothing to divide by — the per-turn cost
+      // and model are both already here, so allocate rather than make callers guess.
+      // Accumulated in whole micro-USD, the unit costs are already computed in
+      // (usageRecorderService.computeCostMicroUsd). Rounding each bucket to 6dp on
+      // the way out while deriving the residual from unrounded floats put the three
+      // reported numbers on different bases, so they could fail to sum to totalCost —
+      // the exact reconciliation the tool description tells consumers to rely on.
+      const costMicroByModel: Record<string, number> = {};
+      // Assistant turns carrying no model, counted regardless of cost: a turn with
+      // no recorded spend still means the transcript is only partially labelled, and
+      // keying that off cost alone let a partial set read as authoritative.
+      let unlabelledAssistantTurns = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
+        const turnCost = msg?.usage?.estimated_cost || 0;
+        if (typeof msg?.llm === 'string' && msg.llm) {
+          generationModels.add(msg.llm);
+          if (turnCost) {
+            costMicroByModel[msg.llm] = (costMicroByModel[msg.llm] || 0) + Math.round(turnCost * 1e6);
+          }
+        } else {
+          unlabelledAssistantTurns++;
+        }
+        cacheCreationTokens += msg?.usage?.cache_creation_input_tokens || 0;
+        cacheReadTokens += msg?.usage?.cache_read_input_tokens || 0;
         if (msg?.metadata?.feedback?.type === 'like') likes++;
         if (msg?.metadata?.feedback?.type === 'dislike') dislikes++;
         if (Array.isArray(msg?.metadata?.iterationTimings)) {
@@ -2332,9 +2381,45 @@ mcpToolRegistry.register({
         portalType: session.portalType || null,
         sessionType: session.sessionType || null,
         llmModel: session.llmModel || null,
+        generationModels: generationModels.size > 0 ? [...generationModels] : null,
+        // ENG-892: pre-resolve the attribution so the agent never has to choose
+        // between two model-shaped fields. The original mis-report happened
+        // because a field named `llmModel` sat in the payload and got named on
+        // sight; a stored account memory still instructs grouping cost by it.
+        // Emitting the answer (plus how trustworthy it is) removes that judgement
+        // call rather than relying on the agent to make it correctly.
+        attributedModels: generationModels.size > 0
+          ? [...generationModels]
+          : (session.llmModel ? [session.llmModel] : null),
+        attributionBasis: generationModels.size > 0
+          ? (unlabelledAssistantTurns > 0 ? 'partial-transcript' : 'transcript')
+          : (session.llmModel ? 'selection-only' : null),
         messageCount: messages.length,
         totalTokens: session.totalTokens || null,
-        totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
+        cacheTokens: (cacheCreationTokens > 0 || cacheReadTokens > 0)
+          ? { creation: cacheCreationTokens, read: cacheReadTokens }
+          : null,
+        costByModel: Object.keys(costMicroByModel).length > 0
+          ? Object.fromEntries(
+              Object.entries(costMicroByModel).map(([m, micro]) => [m, micro / 1e6])
+            )
+          : null,
+        // The residual, on the SAME micro-USD basis as the buckets and as the
+        // totalCost reported above, so the three always reconcile exactly. Captures
+        // both spend on unlabelled turns and cost that never lands on an assistant
+        // turn at all (tool/image spend is in totalCost but in no turn's usage —
+        // measured at $1.92 on a real $100 session), which a turn-only sum would
+        // silently drop from a per-model breakdown.
+        unattributedCost: (() => {
+          if (session.totalCost == null) return null;
+          const totalMicro = Math.round(Number(session.totalCost) * 1e6);
+          const attributedMicro = Object.values(costMicroByModel).reduce((a, b) => a + b, 0);
+          const residualMicro = totalMicro - attributedMicro;
+          return residualMicro > 0 ? residualMicro / 1e6 : null;
+        })(),
+        // Same micro-USD basis as costByModel/unattributedCost below, so the three
+        // reconcile exactly rather than each being rounded independently.
+        totalCost: session.totalCost != null ? Math.round(Number(session.totalCost) * 1e6) / 1e6 : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,
         feedback: (likes > 0 || dislikes > 0) ? { likes, dislikes } : null,
