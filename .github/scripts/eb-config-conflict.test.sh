@@ -72,6 +72,25 @@ run_check() {
   set -e
 }
 
+# Commit the fixture root so deletions can be recovered from the base ref, the
+# way CI does with the PR's base SHA.
+commit_root() {
+  git -C "$1" init -q 2>/dev/null
+  git -C "$1" config user.email ci@example.com
+  git -C "$1" config user.name CI
+  git -C "$1" add -A
+  git -C "$1" commit -q -m base
+}
+
+run_check_with_base() {
+  local root="$1"
+  shift
+  set +e
+  LAST_OUTPUT=$(EB_CONFLICT_REPO_ROOT="${root}" EB_CONFLICT_BASE_REF=HEAD bash "${SCRIPT}" "$@" 2>&1)
+  LAST_EXIT=$?
+  set -e
+}
+
 check() {
   local desc="$1" expected_exit="$2" needle="$3"
   TESTS_RUN=$(( TESTS_RUN + 1 ))
@@ -179,27 +198,57 @@ LAST_EXIT=$?
 set -e
 check 'ENG-836: an empty changed-file list passes' 0 'nothing to check'
 
-# Greptile P1 on #2267. A deleted or renamed config has no content left to
-# classify, but its REMOVAL is still a delta: deleting a file that declared
-# `aws:elbv2:loadbalancer` is a resource change just as surely as editing it.
-# The first version logged "not classified" and exited 0, so a delete paired
-# with an instance change sailed through to the immutable deploy.
-R=$(new_root); write_platform_conf "$R"
-run_check "$R" \
-  backend/.ebextensions/deleted.config \
-  backend/.platform/nginx/conf.d/agent-mode-timeout.conf
-check 'ENG-836: a DELETED config alongside an instance change is rejected' 1 \
-  'EB_CONFIG_CONFLICT'
-check 'ENG-836: and it is named as possibly-resource, not silently dropped' 1 \
-  'deleted or renamed'
+# Greptile P1 on #2267, and its follow-up. A DELETED config still carries a
+# delta: removing a file that declared `aws:elbv2:loadbalancer` is a resource
+# change, and removing one that declared `commands:` is an instance change.
+# Rather than guess, the content is recovered from the base ref and the removal
+# is classified by exactly what it removed.
 
-# On its own a deleted config is harmless — it is only a risk paired with an
-# instance change. Failing here too would make the gate fire on ordinary
-# cleanup, which is how a gate gets switched off.
-R=$(new_root)
-run_check "$R" backend/.ebextensions/deleted.config
-check 'ENG-836: a deleted config on its own still passes' 0 \
+# Direction 1: a deleted RESOURCE config alongside an instance change.
+R=$(new_root); write_resource_config "$R"; write_platform_conf "$R"
+commit_root "$R"
+rm "$R/backend/.ebextensions/timeout.config"
+run_check_with_base "$R" \
+  backend/.ebextensions/timeout.config \
+  backend/.platform/nginx/conf.d/agent-mode-timeout.conf
+check 'ENG-836: a DELETED resource config alongside an instance change is rejected' 1 \
+  'EB_CONFIG_CONFLICT'
+check 'ENG-836: and it is classified from its removed content' 1 \
+  'deleted — classified from its removed content'
+
+# Direction 2 — the case that kept #2267 at 4/5. Deleting an INSTANCE-ONLY
+# config (chromium.config carries files:/commands:) alongside a RESOURCE edit.
+# Counting every absent file as possibly-resource left instance_hits empty, so
+# this returned success and preserved the exact failure path being guarded.
+R=$(new_root); write_resource_config "$R"; write_instance_config "$R"
+commit_root "$R"
+rm "$R/backend/.ebextensions/chromium.config"
+run_check_with_base "$R" \
+  backend/.ebextensions/timeout.config \
+  backend/.ebextensions/chromium.config
+check 'ENG-836: a DELETED instance-only config alongside a resource edit is rejected' 1 \
+  'EB_CONFIG_CONFLICT'
+check 'ENG-836: and the deleted file is named on the INSTANCE side' 1 \
+  'chromium.config (instance config) (deleted'
+
+# A deleted resource config on its own is still resource-only, so it passes.
+# Failing here would fire on ordinary cleanup, which is how a gate gets
+# switched off within a week.
+R=$(new_root); write_resource_config "$R"
+commit_root "$R"
+rm "$R/backend/.ebextensions/timeout.config"
+run_check_with_base "$R" backend/.ebextensions/timeout.config
+check 'ENG-836: a deleted resource config on its own still passes' 0 \
   'no instance-config change alongside'
+
+# Content genuinely unrecoverable (deleted, and no base ref supplied). We
+# cannot tell which side it was, so it counts as BOTH rather than neither.
+R=$(new_root); write_resource_config "$R"
+run_check "$R" \
+  backend/.ebextensions/gone.config \
+  backend/.ebextensions/timeout.config
+check 'ENG-836: an unrecoverable config counts as both sides, not neither' 1 \
+  'counted as BOTH resource and instance'
 
 # The real repo must pass against itself — if this gate would fail main today,
 # it is unshippable.

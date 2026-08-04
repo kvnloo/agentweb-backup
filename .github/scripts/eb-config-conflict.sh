@@ -30,10 +30,14 @@
 #
 # Optional environment:
 #   EB_CONFLICT_REPO_ROOT   Root to resolve changed paths against (default: cwd)
+#   EB_CONFLICT_BASE_REF    Git ref to read DELETED files from, so a removal can
+#                           be classified by what it removed instead of guessed
+#                           at. CI passes the PR's base SHA.
 
 set -euo pipefail
 
 REPO_ROOT="${EB_CONFLICT_REPO_ROOT:-.}"
+BASE_REF="${EB_CONFLICT_BASE_REF:-}"
 
 # Namespaces that modify SHARED AWS RESOURCES (the load balancer, the ASG, the
 # environment's process/target-group settings). Changing one of these is a
@@ -68,12 +72,32 @@ INSTANCE_KEYS=(
 
 log() { printf '[eb-config-conflict] %s\n' "$1"; }
 
-# Does $1 (a file's content) contain any needle from the named array?
+# Content of a changed file, for classification.
+#
+# A DELETED or renamed config still carries a delta: removing a file that
+# declared `aws:elbv2:loadbalancer` is a resource change, and removing one that
+# declared `commands:` is an instance change. Guessing which is unnecessary —
+# the content is still in git. Read it from the base ref and classify the
+# removal by exactly what it removed.
+#
+# Echoes the content, or nothing if it cannot be recovered.
+content_of() {
+  local f="$1" path="${REPO_ROOT%/}/$1"
+  if [ -f "${path}" ]; then
+    cat "${path}"
+    return 0
+  fi
+  if [ -n "${BASE_REF}" ]; then
+    git -C "${REPO_ROOT}" show "${BASE_REF}:${f}" 2>/dev/null || true
+  fi
+}
+
+# Does $1 (a blob of content) contain any needle from the named array?
 contains_any() {
-  local file="$1" needle
+  local content="$1" needle
   shift
   for needle in "$@"; do
-    if grep -qF "${needle}" "${file}" 2>/dev/null; then
+    if printf '%s' "${content}" | grep -qF "${needle}"; then
       return 0
     fi
   done
@@ -95,7 +119,7 @@ main() {
     return 0
   fi
 
-  local resource_hits='' instance_hits='' unclassified='' f path
+  local resource_hits='' instance_hits='' unclassified='' f content
 
   for f in "${changed[@]}"; do
     case "${f}" in
@@ -108,40 +132,38 @@ main() {
       *) continue ;;
     esac
 
-    path="${REPO_ROOT%/}/${f}"
-    # A deleted or renamed config has no content left to classify, but its
-    # REMOVAL is still a delta — deleting a file that declared
-    # `aws:elbv2:loadbalancer` is a resource change just as surely as editing
-    # it. Treating that as "nothing to see" let an incompatible combined delta
-    # through (Greptile P1 on #2267).
-    #
-    # It is counted as unclassified, and unclassified is treated as
-    # possibly-resource below. Same rule the rest of this pipeline follows: a
-    # check that cannot see what changed must never be read as proof that
-    # nothing did.
-    if [ ! -f "${path}" ]; then
-      unclassified="${unclassified}  ${f} (deleted or renamed — content unavailable to classify)"$'\n'
+    content="$(content_of "${f}")"
+
+    # Content unavailable: deleted AND no base ref to recover it from. We
+    # cannot tell which side it belonged to, so it counts as BOTH — an
+    # unreadable delta must never be read as proof that nothing changed on
+    # either side.
+    if [ -z "${content}" ]; then
+      unclassified="${unclassified}  ${f} (content unavailable — counted as both resource and instance)"$'\n'
       continue
     fi
 
-    if contains_any "${path}" "${RESOURCE_NAMESPACES[@]}"; then
-      resource_hits="${resource_hits}  ${f} (resource namespace)"$'\n'
+    local origin=''
+    [ -f "${REPO_ROOT%/}/${f}" ] || origin=' (deleted — classified from its removed content)'
+
+    if contains_any "${content}" "${RESOURCE_NAMESPACES[@]}"; then
+      resource_hits="${resource_hits}  ${f} (resource namespace)${origin}"$'\n'
     fi
 
-    if contains_any "${path}" "${INSTANCE_NAMESPACES[@]}" || \
-       contains_any "${path}" "${INSTANCE_KEYS[@]}"; then
-      instance_hits="${instance_hits}  ${f} (instance config)"$'\n'
+    if contains_any "${content}" "${INSTANCE_NAMESPACES[@]}" || \
+       contains_any "${content}" "${INSTANCE_KEYS[@]}"; then
+      instance_hits="${instance_hits}  ${f} (instance config)${origin}"$'\n'
     fi
   done
 
-  # An unclassifiable config counts as possibly-resource. On its own it is
-  # harmless; only paired with an instance change does it become a risk.
+  # An unrecoverable config counts as BOTH sides, so it conflicts with any
+  # other config change — including another unrecoverable one.
   if [ -z "${resource_hits}" ] && [ -z "${unclassified}" ]; then
     log "No Elastic Beanstalk resource-config change in this diff; safe to deploy in one operation."
     return 0
   fi
 
-  if [ -z "${instance_hits}" ]; then
+  if [ -z "${instance_hits}" ] && [ -z "${unclassified}" ]; then
     log "Resource-config change detected, with no instance-config change alongside it:"
     printf '%s' "${resource_hits}${unclassified}"
     log "Safe: an immutable deploy accepts a resource-only update."
@@ -155,7 +177,7 @@ main() {
     printf '%s' "${resource_hits}"
   fi
   if [ -n "${unclassified}" ]; then
-    log 'Possibly-resource changes (could not be classified, treated as resource):'
+    log 'Unrecoverable changes (counted as BOTH resource and instance):'
     printf '%s' "${unclassified}"
   fi
   log 'Instance-config changes:'

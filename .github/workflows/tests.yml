@@ -272,6 +272,11 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Lets a DELETED config be classified by what it removed, rather than
+          # guessed at. Removing a file that declared `aws:elbv2:loadbalancer`
+          # is a resource change; removing one that declared `commands:` is an
+          # instance change. `fetch-depth: 0` above is what makes this readable.
+          EB_CONFLICT_BASE_REF: ${{ github.event.pull_request.base.sha }}
         run: |
           # Three dots: only what this PR changed relative to the merge base,
           # so commits that landed on the base branch meanwhile are not blamed
