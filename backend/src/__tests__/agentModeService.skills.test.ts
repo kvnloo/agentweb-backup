@@ -724,6 +724,35 @@ describe('AgentModeService - Skills', () => {
       expect(toolNames).toContain('linkedin_outreach');
     });
 
+    // The step the tests below this one used to ASSUME: buildSkillContext turning the
+    // real skill RECORD into the allowed-tool set. It is gated on the skill being in
+    // the user's subscription-allowed IDs, and every tier here uses an explicit list —
+    // so a published-but-unenrolled skill silently contributes nothing.
+    it('unions linkedin_outreach from the real skill record only when the tier allows the skillId', async () => {
+      const { buildProfileReaderSkill } = require('../scripts/seed-eng508-linkedin-profile-reader-skill');
+      const skill = buildProfileReaderSkill('profile-reader-id');
+      expect(skill.toolNames).toEqual(['linkedin_outreach']);
+
+      // ENROLLED: skillId present in the subscription-allowed list → tool is granted.
+      const enrolled = (agentModeService as any).buildSkillContext(
+        [skill],
+        ['profile-reader-id'], // userAllowedSkillIds (explicit, non-wildcard tier)
+        [],
+        ['profile-reader-id']
+      );
+      expect(enrolled.allowedToolNames.has('linkedin_outreach')).toBe(true);
+
+      // NOT ENROLLED: same published skill, but the tier's explicit list omits it →
+      // its tools are dropped and the audit falls back to the stale search path.
+      const unenrolled = (agentModeService as any).buildSkillContext(
+        [skill],
+        ['some-other-skill-id'],
+        [],
+        ['profile-reader-id']
+      );
+      expect(unenrolled.allowedToolNames.has('linkedin_outreach')).toBe(false);
+    });
+
     it('excludes linkedin_outreach when the skill is NOT installed (pre-fix stale-headline state)', async () => {
       const { resolveSkillsToToolNames } = require('../services/subscriptionService');
       (resolveSkillsToToolNames as jest.Mock).mockResolvedValueOnce([]);
