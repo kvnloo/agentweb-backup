@@ -2149,9 +2149,10 @@ mcpToolRegistry.register({
             const current = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
             existingSteps = Array.isArray(current?.steps) ? current.steps : [];
           } catch (error: any) {
-            if (mode === 'merge') {
-              return jsonResult({ error: `Cannot merge steps: failed to read work plan ${args.plan_id} (${error?.message || error})` });
-            }
+            // Fail closed in both modes: without the current steps we can
+            // neither merge nor tell whether a replace would delete steps, and
+            // writing blind is exactly the silent deletion this guards against.
+            return jsonResult({ error: `Cannot safely update work plan ${args.plan_id}: failed to read its current steps (${error?.message || error}). Retry, or re-send with the full steps array once the plan is readable.` });
           }
 
           if (mode === 'merge') {
