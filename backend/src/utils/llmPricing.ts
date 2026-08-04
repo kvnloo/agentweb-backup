@@ -40,9 +40,12 @@ function withDerivedCache(inPerM: number, outPerM: number): ModelPrice {
  * prompt-cache TTL. A 1-hour cache write costs 2x the input rate instead of the
  * default TTL's 1.25x; reads are 0.1x either way.
  *
- * ENG-893: only `agentModeService`'s Bedrock Converse wrapper emits cache
- * checkpoints for these ids, and it always asks for `ttl: '1h'` on them, so 2x
- * is their real effective write rate everywhere in the ledger. Every model here
+ * ENG-893: `agentModeService`'s Bedrock Converse wrapper is the only cache-
+ * checkpoint emitter that uses these ids, and it always asks for `ttl: '1h'`
+ * on them, so 2x is their real effective write rate everywhere in the ledger.
+ * (`loops/instances/ai-eval-funnel/rcaEnricher.ts` also emits a checkpoint, but
+ * on Sonnet 4.6 — deliberately NOT listed here. Pointing that path at an id
+ * below without giving it `ttl: '1h'` would silently over-bill.) Every model here
  * MUST be in `BEDROCK_EXTENDED_CACHE_TTL_MODELS` and vice versa — the drift
  * guard is in `__tests__/agentModeService.promptCacheTtl.test.ts`.
  */
@@ -77,7 +80,9 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // ENG-893: the *-v1:0 Sonnet 4.5, Opus 4.8, Opus 5, Sonnet 5, and Haiku 4.5
   // ids below use withExtendedTtlCache because we invoke them with the 1-hour
   // prompt-cache TTL (2x cache-write rate). Sonnet 4.6 and Opus 4.6 are
-  // 5-minute-only on Bedrock and stay on the 1.25x default.
+  // documented by AWS as 5-minute-only and stay on the 1.25x default — they in
+  // fact accept and honour a 1h ttl (probed live 2026-08-04), so moving them up
+  // is a deliberate follow-up, not an oversight.
   'anthropic.claude-sonnet-4-5-20250929-v1:0': withExtendedTtlCache(3, 15),
   'anthropic.claude-sonnet-4-6': withDerivedCache(3, 15),
   'anthropic.claude-opus-4-6-v1': withDerivedCache(5, 25),

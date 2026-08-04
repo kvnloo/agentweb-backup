@@ -80,9 +80,11 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
       expect(bedrockCacheTtl('anthropic.claude-opus-4-8')).toBe('1h');
     });
 
-    it('returns undefined for 5-minute-only models, so no ttl field is sent', () => {
-      // Bedrock rejects `ttl` on a model that does not support it, so the
-      // omission here is load-bearing, not cosmetic.
+    it('returns undefined for models AWS documents as 5-minute-only', () => {
+      // NOT because Bedrock rejects an unsupported `ttl` — a live us-west-2
+      // probe (2026-08-04) showed both of these accepting it. The omission
+      // keeps them off the 2x cache-write price until we adopt the 1h TTL for
+      // them deliberately; it is a billing guard, not a crash guard.
       expect(bedrockCacheTtl('anthropic.claude-sonnet-4-6')).toBeUndefined();
       expect(bedrockCacheTtl('anthropic.claude-opus-4-6-v1')).toBeUndefined();
     });

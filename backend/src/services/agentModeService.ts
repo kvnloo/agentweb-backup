@@ -1963,8 +1963,10 @@ export class AgentModeService {
     // ENG-893: agent-mode conversations are human-paced, so the default
     // 5-minute prompt-cache TTL expires between turns and the whole prefix is
     // re-written at 1.25x input instead of read back at 0.1x. Ask for the
-    // 1-hour TTL on the models that support it. `undefined` (5m-only or
-    // non-Bedrock models) sends the bare block — Bedrock rejects `ttl` there.
+    // 1-hour TTL on the models we have verified honour it. `undefined`
+    // (unlisted or non-Bedrock models) sends the bare block, i.e. today's
+    // 5-minute behaviour. Note Bedrock does NOT reject an unsupported `ttl`,
+    // so the allowlist guards against silent mispricing, not a hard failure.
     const cacheTtl = bedrockCacheTtl(modelId);
     // A fresh object per call site: the two checkpoints must not alias.
     const cachePointBlock = () => ({

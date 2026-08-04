@@ -76,9 +76,18 @@ export type BedrockCacheTtl = '5m' | '1h';
  * turns paid an 80k-185k full re-cache and cache writes were 77% of the bill.
  * The 1-hour TTL converts those misses into 0.1x cache reads.
  *
- * This is an ALLOWLIST on purpose. Bedrock rejects `ttl` on a model that only
- * supports the 5-minute TTL (Opus 4.6 and Sonnet 4.6 are both 5m-only), so an
- * unlisted model must send the bare `{ type: 'default' }` block it sends today.
+ * This is an ALLOWLIST on purpose, but NOT because Bedrock rejects an
+ * unsupported `ttl` — it does not. Probed live in us-west-2 on 2026-08-04:
+ * Sonnet 4.6 and Opus 4.6, which the AWS prompt-caching table lists as
+ * "5 minutes" only, both ACCEPT `ttl: '1h'` and echo
+ * `cacheDetails: [{ ttl: '1h', ... }]`. So a wrong entry here fails SILENTLY
+ * (billed at the 2x write rate below while possibly only getting 5m of cache),
+ * not loudly. Unlisted models send the bare `{ type: 'default' }` block.
+ *
+ * Sonnet 4.6 is omitted despite accepting the field only because AWS documents
+ * it as 5m-only; a same-session probe showed its 1h cache surviving an 8m45s
+ * idle gap, so adding it (with the matching 2x price) is a live follow-up
+ * worth taking — see ENG-893 for the measurement.
  *
  * Cache writes at the 1-hour TTL are billed at 2x the input rate rather than
  * 1.25x, so every id here MUST be priced accordingly in `llmPricing.ts`. The
