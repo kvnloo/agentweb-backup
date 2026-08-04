@@ -134,6 +134,16 @@ export interface User {
   slackChannels?: string[]; // Slack channels configured for this user (agent tools are restricted to these)
   slackSuggestedRepliesDisabled?: boolean; // When true, suppress Slack suggested-reply (slack-triggered) sessions/emails for this user. Absent/false = enabled (default).
   slackShipNotifyDisabled?: boolean; // When true, suppress the Slack ping when an item this user reported ships (shipNotifyService). Absent/false = enabled (default).
+  // Channel-neutral messaging configuration (ENG-273). ADDITIVE — the slack* fields
+  // above stay authoritative for users who have never configured a second channel,
+  // and messagingChannelService.normalizeUserChannels() folds them in at READ time.
+  // There is deliberately no migration or backfill: see that function's doc comment.
+  messagingChannels?: Array<{
+    channel: 'slack' | 'whatsapp';
+    destination: string; // Slack channel id, or E.164 phone for WhatsApp
+    enabled: boolean;
+    optIn?: { at: string; source: string }; // Required before first send where the channel demands it
+  }>;
   secrets?: Record<string, string>; // Encrypted per-user secrets (key → encrypted value)
   seoDomains?: string[]; // SEO domains to track (e.g., ["example.com", "subdomain.example.com"])
   googleAnalyticsPropertyId?: string; // DEPRECATED: Google Analytics Property ID (numeric, e.g., 123456789) - use googleAnalyticsProperties instead
