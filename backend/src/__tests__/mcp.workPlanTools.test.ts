@@ -267,6 +267,24 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(JSON.parse(result.content[0].text).error).toMatch(/array/i);
     });
 
+    it('fails closed in replace mode when the pre-update read fails', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.method === 'GET') throw new Error('HTTP 503: Service Unavailable');
+        return { planId: 'wp-1', message: 'Updated' };
+      });
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: [{ title: 'Step 1: Scope', description: 'amended scope' }],
+      }, context);
+
+      expect(putCalls()).toHaveLength(0);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/failed to read its current steps/i);
+      expect(payload.error).toContain('HTTP 503: Service Unavailable');
+    });
+
     it('merge mode amends the targeted step and keeps every other step', async () => {
       mockPlanFetches();
 
