@@ -203,6 +203,27 @@ describe('ENG-875 — sent-invitation sync write amplification', () => {
     expect(known).toHaveLength(1);
   });
 
+  it('does not treat a DRIFTING parsed_datetime as a change (the bug that made the first fix inert)', async () => {
+    // The production failure, reproduced. LinkedIn reports invitation age
+    // relatively ("3 months ago") and Unipile resolves it to an absolute
+    // datetime at request time, so parsed_datetime moves on every single call.
+    // The first version of this fix compared sentAt and preferred the incoming
+    // value, so every row differed every cycle and the skip never fired:
+    // "1547 upserted, 0 unchanged (skipped)" on every account in prod.
+    mockListSentInvitations.mockImplementation(() =>
+      Promise.resolve({
+        items: [feedItem('alice', { parsed_datetime: '2026-05-04T04:38:52.378Z' })],
+        cursor: undefined,
+      }));
+    mockGetAllSentInvitationsByAccount.mockResolvedValue([
+      cachedRow('alice', { sentAt: '2026-05-04T04:31:10.002Z' }),
+    ]);
+
+    await runLinkedInConnectionSync();
+
+    expect(upsertedIds()).toEqual([]);
+  });
+
   it('falls back to rewriting everything when the preload fails, rather than skipping writes blind', async () => {
     feedOverPages(['alice', 'bob']);
     mockGetAllSentInvitationsByAccount.mockRejectedValue(new Error('dynamo unavailable'));

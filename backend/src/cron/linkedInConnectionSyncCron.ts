@@ -45,8 +45,27 @@ const TAG = '[linkedInConnectionSync]';
  * depends on it — so a skipped row keeps its previous value, which then means
  * "when this row last changed" rather than "when the cron last ran".
  *
- * Every other field IS compared, including `sentAt`: if Unipile ever corrects a
- * send time, that is a real change and must be persisted.
+ * `sentAt` is also excluded, and this one was learned the hard way. The first
+ * version of this function compared it, on the assumption that a changed send
+ * time meant Unipile had corrected it. Production proved that false: LinkedIn
+ * exposes invitation age RELATIVELY ("3 months ago") and Unipile resolves that
+ * to an absolute datetime at the moment of the API call, so `parsed_datetime`
+ * moves every single request. Two real rows, hours after the first deploy:
+ *
+ *   sentAt 2026-05-04T04:38:52.378Z  syncedAt 2026-08-04T04:38:44.973Z
+ *   sentAt 2026-04-04T04:38:25.256Z  syncedAt 2026-08-04T04:38:24.877Z
+ *
+ * — exact whole-month offsets landing on the sync's own time-of-day. Comparing
+ * it made every row differ on every cycle, so the skip never fired once:
+ * `1547 upserted, 0 unchanged` on every account.
+ *
+ * Only the COMPARISON drops it. The write still prefers Unipile's value
+ * (ENG-787, `parsed_datetime ?? cached.sentAt ?? now`) — that contract is
+ * unchanged, and a skipped row simply keeps the value it already had, which is
+ * the stability ENG-787 was after.
+ *
+ * Every other field IS compared. Those are stable identity/content fields, and
+ * a change in one is a real change that must be persisted.
  */
 export function sentInvitationChanged(
   cached: UnipileSentInvitation,
@@ -56,8 +75,7 @@ export function sentInvitationChanged(
     cached.publicProfileUrl !== candidate.publicProfileUrl ||
     cached.invitationId !== candidate.invitationId ||
     cached.invitedUserName !== candidate.invitedUserName ||
-    cached.invitationText !== candidate.invitationText ||
-    cached.sentAt !== candidate.sentAt
+    cached.invitationText !== candidate.invitationText
   );
 }
 
