@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -286,7 +286,28 @@ export interface TwitterXConfig extends BaseOAuthConfig {
   needs_reconnect?: boolean; // set when token refresh fails (revoked/expired refresh token); cleared on reconnect
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig;
+/**
+ * Calendly OAuth configuration (ENG-524).
+ *
+ * `booking_tracking_active` is false when the connecting account's Calendly plan
+ * doesn't support webhooks (Free tier) — OAuth still succeeds and the account is
+ * stored, but no `webhook_id`/`webhook_signing_key` exist and no booking events
+ * will ever arrive. Distinct from `needs_reconnect`, which means the OAuth grant
+ * itself is broken; this means the grant is fine but the plan doesn't qualify.
+ */
+export interface CalendlyConfig extends BaseOAuthConfig {
+  account_type: 'calendly';
+  email?: string;             // From /users/me, used as account_id
+  display_name?: string;
+  user_uri: string;           // Calendly user URI — resolves the webhook scope
+  organization_uri: string;   // Calendly organization URI — required by the webhook subscription body regardless of scope
+  webhook_id?: string;        // Set only when booking_tracking_active is true
+  webhook_signing_key?: string; // HMAC secret WE generate and hand to Calendly at subscription-create time
+  booking_tracking_active: boolean;
+  needs_reconnect?: boolean;
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
