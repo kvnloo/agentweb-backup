@@ -268,6 +268,44 @@ describe('WorkPlanService', () => {
       thumbnail_url: 'https://stale/old.png', thumbnail_source: 'ai', thumbnail_rev: 'rev-old',
     };
 
+    it('actually emits every non-thumbnail field, not just lists them', async () => {
+      // The source-scanning guard proves the LISTS are complete. This proves the
+      // loop over them really reaches DynamoDB — a listed field that the code
+      // failed to emit would still be silently lost.
+      const full: any = {
+        planId: 'p1', title: 'T', steps: [], visibility: 'system', isBuiltIn: true,
+        createdAt: 'c', updatedAt: 'u',
+        description: 'd', welcomeMessage: 'w', autocomplete: true, requireLogin: false,
+        showLoginSignup: 'always', showInAgentMode: true, defaultModel: 'm',
+        category: 'Strategy', ownerId: 'o', orgId: 'g', reviewFeedback: 'r',
+      };
+      await workPlanService.updateWorkPlan(full);
+
+      const arg = mockUpdate.mock.calls[0][0];
+      for (const field of [
+        'title', 'steps', 'visibility', 'isBuiltIn', 'createdAt',
+        'description', 'welcomeMessage', 'autocomplete', 'requireLogin', 'showLoginSignup',
+        'showInAgentMode', 'defaultModel', 'category', 'ownerId', 'orgId', 'reviewFeedback',
+      ]) {
+        expect(arg.UpdateExpression).toContain(`#${field} = :${field}`);
+        expect(arg.ExpressionAttributeValues[`:${field}`]).toEqual(full[field]);
+      }
+      expect(arg.UpdateExpression).toContain('#updatedAt = :updatedAt');
+    });
+
+    it('reports a plan deleted between read and write as not-found, not a crash', async () => {
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPromise.mockRejectedValueOnce(err);
+
+      await expect(
+        workPlanService.updateWorkPlan({
+          planId: 'gone', title: 'T', steps: [], visibility: 'system', isBuiltIn: true,
+          createdAt: 'c', updatedAt: 'u',
+        } as any),
+      ).rejects.toThrow('Work plan not found');
+    });
+
     it('never writes any thumbnail attribute', async () => {
       await workPlanService.updateWorkPlan(plan);
 

@@ -449,3 +449,46 @@ describe("a non-array steps payload is rejected, not crashed on", () => {
     expect(workPlanService.updateWorkPlan).not.toHaveBeenCalled();
   });
 });
+
+describe("a plan deleted between read and write answers 404, not 500", () => {
+  const stored = {
+    planId: "p", title: "T", steps: [], ownerId: "user-1",
+    visibility: "private", isBuiltIn: false,
+    createdAt: "2026-08-04T00:00:00Z", updatedAt: "2026-08-04T00:00:00Z",
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.getWorkPlan.mockResolvedValue(stored);
+    // updateWorkPlan's attribute_exists guard now rejects a vanished plan
+    // instead of the old put silently resurrecting it.
+    workPlanService.updateWorkPlan.mockRejectedValue(new Error("Work plan not found"));
+  });
+
+  it("on the admin PUT", async () => {
+    const res = await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed" });
+
+    expect(res.status).toBe(404);
+    expect(res.body.message).toBe("Work plan not found");
+  });
+
+  it("on the user PUT", async () => {
+    const res = await request(app)
+      .put("/api/user-work-plans/p")
+      .send({ title: "Renamed" });
+
+    expect(res.status).toBe(404);
+  });
+
+  it("still returns 500 for a genuine failure", async () => {
+    workPlanService.updateWorkPlan.mockRejectedValue(new Error("ProvisionedThroughputExceeded"));
+
+    const res = await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed" });
+
+    expect(res.status).toBe(500);
+  });
+});
