@@ -1036,6 +1036,79 @@ describe('apiTools', () => {
       expect(session.unattributedCost).toBeNull();
     });
 
+    // Greptile: buckets were rounded individually while the residual was derived
+    // from unrounded buckets and totalCost was rounded separately, so the three
+    // could disagree — on a contract the description tells consumers to rely on.
+    // Sub-micro-dollar turn costs make the drift visible: each bucket rounds to
+    // zero, so a residual computed from unrounded values reported nothing while
+    // totalCost still rounded up to 1 micro-dollar.
+    it('should keep cost components reconciling under rounding', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-rounding',
+          userId: 'user-16',
+          title: 'Sub-micro turn costs',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 0.0000008,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'model-a', usage: { estimated_cost: 0.0000004 } },
+            { role: 'assistant', content: 'b', llm: 'model-b', usage: { estimated_cost: 0.0000004 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      // Compare in whole micro-dollars — the unit the payload is rounded to.
+      const micro = (n: number) => Math.round(n * 1e6);
+      const bucketMicro = Object.values(session.costByModel ?? {})
+        .reduce((a: number, b) => a + micro(b as number), 0);
+      const residualMicro = micro(session.unattributedCost ?? 0);
+
+      expect(bucketMicro + residualMicro).toBe(micro(session.totalCost));
+    });
+
+    // Real shape: prod sessions 12b68d41 and 6219e856 have per-turn costs summing a
+    // few micro-dollars ABOVE the stored session total. Report null rather than a
+    // negative "unattributed spend", and never rescale the buckets to force a fit.
+    it('should report null rather than a negative residual when turns exceed the total', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-over',
+          userId: 'user-17',
+          title: 'Turn costs slightly exceed the session total',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          totalCost: 1.000000,
+          messages: [
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'a', llm: 'model-a', usage: { estimated_cost: 0.600002 } },
+            { role: 'assistant', content: 'b', llm: 'model-b', usage: { estimated_cost: 0.400002 } },
+          ],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const session = JSON.parse((result as any).content[0].text).sessions[0];
+
+      expect(session.unattributedCost).toBeNull();
+      // Buckets are reported as measured, not scaled down to fit totalCost.
+      expect(session.costByModel).toEqual({ 'model-a': 0.600002, 'model-b': 0.400002 });
+    });
+
     it('should tell consumers to split cost with costByModel, not the model list', () => {
       const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
       expect(description).toContain('costByModel');

@@ -2252,7 +2252,7 @@ The two underlying fields are also returned, and they are NOT interchangeable:
 
 TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly; when reporting volume, add cacheTokens to totalTokens and say you did.
 
-PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost (null when zero) is the exact residual: sum(costByModel) + unattributedCost === totalCost. It covers both spend on turns that recorded no model AND cost that never lands on a turn at all (tool/image spend counts toward totalCost but belongs to no model). When it is non-null the per-model split does NOT account for all of this session's cost — report it as its own line rather than folding it into a model, or your model percentages will not sum to the total.
+PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost is the residual, on the same micro-USD basis as costByModel and totalCost: sum(costByModel) + unattributedCost reconciles to totalCost, exactly whenever there is spend left to attribute. It is null when the residual is not positive — in that case the per-model buckets already account for the whole session and may exceed totalCost by a few micro-dollars of per-turn rounding, which is noise, not missing money. Never treat a null as licence to rescale the buckets. It covers both spend on turns that recorded no model AND cost that never lands on a turn at all (tool/image spend counts toward totalCost but belongs to no model). When it is non-null the per-model split does NOT account for all of this session's cost — report it as its own line rather than folding it into a model, or your model percentages will not sum to the total.
 
 Whenever you name a model — reports, cost/usage breakdowns, per-model groupings, routing recommendations, filed tickets — use attributedModels. Never group or attribute cost by llmModel: it is a selection, so it books spend to models that never ran. This supersedes any earlier note, prior report, or saved memory that tells you to group cost by llmModel. If llmModel and generationModels disagree, that mismatch is itself worth reporting.`,
     inputSchema: {
@@ -2322,7 +2322,12 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       // Per-model cost split. totalCost is one session-wide number, so a multi-model
       // session gave a per-model breakdown nothing to divide by — the per-turn cost
       // and model are both already here, so allocate rather than make callers guess.
-      const costByModel: Record<string, number> = {};
+      // Accumulated in whole micro-USD, the unit costs are already computed in
+      // (usageRecorderService.computeCostMicroUsd). Rounding each bucket to 6dp on
+      // the way out while deriving the residual from unrounded floats put the three
+      // reported numbers on different bases, so they could fail to sum to totalCost —
+      // the exact reconciliation the tool description tells consumers to rely on.
+      const costMicroByModel: Record<string, number> = {};
       // Assistant turns carrying no model, counted regardless of cost: a turn with
       // no recorded spend still means the transcript is only partially labelled, and
       // keying that off cost alone let a partial set read as authoritative.
@@ -2332,7 +2337,9 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         const turnCost = msg?.usage?.estimated_cost || 0;
         if (typeof msg?.llm === 'string' && msg.llm) {
           generationModels.add(msg.llm);
-          if (turnCost) costByModel[msg.llm] = (costByModel[msg.llm] || 0) + turnCost;
+          if (turnCost) {
+            costMicroByModel[msg.llm] = (costMicroByModel[msg.llm] || 0) + Math.round(turnCost * 1e6);
+          }
         } else {
           unlabelledAssistantTurns++;
         }
@@ -2392,23 +2399,27 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         cacheTokens: (cacheCreationTokens > 0 || cacheReadTokens > 0)
           ? { creation: cacheCreationTokens, read: cacheReadTokens }
           : null,
-        costByModel: Object.keys(costByModel).length > 0
+        costByModel: Object.keys(costMicroByModel).length > 0
           ? Object.fromEntries(
-              Object.entries(costByModel).map(([m, c]) => [m, Number(c.toFixed(6))])
+              Object.entries(costMicroByModel).map(([m, micro]) => [m, micro / 1e6])
             )
           : null,
-        // The exact residual, so sum(costByModel) + unattributedCost === totalCost.
-        // This captures BOTH spend on unlabelled turns and cost that never lands on
-        // an assistant turn at all (tool/image spend is in totalCost but not in any
-        // turn's usage — measured at $1.92 on a real $100 session), which a
-        // turn-only sum would silently drop from a per-model breakdown.
+        // The residual, on the SAME micro-USD basis as the buckets and as the
+        // totalCost reported above, so the three always reconcile exactly. Captures
+        // both spend on unlabelled turns and cost that never lands on an assistant
+        // turn at all (tool/image spend is in totalCost but in no turn's usage —
+        // measured at $1.92 on a real $100 session), which a turn-only sum would
+        // silently drop from a per-model breakdown.
         unattributedCost: (() => {
           if (session.totalCost == null) return null;
-          const attributed = Object.values(costByModel).reduce((a, b) => a + b, 0);
-          const residual = Number(session.totalCost) - attributed;
-          return residual > 5e-7 ? Number(residual.toFixed(6)) : null;
+          const totalMicro = Math.round(Number(session.totalCost) * 1e6);
+          const attributedMicro = Object.values(costMicroByModel).reduce((a, b) => a + b, 0);
+          const residualMicro = totalMicro - attributedMicro;
+          return residualMicro > 0 ? residualMicro / 1e6 : null;
         })(),
-        totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
+        // Same micro-USD basis as costByModel/unattributedCost below, so the three
+        // reconcile exactly rather than each being rounded independently.
+        totalCost: session.totalCost != null ? Math.round(Number(session.totalCost) * 1e6) / 1e6 : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,
         feedback: (likes > 0 || dislikes > 0) ? { likes, dislikes } : null,
