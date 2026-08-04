@@ -170,12 +170,13 @@ describeLive('ENG-737 live native gemini adapter', () => {
   });
 
   it('accepts a third-party MCP schema carrying keywords no denylist covered (ENG-845)', async () => {
-    // Verbatim `browser_drop` schema from `@playwright/mcp@latest` — the MCP server
-    // registered in the prod `mcp_servers` setting, whose tools are passed through
-    // to the model exactly as `tools/list` returns them. Before the allowlist this
-    // 400'd live with `Unknown name "propertyNames"`, killing the whole turn with
-    // zero assistant output. The extra draft-2020 keywords alongside it (`examples`,
-    // `exclusiveMinimum`, `uniqueItems`) were each confirmed to 400 the same way.
+    // `browser_drop` from `@playwright/mcp` 0.0.78 — the playwright MCP server is
+    // registered in the prod `mcp_servers` setting and its tools are passed through
+    // to the model exactly as `tools/list` returns them (prod pins 0.0.70, which
+    // predates this tool, so this covers the next bump). Under the old denylist this
+    // 400'd live with `Unknown name "propertyNames"`, which would kill the whole turn
+    // with zero assistant output. The extra draft-2020 keywords alongside it
+    // (`examples`, `exclusiveMinimum`, `uniqueItems`) each 400 the same way.
     const client = makeClient();
     const res: any = await client.chat.completions.create({
       model: MODEL,

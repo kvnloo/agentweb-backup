@@ -58,14 +58,22 @@ const GEMINI_SCHEMA_KEYWORDS = new Set([
  * not a denylist of known-bad ones. The denylist form regressed three times — it
  * grew `x-*` (ENG-737: `x-aliases` on search_tool_response et al broke 100% of
  * gemini tool turns), then `oneOf`/`allOf`/`const`, then union `type` arrays
- * (ENG-826) — and was still incomplete: `@playwright/mcp@latest`, the MCP server
- * registered in the prod `mcp_servers` setting, exposes `browser_drop` whose `data`
- * property carries `propertyNames`, which 400s live today. MCP tool schemas are
- * third-party input pinned to `@latest` (mcpClientService registers `tool.inputSchema`
- * verbatim), so no enumeration of bad keywords can stay complete — only an allowlist
- * closes the class. Confirmed live to 400: `propertyNames`, `examples`,
- * `exclusiveMinimum`/`exclusiveMaximum`, `multipleOf`, `uniqueItems`, `readOnly`,
- * `deprecated`, `contentEncoding`, `not`.
+ * (ENG-826, the defect that actually killed the LinkedIn Post Factory runs) — and
+ * each time the gap only surfaced as a production outage, because the schemas that
+ * carry the missing keyword are third-party: `mcpClientService` registers whatever
+ * `tools/list` returns as `tool.inputSchema`, verbatim, as the function parameters.
+ * No enumeration of bad keywords can stay complete against that; only an allowlist
+ * closes the class.
+ *
+ * The concrete headroom this buys is a version bump away rather than live today:
+ * prod runs the pinned `@playwright/mcp` 0.0.70, whose 21 tools carry only
+ * `$schema`/`additionalProperties` (both already denied). 0.0.78 adds `browser_drop`,
+ * whose `data` property carries `propertyNames` — verified against the real API to
+ * 400 the ENTIRE request under the old denylist and to be accepted under this
+ * allowlist. The `github` stdio server in `mcp_config.ts` is the same shape of
+ * exposure once a user configures its secret. Keywords verified to 400 the request:
+ * `propertyNames`, `examples`, `exclusiveMinimum`/`exclusiveMaximum`, `multipleOf`,
+ * `uniqueItems`, `readOnly`, `deprecated`, `contentEncoding`, `not`.
  *
  * The filter is POSITION-AWARE: `properties` maps parameter NAMES to sub-schemas, so
  * its keys must never be keyword-filtered (a parameter legitimately named `const` or

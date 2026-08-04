@@ -519,10 +519,12 @@ describe('sanitizeGeminiSchema', () => {
   });
 
   it('drops `propertyNames` — the live @playwright/mcp browser_drop shape (ENG-845)', () => {
-    // Verbatim `data` property of browser_drop from `@playwright/mcp@latest`, the
-    // MCP server registered in the prod `mcp_servers` setting. Confirmed against the
-    // real API: this schema 400s the ENTIRE request with
-    //   Unknown name "propertyNames" at '...parameters.properties[3].value'
+    // Verbatim `data` property of browser_drop from `@playwright/mcp` 0.0.78. The
+    // playwright MCP server is registered in the prod `mcp_servers` setting; prod
+    // currently resolves the pinned 0.0.70, which predates this tool, so this guards
+    // the next version bump rather than a live break. Confirmed against the real API:
+    // unsanitized, this schema 400s the ENTIRE request with
+    //   Unknown name "propertyNames" at '...parameters.properties[1].value'
     // which is exactly the ENG-845 zero-assistant-output / null-token signature.
     const input = {
       type: 'object',
@@ -547,9 +549,9 @@ describe('sanitizeGeminiSchema', () => {
 
   it('drops every keyword outside the genai Schema field set, not just known-bad ones (ENG-845)', () => {
     // The sanitizer is an ALLOWLIST because Gemini rejects any unknown field
-    // outright. Each keyword below was confirmed to 400 the whole request live;
-    // none of them was on the previous denylist. Third-party MCP tool schemas are
-    // arbitrary input, so enumerating bad keywords can never be complete.
+    // outright. Each keyword below was confirmed against the real API to 400 the
+    // whole request; none of them was on the previous denylist. Third-party MCP tool
+    // schemas are arbitrary input, so enumerating bad keywords can never be complete.
     const input = {
       type: 'object',
       properties: {
