@@ -124,6 +124,68 @@ describe('AgentModeController - Custom Run Time for Scheduled Chats', () => {
     });
   });
 
+  describe('createScheduledChat timezone persistence (ENG-844)', () => {
+    const makeReq = (body: Record<string, unknown>) => ({
+      user: { userId: mockUserId },
+      body: { scheduleName: 'S', startingMessage: 'Hello', scheduleFrequency: 'daily', ...body },
+    }) as unknown as Request;
+    const makeRes = () => ({ json: jest.fn(), status: jest.fn().mockReturnThis() }) as unknown as Response;
+
+    it('persists a valid IANA timezone', async () => {
+      mockScheduleDb.createSchedule.mockResolvedValue(undefined);
+      const res = makeRes();
+      await agentModeController.createScheduledChat(makeReq({ timezone: 'America/Los_Angeles' }), res);
+      expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
+        expect.objectContaining({ timezone: 'America/Los_Angeles' })
+      );
+      expect(res.status).toHaveBeenCalledWith(201);
+    });
+
+    it('rejects a malformed timezone with 400', async () => {
+      mockScheduleDb.createSchedule.mockResolvedValue(undefined);
+      const res = makeRes();
+      await agentModeController.createScheduledChat(makeReq({ timezone: 'Not/AZone' }), res);
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('omits timezone when the client sends none (UTC fallback at evaluation time)', async () => {
+      mockScheduleDb.createSchedule.mockResolvedValue(undefined);
+      await agentModeController.createScheduledChat(makeReq({}), makeRes());
+      const created = mockScheduleDb.createSchedule.mock.calls[0][0] as any;
+      expect(created.timezone).toBeUndefined();
+    });
+  });
+
+  describe('updateScheduledChat timezone persistence (ENG-844)', () => {
+    const existing = {
+      scheduleId: mockScheduleId, userId: mockUserId, frequency: 'daily',
+      nextRunTime: '2026-01-20T09:00:00.000Z', scheduleName: 'Original', startingMessage: 'Hello',
+      emailNotifications: ['owner@example.com'],
+    };
+    const makeRes = () => ({ json: jest.fn(), status: jest.fn().mockReturnThis() }) as unknown as Response;
+
+    it('updates the timezone when a valid one is supplied', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(existing as any);
+      mockScheduleDb.updateSchedule.mockResolvedValue(undefined);
+      const req = { user: { userId: mockUserId }, params: { scheduleId: mockScheduleId }, body: { timezone: 'Asia/Tokyo' } } as unknown as Request;
+      await agentModeController.updateScheduledChat(req, makeRes());
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+        mockScheduleId, expect.objectContaining({ timezone: 'Asia/Tokyo' })
+      );
+    });
+
+    it('rejects a malformed timezone update with 400', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(existing as any);
+      mockScheduleDb.updateSchedule.mockResolvedValue(undefined);
+      const res = makeRes();
+      const req = { user: { userId: mockUserId }, params: { scheduleId: mockScheduleId }, body: { timezone: 'bogus' } } as unknown as Request;
+      await agentModeController.updateScheduledChat(req, res);
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+    });
+  });
+
   describe('updateScheduledChat with custom nextRunTime', () => {
     const existingSchedule = {
       scheduleId: mockScheduleId,
