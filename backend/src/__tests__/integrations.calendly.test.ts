@@ -44,6 +44,20 @@ describe('getCalendlyConfig', () => {
     expect(config.tokenUrl).toBe('https://auth.calendly.com/oauth/token');
   });
 
+  // Calendly scopes are configured app-level in the developer dashboard, not passed on the
+  // /oauth/authorize request (unlike Outlook/HubSpot) — this list exists so the app
+  // registration in the dashboard can be cross-checked against what the code actually calls:
+  // GET /users/me (users:read) and POST /webhook_subscriptions for invitee.created
+  // (webhooks:write + scheduled_events:read, per developer.calendly.com/scopes).
+  it('lists exactly the scopes the registered app needs — no more, no less', async () => {
+    mockGetCalendlyCredentials.mockResolvedValue(mockCredentials);
+    const { getCalendlyConfig } = await import('../config/integrations');
+
+    const config = await getCalendlyConfig();
+
+    expect(config.scopes.sort()).toEqual(['scheduled_events:read', 'users:read', 'webhooks:write']);
+  });
+
   it('points at the api.calendly.com users/me and webhook_subscriptions endpoints', async () => {
     mockGetCalendlyCredentials.mockResolvedValue(mockCredentials);
     const { getCalendlyConfig } = await import('../config/integrations');

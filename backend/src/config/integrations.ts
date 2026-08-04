@@ -104,12 +104,18 @@ export const INTEGRATION_CONFIG = {
 
   calendly: {
     redirectUri: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/oauth/calendly/callback`,
-    // Calendly requires PKCE (S256) on every OAuth app, web or native — there is no
-    // scope list to request; access is all-or-nothing per the connecting user's grant.
+    // Calendly requires PKCE (S256) on every OAuth app, web or native, IN ADDITION to
+    // scoped permissions (developer.calendly.com/scopes) — new OAuth apps get no API
+    // access at all until scopes are explicitly requested and granted.
     authorizationUrl: 'https://auth.calendly.com/oauth/authorize',
     tokenUrl: 'https://auth.calendly.com/oauth/token',
     meUrl: 'https://api.calendly.com/users/me',
     webhookSubscriptionsUrl: 'https://api.calendly.com/webhook_subscriptions',
+    scopes: [
+      'users:read',           // GET /users/me — resolves user_uri/organization_uri
+      'webhooks:write',       // POST /webhook_subscriptions — provisions the booking webhook
+      'scheduled_events:read', // required alongside webhooks:write for invitee.created events
+    ],
   },
 
   googleDrive: {
@@ -445,6 +451,7 @@ export interface CalendlyOAuthConfig {
   clientId: string;
   clientSecret: string;
   redirectUri: string;
+  scopes: string[];
   authorizationUrl: string;
   tokenUrl: string;
   meUrl: string;
@@ -470,6 +477,7 @@ export async function getCalendlyConfig(): Promise<CalendlyOAuthConfig> {
     clientId: credentials.clientId,
     clientSecret: credentials.clientSecret,
     redirectUri: INTEGRATION_CONFIG.calendly.redirectUri,
+    scopes: INTEGRATION_CONFIG.calendly.scopes,
     authorizationUrl: INTEGRATION_CONFIG.calendly.authorizationUrl,
     tokenUrl: INTEGRATION_CONFIG.calendly.tokenUrl,
     meUrl: INTEGRATION_CONFIG.calendly.meUrl,
