@@ -82,6 +82,49 @@ describe("normalizeWorkPlanSteps", () => {
     ]);
   });
 
+  // A value of the wrong shape is worse than a missing one: it stores fine and
+  // then the consumer skips it. setWorkPlanStatus gates on
+  // `typeof expectedAssetCount === "number"`, so "18" would save happily and
+  // the gate would never fire — the exact silent no-op this issue is about.
+  describe("values of the wrong shape", () => {
+    it.each([
+      ["a numeric string", "18"],
+      ["a negative number", -3],
+      ["a non-finite number", Number.NaN],
+      ["an object", { n: 18 }],
+    ])("drops and reports expectedAssetCount given %s", (_label, value) => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", expectedAssetCount: value },
+      ]);
+
+      expect("expectedAssetCount" in steps[0]).toBe(false);
+      expect(warnings).toEqual([
+        "step 1: ignored expectedAssetCount — expected a non-negative number",
+      ]);
+    });
+
+    it("keeps an explicit zero, which legitimately means no requirement", () => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", expectedAssetCount: 0 },
+      ]);
+
+      expect(steps[0].expectedAssetCount).toBe(0);
+      expect(warnings).toEqual([]);
+    });
+
+    it.each([
+      ["requiredFunctionCalls", "list_skills"],
+      ["skillIds", "skill-1"],
+    ])("falls back to an empty list and reports %s given a non-array", (field, value) => {
+      const { steps, warnings } = normalizeWorkPlanSteps([
+        { stepCount: 1, title: "Step", [field]: value },
+      ]);
+
+      expect((steps[0] as any)[field]).toEqual([]);
+      expect(warnings).toEqual([`step 1: ignored ${field} — expected an array`]);
+    });
+  });
+
   it("returns empty results for an empty step list", () => {
     expect(normalizeWorkPlanSteps([])).toEqual({ steps: [], warnings: [] });
   });

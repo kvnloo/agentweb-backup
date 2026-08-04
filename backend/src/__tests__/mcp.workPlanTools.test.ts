@@ -273,6 +273,45 @@ describe('Predefined Work Plan MCP Tools', () => {
       ]);
     });
 
+    it('uses the snake_case value when the camelCase twin is explicitly null', async () => {
+      // JSON has no undefined, so a model that emits an unset field emits null.
+      // Treating null as "camelCase present" would shadow a perfectly good
+      // snake_case value and hand the route null -> `|| []` -> silently empty.
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{
+          title: 'Step 1',
+          requiredFunctionCalls: null,
+          required_function_calls: ['list_connected_accounts'],
+        }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['list_connected_accounts'] },
+      ]);
+    });
+
+    it('is not sensitive to the order the two casings appear in', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{
+          required_function_calls: ['snake_first'],
+          requiredFunctionCalls: ['camel_second'],
+          title: 'Step 1',
+        }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['camel_second'] },
+      ]);
+    });
+
     it('prefers the camelCase value when both casings are supplied', async () => {
       mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
 

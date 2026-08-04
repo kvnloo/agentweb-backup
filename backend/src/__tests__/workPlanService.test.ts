@@ -300,6 +300,35 @@ describe('WorkPlanService', () => {
       expect(arg.ExpressionAttributeValues[':thumbnail_url']).toBeUndefined();
     });
 
+    it('never resurrects a deleted plan as a stub item', async () => {
+      // dynamodb.update is an upsert: with the thumbnail job running long after
+      // create, the plan can be deleted mid-flight. Writing then would leave an
+      // item with only planId + thumbnail fields — no title, no steps — which
+      // crashes the customer portal's plan list (it maps plan.steps unguarded).
+      await workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.ConditionExpression).toBe('attribute_exists(planId)');
+    });
+
+    it('treats a vanished plan as a no-op rather than an error', async () => {
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPromise.mockRejectedValueOnce(err);
+
+      await expect(
+        workPlanService.updateThumbnail('gone', { thumbnail_source: 'ai' }),
+      ).resolves.toBeUndefined();
+    });
+
+    it('still surfaces any other write failure', async () => {
+      mockPromise.mockRejectedValueOnce(new Error('ProvisionedThroughputExceeded'));
+
+      await expect(
+        workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' }),
+      ).rejects.toThrow('ProvisionedThroughputExceeded');
+    });
+
     it('always refreshes updatedAt', async () => {
       await workPlanService.updateThumbnail('p1', { thumbnail_source: 'ai' });
 
