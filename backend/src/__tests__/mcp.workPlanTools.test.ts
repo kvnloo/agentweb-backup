@@ -259,6 +259,20 @@ describe('Predefined Work Plan MCP Tools', () => {
       ]);
     });
 
+    it('maps snake_case expected_asset_count to expectedAssetCount', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Creative Hub',
+        steps: [{ title: 'Generate 3 Images Per Hook', expected_asset_count: 18 }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Generate 3 Images Per Hook', expectedAssetCount: 18 },
+      ]);
+    });
+
     it('prefers the camelCase value when both casings are supplied', async () => {
       mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
 
@@ -299,7 +313,7 @@ describe('Predefined Work Plan MCP Tools', () => {
       const def: any = mcpToolRegistry.getTool('manage_predefined_work_plan')!.definition;
       const stepProps = def.inputSchema.properties.steps.items.properties;
       expect(Object.keys(stepProps)).toEqual(
-        expect.arrayContaining(['requiredFunctionCalls', 'skillIds'])
+        expect.arrayContaining(['requiredFunctionCalls', 'skillIds', 'expectedAssetCount'])
       );
       expect(stepProps.required_function_calls).toBeUndefined();
     });

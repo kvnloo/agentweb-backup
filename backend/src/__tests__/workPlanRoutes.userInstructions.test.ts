@@ -205,3 +205,183 @@ describe("backwards compat — steps without userInstructions still work", () =>
     expect(arg.steps[0].userInstructions).toBeUndefined();
   });
 });
+
+// ─── ENG-889 ────────────────────────────────────────────────────────────────
+// Third instance of the same defect the tests above cover: the route rebuilds
+// each step from a fixed field list, so anything outside that list is dropped
+// on a 200/201 with no signal. userInstructions was the first casualty, the
+// snake_case `required_function_calls` alias the second (ENG-889), and
+// expectedAssetCount — the asset-count completion gate's input — the third.
+// These tests pin both halves: the field round-trips, and an unrecognized
+// field is reported back to the caller instead of vanishing.
+const STEP_WITH_ASSET_COUNT = {
+  stepCount: 1,
+  title: "Generate 3 Images Per Hook",
+  description: "generate 3 images per hook (18 total)",
+  requiredFunctionCalls: ["generate_image"],
+  expectedAssetCount: 18,
+};
+
+describe("expectedAssetCount pass-through", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.createWorkPlan.mockResolvedValue({
+      planId: "plan-assets",
+      title: "Creative Hub",
+      steps: [STEP_WITH_ASSET_COUNT],
+      visibility: "system",
+      isBuiltIn: true,
+      createdAt: "2026-08-04T00:00:00Z",
+      updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "plan-assets",
+      title: "Creative Hub",
+      steps: [],
+      visibility: "system",
+      isBuiltIn: true,
+      createdAt: "2026-08-04T00:00:00Z",
+      updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.updateWorkPlan.mockResolvedValue(undefined);
+  });
+
+  it("forwards step.expectedAssetCount on admin create", async () => {
+    const res = await request(app)
+      .post("/api/admin/work-plans")
+      .send({ title: "Creative Hub", steps: [STEP_WITH_ASSET_COUNT], visibility: "system" });
+
+    expect(res.status).toBe(201);
+    const arg = workPlanService.createWorkPlan.mock.calls[0][0];
+    expect(arg.steps[0].expectedAssetCount).toBe(18);
+  });
+
+  it("forwards step.expectedAssetCount on admin update", async () => {
+    const res = await request(app)
+      .put("/api/admin/work-plans/plan-assets")
+      .send({ title: "Creative Hub", steps: [STEP_WITH_ASSET_COUNT] });
+
+    expect(res.status).toBe(200);
+    const arg = workPlanService.updateWorkPlan.mock.calls[0][0];
+    expect(arg.steps[0].expectedAssetCount).toBe(18);
+  });
+
+  it("forwards step.expectedAssetCount on user create", async () => {
+    const res = await request(app)
+      .post("/api/user-work-plans")
+      .send({ title: "Creative Hub", steps: [STEP_WITH_ASSET_COUNT] });
+
+    expect(res.status).toBe(201);
+    const arg = workPlanService.createWorkPlan.mock.calls[0][0];
+    expect(arg.steps[0].expectedAssetCount).toBe(18);
+  });
+
+  it("omits expectedAssetCount entirely when the caller did not send it", async () => {
+    await request(app)
+      .post("/api/admin/work-plans")
+      .send({ title: "Plain", steps: [{ stepCount: 1, title: "Step" }], visibility: "system" });
+
+    const arg = workPlanService.createWorkPlan.mock.calls[0][0];
+    expect("expectedAssetCount" in arg.steps[0]).toBe(false);
+  });
+});
+
+describe("unrecognized step fields are reported, not silently dropped", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.createWorkPlan.mockResolvedValue({
+      planId: "plan-warn",
+      title: "Warned",
+      steps: [{ stepCount: 1, title: "Step" }],
+      visibility: "system",
+      isBuiltIn: true,
+      createdAt: "2026-08-04T00:00:00Z",
+      updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "plan-warn",
+      title: "Warned",
+      steps: [],
+      visibility: "system",
+      isBuiltIn: true,
+      createdAt: "2026-08-04T00:00:00Z",
+      updatedAt: "2026-08-04T00:00:00Z",
+    });
+    workPlanService.updateWorkPlan.mockResolvedValue(undefined);
+  });
+
+  it("names the ignored field and its 1-based step on admin create", async () => {
+    const res = await request(app)
+      .post("/api/admin/work-plans")
+      .send({
+        title: "Warned",
+        steps: [
+          { stepCount: 1, title: "Step 1" },
+          { stepCount: 2, title: "Step 2", mystery_field: ["x"] },
+        ],
+        visibility: "system",
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.warnings).toEqual([
+      "step 2: ignored unrecognized field 'mystery_field'",
+    ]);
+  });
+
+  it("lists every ignored field on a step", async () => {
+    const res = await request(app)
+      .post("/api/admin/work-plans")
+      .send({
+        title: "Warned",
+        steps: [{ stepCount: 1, title: "Step 1", alpha: 1, beta: 2 }],
+        visibility: "system",
+      });
+
+    expect(res.body.warnings).toEqual([
+      "step 1: ignored unrecognized fields 'alpha', 'beta'",
+    ]);
+  });
+
+  it("reports ignored fields on admin update too", async () => {
+    const res = await request(app)
+      .put("/api/admin/work-plans/plan-warn")
+      .send({ title: "Warned", steps: [{ stepCount: 1, title: "Step 1", nope: true }] });
+
+    expect(res.status).toBe(200);
+    expect(res.body.warnings).toEqual([
+      "step 1: ignored unrecognized field 'nope'",
+    ]);
+  });
+
+  it("reports ignored fields on user create too", async () => {
+    const res = await request(app)
+      .post("/api/user-work-plans")
+      .send({ title: "Warned", steps: [{ stepCount: 1, title: "Step 1", nope: true }] });
+
+    expect(res.status).toBe(201);
+    expect(res.body.warnings).toEqual([
+      "step 1: ignored unrecognized field 'nope'",
+    ]);
+  });
+
+  it("leaves the response shape untouched when every field is recognized", async () => {
+    const res = await request(app)
+      .post("/api/admin/work-plans")
+      .send({
+        title: "Clean",
+        steps: [{
+          stepCount: 1,
+          title: "Step 1",
+          description: "d",
+          userInstructions: "u",
+          requiredFunctionCalls: ["a"],
+          skillIds: ["s"],
+          expectedAssetCount: 3,
+        }],
+        visibility: "system",
+      });
+
+    expect(res.status).toBe(201);
+    expect("warnings" in res.body).toBe(false);
+  });
+});
