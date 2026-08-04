@@ -2191,7 +2191,13 @@ mcpToolRegistry.register({
   name: 'get_chat_history',
   definition: {
     name: 'get_chat_history',
-    description: 'Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don\'t have them (slower but ensures all scores are present).',
+    description: `Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don't have them (slower but ensures all scores are present).
+
+Two model fields are returned, and they are NOT interchangeable:
+- llmModel: the model *selected* in the picker. It records a client-side selection only — the session may never have run on it (it can even name a model that is not in the registry, or a live voice model that cannot generate text at all).
+- generationModels: the models that *actually generated* the assistant turns, derived from the transcript. This is the real provenance. Null when no message recorded one.
+
+When naming or attributing a model — in reports, cost/usage breakdowns, routing recommendations, or filed tickets — use generationModels. Only fall back to llmModel when generationModels is null, and say so. If the two disagree, that mismatch is itself worth reporting.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -2245,8 +2251,14 @@ mcpToolRegistry.register({
       let dislikes = 0;
       let longestWaitMs = 0;
       let maxHeapMB = 0;
+      // ENG-892: session.llmModel is only what the model picker last stored — a
+      // selection, not provenance. Each assistant message carries the model that
+      // actually produced it (written after model resolution and any backup-model
+      // switch), so derive real attribution from the transcript.
+      const generationModels = new Set<string>();
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
+        if (typeof msg?.llm === 'string' && msg.llm) generationModels.add(msg.llm);
         if (msg?.metadata?.feedback?.type === 'like') likes++;
         if (msg?.metadata?.feedback?.type === 'dislike') dislikes++;
         if (Array.isArray(msg?.metadata?.iterationTimings)) {
@@ -2283,6 +2295,7 @@ mcpToolRegistry.register({
         portalType: session.portalType || null,
         sessionType: session.sessionType || null,
         llmModel: session.llmModel || null,
+        generationModels: generationModels.size > 0 ? [...generationModels] : null,
         messageCount: messages.length,
         totalTokens: session.totalTokens || null,
         totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
