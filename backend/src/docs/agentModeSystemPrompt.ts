@@ -567,7 +567,20 @@ When you confirm a filed item, share the tracking link from the tool result so t
 // product bug. The reported failure was the agent INVENTING a gate and then
 // titling the run "Replies queued" having posted nothing — a reporting defect,
 // which is what these two rules address. Whether a given schedule may publish is
-// ENG-827's question, answered by its block; rule (1) below defers to it.
+// ENG-827's question, answered by its block; the mandated-action rule defers to it.
+//
+// That deferral is load-bearing, and getting it wrong is how this fix has failed
+// twice. The mandated-action rule's escape hatch is "quote the authorization
+// block that says you may not". On main TODAY no such block exists — ENG-827 has
+// not merged — so an unqualified mandate would have no reachable escape hatch and
+// would resolve to "publish anyway" on every scheduled run, with no owner control
+// able to say no (Greptile review #11). A gated rule whose escape branch cannot
+// occur is not gated at all; the same shape, inverted, was an earlier P1 here.
+// So external publishing is carved OUT of the mandate and delegated wholly to the
+// PUBLISH AUTHORIZATION block, with an explicit no-op when that block is absent:
+// this PR must not shift publishing behaviour in either direction on its own. The
+// hard mandate is kept for non-publishing actions, which carry no consent question
+// and where "I drafted it instead" is never defensible.
 export function getScheduledSessionOverride(sessionType?: string): string {
   if (sessionType !== 'scheduled') return '';
   return `\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.
@@ -579,10 +592,11 @@ NO FABRICATED PLATFORM OR PUBLISH GATE (CRITICAL — Truthful Reporting):
 - Derive your title and summary from actual tool-call outcomes. A run that posted nothing must NOT claim replies/posts were "queued", "posted", or "sent" — if nothing was posted, say so plainly and state the reason.
 
 NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION (CRITICAL):
-- When the schedule's instructions direct you to perform an action (post, reply, send, publish, update) and the tool that performs it is available to you, you MUST actually call that tool. Drafting the content and reporting it as "queued", "ready", or "pending approval" is NOT completion — e.g. twitter_manage_post (action "reply") to reply on X, post_on_connected_account to post a new tweet.
-- There are exactly TWO acceptable reasons not to perform a mandated action, and you must cite which one applies: (1) an explicit authorization block in THIS system prompt states the action is not authorized for this run — quote that block; or (2) a tool call you ACTUALLY made returned an error — quote the tool name and its error. Nothing else qualifies.
+- When the schedule's instructions direct you to perform an action and the tool that performs it is available to you, you MUST actually call that tool. Drafting the content and reporting it as "queued", "ready", or "pending approval" is NOT completion.
+- PUBLISHING EXTERNALLY — posting, replying or publishing to a connected account (e.g. twitter_manage_post, post_on_connected_account) — is governed SOLELY by the PUBLISH AUTHORIZATION block of this prompt. If that block is present, follow it exactly: publish when it authorizes publishing, and draft-and-notify when it withholds. If NO such block is present, this rule neither grants you permission to publish nor removes any you already have — apply your normal judgment. Either way the reporting rules above still bind in full: state the real reason you did or did not publish, and never dress it up as a platform gate.
+- For every OTHER mandated action (e.g. sending the report, saving to the knowledge base, updating a record) there are exactly TWO acceptable reasons not to perform it, and you must cite which one applies: (1) an explicit authorization block in THIS system prompt states the action is not authorized for this run — quote that block; or (2) a tool call you ACTUALLY made returned an error — quote the tool name and its error. Nothing else qualifies.
 - Your own caution is NOT a reason. "This run is scheduled/unattended" is NOT by itself a reason. A generic preference for human approval is NOT a reason. If neither (1) nor (2) applies, perform the action.
-- If (1) or (2) genuinely applies, say plainly that nothing was posted/sent, give that specific reason, persist the drafts, and surface the concrete unblocking action for the owner.`;
+- Whenever a mandated action is not performed, say plainly that nothing was posted/sent, give that specific real reason, persist the drafts, and surface the concrete unblocking action for the owner.`;
 }
 
 // Directive injected for scheduled / automated unattended runs.

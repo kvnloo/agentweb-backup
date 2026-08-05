@@ -80,14 +80,44 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
       expect(scheduled).toContain('Nothing else qualifies');
     });
 
+    // Greptile review #11 (P1, and an earlier P1 here in the opposite direction):
+    // the two-outs rule's escape hatch is "quote the authorization block". On main
+    // today NO such block exists — ENG-827 has not merged — so applying the mandate
+    // to publishing would leave the escape hatch unreachable and resolve to
+    // "publish anyway" on every scheduled run, with no owner control able to say
+    // no. A gated rule whose escape branch cannot occur is not gated at all.
+    it('carves external publishing OUT of the mandate and delegates it to the authorization block', () => {
+      expect(scheduled).toContain('PUBLISHING EXTERNALLY');
+      expect(scheduled).toContain('governed SOLELY by the PUBLISH AUTHORIZATION block');
+      expect(scheduled).toContain('publish when it authorizes publishing, and draft-and-notify when it withholds');
+      // the two-outs rule is explicitly scoped to everything else
+      expect(scheduled).toContain('For every OTHER mandated action');
+    });
+
+    it('is an explicit NO-OP on publishing when no authorization block is present', () => {
+      // Neither direction: it must not order publishing (that was Greptile #11), and
+      // it must not withhold it either — a default-deny would silently convert the
+      // ~25 active publishing-shaped schedules into drafting-only runs, which is the
+      // regression an earlier revision of this fix shipped and had to reverse.
+      expect(scheduled).toContain('neither grants you permission to publish nor removes any you already have');
+      expect(scheduled).toContain('apply your normal judgment');
+      // but truthfulness is NOT optional in that case — it is the whole ticket
+      expect(scheduled).toContain('the reporting rules above still bind in full');
+      expect(scheduled).toContain('never dress it up as a platform gate');
+    });
+
     it('closes the three excuses the reported run actually used', () => {
       expect(scheduled).toContain('Your own caution is NOT a reason');
       expect(scheduled).toContain('"This run is scheduled/unattended" is NOT by itself a reason');
       expect(scheduled).toContain('A generic preference for human approval is NOT a reason');
     });
 
-    it('requires an honest "nothing was posted" report when an out genuinely applies', () => {
+    it('requires an honest "nothing was posted" report WHENEVER an action is skipped', () => {
+      // Deliberately unconditional — it binds on the carved-out publishing path too,
+      // where the model keeps its judgment but not its licence to misdescribe.
+      expect(scheduled).toContain('Whenever a mandated action is not performed');
       expect(scheduled).toContain('say plainly that nothing was posted/sent');
+      expect(scheduled).toContain('give that specific real reason');
       expect(scheduled).toContain('surface the concrete unblocking action for the owner');
     });
   });
@@ -105,11 +135,13 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
     });
 
     it('does not order publishing, so a withheld ENG-827 run is never pushed to post', () => {
-      // Rule (1) is the hinge: with ENG-827's withheld block present the model has
-      // a valid out and must draft-and-notify; the mandate only bites when there is
-      // no such block and no tool error — the reported session's exact shape.
+      // The delegation is what makes this safe in BOTH merge orders: with ENG-827's
+      // withheld block present the model must draft-and-notify, with its authorized
+      // block present the model must post, and with neither present this PR changes
+      // nothing about publishing at all.
       expect(scheduled).not.toContain('CALL THE TOOL');
       expect(scheduled).not.toContain('publishing is authorized for this run');
+      expect(scheduled).not.toContain('you MUST call');
     });
   });
 });
