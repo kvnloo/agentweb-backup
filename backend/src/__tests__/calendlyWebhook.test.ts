@@ -381,6 +381,111 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     });
   });
 
+  describe('Multi-host event resolution', () => {
+    // Each customer's webhook subscription is scope:'user' (calendlyAuth.ts), so when 2+
+    // hosts on the same event are each independently connected to AgentWeb, Calendly sends
+    // a SEPARATE delivery per subscription — same payload, but signed with THAT host's own
+    // webhook_signing_key. Resolution must find the specific membership whose account's key
+    // actually verifies this delivery, not just the first connected account in array order.
+    const HOST_A_URI = 'https://api.calendly.com/users/host-a';
+    const HOST_B_URI = 'https://api.calendly.com/users/host-b';
+    const HOST_A_KEY = 'signing-key-host-a';
+    const HOST_B_KEY = 'signing-key-host-b';
+    const USER_ID_A = 'user-host-a';
+    const USER_ID_B = 'user-host-b';
+
+    const accountA = {
+      ...mockAccount,
+      account_id: 'acct-host-a',
+      config: { ...mockAccount.config, user_uri: HOST_A_URI, webhook_signing_key: HOST_A_KEY },
+    };
+    const accountB = {
+      ...mockAccount,
+      account_id: 'acct-host-b',
+      config: { ...mockAccount.config, user_uri: HOST_B_URI, webhook_signing_key: HOST_B_KEY },
+    };
+    const ownerA = { userId: USER_ID_A, email: 'host-a@example.com' };
+    const ownerB = { userId: USER_ID_B, email: 'host-b@example.com' };
+
+    function multiHostPayload() {
+      return makePayload({ email: 'lead@example.com' }) as any;
+    }
+
+    beforeEach(() => {
+      mockGetAccountByCalendlyUserUri.mockImplementation((uri: string) => {
+        if (uri === HOST_A_URI) return Promise.resolve({ userId: USER_ID_A, account: accountA });
+        if (uri === HOST_B_URI) return Promise.resolve({ userId: USER_ID_B, account: accountB });
+        return Promise.resolve(null);
+      });
+      mockGetUserById.mockImplementation((id: string) => {
+        if (id === USER_ID_A) return Promise.resolve(ownerA);
+        if (id === USER_ID_B) return Promise.resolve(ownerB);
+        return Promise.resolve(null);
+      });
+    });
+
+    it('resolves to the SECOND host when the delivery is signed with the second (not first-listed) host\'s key', async () => {
+      const body = multiHostPayload();
+      body.payload.scheduled_event.event_memberships = [
+        { user: HOST_A_URI, user_email: 'host-a@example.com', user_name: 'Host A' },
+        { user: HOST_B_URI, user_email: 'host-b@example.com', user_name: 'Host B' },
+      ];
+      const res = await postSigned(body, HOST_B_KEY);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetUserById).toHaveBeenCalledWith(USER_ID_B);
+      expect(mockSendCapiLeadEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it('resolves to the FIRST host when the delivery is signed with the first-listed host\'s key', async () => {
+      const body = multiHostPayload();
+      body.payload.scheduled_event.event_memberships = [
+        { user: HOST_A_URI, user_email: 'host-a@example.com', user_name: 'Host A' },
+        { user: HOST_B_URI, user_email: 'host-b@example.com', user_name: 'Host B' },
+      ];
+      const res = await postSigned(body, HOST_A_KEY);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetUserById).toHaveBeenCalledWith(USER_ID_A);
+      expect(mockSendCapiLeadEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it('resolves to the one connected host among several unconnected members, regardless of position', async () => {
+      const body = multiHostPayload();
+      body.payload.scheduled_event.event_memberships = [
+        { user: 'https://api.calendly.com/users/unconnected-1', user_email: 'x@example.com', user_name: 'X' },
+        { user: HOST_B_URI, user_email: 'host-b@example.com', user_name: 'Host B' },
+        { user: 'https://api.calendly.com/users/unconnected-2', user_email: 'y@example.com', user_name: 'Y' },
+      ];
+      const res = await postSigned(body, HOST_B_KEY);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetUserById).toHaveBeenCalledWith(USER_ID_B);
+      expect(mockSendCapiLeadEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops the delivery when the signature matches none of the connected hosts\' keys', async () => {
+      const body = multiHostPayload();
+      body.payload.scheduled_event.event_memberships = [
+        { user: HOST_A_URI, user_email: 'host-a@example.com', user_name: 'Host A' },
+        { user: HOST_B_URI, user_email: 'host-b@example.com', user_name: 'Host B' },
+      ];
+      const res = await postSigned(body, 'some-unrelated-key');
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetUserById).not.toHaveBeenCalled();
+      expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Lead-added/updated alert (gap 4)', () => {
     it('fires an api.lead_added alert when a new lead is created', async () => {
       mockGetLeadByEmail.mockResolvedValue(null);
