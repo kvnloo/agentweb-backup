@@ -144,6 +144,35 @@ describe("ENG-830 — retraction is conditional on the score it read", () => {
       expect(fallback.ExpressionAttributeValues[":prevEvaluatedAt"]).toBe(previousJudgeScore.evaluatedAt);
     });
 
+    it("refuses to clobber an archive map another retraction created first", async () => {
+      // Two first-time retractions for the same session overlap: both see no
+      // retractedJudgeScores map and both reach the fallback. The loser must not
+      // replace the whole map with its own single entry.
+      update.mockReset();
+      respond(validationFailure(), conditionalFailure(), "ok");
+
+      await expect(
+        chatbotDb.clearSessionJudgeScore("s1", "judge_1", previousJudgeScore)
+      ).resolves.toBe(true);
+
+      expect(update.mock.calls[1][0].ConditionExpression).toContain("attribute_not_exists(#rjs)");
+      // ...and once the map exists, the per-key write is retried instead.
+      expect(update.mock.calls[2][0].UpdateExpression).toBe("SET #rjs.#jid = :prev REMOVE #js.#jid");
+      expect(update.mock.calls[2][0].ConditionExpression).toContain("#js.#jid.evaluatedAt = :prevEvaluatedAt");
+      expect(errorSpy).not.toHaveBeenCalled();
+    });
+
+    it("gives up quietly if the judge score also changed during that retry", async () => {
+      update.mockReset();
+      respond(validationFailure(), conditionalFailure(), conditionalFailure());
+
+      await expect(
+        chatbotDb.clearSessionJudgeScore("s1", "judge_1", previousJudgeScore)
+      ).resolves.toBe(false);
+      expect(update).toHaveBeenCalledTimes(3);
+      expect(errorSpy).not.toHaveBeenCalled();
+    });
+
     it("is a no-op — not an error — when the judge score changed under it", async () => {
       update.mockReset();
       respond(conditionalFailure());
