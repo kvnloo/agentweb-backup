@@ -2083,7 +2083,12 @@ function diffStepTitles(from: any[], to: any[]): any[] {
 function findAmbiguousMergeTargets(existingSteps: any[], incomingSteps: any[]) {
   const ambiguous: { title: any; matchingStepCounts: any[] }[] = [];
   for (const incoming of incomingSteps) {
-    if (incoming.stepCount !== undefined && incoming.stepCount !== null) continue;
+    // A stepCount only settles the target if it names a step that exists.
+    // mergeWorkPlanSteps falls back to the title otherwise, so a stale or
+    // invented count must not buy a pass through this check.
+    const named = incoming.stepCount !== undefined && incoming.stepCount !== null
+      && existingSteps.some((s: any) => Number(s.stepCount) === Number(incoming.stepCount));
+    if (named) continue;
     if (incoming.title === undefined) continue;
     const title = normalizeStepTitle(incoming.title);
     const matches = existingSteps.filter((s: any) => normalizeStepTitle(s.title) === title);
