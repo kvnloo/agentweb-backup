@@ -7315,6 +7315,10 @@ emmaToolRegistry.register({
                 items: { type: 'string' },
                 description: 'Skill IDs to auto-install when this step becomes active'
               },
+              expectedAssetCount: {
+                type: 'number',
+                description: 'Number of media assets that must have been generated in the run before this step can be completed (e.g. 18 for "generate 3 images per hook, 18 total"). Counted per run, not per step. Carried over from the session work plan when omitted.'
+              },
             },
             required: ['stepCount', 'title']
           },
@@ -7380,6 +7384,15 @@ emmaToolRegistry.register({
           skillIds: Array.isArray(s.skillIds) && s.skillIds.length > 0
             ? s.skillIds
             : (sessionStep?.skillIds || []),
+          // Same reason as the two above: the LLM usually omits the asset gate
+          // when saving, and losing it here would silently strip the session
+          // plan's "must actually produce N assets" guarantee (ENG-889).
+          ...(() => {
+            const count = s.expectedAssetCount !== undefined
+              ? s.expectedAssetCount
+              : sessionStep?.expectedAssetCount;
+            return count !== undefined ? { expectedAssetCount: count } : {};
+          })(),
         };
       }),
       ownerId: userId,

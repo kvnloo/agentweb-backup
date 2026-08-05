@@ -257,9 +257,116 @@ export async function downloadBrandLogoToS3(
   }
 }
 
+/**
+ * How usable a persisted logo URL is *right now* (ENG-792).
+ *
+ * Deliberately tri-state rather than boolean, because the two callers need
+ * OPPOSITE failure semantics for an inconclusive probe:
+ *
+ *  - the ad-image preflight fails CLOSED (`'unknown'` blocks the run) — a
+ *    doubtful logo would otherwise burn three Gemini calls and ship
+ *    placeholders;
+ *  - `ensureBrandLogoPersisted` fails OPEN (`'unknown'` keeps the existing
+ *    logo) — a transient blip must never cause us to replace an account's
+ *    real, manually-uploaded logo.
+ *
+ * Only a DEFINITIVE negative is `'broken'`: a 4xx (the resource genuinely
+ * isn't there — e.g. the reported `google.com/s2/favicons` URL that
+ * 301→404s for a domain with no crawlable favicon), or a 2xx whose body is
+ * empty or clearly textual (an HTML/JSON error page is not a logo).
+ * Timeouts, DNS errors and 5xx are `'unknown'` — the URL may be perfectly
+ * fine and merely unreachable this second.
+ */
+export type BrandLogoUsability = 'usable' | 'broken' | 'unknown';
+
+/** Timeout for the one-shot logo usability probe (ENG-792). */
+const LOGO_PROBE_TIMEOUT_MS = 15_000;
+
+export interface BrandLogoProbeDeps {
+  /**
+   * One-shot fetch. Defaults to a real axios GET. May either reject (real
+   * axios rejects non-2xx) or resolve with a non-2xx `status`; both shapes
+   * are classified.
+   */
+  httpGet?: (url: string) => Promise<{
+    status?: number;
+    headers?: Record<string, unknown>;
+    data?: unknown;
+  }>;
+}
+
+/**
+ * Probe a logo URL once and classify whether it currently serves usable
+ * image bytes. Never throws.
+ *
+ * A 2xx with a generic or absent content-type counts as `'usable'`: the
+ * downstream consumer (`imageGeneration.processInputImage` →
+ * `getImageMimeType`) tolerates those by sniffing the URL extension and
+ * defaulting to image/png, so rejecting them here would break logos that
+ * work fine today (e.g. S3 objects with no ContentType metadata).
+ */
+export async function classifyBrandLogoUrl(
+  logoUrl: string,
+  deps: BrandLogoProbeDeps = {},
+): Promise<BrandLogoUsability> {
+  if (typeof logoUrl !== 'string' || logoUrl.trim() === '') return 'broken';
+  const httpGet =
+    deps.httpGet ??
+    (async (url: string) => {
+      const axios = (await import('axios')).default;
+      return axios.get(url, {
+        responseType: 'arraybuffer',
+        timeout: LOGO_PROBE_TIMEOUT_MS,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AgentWeb/1.0)' },
+      });
+    });
+  try {
+    const resp = await httpGet(logoUrl);
+    const status = resp?.status;
+    if (typeof status === 'number' && (status < 200 || status >= 300)) {
+      // An injected fetcher (or a custom validateStatus) can surface the
+      // non-2xx instead of rejecting. Same classification as the throw path.
+      return status >= 400 && status < 500 ? 'broken' : 'unknown';
+    }
+    const data: any = resp?.data;
+    const byteLength =
+      data == null
+        ? 0
+        : typeof data.byteLength === 'number'
+          ? data.byteLength
+          : typeof data.length === 'number'
+            ? data.length
+            : 0;
+    // A 2xx with no bytes is definitively not a logo.
+    if (byteLength <= 0) return 'broken';
+    const contentType = String(
+      (resp?.headers as any)?.['content-type'] || '',
+    ).toLowerCase();
+    const isTextual =
+      contentType.startsWith('text/') ||
+      contentType.startsWith('application/json');
+    return isTextual ? 'broken' : 'usable';
+  } catch (err: any) {
+    const status = err?.response?.status;
+    // Real axios rejects on non-2xx and carries the response. A 4xx is a
+    // definitive "not there"; everything else (timeout, DNS, 5xx, and any
+    // error with no response attached) is inconclusive.
+    if (typeof status === 'number' && status >= 400 && status < 500) {
+      return 'broken';
+    }
+    return 'unknown';
+  }
+}
+
 export interface EnsureBrandLogoDeps {
   /** Org-aware brandGuidelines read. Defaults to the real Dynamo read. */
   resolveBrand?: (userId: string) => Promise<BrandGuidelinesLike | null>;
+  /**
+   * Usability probe for an ALREADY-persisted logo (ENG-792). Defaults to
+   * `classifyBrandLogoUrl`. Only a `'broken'` verdict makes the step fall
+   * through to rediscovery — see the call site.
+   */
+  classifyExisting?: (logoUrl: string) => Promise<BrandLogoUsability>;
   /** Logo discovery. Defaults to the cssExtractor heuristics on the company URL. */
   discoverLogoUrl?: (companyUrl: string) => Promise<string | null>;
   /** Download + S3 pin. Defaults to `downloadBrandLogoToS3`. */
@@ -347,8 +454,28 @@ export async function ensureBrandLogoPersisted(
   try {
     const resolveBrand = deps.resolveBrand ?? resolveBrandGuidelinesForUser;
     const existing = getPersistedBrandLogoUrl(await resolveBrand(userId));
+    // ENG-792: "already present" used to be a purely STRUCTURAL check — any
+    // non-empty string short-circuited this step. Emma's brand-build session
+    // writes `logoUrl` voluntarily and, when a site renders its logo as inline
+    // SVG (nothing to link to), has been observed substituting a
+    // `google.com/s2/favicons?domain=…` URL that 404s. That junk value counted
+    // as "present", so the deterministic discover-and-pin below never ran and
+    // every downstream ad-image generation failed on the unfetchable logo.
+    //
+    // Verify before trusting it, and fall through to rediscovery only on a
+    // DEFINITIVE negative. `'unknown'` (timeout / DNS / 5xx) keeps the existing
+    // URL: replacing an account's real logo because of a transient blip would
+    // be far worse than leaving a possibly-stale one in place.
     if (existing) {
-      return { persisted: false, logoUrl: existing, reason: 'already-present' };
+      const classifyExisting = deps.classifyExisting ?? classifyBrandLogoUrl;
+      const usability = await classifyExisting(existing);
+      if (usability !== 'broken') {
+        return { persisted: false, logoUrl: existing, reason: 'already-present' };
+      }
+      console.warn(
+        '[brandLogo] persisted logo is unfetchable — rediscovering (ENG-792)',
+        { userId, existing },
+      );
     }
 
     const discoverLogoUrl = deps.discoverLogoUrl ?? defaultDiscoverLogoUrl;

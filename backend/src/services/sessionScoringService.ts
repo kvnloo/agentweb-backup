@@ -196,6 +196,32 @@ function isRunFailurePlaceholder(m: any): boolean {
 }
 
 /**
+ * True when the LAST real turn of a session is a run-failure placeholder — i.e. the
+ * run's process died mid-flight and was recovered by the ENG-324 reconciler / ENG-473
+ * backstop, which appended the "job incomplete"/"please retry" note and never continued
+ * to a genuine completion in THIS session.
+ *
+ * Such a run often did real work before dying (e.g. an enrich_leads_execute that ran,
+ * then the instance was terminated by an EB deploy) but never emitted its final summary,
+ * so the transcript "cuts off after a tool call". `serializeMessagesForScoring` strips
+ * the placeholder, so the LLM judge would see a truncated transcript and mis-score the
+ * run low on goalCompletion/outputQuality for an infra abandonment that is NOT a
+ * reasoning failure (ENG-764). It must instead be classified as a deterministic failed
+ * run — the same treatment ENG-479 intended for abandoned runs, but which only fired
+ * when the crash left NO real assistant turn at all (hasAssistantTurn === false). Here
+ * real turns preceded the crash, so hasAssistantTurn is true and the run slipped through.
+ *
+ * A crash that was later RETRIED and completed in the same session ends on a genuine
+ * assistant turn (not the placeholder), so this returns false and the run is scored
+ * normally — the placeholder is only ever the trailing turn on a terminally abandoned run.
+ */
+function endsWithRunFailurePlaceholder(messages: ChatMessage[] = []): boolean {
+  const nonSystem = (messages || []).filter((m: any) => m.role !== "system");
+  const last = nonSystem[nonSystem.length - 1];
+  return !!last && isRunFailurePlaceholder(last);
+}
+
+/**
  * Whether the session has produced at least one real assistant turn — i.e. the
  * model actually responded with text or invoked a tool.
  *
@@ -626,9 +652,22 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
-  // No assistant turn yet: skip if still in-flight, flag as failed if stale.
+  // Abandoned run recovered by the reconciler/backstop (ENG-764): the transcript ends
+  // on a run-failure placeholder, so the process died mid-flight and never emitted its
+  // final summary. The real work may have been correct, but this is an infra failure —
+  // score it as a deterministic failed run rather than feeding the (placeholder-stripped)
+  // truncated transcript to the LLM judge, which would mis-score it low for a "transcript
+  // that cuts off after a tool call". The reconciler already left the placeholder note.
+  // Still deferred within the grace window in case the reconciler's resume/retry is
+  // racing to continue the same session (ENG-479).
   let result: ScoringResult;
-  if (!hasAssistantTurn(session.messages)) {
+  if (endsWithRunFailurePlaceholder(session.messages)) {
+    if (classifyTurnlessSession(session) === "in-flight") {
+      return null;
+    }
+    result = buildFailedRunResult(messageCount);
+  } else if (!hasAssistantTurn(session.messages)) {
+    // No assistant turn yet: skip if still in-flight, flag as failed if stale.
     if (classifyTurnlessSession(session) === "in-flight") {
       return null;
     }
@@ -706,9 +745,22 @@ export async function scoreSessionIfNeeded(
     return null;
   }
 
-  // No assistant turn yet: skip if still in-flight, flag as failed if stale.
+  // Abandoned run recovered by the reconciler/backstop (ENG-764): the transcript ends
+  // on a run-failure placeholder, so the process died mid-flight and never emitted its
+  // final summary. Score it as a deterministic failed run rather than feeding the
+  // (placeholder-stripped) truncated transcript to the LLM judge, which would mis-score
+  // it low for a "transcript that cuts off after a tool call". The reconciler already
+  // left the placeholder note, so surfaceFailedRun would be a no-op — skip it. Still
+  // deferred within the grace window in case the reconciler's resume/retry is racing
+  // to continue the same session (ENG-479).
   let result: ScoringResult;
-  if (!hasAssistantTurn(session.messages)) {
+  if (endsWithRunFailurePlaceholder(session.messages)) {
+    if (classifyTurnlessSession(session) === "in-flight") {
+      return null;
+    }
+    result = buildFailedRunResult(messageCount);
+  } else if (!hasAssistantTurn(session.messages)) {
+    // No assistant turn yet: skip if still in-flight, flag as failed if stale.
     if (classifyTurnlessSession(session) === "in-flight") {
       return null;
     }
