@@ -251,15 +251,9 @@ export function renderMarkdownBody(draft: string): string {
   return out.join('\n');
 }
 
-/**
- * Render a draft into a complete, self-contained HTML document. Never throws and
- * never rejects a draft for being too large — that is the whole point: it is the
- * path that guarantees completed work is still delivered when the styled render
- * cannot run.
- */
-export function renderMarkdownReportDocument(title: string, draft: string): string {
+/** Wrap rendered body markup in the report's document shell. */
+function wrapReportDocument(title: string, body: string): string {
   const safeTitle = escapeHtml(String(title ?? '').trim() || 'Report');
-  const body = renderMarkdownBody(draft as string);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -273,4 +267,96 @@ ${body}
 </div>
 </body>
 </html>`;
+}
+
+/**
+ * Render a draft into a complete, self-contained HTML document. Never throws and
+ * never rejects a draft for being too large — that is the whole point: it is the
+ * path that guarantees completed work is still delivered when the styled render
+ * cannot run.
+ */
+export function renderMarkdownReportDocument(title: string, draft: string): string {
+  return wrapReportDocument(title, renderMarkdownBody(draft as string));
+}
+
+/** Per-tag inline styles for markup produced by the remark pipeline. */
+const TAG_STYLE: Record<string, string> = {
+  h1: STYLE.h[0], h2: STYLE.h[1], h3: STYLE.h[2],
+  h4: STYLE.h[3], h5: STYLE.h[4], h6: STYLE.h[5],
+  p: STYLE.p, ul: STYLE.ul, ol: STYLE.ul, li: STYLE.li,
+  blockquote: STYLE.quote, hr: STYLE.hr, pre: STYLE.pre, code: STYLE.code,
+  table: STYLE.table, th: STYLE.th, td: STYLE.td, a: STYLE.a,
+};
+
+// A <code> inside <pre> must not get the inline-code chip (light chip on the
+// dark code block); it is styled first so the general pass skips it.
+const PRE_CODE_STYLE = "font-family:'SFMono-Regular',Consolas,monospace;";
+
+/**
+ * Add the report's inline styles to remark's (sanitised, attribute-free)
+ * markup. Styles are inline rather than in a <style> block for the same reason
+ * the hand-rolled renderer inlines them: create_html_file also produces email
+ * drafts, and email clients strip <style>. Tags that already carry a style
+ * attribute are left exactly as they are.
+ */
+export function applyInlineReportStyles(html: string): string {
+  return String(html ?? '')
+    .replace(
+      /<pre([^>]*)>(\s*)<code([^>]*)>/gi,
+      (match, preAttrs: string, gap: string, codeAttrs: string) =>
+        /\sstyle\s*=/i.test(preAttrs) || /\sstyle\s*=/i.test(codeAttrs)
+          ? match
+          : `<pre${preAttrs} style="${STYLE.pre}">${gap}<code${codeAttrs} style="${PRE_CODE_STYLE}">`,
+    )
+    .replace(
+      /<(h[1-6]|p|ul|ol|li|blockquote|hr|pre|code|table|th|td|a)((?:\s[^>]*)?)(\/?)>/gi,
+      (match, tag: string, attrs: string, selfClose: string) => {
+        if (/\sstyle\s*=/i.test(attrs)) return match;
+        // Every tag the pattern matches has an entry in TAG_STYLE.
+        return `<${tag}${attrs} style="${TAG_STYLE[tag.toLowerCase()]}"${selfClose}>`;
+      },
+    );
+}
+
+/**
+ * Render a draft into a complete HTML document using the same remark pipeline
+ * the blog publisher uses (remark + GFM + line breaks + SANITISING remark-html
+ * — unlike the blog path, untrusted markup in a model-written draft must never
+ * execute). It handles markdown the hand-rolled renderer only approximates:
+ * nested lists, reference links, entities, setext headings.
+ *
+ * remark 15 is ESM-only, so it is imported dynamically at call time. If that
+ * import fails — or the pipeline throws, or yields nothing — this falls back to
+ * the synchronous hand-rolled renderer above. Both paths are guaranteed to
+ * return a complete document: this function exists precisely so that a failure
+ * at the formatting layer can never discard completed work.
+ */
+export async function renderMarkdownReportDocumentAsync(
+  title: string,
+  draft: string,
+): Promise<string> {
+  const source = String(draft ?? '');
+  try {
+    const { remark } = await import('remark');
+    const remarkHtml = (await import('remark-html')).default;
+    const remarkGfm = (await import('remark-gfm')).default;
+    const remarkBreaks = (await import('remark-breaks')).default;
+
+    const rendered = remark()
+      .use(remarkGfm)
+      .use(remarkBreaks)
+      .use(remarkHtml)
+      .processSync(source)
+      .toString();
+
+    if (rendered.trim()) {
+      return wrapReportDocument(title, applyInlineReportStyles(rendered));
+    }
+  } catch (error) {
+    console.warn(
+      'markdownHtmlReport: remark render unavailable, using the built-in renderer:',
+      error instanceof Error ? error.message : error,
+    );
+  }
+  return renderMarkdownReportDocument(title, source);
 }
