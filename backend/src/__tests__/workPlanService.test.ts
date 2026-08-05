@@ -326,6 +326,89 @@ describe('WorkPlanService', () => {
     });
   });
 
+  // ENG-890: the MCP tool guards a destructive step replace by reading the plan
+  // and checking what the payload would remove. Read-then-write is not atomic,
+  // so without a version the check can pass against a snapshot that a competing
+  // write has already replaced — and the guard waves through the very deletion
+  // it exists to stop.
+  describe('updateWorkPlan step revision', () => {
+    const plan: any = {
+      planId: 'p1', title: 'T', steps: [{ stepCount: 1, title: 'S' }],
+      visibility: 'system', isBuiltIn: true, createdAt: 'c', updatedAt: 'u',
+    };
+
+    it('bumps steps_rev on every write, so a reader always has something to order against', async () => {
+      await workPlanService.updateWorkPlan(plan);
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).toContain('#steps_rev = :steps_rev');
+      expect(arg.ExpressionAttributeValues[':steps_rev']).toBe('test-plan-id-789');
+    });
+
+    it('orders the write against the revision the caller observed', async () => {
+      await workPlanService.updateWorkPlan(plan, { expectedStepsRev: 'rev-1' });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.ConditionExpression).toContain('#steps_rev = :expectedStepsRev');
+      expect(arg.ExpressionAttributeValues[':expectedStepsRev']).toBe('rev-1');
+    });
+
+    it('accepts a plan that predates the field, without matching one that has since been written', async () => {
+      await workPlanService.updateWorkPlan(plan, { expectedStepsRev: null });
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.ConditionExpression).toContain('attribute_not_exists(#steps_rev)');
+    });
+
+    it('leaves a caller that did not observe a revision unconditioned', async () => {
+      await workPlanService.updateWorkPlan(plan);
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.ConditionExpression).toBe('attribute_exists(planId)');
+    });
+
+    it('reports a lost race as a conflict, not as a missing plan', async () => {
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPromise.mockRejectedValueOnce(err);
+      // The plan is still there — it was the revision that moved.
+      mockPromise.mockResolvedValueOnce({ Item: { ...plan, steps_rev: 'rev-2' } });
+
+      await expect(
+        workPlanService.updateWorkPlan(plan, { expectedStepsRev: 'rev-1' }),
+      ).rejects.toThrow('Work plan steps changed');
+    });
+
+    it('still reports a deleted plan as not-found even when a revision was supplied', async () => {
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPromise.mockRejectedValueOnce(err);
+      mockPromise.mockResolvedValueOnce({});
+
+      await expect(
+        workPlanService.updateWorkPlan(plan, { expectedStepsRev: 'rev-1' }),
+      ).rejects.toThrow('Work plan not found');
+    });
+
+    it('does not re-read when no revision was supplied — that failure can only be a deletion', async () => {
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPromise.mockRejectedValueOnce(err);
+
+      await expect(workPlanService.updateWorkPlan(plan)).rejects.toThrow('Work plan not found');
+      expect(mockGet).not.toHaveBeenCalled();
+    });
+
+    it('never REMOVEs steps_rev, which would strand every reader holding one', async () => {
+      // It is minted here, not supplied by the caller, so it must not be treated
+      // as an optional field the caller "cleared" by omitting it.
+      await workPlanService.updateWorkPlan(plan);
+
+      const arg = mockUpdate.mock.calls[0][0];
+      expect(arg.UpdateExpression).not.toMatch(/REMOVE .*steps_rev/);
+    });
+  });
+
   describe('updateThumbnail', () => {
     it('writes only the thumbnail attributes, never a whole-item put', async () => {
       await workPlanService.updateThumbnail('p1', { thumbnail_url: 'https://x/y.png', thumbnail_source: 'ai' });

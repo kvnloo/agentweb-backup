@@ -457,6 +457,7 @@ describe('Predefined Work Plan MCP Tools', () => {
     const existingPlan = {
       planId: 'wp-1',
       title: 'Meta Launch Gate',
+      steps_rev: 'rev-1',
       steps: [
         { stepCount: 1, title: 'Step 1: Scope', description: 'old scope', requiredFunctionCalls: ['a'], skillIds: ['s1'] },
         { stepCount: 2, title: 'Step 2: Inventory', description: 'inventory', requiredFunctionCalls: [], skillIds: [] },
@@ -620,6 +621,87 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(mockMcpFetch.mock.calls.filter((c: any) => c[0].method === 'GET')).toHaveLength(0);
       expect(putCalls()).toHaveLength(1);
       expect((putCalls()[0][0] as any).body.steps).toBeUndefined();
+    });
+
+    // The guard's decision is only as good as the snapshot it read. Staking that
+    // read means a plan changed in the meantime fails the write instead of
+    // overwriting it with a payload that was only safe against the old steps.
+    describe('staking the inspected plan', () => {
+      it('sends the revision it read back with the write', async () => {
+        mockPlanFetches();
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 1, description: 'amended' }],
+        }, context);
+
+        expect((putCalls()[0][0] as any).body.expectedStepsRev).toBe('rev-1');
+      });
+
+      it('stakes null when the plan predates the revision field', async () => {
+        mockMcpFetch.mockImplementation(async (opts: any) =>
+          opts.method === 'GET'
+            ? { planId: 'wp-1', steps: existingPlan.steps }
+            : { planId: 'wp-1' }
+        );
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 1, description: 'amended' }],
+        }, context);
+
+        const body = (putCalls()[0][0] as any).body;
+        expect('expectedStepsRev' in body).toBe(true);
+        expect(body.expectedStepsRev).toBeNull();
+      });
+
+      it('does not stake a revision on a metadata-only update, which never read one', async () => {
+        mockPlanFetches();
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          welcome_message: 'hello',
+        }, context);
+
+        expect('expectedStepsRev' in (putCalls()[0][0] as any).body).toBe(false);
+      });
+
+      it('turns a lost race into a retry instruction rather than an opaque failure', async () => {
+        mockMcpFetch.mockImplementation(async (opts: any) => {
+          if (opts.method === 'GET') return JSON.parse(JSON.stringify(existingPlan));
+          throw new Error('API error (409): Work plan steps changed');
+        });
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 1, description: 'amended' }],
+        }, context);
+
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload.error).toMatch(/changed while/i);
+        expect(payload.howToProceed).toEqual(expect.arrayContaining([expect.stringMatching(/retry/i)]));
+      });
+
+      it('does not swallow an unrelated write failure as a lost race', async () => {
+        mockMcpFetch.mockImplementation(async (opts: any) => {
+          if (opts.method === 'GET') return JSON.parse(JSON.stringify(existingPlan));
+          throw new Error('API error (500): Failed to update work plan');
+        });
+
+        await expect(mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 1, description: 'amended' }],
+        }, context)).rejects.toThrow(/500/);
+      });
     });
 
     it('documents the replace semantics and the merge escape hatch in the tool description', () => {
