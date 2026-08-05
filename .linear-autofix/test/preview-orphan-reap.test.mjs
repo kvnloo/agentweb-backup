@@ -69,6 +69,27 @@ console.log('orphanPreviewProcs — what it must never kill');
   ok(run([P(31, BACKEND('ENG-845'), { cwd: '/tmp' })]).length === 0, 'cwd outside the worktree root → never reaped');
 }
 
+// REGRESSION, caught in production on the first live sweep (2026-08-05 13:40): the reaper killed the
+// backend of an eng-803 bring-up that was 24 minutes into its run. The `starting` guard did not save it
+// because `starting` only exists when a state ENTRY exists — and `preview.mjs up` does teardown-before-
+// start, which REMOVES the entry. In that window there is no entry at all: no flag to read, no recorded
+// pids, age past the threshold, so a perfectly live bring-up looked exactly like an orphan.
+//
+// Absence of state is not evidence of orphanhood. While a bring-up is running, the process table is the
+// authoritative signal, so an in-flight `preview.mjs up <bug>` now vetoes reaping anything for that bug.
+console.log('orphanPreviewProcs — an in-flight bring-up vetoes reaping (regression)');
+{
+  const victim = P(40, BACKEND('ENG-803'), { age: 24 * 60, cwd: WT('ENG-803') });
+  const bringUp = (bug) => P(41, `node /home/ec2-user/agentweb/.linear-autofix/preview/preview.mjs up ${bug} ${WT(bug)}`, { age: 800, cwd: '/home/ec2-user/agentweb/.linear-autofix' });
+
+  ok(run([victim]).join() === '40', 'no bring-up running → the forgotten backend is reaped (unchanged)');
+  ok(run([victim, bringUp('ENG-803')]).length === 0, 'a `preview.mjs up` for THIS bug → spared, even with no state entry at all');
+  ok(run([victim, bringUp('eng-803')]).length === 0, 'bug id matching is case-insensitive (state keys lowercase, argv often UPPER)');
+  ok(run([victim, bringUp('ENG-999')]).join() === '40', "a bring-up for a DIFFERENT bug does not protect this one");
+  // and the veto must never protect the bring-up runner itself from being counted as a candidate
+  ok(run([bringUp('ENG-803')]).length === 0, 'the bring-up process itself is not preview-server-shaped → never a candidate');
+}
+
 console.log('orphanPreviewProcs — the live ENG-845 shape');
 {
   const procs = [

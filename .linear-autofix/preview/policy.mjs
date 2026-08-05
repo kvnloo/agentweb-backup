@@ -300,6 +300,17 @@ export function orphanPreviewProcs({
     if (e?.starting) starting.add(b.toLowerCase());
     for (const p of Object.values(e?.procs || {})) if (Number.isInteger(p?.pid)) recorded.add(p.pid);
   }
+  // Bugs with a bring-up ACTUALLY RUNNING, read from the process table rather than from state. This is
+  // the guard the `starting` flag cannot provide: `preview.mjs up` does teardown-before-start, so mid
+  // bring-up there is no state entry at all — no flag to read and no recorded pids. On the first live
+  // sweep (2026-08-05 13:40) that window cost an eng-803 bring-up its backend 24 minutes into the run,
+  // because with the entry gone a perfectly live server was indistinguishable from an orphan. Absence of
+  // state is not evidence of orphanhood; while a bring-up runs, the process table is the authority.
+  const bringingUp = new Set();
+  for (const p of procs) {
+    const m = String(p?.args || '').match(/preview\.mjs\s+(?:up|refresh)\s+(\S+)/);
+    if (m) bringingUp.add(m[1].toLowerCase());
+  }
   const rootPrefix = root.endsWith('/') ? root : `${root}/`;
   return procs.filter((p) => {
     if (!p || !PREVIEW_SHAPES.some((re) => re.test(p.args))) return false;   // not a preview server
@@ -307,7 +318,8 @@ export function orphanPreviewProcs({
     if (recorded.has(p.pid)) return false;                                   // the live generation
     if (p.ageSec < minAgeSec) return false;                                  // may be a bring-up in flight
     const bug = String(p.cwd).slice(rootPrefix.length).split('/')[0].toLowerCase();
-    if (starting.has(bug)) return false;                                     // bring-up in flight, for sure
+    if (starting.has(bug)) return false;                                     // bring-up in flight, per state
+    if (bringingUp.has(bug)) return false;                                   // bring-up in flight, per ps
     return true;
   });
 }
