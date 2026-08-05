@@ -2045,11 +2045,34 @@ function isEmptyStepValue(value: unknown): boolean {
 function findStepIndex(steps: any[], probe: any): number {
   if (probe.title !== undefined) {
     const title = normalizeStepTitle(probe.title);
-    const byTitle = steps.findIndex((s: any) => normalizeStepTitle(s.title) === title);
-    if (byTitle !== -1) return byTitle;
+    const matches = steps.filter((s: any) => normalizeStepTitle(s.title) === title);
+    // A title shared by two steps identifies neither — fall through to position
+    // rather than pairing everything against the first one.
+    if (matches.length === 1) return steps.indexOf(matches[0]);
   }
   if (probe.stepCount === undefined || probe.stepCount === null) return -1;
   return steps.findIndex((s: any) => Number(s.stepCount) === Number(probe.stepCount));
+}
+
+/**
+ * Titles in `from` with no counterpart left in `to`. Counts occurrences instead
+ * of testing set membership, so dropping one of two steps that share a title is
+ * still reported as a drop.
+ */
+function diffStepTitles(from: any[], to: any[]): any[] {
+  const available = new Map<string, number>();
+  for (const step of to) {
+    const title = normalizeStepTitle(step.title);
+    available.set(title, (available.get(title) || 0) + 1);
+  }
+  const unmatched: any[] = [];
+  for (const step of from) {
+    const title = normalizeStepTitle(step.title);
+    const remaining = available.get(title) || 0;
+    if (remaining > 0) available.set(title, remaining - 1);
+    else unmatched.push(step.title);
+  }
+  return unmatched;
 }
 
 /**
@@ -2123,20 +2146,14 @@ function mergeWorkPlanSteps(existingSteps: any[], incomingSteps: any[]): any[] {
 
 /** Diff summary returned to the caller so step removals can never go unnoticed. */
 function summarizeStepChange(before: any[], after: any[], mode: 'merge' | 'replace') {
-  const afterTitles = new Set(after.map((s: any) => normalizeStepTitle(s.title)));
-  const beforeTitles = new Set(before.map((s: any) => normalizeStepTitle(s.title)));
   const contentLoss = findStepContentLoss(before, after);
   return {
     mode,
     stepsBefore: before.length,
     stepsAfter: after.length,
     stepsRemoved: Math.max(0, before.length - after.length),
-    droppedStepTitles: before
-      .filter((s: any) => !afterTitles.has(normalizeStepTitle(s.title)))
-      .map((s: any) => s.title),
-    addedStepTitles: after
-      .filter((s: any) => !beforeTitles.has(normalizeStepTitle(s.title)))
-      .map((s: any) => s.title),
+    droppedStepTitles: diffStepTitles(before, after),
+    addedStepTitles: diffStepTitles(after, before),
     // Omitted rather than empty so a clean update's summary stays quiet.
     ...(contentLoss.length > 0 && { stepContentLoss: contentLoss }),
   };
