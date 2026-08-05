@@ -144,10 +144,14 @@ export class WorkPlanService {
     return workPlan;
   }
 
-  async getWorkPlan(planId: string): Promise<WorkPlan | null> {
+  /** @param opts.consistentRead for reads that must not see a stale replica —
+   *  i.e. when the answer decides what a caller is told about a write that has
+   *  already happened. Ordinary reads stay eventually consistent. */
+  async getWorkPlan(planId: string, opts: { consistentRead?: boolean } = {}): Promise<WorkPlan | null> {
     const result = await dynamodb.get({
       TableName: this.tableName,
       Key: { planId },
+      ...(opts.consistentRead && { ConsistentRead: true }),
     }).promise();
     return (result.Item as WorkPlan) || null;
   }
@@ -168,11 +172,14 @@ export class WorkPlanService {
    * @throws 'Work plan steps changed' when a competing write landed first, and
    *   'Work plan not found' when the plan was deleted. Callers must tell these
    *   apart: the first is retryable against a fresh read, the second is not.
+   * @returns the revision this write produced. Callers assembling a response
+   *   must surface it: the plan they read carries the superseded one, and
+   *   echoing that back guarantees a spurious conflict on the next staked write.
    */
   async updateWorkPlan(
     plan: WorkPlan,
     opts: { expectedStepsRev?: string | null } = {},
-  ): Promise<void> {
+  ): Promise<string> {
     this.validateSteps(plan.steps);
 
     // Every write rewrites steps (they are a REQUIRED field), so every write
@@ -180,9 +187,10 @@ export class WorkPlanService {
     const sets = ['#updatedAt = :updatedAt', '#steps_rev = :steps_rev'];
     const removes: string[] = [];
     const names: Record<string, string> = { '#updatedAt': 'updatedAt', '#steps_rev': 'steps_rev' };
+    const stepsRev = uuidv4();
     const values: Record<string, any> = {
       ':updatedAt': new Date().toISOString(),
-      ':steps_rev': uuidv4(),
+      ':steps_rev': stepsRev,
     };
 
     for (const key of REQUIRED_PLAN_FIELDS) {
@@ -230,7 +238,9 @@ export class WorkPlanService {
         // With one, the failure is ambiguous and the difference matters to the
         // caller — a conflict is retryable against a fresh read, a deletion is
         // not — so pay for one read to say which.
-        if (staked && await this.getWorkPlan(plan.planId)) {
+        // Consistent, because a stale replica here would report a plan we just
+        // failed to write as deleted — a 404 for a retryable conflict.
+        if (staked && await this.getWorkPlan(plan.planId, { consistentRead: true })) {
           throw new Error('Work plan steps changed');
         }
         // Same message approveWorkPlan/rejectWorkPlan already throw, which the
@@ -239,6 +249,8 @@ export class WorkPlanService {
       }
       throw err;
     }
+
+    return stepsRev;
   }
 
   /**
@@ -432,12 +444,21 @@ export class WorkPlanService {
 
     if (!result.Item) return null;
 
+    // A whole-item put that replaces the target's steps while bypassing
+    // updateWorkPlan entirely. Carrying the source's steps_rev across would let
+    // a staked write pass its precondition against steps this sync had already
+    // replaced — and the two tables' revisions genuinely can match, since dev is
+    // populated from prod. Mint a new one: the target's steps just changed.
+    // getSyncStatus compares an explicit field list, so this does not make every
+    // plan read as out-of-sync (ENG-890).
+    const synced = { ...result.Item, steps_rev: uuidv4() } as WorkPlan;
+
     await dynamodb.put({
       TableName: targetTable,
-      Item: result.Item,
+      Item: synced,
     }).promise();
 
-    return result.Item as WorkPlan;
+    return synced;
   }
 
   async getSyncStatus(): Promise<Record<string, { inSync: boolean; existsInProd: boolean; existsInDev: boolean; changedFields: string[] }>> {

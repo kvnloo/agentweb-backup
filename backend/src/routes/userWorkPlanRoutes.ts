@@ -157,9 +157,10 @@ router.put("/:planId", async (req, res) => {
     // revision", so presence of the key is what counts (ENG-890).
     const stake = "expectedStepsRev" in req.body
       ? { expectedStepsRev: req.body.expectedStepsRev }
-      : undefined;
-    await workPlanService.updateWorkPlan(updated, ...(stake ? [stake] as const : [] as const));
-    res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
+      : {};
+    const steps_rev = await workPlanService.updateWorkPlan(updated, stake);
+    const saved = { ...updated, steps_rev };
+    res.json(warnings.length > 0 ? { ...saved, warnings } : saved);
   } catch (error: any) {
     // A competing write landed between the caller's read and this one.
     if (error?.message === "Work plan steps changed") {

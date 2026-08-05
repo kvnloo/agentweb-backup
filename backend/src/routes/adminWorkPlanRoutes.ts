@@ -113,7 +113,7 @@ router.put("/:planId", async (req, res) => {
     // revision"), so presence of the key is what counts (ENG-890).
     const stake = "expectedStepsRev" in req.body
       ? { expectedStepsRev: req.body.expectedStepsRev }
-      : undefined;
+      : {};
     const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
     const normalizedSteps = normalized?.steps;
     const warnings = normalized?.warnings ?? [];
@@ -131,8 +131,11 @@ router.put("/:planId", async (req, res) => {
       ...(category !== undefined && { category }),
       ...(visibility !== undefined && { visibility }),
     };
-    await workPlanService.updateWorkPlan(updated, ...(stake ? [stake] as const : [] as const));
-    res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
+    // `updated` was built by spreading the plan we read, so it carries the
+    // pre-write revision. Answer with the one the write produced.
+    const steps_rev = await workPlanService.updateWorkPlan(updated, stake);
+    const saved = { ...updated, steps_rev };
+    res.json(warnings.length > 0 ? { ...saved, warnings } : saved);
   } catch (error: any) {
     // A competing write landed between the caller's read and this one, so the
     // payload was judged against steps that no longer exist. Retryable, unlike
