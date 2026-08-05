@@ -1675,6 +1675,8 @@ export async function runVerifiedChat(
   // — a snapshot taken at admission would publish minutes after the owner said stop.
   let livePublishAuthorization = publishAuthorization;
   let requiredFunctions = params.requiredFunctions ?? [];
+  /** Set when consent narrows mid-run; prepended to every subsequent turn message. */
+  let publishRevocationNotice: string | null = null;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
   // question, so a model that keeps re-asking cannot loop until maxAttempts. Once
@@ -1938,6 +1940,17 @@ export async function runVerifiedChat(
         // effective authorization to report the run against. Here we only consume it.
         const narrowed = (await refreshPublishAuthorization()) ?? livePublishAuthorization;
         if (narrowed.tools.length !== livePublishAuthorization.tools.length) {
+          // Sticky: once consent is withdrawn it must stay withdrawn for the rest of
+          // the run, and narrowing is monotonic so this can never be un-set.
+          publishRevocationNotice =
+            '[PUBLISH AUTHORIZATION WITHDRAWN] The owner has revoked this schedule\'s ' +
+            'permission to publish without review while this run was in progress. Any ' +
+            'authorization to publish stated earlier in this conversation is now VOID' +
+            (narrowed.tools.length > 0
+              ? ` except for: ${narrowed.tools.join(', ')}.`
+              : ' — you are no longer authorized to publish with any tool.') +
+            '\n' +
+            getUnattendedExecutionDirective('scheduled', false, narrowed.authorized ? 'authorized' : 'withheld', narrowed.tools);
           console.log(
             `AgentMode: publish consent narrowed mid-run for session ${sessionId} — ` +
             `authorized tools [${livePublishAuthorization.tools.join(', ') || 'none'}] -> ` +
@@ -2128,6 +2141,18 @@ export async function runVerifiedChat(
       // Generate response
       // Only pass attachments on the first attempt to avoid duplicating them
       const attachmentsForThisAttempt = attempt === 1 ? attachmentsArray : [];
+      // ENG-827: the system prompt — and with it the PUBLISH AUTHORIZATION directive —
+      // is assembled and persisted ONCE, on the session's first message. Narrowing
+      // `livePublishAuthorization` therefore reaches the required-function checker but
+      // NOT the model, which would keep reading its admission-time "you are authorized
+      // to publish" instruction for the rest of the run. Revocation would stop the
+      // nudging without stopping the publishing. Carry the withdrawal in the turn
+      // message instead, where it lands in context immediately and persists in the
+      // transcript for every later turn. The prohibition wording is single-sourced
+      // from the same directive builder the system prompt uses.
+      if (publishRevocationNotice) {
+        userMessage = `${publishRevocationNotice}\n\n${userMessage}`;
+      }
       console.log(`AgentMode runVerifiedChat: Attempt ${attempt}, passing ${attachmentsForThisAttempt.length} attachments to generateSessionResponse`);
       const response = await generateSessionResponse(
         sessionId,
