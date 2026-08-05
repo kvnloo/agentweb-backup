@@ -857,6 +857,78 @@ changed_files "${d}" 'backend/src/server.ts'
 run_gate "${d}"
 check 'an earlier green never masks a later failure at the same head' 1 'FAIL'
 
+# The backend requirement must never be the reason a PR is blocked when some
+# OTHER, accurate reason applies — and it must never fire on a PR the path
+# filter legitimately excluded. Both depend on section 7 staying LAST, after
+# the draft, failure and pending verdicts. That ordering is load-bearing and
+# otherwise undefended: hoisting section 7 above the pending check would block
+# every backend PR while its suite is still running, and nothing else here
+# would notice. These cases pin the ordering by its observable effect.
+
+# Draft: the draft verdict, not the backend block. Greptile is skipped on a
+# draft, which is exactly the "a check was skipped, is that a problem?" shape.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE' 'true'
+checkruns "${d}" "${DRAFT_RUN_RUNS}"
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a draft backend PR reports DRAFT, not the backend-suite block' 3 'is a draft'
+
+# Greptile refused: the failure is the reason, and it is named. Reporting
+# NO_EVIDENCE here would send the reader looking for a missing run when the
+# actual problem is a review that said no.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"failure"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped"}
+]'
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a refused-Greptile backend PR reports FAIL, not the backend-suite block' 1 'FAIL'
+
+# Mid-suite: PENDING. This is the one that would bite hardest if the ordering
+# regressed, because it is the normal state of every backend PR for ~15 min.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"in_progress","conclusion":null},
+  {"name":"Backend tests (all other + coverage)","status":"in_progress","conclusion":null}
+]'
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a backend PR mid-suite reports PENDING, not the backend-suite block' 2 'PENDING'
+
+# And the whole class of diffs the backend filter legitimately excludes. Each
+# skips the suite for a good reason and must still pass — including the two
+# CI-path files that are deliberately NOT backend paths, which is the easiest
+# place to over-reach when widening BACKEND_PATHS later.
+NON_BACKEND_RUNS='[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped"},
+  {"name":"Partner portal tests","status":"completed","conclusion":"skipped"},
+  {"name":"CI script tests","status":"completed","conclusion":"skipped"}
+]'
+for non_backend in \
+  'partner-portal/src/App.tsx' \
+  '.github/workflows/deploy.yml' \
+  '.github/scripts/merge-evidence.sh' \
+  'docs/readme.md' \
+  'agent-engine/web_agent.py'; do
+  d="$(new_fixture_dir)"
+  pr_view "${d}" 'MERGEABLE'
+  checkruns "${d}" "${NON_BACKEND_RUNS}"
+  changed_files "${d}" "${non_backend}"
+  run_gate "${d}"
+  check "a PR touching only ${non_backend} passes with the suite skipped" 0 'PASS'
+done
+
 # Renaming a job must fail closed rather than delete the requirement. With the
 # override pointing at a name nothing reports, the gate blocks.
 TESTS_RUN=$((TESTS_RUN + 1))
