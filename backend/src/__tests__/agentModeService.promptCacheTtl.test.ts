@@ -136,7 +136,7 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
     it('asks for the 1h TTL on the system cache point for an extended-TTL model', async () => {
       const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 
-      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION);
+      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION, { humanPaced: true });
 
       const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
       expect(input.system).toEqual([
@@ -148,7 +148,7 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
     it('asks for the 1h TTL on the conversation-prefix cache point too', async () => {
       const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 
-      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION);
+      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION, { humanPaced: true });
 
       const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
       // The history — not the ~14k-token system prompt — is the bulk of the
@@ -159,7 +159,7 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
     it('emits two independent cachePoint objects (no shared reference)', async () => {
       const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 
-      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION);
+      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION, { humanPaced: true });
 
       const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
       const systemPoint = input.system[input.system.length - 1];
@@ -175,19 +175,19 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
       const unverified = 'anthropic.claude-3-7-sonnet-20250219-v1:0';
       (agentModeService as any).llmModels[unverified] = { client: null, supportsTemperature: true };
 
-      await (agentModeService as any).callLLM(unverified, CONVERSATION);
+      await (agentModeService as any).callLLM(unverified, CONVERSATION, { humanPaced: true });
 
       const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
       expect(input.system[input.system.length - 1]).toEqual({ cachePoint: { type: 'default' } });
       expect(lastBlockOfPivot(input)).toEqual({ cachePoint: { type: 'default' } });
     });
 
-    it('omits the 1h TTL for machine-paced runs, which never idle past 5 minutes', async () => {
+    it('omits the 1h TTL by DEFAULT, so a caller that never considered pacing pays 1.25x', async () => {
       const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 
-      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION, {
-        machinePaced: true,
-      });
+      // No `humanPaced` at all — scheduled runs, loops, one-shot judges and any
+      // future call site land here and keep today's 5-minute behaviour.
+      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION);
 
       // A 1h write costs 2x vs 1.25x, and a hit refreshes the TTL for free, so
       // scheduled runs firing turns back-to-back would pay the surcharge and
@@ -204,13 +204,13 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
       // session in the process. Resolving the TTL when the client is BUILT would
       // pin whichever pacing happened to construct it first.
       await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION, {
-        machinePaced: true,
+        humanPaced: false,
       });
       const scheduled = (ConverseCommand as jest.Mock).mock.calls[0][0];
 
       (ConverseCommand as jest.Mock).mockClear();
       await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION, {
-        machinePaced: false,
+        humanPaced: true,
       });
       const interactive = (ConverseCommand as jest.Mock).mock.calls[0][0];
 
@@ -222,7 +222,7 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
       });
     });
 
-    it('never leaks the machinePaced hint into a non-Bedrock request body', async () => {
+    it('never leaks the humanPaced hint into a non-Bedrock request body', async () => {
       // `params` is handed verbatim to client.chat.completions.create() for
       // every provider and the OpenAI SDK forwards unknown body fields to the
       // API, where Azure returns 400 on an unrecognised argument. Only the
@@ -232,10 +232,63 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
         chat: { completions: { create: async (p: any) => { created.push(p); return { choices: [{ message: { content: 'ok' } }] }; } } },
       };
 
-      await (agentModeService as any).callLLM('gpt-5-chat-2', CONVERSATION, { machinePaced: true });
+      await (agentModeService as any).callLLM('gpt-5-chat-2', CONVERSATION, { humanPaced: true });
 
       expect(created).toHaveLength(1);
-      expect(created[0]).not.toHaveProperty('machinePaced');
+      expect(created[0]).not.toHaveProperty('humanPaced');
+    });
+
+    it('warns once when Bedrock serves a shorter TTL than we asked for', async () => {
+      // Sonnet 4.6 / Opus 4.6 are on the allowlist against AWS's published
+      // "5 minutes only" table, on the strength of live probes. Billing is safe
+      // either way, but if AWS ever enforces the docs we want to hear about it
+      // rather than silently stop saving.
+      AgentModeService.__resetCacheTtlDowngradeWarnsForTests();
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      mockBedrockSend.mockResolvedValue({
+        output: { message: { role: 'assistant', content: [{ text: 'response' }] } },
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadInputTokens: 0,
+          cacheWriteInputTokens: 9000,
+          cacheDetails: [{ ttl: '5m', inputTokens: 9000 }],
+        },
+        stopReason: 'end_turn',
+      });
+
+      await (agentModeService as any).callLLM('anthropic.claude-sonnet-4-6', CONVERSATION, { humanPaced: true });
+      await (agentModeService as any).callLLM('anthropic.claude-sonnet-4-6', CONVERSATION, { humanPaced: true });
+
+      const downgradeWarns = warn.mock.calls.filter((c) =>
+        String(c[0]).includes('did NOT honour the requested prompt-cache TTL')
+      );
+      expect(downgradeWarns).toHaveLength(1);
+      expect(String(downgradeWarns[0][0])).toContain("asked for '1h', got '5m'");
+      warn.mockRestore();
+    });
+
+    it('stays quiet when Bedrock honours the requested TTL', async () => {
+      AgentModeService.__resetCacheTtlDowngradeWarnsForTests();
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      mockBedrockSend.mockResolvedValue({
+        output: { message: { role: 'assistant', content: [{ text: 'response' }] } },
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadInputTokens: 0,
+          cacheWriteInputTokens: 9000,
+          cacheDetails: [{ ttl: '1h', inputTokens: 9000 }],
+        },
+        stopReason: 'end_turn',
+      });
+
+      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION, { humanPaced: true });
+
+      expect(
+        warn.mock.calls.filter((c) => String(c[0]).includes('did NOT honour'))
+      ).toHaveLength(0);
+      warn.mockRestore();
     });
 
     it('never mixes TTLs within one request (Bedrock requires longer TTLs first)', async () => {
@@ -245,7 +298,7 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
       (agentModeService as any).llmModels[unverified] = { client: null, supportsTemperature: true };
       for (const model of ['anthropic.claude-opus-5', unverified]) {
         (ConverseCommand as jest.Mock).mockClear();
-        await (agentModeService as any).callLLM(model, CONVERSATION);
+        await (agentModeService as any).callLLM(model, CONVERSATION, { humanPaced: true });
         const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
         const ttls = [...input.system, ...input.messages.flatMap((m: any) => m.content)]
           .filter((b: any) => b?.cachePoint)

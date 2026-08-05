@@ -728,12 +728,19 @@ interface LLMCallOptions {
    */
   usageContext?: LLMUsageContext | null;
   /**
-   * ENG-893: true when this call belongs to a machine-paced run (scheduled
-   * chats, loops) whose turns fire back-to-back. Such runs never idle past the
-   * default 5-minute prompt cache, so requesting the 1-hour TTL would only add
-   * its 2x write surcharge. Interactive sessions leave this false.
+   * ENG-893: opt IN to the 1-hour prompt-cache TTL, for conversations with human
+   * thinking time between turns.
+   *
+   * The default is deliberately OFF. A 1-hour cache write costs 2x input where a
+   * 5-minute write costs 1.25x, and a cache HIT refreshes the TTL for free — so
+   * the extended TTL only pays for itself when turns are far enough apart to have
+   * expired the 5-minute window. Machine-paced callers (scheduled runs, loops,
+   * one-shot judges and utility calls) fire back-to-back or never re-read the
+   * prefix at all, so for them it is a pure surcharge. Opting in rather than out
+   * means a new call site that has not thought about pacing keeps today's
+   * behaviour instead of silently buying the 2x rate.
    */
-  machinePaced?: boolean;
+  humanPaced?: boolean;
 }
 
 // Diagnosis agent configuration
@@ -1916,6 +1923,32 @@ export class AgentModeService {
     return this.getGeminiClient();
   }
 
+  /**
+   * ENG-893: models that have already reported a TTL other than the one we
+   * asked for. Log-once, so a persistent downgrade does not spam every turn.
+   */
+  private static readonly cacheTtlDowngradeWarned = new Set<string>();
+
+  /** Test seam — reset the log-once guard. */
+  public static __resetCacheTtlDowngradeWarnsForTests(): void {
+    AgentModeService.cacheTtlDowngradeWarned.clear();
+  }
+
+  private static warnCacheTtlDowngradeOnce(
+    modelId: string,
+    requestedTtl: string,
+    appliedTtls: string[]
+  ): void {
+    if (AgentModeService.cacheTtlDowngradeWarned.has(modelId)) return;
+    AgentModeService.cacheTtlDowngradeWarned.add(modelId);
+    console.warn(
+      `AgentMode: Bedrock did NOT honour the requested prompt-cache TTL for "${modelId}" ` +
+        `— asked for '${requestedTtl}', got '${appliedTtls.join(',') || 'none'}'. ` +
+        `Cost is still billed at the applied rate, but the extended-TTL saving is not being realised: ` +
+        `remove this model from BEDROCK_EXTENDED_CACHE_TTL_MODELS (ENG-893).`
+    );
+  }
+
   public async getBedrockClient(modelId: string): Promise<any> {
     // Use the Bedrock Converse API directly (instead of LangChain) to support
     // Anthropic prompt caching via cachePoint markers. This saves 30-50% on
@@ -1997,7 +2030,7 @@ export class AgentModeService {
             // measured at +43% of cache-write spend across the ten costliest
             // scheduled sessions. This mirrors AWS's own guidance: keep the
             // 5-minute cache for prompts reused more often than every 5 minutes.
-            const cacheTtl = params.machinePaced ? undefined : modelSupportsExtendedTtl;
+            const cacheTtl = params.humanPaced ? modelSupportsExtendedTtl : undefined;
             // A fresh object per call site: the two checkpoints must not alias.
             const cachePointBlock = () => ({
               cachePoint: cacheTtl ? { type: 'default', ttl: cacheTtl } : { type: 'default' },
@@ -2097,6 +2130,20 @@ export class AgentModeService {
                     return acc;
                   }, {})
                 : undefined;
+
+            // ENG-893: we allowlist the 1-hour TTL per model from live probes,
+            // and for Sonnet 4.6 / Opus 4.6 those probes contradict AWS's
+            // published "5 minutes only" table. Billing is already safe either
+            // way (we charge the TTL that came back), but a silent downgrade
+            // would quietly cost us the savings — so say so, once per model,
+            // rather than assuming the measurement holds forever.
+            if (cacheTtl && cacheWriteByTtl && !cacheWriteByTtl[cacheTtl]) {
+              AgentModeService.warnCacheTtlDowngradeOnce(
+                modelId,
+                cacheTtl,
+                Object.keys(cacheWriteByTtl)
+              );
+            }
 
             if (cacheReadTokens > 0 || cacheWriteTokens > 0) {
               const ttlBreakdown = Object.entries(cacheWriteByTtl || {})
@@ -2683,7 +2730,7 @@ export class AgentModeService {
       temperature = null,
       response_format = { type: "text" },
       usageContext = null,
-      machinePaced = false
+      humanPaced = false
     } = options || {};
 
     const params: any = {
@@ -2699,7 +2746,7 @@ export class AgentModeService {
     // forwards unknown body fields to the API — Azure OpenAI rejects an
     // unrecognised argument with a 400, which would break every GPT turn.
     if (model.startsWith('anthropic.')) {
-      params.machinePaced = machinePaced;
+      params.humanPaced = humanPaced;
     }
 
     // Only add tools and tool_choice if tools are provided
@@ -3574,8 +3621,8 @@ export class AgentModeService {
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
             usageContext: { userId, sessionId, feature: 'agent_task' },
-            // ENG-893: scheduled runs are machine-paced — no 1-hour TTL.
-            machinePaced: isScheduledSession
+            // ENG-893: only the interactive conversation loop waits on a human.
+            humanPaced: !isScheduledSession
           });
         } catch (callError) {
           if (isTransientLLMError(callError) && !backupModelUsed) {
@@ -3599,7 +3646,7 @@ export class AgentModeService {
                 temperature: 0.1,
                 usageContext: { userId, sessionId, feature: 'agent_task' },
                 // ENG-893: same pacing as the primary call it is retrying.
-                machinePaced: isScheduledSession
+                humanPaced: !isScheduledSession
               });
             } else {
               recordSpanError(chatSpan, callError);
