@@ -81,12 +81,23 @@ export function resolveSchedulePublishAuthorization(
     new Set(required.filter((name): name is string => typeof name === 'string' && isPublishName(name)))
   );
 
+  // CONSENT and SCOPE are separate, and BOTH are required.
+  //
   // Consent is the one flag the owner deliberately set for THIS purpose — never
   // inferred from the required-function picker, from prompt wording, or from
   // fullAutonomy (which governs how blocking questions are answered, not whether a
   // live write may happen). Strict === true so a truthy string/number from a
   // loosely-typed caller cannot grant publishing rights.
-  const authorized = schedule.autopublishAuthorized === true;
+  //
+  // Scope is `tools`. Consent with an EMPTY scope authorizes nothing: the owner
+  // consented to unattended publishing but designated no tool to do it with, so
+  // there is no specific irreversible action to approve. Authorizing that would
+  // turn an empty scope into a licence to reach for any live-publishing tool —
+  // an unscoped mandate the owner never granted. Requiring a designated tool keeps
+  // every authorization concrete and enumerable. Note this does NOT make the
+  // required-function picker a consent signal: it cannot authorize anything on its
+  // own, it only bounds what an already-granted consent covers.
+  const authorized = schedule.autopublishAuthorized === true && tools.length > 0;
 
   return { authorized, tools };
 }

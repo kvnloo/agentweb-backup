@@ -648,20 +648,18 @@ COMPLETION GATE (before final output):
 SURFACE GAPS AS ACTIONABLE ITEMS:
 - In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.${publishAuthorization === 'unknown'
   ? ''
-  : publishAuthorization === 'authorized'
+  : publishAuthorization === 'authorized' && authorizedPublishTools && authorizedPublishTools.length > 0
   ? `
 
 PUBLISH AUTHORIZATION — this schedule is PRE-AUTHORIZED to publish (CRITICAL):
-- The owner configured this schedule, in advance, to publish on their behalf${authorizedPublishTools && authorizedPublishTools.length > 0
-  ? ` — they explicitly designated ${authorizedPublishTools.join(' and ')} as required for this run`
-  : ' and marked it fully autonomous'}. That standing configuration IS the human approval for publishing — the "review with the user and get explicit approval before publishing" gate that the social tools mention is therefore ALREADY SATISFIED for this run. Do NOT seek additional sign-off and do NOT withhold the publish because no human is present.
-- When the task's goal is to publish (e.g. post the approved content to a connected LinkedIn / X / Instagram / YouTube account), you MUST call the publishing tool${authorizedPublishTools && authorizedPublishTools.length > 0 ? ` (${authorizedPublishTools.join(', ')})` : ' (e.g. post_on_connected_account)'} to actually publish it. Drafting the content or saving it to the knowledge base alone is NOT completion — the run only succeeds once the post is actually published.
-- This authorization covers ONLY the publishing action above. It does not waive any other limit — volume caps, spend, and destructive operations are governed by their own rules and are unaffected.
+- The owner turned on "Publish without my review" for this schedule and designated ${authorizedPublishTools.join(' and ')} for it. That standing consent IS the human approval for publishing — the "review with the user and get explicit approval before publishing" gate that the social tools mention is therefore ALREADY SATISFIED for this run. Do NOT seek additional sign-off and do NOT withhold the publish because no human is present.
+- When the task's goal is to publish (e.g. post the approved content to a connected LinkedIn / X / Instagram / YouTube account), you MUST call ${authorizedPublishTools.join(' / ')} to actually publish it. Drafting the content or saving it to the knowledge base alone is NOT completion — the run only succeeds once the post is actually published.
+- The authorization covers ONLY ${authorizedPublishTools.join(' and ')}. Any OTHER publishing tool is NOT authorized by it — draft and notify for those instead. It also does not waive any non-publishing limit: volume caps, spend, and destructive operations are governed by their own rules and are unaffected.
 - Treat a required-tool nudge to call the publishing tool as the authorized instruction it is and execute it; declining an authorized publish on safety/approval grounds is the exact failure this authorization exists to prevent.`
   : `
 
 PUBLISH AUTHORIZATION — this schedule is NOT pre-authorized to publish (CRITICAL):
-- No standing approval exists to publish to a live connected account in this unattended run, and no human is present to give one. Do NOT call a live-publishing tool (e.g. post_on_connected_account) — publishing is irreversible and this schedule was not marked autonomous.
+- No standing approval exists to publish to a live connected account in this unattended run, and no human is present to give one. Do NOT call a live-publishing tool (e.g. post_on_connected_account) — publishing is irreversible and the owner has not turned on "Publish without my review" for this schedule.
 - Instead, fully draft the content, save it to the knowledge base, and state ONCE — clearly — that it is drafted and awaiting the owner's approval. That draft-and-notify outcome is the correct, COMPLETE terminal state for a non-authorized publishing run; it is NOT unfinished work and must not be treated as a failure.
 - Do NOT repeatedly re-attempt or re-explain the withheld publish across turns — one clear "drafted, pending approval" statement ends the run.`}`;
 }
