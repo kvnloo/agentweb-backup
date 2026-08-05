@@ -9,11 +9,14 @@ import { resolveSchedulePublishAuthorization } from '../utils/schedulePublishAut
  * the schedule was authorized to publish, and the required-function checker then
  * nudged it ~21 times.
  *
- * Consent is an explicit owner-set boolean and NOTHING else. Two earlier attempts
- * were both wrong and are pinned here as regressions:
- *   - the Required Functions picker (a verification control with no waiver language)
+ * Consent is `autopublishAuthorized` and NOTHING else. Three earlier attempts were
+ * each wrong for the same reason — a control whose own wording never tells the owner
+ * that publishing-without-review is what they are agreeing to cannot be consent for
+ * it — and all three are pinned here as regressions:
+ *   - the Required Functions picker (a verification control, no waiver language)
  *   - approval-waiver wording in the schedule prompt (unscoped: a waiver about a
  *     different step would authorize a live post)
+ *   - fullAutonomy (governs how a blocking question is ANSWERED, not live writes)
  */
 describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
   // ── Fail-closed: every ambiguous / missing case ─────────────────────────────
@@ -22,12 +25,11 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
     expect(resolveSchedulePublishAuthorization(undefined)).toEqual({ authorized: false, tools: [] });
   });
 
-  it('is NOT authorized for an empty schedule or with both flags off', () => {
+  it('is NOT authorized for an empty schedule or with the flag off', () => {
     expect(resolveSchedulePublishAuthorization({})).toEqual({ authorized: false, tools: [] });
     expect(
       resolveSchedulePublishAuthorization({
         requiredFunctionCalls: [],
-        fullAutonomy: false,
         autopublishAuthorized: false,
       })
     ).toEqual({ authorized: false, tools: [] });
@@ -40,11 +42,10 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
       .toEqual({ authorized: false, tools: [] });
   });
 
-  it('requires the consent flags to be strictly true (truthy values do not authorize)', () => {
-    expect(resolveSchedulePublishAuthorization({ fullAutonomy: 'yes' as any }).authorized).toBe(false);
-    expect(resolveSchedulePublishAuthorization({ fullAutonomy: 1 as any }).authorized).toBe(false);
+  it('requires the consent flag to be strictly true (truthy values do not authorize)', () => {
     expect(resolveSchedulePublishAuthorization({ autopublishAuthorized: 'true' as any }).authorized).toBe(false);
     expect(resolveSchedulePublishAuthorization({ autopublishAuthorized: 1 as any }).authorized).toBe(false);
+    expect(resolveSchedulePublishAuthorization({ autopublishAuthorized: {} as any }).authorized).toBe(false);
   });
 
   // ── The picker is NOT consent (Greptile P1 #2) ──────────────────────────────
@@ -55,7 +56,6 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
   it('does NOT authorize on a required publish tool alone', () => {
     const result = resolveSchedulePublishAuthorization({
       requiredFunctionCalls: ['post_on_connected_account'],
-      fullAutonomy: false,
     });
     expect(result.authorized).toBe(false);
     // tools are still REPORTED so the required-function checker can filter on them
@@ -65,7 +65,6 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
   it('does NOT authorize the real LUCAS shape (publish tool required, no consent flag)', () => {
     const result = resolveSchedulePublishAuthorization({
       requiredFunctionCalls: ['generate_image', 'post_on_connected_account'],
-      fullAutonomy: false,
     });
     expect(result.authorized).toBe(false);
     expect(result.tools).toEqual(['post_on_connected_account']);
@@ -99,14 +98,30 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
     const result = resolveSchedulePublishAuthorization({
       autopublishAuthorized: true,
       requiredFunctionCalls: ['post_on_connected_account'],
-      fullAutonomy: false,
     });
     expect(result).toEqual({ authorized: true, tools: ['post_on_connected_account'] });
   });
 
-  it('AUTHORIZES on fullAutonomy, the pre-existing irreversible-action waiver', () => {
-    expect(resolveSchedulePublishAuthorization({ fullAutonomy: true }))
-      .toEqual({ authorized: true, tools: [] });
+  // Greptile P1 #4: fullAutonomy governs how a blocking AskUserQuestion is ANSWERED
+  // (ENG-396/ENG-517) — "if Emma needs a decision mid-run she'll proceed with her
+  // recommended option". An owner ticking it consented to Emma choosing between
+  // options, NOT to Emma posting content they never saw. It must not grant publishing.
+  it('does NOT authorize on fullAutonomy — it is not a publish-consent control', () => {
+    const result = resolveSchedulePublishAuthorization({
+      fullAutonomy: true,
+      requiredFunctionCalls: ['post_on_connected_account'],
+    } as any);
+    expect(result.authorized).toBe(false);
+    expect(result.tools).toEqual(['post_on_connected_account']);
+  });
+
+  it('does NOT authorize on fullAutonomy even combined with every other non-consent signal', () => {
+    const result = resolveSchedulePublishAuthorization({
+      fullAutonomy: true,
+      requiredFunctionCalls: ['post_on_connected_account'],
+      startingMessage: 'Post it automatically. Do not ask for approval.',
+    } as any);
+    expect(result.authorized).toBe(false);
   });
 
   it('AUTHORIZES on the mixed required-list shape, returning only the publish tools', () => {

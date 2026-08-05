@@ -140,10 +140,10 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     // Default owner-admin lookup to a deterministic non-admin so the base suite
     // never makes a real DB call; admin-gating cases below override this per-test.
     jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: USER_ID, isAdmin: false } as any);
-    // ENG-827: publish authorization is derived from the schedule's fullAutonomy
-    // flag. Default the lookup to a non-autonomous schedule (draft-and-notify);
-    // publish-authorized cases below override this per-test.
-    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: false } as any);
+    // ENG-827: publish authorization comes solely from the schedule's dedicated
+    // `autopublishAuthorized` consent flag. Default the lookup to a schedule without
+    // it (draft-and-notify); authorized cases below override this per-test.
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, autopublishAuthorized: false } as any);
     // Worker returns a normal success so generateResponse completes without error.
     mockWorker.runInWorker.mockResolvedValue({
       content: 'Report delivered.',
@@ -293,14 +293,21 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
   // The controller resolves the schedule's fullAutonomy flag into the publish
   // authorization block. Cover the authorize / withhold / lookup-failure branches
   // end-to-end so a regression in the wiring can't silently drop the signal.
-  it('AUTHORIZES publishing when the schedule is fullAutonomy (pre-authorized)', async () => {
-    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: true } as any);
+  // Greptile P1 #4: fullAutonomy governs how a blocking AskUserQuestion is ANSWERED
+  // (ENG-396/ENG-517), not whether a live write may happen. An owner ticking it
+  // consented to Emma choosing between options, not to Emma posting content they
+  // never saw — so it must NOT flip the publish directive.
+  it('WITHHOLDS publishing on fullAutonomy alone — it is not a publish-consent control', async () => {
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
+      scheduleId: SCHEDULE_ID,
+      fullAutonomy: true,
+      requiredFunctionCalls: ['post_on_connected_account'],
+    } as any);
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
     expect(sp).toContain('PUBLISH AUTHORIZATION');
-    expect(sp).toContain('PRE-AUTHORIZED to publish');
-    expect(sp).toContain('post_on_connected_account');
-    expect(sp).not.toContain('NOT pre-authorized to publish');
+    expect(sp).toContain('NOT pre-authorized to publish');
+    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
   });
 
   it('WITHHOLDS publishing (draft & notify) when the schedule is not fullAutonomy', async () => {
