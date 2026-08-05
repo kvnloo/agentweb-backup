@@ -30,16 +30,20 @@ const context = { userId: 'user-123', sessionId: 'session-abc', llmModel: 'test-
 const GMAIL_ACCOUNT = { platform: 'gmail', account_id: 'founders@agentweb.pro', account_name: 'founders@agentweb.pro' };
 
 /** A message summary as the email providers return it. */
-function summary(over: Partial<{ id: string; subject: string; from: string; date: string }> = {}) {
+function summary(over: Partial<{ id: string; subject: string; from: string; date: string; receivedAt: string }> = {}) {
+  // receivedAt (the provider's own receipt stamp) is what freshness is judged
+  // on; `date` is the sender's header and is display-only. The default fixture
+  // arrived AFTER the tool was invoked, which is the only thing a default call
+  // accepts — a pre-call message cannot be told apart from the previous
+  // attempt's code.
+  const arrived = over.receivedAt ?? over.date ?? new Date(Date.now() + 5_000).toISOString();
   return {
     id: over.id ?? 'msg-1',
     threadId: 't-1',
     subject: over.subject ?? 'Your RankAI Login Code',
     from: over.from ?? 'founders@agentweb.pro',
-    // Default fixture: arrived AFTER the tool was invoked, which is the only
-    // thing a default call accepts (a pre-call message cannot be told apart
-    // from the previous attempt's code).
-    date: over.date ?? new Date(Date.now() + 5_000).toISOString(),
+    date: over.date ?? arrived,
+    receivedAt: arrived,
     snippet: '',
   };
 }
@@ -87,7 +91,7 @@ describe('read_verification_code — wait window', () => {
 describe('read_verification_code — arrival partitioning', () => {
   const invokedAt = Date.parse('2026-08-05T12:00:00.000Z');
   const window = { invokedAt, since: invokedAt - 60_000 };
-  const at = (offsetMs: number) => ({ id: `m${offsetMs}`, date: new Date(invokedAt + offsetMs).toISOString() });
+  const at = (offsetMs: number) => ({ id: `m${offsetMs}`, receivedAt: new Date(invokedAt + offsetMs).toISOString() });
 
   it('treats a message that arrived after the call as unambiguously ours', () => {
     const result = partitionByArrival([at(5_000)], window);
@@ -113,9 +117,28 @@ describe('read_verification_code — arrival partitioning', () => {
     expect(result.arrivedAfterCall.map((e) => e.id)).toEqual(['m9000', 'm5000', 'm1000']);
   });
 
-  it('treats an unparseable date as stale rather than as a fresh code', () => {
-    const result = partitionByArrival([{ id: 'bad', date: 'not a date' }], window);
+  it('treats an unparseable server timestamp as stale rather than as a fresh code', () => {
+    const result = partitionByArrival([{ id: 'bad', receivedAt: 'not a date' }], window);
     expect(result.stale.map((e) => e.id)).toEqual(['bad']);
+  });
+
+  it('treats a message with no server timestamp as stale, whatever its Date header claims', () => {
+    const result = partitionByArrival([{ id: 'nostamp', date: new Date(invokedAt + 60_000).toISOString() }], window);
+    expect(result.arrivedAfterCall).toHaveLength(0);
+    expect(result.stale.map((e) => e.id)).toEqual(['nostamp']);
+  });
+
+  // Greptile P1: Gmail's `date` is the SENDER's header. A sender whose clock
+  // runs fast would otherwise stamp a previous email into our future.
+  it('ignores a sender Date header that claims the future', () => {
+    const skewed = {
+      id: 'skewed',
+      date: new Date(invokedAt + 10 * 60_000).toISOString(),
+      receivedAt: new Date(invokedAt - 30 * 60_000).toISOString(),
+    };
+    const result = partitionByArrival([skewed], window);
+    expect(result.arrivedAfterCall).toHaveLength(0);
+    expect(result.stale.map((e) => e.id)).toEqual(['skewed']);
   });
 });
 

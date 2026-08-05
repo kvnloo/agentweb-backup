@@ -77,6 +77,22 @@ function parsedTime(value: unknown): number {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
+/**
+ * When the provider received the message.
+ *
+ * Deliberately NOT the Date header: Gmail populates `date` from the sender's own
+ * header, so a sender whose clock runs fast stamps a previous email into our
+ * future and it would be read as having arrived after this call — the stale-code
+ * path all over again (Greptile P1). `receivedAt` is server-stamped (Gmail
+ * internalDate, Outlook receivedDateTime) and cannot be moved by the sender.
+ *
+ * A message with no server timestamp gets 0, i.e. sorts as stale: unknown
+ * arrival is not evidence of a fresh code.
+ */
+function arrivalTime(email: any): number {
+  return parsedTime(email?.receivedAt);
+}
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
@@ -89,8 +105,8 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * the buckets stay separate and the caller prefers `arrivedAfterCall`, falling
  * back to `withinGrace` only once there is no time left for a newer message.
  *
- * An unparseable date sorts as stale: a message we cannot place in time is not
- * evidence of a fresh code.
+ * An unparseable or absent server timestamp sorts as stale: a message we cannot
+ * place in time is not evidence of a fresh code.
  */
 export function partitionByArrival(
   emails: any[],
@@ -101,13 +117,13 @@ export function partitionByArrival(
   const stale: any[] = [];
 
   for (const email of emails || []) {
-    const at = parsedTime(email?.date);
+    const at = arrivalTime(email);
     if (at >= window.invokedAt) arrivedAfterCall.push(email);
     else if (at >= window.since) withinGrace.push(email);
     else stale.push(email);
   }
 
-  const newestFirst = (a: any, b: any) => parsedTime(b?.date) - parsedTime(a?.date);
+  const newestFirst = (a: any, b: any) => arrivalTime(b) - arrivalTime(a);
   return {
     arrivedAfterCall: arrivedAfterCall.sort(newestFirst),
     withinGrace: withinGrace.sort(newestFirst),
@@ -402,7 +418,7 @@ emmaToolRegistry.register({
             link_omitted: linkOmitted,
             subject: detail.subject ?? summary?.subject,
             from: detail.from ?? summary?.from,
-            received_at: detail.date ?? summary?.date,
+            received_at: detail.receivedAt ?? summary?.receivedAt ?? detail.date ?? summary?.date,
             account: { platform, account_id: accountId },
           };
         }
