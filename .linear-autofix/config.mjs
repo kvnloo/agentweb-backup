@@ -220,6 +220,17 @@ export const config = {
                                    // worktree path — a worktree also hosts type-checks, jest, portal builds
                                    // and claude turns, and ENG-845 was locked with 2 live turns at the time.
                                    // false = leave orphans running.
+  previewReconcileFailedBringUps: true, // tear down half-built stacks left by a bring-up that started and
+                                   // never finished. preview.mjs records each service as it starts it, so an
+                                   // interrupted run leaves a TRACKED half-stack instead of invisible servers;
+                                   // this is what resolves it once no `preview.mjs up` is alive for the bug.
+                                   // Before this, a died bring-up leaked its servers with NO state entry at
+                                   // all — how eng-803 and eng-873 ended up serving on 31100/52100 unrecorded
+                                   // on 2026-08-05, and how ENG-845 accumulated 2498MB of them. false = leave.
+  previewMaxBringUpMinutes: 45,    // how long a `starting`/`refreshing` entry is trusted while NO bring-up
+                                   // process is running for it. Deliberately generous: each portal build
+                                   // queues on the machine-wide flock, so bring-ups have taken 15-25 minutes
+                                   // under contention and must never be cut off mid-build.
   previewOrphanDryRun: true,       // OBSERVE-ONLY: log what the reap WOULD stop, signal nothing. On its first
                                    // live pass (2026-08-05 13:40) the reap killed the backend of a bring-up
                                    // 24 minutes into its run, through a window where no state entry existed

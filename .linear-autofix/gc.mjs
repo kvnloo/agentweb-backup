@@ -13,7 +13,7 @@ import { resolveIssue, addComment } from './linear.mjs';
 import { lockActive } from './lock.mjs';
 import { gitRepoOp, pruneRepoLocks } from './repo-lock.mjs';
 import { admissionWithdrawal } from './admission.mjs';
-import { evictIdlePreviews, evictUnderMemoryPressure, reconcileDeadPreviews, reapOrphanPreviewProcs, stalePreviews } from './preview/policy.mjs';
+import { evictIdlePreviews, evictUnderMemoryPressure, reconcileDeadPreviews, reconcileFailedBringUps, reapOrphanPreviewProcs, stalePreviews } from './preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..');
@@ -164,6 +164,19 @@ async function main() {
   // and protect previews by idle time without knowing which are corpses, so a dead stack could occupy
   // the `previewMemKeep` slot and get spared while a LIVE one was evicted in its place. Clearing first
   // makes every decision after it operate on stacks that actually exist.
+  // First: bring-ups that started and never finished. preview.mjs records each service as it starts it,
+  // so a run interrupted mid-build leaves a TRACKED half-stack (`starting` + recorded pids) rather than
+  // invisible servers. This is what notices those runs are dead — no `preview.mjs up` alive for the bug
+  // and past previewMaxBringUpMinutes — and tears the half-stack down through the normal path, which
+  // stops its servers and frees the bug for a clean re-bring-up. Runs before the sweeps below because
+  // it is the one that turns an ambiguous `starting` entry into a resolved one.
+  if (config.previewReconcileFailedBringUps !== false) {
+    try {
+      const failed = reconcileFailedBringUps(log, { maxStartMs: (config.previewMaxBringUpMinutes ?? 45) * 60 * 1000 });
+      if (failed.length) log(`tore down ${failed.length} half-built stack(s) from failed bring-up(s)`);
+    } catch (e) { log(`failed-bring-up reconcile failed: ${e.message}`); }
+  }
+
   if (config.previewReconcileDead !== false) {
     try { reconcileDeadPreviews(log, { isLocked: lockActive }); }
     catch (e) { log(`dead-preview reconcile failed: ${e.message}`); }

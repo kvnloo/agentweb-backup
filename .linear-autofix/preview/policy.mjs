@@ -306,11 +306,7 @@ export function orphanPreviewProcs({
   // sweep (2026-08-05 13:40) that window cost an eng-803 bring-up its backend 24 minutes into the run,
   // because with the entry gone a perfectly live server was indistinguishable from an orphan. Absence of
   // state is not evidence of orphanhood; while a bring-up runs, the process table is the authority.
-  const bringingUp = new Set();
-  for (const p of procs) {
-    const m = String(p?.args || '').match(/preview\.mjs\s+(?:up|refresh)\s+(\S+)/);
-    if (m) bringingUp.add(m[1].toLowerCase());
-  }
+  const bringingUp = bringingUpBugs(procs);
   const rootPrefix = root.endsWith('/') ? root : `${root}/`;
   return procs.filter((p) => {
     if (!p || !PREVIEW_SHAPES.some((re) => re.test(p.args))) return false;   // not a preview server
@@ -361,6 +357,58 @@ export function listPreviewCandidates(spawn = spawnSync, readLink = (p) => readl
     out.push({ pid: +m[1], ageSec: +m[2], rssKB: +m[3], args: m[4], cwd });
   }
   return out;
+}
+
+// Which `starting`/`refreshing` entries belong to a bring-up that DIED mid-flight?
+//
+// preview.mjs now persists each service as it starts it, keeping `starting` set until the run finishes,
+// so an interrupted bring-up leaves a TRACKED half-stack rather than invisible leaked servers. That
+// closes the leak but opens this question: every sweep skips `starting` entries, so a run that died
+// would keep its entry — and its live servers — forever.
+//
+// A `starting` entry is trusted only while a bring-up is actually running for that bug (the process
+// table is the authority, same signal the orphan reaper uses) or while it is young enough to still
+// plausibly be working. Bring-ups here take 15-25 minutes under build-lock contention, so `maxStartMs`
+// is deliberately generous. Past it with no bring-up alive, the run is dead and its half-stack should be
+// torn down — which now actually works, because its pids are recorded.
+export function failedBringUps({
+  state = readJson(STATE),
+  bringingUp = bringingUpBugs(),
+  now = Date.now(),
+  maxStartMs = 45 * 60 * 1000,
+} = {}) {
+  const failed = [];
+  for (const [b, e] of Object.entries(state)) {
+    if (!e || !(e.starting || e.refreshing)) continue;      // only in-flight bring-ups can have failed
+    if (bringingUp.has(b.toLowerCase())) continue;          // it is running right now — trust it
+    const started = Date.parse(e.at || '');
+    if (Number.isNaN(started)) continue;                    // no timestamp → cannot judge age
+    if (now - started < maxStartMs) continue;               // still plausibly building
+    failed.push(b);
+  }
+  return failed;
+}
+
+// Bugs with a `preview.mjs up|refresh` actually running, read from the process table.
+export function bringingUpBugs(procs = listPreviewCandidates()) {
+  const out = new Set();
+  for (const p of procs) {
+    const m = String(p?.args || '').match(/preview\.mjs\s+(?:up|refresh)\s+(\S+)/);
+    if (m) out.add(m[1].toLowerCase());
+  }
+  return out;
+}
+
+// Effectful wrapper: tears down half-built stacks left by bring-ups that died. `down` kills the recorded
+// pids — which exist now that preview.mjs records services as it starts them — and drops the entry, so
+// the bug can be brought up again cleanly instead of leaking servers nothing can find.
+export function reconcileFailedBringUps(log = () => {}, opts = {}) {
+  const failed = failedBringUps(opts);
+  for (const b of failed) {
+    log(`preview ${b}: bring-up started but never finished and is no longer running — tearing down the half-built stack`);
+    spawnSync('node', [PREVIEW, 'down', b], { stdio: 'inherit' });
+  }
+  return failed;
 }
 
 // Effectful wrapper: clears every dead preview's state + routes via the normal teardown path (which is

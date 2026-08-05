@@ -80,5 +80,35 @@ console.log('deadPreviewIds — mixed fleet (the post-OOM-kill shape)');
   ok(got.length === 2, 'exactly the two dead, unlocked stacks');
 }
 
+// ── Failed bring-ups ────────────────────────────────────────────────────────────────────────────────
+// A bring-up now persists its services as it starts them (preview.mjs), keeping `starting` set while it
+// works — so an interrupted run leaves a TRACKED half-stack instead of invisible leaked servers. That
+// closes the leak but opens a second question: `starting` entries are skipped by every sweep, so a run
+// that died mid-flight would keep its entry, and its live servers, forever.
+//
+// A `starting` entry is therefore only trusted while a bring-up is actually running for that bug (the
+// process table is the authority — the same signal the orphan reaper uses) or while it is young enough
+// to still plausibly be working. Bring-ups here take 15-25 minutes under build-lock contention, so the
+// threshold is generous. Past it, with no bring-up process alive, the run is dead: tear the half-stack
+// down so its servers stop and the bug can be brought up again cleanly.
+import { failedBringUps } from '../preview/policy.mjs';
+
+const NOW2 = 1_700_000_000_000;
+const ago = (ms) => new Date(NOW2 - ms).toISOString();
+const MIN = 60 * 1000;
+const fb = (state, opts = {}) => failedBringUps({ state, bringingUp: new Set(), now: NOW2, maxStartMs: 45 * MIN, ...opts });
+
+console.log('failedBringUps');
+{
+  ok(fb({ a: { starting: true, at: ago(60 * MIN) } }).join() === 'a', 'starting for 60m with no bring-up running → failed');
+  ok(fb({ a: { starting: true, at: ago(20 * MIN) } }).length === 0, 'starting for only 20m → still plausibly building (bring-ups take 15-25m)');
+  ok(fb({ a: { starting: true, at: ago(60 * MIN) } }, { bringingUp: new Set(['a']) }).length === 0,
+    'a bring-up IS running for it → trusted no matter how long it has taken');
+  ok(fb({ a: { refreshing: true, at: ago(60 * MIN) } }).join() === 'a', '`refreshing` (a rebuild of a live stack) is the same case');
+  ok(fb({ a: { procs: { backend: { pid: 1 } }, at: ago(99 * MIN) } }).length === 0, 'a COMPLETED entry is never a failed bring-up, however old');
+  ok(fb({ a: { starting: true } }).length === 0, 'no timestamp → cannot judge age, so left alone');
+  ok(fb({}).length === 0, 'empty state → nothing');
+}
+
 console.log(fail ? `\n❌ ${fail} FAILED — ${pass} passed, ${fail} failed` : `\n✅ ALL PASSED — ${pass} passed, 0 failed`);
 process.exit(fail ? 1 : 0);

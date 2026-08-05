@@ -226,6 +226,20 @@ async function up(bugRaw, worktreeRaw) {
     child.unref();
     procs[svc.name] = { pid: child.pid, port: ports[pkey] };
     console.log(`[preview] ${bug}: started ${svc.name} (pid ${child.pid}) on :${ports[pkey]}`);
+
+    // Persist what is running RIGHT NOW, before the next service's (minutes-long) build. The full entry
+    // used to be written only after this whole loop finished, which meant every service started so far
+    // was untracked for the duration — and the gap is not small: each portal build queues on the
+    // machine-wide flock, so bring-ups here have taken 15-25 minutes under contention. Anything that
+    // ended the run inside that window (a kill, a crash, an exit) left live servers with NO state entry
+    // and nothing that could ever find them again. That is how eng-803 and eng-873 both ended up serving
+    // on 31100/52100 with no record on 2026-08-05, and how ENG-845 accumulated 2498MB of forgotten
+    // processes. Keeping `starting` set marks the bring-up as still in flight, so the gc sweeps leave it
+    // alone while it works; the final write below drops the flag.
+    { const st = readJson(STATE);
+      st[bug] = { ...(st[bug] || {}), worktree, ports: { ...ports }, procs: { ...procs }, starting: true, ...(manual ? { manual: true } : {}) };
+      writeJson(STATE, st);
+    }
   }
 
   const routes = readJson(ROUTES);
