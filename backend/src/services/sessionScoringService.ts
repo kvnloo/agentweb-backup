@@ -123,8 +123,8 @@ const MIN_USER_MESSAGES = 1;
  * deliberately small and exact-match — a greeting-only session is excluded from
  * satisfaction scoring (ENG-168), so this set biases toward NOT matching: any
  * substantive user turn falls through and the session is scored normally.
- * Values are the normalized form produced by `normalizeForGreeting` (lowercased,
- * punctuation/emoji stripped, whitespace collapsed).
+ * Values are the normalized form produced by `normalizeUserTurn` (sender prefix
+ * stripped, lowercased, punctuation/emoji stripped, whitespace collapsed).
  */
 const GREETING_PHRASES = new Set<string>([
   "hi", "hii", "hiii", "hiya", "high", "hey", "heya", "heyy", "hello", "helo",
@@ -135,12 +135,52 @@ const GREETING_PHRASES = new Set<string>([
 ]);
 
 /**
- * Normalize a user message for greeting matching: lowercase, drop everything
- * that is not a letter/digit/space (punctuation, emoji), then collapse runs of
- * whitespace. E.g. "Hi 👋" → "hi", "Good morning!" → "good morning".
+ * Non-greeting turns that still state no task: interruptions ("wait"), bare
+ * acknowledgements ("ok", "thanks"), withdrawals ("nvm") and probe messages
+ * ("test"). A session whose user turns are ONLY these asked for nothing, so —
+ * exactly like a greeting-only session — there is no goal for the judge to
+ * grade and goalCompletion floors the score at ~3 as a pure artifact (ENG-830).
+ * Same exact-match discipline as GREETING_PHRASES: anything longer than the
+ * bare phrase (e.g. "wait, redo the post") falls through and is scored.
  */
-function normalizeForGreeting(text: string): string {
+const NO_TASK_PHRASES = new Set<string>([
+  "wait", "wait a sec", "wait a second", "wait a moment", "hold on", "hold up",
+  "hang on", "one sec", "one second", "one moment", "just a sec",
+  "just a second", "give me a sec", "give me a second", "brb", "nvm",
+  "nevermind", "never mind", "ignore that", "ignore this", "disregard",
+  "nothing", "nothing for now", "no task", "not now", "later", "ok", "okay",
+  "k", "kk", "got it", "cool", "nice", "thanks", "thank you", "thx", "ty",
+  "test", "testing", "test message",
+]);
+
+/** Union of every user turn that states no goal. */
+const NO_GOAL_PHRASES = new Set<string>([...GREETING_PHRASES, ...NO_TASK_PHRASES]);
+
+/**
+ * A Slack-style sender-name prefix on a user turn. Messages relayed from Slack
+ * are persisted as `"<Display Name>: <text>"` (see routes/slack.ts), so the raw
+ * content of a greeting-only Slack session is "Fangfang Tan: Hi" rather than
+ * "Hi" — which silently defeated the exact-match no-goal check and put flawless
+ * zero-task sessions back into the ≤3 cohort (ENG-830).
+ *
+ * Deliberately narrow: 1–4 name-shaped words (letters plus `.`/`'`/`-`, no
+ * digits) followed by a colon AND whitespace AND remaining text. A label prefix
+ * on a real request ("Reminder: send the report") also matches, but its
+ * remainder is substantive and still fails the phrase check, so stripping it
+ * changes nothing.
+ */
+const SENDER_NAME_PREFIX = /^[\p{L}][\p{L}.'’-]*(?:[ \t]+[\p{L}][\p{L}.'’-]*){0,3}:[ \t]+(?=\S)/u;
+
+/**
+ * Normalize a user message for no-goal matching: drop a relayed sender-name
+ * prefix, lowercase, drop everything that is not a letter/digit/space
+ * (punctuation, emoji), then collapse runs of whitespace.
+ * E.g. "Hi 👋" → "hi", "Good morning!" → "good morning",
+ * "Fangfang Tan: Hi" → "hi".
+ */
+function normalizeUserTurn(text: string): string {
   return text
+    .replace(SENDER_NAME_PREFIX, "")
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
@@ -148,34 +188,37 @@ function normalizeForGreeting(text: string): string {
 }
 
 /**
- * True when a session is greeting-only / no-goal-stated: the user exchanged
- * pleasantries but never stated a task or asked a question. Such sessions have
- * no goal to complete, so the LLM judge scores goalCompletion low (≈3/5) purely
- * as a scoring artifact — dragging the satisfaction cohort down with no
- * actionable fault (ENG-168). We treat them like the existing skip cases
- * (sub-threshold / in-flight sessions) and exclude them from scoring.
+ * True when a session states no task at all: the user exchanged pleasantries
+ * ("hi"), interrupted ("wait"), acknowledged ("ok, thanks") or probed ("test"),
+ * but never stated a goal or asked a question. Such sessions have no goal to
+ * complete, so the LLM judge scores goalCompletion low (≈3/5) purely as a
+ * scoring artifact — dragging the satisfaction cohort down with no actionable
+ * fault (ENG-168, extended by ENG-830). We treat them like the existing skip
+ * cases (sub-threshold / in-flight sessions) and exclude them from scoring
+ * entirely, in BOTH the general and custom-judge paths, so the judges cannot
+ * disagree on how to grade an equivalent zero-task session.
  *
  * Conservative by design: EVERY user turn must normalize to a recognized
- * greeting for the session to qualify. Any substantive turn — a request, a
- * question, or any text not in `GREETING_PHRASES` — returns false so the
+ * no-goal phrase for the session to qualify. Any substantive turn — a request,
+ * a question, or any text not in `NO_GOAL_PHRASES` — returns false so the
  * session is scored normally. Erring toward scoring avoids silently hiding a
  * genuinely unsatisfied session.
  */
-export function isGreetingOnlySession(messages: ChatMessage[] = []): boolean {
+export function isNoTaskSession(messages: ChatMessage[] = []): boolean {
   const userTexts = (messages || [])
     .filter((m: any) => m.role === "user")
     .map((m: any) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")));
 
   if (userTexts.length === 0) return false;
 
-  let sawGreeting = false;
+  let sawNoGoalTurn = false;
   for (const raw of userTexts) {
-    const norm = normalizeForGreeting(raw);
+    const norm = normalizeUserTurn(raw);
     if (norm === "") continue; // non-substantive (e.g. emoji-only) — not a goal
-    if (!GREETING_PHRASES.has(norm)) return false; // substantive content → scorable
-    sawGreeting = true;
+    if (!NO_GOAL_PHRASES.has(norm)) return false; // substantive content → scorable
+    sawNoGoalTurn = true;
   }
-  return sawGreeting;
+  return sawNoGoalTurn;
 }
 
 /**
@@ -609,11 +652,11 @@ export async function scoreSessionWithJudgeIfNeeded(
     return null;
   }
 
-  // Greeting-only / no-goal-stated session: no goal to complete, so the judge
-  // scores it low on goalCompletion as a pure scoring artifact. Exclude it from
-  // the satisfaction cohort (ENG-168) — same skip-and-return-null treatment as
-  // sub-threshold and in-flight sessions.
-  if (isGreetingOnlySession(session.messages)) {
+  // No-task session (greeting-only, interruption, bare acknowledgement): no goal
+  // to complete, so the judge scores it low on goalCompletion as a pure scoring
+  // artifact. Exclude it from the satisfaction cohort (ENG-168, ENG-830) — same
+  // skip-and-return-null treatment as sub-threshold and in-flight sessions.
+  if (isNoTaskSession(session.messages)) {
     return null;
   }
 
@@ -689,11 +732,11 @@ export async function scoreSessionIfNeeded(
     return null;
   }
 
-  // Greeting-only / no-goal-stated session: no goal to complete, so the judge
-  // scores it low on goalCompletion as a pure scoring artifact. Exclude it from
-  // the satisfaction cohort (ENG-168) — same skip-and-return-null treatment as
-  // sub-threshold and in-flight sessions.
-  if (isGreetingOnlySession(session.messages)) {
+  // No-task session (greeting-only, interruption, bare acknowledgement): no goal
+  // to complete, so the judge scores it low on goalCompletion as a pure scoring
+  // artifact. Exclude it from the satisfaction cohort (ENG-168, ENG-830) — same
+  // skip-and-return-null treatment as sub-threshold and in-flight sessions.
+  if (isNoTaskSession(session.messages)) {
     return null;
   }
 
