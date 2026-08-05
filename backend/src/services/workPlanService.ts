@@ -70,6 +70,14 @@ export interface WorkPlan {
    *  condition on it, so a concurrent title/step/owner edit cannot discard a
    *  generated thumbnail while a concurrent thumbnail action still does. */
   thumbnail_rev?: string;
+
+  /** Bumped by every updateWorkPlan write. A caller that decided a write was
+   *  safe by reading the plan first can pass the revision it saw, so a
+   *  competing write in between fails it instead of silently invalidating the
+   *  decision — the read-then-write gap under the MCP tool's destructive-step
+   *  guard (ENG-890). Scoped to plan writes, exactly as thumbnail_rev is scoped
+   *  to thumbnail writes, so the two never invalidate each other. */
+  steps_rev?: string;
 }
 
 /** Owned exclusively by updateThumbnail. updateWorkPlan must never write these,
@@ -86,6 +94,10 @@ const OPTIONAL_PLAN_FIELDS = [
 
 /** Always written. */
 const REQUIRED_PLAN_FIELDS = ['title', 'steps', 'visibility', 'isBuiltIn', 'createdAt'] as const;
+
+/** Minted by updateWorkPlan itself, never supplied by a caller. Kept out of the
+ *  lists above so an ordinary save cannot REMOVE it as a "cleared" field. */
+const SELF_MINTED_FIELDS = ['steps_rev'] as const;
 
 export class WorkPlanService {
   private tableName: string;
@@ -149,14 +161,29 @@ export class WorkPlanService {
    * attribute-scoped: every non-thumbnail field is written, fields the caller
    * cleared are REMOVEd (which the put gave us for free), and the thumbnail
    * attributes are left entirely alone (ENG-889).
+   *
+   * @param opts.expectedStepsRev the `steps_rev` observed when the caller
+   *   decided this write was safe; `null` for "the plan had no revision yet".
+   *   Omit for writes that inspected nothing, which stay unconditional.
+   * @throws 'Work plan steps changed' when a competing write landed first, and
+   *   'Work plan not found' when the plan was deleted. Callers must tell these
+   *   apart: the first is retryable against a fresh read, the second is not.
    */
-  async updateWorkPlan(plan: WorkPlan): Promise<void> {
+  async updateWorkPlan(
+    plan: WorkPlan,
+    opts: { expectedStepsRev?: string | null } = {},
+  ): Promise<void> {
     this.validateSteps(plan.steps);
 
-    const sets = ['#updatedAt = :updatedAt'];
+    // Every write rewrites steps (they are a REQUIRED field), so every write
+    // invalidates any decision made against the previous ones.
+    const sets = ['#updatedAt = :updatedAt', '#steps_rev = :steps_rev'];
     const removes: string[] = [];
-    const names: Record<string, string> = { '#updatedAt': 'updatedAt' };
-    const values: Record<string, any> = { ':updatedAt': new Date().toISOString() };
+    const names: Record<string, string> = { '#updatedAt': 'updatedAt', '#steps_rev': 'steps_rev' };
+    const values: Record<string, any> = {
+      ':updatedAt': new Date().toISOString(),
+      ':steps_rev': uuidv4(),
+    };
 
     for (const key of REQUIRED_PLAN_FIELDS) {
       names[`#${key}`] = key;
@@ -174,6 +201,20 @@ export class WorkPlanService {
       }
     }
 
+    // update is an upsert. Callers read the plan first, so a failure here
+    // means it was deleted in between — the old whole-item put silently
+    // resurrected it, which is worse than failing.
+    let condition = 'attribute_exists(planId)';
+    const staked = 'expectedStepsRev' in opts;
+    if (staked) {
+      if (opts.expectedStepsRev === null || opts.expectedStepsRev === undefined) {
+        condition += ' AND attribute_not_exists(#steps_rev)';
+      } else {
+        values[':expectedStepsRev'] = opts.expectedStepsRev;
+        condition += ' AND #steps_rev = :expectedStepsRev';
+      }
+    }
+
     try {
       await dynamodb.update({
         TableName: this.tableName,
@@ -181,13 +222,17 @@ export class WorkPlanService {
         UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
         ExpressionAttributeNames: names,
         ExpressionAttributeValues: values,
-        // update is an upsert. Callers read the plan first, so a failure here
-        // means it was deleted in between — the old whole-item put silently
-        // resurrected it, which is worse than failing.
-        ConditionExpression: 'attribute_exists(planId)',
+        ConditionExpression: condition,
       }).promise();
     } catch (err: any) {
       if (err?.code === 'ConditionalCheckFailedException') {
+        // Without a stake the only condition is existence, so the plan is gone.
+        // With one, the failure is ambiguous and the difference matters to the
+        // caller — a conflict is retryable against a fresh read, a deletion is
+        // not — so pay for one read to say which.
+        if (staked && await this.getWorkPlan(plan.planId)) {
+          throw new Error('Work plan steps changed');
+        }
         // Same message approveWorkPlan/rejectWorkPlan already throw, which the
         // routes map to 404 — a deleted plan is not an internal error.
         throw new Error('Work plan not found');
