@@ -9,6 +9,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-08-04',
+    changes: [
+      'Fixed: Work Plan Steps Built Over the API No Longer Lose Their Settings',
+      '- When you created a work plan through the Claude connector, the tool bindings on each step could come back empty even though the request succeeded — the field name shown in the tool description was not the one the system read, and nothing warned you',
+      '- Both spellings are now accepted, and the tool description lists the settings a step really supports, including the skills you can attach to it',
+      '- If a step does include something we cannot store, the response now names that field instead of quietly discarding it, so a plan that saved differently from what you asked for tells you why',
+      'New: Require a Step to Actually Produce Its Images Before It Can Be Completed',
+      '- A step can now state how many images or videos it must produce — say 18 for "three images per hook across six hooks" — and it will not be marked complete until that many have genuinely been generated in the run',
+      '- Set it per step in the work plan editor, where saved plans also show the requirement at a glance; leave it blank for steps with no fixed count',
+    ],
+  },
+  {
     date: '2026-08-03',
     changes: [
       'Fixed: Scheduled Chats on Gemini 3.5 Flash No Longer Fail Silently',

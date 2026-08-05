@@ -557,6 +557,57 @@ describe('AgentModeService - Work Plan', () => {
         expect(chatbotDb.updateSessionWorkPlan).toHaveBeenCalled();
       });
 
+      // Regression guard for a hazard that reads like a bug but is not one.
+      // The required-call decrement runs before the asset gate has had its say, so
+      // it LOOKS like a step rejected for missing assets would burn its tool-call
+      // credits. It does not: the decrement lands in a local copy of
+      // session.calledFunctions, and the asset-gate failure returns early — well
+      // before the updateCalledFunctions persistence below. Raised as a finding on
+      // PR #2266 and disproved by this test. If someone later moves that early
+      // return, or persists the counts sooner, this test fails and the retry-burns-
+      // credits behaviour is caught rather than shipped.
+      it('does NOT consume required-call credits when the asset gate rejects the step', async () => {
+        const mockSession = {
+          sessionId: mockSessionId,
+          userId: mockUserId,
+          messages: [
+            { role: 'system', content: 'Image generated: a.png', metadata: { kind: 'image-generated', imageFilename: 'a.png' } },
+          ],
+          calledFunctions: { generate_image: 5 },
+          workPlan: {
+            title: 'Creative Hub',
+            steps: [
+              {
+                stepCount: 1,
+                title: 'Generate 4 images',
+                status: 'pending' as const,
+                requiredFunctionCalls: ['generate_image'],
+                expectedAssetCount: 4,
+              },
+            ],
+            createdAt: '2025-01-15T09:00:00.000Z',
+            updatedAt: '2025-01-15T10:00:00.000Z',
+          },
+        };
+        (chatbotDb.getChatSession as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateSessionWorkPlan as jest.Mock).mockResolvedValue(mockSession);
+        (chatbotDb.updateCalledFunctions as jest.Mock).mockResolvedValue(mockSession);
+
+        const result = await (agentModeService as any).setWorkPlanStatus(
+          [{ stepCount: 1, status: 'completed' }],
+          mockSessionId
+        );
+
+        // The required-call gate passes (5 >= 1) but only 1 of 4 assets exists.
+        expect(result.success).toBe(false);
+        expect(result.insufficientAssets).toEqual([
+          expect.objectContaining({ stepCount: 1, expected: 4, produced: 1 }),
+        ]);
+        // The step was not completed, so its credits must be untouched.
+        expect(chatbotDb.updateCalledFunctions).not.toHaveBeenCalled();
+        expect(chatbotDb.updateSessionWorkPlan).not.toHaveBeenCalled();
+      });
+
       it('does NOT gate a step that has no expectedAssetCount (zero regression)', async () => {
         // Step with NO expectedAssetCount field at all and zero images produced.
         const mockSession = {

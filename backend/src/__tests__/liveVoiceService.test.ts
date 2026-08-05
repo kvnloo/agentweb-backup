@@ -25,8 +25,8 @@ jest.mock('@google/genai', () => ({
   })),
   Modality: { AUDIO: 'AUDIO', TEXT: 'TEXT' },
   MediaResolution: { MEDIA_RESOLUTION_MEDIUM: 'MEDIA_RESOLUTION_MEDIUM' },
-  StartSensitivity: { START_SENSITIVITY_LOW: 'START_SENSITIVITY_LOW' },
-  EndSensitivity: { END_SENSITIVITY_LOW: 'END_SENSITIVITY_LOW' },
+  StartSensitivity: { START_SENSITIVITY_LOW: 'START_SENSITIVITY_LOW', START_SENSITIVITY_HIGH: 'START_SENSITIVITY_HIGH' },
+  EndSensitivity: { END_SENSITIVITY_LOW: 'END_SENSITIVITY_LOW', END_SENSITIVITY_HIGH: 'END_SENSITIVITY_HIGH' },
   ActivityHandling: { START_OF_ACTIVITY_INTERRUPTS: 'START_OF_ACTIVITY_INTERRUPTS' },
 }));
 
@@ -234,20 +234,31 @@ describe('startLiveSession', () => {
     expect(connectionConfig.systemInstruction.parts[0].text).toContain('General American English');
   });
 
-  it('allows a natural pause before committing the user turn', async () => {
+  // ENG-525: the original LOW/LOW/1200ms tuning (tuned to one heavy dogfooder's
+  // pause-heavy speech pattern) made turn-taking and barge-in feel sluggish
+  // compared to ChatGPT's voice mode for ordinary users. Tightened to HIGH
+  // sensitivity + a sub-second silence window so Emma responds/interrupts
+  // promptly, while keeping some floor so a normal mid-sentence breath doesn't
+  // false-trigger a turn end.
+  it('reacts promptly to end-of-turn and barge-in instead of a long deliberate pause', async () => {
     makeCallbacks();
 
-    await startLiveSession('session-natural-pause', 'socket-pause', jest.fn(), 'test-user-id');
+    await startLiveSession('session-prompt-turn-taking', 'socket-prompt', jest.fn(), 'test-user-id');
 
     const detection = mockLiveConnect.mock.calls[0][0].config
       .realtimeInputConfig.automaticActivityDetection;
     expect(detection).toEqual(expect.objectContaining({
       disabled: false,
-      startOfSpeechSensitivity: 'START_SENSITIVITY_LOW',
-      endOfSpeechSensitivity: 'END_SENSITIVITY_LOW',
+      startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
+      endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
     }));
-    expect(detection.prefixPaddingMs).toBeGreaterThanOrEqual(150);
-    expect(detection.silenceDurationMs).toBeGreaterThanOrEqual(1_000);
+    // Snappy, but not a hair-trigger: keep enough of a floor that a normal
+    // in-sentence breath (or a pause-heavy speaker mid-thought) doesn't get
+    // read as end-of-turn — unvalidated with real speech at ship time, so
+    // biased toward the safer end of "snappier than the old 1200ms" rather
+    // than the most aggressive value tested.
+    expect(detection.silenceDurationMs).toBeGreaterThanOrEqual(700);
+    expect(detection.silenceDurationMs).toBeLessThanOrEqual(900);
   });
 
   it('starting a second session for the same sessionId replaces the old one', async () => {
