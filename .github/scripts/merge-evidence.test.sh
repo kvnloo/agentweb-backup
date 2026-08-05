@@ -928,6 +928,37 @@ else
   printf "      Rename both together, or the backend-suite requirement blocks every backend PR.\n"
 fi
 
+# BACKEND_PATHS hand-mirrors the `backend` filter in tests.yml, and the two
+# drift in one direction silently: adding a path to the workflow filter widens
+# what the suite runs on, while the requirement here keeps applying to the old,
+# narrower set. The result is a file that triggers the backend suite but is not
+# required to have run it — the exact hole this section closes, reopened. Only
+# the reverse (a path here that the filter dropped) is loud, because it demands
+# a suite that never runs.
+TESTS_RUN=$((TESTS_RUN + 1))
+# `backend/**` in the filter is the prefix `backend/` here; quotes and the glob
+# suffix are normalised away so the two are compared as the same kind of thing.
+filter_paths="$(awk '
+  /^            backend:$/ { in_filter = 1; next }
+  in_filter && /^            [a-z]+:$/ { exit }
+  in_filter && /^              - / {
+    sub(/^              - /, ""); gsub(/'"'"'/, ""); sub(/\*\*$/, ""); print
+  }
+' "${WORKFLOW}" | sort)"
+gate_paths="$(sed -n "/^BACKEND_PATHS='/,/'$/p" "${GATE_SH}" \
+  | sed -e "s/^BACKEND_PATHS='//" -e "s/'$//" | sort)"
+
+if [ "${filter_paths}" = "${gate_paths}" ]; then
+  printf "ok    invariant: BACKEND_PATHS mirrors the workflow's backend paths filter\n"
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf "FAIL  invariant: BACKEND_PATHS has drifted from the backend filter in tests.yml.\n"
+  printf "      tests.yml: %s\n" "$(printf '%s' "${filter_paths}" | tr '\n' ' ')"
+  printf "      this gate: %s\n" "$(printf '%s' "${gate_paths}" | tr '\n' ' ')"
+  printf "      A path the filter has and this gate does not is a file that triggers the\n"
+  printf "      backend suite without being required to have run it.\n"
+fi
+
 # Two jobs sharing a per-PR concurrency group cancel each other, which is the
 # problem ENG-915 design wrinkle 4 warns must not come back: the reorder means
 # `greptile-review` now decides whether the suite runs at all, so a group
