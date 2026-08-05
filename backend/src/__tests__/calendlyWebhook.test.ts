@@ -24,7 +24,6 @@ jest.mock('../services/connectedAccountsDb', () => ({
 }));
 
 const mockGetUserById = jest.fn();
-const mockGetLeadListsByUserId = jest.fn();
 const mockCreateLeadList = jest.fn();
 const mockGetLeadByEmail = jest.fn();
 const mockCreateLead = jest.fn();
@@ -33,7 +32,6 @@ const mockGetLeadListById = jest.fn();
 jest.mock('../services/db', () => ({
   userDb: { getUserById: (...a: any[]) => mockGetUserById(...a) },
   crmDb: {
-    getLeadListsByUserId: (...a: any[]) => mockGetLeadListsByUserId(...a),
     createLeadList: (...a: any[]) => mockCreateLeadList(...a),
     getLeadByEmail: (...a: any[]) => mockGetLeadByEmail(...a),
     createLead: (...a: any[]) => mockCreateLead(...a),
@@ -156,10 +154,15 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     mockCreateLead.mockResolvedValue({ leadId: 'lead-1', email: 'lead@example.com' });
     mockUpdateLead.mockResolvedValue(undefined);
     mockAutoSyncLead.mockResolvedValue(undefined);
-    mockGetLeadListsByUserId.mockResolvedValue([]);
     mockCreateLeadList.mockResolvedValue({ listId: 'list-auto-created' });
     mockUpdateAccountConfig.mockResolvedValue(undefined);
-    mockGetLeadListById.mockResolvedValue({ listId: 'list-1', userId: USER_ID, name: 'Test List', alertEvents: ['api.lead_added', 'api.lead_updated'] });
+    // getLeadListById serves two callers: resolveOrCreateBookingList's deterministic-ID
+    // lookup (should see "not found" by default, so the fallback-create path exercises
+    // naturally) and the CRM-forward leg's "fetch full list for the alert" lookup on an
+    // explicit list-1 id. Keep them distinct rather than one blanket resolved value.
+    mockGetLeadListById.mockImplementation((id: string) =>
+      Promise.resolve(id === 'list-1' ? { listId: 'list-1', userId: USER_ID, name: 'Test List', alertEvents: ['api.lead_added', 'api.lead_updated'] } : null),
+    );
     mockNotifyLeadListOwnerIfConfigured.mockResolvedValue(undefined);
   });
 
@@ -234,14 +237,12 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(res.status).toBe(200);
       await flushPromises();
 
-      expect(mockGetLeadListsByUserId).not.toHaveBeenCalled();
       expect(mockCreateLeadList).not.toHaveBeenCalled();
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
       expect(mockCreateLead).toHaveBeenCalledWith('list-explicit', expect.objectContaining({ email: 'lead@example.com' }));
     });
 
     it('falls back to resolveOrCreateBookingList and persists the result when no list is configured', async () => {
-      mockGetLeadListsByUserId.mockResolvedValue([]);
       mockCreateLeadList.mockResolvedValue({ listId: 'list-auto-created' });
 
       const body = makePayload({ email: 'lead@example.com' });
@@ -296,7 +297,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     });
 
     it('still sends the CAPI event when the CRM-forward leg throws', async () => {
-      mockGetLeadListsByUserId.mockRejectedValue(new Error('crm down'));
+      mockGetLeadListById.mockRejectedValue(new Error('crm down'));
       mockCreateLeadList.mockRejectedValue(new Error('crm down'));
 
       const body = makePayload({ email: 'lead@example.com' });
