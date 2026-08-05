@@ -1,0 +1,29 @@
+# Keeps the SHA-pinned GitHub Actions current (ENG-895 AC2).
+#
+# Every `uses:` in .github/workflows is pinned to a commit SHA rather than a
+# floating major tag, because a tag can be moved and would then change the code
+# that handles this repository, the workflow token, and our AWS credentials
+# without any commit here. That matters more in this repo than most: it runs
+# aws-actions/configure-aws-credentials with production deploy rights and
+# dorny/paths-filter, which is genuinely third-party.
+#
+# But a pin with no update path is a different failure, not a fix — it just
+# converts "silently moves" into "silently rots", and a stale pin misses the
+# security fixes the pin was taken for. Dependabot opens a PR when an upstream
+# release moves, updating both the SHA and the trailing version comment, so the
+# pins stay current through the normal review gate.
+#
+# Weekly, not daily: action releases are infrequent and a daily cadence would
+# add noise to a queue that is already the bottleneck.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: ci
+    labels:
+      - Auto

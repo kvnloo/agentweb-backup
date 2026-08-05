@@ -439,6 +439,68 @@ describe('sanitizeGeminiSchema', () => {
     });
   });
 
+  it('normalizes a union `type` array to a single Gemini type + nullable (ENG-826)', () => {
+    // Real prod shape from emma/tools.ts (get_meta_ads_metrics.campaign_ids,
+    // gmail send to/cc/bcc): a JSON-Schema union `type: ['array', 'string']`.
+    // Gemini's function-declaration Schema.type is a SINGLE OpenAPI type — a
+    // union array 400s the ENTIRE request the moment the tool is attached, so
+    // every gemini-3.5-flash agent turn carrying such a tool failed with zero
+    // assistant output (the ENG-826 silent-failure signature). 'array' is kept
+    // when `items` is present so the element schema stays meaningful.
+    const input = {
+      type: 'object',
+      properties: {
+        campaign_ids: { type: ['array', 'string'], items: { type: 'string' }, minItems: 1 },
+        note: { type: ['string', 'null'] },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        campaign_ids: { type: 'array', items: { type: 'string' }, minItems: 1 },
+        note: { type: 'string', nullable: true },
+      },
+    });
+  });
+
+  it('drops array-only keywords when a union `type` resolves to a non-array type', () => {
+    // A union with no `array` member resolves to a scalar and must not keep
+    // array-only constraints (items/minItems/maxItems) — Gemini rejects those
+    // on a non-array type.
+    const input = { type: ['string', 'number'], items: { type: 'string' }, maxItems: 5 };
+    expect(sanitizeGeminiSchema(input)).toEqual({ type: 'string' });
+  });
+
+  it('falls back to a scalar `string` for a degenerate union with no non-null member', () => {
+    // The `nonNull[0] || 'string'` fallback (geminiNativeClient.ts): a `type: []`
+    // (empty union) or `type: ['null']` (only null) has no resolvable member, so
+    // it must default to a concrete Gemini type rather than leaving `type`
+    // undefined/array — both of which Gemini rejects.
+    expect(sanitizeGeminiSchema({ type: [] })).toEqual({ type: 'string' });
+    expect(sanitizeGeminiSchema({ type: ['null'] })).toEqual({ type: 'string', nullable: true });
+  });
+
+  it('resolves an `object`/scalar union to `object` when the node carries `properties` (ENG-826)', () => {
+    // A union that pairs `object` with a scalar and actually defines `properties`
+    // (some MCP tools describe a payload this way) should collapse to `object` so
+    // the nested shape stays meaningful — not to the scalar member. Array-only
+    // keywords are irrelevant here and must not appear.
+    const input = {
+      type: ['object', 'string'],
+      properties: { id: { type: 'string' } },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: { id: { type: 'string' } },
+    });
+  });
+
+  it('does NOT force `object` for an object-union that lacks `properties`', () => {
+    // Without sibling `properties`, `object` is not more faithful than the scalar,
+    // so we fall to the first non-null member rather than inventing an empty object.
+    expect(sanitizeGeminiSchema({ type: ['string', 'object'] })).toEqual({ type: 'string' });
+  });
+
   it('drops oneOf/allOf/const (absent from the genai Schema type, e.g. dynamic MCP tool schemas)', () => {
     const input = {
       type: 'object',

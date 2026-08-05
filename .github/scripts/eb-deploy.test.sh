@@ -106,6 +106,97 @@ case "$operation" in
     exit 0
     ;;
 
+  describe-events)
+    # ENG-837: ERROR-severity events are how an ASYNCHRONOUS EB rejection
+    # becomes visible. Fixtures: `events` (message text, one per line),
+    # `events_exit` (simulate an API/IAM failure).
+    code=0
+    [ -f "${MOCK_DIR}/events_exit" ] && code=$(cat "${MOCK_DIR}/events_exit")
+    if [ "$code" != "0" ]; then
+      printf 'mock aws: simulated describe-events failure\n' >&2
+      exit "$code"
+    fi
+    if [ -f "${MOCK_DIR}/events" ]; then
+      cat "${MOCK_DIR}/events"
+    else
+      printf 'None\n'
+    fi
+    exit 0
+    ;;
+
+  describe-instances-health)
+    # ENG-878: the non-lagging per-instance signal. Fixture `instances_health`
+    # holds "<instance-id><TAB><HealthStatus>" lines, the literal token NONE for
+    # an empty environment, or "ERROR|<message>" to simulate an API/IAM failure.
+    if [ -f "${MOCK_DIR}/instances_health" ]; then
+      first=$(head -n 1 "${MOCK_DIR}/instances_health")
+      if [ "${first%%|*}" = "ERROR" ]; then
+        printf '%s\n' "${first#*|}" >&2
+        exit 255
+      fi
+      if [ "$first" = "NONE" ]; then
+        printf 'None\n'
+        exit 0
+      fi
+      cat "${MOCK_DIR}/instances_health"
+    else
+      printf 'None\n'
+    fi
+    exit 0
+    ;;
+
+  describe-environment-resources)
+    # Fixture `lb_arns`: tab/newline separated ALB ARNs, NONE, or "ERROR|<msg>".
+    if [ -f "${MOCK_DIR}/lb_arns" ]; then
+      first=$(head -n 1 "${MOCK_DIR}/lb_arns")
+      if [ "${first%%|*}" = "ERROR" ]; then
+        printf '%s\n' "${first#*|}" >&2
+        exit 255
+      fi
+      if [ "$first" = "NONE" ]; then
+        printf 'None\n'
+        exit 0
+      fi
+      cat "${MOCK_DIR}/lb_arns"
+    else
+      printf 'None\n'
+    fi
+    exit 0
+    ;;
+
+  describe-target-groups)
+    if [ -f "${MOCK_DIR}/tg_arns" ]; then
+      first=$(head -n 1 "${MOCK_DIR}/tg_arns")
+      if [ "${first%%|*}" = "ERROR" ]; then
+        printf '%s\n' "${first#*|}" >&2
+        exit 255
+      fi
+      cat "${MOCK_DIR}/tg_arns"
+    else
+      printf 'None\n'
+    fi
+    exit 0
+    ;;
+
+  describe-target-health)
+    # Fixture `target_health`: "<target-id><TAB><State>" lines, NONE, or ERROR|.
+    if [ -f "${MOCK_DIR}/target_health" ]; then
+      first=$(head -n 1 "${MOCK_DIR}/target_health")
+      if [ "${first%%|*}" = "ERROR" ]; then
+        printf '%s\n' "${first#*|}" >&2
+        exit 255
+      fi
+      if [ "$first" = "NONE" ]; then
+        printf 'None\n'
+        exit 0
+      fi
+      cat "${MOCK_DIR}/target_health"
+    else
+      printf 'None\n'
+    fi
+    exit 0
+    ;;
+
   *)
     printf 'mock aws: unhandled operation %s\n' "$operation" >&2
     exit 64
@@ -431,6 +522,198 @@ set_update_results "$M" '255|An error occurred (AccessDenied) when calling the U
 set_describe_states "$M" 'Ready|Green|old-version'
 run_deploy "$M"
 check 'NEW logic fails on the identical fixture' 1 'EB_DEPLOY_FAILED: update-environment failed'
+
+# ---------------------------------------------------------------------------
+# ENG-837 — an ASYNCHRONOUS EB rejection must fail fast and say why
+# ---------------------------------------------------------------------------
+#
+# The 2026-08-01 production incident, reproduced. PR #2237 changed resource
+# configuration (.ebextensions ALB IdleTimeout) and instance configuration
+# (.platform nginx + app bundle) in one deploy. EB ACCEPTED update-environment,
+# validated asynchronously, rejected it, and left the environment Ready on its
+# previous version.
+#
+# The old script therefore polled a perfectly healthy environment for the full
+# 2700s budget and reported a generic "did not come up Ready" timeout. The real
+# reason sat in the EB event log the entire time, and the failure was
+# misattributed twice to the ENG-777 autoscaling race because nothing surfaced
+# it. Production stayed undeployable for ~17 hours.
+
+printf '\nENG-837 (asynchronous EB rejection)\n'
+
+IMMUTABLE_REJECTION='Service:AmazonCloudFormation, Message:Cannot update resource configuration and instance configuration simultaneously with immutable deployments.'
+
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${IMMUTABLE_REJECTION}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1'
+check 'ENG-837: an EB rejection fails the deploy' 1 'Elastic Beanstalk REJECTED this update'
+check 'ENG-837: EB own error text is surfaced, not a generic timeout' 1 \
+  'Cannot update resource configuration and instance configuration simultaneously'
+check 'ENG-837: the failure states the version was not applied' 1 \
+  "Version 'backend-20260729-pr2216' was NOT applied"
+
+# AC3 states the rejection must surface "not after the full 2700s budget".
+# The budget above is 60s; a correct fail-fast lands in a couple of seconds.
+TESTS_RUN=$((TESTS_RUN + 1))
+if [ "${LAST_DURATION}" -lt 15 ]; then
+  printf "  ok   ENG-837: it fails FAST (%ss) rather than burning the 60s budget\n" "${LAST_DURATION}"
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf "  FAIL ENG-837: took %ss — a rejection must not burn the deploy budget\n" "${LAST_DURATION}"
+fi
+
+# Without any event to read, the same state is still terminal: Ready on the old
+# version long after the update was accepted means EB took the request and
+# declined to apply it. This is the backstop for a rejection EB never events,
+# or one whose wording is not in the terminal-pattern list.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1'
+check 'ENG-837: Ready on the old version is terminal even with no ERROR event' 1 \
+  'declined to apply it, so this will never converge'
+
+# A gate that fails recoverable deploys gets switched off within a week, so the
+# terminal-pattern list is deliberately narrow. An unrelated ERROR event must be
+# logged for attribution and must NOT fail a deploy that then succeeds.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+printf '%s\n' 'Service:Amazon EC2, Message:Instance i-0abc has been health-check flagged and replaced.' >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1'
+check 'ENG-837: a NON-terminal ERROR event does not fail a recoverable deploy' 0 \
+  'SUCCESS: environment'
+check 'ENG-837: but it is logged, so the next failure is not misattributed' 0 \
+  'health-check flagged and replaced'
+
+# The event scan is a diagnostic overlay. An IAM gap or a throttle on
+# describe-events must never take down a deploy that verifies correctly.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+printf '255' >"$M/events_exit"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1'
+check 'ENG-837: an unreadable event log is non-fatal' 0 'SUCCESS: environment'
+check 'ENG-837: and the inability to read it is stated plainly' 0 'could not read EB events'
+
+# The grace window exists because immediately after update-environment is
+# accepted the environment legitimately still reports Ready on the old version
+# for a few seconds. A deploy that transitions normally must not be killed.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version' 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='120'
+check 'ENG-837: a normal deploy passing through Ready-on-old-version is not killed' 0 \
+  'SUCCESS: environment'
+
+# ---------------------------------------------------------------------------
+# ENG-878 — a lagging environment-health rollup must not fail a healthy deploy.
+#
+# Live on 2026-08-03: #2252's deploy job failed with "health stayed Red" while
+# the instance was Ok, the target group was healthy, the app served 100% 2xx,
+# and the environment went Green on its own minutes later. Because ENG-837's
+# trunk gate keys off the deploy run's conclusion, that single false failure
+# blocked every merge onto main.
+# ---------------------------------------------------------------------------
+
+set_healthy_underlying() {
+  local dir="$1"
+  printf 'i-0d6a42c54cfc58bd7\tOk\n' >"${dir}/instances_health"
+  printf 'arn:aws:elasticloadbalancing:us-west-2:1:loadbalancer/app/awseb-AWSEB-X/abc\n' >"${dir}/lb_arns"
+  printf 'arn:aws:elasticloadbalancing:us-west-2:1:targetgroup/awseb-AWSEB-UUBAGFYEVPQ1/def\n' >"${dir}/tg_arns"
+  printf 'i-0d6a42c54cfc58bd7\thealthy\n' >"${dir}/target_health"
+}
+
+# AC1 — Red rollup, everything underneath healthy: PASSES, and says why.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878 AC1: a lagging Red rollup over healthy instances/targets passes' 0 \
+  'SUCCESS: environment'
+check 'ENG-878 AC1: and the log names the lag rather than hiding it' 0 \
+  'lagging aggregate'
+
+# Same for Grey, which is the other rollup value that lags.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Grey|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878 AC1: a lagging Grey rollup over healthy signals also passes' 0 \
+  'SUCCESS: environment'
+
+# AC2 — the gate must NOT become "always pass". A genuinely unhealthy instance
+# under a Red rollup still fails, and the instance is named.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'i-0d6a42c54cfc58bd7\tSevere\n' >"$M/instances_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878 AC2: a genuinely unhealthy instance still fails the deploy' 1 \
+  'EB_DEPLOY_FAILED'
+check 'ENG-878 AC3: and the failure names the unhealthy instance' 1 \
+  'instance i-0d6a42c54cfc58bd7=Severe'
+
+# AC2 — an unhealthy TARGET also still fails, even with every instance Ok. This
+# is the exact shape of the incident's event text ("One or more TargetGroups
+# ... Degraded"), so it must be the thing that can still fail the job.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'i-0d6a42c54cfc58bd7\tunhealthy\n' >"$M/target_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878 AC2: an unhealthy load-balancer target still fails the deploy' 1 \
+  'EB_DEPLOY_FAILED'
+check 'ENG-878 AC3: and the failure names the unhealthy target' 1 \
+  'target i-0d6a42c54cfc58bd7=unhealthy'
+
+# Fail-closed: if the probe cannot run, the old failure stands. A probe that
+# cannot see the instances must never be read as proof they are fine.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'ERROR|AccessDeniedException: not authorized to perform DescribeInstancesHealth\n' \
+  >"$M/instances_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878: an unreadable instance-health probe fails closed, not open' 1 \
+  'EB_DEPLOY_FAILED'
+check 'ENG-878 AC3: and says the health could not be established' 1 \
+  'could not be established'
+
+# An environment with no instances is an empty environment, not a stale rollup.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'NONE\n' >"$M/instances_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878: zero instances is not treated as "nothing unhealthy"' 1 \
+  'returned no instances'
+
+# An ALB with zero target groups gave the target loop zero iterations, so
+# `unhealthy` stayed empty and the verdict came back LAGGING — vouching for the
+# deploy without having checked a single target. Greptile P1 on #2264; the same
+# hole the no-instances and no-registered-targets guards already covered.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'None\n' >"$M/tg_arns"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878: an ALB with zero target groups does not silently pass' 1 \
+  'returned no target groups'
+
+# A classic (non-ALB) load balancer exposes no target-group ARN, so the probe
+# cannot speak for it and must not vouch for the deploy.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'awseb-e-classic-lb\n' >"$M/lb_arns"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878: a classic load balancer leaves the verdict UNKNOWN, so it fails' 1 \
+  'no Application Load Balancer ARN'
+
+# Green never reaches the probe at all — the happy path must stay free of the
+# extra AWS calls, so a Green deploy passes even with no probe fixtures present.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878: a Green deploy never invokes the probe' 0 'SUCCESS: environment'
 
 # ---------------------------------------------------------------------------
 
