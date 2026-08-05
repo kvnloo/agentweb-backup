@@ -15059,7 +15059,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
               `Could not verify which ad account creative ${params.creative_id} belongs to; refusing to return it.`,
             );
           }
-          if (selected && owner !== selected) {
+          // Both sides must be known. An empty resolved account cannot be
+          // compared against anything, so treating it as "no mismatch" would
+          // reopen the exact bypass this check exists to close — the guard
+          // would silently pass every creative the token can reach.
+          if (!selected) {
+            throw new Error(
+              `Could not determine which ad account was selected; refusing to return creative ${params.creative_id}.`,
+            );
+          }
+          if (owner !== selected) {
             throw new Error(
               `Ad creative ${params.creative_id} belongs to ad account ${owner}, not the selected account ${selected}.`,
             );
