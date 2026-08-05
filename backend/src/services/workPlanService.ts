@@ -409,7 +409,10 @@ export class WorkPlanService {
     plan.reviewFeedback = undefined;
     // Stake the read: this writes the whole plan back, steps included, so
     // without it a concurrent step edit is silently reverted (ENG-890).
-    await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
+    // Carry the minted revision onto what we hand back: the object we read
+    // still holds the superseded one, and echoing that guarantees a false
+    // conflict on the caller's next staked write (ENG-890).
+    plan.steps_rev = await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
     return plan;
   }
 
@@ -420,7 +423,10 @@ export class WorkPlanService {
 
     plan.visibility = 'public';
     plan.showInAgentMode = true;
-    await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
+    // Carry the minted revision onto what we hand back: the object we read
+    // still holds the superseded one, and echoing that guarantees a false
+    // conflict on the caller's next staked write (ENG-890).
+    plan.steps_rev = await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
     return plan;
   }
 
@@ -431,7 +437,10 @@ export class WorkPlanService {
 
     plan.visibility = 'private';
     plan.reviewFeedback = feedback;
-    await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
+    // Carry the minted revision onto what we hand back: the object we read
+    // still holds the superseded one, and echoing that guarantees a false
+    // conflict on the caller's next staked write (ENG-890).
+    plan.steps_rev = await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
     return plan;
   }
 

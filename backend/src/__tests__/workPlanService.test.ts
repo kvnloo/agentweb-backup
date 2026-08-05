@@ -507,6 +507,23 @@ describe('WorkPlanService', () => {
       expect(mockUpdate.mock.calls[0][0].ConditionExpression).toContain('attribute_not_exists(#steps_rev)');
     });
 
+    // Same defect the PUT routes already fixed, in the three methods that were
+    // staked afterwards: they mint a new revision and then answer with the
+    // plan object they read, which still carries the superseded one. A client
+    // chaining a staked update off that response conflicts every time.
+    it.each([
+      ['submitForReview', (svc: any) => svc.submitForReview('p1', 'u1'), { visibility: 'private' }],
+      ['approveWorkPlan', (svc: any) => svc.approveWorkPlan('p1'), {}],
+      ['rejectWorkPlan', (svc: any) => svc.rejectWorkPlan('p1', 'no'), {}],
+    ])('%s returns the revision its write produced, not the one it read', async (_name, call, over) => {
+      mockPromise.mockResolvedValueOnce({ Item: pending(over) });
+
+      const result = await call(workPlanService);
+
+      expect(result.steps_rev).toBe('test-plan-id-789');
+      expect(result.steps_rev).not.toBe('rev-1');
+    });
+
     it('surfaces a lost race instead of silently restoring the old steps', async () => {
       mockPromise.mockResolvedValueOnce({ Item: pending() });
       const err: any = new Error('The conditional request failed');
