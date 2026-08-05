@@ -40,6 +40,26 @@ function contains(haystack: unknown, needle?: string): boolean {
   return String(haystack ?? '').toLowerCase().includes(needle.toLowerCase());
 }
 
+/** Strip the characters that would break out of a quoted Gmail search operand. */
+function sanitizeQueryTerm(value: string): string {
+  return value.replace(/["\\]/g, '').trim();
+}
+
+/**
+ * Gmail-native query for the code email. The INBOX scan alone misses a message
+ * a user filter archived, or one pushed past the scan size by a busy inbox —
+ * search sees both. Deliberately wider than the caller's window (`newer_than`
+ * has day granularity in Gmail, and hours are not a supported unit): the
+ * precise freshness cut is applied locally against `since`, so a wide query
+ * costs nothing in correctness.
+ */
+function buildGmailQuery(subjectContains?: string, fromContains?: string): string {
+  const parts = ['newer_than:1d'];
+  if (subjectContains) parts.push(`subject:"${sanitizeQueryTerm(subjectContains)}"`);
+  if (fromContains) parts.push(`from:${sanitizeQueryTerm(fromContains)}`);
+  return parts.join(' ');
+}
+
 function parsedTime(value: unknown): number {
   const parsed = Date.parse(String(value ?? ''));
   return Number.isNaN(parsed) ? 0 : parsed;
@@ -94,7 +114,9 @@ emmaToolRegistry.register({
         },
         search_query: {
           type: 'string',
-          description: 'Advanced: a provider-native search query (Gmail syntax) used instead of scanning the inbox.',
+          description:
+            'Advanced: a provider-native search query (Gmail syntax) used instead of the query built from subject_contains/from_contains. ' +
+            'On Gmail the mailbox is searched as well as scanned, so a code email a filter archived is still found; subject_contains/from_contains still apply to whatever the search returns.',
         },
       },
       required: [],
@@ -170,11 +192,31 @@ emmaToolRegistry.register({
     let sawFreshMatchWithoutCode = false;
 
     for (;;) {
-      let summaries: any[] = [];
+      // Two sources, unioned: a provider search (sees archived/filtered mail and
+      // is not bounded by the scan size) and the INBOX scan (needs no query
+      // support and is the only source for non-Gmail providers). A search
+      // failure is non-fatal — it can only ever ADD candidates, so falling back
+      // to the scan alone is exactly the behaviour we had before it existed. An
+      // INBOX failure stays fatal: that is the mailbox itself being unreadable
+      // (revoked token), which must not be reported as "no code arrived".
+      const query = args?.search_query
+        ? String(args.search_query)
+        : platform === 'gmail'
+          ? buildGmailQuery(args?.subject_contains, args?.from_contains)
+          : null;
+
+      let searched: any[] = [];
+      if (query) {
+        try {
+          searched = (await provider.searchEmails(userId, accountId, query, INBOX_SCAN_SIZE)) || [];
+        } catch (error: any) {
+          console.warn(`[read_verification_code] Mailbox search failed, using the inbox scan only: ${error?.message || error}`);
+        }
+      }
+
+      let listed: any[] = [];
       try {
-        summaries = args?.search_query
-          ? await provider.searchEmails(userId, accountId, args.search_query, INBOX_SCAN_SIZE)
-          : await provider.listEmails(userId, accountId, 'INBOX', INBOX_SCAN_SIZE);
+        listed = (await provider.listEmails(userId, accountId, 'INBOX', INBOX_SCAN_SIZE)) || [];
       } catch (error: any) {
         return {
           success: false,
@@ -182,6 +224,12 @@ emmaToolRegistry.register({
           message: `Could not read the mailbox: ${error?.message || String(error)}. ${NO_FABRICATION_NOTE}`,
         };
       }
+
+      const byId = new Map<string, any>();
+      for (const email of [...searched, ...listed]) {
+        if (email?.id && !byId.has(email.id)) byId.set(email.id, email);
+      }
+      const summaries = [...byId.values()];
 
       const matched = (summaries || []).filter(
         (email: any) => contains(email?.subject, args?.subject_contains) && contains(email?.from, args?.from_contains)
