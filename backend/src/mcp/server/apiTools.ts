@@ -501,6 +501,7 @@ mcpToolRegistry.register({
         email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
         self_improve: { type: 'boolean', description: 'When true, after each run a reflection turn reviews the result and may automatically refine starting_message so future runs do better. Off by default (create/update).' },
+        revoke_autopublish: { type: 'boolean', description: 'Set true to REVOKE this schedule\'s permission to publish to the user\'s live connected accounts unattended, so future runs draft the content for approval instead. Revoking is always safe and always allowed. You CANNOT grant this permission — granting it means posts go live without the user ever seeing them, so it must be done by the user themselves via the "Publish without my review" checkbox on the schedule. If a user asks you to enable automatic posting, point them at that checkbox; never claim you have enabled it (update only).' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] }, description: 'Variable definitions for the starting message (create/update)' },
         variable_values: { type: 'object', description: 'Initial variable values (create/update)' },
@@ -552,6 +553,12 @@ mcpToolRegistry.register({
         if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
+        // ENG-827: the agent may only ever REVOKE unattended-publish consent, never
+        // grant it. Granting means irreversible public posts the owner never saw, so
+        // it requires a deterministic owner action (the portal checkbox) — a model
+        // setting a boolean from its reading of a conversation is not that. Only a
+        // literal `true` revokes; nothing here can ever send `true` for the grant.
+        if (args.revoke_autopublish === true) body.autopublishAuthorized = false;
         if (args.run_count !== undefined) body.runCount = args.run_count;
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
