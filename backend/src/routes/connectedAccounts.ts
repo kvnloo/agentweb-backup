@@ -127,6 +127,9 @@ router.get('/connected-accounts', authenticateToken, async (req: any, res) => {
         // Calendly only: false when the connecting account's plan doesn't support
         // webhooks (Free tier) — OAuth succeeded but no booking events will arrive (ENG-524).
         booking_tracking_active: acc.platform === 'calendly' ? ((acc.config as any).booking_tracking_active === true) : undefined,
+        // Calendly only: which lead list bookings land in — explicitly chosen or
+        // auto-resolved server-side on first booking (ENG-524 CRM-forward).
+        booking_lead_list_id: acc.platform === 'calendly' ? (acc.config as any).booking_lead_list_id : undefined,
         // Status fields
         status,
         expires_at: acc.config.token_expires_at,
