@@ -216,7 +216,7 @@ import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
-import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
+import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -2805,6 +2805,39 @@ export class AgentModeService {
     }
 
     return isTransientLLMError(error) || /timed out|timeout|overloaded|upstream|network/i.test(message);
+  }
+
+  /**
+   * Should describe_image retry a failed vision call on the OTHER provider?
+   *
+   * This is a superset of isRetryableMediaToolError, and deliberately local to
+   * describe_image. That classifier answers "would this same call succeed if
+   * repeated", so it rejects credential/permission failures — correctly, since
+   * hammering the same model with a bad key is pointless. But describe_image's
+   * fallback switches providers entirely (Gemini -> Bedrock Claude), which
+   * authenticate separately, so a provider-scoped 401/403 is precisely the case
+   * where the other provider WOULD answer. Without this, one bad Gemini key
+   * hard-fails every describe_image call while Bedrock sits healthy beside it —
+   * the same "provider rejection surfaces as a broken tool" shape as ENG-834.
+   *
+   * NOT widened in the shared classifier: image generation relies on its current
+   * narrowness (ENG-510), and switching image models changes output semantics in
+   * a way switching vision models does not.
+   *
+   * Payload rejections (400 INVALID_ARGUMENT) stay excluded — the image is
+   * already normalised and downscaled by the time we call, so a second provider
+   * would only double the latency and cost. Recovery is still observable:
+   * describeImage returns fallbackUsed + primaryError, so a broken key is
+   * diagnosable from the session record rather than silently papered over.
+   */
+  private isVisionFallbackWorthy(error: unknown): boolean {
+    if (this.isRetryableMediaToolError(error)) return true;
+    if (!error) return false;
+    const e = error as any;
+    const status = e?.status ?? e?.$metadata?.httpStatusCode ?? e?.response?.status;
+    if (status === 401 || status === 403) return true;
+    const message = error instanceof Error ? error.message : String(error);
+    return /permission.?denied|unauthenticated|api key not valid/i.test(message);
   }
 
   private getImageGenerationFallbackModel(
@@ -7084,26 +7117,76 @@ export class AgentModeService {
       // Use custom prompt or default
       const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
 
-      // Claude models require the image as inline bytes rather than a bare URL:
-      //  - Bedrock Converse API requires base64 data URIs.
+      // Vision models here require the image as inline bytes rather than a bare URL:
+      //  - Bedrock Converse API (anthropic.*) requires base64 data URIs.
       //  - Anthropic-on-Vertex (claude-*) can take a url source, but our images are
       //    typically private S3 objects Anthropic's fetcher cannot reach, so we
       //    download and presign them into a base64 data URI here.
-      // Download the image and convert to a data URI for these models.
+      //  - Gemini (gemini-*) receives a non-data URL as `fileData.fileUri`. Gemini
+      //    DOES fetch these URLs successfully for ordinary screenshots (verified in
+      //    prod: 100+ sessions served by gemini-3.5-flash straight from an S3 URL),
+      //    but it rejects an un-downscaled 4K image (3072x5504, ~16MB from
+      //    gemini-3.1-flash-image) with a hard 400 INVALID_ARGUMENT. In prod that
+      //    oversize class failed on Gemini 100% of the time across every session
+      //    that attempted it. Downloading + downscaling + inlining here keeps the
+      //    payload self-contained and within Gemini's limits (ENG-834).
+      //    NOTE: until the native Gemini adapter landed (ENG-737, 2026-07-30) the
+      //    OpenAI-compat transport reported this as "400 status code (no body)",
+      //    which isRetryableMediaToolError() treats as retryable — so the Claude
+      //    fallback below silently rescued every one of these. The native adapter
+      //    surfaces Google's raw "...INVALID_ARGUMENT" JSON, which matches that
+      //    method's /invalid/i non-retryable pattern, so the fallback stopped
+      //    firing and the long-standing oversize bug became user-visible.
+      // Download the image and convert to a (downscaled) data URI for these models.
       let resolvedImageUrl = imageUrl;
-      if ((llmModel.startsWith('anthropic.') || llmModel.startsWith('claude-')) && !imageUrl.startsWith('data:')) {
+      if (
+        (llmModel.startsWith('anthropic.') ||
+          llmModel.startsWith('claude-') ||
+          llmModel.startsWith('gemini-')) &&
+        !imageUrl.startsWith('data:')
+      ) {
         try {
           const axios = (await import('axios')).default;
           // For private S3 URLs from our bucket, generate a presigned URL so the download succeeds
           const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
-          const fetchUrl = isS3Url(imageUrl) ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
-          const imgResp = await axios.get<ArrayBuffer>(fetchUrl, { responseType: 'arraybuffer', timeout: 30000 });
+          const isOwnS3 = isS3Url(imageUrl);
+          const fetchUrl = isOwnS3 ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
           // Normalize content-type: strip any charset/extra params and trim whitespace.
           // Do NOT default a missing/empty header to a native type here — that would
           // short-circuit sharp detection and embed non-PNG bytes as image/png (ENG-370).
           // Pass the raw/empty type through so normalizeImageForVision decodes via sharp.
-          const contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
-          let imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          let contentType: string;
+          let imageBuffer: Buffer;
+          if (isOwnS3) {
+            // Our own presigned S3 object: no redirects, no SSRF surface. Still
+            // size-capped — a user can put an arbitrarily large object in their
+            // own bucket, and the >4MB resize below only runs once the whole
+            // thing is already resident in memory, so the cap has to be enforced
+            // by the transport rather than after the fact (Greptile).
+            // `as any`: this repo's axios typings predate maxContentLength on the
+            // config interface (same workaround as the guarded fetch helper).
+            const imgResp = await axios.get<ArrayBuffer>(fetchUrl, {
+              responseType: 'arraybuffer',
+              timeout: 30000,
+              maxContentLength: DEFAULT_MAX_IMAGE_BYTES,
+              maxBodyLength: DEFAULT_MAX_IMAGE_BYTES,
+            } as any);
+            contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
+            imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          } else {
+            // describe_image is an agent-callable foundation tool fed image URLs
+            // from untrusted content, so this server-side fetch of an agent-supplied
+            // URL is a reachable SSRF vector (cloud metadata, RFC1918/loopback).
+            // fetchBufferFollowingRedirects validates that the host resolves to a
+            // public IP and pins the connection to that exact address (DNS-rebinding
+            // safe) on EVERY hop — so redirects can be followed without reopening
+            // the bypass. Flatly refusing redirects would be safe but false-blocks
+            // ordinary one-hop image links such as Google Drive `uc?export=view`
+            // (ENG-834).
+            const fetched = await fetchBufferFollowingRedirects(fetchUrl);
+            contentType = fetched.contentType;
+            imageBuffer = fetched.buffer;
+          }
           let finalContentType = contentType;
           // Normalize to a vision-decodable format so the declared media type always
           // matches the bytes. Fixes HEIC/AVIF/TIFF/BMP/SVG logos and mislabeled or
@@ -7177,7 +7260,7 @@ export class AgentModeService {
       } catch (primaryFailure: any) {
         primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
         const fallbackModel = this.getVisionFallbackModel(visionModelUsed);
-        if (!fallbackModel || !this.isRetryableMediaToolError(primaryFailure)) {
+        if (!fallbackModel || !this.isVisionFallbackWorthy(primaryFailure)) {
           throw primaryFailure;
         }
 
@@ -28891,8 +28974,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // Unipile for linkedin_sections=* (full profile incl. experience /
           // education / skills) and strips viewer-relative fields before
           // persisting — see unipileProfileService.ts.
+          // force_refresh bypasses the 30-day profile cache and reads live from the
+          // authenticated Unipile account (ENG-508). The Founder LinkedIn audit and any
+          // "what is my headline right now?" read must pass it so a months-stale cached
+          // headline is never presented as current; high-volume outreach loops keep the
+          // cache-first default for their dedup/rate-limit benefit. This is a pass-through
+          // boolean — it never introduces a non-authenticated fallback.
+          const forceRefresh = !!args.force_refresh;
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
-          const profileResult = await getUnipileProfileService().getProfile(target, account_id);
+          const profileResult = await getUnipileProfileService().getProfile(target, account_id, { forceRefresh });
           const raw = profileResult.rawData;
 
           // The global profile cache strips is_relationship / connected_at because

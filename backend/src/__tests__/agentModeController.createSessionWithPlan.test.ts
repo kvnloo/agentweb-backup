@@ -18,6 +18,7 @@ jest.mock('../services/chatbotService', () => ({
     getChatSession: jest.fn(),
     addChatMessage: jest.fn(),
     addMessageToSession: jest.fn().mockResolvedValue({}),
+    addAssociatedSkills: jest.fn().mockResolvedValue(undefined),
     createOrReuseInteractiveShare: jest.fn().mockResolvedValue('https://example.com/ishare'),
   }
 }));
@@ -385,6 +386,46 @@ describe('AgentModeController - createSessionWithPlan', () => {
         conversableToken: 'mock-conversable-token-123',
         userId: 'test-user-123'
       });
+    });
+
+    // ENG-508/ENG-867: the Founder LinkedIn audit plan carries the "LinkedIn Profile
+    // Reader" skill on its profile-extraction step. Creating a session from the plan
+    // must auto-install that skill, because tool filtering is computed at the start of
+    // each message — if the skill were not installed upfront, linkedin_outreach would
+    // be unavailable and the model would fall back to the stale you_search_web cache.
+    it('auto-installs a step skillId so the authenticated LinkedIn tool is available (ENG-508)', async () => {
+      const PROFILE_READER_ID = '73ad4f6b-813d-4c56-bb9f-9e7abd89ab04';
+      mockWorkPlanService.getWorkPlansByVisibility.mockImplementation((visibility: string) =>
+        Promise.resolve(
+          visibility === 'system'
+            ? [
+                {
+                  ...mockWorkPlans[0],
+                  steps: [
+                    { stepCount: 1, title: 'ICP Info Collection', description: 'First step' },
+                    {
+                      stepCount: 2,
+                      title: 'Scoring + Report',
+                      description: 'Extract Profile Data (authenticated, live)',
+                      requiredFunctionCalls: ['create_html_file', 'linkedin_outreach'],
+                      skillIds: [PROFILE_READER_ID],
+                    },
+                  ],
+                },
+              ]
+            : []
+        ) as any
+      );
+
+      const req = mockRequest(mockPlanTitle);
+      const res = mockResponse();
+
+      await agentModeController.createSessionWithPlan(req, res);
+
+      expect(mockChatbotDb.addAssociatedSkills).toHaveBeenCalledWith(
+        'test-session-123',
+        expect.arrayContaining([PROFILE_READER_ID])
+      );
     });
 
     it('should return 400 when planTitle is missing', async () => {

@@ -44,6 +44,10 @@ describe('Predefined Work Plan MCP Tools', () => {
 
   const context = { userId: 'user-123', agentUserId: 'user-123' };
 
+  /** The mcpFetch calls that carry a payload — i.e. everything but the
+   *  pre-update read the destructive-steps guard performs (ENG-890). */
+  const writeCalls = () => mockMcpFetch.mock.calls.filter((call: any) => call[0].method !== 'GET');
+
   // ─── FAIL tests: invalid inputs, boundary conditions, error paths ────
 
   describe('registration', () => {
@@ -190,6 +194,240 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(callBody.welcomeMessage).toBeUndefined();
       expect(callBody.defaultModel).toBeUndefined();
     });
+  });
+
+  // ─── ENG-889: step fields are documented snake_case but the admin route
+  // reads them camelCase. Both casings must reach the route as camelCase.
+  describe('manage_predefined_work_plan - step field casing', () => {
+    // An update reads the plan before writing (ENG-890), so the first call is a
+    // bodyless GET. Index over the write calls to keep asserting on the payload.
+    const stepBodyOf = (call: number) => ((writeCalls()[call][0] as any).body.steps);
+
+    it('maps the documented snake_case required_function_calls to requiredFunctionCalls on create', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{ title: 'Step 1', required_function_calls: ['list_connected_accounts'] }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['list_connected_accounts'] },
+      ]);
+    });
+
+    it('maps snake_case skill_ids, user_instructions and step_count on create', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{
+          title: 'Step 1',
+          skill_ids: ['skill-1'],
+          user_instructions: 'Do this',
+          step_count: 2,
+        }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', skillIds: ['skill-1'], userInstructions: 'Do this', stepCount: 2 },
+      ]);
+    });
+
+    it('maps snake_case step fields on update', async () => {
+      mockMcpFetch.mockResolvedValue({ message: 'Updated' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        title: 'Gate Plan',
+        steps: [{ title: 'Step 1', required_function_calls: ['list_skills'], skill_ids: ['skill-1'] }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['list_skills'], skillIds: ['skill-1'] },
+      ]);
+    });
+
+    it('still accepts the camelCase form unchanged', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{ title: 'Step 1', requiredFunctionCalls: ['list_skills'], skillIds: ['skill-1'] }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['list_skills'], skillIds: ['skill-1'] },
+      ]);
+    });
+
+    it('maps snake_case expected_asset_count to expectedAssetCount', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Creative Hub',
+        steps: [{ title: 'Generate 3 Images Per Hook', expected_asset_count: 18 }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Generate 3 Images Per Hook', expectedAssetCount: 18 },
+      ]);
+    });
+
+    it('uses the snake_case value when the camelCase twin is explicitly null', async () => {
+      // JSON has no undefined, so a model that emits an unset field emits null.
+      // Treating null as "camelCase present" would shadow a perfectly good
+      // snake_case value and hand the route null -> `|| []` -> silently empty.
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{
+          title: 'Step 1',
+          requiredFunctionCalls: null,
+          required_function_calls: ['list_connected_accounts'],
+        }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['list_connected_accounts'] },
+      ]);
+    });
+
+    it('is not sensitive to the order the two casings appear in', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{
+          required_function_calls: ['snake_first'],
+          requiredFunctionCalls: ['camel_second'],
+          title: 'Step 1',
+        }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['camel_second'] },
+      ]);
+    });
+
+    it('prefers the camelCase value when both casings are supplied', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: [{
+          title: 'Step 1',
+          requiredFunctionCalls: ['camel'],
+          required_function_calls: ['snake'],
+        }],
+      }, context);
+
+      expect(stepBodyOf(0)).toEqual([
+        { title: 'Step 1', requiredFunctionCalls: ['camel'] },
+      ]);
+    });
+
+    it('leaves a missing or malformed steps value untouched', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Gate Plan',
+        steps: ['not-an-object', null],
+      }, context);
+      expect(stepBodyOf(0)).toEqual(['not-an-object', null]);
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        title: 'Gate Plan',
+      }, context);
+      expect(stepBodyOf(1)).toBeUndefined();
+    });
+
+    it('documents the field names the route actually reads', () => {
+      const def: any = mcpToolRegistry.getTool('manage_predefined_work_plan')!.definition;
+      const stepProps = def.inputSchema.properties.steps.items.properties;
+      expect(Object.keys(stepProps)).toEqual(
+        expect.arrayContaining(['requiredFunctionCalls', 'skillIds', 'expectedAssetCount'])
+      );
+      expect(stepProps.required_function_calls).toBeUndefined();
+    });
+  });
+
+  // The admin route reads category, and the portal sets it — but it was absent
+  // from the tool, so an API-only caller had to open the portal to finish a plan
+  // it had just created (ENG-889). visibility is deliberately NOT exposed: it
+  // publishes to, or hides from, every user.
+  describe('manage_predefined_work_plan - category', () => {
+    it('maps category on create', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Paid Ads Plan',
+        steps: [{ title: 'Step 1' }],
+        category: 'Paid Ads',
+      }, context);
+
+      expect((mockMcpFetch.mock.calls[0][0] as any).body.category).toBe('Paid Ads');
+    });
+
+    it('maps category on update', async () => {
+      mockMcpFetch.mockResolvedValue({ message: 'Updated' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        category: 'Strategy',
+      }, context);
+
+      expect((mockMcpFetch.mock.calls[0][0] as any).body.category).toBe('Strategy');
+    });
+
+    it('omits category when not supplied, leaving the route default alone', async () => {
+      mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'create',
+        title: 'Plain',
+        steps: [{ title: 'Step 1' }],
+      }, context);
+
+      expect('category' in (mockMcpFetch.mock.calls[0][0] as any).body).toBe(false);
+    });
+
+    it('does not expose visibility on the tool', () => {
+      const def: any = mcpToolRegistry.getTool('manage_predefined_work_plan')!.definition;
+      expect(def.inputSchema.properties.category).toBeDefined();
+      expect(def.inputSchema.properties.visibility).toBeUndefined();
+    });
+
+    it.each([['create'], ['update']])(
+      'never forwards visibility to the route on %s, even if a caller sends it',
+      async (action) => {
+        mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action,
+          plan_id: 'wp-1',
+          title: 'Plan',
+          steps: [{ title: 'Step 1' }],
+          visibility: 'public',
+        }, context);
+
+        expect('visibility' in (writeCalls()[0][0] as any).body).toBe(false);
+      },
+    );
   });
 
   describe('manage_predefined_work_plan - update', () => {
