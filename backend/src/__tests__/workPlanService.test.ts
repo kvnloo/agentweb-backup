@@ -379,6 +379,20 @@ describe('WorkPlanService', () => {
       ).rejects.toThrow('Work plan steps changed');
     });
 
+    it('disambiguates on a consistent read, since a stale replica would invent a deletion', async () => {
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPromise.mockRejectedValueOnce(err);
+      mockPromise.mockResolvedValueOnce({ Item: { ...plan, steps_rev: 'rev-2' } });
+
+      await expect(
+        workPlanService.updateWorkPlan(plan, { expectedStepsRev: 'rev-1' }),
+      ).rejects.toThrow('Work plan steps changed');
+      // An eventually-consistent read can miss a plan that exists, which would
+      // report a live conflict to the caller as "your plan was deleted".
+      expect(mockGet.mock.calls[0][0].ConsistentRead).toBe(true);
+    });
+
     it('still reports a deleted plan as not-found even when a revision was supplied', async () => {
       const err: any = new Error('The conditional request failed');
       err.code = 'ConditionalCheckFailedException';
@@ -399,6 +413,29 @@ describe('WorkPlanService', () => {
       expect(mockGet).not.toHaveBeenCalled();
     });
 
+    it('disambiguates with a consistent read, so a stale replica cannot call a live plan deleted', async () => {
+      // A default DynamoDB read may serve a replica that has not caught up. On
+      // this path that would report a plan we just failed to write as deleted —
+      // a 404 for what is really a retryable conflict.
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPromise.mockRejectedValueOnce(err);
+      mockPromise.mockResolvedValueOnce({ Item: { ...plan, steps_rev: 'rev-2' } });
+
+      await expect(
+        workPlanService.updateWorkPlan(plan, { expectedStepsRev: 'rev-1' }),
+      ).rejects.toThrow('Work plan steps changed');
+      expect(mockGet).toHaveBeenCalledWith(expect.objectContaining({ ConsistentRead: true }));
+    });
+
+    it('returns the revision it wrote, so a caller can chain a second staked write', async () => {
+      // Without this the only revision a caller can obtain is the one it read,
+      // which its own write has already superseded.
+      const rev = await workPlanService.updateWorkPlan(plan);
+
+      expect(rev).toBe('test-plan-id-789');
+    });
+
     it('never REMOVEs steps_rev, which would strand every reader holding one', async () => {
       // It is minted here, not supplied by the caller, so it must not be treated
       // as an optional field the caller "cleared" by omitting it.
@@ -406,6 +443,43 @@ describe('WorkPlanService', () => {
 
       const arg = mockUpdate.mock.calls[0][0];
       expect(arg.UpdateExpression).not.toMatch(/REMOVE .*steps_rev/);
+    });
+  });
+
+  describe('syncWorkPlan', () => {
+    it('mints a fresh steps_rev instead of importing the source plan\'s', async () => {
+      // The put replaces the target's steps wholesale while bypassing
+      // updateWorkPlan entirely. Copying the source revision across would let a
+      // caller's staked write pass its precondition against steps the sync had
+      // already replaced — the two tables' revisions can genuinely collide,
+      // since dev is populated from prod (ENG-890).
+      mockPromise.mockResolvedValueOnce({
+        Item: { planId: 'p1', title: 'T', steps: [{ stepCount: 1, title: 'S' }], steps_rev: 'rev-source' },
+      });
+
+      await workPlanService.syncWorkPlan('p1', 'prod-to-dev');
+
+      const written = mockPut.mock.calls[0][0].Item;
+      expect(written.steps_rev).toBe('test-plan-id-789');
+      expect(written.steps_rev).not.toBe('rev-source');
+      expect(written.steps).toEqual([{ stepCount: 1, title: 'S' }]);
+    });
+
+    it('stamps one onto a source plan that predates the field', async () => {
+      mockPromise.mockResolvedValueOnce({
+        Item: { planId: 'p1', title: 'T', steps: [] },
+      });
+
+      await workPlanService.syncWorkPlan('p1', 'dev-to-prod');
+
+      expect(mockPut.mock.calls[0][0].Item.steps_rev).toBe('test-plan-id-789');
+    });
+
+    it('returns null without writing when the source plan is missing', async () => {
+      mockPromise.mockResolvedValueOnce({});
+
+      await expect(workPlanService.syncWorkPlan('gone', 'prod-to-dev')).resolves.toBeNull();
+      expect(mockPut).not.toHaveBeenCalled();
     });
   });
 

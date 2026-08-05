@@ -539,7 +539,9 @@ describe("a step revision lets a caller stake the plan it inspected", () => {
       .put("/api/admin/work-plans/p")
       .send({ title: "Renamed" });
 
-    expect(workPlanService.updateWorkPlan).toHaveBeenCalledWith(expect.any(Object));
+    // An empty stake, which the service reads as "unconditioned" — the key's
+    // absence is the signal, so this must not carry expectedStepsRev at all.
+    expect(workPlanService.updateWorkPlan).toHaveBeenCalledWith(expect.any(Object), {});
   });
 
   it("never persists expectedStepsRev as a plan field", async () => {
@@ -548,6 +550,20 @@ describe("a step revision lets a caller stake the plan it inspected", () => {
       .send({ title: "Renamed", expectedStepsRev: "rev-1" });
 
     expect(workPlanService.updateWorkPlan.mock.calls[0][0]).not.toHaveProperty("expectedStepsRev");
+  });
+
+  it("returns the revision the write produced, not the stale one it read", async () => {
+    // `updated` is built by spreading the plan that was read, so it carries the
+    // pre-write revision. Echoing that back hands the caller a value its own
+    // write has already superseded — a guaranteed 409 on the next staked write.
+    workPlanService.updateWorkPlan.mockResolvedValue("rev-2");
+
+    const res = await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.steps_rev).toBe("rev-2");
   });
 
   it("answers 409, not 500, when the plan moved under the caller", async () => {
