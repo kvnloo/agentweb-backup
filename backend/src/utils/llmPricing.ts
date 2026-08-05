@@ -35,6 +35,57 @@ function withDerivedCache(inPerM: number, outPerM: number): ModelPrice {
   };
 }
 
+/**
+ * Cache-write price as a multiple of the input rate, per prompt-cache TTL.
+ * Anthropic's published multipliers: 5-minute writes 1.25x, 1-hour writes 2x.
+ */
+export const CACHE_WRITE_TTL_MULTIPLIER: Readonly<Record<string, number>> = Object.freeze({
+  '5m': 1.25,
+  '1h': 2,
+});
+
+/** Cache-write tokens split by the TTL Bedrock actually applied, e.g. `{ '1h': 84210 }`. */
+export type CacheWriteByTtl = Readonly<Record<string, number>>;
+
+/**
+ * Cost of cache-WRITE tokens for one call, in USD-per-1M units (tokens x rate;
+ * divide by 1e6 for dollars, or round for microdollars).
+ *
+ * ENG-893: Bedrock returns `usage.cacheDetails` — the exact token count per TTL
+ * it applied. When we have it, bill each bucket at ITS rate rather than at the
+ * model's declared rate. That matters because requesting `ttl: '1h'` is not a
+ * guarantee of getting it: Bedrock accepts the field on models AWS documents as
+ * 5-minute-only (probed live 2026-08-04), so a static 2x rate would over-bill by
+ * 60% on any model that silently served us a 5-minute cache. Pricing from what
+ * came back makes the ledger correct no matter which TTL was honoured, and means
+ * a wrong allowlist entry costs missed savings rather than money.
+ *
+ * Falls back to the model's declared `cacheWritePerM` when no breakdown is
+ * present (non-Bedrock providers, or a response without `cacheDetails`).
+ */
+export function cacheWriteCost(
+  price: ModelPrice,
+  cacheWriteTokens: number,
+  byTtl?: CacheWriteByTtl
+): number {
+  const declaredPerM = price.cacheWritePerM ?? price.inPerM * 1.25;
+  if (!byTtl) return cacheWriteTokens * declaredPerM;
+
+  let billed = 0;
+  let accountedTokens = 0;
+  for (const [ttl, tokens] of Object.entries(byTtl)) {
+    if (!Number.isFinite(tokens) || tokens <= 0) continue;
+    const multiplier = CACHE_WRITE_TTL_MULTIPLIER[ttl];
+    // An unrecognised TTL must not be billed at zero — fall back to the
+    // declared rate so a new Bedrock TTL tier can never under-bill silently.
+    billed += tokens * (multiplier != null ? price.inPerM * multiplier : declaredPerM);
+    accountedTokens += tokens;
+  }
+  // Any remainder the breakdown did not cover still bills at the declared rate.
+  const unaccounted = Math.max(0, cacheWriteTokens - accountedTokens);
+  return billed + unaccounted * declaredPerM;
+}
+
 // Fable 5 / Haiku 4.5 list prices, confirmed against Anthropic's official pricing
 // (Fable $10/$50, Haiku $1/$5). Defined once and registered under BOTH the bare
 // Vertex id (e.g. claude-fable-5) and the anthropic.-prefixed Bedrock id, because
@@ -54,6 +105,13 @@ const HAIKU_4_5_PRICE = withDerivedCache(1, 5);
  */
 export const MODEL_PRICING: Record<string, ModelPrice> = {
   // ── AWS Bedrock Anthropic (ported from estimateCost) ───────────────────────
+  // ENG-893: every cacheWritePerM here is the DEFAULT-TTL (1.25x) rate, even
+  // for models agent-mode invokes with `ttl: '1h'`. The 1-hour rate is 2x, but
+  // it is applied per RESPONSE by cacheWriteCost, not per model — because a
+  // model id is shared across paths with different TTLs. Sonnet 4.6 is the
+  // proof: agent-mode asks it for 1h, while codingAgentService and rcaEnricher
+  // use the same id with no ttl at all. One per-model number cannot be right
+  // for both; `usage.cacheDetails` / `usage.cache_creation` can.
   'anthropic.claude-sonnet-4-5-20250929-v1:0': withDerivedCache(3, 15),
   'anthropic.claude-sonnet-4-6': withDerivedCache(3, 15),
   'anthropic.claude-opus-4-6-v1': withDerivedCache(5, 25),
