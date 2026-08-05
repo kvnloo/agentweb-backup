@@ -305,6 +305,12 @@ export interface CalendlyConfig extends BaseOAuthConfig {
   webhook_signing_key?: string; // HMAC secret WE generate and hand to Calendly at subscription-create time
   booking_tracking_active: boolean;
   needs_reconnect?: boolean;
+  // Which of the customer's own lead lists a booking gets created/updated in
+  // (CRM-forward, ENG-524 §6 step 4). Either set explicitly via Settings, or
+  // auto-resolved to an idempotent system-managed list on first booking and
+  // persisted here so every later delivery reuses it directly — see
+  // resolveOrCreateBookingList in calendlyWebhook.ts.
+  booking_lead_list_id?: string;
 }
 
 export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
