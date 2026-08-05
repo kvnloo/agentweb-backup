@@ -351,12 +351,11 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   //       gate that no tool call actually returned, and tie the title/summary to
   //       real tool outcomes. This holds regardless of publish authorization,
   //       because inventing a gate is a reporting violation either way.
-  //   (b) AUTHORIZED-ACTION OVERRIDE — GATED on the machine-readable
-  //       publishAuthorized signal (ENG-827's fullAutonomy owner opt-in), NOT on
-  //       the model's reading of the prompt's free text (review finding 1). Only
-  //       an owner-authorized schedule gets "you MUST attempt the action / the
-  //       generic get-approval default does NOT apply". A non-authorized run
-  //       keeps the safe draft-and-notify default.
+  //   (b) AUTHORIZED-ACTION OVERRIDE — resolved deterministically from the
+  //       schedule record, NOT from the model's reading of the prompt's free text
+  //       (review finding 1). Authorized is the DEFAULT, because scheduled runs
+  //       have always published; the owner opts OUT per schedule via
+  //       requirePublishApproval, and only then does the run hold and notify.
   const authorizedDirective = getUnattendedExecutionDirective('scheduled', true, true);
   const unauthorizedDirective = getUnattendedExecutionDirective('scheduled', true, false);
 
@@ -428,15 +427,23 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     for (const d of [authorizedDirective, unauthorizedDirective, directive]) {
       expect(d.toLowerCase()).toContain('publish authorization —');
     }
-    expect(authorizedDirective).toContain('this schedule is publish-authorized');
-    expect(authorizedDirective).not.toContain('NOT publish-authorized');
-    for (const d of [unauthorizedDirective, directive]) {
-      expect(d).toContain('this schedule is NOT publish-authorized');
+    for (const d of [authorizedDirective, directive]) {
+      expect(d).toContain('this schedule publishes without approval');
+      expect(d).not.toContain('requires approval before publishing');
     }
+    expect(unauthorizedDirective).toContain('requires approval before publishing');
   });
 
-  it('the NOT-authorized block forbids the publishing tools and is cited as reason (1)', () => {
-    for (const d of [unauthorizedDirective, directive]) {
+  it('DEFAULTS to publishing when the caller omits the signal', () => {
+    // The 897 existing schedules carry no publish field, and a caller that omits
+    // the argument must not silently convert them to drafting-only. If this test
+    // fails, live publishing has regressed.
+    expect(directive).toContain('this schedule publishes without approval');
+    expect(directive).toContain('If the task says to post, reply, or publish, CALL THE TOOL.');
+  });
+
+  it('the approval-required block forbids the publishing tools and is cited as reason (1)', () => {
+    for (const d of [unauthorizedDirective]) {
       expect(d).toContain('THIS BLOCK IS reason (1) above');
       expect(d).toContain('Do NOT call any tool that publishes externally');
       expect(d).toContain('twitter_manage_post');
@@ -444,32 +451,32 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     }
   });
 
-  it('the NOT-authorized block must not be describable as a platform gate', () => {
+  it('the approval-required block must not be describable as a platform gate', () => {
     // The whole ENG-803 failure was calling a policy decision an "X publishing
     // gate". A real authorization block is not a licence to resume that framing.
-    for (const d of [unauthorizedDirective, directive]) {
-      expect(d).toContain('account-level authorization setting the owner controls');
+    for (const d of [unauthorizedDirective]) {
+      expect(d).toContain('account-level setting the owner chose');
       expect(d).toContain('NOT a platform, X/Twitter, API, or credential gate');
       expect(d).toContain('Calling it a platform gate is exactly the fabrication banned above');
     }
   });
 
-  it('the unblocking action names the setting that actually grants authorization', () => {
-    // Drift guard: the signal moved from fullAutonomy to the schedule's own
-    // publishing opt-in, and this instruction was left pointing at the old
-    // toggle. An owner who followed it would enable full autonomy, get no
-    // publishing, and hit the identical block next run.
-    for (const d of [unauthorizedDirective, directive]) {
-      expect(d).toContain('"Publish without approval"');
+  it('the unblocking action names the setting that actually unblocks publishing', () => {
+    // Drift guard: the signal has moved twice (fullAutonomy → an opt-in → this
+    // opt-out) and this instruction was left pointing at the old toggle each
+    // time. An owner who followed a stale instruction would change the wrong
+    // setting and hit the identical block next run.
+    for (const d of [unauthorizedDirective]) {
+      expect(d).toContain('turn OFF "Require approval before publishing"');
       expect(d).toContain('Do NOT point them at "Full autonomy"');
       expect(d).not.toContain('turn on full autonomy');
     }
   });
 
-  it('the NOT-authorized block refuses to let prompt wording grant authorization', () => {
-    for (const d of [unauthorizedDirective, directive]) {
+  it('the approval-required block refuses to let prompt wording override the setting', () => {
+    for (const d of [unauthorizedDirective]) {
       expect(d).toContain('however the schedule\'s prompt text is worded');
-      expect(d).toContain('the prompt cannot grant this, only that setting can');
+      expect(d).toContain('the prompt cannot override the setting');
     }
   });
 });

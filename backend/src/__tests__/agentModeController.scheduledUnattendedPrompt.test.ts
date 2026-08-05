@@ -144,7 +144,7 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     // publish-authorization signal via getScheduleById. Default it to a
     // deterministic not-authorized schedule so the base suite never makes a real
     // DB call; the publish-authorization cases below override this per-test.
-    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, unattendedPublishAuthorized: false } as any);
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, requirePublishApproval: false } as any);
     // Worker returns a normal success so generateResponse completes without error.
     mockWorker.runInWorker.mockResolvedValue({
       content: 'Report delivered.',
@@ -295,77 +295,85 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
   // EVERY scheduled run regardless of the signal — gating them on an opt-in
   // would make them dead code for 100% of real traffic. Only the
   // publish-AUTHORIZATION block is gated, on the schedule's own
-  // unattendedPublishAuthorized opt-in.
+  // requirePublishApproval opt-OUT (absent/false → authorized, the status quo).
 
-  it('injects the fabrication ban and the mandated-action rule on a NON-authorized schedule', async () => {
-    // this is the reported schedule's exact shape — the fix must reach it.
-    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, unattendedPublishAuthorized: false });
+  it('tells the REPORTED schedule to publish — the shape that produced ENG-803', async () => {
+    // Harsha's schedule: no publish-approval opt-out, so it publishes, exactly as
+    // it did before this PR. This is the end-to-end assertion that the fix reaches
+    // the reported case instead of quietly converting it to drafting-only.
+    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, requirePublishApproval: false });
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
     expect(sp).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
     expect(sp).toContain('report_product_issues');
     expect(sp).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
     expect(sp).toContain('twitter_manage_post');
-    // …and a non-authorized schedule gets an explicit REFUSAL block, not silence:
-    // without it the mandated-action rule has no citable "not authorized" out and
-    // would resolve to publishing anyway (Greptile P1 on PR #2260).
-    expect(sp).toContain('this schedule is NOT publish-authorized');
-    expect(sp).toContain('THIS BLOCK IS reason (1) above');
-    expect(sp).not.toContain('this schedule is publish-authorized');
+    expect(sp).toContain('this schedule publishes without approval');
+    expect(sp).toContain('If the task says to post, reply, or publish, CALL THE TOOL.');
+    expect(sp).not.toContain('requires approval before publishing');
   });
 
-  it('a model-writable required call never authorizes publishing end-to-end', async () => {
+  it('a model-writable required call cannot move the decision either way', async () => {
     // manage_scheduled_chat lets the MODEL write requiredFunctionCalls onto the
-    // schedule. If that granted authorization, Emma could self-authorize standing
-    // publish rights; the assembled prompt must still refuse.
+    // schedule, so it must not be read as a publishing decision. Here the schedule
+    // publishes because the owner set no opt-out — NOT because the model listed a
+    // publish tool.
     (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({
       scheduleId: SCHEDULE_ID,
       requiredFunctionCalls: ['search_tweets', 'twitter_manage_post'],
+      requirePublishApproval: true,
     });
     await agentModeController.generateResponse(makeReq(), makeRes());
-    expect(capturedSystemPrompt()!).toContain('this schedule is NOT publish-authorized');
+    expect(capturedSystemPrompt()!).toContain('requires approval before publishing');
   });
 
-  it('fullAutonomy alone never authorizes publishing end-to-end', async () => {
-    // ENG-396's opt-in is consent to DECIDE unaided, not consent to publish. An
-    // existing full-autonomy schedule must not be silently converted into a
-    // publishing one (Greptile consent-boundary P1 on PR #2260).
-    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: true });
+  it('fullAutonomy does not decide publishing end-to-end', async () => {
+    // ENG-396's opt-in is consent to DECIDE unaided, a different question. It must
+    // neither grant nor withhold publishing.
+    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({
+      scheduleId: SCHEDULE_ID,
+      fullAutonomy: true,
+      requirePublishApproval: true,
+    });
     await agentModeController.generateResponse(makeReq(), makeRes());
-    expect(capturedSystemPrompt()!).toContain('this schedule is NOT publish-authorized');
+    expect(capturedSystemPrompt()!).toContain('requires approval before publishing');
   });
 
-  it('adds the publish-authorization block when the owner granted the publishing opt-in', async () => {
-    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, unattendedPublishAuthorized: true });
+  it('adds the approval-required block when the owner opted out of publishing', async () => {
+    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, requirePublishApproval: true });
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
-    // the machine-readable owner opt-in adds authorization on top…
-    expect(sp).toContain('PUBLISH AUTHORIZATION —');
+    expect(sp).toContain('requires approval before publishing');
+    expect(sp).toContain('THIS BLOCK IS reason (1) above');
+    // the owner is pointed at the setting that actually unblocks them
+    expect(sp).toContain('turn OFF "Require approval before publishing"');
     // …and the unconditional rules still ride alongside it.
     expect(sp).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
     expect(sp).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
   });
 
-  it('falls back to the NOT-authorized block when no signal is present (safe default)', async () => {
-    // owner never opted in → schedule item lacks both signals entirely.
+  it('a legacy schedule with NO publish field still publishes (no silent regression)', async () => {
+    // Every one of the 897 existing schedules looks like this. If this test ever
+    // flips to the approval-required block, this PR has broken live publishing.
     (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID });
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
-    expect(sp).toContain('this schedule is NOT publish-authorized');
+    expect(sp).toContain('this schedule publishes without approval');
+    expect(sp).not.toContain('requires approval before publishing');
     expect(sp).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
     expect(sp).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
   });
 
-  it('degrades to NOT-authorized when the schedule lookup THROWS, keeping the unconditional rules', async () => {
+  it('keeps publishing when the schedule lookup THROWS, keeping the unconditional rules', async () => {
     (scheduleDb.getScheduleById as jest.Mock).mockRejectedValue(new Error('DynamoDB throttled'));
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt();
-    // a prompt-enrichment lookup failure must never break the run, and must fail
-    // closed on authorization while still shipping the truthful-reporting rules.
+    // a prompt-enrichment lookup failure must never break the run, and must not
+    // silently halt publishing for a schedule that works today.
     expect(sp).toBeDefined();
     expect(sp!).toContain('[AUTOMATED UNATTENDED EXECUTION]');
-    expect(sp!).toContain('this schedule is NOT publish-authorized');
-    expect(sp!).not.toContain('this schedule is publish-authorized');
+    expect(sp!).toContain('this schedule publishes without approval');
+    expect(sp!).not.toContain('requires approval before publishing');
     expect(sp!).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
     expect(sp!).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
   });

@@ -1,16 +1,22 @@
 /**
- * ENG-803 — the unattended-publishing opt-in is reachable by the OWNER.
+ * ENG-803 — the publish-approval opt-OUT is reachable by the OWNER.
  *
  * Companion to agentModeController.unattemptedPublishGate.test.ts, which pins the
  * opposite guarantee: the model cannot set this field (it is absent from the
- * manage_scheduled_chat MCP allowlist). Both halves matter. A consent signal only
- * the model can write is the ENG-803 defect inverted; a consent signal NOBODY can
- * write is a dead toggle, and the prompt's unblocking instruction ("turn on
- * 'Publish without approval'") would send owners to a control that does nothing.
+ * manage_scheduled_chat MCP allowlist). Both halves matter. A setting only the
+ * model can write lets Emma decide her own publishing permission; a setting
+ * NOBODY can write is a dead toggle, and the prompt's unblocking instruction
+ * ("turn OFF 'Require approval before publishing'") would send owners to a
+ * control that does nothing.
+ *
+ * NOTE THE POLARITY: `requirePublishApproval: true` means HOLD at the publish
+ * step. False/absent means publish, which is what scheduled runs have always
+ * done — so an omitted field must resolve to false, never to true, or existing
+ * schedules would stop publishing.
  *
  * These tests pin the owner-facing HTTP write path — POST/PUT
- * /api/agent-mode/scheduled-chats — that the Customer Portal's "Publish without
- * approval" switch calls. The switch itself lives in the separate
+ * /api/agent-mode/scheduled-chats — that the Customer Portal's "Require approval
+ * before publishing" switch calls. The switch itself lives in the separate
  * agentweb-customer-portal repo
  * (src/components/agent-mode/schedule/ScheduleFormPanel.tsx); it submits the whole
  * form object, so the contract that actually needs guarding is this one: the
@@ -102,125 +108,127 @@ const updateReq = (extra: Record<string, unknown>) => ({
 }) as unknown as Request;
 
 /** The stored schedule the update handler merges onto. */
-const existingSchedule = (unattendedPublishAuthorized: boolean) => ({
+const existingSchedule = (requirePublishApproval: boolean) => ({
   scheduleId: SCHEDULE_ID,
   userId: USER_ID,
   scheduleName: 'Harsha X Reply Guy — Mentions',
   startingMessage: 'Source recent mentions and POST replies directly.',
   frequency: 'daily',
-  unattendedPublishAuthorized,
+  requirePublishApproval,
 });
 
-describe('createScheduledChat persists the owner publishing opt-in (ENG-803)', () => {
+describe('createScheduledChat persists the owner publish-approval setting (ENG-803)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2');
     mockScheduleDb.createSchedule.mockResolvedValue(undefined as never);
   });
 
-  it('stores the opt-in when the owner turns the switch on', async () => {
+  it('stores the opt-out when the owner asks to approve publishing', async () => {
     await agentModeController.createScheduledChat(
-      createReq({ unattendedPublishAuthorized: true }),
+      createReq({ requirePublishApproval: true }),
       mockRes()
     );
 
     expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
-      expect.objectContaining({ unattendedPublishAuthorized: true })
+      expect.objectContaining({ requirePublishApproval: true })
     );
   });
 
-  it('defaults to NOT authorized when the client omits the field', async () => {
+  it('defaults to NO approval requirement when the client omits the field', async () => {
+    // i.e. keeps publishing — the behaviour every existing schedule has today.
     await agentModeController.createScheduledChat(createReq({}), mockRes());
 
     expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
-      expect.objectContaining({ unattendedPublishAuthorized: false })
+      expect.objectContaining({ requirePublishApproval: false })
     );
   });
 
-  it('does not grant publishing on a truthy non-boolean (strict === true)', async () => {
-    // A form/query serialisation that stringifies booleans must not be read as consent.
+  it('does not halt publishing on a truthy non-boolean (strict === true)', async () => {
+    // A serialisation that stringifies booleans must not silently stop a working schedule.
     for (const truthy of ['true', 1, 'yes', {}]) {
       jest.clearAllMocks();
       await agentModeController.createScheduledChat(
-        createReq({ unattendedPublishAuthorized: truthy }),
+        createReq({ requirePublishApproval: truthy }),
         mockRes()
       );
       expect(mockScheduleDb.createSchedule).toHaveBeenCalledWith(
-        expect.objectContaining({ unattendedPublishAuthorized: false })
+        expect.objectContaining({ requirePublishApproval: false })
       );
     }
   });
 });
 
-describe('updateScheduledChat keeps the opt-in partial-update safe (ENG-803)', () => {
+describe('updateScheduledChat keeps the publish-approval setting partial-update safe (ENG-803)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockAgentModeService.getDefaultModel.mockResolvedValue('gpt-5-chat-2');
     mockScheduleDb.updateSchedule.mockResolvedValue(undefined as never);
   });
 
-  it('grants publishing when the owner turns the switch on', async () => {
+  it('records the approval requirement when the owner turns the switch on', async () => {
     mockScheduleDb.getScheduleById.mockResolvedValue(existingSchedule(false) as never);
 
     await agentModeController.updateScheduledChat(
-      updateReq({ unattendedPublishAuthorized: true }),
+      updateReq({ requirePublishApproval: true }),
       mockRes()
     );
 
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
       SCHEDULE_ID,
-      expect.objectContaining({ unattendedPublishAuthorized: true })
+      expect.objectContaining({ requirePublishApproval: true })
     );
   });
 
-  it('revokes publishing when the owner turns the switch off', async () => {
+  it('restores publishing when the owner turns the switch off', async () => {
     mockScheduleDb.getScheduleById.mockResolvedValue(existingSchedule(true) as never);
 
     await agentModeController.updateScheduledChat(
-      updateReq({ unattendedPublishAuthorized: false }),
+      updateReq({ requirePublishApproval: false }),
       mockRes()
     );
 
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
       SCHEDULE_ID,
-      expect.objectContaining({ unattendedPublishAuthorized: false })
+      expect.objectContaining({ requirePublishApproval: false })
     );
   });
 
-  it('preserves an existing grant when an unrelated edit omits the field', async () => {
-    // e.g. renaming the schedule must not silently revoke publishing.
+  it('preserves an existing approval requirement when an unrelated edit omits it', async () => {
+    // e.g. renaming the schedule must not silently start publishing.
     mockScheduleDb.getScheduleById.mockResolvedValue(existingSchedule(true) as never);
 
     await agentModeController.updateScheduledChat(updateReq({}), mockRes());
 
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
       SCHEDULE_ID,
-      expect.objectContaining({ unattendedPublishAuthorized: true })
+      expect.objectContaining({ requirePublishApproval: true })
     );
   });
 
-  it('does not invent a grant when an unrelated edit omits the field', async () => {
+  it('does not invent an approval requirement when an unrelated edit omits it', async () => {
     mockScheduleDb.getScheduleById.mockResolvedValue(existingSchedule(false) as never);
 
     await agentModeController.updateScheduledChat(updateReq({}), mockRes());
 
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
       SCHEDULE_ID,
-      expect.objectContaining({ unattendedPublishAuthorized: false })
+      expect.objectContaining({ requirePublishApproval: false })
     );
   });
 
-  it('leaves a legacy schedule that predates the field unauthorized', async () => {
+  it('leaves a legacy schedule that predates the field PUBLISHING', async () => {
     // Every schedule created before this PR: the attribute simply is not there.
+    // It must resolve to false (publish), which is what those schedules do today.
     const legacy = { ...existingSchedule(false) } as Record<string, unknown>;
-    delete legacy.unattendedPublishAuthorized;
+    delete legacy.requirePublishApproval;
     mockScheduleDb.getScheduleById.mockResolvedValue(legacy as never);
 
     await agentModeController.updateScheduledChat(updateReq({}), mockRes());
 
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
       SCHEDULE_ID,
-      expect.objectContaining({ unattendedPublishAuthorized: false })
+      expect.objectContaining({ requirePublishApproval: false })
     );
   });
 });

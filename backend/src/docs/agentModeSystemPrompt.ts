@@ -571,41 +571,46 @@ export function getScheduledSessionOverride(sessionType?: string): string {
 // call unconditionally and never leaks the unattended block into a non-scheduled
 // session, even if a future caller omits the call-site guard.
 //
-// ENG-803 / ENG-827: `publishAuthorized` is the machine-readable per-schedule
-// signal that resolves the publish-gate ambiguity — owner-set schedule fields
-// (see agentModeController.resolvePublishAuthorized), not the model's reading of
-// the schedule prompt's free text. Whether an irreversible publish is authorized
-// is a deterministic owner decision, so the "generic approval guidance does NOT
-// apply / you MUST attempt the action" override is gated on this signal rather
-// than inferred from prompt wording. Default (undefined/false) → the safe
-// draft-and-notify default; never inferred by the model.
+// ENG-803 / ENG-827: `publishAuthorized` is resolved deterministically from the
+// schedule record (see agentModeController.resolvePublishAuthorized), never from
+// the model's reading of the schedule prompt's free text. It is TRUE by default,
+// because scheduled runs have always published and ENG-803 is a report of the
+// agent inventing a restriction — answering it with a real platform-wide
+// restriction would break the ~25 active schedules that publish today. The owner
+// opts OUT per schedule via requirePublishApproval; only then does the run hold
+// at the publish step.
 //
 // BOTH branches emit a block, and that is load-bearing. The mandated-action rule
 // below allows exactly two outs, the first being "an explicit authorization block
 // in THIS prompt says the action is not authorized — quote it". If the
-// unauthorized branch emitted nothing, that out would not exist, no tool error
-// would exist either, and the rule would resolve to "publish anyway" — driving an
-// unauthorized external post on every schedule without the opt-in. So the false
-// branch emits the block the model is meant to cite.
+// approval-required branch emitted nothing, that out would not exist, no tool
+// error would exist either, and the rule would resolve to "publish anyway" —
+// overriding the owner's explicit request to approve first. So that branch emits
+// the block the model is meant to cite.
 //
 // The truthful-reporting rules (no fabricated gate, derive the title from real
 // tool outcomes) apply UNCONDITIONALLY, because inventing a gate is a reporting
 // violation regardless of authorization — including misdescribing this very
 // authorization block as a platform gate.
 //
-// WHERE THE OWNER FLIPS IT: the unauthorized branch tells the owner to turn on
-// "Publish without approval", so that control has to exist or the instruction is
-// a dead end. It is the switch in the Customer Portal's schedule form —
+// WHERE THE OWNER FLIPS IT: the approval-required branch tells the owner they can
+// turn OFF "Require approval before publishing", so that control has to exist or
+// the instruction is a dead end. It is the switch in the Customer Portal's
+// schedule form —
 // src/components/agent-mode/schedule/ScheduleFormPanel.tsx in the SEPARATE
 // agentweb-customer-portal repo (PR #1002), which submits the form to
 // POST/PUT /api/agent-mode/scheduled-chats. That is why the control is not
 // greppable from this repo. The half of the path that DOES live here — the two
-// handlers reading `unattendedPublishAuthorized` off req.body, coercing it
-// strictly, and preserving it across partial updates — is pinned by
+// handlers reading `requirePublishApproval` off req.body, coercing it strictly,
+// and preserving it across partial updates — is pinned by
 // agentModeController.publishOptInWritePath.test.ts. Deliberately absent from
-// the manage_scheduled_chat MCP allowlist so only a human can grant it
+// the manage_scheduled_chat MCP allowlist so only a human can set it
 // (pinned by agentModeController.unattemptedPublishGate.test.ts).
-export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean, publishAuthorized?: boolean): string {
+// `publishAuthorized` defaults to TRUE so an omitted argument matches
+// resolvePublishAuthorized's own default (and the pre-existing product
+// behaviour). A caller that forgets to pass it must not silently halt publishing
+// on schedules that work today.
+export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean, publishAuthorized: boolean = true): string {
   if (sessionType !== 'scheduled') return '';
   // The userId→identity mapping and its data-minimization guard reference two
   // admin-only tools (get_chat_history, list_all_clients). Inject this slice
@@ -664,14 +669,15 @@ NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION (CRITICAL):
 - If (1) or (2) genuinely applies, say plainly that nothing was posted/sent, give that specific reason, persist the drafts, and surface the concrete unblocking action for the owner.${publishAuthorized
   ? `
 
-PUBLISH AUTHORIZATION — this schedule is publish-authorized (CRITICAL):
-- The owner has explicitly turned on "Publish without approval" for this schedule (the machine-readable authorization signal, not the prompt's wording). Any generic "get approval before publishing" default is therefore ALREADY satisfied for this run and is never a reason to withhold the action.`
+PUBLISH AUTHORIZATION — this schedule publishes without approval (CRITICAL):
+- The owner has NOT asked to approve publishing for this schedule, so publishing is authorized for this run. This is the account-level setting that decides it, resolved from the schedule record — not something you infer from the prompt's wording, and not something you may override.
+- Any generic "get approval before publishing to social" default is therefore ALREADY satisfied for this run and is NEVER a reason to withhold the action. Neither is the run being scheduled or unattended. If the task says to post, reply, or publish, CALL THE TOOL.`
   : `
 
-PUBLISH AUTHORIZATION — this schedule is NOT publish-authorized (CRITICAL):
-- The owner has NOT enabled unattended publishing for this schedule — they never turned on its "Publish without approval" setting. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot grant this, only that setting can.
-- THIS BLOCK IS reason (1) above. Do NOT call any tool that publishes externally (e.g. twitter_manage_post, post_on_connected_account, publish_blog_article). Instead: do all the work up to the publish step, persist the drafts to the knowledge base, and state plainly in your final report that nothing was posted because unattended publishing is not enabled for this schedule.
-- Quote THIS block as the reason, and describe it accurately: it is an account-level authorization setting the owner controls, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action, naming the setting exactly: turn on "Publish without approval" in this schedule's settings, and the next run will post. Do NOT point them at "Full autonomy" — that setting governs whether Emma decides unaided mid-run and does NOT authorize publishing, so following it would leave the next run blocked in exactly the same place.`}`;
+PUBLISH AUTHORIZATION — this schedule requires approval before publishing (CRITICAL):
+- The owner has turned ON "Require approval before publishing" for this schedule. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot override the setting.
+- THIS BLOCK IS reason (1) above. Do NOT call any tool that publishes externally (e.g. twitter_manage_post, post_on_connected_account, publish_blog_article). Instead: do all the work up to the publish step, persist the drafts to the knowledge base, and state plainly in your final report that nothing was posted because this schedule requires approval before publishing.
+- Quote THIS block as the reason, and describe it accurately: it is an account-level setting the owner chose, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action, naming the setting exactly: turn OFF "Require approval before publishing" in this schedule's settings, and the next run will post. Do NOT point them at "Full autonomy" — that setting governs whether Emma decides unaided mid-run and does NOT affect publishing, so following it would leave the next run blocked in exactly the same place.`}`;
 }
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.

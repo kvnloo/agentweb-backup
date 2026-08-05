@@ -123,18 +123,21 @@ describe('scheduledRunDeferredPublishWithoutAttempt (ENG-803)', () => {
   // external post out of the exact draft-and-notify behaviour the safe default is
   // supposed to produce — so the reason requires the authorization signal.
 
-  it('does NOT fire on an unauthorized schedule, even though the deferral is detected', () => {
+  it('does NOT fire on an approval-required schedule, even though the deferral is detected', () => {
     // the underlying detector still sees it — only the continuation is withheld
     expect(scheduledRunDeferredPublishWithoutAttempt(REPORT_EXCERPT, READ_ONLY_CALLS)).toBe(true);
     expect(classifyScheduledContinuation({ content: REPORT_EXCERPT, toolCalls: READ_ONLY_CALLS }, false)).toBeNull();
   });
 
-  it('fails closed when the caller resolves no authorization signal at all', () => {
-    // omitted arg → default false → never publish. A new caller is safe by default.
+  it('never fires for a caller that passed no schedule at all', () => {
+    // omitted arg → default false. The SCHEDULE default is authorized, but an
+    // unspecified caller has no schedule to read, and no caller should be able to
+    // trigger a publish ORDER by omission. Schedule-driven callers pass the
+    // resolved value explicitly.
     expect(classifyScheduledContinuation({ content: REPORT_EXCERPT, toolCalls: READ_ONLY_CALLS })).toBeNull();
   });
 
-  it('still yields a lower-precedence reason on an unauthorized schedule', () => {
+  it('still yields a lower-precedence reason on an approval-required schedule', () => {
     // withholding 'unattempted-publish' must not swallow an unrelated signal
     expect(
       classifyScheduledContinuation({
@@ -156,55 +159,70 @@ describe('scheduledRunDeferredPublishWithoutAttempt (ENG-803)', () => {
 });
 
 describe('resolvePublishAuthorized (ENG-803)', () => {
-  it('authorizes on the schedule\'s own unattended-publishing opt-in', () => {
-    expect(resolvePublishAuthorized({ unattendedPublishAuthorized: true })).toBe(true);
+  // THE INVARIANT THIS PR MUST NOT BREAK. Scheduled runs have always published;
+  // there was never a gate in front of twitter_manage_post. Measured on the live
+  // table while fixing this, 25 ACTIVE schedules are publishing-shaped (4 that
+  // require a publish tool outright, 21 whose prompt tells Emma to post/publish/
+  // tweet/reply). An earlier revision of this fix defaulted to NOT authorized,
+  // which would have silently converted every one of them into a drafting-only
+  // run — curing a 1-in-62-session fabrication by breaking 25 working schedules.
+  // If you are tempted to make the default deny again, that is the cost.
+  it('authorizes a schedule that predates the field entirely', () => {
+    expect(resolvePublishAuthorized({})).toBe(true);
   });
 
-  it('does NOT authorize off fullAutonomy — that is a different consent', () => {
-    // ENG-396's toggle says Emma decides unaided instead of pausing to ask. An
-    // owner who ticked that for campaign-objective decisions did not agree to
-    // have posts published under their name, so reusing it would silently
-    // convert every existing full-autonomy schedule into a publishing one.
-    expect(resolvePublishAuthorized({ fullAutonomy: true } as any)).toBe(false);
-    expect(resolvePublishAuthorized({ fullAutonomy: true, unattendedPublishAuthorized: false } as any)).toBe(false);
-    // …and the publishing opt-in stands on its own, without full autonomy.
-    expect(resolvePublishAuthorized({ fullAutonomy: false, unattendedPublishAuthorized: true } as any)).toBe(true);
+  it('authorizes when the owner has not asked to approve publishing', () => {
+    expect(resolvePublishAuthorized({ requirePublishApproval: false })).toBe(true);
   });
 
-  it('does NOT authorize off requiredFunctionCalls, however publish-shaped', () => {
-    // Regression guard for a reverted design. requiredFunctionCalls reads like
-    // owner intent, but manage_scheduled_chat (an MCP tool the MODEL calls) writes
-    // it onto the schedule record — so honouring it would let Emma grant herself
-    // standing publish authority. Authorization may only come from a field a
-    // human sets. Do not "restore" this.
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['twitter_manage_post'] } as any)).toBe(false);
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['post_on_connected_account'] } as any)).toBe(false);
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: [{ functionName: 'publish_blog_article' }] } as any)).toBe(false);
+  it('withholds authorization only on the explicit owner opt-out', () => {
+    expect(resolvePublishAuthorized({ requirePublishApproval: true })).toBe(false);
   });
 
-  it('fails closed on every degenerate input', () => {
-    expect(resolvePublishAuthorized(undefined)).toBe(false);
-    expect(resolvePublishAuthorized(null)).toBe(false);
-    expect(resolvePublishAuthorized({})).toBe(false);
-    expect(resolvePublishAuthorized({ unattendedPublishAuthorized: false })).toBe(false);
-    expect(resolvePublishAuthorized({ unattendedPublishAuthorized: 'true' as any })).toBe(false);
-    expect(resolvePublishAuthorized({ unattendedPublishAuthorized: 1 as any })).toBe(false);
+  it('is unaffected by fullAutonomy in either direction — a different consent', () => {
+    // ENG-396's toggle says Emma decides unaided instead of pausing to ask. It is
+    // not a publishing decision, so it must neither grant nor withhold publishing.
+    expect(resolvePublishAuthorized({ fullAutonomy: true } as any)).toBe(true);
+    expect(resolvePublishAuthorized({ fullAutonomy: false } as any)).toBe(true);
+    expect(resolvePublishAuthorized({ fullAutonomy: true, requirePublishApproval: true } as any)).toBe(false);
+  });
+
+  it('is unaffected by requiredFunctionCalls, however publish-shaped', () => {
+    // Regression guard for a reverted design. requiredFunctionCalls is MODEL-
+    // WRITABLE — manage_scheduled_chat (an MCP tool the model calls) PUTs it onto
+    // the schedule record. It must not move this decision in either direction, or
+    // Emma could write her own publishing permission. Do not "restore" this.
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['twitter_manage_post'] } as any)).toBe(true);
+    expect(
+      resolvePublishAuthorized({ requiredFunctionCalls: ['twitter_manage_post'], requirePublishApproval: true } as any)
+    ).toBe(false);
+  });
+
+  it('treats a non-boolean opt-out as absent, keeping the existing behaviour', () => {
+    // Strict === true: a serialisation that stringifies booleans must not silently
+    // halt publishing on a schedule that works today.
+    expect(resolvePublishAuthorized(undefined)).toBe(true);
+    expect(resolvePublishAuthorized(null)).toBe(true);
+    expect(resolvePublishAuthorized({ requirePublishApproval: 'true' as any })).toBe(true);
+    expect(resolvePublishAuthorized({ requirePublishApproval: 1 as any })).toBe(true);
   });
 });
 
-describe('the publishing opt-in is not reachable by the model (ENG-803)', () => {
+describe('the publish-approval setting is not reachable by the model (ENG-803)', () => {
   // The whole point of a distinct field is that Emma cannot set it. manage_scheduled_chat
   // builds its request body from an explicit allowlist; this pins that neither the
-  // publishing opt-in nor fullAutonomy is on it, so a future field added to that
-  // allowlist cannot quietly become a self-authorization path.
+  // publish-approval setting nor fullAutonomy is on it, so a future field added to
+  // that allowlist cannot quietly become a self-authorization path — in either
+  // direction: writing requirePublishApproval would let Emma silence her own
+  // publishing just as surely as granting it would let her authorize it.
   it('manage_scheduled_chat never forwards an authorization field', () => {
     const apiTools = readFileSync(
       resolvePath(__dirname, '../mcp/server/apiTools.ts'),
       'utf8'
     );
     expect(apiTools).toContain("path: '/api/agent-mode/scheduled-chats'"); // guard: the tool still exists
-    expect(apiTools).not.toContain('unattendedPublishAuthorized');
-    expect(apiTools).not.toContain('unattended_publish_authorized');
+    expect(apiTools).not.toContain('requirePublishApproval');
+    expect(apiTools).not.toContain('require_publish_approval');
     expect(apiTools).not.toContain('fullAutonomy');
     expect(apiTools).not.toContain('full_autonomy');
   });

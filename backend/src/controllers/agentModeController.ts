@@ -1451,39 +1451,54 @@ function isPublishAttemptTool(name?: string): boolean {
 }
 
 /**
- * ENG-803: the machine-readable per-schedule signal that authorizes an unattended
- * run to publish externally. Deliberately NEVER inferred from the schedule
- * prompt's free text — a model reading "POST replies directly" is not an owner
- * decision, and treating it as one is the hole this whole fix exists to close.
- * Exactly ONE signal qualifies: `unattendedPublishAuthorized`, the schedule's
- * own publishing opt-in, which only the owner can set (portal form). Absent it,
- * the run keeps the safe draft-and-notify default. Fail-closed: a missing
- * schedule or a non-true value → false.
+ * ENG-803: whether an unattended run may publish externally. Deterministic and
+ * resolved HERE, never inferred by the model from the schedule prompt's free
+ * text — a model reading "POST replies directly" and concluding it is authorized
+ * is the hole this fix exists to close.
  *
- * Two signals were tried here and REJECTED — do not reinstate either.
+ * DEFAULT IS AUTHORIZED, and that is deliberate. Scheduled runs have always
+ * published; there was never a gate in front of `twitter_manage_post`. ENG-803
+ * is a report of the agent INVENTING a restriction, so answering it with a real
+ * platform-wide restriction would be the wrong cure: measured against the live
+ * table, 25 active schedules are publishing-shaped (4 requiring a publish tool
+ * outright, 21 whose prompt tells Emma to post/publish/tweet/reply), and a
+ * default-deny would silently convert all of them into drafting-only runs. The
+ * fabrication being fixed was 1 failure in 62 scored sessions; trading that for
+ * ~25 broken schedules is a strictly worse outcome.
  *
- * `fullAutonomy` (ENG-396) is a DIFFERENT consent. Its toggle says Emma will
- * "proceed with her recommended option" rather than pausing to ask when she
- * needs a decision mid-run. That is consent to decide unaided, not consent to
- * publish to the world unattended; an owner who ticked it for campaign-objective
- * decisions never agreed to have replies posted under their name. Reusing it
- * would silently convert every existing full-autonomy schedule into a
- * publishing one.
+ * So the owner control is an OPT-OUT: `requirePublishApproval === true` means
+ * "hold my runs at the publish step and tell me what's waiting". Anything else —
+ * false, absent, a legacy row that predates the field — keeps today's behaviour.
+ * Because absence means authorized, no backfill is needed and no existing
+ * schedule changes behaviour when this ships.
  *
- * `requiredFunctionCalls` naming a publishing tool reads like owner intent, but
- * it is MODEL-WRITABLE: the `manage_scheduled_chat` MCP tool PUTs it onto the
- * schedule record (mcp/server/apiTools.ts), and admin templates and work-plan
- * steps write it too. Honouring it lets Emma grant herself standing authority to
- * post — the ENG-803 defect inverted, manufacturing consent to act instead of a
- * gate to avoid acting.
+ * Note this is NOT fail-open in the dangerous direction: it preserves an
+ * existing capability rather than granting a new one. The model still cannot
+ * talk its way into publishing (the value is read off the record, not the
+ * prompt), and it still cannot set the value — `requirePublishApproval` is
+ * absent from the `manage_scheduled_chat` MCP allowlist, so only a human writes
+ * it. A lookup failure resolves to the status quo, not to a new grant.
  *
- * The rule both rejections share: an authorization signal must mean exactly this
- * capability, and must be writable only by a human.
+ * Three signals were tried as an opt-IN and REJECTED — do not reinstate any.
+ *
+ * `fullAutonomy` (ENG-396) is a DIFFERENT consent: Emma will "proceed with her
+ * recommended option" rather than pause when she needs a mid-run decision. That
+ * is consent to decide unaided, not to publish under the owner's name.
+ *
+ * `requiredFunctionCalls` naming a publishing tool is MODEL-WRITABLE — the
+ * `manage_scheduled_chat` MCP tool PUTs it onto the schedule record
+ * (mcp/server/apiTools.ts), as do admin templates and work-plan steps. Honouring
+ * it lets Emma grant herself standing authority to post.
+ *
+ * The schedule prompt's free text is model-read, never an owner decision.
+ *
+ * The rule they share: an authorization signal must mean exactly the capability
+ * being granted, and must be writable only by a human.
  */
 export function resolvePublishAuthorized(
-  schedule?: { unattendedPublishAuthorized?: boolean } | null
+  schedule?: { requirePublishApproval?: boolean } | null
 ): boolean {
-  return schedule?.unattendedPublishAuthorized === true;
+  return schedule?.requirePublishApproval !== true;
 }
 
 /**
@@ -1530,11 +1545,15 @@ export type ScheduledContinuationReason = 'preview-only' | 'unattempted-publish'
 //       before proceeding, with no human present to answer (ENG-369); or
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
 //       (scheduledRunSignalsIncompleteWork).
-// 'unattempted-publish' additionally requires `publishAuthorized` — the owner's
-// machine-readable opt-in (resolvePublishAuthorized). Its continuation ORDERS the
-// model to publish, so firing it on a schedule the owner never authorized would
-// drive an unauthorized external post out of the very draft-and-notify behaviour
-// the safe default is supposed to produce. Unauthorized schedules therefore fall
+// 'unattempted-publish' additionally requires `publishAuthorized`, resolved from
+// the schedule by resolvePublishAuthorized (authorized unless the owner ticked
+// requirePublishApproval). Its continuation ORDERS the model to publish, so
+// firing it on a schedule whose owner asked to approve first would drive an
+// unwanted external post out of the very draft-and-notify behaviour they chose.
+// The parameter defaults to FALSE here rather than following the schedule
+// default: an unspecified caller has given no schedule to read, and no caller
+// should be able to trigger a publish order by omission. Schedule-driven callers
+// pass the resolved value explicitly. Approval-required schedules therefore fall
 // through to the other reasons: their deferral is legitimate, and the truthful
 // reporting of it is enforced unconditionally by the system directive instead.
 // Default false = fail-closed, so a caller that never resolves the signal can
@@ -1711,12 +1730,14 @@ export async function runVerifiedChat(
     // human protection on irreversible decisions (owner opted in per-schedule).
     fullAutonomy?: boolean;
     // ENG-803: the schedule's own unattended-publishing opt-in
-    // (unattendedPublishAuthorized), resolved by the caller. Gates the
+    // (requirePublishApproval), resolved by the caller. Gates the
     // 'unattempted-publish' continuation, which ORDERS the model to call the
-    // posting tool — firing that without the owner's consent would manufacture
-    // an unauthorized external post out of correct draft-and-notify behaviour.
-    // Deliberately NOT derived from fullAutonomy: that is consent to decide
-    // unaided, not consent to publish. Default false = fail-closed.
+    // posting tool — firing that on a schedule whose owner asked to approve
+    // publishing first would manufacture an unwanted external post out of the
+    // draft-and-notify behaviour they chose. Deliberately NOT derived from
+    // fullAutonomy: that is consent to decide unaided, not consent to publish.
+    // Defaults false so an unspecified caller never triggers a publish order;
+    // schedule-driven callers pass resolvePublishAuthorized(schedule).
     publishAuthorized?: boolean;
     // ENG-636: does a PARK on this run actually reach a human? Only true for
     // callers with a notification/answer channel: runScheduledChat (owner email)
@@ -4119,12 +4140,17 @@ export async function generateSessionResponse(
           // resolvePublishAuthorized for which signals qualify. A failed read
           // degrades to the safe default (not authorized → draft & notify); a
           // prompt-enrichment lookup must never break the run.
-          let publishAuthorized = false;
+          // Starts TRUE because publishing is the pre-existing behaviour of every
+          // scheduled run; the owner opts OUT via requirePublishApproval. A failed
+          // lookup therefore degrades to the status quo rather than silently
+          // halting publishing for schedules that work today — a prompt-enrichment
+          // read must never change what the run is allowed to do.
+          let publishAuthorized = true;
           if (scheduleIdMatch) {
             try {
               publishAuthorized = resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleIdMatch[1]));
             } catch (scheduleLookupError) {
-              console.error(`AgentMode: failed to resolve publish authorization for scheduled session ${session.sessionId}; defaulting to draft-and-notify:`, scheduleLookupError);
+              console.error(`AgentMode: failed to resolve publish approval setting for scheduled session ${session.sessionId}; keeping the existing publish behaviour:`, scheduleLookupError);
             }
           }
           systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, publishAuthorized);
@@ -6848,7 +6874,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
-        unattendedPublishAuthorized,
+        requirePublishApproval,
         timezone
       } = req.body;
 
@@ -6929,11 +6955,12 @@ export const agentModeController = {
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
         fullAutonomy: fullAutonomy === true,
-        // ENG-803: separate opt-in authorizing this schedule's unattended runs to
-        // publish externally. Kept distinct from fullAutonomy (consent to decide
-        // unaided ≠ consent to post on the owner's behalf) and absent from the
-        // manage_scheduled_chat MCP allowlist, so only the owner can grant it.
-        unattendedPublishAuthorized: unattendedPublishAuthorized === true,
+        // ENG-803: owner opt-OUT holding this schedule's runs at the publish step.
+        // Default false = publish, which is what scheduled runs have always done.
+        // Kept distinct from fullAutonomy (consent to decide unaided is not the
+        // same question) and absent from the manage_scheduled_chat MCP allowlist,
+        // so only the owner can change it.
+        requirePublishApproval: requirePublishApproval === true,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -7059,7 +7086,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
-        unattendedPublishAuthorized,
+        requirePublishApproval,
         timezone
       } = req.body;
 
@@ -7132,11 +7159,11 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
-        // ENG-803: opt-in unattended external publishing. Partial-update safe —
-        // an update that omits it must never silently revoke or grant it.
-        unattendedPublishAuthorized: unattendedPublishAuthorized !== undefined
-          ? (unattendedPublishAuthorized === true)
-          : ((existingSchedule as any).unattendedPublishAuthorized || false),
+        // ENG-803: owner opt-out from unattended publishing. Partial-update safe —
+        // an update that omits it must never silently set or clear it.
+        requirePublishApproval: requirePublishApproval !== undefined
+          ? (requirePublishApproval === true)
+          : ((existingSchedule as any).requirePublishApproval || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
