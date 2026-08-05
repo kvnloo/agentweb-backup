@@ -119,6 +119,47 @@ const MAX_MESSAGES_FOR_SCORING = 50;
 const MIN_USER_MESSAGES = 1;
 
 /**
+ * Backstop for zero-task sessions the static phrase lists below cannot
+ * enumerate ("hey, just checking in", "sorry wrong window", …). The judge is
+ * asked one extra, purely factual question — did the user ever ask for
+ * anything? — and a `false` answer excludes the session from the cohort.
+ *
+ * APPENDED at call time rather than written into DEFAULT_SCORING_SYSTEM_PROMPT
+ * on purpose: both the default prompt and every custom judge prompt are read
+ * from AW-Settings, and production HAS an override for both. A change made to
+ * the in-code constant alone would be silently masked in prod (ENG-392), which
+ * is exactly how this class of fix has failed before. Appending applies the
+ * rule to whatever prompt is loaded, override or not.
+ *
+ * The instruction is deliberately biased toward `true`: a wrong `true` merely
+ * scores a session as before, whereas a wrong `false` would silently hide a
+ * genuinely unsatisfied user. Parsing fails OPEN for the same reason — only an
+ * explicit boolean `false` excludes.
+ */
+export const NO_TASK_JUDGMENT_CLAUSE = `
+
+ADDITIONAL REQUIRED FIELD — "taskRequested":
+- Set "taskRequested": false ONLY when the user never asked for anything at all in this conversation — e.g. they only greeted ("hi", "good morning"), interrupted ("wait", "hold on"), acknowledged ("ok", "thanks"), sent a test/probe message, or left before stating anything.
+- Set "taskRequested": true in EVERY other case, including when the request is vague, implicit, incomplete, unanswerable, or the user only asked a question.
+- When in any doubt, set it to true.
+- A session marked false is removed from satisfaction reporting entirely, so never use false for a session where the user actually wanted something — even if the assistant handled it badly.
+
+Include it in the SAME JSON object as the other fields, e.g.:
+{"score": <1-5>, "reason": "<brief explanation>", "dimensions": {"goalCompletion": <1-5>, "dataAccuracy": <1-5>, "outputQuality": <1-5>}, "taskRequested": <true|false>}`;
+
+/**
+ * Read the judge's zero-task verdict, failing OPEN.
+ *
+ * Only a literal boolean `false` counts as "no task was requested". A missing,
+ * null, string or otherwise malformed field means the judge did not answer the
+ * question — in which case the session must be scored normally rather than
+ * silently dropped from the cohort.
+ */
+function parseTaskRequested(parsed: any): boolean | undefined {
+  return parsed?.taskRequested === false ? false : undefined;
+}
+
+/**
  * Standalone greetings / pleasantries that carry no task or question. Kept
  * deliberately small and exact-match — a greeting-only session is excluded from
  * satisfaction scoring (ENG-168), so this set biases toward NOT matching: any
@@ -163,15 +204,24 @@ const NO_GOAL_PHRASES = new Set<string>([...GREETING_PHRASES, ...NO_TASK_PHRASES
  * "Hi" — which silently defeated the exact-match no-goal check and put flawless
  * zero-task sessions back into the ≤3 cohort (ENG-830).
  *
- * Deliberately narrow: 1–4 name-shaped words (letters plus `.`/`'`/`-`, no
- * digits) followed by a colon AND whitespace AND remaining text. That shape
- * also matches a label prefix on a genuine instruction ("Reply to this: Hi",
- * "Note: ok"), whose remainder IS a no-goal phrase — stripping it there would
- * misclassify a real request as a zero-task session and silently drop it from
- * the cohort, inverting the err-toward-scoring invariant below. So the strip is
- * applied only to sessions that actually carry the prefix: Slack-relayed ones.
+ * On a Slack-relayed session the prefix is present BY CONSTRUCTION — the routes
+ * build the content as `${displayName}: ${text}` — so the separator is simply
+ * the FIRST colon, and everything before it is the display name whatever shape
+ * it has. Matching that directly (rather than guessing a "name-shaped" token)
+ * is what makes real display names work: digits ("Adam2 Cai"), parenthesised
+ * teams ("Fangfang Tan (Marketing)"), long or non-latin names ("田中 太郎").
+ * `[^:\n]` cannot cross a colon, so a colon inside the user's own text is
+ * preserved ("Adam Cai: Write a post about: pricing" → "Write a post about:
+ * pricing"). The 80-char bound keeps a pathological line from being eaten.
+ *
+ * This shape also matches a label prefix on a genuine instruction ("Reply to
+ * this: Hi", "Note: ok"), whose remainder IS a no-goal phrase — stripping it
+ * there would misclassify a real request as a zero-task session and silently
+ * drop it from the cohort, inverting the err-toward-scoring invariant below. So
+ * the strip is applied ONLY to sessions that actually carry the prefix:
+ * Slack-relayed ones.
  */
-const SENDER_NAME_PREFIX = /^[\p{L}][\p{L}.'’-]*(?:[ \t]+[\p{L}][\p{L}.'’-]*){0,3}:[ \t]+(?=\S)/u;
+const SENDER_NAME_PREFIX = /^[^:\n]{1,80}:[ \t]*(?=\S)/;
 
 /**
  * True for sessions whose user turns are relayed from Slack and therefore
@@ -504,6 +554,13 @@ type ScoringResult = {
   reason: string;
   evaluatedMessageIndex: number;
   dimensions?: { goalCompletion: number; dataAccuracy: number; outputQuality: number };
+  /**
+   * `false` when the judge reported that the user never requested anything, so
+   * the session belongs outside the satisfaction cohort. `undefined` means the
+   * judge gave no usable answer — score normally (fail open). See
+   * NO_TASK_JUDGMENT_CLAUSE.
+   */
+  taskRequested?: boolean;
 };
 
 function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
@@ -551,7 +608,9 @@ export async function scoreSession(
 
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
-  const systemPrompt = await getDefaultScoringPrompt();
+  // Append the zero-task clause to whatever prompt is configured — the stored
+  // override, if any, would otherwise mask it entirely (ENG-392/ENG-830).
+  const systemPrompt = (await getDefaultScoringPrompt()) + NO_TASK_JUDGMENT_CLAUSE;
   // Persisted setting — validate before calling, or a retired id throws
   // `Invalid model` and the session silently goes unscored (ENG-744).
   const model = await resolveScoringModel(await getDefaultScoringModel());
@@ -585,6 +644,7 @@ export async function scoreSession(
     reason: parsed.reason || "No reason provided",
     evaluatedMessageIndex: currentMessageCount,
     dimensions: parseDimensions(parsed),
+    taskRequested: parseTaskRequested(parsed),
   };
 }
 
@@ -620,7 +680,10 @@ export async function scoreSessionWithJudge(
   const llmPromise = agentModeService.callLLM(
     judgeModel,
     [
-      { role: "system", content: judge.systemPrompt },
+      // Same appended clause as the general scorer, so a custom judge cannot
+      // disagree with it about whether a zero-task session is in the cohort
+      // (the Matt-5 vs Fangfang-3 split in ENG-830).
+      { role: "system", content: judge.systemPrompt + NO_TASK_JUDGMENT_CLAUSE },
       { role: "user", content: `Evaluate this conversation:\n\n${conversationText}` },
     ],
     {
@@ -646,7 +709,42 @@ export async function scoreSessionWithJudge(
     reason: parsed.reason || "No reason provided",
     evaluatedMessageIndex: currentMessageCount,
     dimensions: parseDimensions(parsed),
+    taskRequested: parseTaskRequested(parsed),
   };
+}
+
+/**
+ * Drop a stale satisfaction score from a session that is no longer in the
+ * cohort. Without this the ENG-830 exclusion would only ever apply going
+ * forward: a zero-task session scored 3 before the exclusion existed keeps that
+ * 3 forever, because scoring now skips it and therefore never overwrites it.
+ *
+ * Best-effort and idempotent: nothing to clear → no write at all (so repeated
+ * sweeps are free), and a persistence failure is logged rather than thrown so
+ * one bad session cannot abort the whole scoring pass. An admin-overridden
+ * score is human judgement and is never retracted.
+ */
+async function retractSatisfactionScore(session: ChatSession): Promise<void> {
+  if (!session.satisfactionScore || session.satisfactionScore.adminOverride) return;
+  try {
+    await chatbotDb.clearSessionSatisfactionScore(session.sessionId);
+    // Keep the in-memory copy consistent: the sync sweep applies scores onto
+    // these objects and serialises them straight back to the caller.
+    delete (session as any).satisfactionScore;
+  } catch (err) {
+    console.error(`retractSatisfactionScore: session ${session.sessionId}:`, err);
+  }
+}
+
+/** Judge-score counterpart of retractSatisfactionScore. */
+async function retractJudgeScore(session: ChatSession, judgeId: string): Promise<void> {
+  if (!session.judgeScores?.[judgeId]) return;
+  try {
+    await chatbotDb.clearSessionJudgeScore(session.sessionId, judgeId);
+    delete session.judgeScores[judgeId];
+  } catch (err) {
+    console.error(`retractJudgeScore: session ${session.sessionId}/${judgeId}:`, err);
+  }
 }
 
 export async function scoreSessionWithJudgeIfNeeded(
@@ -654,12 +752,6 @@ export async function scoreSessionWithJudgeIfNeeded(
   judge: ScoringJudge
 ): Promise<NonNullable<ChatSession["judgeScores"]>[string] | null> {
   const messageCount = session.messageCount ?? session.messages?.length ?? 0;
-
-  // Skip if already scored by this judge, up-to-date, and has dimensional scores
-  const existingJudgeScore = session.judgeScores?.[judge.id];
-  if (existingJudgeScore && existingJudgeScore.evaluatedMessageIndex >= messageCount && existingJudgeScore.dimensions) {
-    return null;
-  }
 
   const userMessages = (session.messages || []).filter((m: any) => m.role === "user");
   if (userMessages.length < MIN_USER_MESSAGES) {
@@ -670,7 +762,23 @@ export async function scoreSessionWithJudgeIfNeeded(
   // to complete, so the judge scores it low on goalCompletion as a pure scoring
   // artifact. Exclude it from the satisfaction cohort (ENG-168, ENG-830) — same
   // skip-and-return-null treatment as sub-threshold and in-flight sessions.
-  if (isNoTaskSession(session.messages, session.pageIdentifier)) {
+  //
+  // Gated on hasAssistantTurn: a no-task session that produced NO assistant turn
+  // crashed, and a crash is a genuine reliability failure that must still be
+  // flagged below — the cohort exclusion must never swallow it.
+  //
+  // Placed BEFORE the already-scored early return so a session scored back when
+  // it was still in the cohort gets that stale score retracted rather than
+  // keeping it forever (scoring skips it from now on, so nothing would ever
+  // overwrite it).
+  if (isNoTaskSession(session.messages, session.pageIdentifier) && hasAssistantTurn(session.messages)) {
+    await retractJudgeScore(session, judge.id);
+    return null;
+  }
+
+  // Skip if already scored by this judge, up-to-date, and has dimensional scores
+  const existingJudgeScore = session.judgeScores?.[judge.id];
+  if (existingJudgeScore && existingJudgeScore.evaluatedMessageIndex >= messageCount && existingJudgeScore.dimensions) {
     return null;
   }
 
@@ -705,6 +813,15 @@ export async function scoreSessionWithJudgeIfNeeded(
     });
   }
 
+  // Backstop for zero-task phrasings the static lists cannot enumerate: the
+  // judge itself reported that the user never asked for anything, so the
+  // session is outside the cohort. Fails open — only an explicit `false`
+  // reaches here (see NO_TASK_JUDGMENT_CLAUSE).
+  if (result.taskRequested === false) {
+    await retractJudgeScore(session, judge.id);
+    return null;
+  }
+
   const judgeScore = {
     score: result.score,
     reason: result.reason,
@@ -729,15 +846,6 @@ export async function scoreSessionIfNeeded(
 
   const messageCount = session.messageCount ?? session.messages?.length ?? 0;
 
-  // Skip if already scored, up-to-date, and has dimensional scores
-  if (
-    session.satisfactionScore &&
-    session.satisfactionScore.evaluatedMessageIndex >= messageCount &&
-    session.satisfactionScore.dimensions
-  ) {
-    return null;
-  }
-
   // Count user messages
   const userMessages = (session.messages || []).filter(
     (m: any) => m.role === "user"
@@ -750,7 +858,26 @@ export async function scoreSessionIfNeeded(
   // to complete, so the judge scores it low on goalCompletion as a pure scoring
   // artifact. Exclude it from the satisfaction cohort (ENG-168, ENG-830) — same
   // skip-and-return-null treatment as sub-threshold and in-flight sessions.
-  if (isNoTaskSession(session.messages, session.pageIdentifier)) {
+  //
+  // Gated on hasAssistantTurn: a no-task session that produced NO assistant turn
+  // crashed, and a crash is a genuine reliability failure that must still be
+  // flagged below — the cohort exclusion must never swallow it.
+  //
+  // Placed BEFORE the already-scored early return so a session scored back when
+  // it was still in the cohort gets that stale score retracted rather than
+  // keeping it forever (scoring skips it from now on, so nothing would ever
+  // overwrite it).
+  if (isNoTaskSession(session.messages, session.pageIdentifier) && hasAssistantTurn(session.messages)) {
+    await retractSatisfactionScore(session);
+    return null;
+  }
+
+  // Skip if already scored, up-to-date, and has dimensional scores
+  if (
+    session.satisfactionScore &&
+    session.satisfactionScore.evaluatedMessageIndex >= messageCount &&
+    session.satisfactionScore.dimensions
+  ) {
     return null;
   }
 
@@ -788,6 +915,15 @@ export async function scoreSessionIfNeeded(
       userId: session.userId,
       sessionId: session.sessionId,
     });
+  }
+
+  // Backstop for zero-task phrasings the static lists cannot enumerate: the
+  // judge itself reported that the user never asked for anything, so the
+  // session is outside the cohort. Fails open — only an explicit `false`
+  // reaches here (see NO_TASK_JUDGMENT_CLAUSE).
+  if (result.taskRequested === false) {
+    await retractSatisfactionScore(session);
+    return null;
   }
 
   const satisfactionScore: ChatSession["satisfactionScore"] = {

@@ -2465,6 +2465,49 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Remove a previously persisted satisfaction score.
+   *
+   * Used when a session is re-examined and turns out to be outside the
+   * satisfaction cohort altogether (e.g. a zero-task session scored before that
+   * exclusion existed — ENG-830). Scoring skips such sessions, so without an
+   * explicit retraction the stale score would linger forever and keep inflating
+   * the ≤3 cohort. The score is derived, recomputable data: if the session later
+   * gains a real request, the next sweep scores it again from scratch.
+   */
+  async clearSessionSatisfactionScore(sessionId: string): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "REMOVE satisfactionScore",
+    };
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error clearing session satisfaction score:", error);
+      throw error;
+    }
+  }
+
+  /** Remove one judge's previously persisted score (see clearSessionSatisfactionScore). */
+  async clearSessionJudgeScore(sessionId: string, judgeId: string): Promise<void> {
+    const params = {
+      TableName: this.tableName,
+      Key: { sessionId },
+      UpdateExpression: "REMOVE #js.#jid",
+      ExpressionAttributeNames: {
+        "#js": "judgeScores",
+        "#jid": judgeId,
+      },
+    };
+    try {
+      await dynamodb.update(params).promise();
+    } catch (error) {
+      console.error("Error clearing session judge score:", error);
+      throw error;
+    }
+  }
+
   async updateSessionSummary(
     sessionId: string,
     sessionSummary: NonNullable<ChatSession["sessionSummary"]>
