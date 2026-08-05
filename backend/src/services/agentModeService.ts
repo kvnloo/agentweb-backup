@@ -26411,7 +26411,7 @@ CHARTS (if the section's data calls for one):
     const renderSection = async (chunk: string, index: number): Promise<string> => {
       const userPrompt = `Report title: ${title}
 
-This is section ${index + 1} of ${chunks.length} of the report.${index > 0 ? ' Do not repeat the report title — an earlier section already carries it.' : ''}
+This is section ${index + 1} of ${chunks.length} of the report.${index === 0 ? ' Open it with the report title in an <h1>, then use <h2> for the sections below it.' : ' Do not repeat the report title — the first section already carries it in an <h1>. Start at <h2>.'}
 
 Section content:
 ${chunk}
