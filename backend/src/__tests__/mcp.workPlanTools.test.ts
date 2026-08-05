@@ -846,6 +846,42 @@ describe('Predefined Work Plan MCP Tools', () => {
         );
       }
 
+      // Raised by Greptile on PR #2269. The diff matcher already refuses to
+      // treat a shared title as an identity; merge did not, so a title-only
+      // amendment silently landed on whichever duplicate came first.
+      it('refuses a title-only merge when the title matches more than one step', async () => {
+        mockDuplicateFetches();
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ title: 'Review', description: 'which one?' }],
+        }, context);
+
+        expect(putCalls()).toHaveLength(0);
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload.error).toMatch(/matches more than one step/i);
+        expect(payload.ambiguousSteps).toEqual([
+          { title: 'Review', matchingStepCounts: [1, 2] },
+        ]);
+      });
+
+      it('accepts the same merge once a stepCount disambiguates it', async () => {
+        mockDuplicateFetches();
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 2, title: 'Review', description: 'the second one' }],
+        }, context);
+
+        const body = (putCalls()[0][0] as any).body;
+        expect(body.steps[1].description).toBe('the second one');
+        expect(body.steps[0].description).toBe('first review');
+      });
+
       it('reports a dropped step whose title still exists on another step', async () => {
         mockDuplicateFetches();
 

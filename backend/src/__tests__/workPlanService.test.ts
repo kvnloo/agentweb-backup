@@ -458,6 +458,66 @@ describe('WorkPlanService', () => {
     });
   });
 
+  // Raised by Greptile on PR #2269. Each of these reads the plan, mutates one
+  // visibility field, then writes the WHOLE plan back — steps included. Without
+  // a stake, approving a plan silently restores the steps as they were when the
+  // approval started, undoing anything edited in between. Same read-then-write
+  // race the update path just closed, in three methods that bypassed it.
+  describe('review transitions stake the plan they read', () => {
+    // A factory, not a shared object: these methods mutate the plan they are
+    // handed (plan.visibility = 'public'), so a shared fixture would arrive at
+    // the next test already approved.
+    const pending = (over: any = {}): any => ({
+      planId: 'p1', title: 'T', steps: [{ stepCount: 1, title: 'S' }],
+      visibility: 'pending_review', isBuiltIn: false, ownerId: 'u1',
+      createdAt: 'c', updatedAt: 'u', steps_rev: 'rev-1', ...over,
+    });
+    const stakeOf = () => mockUpdate.mock.calls[0][0].ExpressionAttributeValues[':expectedStepsRev'];
+
+    // Every dynamo call shares one mockPromise, and clearAllMocks does not drain
+    // a mockResolvedValueOnce queue — an unconsumed entry would surface as the
+    // NEXT test's read. Reset the queue rather than leak across tests.
+    beforeEach(() => {
+      mockPromise.mockReset();
+      mockPromise.mockResolvedValue({});
+    });
+
+    it('submitForReview stakes it', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: pending({ visibility: 'private' }) });
+      await workPlanService.submitForReview('p1', 'u1');
+      expect(stakeOf()).toBe('rev-1');
+    });
+
+    it('approveWorkPlan stakes it', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: pending() });
+      await workPlanService.approveWorkPlan('p1');
+      expect(stakeOf()).toBe('rev-1');
+    });
+
+    it('rejectWorkPlan stakes it', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: pending() });
+      await workPlanService.rejectWorkPlan('p1', 'needs work');
+      expect(stakeOf()).toBe('rev-1');
+    });
+
+    it('stakes attribute_not_exists for a plan that predates the field', async () => {
+      const { steps_rev, ...legacy } = pending();
+      mockPromise.mockResolvedValueOnce({ Item: legacy });
+      await workPlanService.approveWorkPlan('p1');
+      expect(mockUpdate.mock.calls[0][0].ConditionExpression).toContain('attribute_not_exists(#steps_rev)');
+    });
+
+    it('surfaces a lost race instead of silently restoring the old steps', async () => {
+      mockPromise.mockResolvedValueOnce({ Item: pending() });
+      const err: any = new Error('The conditional request failed');
+      err.code = 'ConditionalCheckFailedException';
+      mockPromise.mockRejectedValueOnce(err);
+      mockPromise.mockResolvedValueOnce({ Item: pending({ steps_rev: 'rev-2' }) });
+
+      await expect(workPlanService.approveWorkPlan('p1')).rejects.toThrow('Work plan steps changed');
+    });
+  });
+
   describe('syncWorkPlan', () => {
     it('mints a fresh steps_rev instead of importing the source plan\'s', async () => {
       // The put replaces the target's steps wholesale while bypassing

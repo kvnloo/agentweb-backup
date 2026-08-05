@@ -20,6 +20,9 @@ jest.mock("../services/workPlanService", () => ({
     createWorkPlan: jest.fn(),
     getWorkPlan: jest.fn(),
     updateWorkPlan: jest.fn(),
+    approveWorkPlan: jest.fn(),
+    rejectWorkPlan: jest.fn(),
+    submitForReview: jest.fn(),
   },
 }));
 
@@ -590,5 +593,46 @@ describe("a step revision lets a caller stake the plan it inspected", () => {
       .send({ title: "Renamed", expectedStepsRev: "rev-1" });
 
     expect(res.status).toBe(409);
+  });
+});
+
+// Raised by Greptile on PR #2269. These three now stake the plan they read, so
+// they can fail with a conflict — which without a mapping falls through to the
+// generic 500 and reads as "the server broke" rather than "retry".
+describe("review transitions answer 409 on a lost race", () => {
+  const conflict = () => new Error("Work plan steps changed");
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "p", title: "T", steps: [], ownerId: "user-1",
+      visibility: "pending_review", isBuiltIn: false,
+      createdAt: "2026-08-05T00:00:00Z", updatedAt: "2026-08-05T00:00:00Z",
+    });
+  });
+
+  it("on approve", async () => {
+    workPlanService.approveWorkPlan.mockRejectedValue(conflict());
+    const res = await request(app).post("/api/admin/work-plans/p/approve");
+    expect(res.status).toBe(409);
+    expect(res.body.message).toMatch(/changed/i);
+  });
+
+  it("on reject", async () => {
+    workPlanService.rejectWorkPlan.mockRejectedValue(conflict());
+    const res = await request(app).post("/api/admin/work-plans/p/reject").send({ feedback: "no" });
+    expect(res.status).toBe(409);
+  });
+
+  it("on submit for review", async () => {
+    workPlanService.submitForReview.mockRejectedValue(conflict());
+    const res = await request(app).post("/api/user-work-plans/p/submit-for-review");
+    expect(res.status).toBe(409);
+  });
+
+  it("still returns 500 for a genuine failure on approve", async () => {
+    workPlanService.approveWorkPlan.mockRejectedValue(new Error("ProvisionedThroughputExceeded"));
+    const res = await request(app).post("/api/admin/work-plans/p/approve");
+    expect(res.status).toBe(500);
   });
 });
