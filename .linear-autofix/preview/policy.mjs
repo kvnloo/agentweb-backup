@@ -167,9 +167,21 @@ export function availMemMB({
 // stopped? When available memory is below `floorMB`, pick the longest-idle previews (oldest last-hit
 // first) — but NEVER one hit within `minIdleMs` (someone is actively opening its URL or chatting on it)
 // and never drop below `keep` total. Returns `{ avail, victims:[{b,hit}] }`. Everything injectable.
+//
+// The grace period is GRADUATED (added 2026-08-05). A flat `minIdleMs` made this backstop unfireable
+// exactly when it was needed: observed live at 1858MB available against a 3500MB floor with three
+// previews up, all hit 4-9 minutes ago, so the 10-minute grace protected every one and nobody was
+// evicted. That is the normal case, not a coincidence — the previews holding the memory belong to the
+// runs being actively chatted, so lastHit is always recent under load. So once available memory falls
+// below `criticalMB` the grace shrinks to `criticalMinIdleMs`: the hungrier the box, the shorter the
+// benefit of the doubt. It shrinks, never disappears — a preview touched seconds ago is still protected
+// at any pressure, and `keep` still holds — and with `criticalMB` unset the behaviour is exactly the
+// flat grace it replaced.
 export function memoryPressureVictims(floorMB, {
   keep = 1,
   minIdleMs = 10 * 60 * 1000,
+  criticalMB = 0,
+  criticalMinIdleMs = 2 * 60 * 1000,
   now = Date.now(),
   mem = availMemMB,
   state = readJson(STATE),
@@ -180,22 +192,25 @@ export function memoryPressureVictims(floorMB, {
   if (avail == null || avail >= floorMB) return { avail, victims: [] }; // unknown or healthy → nothing
   const bugs = Object.keys(state);
   if (bugs.length <= keep) return { avail, victims: [] };
+  const critical = criticalMB > 0 && avail < criticalMB;
+  const grace = critical ? Math.min(minIdleMs, criticalMinIdleMs) : minIdleMs;
   const ranked = bugs
     .map((b) => ({ b, hit: lastHit(b, state, access, chat) }))
-    .filter(({ hit }) => now - hit >= minIdleMs)           // protect actively-used previews
+    .filter(({ hit }) => now - hit >= grace)               // protect actively-used previews
     .sort((a, z) => a.hit - z.hit);                        // longest-idle first
-  return { avail, victims: ranked.slice(0, Math.max(0, bugs.length - keep)) };
+  return { avail, victims: ranked.slice(0, Math.max(0, bugs.length - keep)), critical };
 }
 
 // OOM backstop, independent of Linear status AND of the 24h idle age. Thin effectful wrapper around
 // memoryPressureVictims: logs + spawns the teardown. Called from gc.mjs each sweep. Returns evicted ids.
 export function evictUnderMemoryPressure(floorMB, opts = {}, log = () => {}) {
   const now = opts.now ?? Date.now();
-  const { avail, victims } = memoryPressureVictims(floorMB, { now, ...opts });
+  const { avail, victims, critical } = memoryPressureVictims(floorMB, { now, ...opts });
   const evicted = [];
   for (const { b, hit } of victims) {
     const ago = hit ? `${Math.round((now - hit) / 60000)}m ago` : 'never';
-    log(`memory pressure (${avail}MB avail < ${floorMB}MB floor): stopping idle ${b} (last hit ${ago})`);
+    const tier = critical ? `CRITICAL <${opts.criticalMB}MB, shortened grace` : `<${floorMB}MB floor`;
+    log(`memory pressure (${avail}MB avail, ${tier}): stopping idle ${b} (last hit ${ago})`);
     spawnSync('node', [PREVIEW, 'down', b], { stdio: 'inherit' });
     evicted.push(b);
   }

@@ -179,6 +179,8 @@ async function main() {
       evictUnderMemoryPressure(memFloorMB, {
         keep: config.previewMemKeep ?? 1,
         minIdleMs: (config.previewMemMinIdleMinutes ?? 10) * 60 * 1000,
+        criticalMB: config.previewMemCriticalMB ?? 0,
+        criticalMinIdleMs: (config.previewMemCriticalMinIdleMinutes ?? 2) * 60 * 1000,
       }, log);
     } catch (e) { log(`memory-pressure preview reap failed: ${e.message}`); }
   }

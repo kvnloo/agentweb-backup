@@ -192,6 +192,15 @@ export const config = {
   previewMemKeep: 1,               // never let the memory-pressure reap drop below this many live previews.
   previewMemMinIdleMinutes: 10,    // and never let it stop a preview touched within this window (a human
                                    // actively opening its URL / chatting on it), even under pressure.
+  previewMemCriticalMB: 2000,      // below THIS the grace period above shrinks to previewMemCriticalMinIdleMinutes.
+                                   // A flat 10m grace made the backstop unfireable exactly when it mattered:
+                                   // measured live on 2026-08-05 at 1858MB available (floor 3500) with three
+                                   // previews up, all hit 4-9m ago — so every one was protected and nothing was
+                                   // reaped. That is the normal shape under load, not bad luck: the previews
+                                   // eating the memory belong to the runs being actively chatted. 0 disables the
+                                   // escalation (flat grace, pre-2026-08-05 behaviour).
+  previewMemCriticalMinIdleMinutes: 2, // the shortened grace. Still a real floor — a preview touched seconds ago
+                                   // survives at any pressure, and previewMemKeep still holds.
   previewAutoRefreshOnHeadChange: true, // a preview is a bring-up-time snapshot (ts-node backend + built-once
                                    // portals); when the branch advances past the commit it was brought up
                                    // from, gc.mjs refreshes it — cheap ts-node restart for a backend-only
