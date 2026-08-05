@@ -398,6 +398,9 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
       expect(ConverseCommand).toHaveBeenCalled();
       const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
       // System array should have the text + cachePoint
+      // ENG-893: no `humanPaced` opt-in here, so the checkpoint carries no ttl
+      // — the default 5-minute behaviour. TTL assertions live in
+      // promptCacheTtl.test.ts.
       expect(input.system).toEqual([
         { text: 'System prompt here' },
         { cachePoint: { type: 'default' } },
