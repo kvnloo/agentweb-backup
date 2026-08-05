@@ -13,9 +13,9 @@
  */
 
 const mockUpdateSessionSatisfactionScore = jest.fn().mockResolvedValue({});
-const mockClearSessionSatisfactionScore = jest.fn().mockResolvedValue({});
+const mockClearSessionSatisfactionScore = jest.fn().mockResolvedValue(true);
 const mockUpdateSessionJudgeScore = jest.fn().mockResolvedValue({});
-const mockClearSessionJudgeScore = jest.fn().mockResolvedValue({});
+const mockClearSessionJudgeScore = jest.fn().mockResolvedValue(true);
 const mockUpdateSessionError = jest.fn().mockResolvedValue({});
 const mockAddMessageToSession = jest.fn().mockResolvedValue({});
 const mockCallLLM = jest.fn();
@@ -332,6 +332,25 @@ describe('ENG-830 D — stale scores on no-task sessions are retracted', () => {
     expect(await scoreSessionIfNeeded(session)).toBeNull();
     expect(mockClearSessionSatisfactionScore).toHaveBeenCalledWith('s1', expect.anything());
     expect(mockUpdateSessionSatisfactionScore).not.toHaveBeenCalled();
+  });
+
+  it('keeps the in-memory score when the retraction lost the race to a re-score', async () => {
+    // The conditional write refused: something replaced the score between the
+    // read and the write, so the row still HAS a score and the copy we hand
+    // back to the caller must say so.
+    mockClearSessionSatisfactionScore.mockResolvedValueOnce(false);
+    const session = alreadyScored();
+
+    expect(await scoreSessionIfNeeded(session)).toBeNull();
+    expect(session.satisfactionScore).toBeDefined();
+  });
+
+  it('keeps the in-memory judge score when that retraction lost the race', async () => {
+    mockClearSessionJudgeScore.mockResolvedValueOnce(false);
+    const session = alreadyScored();
+
+    expect(await scoreSessionWithJudgeIfNeeded(session, JUDGE)).toBeNull();
+    expect(session.judgeScores?.judge_1).toBeDefined();
   });
 
   it('a retraction failure never breaks the scoring sweep', async () => {
