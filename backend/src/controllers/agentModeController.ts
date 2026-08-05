@@ -22,7 +22,7 @@ import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } fro
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { isPublishName } from '../utils/hardeningGaps';
-import { resolveSchedulePublishAuthorization, getRequiredPublishTools, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
+import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -3002,9 +3002,17 @@ export async function runScheduledChat(
     // structural: the checker can never nudge for a publish tool the prompt told the
     // model not to call, which is the contradiction that looped the reported runs ~21
     // times. Two independent reads could disagree — that was Greptile's P1.
+    //
+    // Filter on the authorized TOOL SET, not the boolean. Consent is bound to the
+    // scope the owner approved, so a run can be authorized for one publish tool
+    // while the schedule also requires another that is outside that scope. Keying
+    // the filter on `authorized` alone would keep BOTH — and the prompt names only
+    // the approved one and forbids the rest, so the checker would nudge for a tool
+    // the prompt prohibits: the original contradiction, reintroduced by partial
+    // scope. `tools` is empty when unauthorized, so this still drops every publish
+    // requirement in that case.
     const publishAuthorization = resolveSchedulePublishAuthorization(schedule);
-    const requiredFunctions = expectedFunctionCalls
-      .filter((funcName: string) => publishAuthorization.authorized || !isPublishName(funcName))
+    const requiredFunctions = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, publishAuthorization)
       .map((funcName: string) => ({
         functionName: funcName,
         minCount: functionCallMinCalls[funcName] || 1

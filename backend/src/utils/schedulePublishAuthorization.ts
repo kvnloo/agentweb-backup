@@ -126,3 +126,27 @@ export function resolveSchedulePublishAuthorization(
 
   return { authorized, tools };
 }
+
+/**
+ * Narrow a schedule's required-function list to what this run is actually allowed
+ * to be nudged for.
+ *
+ * THE INVARIANT: the deterministic required-function checker must never demand a
+ * publishing tool that the system prompt forbids. Both sides derive from the same
+ * `SchedulePublishAuthorization`, so they cannot drift — but the check has to be on
+ * the authorized TOOL SET, not on `authorized` alone. Consent is bound to an
+ * approved scope, so a run can legitimately be authorized for one publish tool
+ * while the schedule also requires another that the owner never approved. Keying on
+ * the boolean would keep both, and the prompt names only the approved one — which
+ * is precisely the prompt-versus-checker contradiction that produced the ~21-turn
+ * nudge loop in the reported sessions.
+ *
+ * Non-publishing requirements are never touched.
+ */
+export function filterRequiredFunctionsToAuthorizedScope(
+  requiredFunctionCalls: string[] | undefined,
+  authorization: SchedulePublishAuthorization
+): string[] {
+  const required = Array.isArray(requiredFunctionCalls) ? requiredFunctionCalls : [];
+  return required.filter(name => !isPublishName(name) || authorization.tools.includes(name));
+}
