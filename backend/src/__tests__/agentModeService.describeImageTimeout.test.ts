@@ -59,7 +59,7 @@ describe('describeImage — vision call timeout (ENG-294)', () => {
     jest.clearAllMocks();
     // Short timeout keeps the test fast while exercising the real timeout path.
     process.env.AGENT_MODE_DESCRIBE_IMAGE_TIMEOUT_MS = '50';
-    mockAxiosGet.mockResolvedValue({ data: pngBytes, headers: { 'content-type': 'image/png' } });
+    mockAxiosGet.mockResolvedValue({ status: 200, data: pngBytes, headers: { 'content-type': 'image/png' } });
     service = new AgentModeService();
   });
 

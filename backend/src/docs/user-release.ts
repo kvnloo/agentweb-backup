@@ -16,6 +16,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
       '- That advice was wrong: nothing was wrong with your request, and a smaller batch would have been interrupted in exactly the same way',
       '- The note now states the real cause — the run was interrupted on our side — and confirms it is retried automatically, so you are not sent off rewriting a schedule that was never the problem',
       '- Interrupted runs are also no longer counted as poor-quality results in our internal quality reporting, so genuine issues stand out instead of being buried',
+      'Fixed: Work Plan Steps Built Over the API No Longer Lose Their Settings',
+      '- When you created a work plan through the Claude connector, the tool bindings on each step could come back empty even though the request succeeded — the field name shown in the tool description was not the one the system read, and nothing warned you',
+      '- Both spellings are now accepted, and the tool description lists the settings a step really supports, including the skills you can attach to it',
+      '- If a step does include something we cannot store, the response now names that field instead of quietly discarding it, so a plan that saved differently from what you asked for tells you why',
+      'New: Require a Step to Actually Produce Its Images Before It Can Be Completed',
+      '- A step can now state how many images or videos it must produce — say 18 for "three images per hook across six hooks" — and it will not be marked complete until that many have genuinely been generated in the run',
+      '- Set it per step in the work plan editor, where saved plans also show the requirement at a glance; leave it blank for steps with no fixed count',
     ],
   },
   {
