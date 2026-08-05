@@ -4507,16 +4507,25 @@ export const crmDb = {
     autoSendEnabled?: boolean,
     statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>,
     listType?: 'sales' | 'customers',
-    isSystemManaged?: boolean
+    isSystemManaged?: boolean,
+    // Idempotent-create support (ENG-524): pass a caller-chosen deterministic ID
+    // (instead of the usual random one) to get a race-safe "create if absent" —
+    // the write is conditioned on the ID not already existing, so concurrent
+    // callers (e.g. two backend instances resolving the same customer's
+    // auto-created default list at once) can't create duplicates. A caller
+    // that loses the race gets a ConditionalCheckFailedException and should
+    // fetch the winner's record via getLeadListById instead.
+    explicitListId?: string
   ) {
     try {
-      const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const listId = explicitListId ?? `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const normalizedAlertEvents = Array.isArray(alertEvents)
         ? alertEvents
         : ['email.received'];
 
-      const params = {
+      const params: AWS.DynamoDB.DocumentClient.PutItemInput = {
         TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        ...(explicitListId ? { ConditionExpression: 'attribute_not_exists(listId)' } : {}),
         Item: {
           listId,
           userId,
