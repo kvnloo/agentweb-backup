@@ -95,6 +95,55 @@ describe('CRM Database Service', () => {
       expect(mockDocumentClientMethods.put).toHaveBeenCalled();
       expect(result.name).toBe(name);
     });
+
+    // Idempotent-create support (ENG-524): a caller that needs a deterministic,
+    // race-safe "create if absent" (e.g. one auto-created list per user, safe
+    // across multiple backend instances) can pass an explicit listId. This
+    // must NOT change behavior for the many existing callers that omit it.
+    it('uses the explicit listId verbatim when provided, instead of generating a random one', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      const result = await crmDb.createLeadList(
+        'user1', 'Test List', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+        'list_deterministic_id',
+      );
+
+      expect(result.listId).toBe('list_deterministic_id');
+    });
+
+    it('adds a ConditionExpression guarding against overwriting an existing item when an explicit listId is given', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      await crmDb.createLeadList(
+        'user1', 'Test List', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+        'list_deterministic_id',
+      );
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.ConditionExpression).toBe('attribute_not_exists(listId)');
+    });
+
+    it('does not add a ConditionExpression when no explicit listId is given (existing random-ID behavior unchanged)', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      await crmDb.createLeadList('user1', 'Test List');
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.ConditionExpression).toBeUndefined();
+    });
+
+    it('propagates a ConditionalCheckFailedException when the explicit listId already exists (lost the create race)', async () => {
+      const conditionalError: any = new Error('The conditional request failed');
+      conditionalError.code = 'ConditionalCheckFailedException';
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockRejectedValue(conditionalError) });
+
+      await expect(
+        crmDb.createLeadList(
+          'user1', 'Test List', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+          'list_deterministic_id',
+        ),
+      ).rejects.toMatchObject({ code: 'ConditionalCheckFailedException' });
+    });
   });
 
   describe('getLeadListById', () => {
