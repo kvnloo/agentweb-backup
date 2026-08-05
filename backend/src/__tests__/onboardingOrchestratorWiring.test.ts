@@ -83,7 +83,15 @@ describe("reconcileForUser", () => {
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
       jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
@@ -171,7 +179,15 @@ describe("reconcileForUser", () => {
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
       jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
@@ -203,7 +219,9 @@ describe("reconcileForUser", () => {
       expect(triggerIcp).toHaveBeenCalledWith("u2");
       expect(triggerCompetitor).toHaveBeenCalledWith("u2");
       expect(triggerCreativeDir).toHaveBeenCalledWith("u2");
-      expect(triggerAdImage).toHaveBeenCalledWith("u2");
+      expect(triggerAdImage).toHaveBeenCalledWith("u2", {
+        run: { runId: "adimg_test-run", startedAt: "2026-08-04T00:00:00.000Z" },
+      });
       expect(triggerAdCopy).toHaveBeenCalledWith("u2");
 
       // Every step ended in `ready` and stamped its output back to
@@ -285,7 +303,15 @@ describe("reconcileForUser", () => {
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
       jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
@@ -306,7 +332,9 @@ describe("reconcileForUser", () => {
       _resetRateLimitState();
       const report = await reconcileForUser("u-eng792");
 
-      expect(triggerAdImage).toHaveBeenCalledWith("u-eng792");
+      expect(triggerAdImage).toHaveBeenCalledWith("u-eng792", {
+        run: { runId: "adimg_test-run", startedAt: "2026-08-04T00:00:00.000Z" },
+      });
       expect(persisted.steps?.adImage?.status).toBe("failed");
       expect(persisted.steps?.adImage?.failedReason).toMatch(/all 3 variants failed/);
       const fired = (report.fired as Array<{ step: string; status: string }>);
@@ -373,7 +401,15 @@ describe("reconcileForUser", () => {
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
       jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
@@ -470,7 +506,15 @@ describe("reconcileForUser", () => {
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
       jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
@@ -536,7 +580,15 @@ describe("reconcileForUser", () => {
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
       jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
@@ -582,6 +634,10 @@ describe("reconcileForUser", () => {
       }));
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: jest.fn(),
+      }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
       }));
       jest.doMock("../services/onboardingAdImageService", () => ({
         triggerAdImageGenerationForUser: jest.fn(),

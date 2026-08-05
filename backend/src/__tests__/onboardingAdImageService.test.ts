@@ -41,6 +41,7 @@ jest.mock("../services/onboardingAdImageChatSessionMirror", () => ({
 import {
   AD_IMAGE_SYSTEM_PROMPT,
   buildSixLayerPromptForVariant,
+  claimAdImageRun,
   extractAdImageBrandContext,
   generateAdImagesForUser,
   isBrandLogoFetchable,
@@ -1536,6 +1537,35 @@ describe("onboardingAdImageService", () => {
         },
       });
       expect(ctx.logoUrl).toBe("https://example.com/real.png");
+    });
+  });
+
+  describe("claimAdImageRun", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      userDb.updateUser.mockResolvedValue({});
+    });
+
+    it("publishes a start patch and returns THAT run's identity", async () => {
+      const run = await claimAdImageRun("u1");
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("running");
+      // The identity handed back is the one just published — not a re-read of
+      // the record, which is what let two overlapping runs share a nonce.
+      expect(run.runId).toBe(written.adImageRunId);
+      expect(run.startedAt).toBe(written.adImageStartedAt);
+    });
+
+    it("gives every claim a distinct identity, even back-to-back (Greptile)", async () => {
+      // Both eager and direct entry points claim through here, so two
+      // overlapping starts must never come away holding the same nonce —
+      // that is precisely what makes the conditional terminal write able to
+      // tell the runs apart.
+      const [a, b] = [await claimAdImageRun("u1"), await claimAdImageRun("u1")];
+      expect(a.runId).not.toBe(b.runId);
+      expect(userDb.updateUser).toHaveBeenCalledTimes(2);
     });
   });
 
