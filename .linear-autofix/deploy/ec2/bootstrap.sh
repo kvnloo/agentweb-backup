@@ -135,6 +135,30 @@ else
   echo "    WARNING: $UNIT_SRC not found — skipping systemd install (older checkout?)."
 fi
 
+# Memory guardrails for BOTH cgroups the work lands in (which one depends on who started it: the chat
+# server → system.slice/autofix-chat.service, cron fix cycles + SSH → user.slice/user-1000.slice).
+# These were host-only for a day and that hurt: on 2026-08-05 the chat service was OOM-killed four times
+# in 56 minutes, and a rebuilt box would have inherited none of the fix. See each file's header for the
+# post-mortem; the short version is that MemoryHigh + ManagedOOMMemoryPressure=kill is self-defeating,
+# because MemoryHigh's own throttling reclaim IS the PSI stall oomd then kills the whole cgroup for.
+# Applied with daemon-reload only — cgroup properties re-realize on running units, so this never needs a
+# restart and never interrupts in-flight turns.
+echo "==> systemd memory guardrails (cgroup limits for autofix-chat.service + user-1000.slice)"
+for pair in "autofix-chat.service.d-10-memory.conf:autofix-chat.service.d" "user-1000.slice.d-10-memory.conf:user-1000.slice.d"; do
+  SRC="$WORKDIR/.linear-autofix/deploy/ec2/${pair%%:*}"
+  DIR="/etc/systemd/system/${pair##*:}"
+  if [ -f "$SRC" ]; then
+    sudo mkdir -p "$DIR"
+    sudo install -m 0644 -o root -g root "$SRC" "$DIR/10-memory.conf"
+    echo "    installed $DIR/10-memory.conf"
+  else
+    echo "    WARNING: $SRC not found — skipping (older checkout?)."
+  fi
+done
+sudo systemctl daemon-reload
+# Confirm oomd is NOT pressure-killing these cgroups: "Memory Pressure Monitored CGroups" must be empty.
+sudo oomctl 2>/dev/null | sed -n '/Memory Pressure Monitored CGroups/,$p' | head -3 || true
+
 # ENG-655: durable log retention. Install a logrotate policy so poll.log + chat.log can't grow unbounded
 # even if the poll cron (which does per-cycle rotation) stops. Idempotent — re-copies the config each run.
 echo "==> Log retention: logrotate for poll.log + chat.log"
