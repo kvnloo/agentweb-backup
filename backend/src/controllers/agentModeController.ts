@@ -7056,13 +7056,13 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
-        // ENG-827: publish consent is NOT settable through the generic update. It is
-        // preserved as-is here and can only be changed via POST .../publish-consent,
-        // so a delegated session or a broad update body can never grant it.
-        autopublishAuthorized: (existingSchedule as any).autopublishAuthorized === true,
-        autopublishAuthorizedTools: Array.isArray((existingSchedule as any).autopublishAuthorizedTools)
-          ? (existingSchedule as any).autopublishAuthorizedTools
-          : [],
+        // ENG-827: publish consent is NOT written here AT ALL. updateSchedule builds a
+        // partial SET expression, so omitting these fields leaves the stored values
+        // untouched — which is the only safe way to "preserve" them. Copying them
+        // forward from `existingSchedule` would be a read-modify-write: a revocation
+        // landing between this handler's read and its write would be silently
+        // resurrected, re-enabling publishing after the owner turned it off. Consent
+        // changes only through POST .../publish-consent.
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
