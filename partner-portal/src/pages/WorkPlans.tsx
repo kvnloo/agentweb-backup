@@ -58,6 +58,9 @@ interface WorkPlanStep {
    *  raw system prompt and must NEVER be rendered to end users. */
   userInstructions?: string;
   requiredFunctionCalls?: string[];
+  /** Media assets this step must actually produce before it can be marked
+   *  completed. Enforced at run time by the session work plan's asset gate. */
+  expectedAssetCount?: number;
 }
 
 const PLAN_CATEGORIES = ["Paid Ads", "Strategy", "Content", "Other"];
@@ -387,7 +390,7 @@ export default function WorkPlans() {
     setSteps(steps.filter((_, i) => i !== index).map((s, i) => ({ ...s, stepCount: i + 1 })));
   };
 
-  const updateStep = (index: number, field: string, value: string | string[]) => {
+  const updateStep = (index: number, field: string, value: string | string[] | number | undefined) => {
     const updated = [...steps];
     updated[index] = { ...updated[index], [field]: value };
     setSteps(updated);
@@ -493,11 +496,22 @@ export default function WorkPlans() {
                           {step.stepCount}. <strong>{step.title}</strong>
                           {step.description && <span> — {step.description}</span>}
                         </Typography>
-                        {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
+                        {((step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) || step.expectedAssetCount) && (
                           <Box sx={{ ml: 2 }}>
-                            {step.requiredFunctionCalls.map((fc, j) => (
+                            {step.requiredFunctionCalls?.map((fc, j) => (
                               <Chip key={j} label={fc} size="small" variant="outlined" sx={{ mr: 0.5, mb: 0.5, fontFamily: "monospace", fontSize: "0.7rem" }} />
                             ))}
+                            {/* Without this the asset gate is invisible here: the step
+                                simply refuses to complete with no on-screen reason. */}
+                            {step.expectedAssetCount ? (
+                              <Chip
+                                label={`${step.expectedAssetCount} assets required`}
+                                size="small"
+                                color="warning"
+                                variant="outlined"
+                                sx={{ mr: 0.5, mb: 0.5, fontSize: "0.7rem" }}
+                              />
+                            ) : null}
                           </Box>
                         )}
                       </Box>
@@ -636,11 +650,20 @@ export default function WorkPlans() {
                                 {step.stepCount}. <strong>{step.title}</strong>
                                 {step.description && <span> — {step.description}</span>}
                               </Typography>
-                              {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
+                              {((step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) || step.expectedAssetCount) && (
                                 <Box sx={{ ml: 2 }}>
-                                  {step.requiredFunctionCalls.map((fc, j) => (
+                                  {step.requiredFunctionCalls?.map((fc, j) => (
                                     <Chip key={j} label={fc} size="small" variant="outlined" sx={{ mr: 0.5, mb: 0.5, fontFamily: "monospace", fontSize: "0.7rem" }} />
                                   ))}
+                                  {step.expectedAssetCount ? (
+                                    <Chip
+                                      label={`${step.expectedAssetCount} assets required`}
+                                      size="small"
+                                      color="warning"
+                                      variant="outlined"
+                                      sx={{ mr: 0.5, mb: 0.5, fontSize: "0.7rem" }}
+                                    />
+                                  ) : null}
                                 </Box>
                               )}
                             </Box>
@@ -779,6 +802,24 @@ export default function WorkPlans() {
                           helperText="Functions that must be called to complete this step"
                         />
                       )}
+                    />
+                    <TextField
+                      size="small"
+                      type="number"
+                      label="Required assets"
+                      value={step.expectedAssetCount ?? ""}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        const parsed = parseInt(raw, 10);
+                        updateStep(
+                          i,
+                          "expectedAssetCount",
+                          raw === "" || Number.isNaN(parsed) ? undefined : parsed,
+                        );
+                      }}
+                      inputProps={{ min: 0 }}
+                      sx={{ mt: 1, maxWidth: 220 }}
+                      helperText="This step cannot be completed until the run has generated this many images/videos. Counted across the whole run, not just this step. Leave blank for no requirement."
                     />
                   </Box>
                   {steps.length > 1 && (

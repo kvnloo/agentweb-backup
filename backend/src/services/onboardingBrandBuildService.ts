@@ -503,20 +503,24 @@ async function persistFailure(
 ): Promise<void> {
   const patch = buildFailedPatch(current || {}, message, now);
   await userDb.updateUser(userId, patch as any);
-  logCompletionMetric(userId, "failed", patch.brandBuildDurationMs ?? 0);
-  // Durable metric — logCompletionMetric only writes a structured log line
-  // that rotates with the container. The OnboardingMetrics row survives.
-  const startedAt = (current?.brandBuildStartedAt as string | undefined) ??
-    new Date(now.getTime() - (patch.brandBuildDurationMs ?? 0)).toISOString();
-  void logStepMetric({
+  // ENG-848: ONE durable row per outcome.
+  //
+  // This used to call logCompletionMetric AND write its own OnboardingMetrics
+  // row, on the stated premise that "logCompletionMetric only writes a
+  // structured log line that rotates". That premise was false — it writes a
+  // durable row too (brandBuildStatusService), so every failure landed twice.
+  //
+  // The heartbeat reads row counts, so the duplication doubled the denominator:
+  // 74 rows for 39 real attempts. It did not distort the failure RATE, because
+  // both copies carried the same status, but it made the sample look twice as
+  // large as it was — and at ~5 attempts in the last active week, that
+  // difference decides whether a "below 10%" claim means anything.
+  logCompletionMetric(
     userId,
-    step: "brand-build",
-    startedAt,
-    completedAt: now.toISOString(),
-    durationMs: patch.brandBuildDurationMs ?? 0,
-    status: message.includes("timed out") ? "timeout" : "failed",
-    errorMessage: message,
-  });
+    message.includes("timed out") ? "timeout" : "failed",
+    patch.brandBuildDurationMs ?? 0,
+    message,
+  );
   // eslint-disable-next-line no-console
   console.warn("[onboardingBrandBuildService] failed", {
     userId,

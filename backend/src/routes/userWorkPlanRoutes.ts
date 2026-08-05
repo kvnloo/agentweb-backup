@@ -1,5 +1,6 @@
 import express from "express";
 import { workPlanService, WorkPlan } from "../services/workPlanService";
+import { normalizeWorkPlanSteps } from "../services/workPlanSteps";
 import { userDb, orgDb } from "../services/db";
 import {
   canEditItem,
@@ -73,14 +74,7 @@ router.post("/", async (req, res) => {
       return res.status(400).json({ message: "Title and at least one step are required" });
     }
 
-    const normalizedSteps = steps.map((s: any, i: number) => ({
-      stepCount: s.stepCount || i + 1,
-      title: s.title || `Step ${i + 1}`,
-      description: s.description,
-      ...(s.userInstructions !== undefined && { userInstructions: s.userInstructions }),
-      requiredFunctionCalls: s.requiredFunctionCalls || [],
-      skillIds: s.skillIds || [],
-    }));
+    const { steps: normalizedSteps, warnings } = normalizeWorkPlanSteps(steps);
 
     const user = await userDb.getUserById(userId);
     const orgId = user?.orgId;
@@ -104,7 +98,7 @@ router.post("/", async (req, res) => {
       isBuiltIn: false,
     });
 
-    res.status(201).json(plan);
+    res.status(201).json(warnings.length > 0 ? { ...plan, warnings } : plan);
   } catch (error) {
     console.error("Error creating user work plan:", error);
     res.status(500).json({ message: "Failed to create work plan" });
@@ -140,11 +134,19 @@ router.put("/:planId", async (req, res) => {
     }
 
     const { title, description, steps, welcomeMessage, autocomplete, requireLogin, showLoginSignup, defaultModel } = req.body;
+    if (steps !== undefined && !Array.isArray(steps)) {
+      return res.status(400).json({ message: "steps must be an array" });
+    }
+    // Normalize here too. This path used to store the caller's step objects
+    // verbatim, which made the same resource behave differently by verb and
+    // left it the one write path with no report of what it discarded (ENG-889).
+    const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
+    const warnings = normalized?.warnings ?? [];
     const updated = {
       ...plan,
       ...(title !== undefined && { title }),
       ...(description !== undefined && { description }),
-      ...(steps !== undefined && { steps }),
+      ...(normalized !== undefined && { steps: normalized.steps }),
       ...(welcomeMessage !== undefined && { welcomeMessage }),
       ...(autocomplete !== undefined && { autocomplete }),
       ...(requireLogin !== undefined && { requireLogin }),
@@ -152,8 +154,12 @@ router.put("/:planId", async (req, res) => {
       ...(defaultModel !== undefined && { defaultModel }),
     };
     await workPlanService.updateWorkPlan(updated);
-    res.json(updated);
-  } catch (error) {
+    res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
+  } catch (error: any) {
+    // The plan was deleted between the read above and the write.
+    if (error?.message === "Work plan not found") {
+      return res.status(404).json({ message: "Work plan not found" });
+    }
     console.error("Error updating user work plan:", error);
     res.status(500).json({ message: "Failed to update work plan" });
   }
