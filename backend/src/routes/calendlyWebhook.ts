@@ -49,37 +49,58 @@ const router = express.Router();
 // When the customer hasn't explicitly picked a list (CalendlyConfig's
 // booking_lead_list_id is unset), fall back to an idempotent, system-managed
 // "Calendly Bookings" list — created once per user and reused from then on.
-// Mirrors resolveOrCreateDefaultLeadList in routes/landingPageGeneration.ts
-// exactly (find-by-name+isSystemManaged, singleflight per user, retry once
-// on transient failure, never silently swallow a persistent failure).
+//
+// Race-safety: uses a DETERMINISTIC listId (not a name+isSystemManaged scan
+// like the sibling pattern in landingPageGeneration.ts's
+// resolveOrCreateDefaultLeadList) plus crmDb.createLeadList's conditional
+// write support, so two concurrent callers — even across different backend
+// instances, not just within one process — can't create duplicate lists. A
+// caller that loses the create race gets a ConditionalCheckFailedException
+// and falls back to fetching the winner's record directly. The in-memory
+// singleflight map below is kept only as a same-process optimization to
+// avoid redundant DB round trips; it's no longer the sole thing preventing
+// duplicates, unlike the sibling pattern (documented there as a known,
+// accepted single-instance-only limitation — this closes it for Calendly).
 
 const BOOKING_LIST_NAME = 'Calendly Bookings';
 
-const inFlightBookingListResolutions = new Map<string, Promise<string>>();
+function bookingListId(userId: string): string {
+  return `list_calendly_bookings_${userId}`;
+}
 
 async function resolveBookingListOnce(userId: string): Promise<string> {
-  const existing = await crmDb.getLeadListsByUserId(userId);
-  const match = (existing || []).find(
-    (l: any) => l && l.isSystemManaged === true && l.name === BOOKING_LIST_NAME,
-  );
-  if (match) return match.listId;
+  const id = bookingListId(userId);
+  const existing = await crmDb.getLeadListById(id);
+  if (existing) return existing.listId;
 
   console.log(`[Calendly Webhook] No booking lead list found for user ${userId} — creating "${BOOKING_LIST_NAME}"`);
-  const created = await crmDb.createLeadList(
-    userId,
-    BOOKING_LIST_NAME,
-    'Auto-created default list for Calendly bookings with no explicitly chosen list. System-managed.',
-    undefined, // alertEvents
-    null, // listSenderId
-    undefined, // autoDraftEnabled
-    undefined, // autoDraftInstruction
-    undefined, // autoSendEnabled
-    undefined, // statusConfig — defaults to sales-style
-    'sales', // listType
-    true, // isSystemManaged
-  );
-  return (created as any).listId;
+  try {
+    const created = await crmDb.createLeadList(
+      userId,
+      BOOKING_LIST_NAME,
+      'Auto-created default list for Calendly bookings with no explicitly chosen list. System-managed.',
+      undefined, // alertEvents
+      null, // listSenderId
+      undefined, // autoDraftEnabled
+      undefined, // autoDraftInstruction
+      undefined, // autoSendEnabled
+      undefined, // statusConfig — defaults to sales-style
+      'sales', // listType
+      true, // isSystemManaged
+      id, // explicitListId — makes the write conditional on not already existing
+    );
+    return (created as any).listId;
+  } catch (err: any) {
+    if (err?.code === 'ConditionalCheckFailedException') {
+      console.log(`[Calendly Webhook] Lost the create race for booking list ${id} — fetching the winner`);
+      const winner = await crmDb.getLeadListById(id);
+      if (winner) return winner.listId;
+    }
+    throw err;
+  }
 }
+
+const inFlightBookingListResolutions = new Map<string, Promise<string>>();
 
 export async function resolveOrCreateBookingList(userId: string): Promise<string> {
   let inFlight = inFlightBookingListResolutions.get(userId);
