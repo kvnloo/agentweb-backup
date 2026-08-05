@@ -2319,6 +2319,11 @@ export class MetaService {
        *  current time when absent/invalid (an older, not-yet-regenerated capture route
        *  never sent one, or the caller's own validation rejected it as implausible). */
       eventTimeSeconds?: number;
+      /** Meta standard event name. Defaults to 'Lead' (this function's original/only
+       *  caller, webhooks.ts's form-submission forward-lead). Callers for a different
+       *  conversion type — e.g. calendlyWebhook.ts sending 'Schedule' for a booking,
+       *  per ENG-524's PRD and matching ENG-522's sendScheduleEvent — pass it explicitly. */
+      eventName?: string;
     },
   ): Promise<
     | { success: true; fbtraceId?: string; usage?: CapiUsage }
@@ -2359,7 +2364,7 @@ export class MetaService {
         access_token: accessToken,
         data: [
           {
-            event_name: 'Lead',
+            event_name: event.eventName || 'Lead',
             event_id: event.eventId,
             event_time: eventTime,
             action_source: 'website',

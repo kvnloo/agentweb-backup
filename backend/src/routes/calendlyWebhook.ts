@@ -3,7 +3,7 @@
  *
  * Receives `invitee.created` deliveries from the per-customer webhook
  * subscriptions auto-provisioned in calendlyAuth.ts's /connect handler, and
- * fires a server-side Meta CAPI `Lead` conversion through the connected
+ * fires a server-side Meta CAPI `Schedule` conversion through the connected
  * customer's own pixel — generalizing the single-account mechanism ENG-522
  * already built for AgentWeb's own funnel.
  *
@@ -245,6 +245,9 @@ router.post('/', (req: express.Request, res: express.Response) => {
             firstName,
             lastName,
             eventTimeSeconds,
+            // A booking is Meta's 'Schedule' standard event, not 'Lead' (this function's
+            // default) — PRD §6 step 3, matches ENG-522's sendScheduleEvent.
+            eventName: 'Schedule',
           });
 
           if (result.success) {
