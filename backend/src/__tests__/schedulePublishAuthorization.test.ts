@@ -1,4 +1,7 @@
-import { resolveSchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
+import {
+  resolveSchedulePublishAuthorization,
+  promptWaivesPublishApproval,
+} from '../utils/schedulePublishAuthorization';
 
 /**
  * ENG-827 — the schedule-level publish authorization signal.
@@ -58,17 +61,46 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
     expect(resolveSchedulePublishAuthorization({ fullAutonomy: 1 as any }).authorized).toBe(false);
   });
 
-  // ── Authorized: the owner's explicit, schedule-creation-time declaration ────
-  it('AUTHORIZES when the owner required a publish tool — the exact reported shape', () => {
+  // ── The picker alone is NOT consent (Greptile P1) ───────────────────────────
+  // The Required Functions picker is a VERIFICATION control and its UI carries no
+  // approval-waiver language. Treating the tick alone as standing approval would
+  // silently convert schedules whose owner ticked it to VERIFY a publish into ones
+  // that publish unreviewed — 5 of the 8 production publish-requiring schedules,
+  // including the active "LUCAS — LinkedIn Thought Leadership".
+  it('does NOT authorize on a required publish tool alone — the picker is not a waiver', () => {
     const result = resolveSchedulePublishAuthorization({
       requiredFunctionCalls: ['post_on_connected_account'],
       fullAutonomy: false,
+      startingMessage: 'Write a thought-leadership post and post it to the connected account.',
+    });
+    expect(result.authorized).toBe(false);
+    // the tools are still reported so the checker can filter on them
+    expect(result.tools).toEqual(['post_on_connected_account']);
+  });
+
+  it('does NOT authorize the real LUCAS shape (publish tool required, no waiver in prompt)', () => {
+    const result = resolveSchedulePublishAuthorization({
+      requiredFunctionCalls: ['generate_image', 'post_on_connected_account'],
+      fullAutonomy: false,
+      startingMessage:
+        'Generate an image automatically and draft a LinkedIn thought-leadership post for review.',
+    });
+    expect(result.authorized).toBe(false);
+  });
+
+  // ── Authorized: two independent owner-authored signals ──────────────────────
+  it('AUTHORIZES when the required publish tool is paired with an approval waiver — the reported shape', () => {
+    const result = resolveSchedulePublishAuthorization({
+      requiredFunctionCalls: ['post_on_connected_account'],
+      fullAutonomy: false,
+      // verbatim tail of the real "Kevin — Daily LinkedIn Post" prompt
+      startingMessage:
+        'STEP 5: Post it to Kevin\'s connected LinkedIn account.\n\nCRITICAL: Post the FULL text automatically. Do not truncate. Do not ask for approval.',
     });
     expect(result).toEqual({ authorized: true, tools: ['post_on_connected_account'] });
   });
 
   it('AUTHORIZES on the mixed required-list shape, returning only the publish tools', () => {
-    // The "CMO Weekly Brew" / "LUCAS" shape: publish tool alongside research tools.
     const result = resolveSchedulePublishAuthorization({
       requiredFunctionCalls: [
         'read_brand_guidelines',
@@ -76,9 +108,20 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
         'list_connected_accounts',
         'post_on_connected_account',
       ],
+      startingMessage: 'Publish the weekly brew without approval.',
     });
     expect(result.authorized).toBe(true);
     expect(result.tools).toEqual(['post_on_connected_account']);
+  });
+
+  it('does NOT authorize an approval waiver with no publish tool required', () => {
+    // Both signals are required; a waiver alone cannot authorize a tool the owner
+    // never designated.
+    const result = resolveSchedulePublishAuthorization({
+      requiredFunctionCalls: ['create_social_media_posts'],
+      startingMessage: 'Post it automatically, do not ask for approval.',
+    });
+    expect(result).toEqual({ authorized: false, tools: [] });
   });
 
   it('AUTHORIZES on fullAutonomy alone, with no specific tools named', () => {
@@ -89,6 +132,7 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
   it('covers publish tools by prefix and de-duplicates them in declaration order', () => {
     const result = resolveSchedulePublishAuthorization({
       requiredFunctionCalls: ['publish_blog_article', 'post_on_connected_account', 'publish_blog_article'],
+      startingMessage: 'Publish it automatically.',
     });
     expect(result.authorized).toBe(true);
     expect(result.tools).toEqual(['publish_blog_article', 'post_on_connected_account']);
@@ -108,5 +152,44 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
     const result = resolveSchedulePublishAuthorization({ requiredFunctionCalls: required });
     expect(result.tools).not.toBe(required);
     expect(required).toEqual(['post_on_connected_account']);
+  });
+});
+
+describe('promptWaivesPublishApproval — the second consent signal (ENG-827)', () => {
+  // Must MATCH: the owner wrote about approval/asking, or said "post automatically".
+  it.each([
+    'CRITICAL: Post the FULL text automatically. Do not truncate. Do not ask for approval.',
+    'Publish it without approval.',
+    'Post without asking me first.',
+    'No approval needed — just post it.',
+    "Don't wait for my sign-off.",
+    'Automatically post the update to LinkedIn.',
+    'Share this automatically once written.',
+  ])('treats an explicit waiver as consent: %s', (msg) => {
+    expect(promptWaivesPublishApproval(msg)).toBe(true);
+  });
+
+  // Must NOT match. The matcher is narrow on purpose: a false positive here
+  // publishes to a live account, so anything short of an explicit waiver fails closed.
+  it.each([
+    // "automatically" about something OTHER than publishing
+    'Automatically generate an image for the post.',
+    'The topic rotation advances automatically each run.',
+    // ordinary publish instructions with no waiver — the LUCAS / CMO Weekly Brew shape
+    'Post it to the connected LinkedIn account.',
+    'Draft the post and save it to the knowledge base.',
+    // the OPPOSITE instruction must never read as consent
+    'Ask for approval before posting.',
+    'Wait for my sign-off before you publish.',
+  ])('does NOT infer consent from: %s', (msg) => {
+    expect(promptWaivesPublishApproval(msg)).toBe(false);
+  });
+
+  it('fails closed on empty, blank, or non-string prompts', () => {
+    expect(promptWaivesPublishApproval('')).toBe(false);
+    expect(promptWaivesPublishApproval('   \n  ')).toBe(false);
+    expect(promptWaivesPublishApproval(undefined)).toBe(false);
+    expect(promptWaivesPublishApproval(null as any)).toBe(false);
+    expect(promptWaivesPublishApproval(42 as any)).toBe(false);
   });
 });

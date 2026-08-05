@@ -330,15 +330,16 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
 
   // ── The actual production shape (ENG-827) ────────────────────────────────────
   // Every reported session ran on a schedule with requiredFunctionCalls naming
-  // post_on_connected_account and fullAutonomy OFF — the toggle is surfaced as
-  // governing mid-run questions, so no owner automating a daily post ticks it.
-  // Authorization MUST come from the required-tool declaration, or the fix never
-  // fires for a single real schedule.
-  it('AUTHORIZES publishing when the owner required the publish tool, even with fullAutonomy OFF', async () => {
+  // post_on_connected_account, fullAutonomy OFF, and a prompt that explicitly
+  // waives approval. The toggle is surfaced as governing mid-run questions, so no
+  // owner automating a daily post ticks it — authorization has to come from the
+  // owner's own configuration, or the fix never fires for a single real schedule.
+  it('AUTHORIZES publishing on the reported shape (required tool + prompt waiver), fullAutonomy OFF', async () => {
     jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
       scheduleId: SCHEDULE_ID,
       fullAutonomy: false,
       requiredFunctionCalls: ['post_on_connected_account'],
+      startingMessage: 'Post the FULL text automatically. Do not ask for approval.',
     } as any);
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
@@ -396,6 +397,25 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     const sp = capturedSystemPrompt()!;
     expect(sp).toContain('PRE-AUTHORIZED to publish');
     expect(sp).not.toContain('NOT pre-authorized to publish');
+  });
+
+  // Greptile P1 regression: the Required Functions picker is a VERIFICATION control
+  // with no approval-waiver language in its UI. A schedule whose owner ticked a
+  // publish tool but never waived approval — the active "LUCAS — LinkedIn Thought
+  // Leadership" shape, and 5 of the 8 production publish-requiring schedules — must
+  // keep drafting, not silently start publishing to a live account.
+  it('WITHHOLDS when a publish tool is required but the prompt never waives approval', async () => {
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
+      scheduleId: SCHEDULE_ID,
+      fullAutonomy: false,
+      requiredFunctionCalls: ['generate_image', 'post_on_connected_account'],
+      startingMessage:
+        'Generate an image automatically and draft a LinkedIn thought-leadership post.',
+    } as any);
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('NOT pre-authorized to publish');
+    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
   });
 
   it('still WITHHOLDS when the required functions contain no publishing tool', async () => {
