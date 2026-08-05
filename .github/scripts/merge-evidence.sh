@@ -65,12 +65,31 @@
 #
 #   discriminator skipped  -> this was a draft-time run; every draft-gated
 #                             job skipped for that reason. Not evidence.
-#   discriminator executed -> any other skip is a path filter doing its job,
-#                             which is legitimate and reported as such.
+#   discriminator executed -> the run is real, and each remaining skip is
+#                             resolved by the rule below.
 #
 # The discriminator is matched by exact name and its absence fails closed, so
 # renaming that job degrades to "no evidence" rather than silently removing
 # the gate's ability to recognise a draft run.
+#
+# Why an executed discriminator is no longer enough on its own (ENG-915)
+# ----------------------------------------------------------------------
+# The backend test jobs are now gated on `greptile-review` as well, so their
+# `skipped` carries a third possible meaning: the Greptile gate did not pass.
+# That defeats every attempt to infer the reason from the payload. Suite ids
+# do not separate the cases either — `re-run failed jobs` appends the new
+# results to the SAME suite, so a re-run in which only the gate turned green
+# leaves the stale skip beside it, and nothing in the response says which came
+# first.
+#
+# So the reason is not inferred at all. The gate instead demands proof, the
+# same way it already refuses to read "nothing failed" as a pass: if the PR's
+# own diff touches the backend paths, the backend test jobs must carry a
+# `success` at this head. Anything else — skipped, absent, cancelled — is
+# NO_EVIDENCE. The diff is read from `pulls/{n}/files`, which is the same
+# input `dorny/paths-filter` decides on, and the path list below mirrors the
+# `backend` filter in tests.yml. This is ENG-915 acceptance criterion 4: the
+# Greptile gate may reorder work, it must not reduce merge evidence.
 #
 # Why a CLI and not a CI job
 # --------------------------
@@ -98,12 +117,29 @@
 #   GH_TOKEN                    token for `gh`
 #   MERGE_EVIDENCE_DRAFT_JOB    discriminator job name
 #                               (default "Require Greptile Review")
+#   MERGE_EVIDENCE_BACKEND_JOBS US-separated job names that must carry a
+#                               `success` when the diff touches the backend
+#                               paths (ENG-915)
 
 set -uo pipefail
 
 REPO="${REPO:?REPO must be set}"
 PR_NUMBER="${PR_NUMBER:?PR_NUMBER must be set}"
 DRAFT_JOB="${MERGE_EVIDENCE_DRAFT_JOB:-Require Greptile Review}"
+
+# Mirrors the `backend` filter in .github/workflows/tests.yml, including the two
+# CI-path entries that filter counts as backend changes (ENG-743). A prefix here
+# matches a changed file that starts with it, so `backend/` covers the tree.
+BACKEND_PATHS='backend/
+.github/workflows/tests.yml
+.github/scripts/eb-deploy.sh'
+
+# The jobs that must prove they ran when those paths are touched. Newline
+# separated; names are matched exactly, and a name that never appears in the
+# payload is treated as "did not run" rather than ignored, so a rename fails
+# closed instead of quietly deleting the requirement.
+BACKEND_JOBS="${MERGE_EVIDENCE_BACKEND_JOBS:-Backend tests (agentMode)
+Backend tests (all other + coverage)}"
 
 log() { printf 'merge-evidence: %s\n' "$*"; }
 
@@ -539,11 +575,78 @@ if [ "${n_success}" -eq 0 ]; then
   exit 3
 fi
 
+# ---------------------------------------------------------------------------
+# 7. The backend suite must have run when the diff touches the backend (ENG-915)
+# ---------------------------------------------------------------------------
+#
+# Reached only once the run is known real and nothing failed or is pending, so
+# this converts exactly one verdict: a PASS that would have been read off a
+# `skipped` backend suite. See the header for why the skip's reason cannot be
+# inferred from the payload now that those jobs are Greptile-gated.
+
+# Endpoint first, flags after: every other call in this script passes the
+# endpoint as the first argument, and the test mock dispatches on it.
+changed_files="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
+  --paginate --jq '.[].filename' 2>"${stderr_file}")"
+gh_exit=$?
+
+# Fail closed, and as ERROR rather than a verdict: an unreadable diff means the
+# gate cannot tell whether the requirement applies, which is not a statement
+# about the PR.
+if [ "${gh_exit}" -ne 0 ]; then
+  hard_fail "GitHub API call failed (exit ${gh_exit}) reading the changed files of ${REPO}#${PR_NUMBER}, so whether the backend suite was required here cannot be established: $(tr '\n' ' ' <"${stderr_file}")"
+fi
+if [ -z "${changed_files}" ]; then
+  hard_fail "${REPO}#${PR_NUMBER} reports no changed files at ${head_sha}. An open PR always has at least one, so this is an unreadable diff rather than an empty one, and the backend-suite requirement cannot be evaluated."
+fi
+
+# Prefix match anchored at the start of the path, via `case` rather than grep:
+# the prefixes contain `.` and `/`, and a regex would either need escaping or
+# would match `partner-portal/backend/x` as a backend change. `case` compares
+# literally except for the trailing `*`, so there is nothing to escape.
+touches_backend=''
+while IFS= read -r file; do
+  [ -n "${file}" ] || continue
+  while IFS= read -r prefix; do
+    [ -n "${prefix}" ] || continue
+    case "${file}" in
+      "${prefix}"*)
+        touches_backend="${file}"
+        break 2
+        ;;
+    esac
+  done <<<"${BACKEND_PATHS}"
+done <<<"${changed_files}"
+
+if [ -n "${touches_backend}" ]; then
+  missing=''
+  while IFS= read -r job; do
+    [ -n "${job}" ] || continue
+    job_state="$(printf '%s' "${runs_json}" | jq -r --arg job "${job}" '
+        [ .check_runs[] | select(.name == $job) ]
+        | max_by(.id // 0)
+        | if . == null then "ABSENT" else (.conclusion // "pending") end' 2>/dev/null)"
+    jq_exit=$?
+    if [ "${jq_exit}" -ne 0 ] || [ -z "${job_state}" ]; then
+      surface 'check-runs response (raw)' "${runs_json}"
+      hard_fail "unparseable check-runs payload while requiring the backend suite job '${job}' at ${head_sha}"
+    fi
+    if [ "${job_state}" != "success" ]; then
+      missing="${missing:+${missing}, }${job} (${job_state})"
+    fi
+  done <<<"${BACKEND_JOBS}"
+
+  if [ -n "${missing}" ]; then
+    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} changes backend paths (e.g. ${touches_backend}), but the backend suite did not execute against head ${head_sha}: ${missing}. Those jobs are gated on '${DRAFT_JOB}' as well as the path filter (ENG-915), so a skip here is not proof the path filter excluded them — it is the absence of the measurement this gate exists to require. Re-run the workflow at this head once the Greptile gate passes. If a job was renamed, set MERGE_EVIDENCE_BACKEND_JOBS."
+    exit 3
+  fi
+fi
+
 # Acceptance criterion 5: the run is known real, so remaining skips are path
 # filters working correctly. Name them, and label them, so the distinction is
 # explicit rather than inferred.
 verdict 'PASS' "${n_success} job(s) executed successfully against head ${head_sha}: ${success_names}"
 if [ -n "${skipped_names}" ]; then
-  log "skipped by path filter (legitimate — '${DRAFT_JOB}' executed, so this was not a draft run): ${skipped_names}"
+  log "skipped by path filter (legitimate — '${DRAFT_JOB}' executed, and any Greptile-gated job it covers carries a success): ${skipped_names}"
 fi
 exit 0
