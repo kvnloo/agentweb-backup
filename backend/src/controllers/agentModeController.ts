@@ -1455,25 +1455,35 @@ function isPublishAttemptTool(name?: string): boolean {
  * run to publish externally. Deliberately NEVER inferred from the schedule
  * prompt's free text — a model reading "POST replies directly" is not an owner
  * decision, and treating it as one is the hole this whole fix exists to close.
- * Exactly ONE signal qualifies: `fullAutonomy`, the explicit per-schedule
- * autonomy opt-in (ENG-396), which a human sets from the customer portal.
- * Absent it, the run keeps the safe draft-and-notify default. Fail-closed: a
- * missing schedule or a non-true value → false.
+ * Exactly ONE signal qualifies: `unattendedPublishAuthorized`, the schedule's
+ * own publishing opt-in, which only the owner can set (portal form). Absent it,
+ * the run keeps the safe draft-and-notify default. Fail-closed: a missing
+ * schedule or a non-true value → false.
  *
- * `requiredFunctionCalls` naming a publishing tool was tried here and REVERTED —
- * do not reinstate it. It reads like owner intent ("the owner listed the tool
- * this run must call") and it has the adoption `fullAutonomy` lacks, but it is
- * MODEL-WRITABLE: the `manage_scheduled_chat` MCP tool POSTs/PUTs
- * requiredFunctionCalls onto the schedule record (mcp/server/apiTools.ts), and
- * admin templates / work-plan steps write it too. Deriving publish consent from
- * it lets Emma grant herself standing authority to post — the ENG-803 defect
- * inverted, manufacturing consent to act instead of a gate to avoid acting.
- * Authorization must come from a field only a human can set.
+ * Two signals were tried here and REJECTED — do not reinstate either.
+ *
+ * `fullAutonomy` (ENG-396) is a DIFFERENT consent. Its toggle says Emma will
+ * "proceed with her recommended option" rather than pausing to ask when she
+ * needs a decision mid-run. That is consent to decide unaided, not consent to
+ * publish to the world unattended; an owner who ticked it for campaign-objective
+ * decisions never agreed to have replies posted under their name. Reusing it
+ * would silently convert every existing full-autonomy schedule into a
+ * publishing one.
+ *
+ * `requiredFunctionCalls` naming a publishing tool reads like owner intent, but
+ * it is MODEL-WRITABLE: the `manage_scheduled_chat` MCP tool PUTs it onto the
+ * schedule record (mcp/server/apiTools.ts), and admin templates and work-plan
+ * steps write it too. Honouring it lets Emma grant herself standing authority to
+ * post — the ENG-803 defect inverted, manufacturing consent to act instead of a
+ * gate to avoid acting.
+ *
+ * The rule both rejections share: an authorization signal must mean exactly this
+ * capability, and must be writable only by a human.
  */
 export function resolvePublishAuthorized(
-  schedule?: { fullAutonomy?: boolean } | null
+  schedule?: { unattendedPublishAuthorized?: boolean } | null
 ): boolean {
-  return schedule?.fullAutonomy === true;
+  return schedule?.unattendedPublishAuthorized === true;
 }
 
 /**
@@ -1700,6 +1710,14 @@ export async function runVerifiedChat(
     // for IMMUTABLE questions. This is a deliberate, default-off WAIVER of the
     // human protection on irreversible decisions (owner opted in per-schedule).
     fullAutonomy?: boolean;
+    // ENG-803: the schedule's own unattended-publishing opt-in
+    // (unattendedPublishAuthorized), resolved by the caller. Gates the
+    // 'unattempted-publish' continuation, which ORDERS the model to call the
+    // posting tool — firing that without the owner's consent would manufacture
+    // an unauthorized external post out of correct draft-and-notify behaviour.
+    // Deliberately NOT derived from fullAutonomy: that is consent to decide
+    // unaided, not consent to publish. Default false = fail-closed.
+    publishAuthorized?: boolean;
     // ENG-636: does a PARK on this run actually reach a human? Only true for
     // callers with a notification/answer channel: runScheduledChat (owner email)
     // and the interactive verifiedGenerate endpoint (the live session renders the
@@ -1740,14 +1758,9 @@ export async function runVerifiedChat(
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
+    publishAuthorized = false,
     parkNotifiable = false
   } = params;
-
-  // ENG-803: does the owner actually authorize this run to publish externally?
-  // Resolved through the same helper the system directive uses, off the same
-  // owner-set opt-in this run was launched with, so the directive and the
-  // completion gate can never disagree about whether publishing is allowed.
-  const publishAuthorized = resolvePublishAuthorized({ fullAutonomy });
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
   // question, so a model that keeps re-asking cannot loop until maxAttempts. Once
@@ -3139,6 +3152,9 @@ export async function runScheduledChat(
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
       fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-803: the schedule's separate unattended-publishing opt-in. Gates the
+      // continuation that orders the posting tool to actually run.
+      publishAuthorized: resolvePublishAuthorized(schedule),
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,
@@ -6832,6 +6848,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
+        unattendedPublishAuthorized,
         timezone
       } = req.body;
 
@@ -6912,6 +6929,11 @@ export const agentModeController = {
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
         fullAutonomy: fullAutonomy === true,
+        // ENG-803: separate opt-in authorizing this schedule's unattended runs to
+        // publish externally. Kept distinct from fullAutonomy (consent to decide
+        // unaided ≠ consent to post on the owner's behalf) and absent from the
+        // manage_scheduled_chat MCP allowlist, so only the owner can grant it.
+        unattendedPublishAuthorized: unattendedPublishAuthorized === true,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -7037,6 +7059,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
+        unattendedPublishAuthorized,
         timezone
       } = req.body;
 
@@ -7109,6 +7132,11 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
+        // ENG-803: opt-in unattended external publishing. Partial-update safe —
+        // an update that omits it must never silently revoke or grant it.
+        unattendedPublishAuthorized: unattendedPublishAuthorized !== undefined
+          ? (unattendedPublishAuthorized === true)
+          : ((existingSchedule as any).unattendedPublishAuthorized || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
