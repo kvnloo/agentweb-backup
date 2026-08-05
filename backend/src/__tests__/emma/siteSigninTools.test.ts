@@ -36,6 +36,44 @@ function buildContext(navigateAvailable = true) {
   };
 }
 
+/**
+ * A context that can also probe the current page — `currentUrl` is what
+ * page.url() returns, or an Error to simulate a failed/hung probe.
+ */
+function buildContextWithPageProbe(currentUrl: string | Error) {
+  const executeTool = jest.fn().mockImplementation((_model: string, toolName: string) => {
+    if (toolName === 'playwright_browser_run_code') {
+      if (currentUrl instanceof Error) return Promise.reject(currentUrl);
+      return Promise.resolve({
+        raw: { content: [{ type: 'text', text: `### Result\n${JSON.stringify(currentUrl)}` }] },
+      });
+    }
+    return Promise.resolve({ raw: { content: [{ type: 'text', text: '### Result\n"navigated"' }] } });
+  });
+  return {
+    userId: 'user-123',
+    sessionId: 'session-abc',
+    llmModel: 'test-model',
+    service: {
+      toolRegistry: {
+        getAllTools: () => [
+          { name: 'playwright_browser_navigate' },
+          { name: 'playwright_browser_run_code' },
+        ],
+      },
+      executeTool,
+    },
+  };
+}
+
+/** Did the context actually navigate the browser? */
+function navigatedTo(context: any): string | null {
+  const call = context.service.executeTool.mock.calls.find(
+    (c: any[]) => c[1] === 'playwright_browser_navigate'
+  );
+  return call ? call[2].url : null;
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockGetRankAICredentials.mockResolvedValue({ ...CREDENTIALS });
@@ -83,6 +121,67 @@ describe('open_site_signin — failure paths', () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/browser/i);
+  });
+});
+
+// The tool is a foundation tool, so it is offered in EVERY session — including
+// one driving the browser somewhere else entirely. Navigating that browser away
+// mid-task would be visibly wrong, so the tool only acts when the browser is
+// already on the site (the real dead-session case) or has nothing open.
+describe('open_site_signin — will not hijack a browser working elsewhere', () => {
+  it('refuses, without navigating, when the browser is on an unrelated site', async () => {
+    const context = buildContextWithPageProbe('https://app.hubspot.com/contacts/123');
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('browser_on_other_site');
+    expect(result.error).toContain('app.hubspot.com');
+    expect(result.error).toContain('rankai.ai');
+    expect(navigatedTo(context)).toBeNull();
+  });
+
+  it('proceeds when the browser is already on the site (the dead-session case)', async () => {
+    const context = buildContextWithPageProbe('https://rankai.ai/signin?returnUrl=%2Fdashboard');
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(result.success).toBe(true);
+    expect(navigatedTo(context)).toContain('rankai.ai/signin');
+  });
+
+  it('proceeds on a subdomain of the site', async () => {
+    const context = buildContextWithPageProbe('https://app.rankai.ai/dashboard/abc/analytics');
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(result.success).toBe(true);
+  });
+
+  it('proceeds when no page is open — there is nothing to disrupt', async () => {
+    const context = buildContextWithPageProbe('about:blank');
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(result.success).toBe(true);
+  });
+
+  it('proceeds when the probe fails, so a flaky probe cannot block the login', async () => {
+    const context = buildContextWithPageProbe(new Error('page closed'));
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(result.success).toBe(true);
+    expect(navigatedTo(context)).toContain('rankai.ai/signin');
+  });
+
+  it('does not mistake a lookalike host for the site', async () => {
+    const context = buildContextWithPageProbe('https://rankai.ai.evil.example.com/signin');
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('browser_on_other_site');
   });
 });
 

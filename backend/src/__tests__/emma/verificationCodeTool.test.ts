@@ -19,7 +19,7 @@ jest.mock('../../services/emailProviderService', () => ({
   EmailProviderError: class EmailProviderError extends Error {},
 }));
 
-import '../../emma/verificationCodeTool';
+import { resolveWaitSeconds } from '../../emma/verificationCodeTool';
 import { emmaToolRegistry } from '../../emma/registry';
 
 const tool = emmaToolRegistry.getTool('read_verification_code');
@@ -49,6 +49,32 @@ beforeEach(() => {
   mockListEmails.mockResolvedValue([]);
   mockSearchEmails.mockResolvedValue([]);
   mockGetEmails.mockResolvedValue([]);
+});
+
+// A whole agent-mode turn is capped at AGENT_MODE_GENERATION_TIMEOUT_MS (600s).
+// A single tool that can hold hundreds of seconds of that budget is how a turn
+// gets killed with completed work still unsaved (ENG-510). Codes arrive in
+// seconds, so the ceiling is deliberately well under the turn cap.
+describe('read_verification_code — wait window', () => {
+  it('defaults to 90 seconds when unspecified', () => {
+    expect(resolveWaitSeconds(undefined)).toBe(90);
+    expect(resolveWaitSeconds(null)).toBe(90);
+    expect(resolveWaitSeconds('not a number')).toBe(90);
+  });
+
+  it('caps an over-long request well short of the whole-turn timeout', () => {
+    expect(resolveWaitSeconds(300)).toBe(180);
+    expect(resolveWaitSeconds(6000)).toBe(180);
+  });
+
+  it('allows a single check and never a negative wait', () => {
+    expect(resolveWaitSeconds(0)).toBe(0);
+    expect(resolveWaitSeconds(-30)).toBe(0);
+  });
+
+  it('passes a reasonable request through unchanged', () => {
+    expect(resolveWaitSeconds(45)).toBe(45);
+  });
 });
 
 describe('read_verification_code — failure paths', () => {

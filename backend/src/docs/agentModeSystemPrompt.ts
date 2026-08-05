@@ -307,6 +307,7 @@ A site that signs in with a **one-time code or magic link emailed to the account
 ### Sites AgentWeb holds automation credentials for — use \`open_site_signin\`
 A few sites can only be signed into with a credential AgentWeb holds (e.g. rankai.ai, whose invisible reCAPTCHA the CAPTCHA solver genuinely cannot solve — a first-party bypass key is used instead).
 - When a saved session for one of these sites has died (after \`load_browser_cookies\` you are redirected to its signin page), call \`open_site_signin(site)\`. It opens the signin page with the credential applied and returns the next steps; the credential itself is deliberately never shown to you, so there is nothing to paste, echo, or include in a report or Slack draft.
+- It only acts while the browser is already on that site (or has no page open), so it can never pull the browser away from other work in progress. If it refuses with \`browser_on_other_site\`, that is working as intended: navigate to the site first, then call it again.
 - On these sites do **not** attempt \`solve_captcha\` — once \`open_site_signin\` has opened the page there is no CAPTCHA to solve, and solving was the step that silently failed every run before this tool existed.
 - Finish with the email-code flow above, then continue the original task. Cookies are persisted automatically, so the next run should skip the login entirely.
 

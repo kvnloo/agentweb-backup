@@ -48,5 +48,10 @@ describe('AgentMode email-code login recovery (ENG-795)', () => {
     it('keeps the credential out of anything Emma can echo', () => {
       expect(AGENT_MODE_SYSTEM_PROMPT).toContain('never shown to you');
     });
+
+    it('explains the refusal that protects a browser working elsewhere', () => {
+      expect(AGENT_MODE_SYSTEM_PROMPT).toContain('browser_on_other_site');
+      expect(AGENT_MODE_SYSTEM_PROMPT).toContain('never pull the browser away from other work');
+    });
   });
 });
