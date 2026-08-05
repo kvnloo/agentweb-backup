@@ -102,8 +102,29 @@ function splitTableRow(row: string): string[] {
   return trimmed.split('|').map((cell) => cell.trim());
 }
 
-const isTableSeparator = (line: string): boolean =>
-  /^\s*\|?[\s:|-]*-[\s:|-]*\|[\s:|-]*$/.test(line);
+/** One separator cell: `---`, `:--`, `--:` or `:-:`. */
+const separatorCell = /^:?-+:?$/;
+
+/**
+ * Recognise a GFM table separator row (`|---|:--:|`).
+ *
+ * Checked cell by cell rather than with one regex over the whole line: a single
+ * pattern needs overlapping quantifiers over the same character class, which
+ * backtracks catastrophically on a near-miss line (a long run of pipes and
+ * dashes with one stray character) and blocks the event loop. Scraped tables
+ * produce exactly that shape, and this renderer is the always-works fallback.
+ */
+const isTableSeparator = (line: string): boolean => {
+  if (!line.includes('|')) return false;
+  let sawCell = false;
+  for (const cell of line.split('|')) {
+    const trimmed = cell.trim();
+    if (!trimmed) continue;
+    if (!separatorCell.test(trimmed)) return false;
+    sawCell = true;
+  }
+  return sawCell;
+};
 
 /** Convert a markdown draft into HTML body markup. */
 export function renderMarkdownBody(draft: string): string {
