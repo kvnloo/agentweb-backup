@@ -31,10 +31,70 @@
 import express from 'express';
 import crypto from 'crypto';
 import { getAccountByCalendlyUserUri } from '../services/connectedAccountsDb';
-import { userDb } from '../services/db';
+import { userDb, crmDb } from '../services/db';
 import { metaService } from '../services/metaService';
 
 const router = express.Router();
+
+// ── CRM-forward: target-list resolution ─────────────────────────────────
+//
+// A customer's booking gets created/updated as a lead in one of their own
+// lead lists, so it forwards to their connected HubSpot/Attio the same way
+// any other lead does (externalCrmSyncService.autoSyncLead, already
+// triggered generically off whatever list a lead lands in — no new CRM-sync
+// logic needed here, just landing the lead in the right list).
+//
+// When the customer hasn't explicitly picked a list (CalendlyConfig's
+// booking_lead_list_id is unset), fall back to an idempotent, system-managed
+// "Calendly Bookings" list — created once per user and reused from then on.
+// Mirrors resolveOrCreateDefaultLeadList in routes/landingPageGeneration.ts
+// exactly (find-by-name+isSystemManaged, singleflight per user, retry once
+// on transient failure, never silently swallow a persistent failure).
+
+const BOOKING_LIST_NAME = 'Calendly Bookings';
+
+const inFlightBookingListResolutions = new Map<string, Promise<string>>();
+
+async function resolveBookingListOnce(userId: string): Promise<string> {
+  const existing = await crmDb.getLeadListsByUserId(userId);
+  const match = (existing || []).find(
+    (l: any) => l && l.isSystemManaged === true && l.name === BOOKING_LIST_NAME,
+  );
+  if (match) return match.listId;
+
+  console.log(`[Calendly Webhook] No booking lead list found for user ${userId} — creating "${BOOKING_LIST_NAME}"`);
+  const created = await crmDb.createLeadList(
+    userId,
+    BOOKING_LIST_NAME,
+    'Auto-created default list for Calendly bookings with no explicitly chosen list. System-managed.',
+    undefined, // alertEvents
+    null, // listSenderId
+    undefined, // autoDraftEnabled
+    undefined, // autoDraftInstruction
+    undefined, // autoSendEnabled
+    undefined, // statusConfig — defaults to sales-style
+    'sales', // listType
+    true, // isSystemManaged
+  );
+  return (created as any).listId;
+}
+
+export async function resolveOrCreateBookingList(userId: string): Promise<string> {
+  let inFlight = inFlightBookingListResolutions.get(userId);
+  if (!inFlight) {
+    inFlight = (async () => {
+      try {
+        return await resolveBookingListOnce(userId);
+      } catch (firstError) {
+        console.warn('[Calendly Webhook] Booking list resolution failed once, retrying:', firstError);
+        return await resolveBookingListOnce(userId);
+      }
+    })();
+    inFlightBookingListResolutions.set(userId, inFlight);
+    inFlight.finally(() => inFlightBookingListResolutions.delete(userId)).catch(() => {});
+  }
+  return inFlight;
+}
 
 interface CalendlyInviteePayload {
   event: string;
