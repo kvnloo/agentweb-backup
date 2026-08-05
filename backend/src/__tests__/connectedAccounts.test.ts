@@ -427,6 +427,59 @@ describe('Connected Accounts Routes', () => {
             expect(response.body.accounts[0].booking_tracking_active).toBe(false);
         });
 
+        it('surfaces booking_lead_list_id for a Calendly account that has one set', async () => {
+            const calendlyWithList = {
+                platform: 'calendly',
+                account_id: 'jane@customer.com',
+                account_name: 'Jane Customer',
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+                config: {
+                    account_type: 'calendly',
+                    email: 'jane@customer.com',
+                    access_token: 'tok',
+                    refresh_token: 'refresh',
+                    token_expires_at: 9999999999999,
+                    user_uri: 'https://api.calendly.com/users/AAAA',
+                    organization_uri: 'https://api.calendly.com/organizations/BBBB',
+                    booking_tracking_active: true,
+                    booking_lead_list_id: 'list-1',
+                }
+            };
+            (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue([calendlyWithList]);
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.accounts[0].booking_lead_list_id).toBe('list-1');
+        });
+
+        it('does not set booking_lead_list_id for non-Calendly accounts', async () => {
+            const mockAccounts = [
+                {
+                    platform: 'gmail',
+                    account_id: 'user@gmail.com',
+                    account_name: 'Test User',
+                    created_at: new Date().toISOString(),
+                    updated_at: new Date().toISOString(),
+                    config: {
+                        account_type: 'gmail',
+                        email: 'user@gmail.com',
+                        access_token: 'access-token',
+                        refresh_token: 'refresh-token',
+                        token_expires_at: Date.now() + 3600000,
+                        granted_scopes: [],
+                    }
+                }
+            ];
+            (connectedAccountsDb.getAccountsWithOwnerIncludingOrgShared as jest.Mock).mockResolvedValue(mockAccounts);
+
+            const response = await request(app).get('/api/oauth/connected-accounts');
+
+            expect(response.status).toBe(200);
+            expect(response.body.accounts[0].booking_lead_list_id).toBeUndefined();
+        });
+
         it('does not set booking_tracking_active for non-Calendly accounts', async () => {
             const mockAccounts = [
                 {
