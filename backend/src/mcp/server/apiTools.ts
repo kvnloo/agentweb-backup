@@ -2018,6 +2018,60 @@ function normalizeStepTitle(value: unknown): string {
   return String(value ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * The step fields worth guarding. The admin route rebuilds every step from a
+ * fixed field list and defaults these to empty (services/workPlanSteps.ts), so
+ * re-sending a step without them blanks whatever was stored — at an unchanged
+ * step count, which no length check can see.
+ */
+const STEP_CONTENT_FIELDS = [
+  'description',
+  'requiredFunctionCalls',
+  'skillIds',
+  'userInstructions',
+  'expectedAssetCount',
+] as const;
+
+function isEmptyStepValue(value: unknown): boolean {
+  return value === undefined || value === null || value === ''
+    || (Array.isArray(value) && value.length === 0);
+}
+
+/**
+ * Locate `probe`'s counterpart in `steps`. Title first, then position: a caller
+ * reordering a plan renumbers the steps but keeps their titles, so matching on
+ * stepCount first would pair up the wrong two.
+ */
+function findStepIndex(steps: any[], probe: any): number {
+  if (probe.title !== undefined) {
+    const title = normalizeStepTitle(probe.title);
+    const byTitle = steps.findIndex((s: any) => normalizeStepTitle(s.title) === title);
+    if (byTitle !== -1) return byTitle;
+  }
+  if (probe.stepCount === undefined || probe.stepCount === null) return -1;
+  return steps.findIndex((s: any) => Number(s.stepCount) === Number(probe.stepCount));
+}
+
+/**
+ * Fields a replace would blank on steps the caller plainly meant to keep. A
+ * step with no counterpart at all is skipped: that is a removal or a rewrite,
+ * which the count guard and the dropped-titles diff already report.
+ */
+function findStepContentLoss(before: any[], after: any[]) {
+  const losses: { stepCount: any; title: any; fields: string[] }[] = [];
+  for (const existing of before) {
+    const index = findStepIndex(after, existing);
+    if (index === -1) continue;
+    const fields = STEP_CONTENT_FIELDS.filter(
+      (field) => !isEmptyStepValue(existing[field]) && isEmptyStepValue(after[index][field]),
+    );
+    if (fields.length > 0) {
+      losses.push({ stepCount: existing.stepCount, title: existing.title, fields: [...fields] });
+    }
+  }
+  return losses;
+}
+
 /** Apply the caller-supplied fields of `incoming` on top of an existing step. */
 function mergeWorkPlanStep(existing: any, incoming: any): any {
   const merged = { ...existing };
@@ -2043,6 +2097,9 @@ function mergeWorkPlanStep(existing: any, incoming: any): any {
 function mergeWorkPlanSteps(existingSteps: any[], incomingSteps: any[]): any[] {
   const merged = existingSteps.map((s: any) => ({ ...s }));
 
+  // Deliberately stepCount-before-title, the opposite of findStepIndex: here
+  // the caller has explicitly named the step to amend, and the schema says so.
+  // findStepIndex infers identity across two full arrays with no such selector.
   for (const incoming of incomingSteps) {
     const targetCount = incoming.stepCount;
     let index = -1;
@@ -2068,6 +2125,7 @@ function mergeWorkPlanSteps(existingSteps: any[], incomingSteps: any[]): any[] {
 function summarizeStepChange(before: any[], after: any[], mode: 'merge' | 'replace') {
   const afterTitles = new Set(after.map((s: any) => normalizeStepTitle(s.title)));
   const beforeTitles = new Set(before.map((s: any) => normalizeStepTitle(s.title)));
+  const contentLoss = findStepContentLoss(before, after);
   return {
     mode,
     stepsBefore: before.length,
@@ -2079,6 +2137,8 @@ function summarizeStepChange(before: any[], after: any[], mode: 'merge' | 'repla
     addedStepTitles: after
       .filter((s: any) => !beforeTitles.has(normalizeStepTitle(s.title)))
       .map((s: any) => s.title),
+    // Omitted rather than empty so a clean update's summary stays quiet.
+    ...(contentLoss.length > 0 && { stepContentLoss: contentLoss }),
   };
 }
 
@@ -2112,7 +2172,7 @@ mcpToolRegistry.register({
   name: 'manage_predefined_work_plan',
   definition: {
     name: 'manage_predefined_work_plan',
-    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes. STEPS ARE DESTRUCTIVE ON UPDATE: sending "steps" with action=update replaces the entire steps array, it does not patch individual steps. To amend one step without touching the others, pass steps_mode="merge" with just the step(s) you are changing. To intentionally rewrite the plan with fewer steps, send the complete new array plus confirm_step_removal=true. An update that would drop steps is rejected unless confirmed, and every step change comes back as a stepsChange diff summary.',
+    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes. STEPS ARE DESTRUCTIVE ON UPDATE: sending "steps" with action=update replaces the entire steps array, it does not patch individual steps. To amend one step without touching the others, pass steps_mode="merge" with just the step(s) you are changing. To intentionally rewrite the plan with fewer steps, send the complete new array plus confirm_step_removal=true. A replace stores exactly what you send, so a field you omit on a step is erased too — an update that would drop steps, or blank fields on the steps it keeps, is rejected unless confirmed. Every step change comes back as a stepsChange diff summary.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2155,7 +2215,7 @@ mcpToolRegistry.register({
         },
         confirm_step_removal: {
           type: 'boolean',
-          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now. Without it the update is rejected instead of silently deleting steps.'
+          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
         }
       },
       required: ['action']
@@ -2227,6 +2287,23 @@ mcpToolRegistry.register({
                 howToProceed: [
                   'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
                   'To intentionally rewrite the plan with fewer steps, retry with confirm_step_removal=true (send the complete new steps array).',
+                ],
+              });
+            }
+
+            // Same failure, one level down: the step count is untouched but the
+            // steps come back gutted, which is what happens when a caller
+            // re-types the array from memory as title+description.
+            const contentLoss = findStepContentLoss(existingSteps || [], body.steps);
+            if (contentLoss.length > 0 && args.confirm_step_removal !== true) {
+              return jsonResult({
+                error: `Refusing to update work plan ${args.plan_id}: this payload keeps the steps but would blank fields that are currently set on ${contentLoss.length} of them. A replace stores exactly what you send, so any field you omit is erased.`,
+                stepsWouldBeRemoved: 0,
+                stepContentLoss: contentLoss,
+                howToProceed: [
+                  'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+                  'To keep these steps as they are, re-send each one with its current fields (call action="get" first if you no longer have them).',
+                  'To intentionally clear them, retry with confirm_step_removal=true.',
                 ],
               });
             }
