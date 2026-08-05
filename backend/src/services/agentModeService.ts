@@ -715,6 +715,12 @@ interface LLMModelConfig {
 }
 
 // Type for LLM call options
+/**
+ * Bedrock's default prompt-cache TTL. A prefix re-read inside this window is a
+ * free refresh; only a gap longer than it can justify the 1-hour rate (ENG-893).
+ */
+const PROMPT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
+
 interface LLMCallOptions {
   tools?: any[] | null;
   tool_choice?: 'auto' | 'none' | any | null;
@@ -3268,6 +3274,29 @@ export class AgentModeService {
       ).length;
 
       const isScheduledSession = currentSession?.sessionType === 'scheduled';
+
+      // ENG-893: does THIS turn justify buying the 1-hour prompt-cache TTL?
+      //
+      // A 1h cache write costs 2x input where a 5m write costs 1.25x, and a
+      // cache HIT refreshes the TTL for free — so the extra 0.75x only pays for
+      // itself if the prefix is re-read after the 5-minute window would have
+      // expired. Session TYPE is a poor proxy for that: it correctly excludes
+      // scheduled runs, but still charges the surcharge to a fast back-and-forth
+      // chat and to a one-turn session that writes the cache and ends, neither
+      // of which ever collects the benefit.
+      //
+      // The honest signal is the pacing the user has actually shown. `updatedAt`
+      // is written only when a message lands, so it is the true time of the last
+      // message; the gap between it and now is exactly how long this user just
+      // took to reply. Someone who has paused once is likely to pause again,
+      // whereas a first turn (gap ~0) and a rapid reply both indicate a prefix
+      // that will be re-read well inside five minutes — or not at all.
+      const msSinceLastMessage = currentSession?.updatedAt
+        ? Date.now() - Date.parse(currentSession.updatedAt)
+        : 0;
+      const userJustPaused =
+        Number.isFinite(msSinceLastMessage) && msSinceLastMessage > PROMPT_CACHE_DEFAULT_TTL_MS;
+      const humanPacedTurn = !isScheduledSession && userJustPaused;
       // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
       // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
       // human withholding information. The anti-loop remedy cannot satisfy a tool call
@@ -3628,7 +3657,7 @@ export class AgentModeService {
             temperature: 0.1,
             usageContext: { userId, sessionId, feature: 'agent_task' },
             // ENG-893: only the interactive conversation loop waits on a human.
-            humanPaced: !isScheduledSession
+            humanPaced: humanPacedTurn
           });
         } catch (callError) {
           if (isTransientLLMError(callError) && !backupModelUsed) {
@@ -3652,7 +3681,7 @@ export class AgentModeService {
                 temperature: 0.1,
                 usageContext: { userId, sessionId, feature: 'agent_task' },
                 // ENG-893: same pacing as the primary call it is retrying.
-                humanPaced: !isScheduledSession
+                humanPaced: humanPacedTurn
               });
             } else {
               recordSpanError(chatSpan, callError);

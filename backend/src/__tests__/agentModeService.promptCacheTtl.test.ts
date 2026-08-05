@@ -309,6 +309,44 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
     });
   });
 
+  describe('who actually pays for the 1-hour TTL', () => {
+    // The surcharge is only worth paying when the prefix will be re-read AFTER
+    // the 5-minute window would have lapsed. These are the four populations.
+    const FIVE_MIN_MS = 5 * 60 * 1000;
+    const pacedFrom = (updatedAt: string | undefined, isScheduled: boolean) => {
+      const ms = updatedAt ? Date.now() - Date.parse(updatedAt) : 0;
+      return !isScheduled && Number.isFinite(ms) && ms > FIVE_MIN_MS;
+    };
+
+    it('buys it for a user who just paused longer than the default TTL', () => {
+      const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      expect(pacedFrom(tenMinutesAgo, false)).toBe(true);
+    });
+
+    it('does NOT buy it for a fast back-and-forth chat', () => {
+      // Replying in under five minutes means the prefix is re-read on a free
+      // refresh; the extra 0.75x would buy nothing.
+      const ninetySecondsAgo = new Date(Date.now() - 90 * 1000).toISOString();
+      expect(pacedFrom(ninetySecondsAgo, false)).toBe(false);
+    });
+
+    it('does NOT buy it on a session with no prior message', () => {
+      // A first (often only) turn writes the cache and may never re-read it.
+      expect(pacedFrom(undefined, false)).toBe(false);
+    });
+
+    it('does NOT buy it for a scheduled run, however long it has been idle', () => {
+      // A scheduled run may start hours after its last message, but its own
+      // turns then fire back-to-back — it never spans the window mid-run.
+      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+      expect(pacedFrom(twoHoursAgo, true)).toBe(false);
+    });
+
+    it('does NOT buy it when the timestamp is unparseable', () => {
+      expect(pacedFrom('not-a-date', false)).toBe(false);
+    });
+  });
+
   describe('diffToolSets — does a skill refresh actually cost a re-cache?', () => {
     // `tools` is the first link in Bedrock's cache chain, so only a refresh that
     // MOVES the tool set invalidates the prefix. This is the measurement that
