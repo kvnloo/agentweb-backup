@@ -200,6 +200,40 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
     });
   });
 
+  describe('diffToolSets — does a skill refresh actually cost a re-cache?', () => {
+    // `tools` is the first link in Bedrock's cache chain, so only a refresh that
+    // MOVES the tool set invalidates the prefix. This is the measurement that
+    // decides whether the remaining install cost is worth engineering away.
+    const set = (...names: string[]) => new Set(names);
+
+    it('reports a change when a skill adds tools (the expensive case)', () => {
+      const diff = AgentModeService.diffToolSets(set('a', 'b'), set('a', 'b', 'c'));
+      expect(diff).toEqual({ added: 1, removed: 0, changed: true });
+    });
+
+    it('reports NO change when the installed skill adds nothing new', () => {
+      // Skills overlap heavily (191 distinct tools across 74 skills), so an
+      // install whose tools are already allowed should keep the cache alive.
+      const diff = AgentModeService.diffToolSets(set('a', 'b'), set('b', 'a'));
+      expect(diff).toEqual({ added: 0, removed: 0, changed: false });
+    });
+
+    it('counts removals too — losing a tool invalidates just as hard', () => {
+      const diff = AgentModeService.diffToolSets(set('a', 'b', 'c'), set('a'));
+      expect(diff).toEqual({ added: 0, removed: 2, changed: true });
+    });
+
+    it('handles simultaneous add and remove', () => {
+      const diff = AgentModeService.diffToolSets(set('a', 'b'), set('b', 'z'));
+      expect(diff).toEqual({ added: 1, removed: 1, changed: true });
+    });
+
+    it('treats an empty starting set as a change once tools appear', () => {
+      expect(AgentModeService.diffToolSets(set(), set('a')).changed).toBe(true);
+      expect(AgentModeService.diffToolSets(set(), set()).changed).toBe(false);
+    });
+  });
+
   describe('the price book stays on the DEFAULT-TTL rate', () => {
     it('declares 1.25x for every Bedrock Anthropic model, extended-TTL or not', () => {
       // The 1-hour uplift is applied per RESPONSE (cacheWriteCost), never per

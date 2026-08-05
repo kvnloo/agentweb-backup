@@ -3388,6 +3388,31 @@ export class AgentModeService {
 
             // Re-build context using helper
             const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess);
+            // ENG-893: a skill install that ADDS tools changes `toolConfig`, and
+            // Bedrock chains its cache checkpoints tools -> system -> messages —
+            // so the whole cached prefix dies and the next call re-writes it in
+            // full. In the session that surfaced ENG-893 that was 5 installs and
+            // ~646k re-written tokens, the largest remaining cost after the
+            // 1-hour TTL fix.
+            //
+            // It is logged rather than "fixed" on purpose. The two candidate
+            // fixes both turned out to be unsupported by that session's data:
+            // batching installs (they were 85+ minutes apart, each answering a
+            // new user request) and moving the skill-context message out of
+            // index 1 (every install changed the tool set anyway, so the message
+            // splice was never the binding constraint). Whether either becomes
+            // worthwhile depends on how often a real install adds NO new tools —
+            // which nothing measured until now. Hence toolSetChanged.
+            const toolSetDiff = AgentModeService.diffToolSets(
+              allowedToolNames,
+              skillContext.allowedToolNames
+            );
+            console.log(
+              `AgentMode: skill refresh — toolSetChanged: ${toolSetDiff.changed}, added: ${toolSetDiff.added}, removed: ${toolSetDiff.removed}, installedSkills: ${updatedAssociatedSkillIds.length}` +
+                (toolSetDiff.changed
+                  ? ' — prompt-cache prefix invalidated for the next call (ENG-893)'
+                  : ' — cached prefix survives the tool list')
+            );
             allowedToolNames = skillContext.allowedToolNames;
             installedSkillContextMsg = skillContext.installedSkillContextMsg;
 
@@ -3405,7 +3430,28 @@ export class AgentModeService {
               _initialMessageCount = initialMessageCount;
             }
 
-            // Invalidate tools cache
+            // Invalidate tools cache.
+            //
+            // ENG-893 — this is the one remaining prompt-cache cost, and it is
+            // deliberate. Installing a skill changes `allowedToolNames`, which
+            // changes the Converse `toolConfig`; Bedrock chains its checkpoints
+            // tools -> system -> messages, so a tool change invalidates system
+            // AND the whole message history. One skill install therefore costs a
+            // full-prefix re-cache (80k-185k tokens in the session that filed
+            // this ticket). Moving the skill-context message out of index 1 does
+            // NOT avoid it — the tool change alone is sufficient.
+            //
+            // Do NOT "fix" this by pre-declaring every tool up front. Measured
+            // 2026-08-05 against prod: 191 distinct tools across 74 skills at
+            // ~941 tokens per definition is ~180k tokens of schema carried on
+            // every turn. At Opus 5 cache-read rates that is ~$0.09/turn, i.e.
+            // ~$9.27 over the 103-turn session — MORE than the ~$6.47 of
+            // re-cache it would save, before counting the context it consumes
+            // and the loss of hard tool gating (ENG-260 / ENG-280).
+            //
+            // Batching installs does not help either: that session's five
+            // installs landed in five different user turns as the user changed
+            // topic, so there was nothing to batch.
             filteredToolsCache = null;
             skillsUpdated = false;
           } catch (error) {
@@ -5366,6 +5412,27 @@ export class AgentModeService {
 
   // Get filtered tools based on user's subscription type AND session state
   // optimized to accept precomputedAllowedNames to avoid redundant DB lookups when possible
+  /**
+   * Compare the tool set before and after a skill refresh.
+   *
+   * ENG-893: `toolConfig` is the FIRST link in Bedrock's cache chain
+   * (tools -> system -> messages), so a change here invalidates the entire
+   * cached prompt prefix, not just the tools. Only a refresh that actually
+   * moves the tool set costs a full re-cache — one that installs a skill whose
+   * tools are already allowed is free. Callers log the difference so we can
+   * find out how often each case really happens.
+   */
+  public static diffToolSets(
+    previous: ReadonlySet<string>,
+    next: ReadonlySet<string>
+  ): { added: number; removed: number; changed: boolean } {
+    let added = 0;
+    for (const name of next) if (!previous.has(name)) added++;
+    let removed = 0;
+    for (const name of previous) if (!next.has(name)) removed++;
+    return { added, removed, changed: added > 0 || removed > 0 };
+  }
+
   public async getFilteredTools(
     userId: string,
     precomputedAllowedSkillToolNames?: Set<string>,
