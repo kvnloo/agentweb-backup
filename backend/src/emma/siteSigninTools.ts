@@ -85,6 +85,7 @@ function findPlaywrightTool(service: any, suffix: string): string | null {
 // page.url() is instant, so bound it explicitly rather than let a hung call
 // stall the sign-in.
 const CURRENT_URL_PROBE_TIMEOUT_MS = 8000;
+const CURRENT_URL_PROBE_ATTEMPTS = 2;
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
@@ -135,22 +136,33 @@ async function checkBrowserIsOnSite(context: any, userId: string, domain: string
   const runCodeTool = findPlaywrightTool(context?.service, 'browser_run_code');
   if (!runCodeTool) return { ok: true };
 
+  // Probed twice: a transient MCP hiccup on the first call is the main way this
+  // guard would have been skipped, and one retry turns most of those into a
+  // definite answer. Only a probe that fails BOTH times falls open.
   let currentUrl = '';
-  try {
-    const result = await withTimeout(
-      context.service.executeTool(
-        context.llmModel,
-        runCodeTool,
-        { code: 'async (page) => page.url()' },
-        userId,
-        context.sessionId
-      ),
-      CURRENT_URL_PROBE_TIMEOUT_MS,
-      'Current-page probe'
-    );
-    currentUrl = extractMcpText(result);
-  } catch (error: any) {
-    console.warn(`[open_site_signin] Could not read the current page (${error?.message || error}) — proceeding.`);
+  let probeError: any = null;
+  for (let attempt = 1; attempt <= CURRENT_URL_PROBE_ATTEMPTS; attempt++) {
+    try {
+      const result = await withTimeout(
+        context.service.executeTool(
+          context.llmModel,
+          runCodeTool,
+          { code: 'async (page) => page.url()' },
+          userId,
+          context.sessionId
+        ),
+        CURRENT_URL_PROBE_TIMEOUT_MS,
+        'Current-page probe'
+      );
+      currentUrl = extractMcpText(result);
+      probeError = null;
+      break;
+    } catch (error: any) {
+      probeError = error;
+    }
+  }
+  if (probeError) {
+    console.warn(`[open_site_signin] Could not read the current page (${probeError?.message || probeError}) — proceeding.`);
     return { ok: true };
   }
 

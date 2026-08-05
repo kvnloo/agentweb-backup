@@ -166,13 +166,50 @@ describe('open_site_signin — will not hijack a browser working elsewhere', () 
     expect(result.success).toBe(true);
   });
 
-  it('proceeds when the probe fails, so a flaky probe cannot block the login', async () => {
+  it('proceeds when the probe fails every attempt, so a broken probe cannot block the login', async () => {
     const context = buildContextWithPageProbe(new Error('page closed'));
 
     const result = await tool.execute({ site: 'rankai' }, context);
 
     expect(result.success).toBe(true);
     expect(navigatedTo(context)).toContain('rankai.ai/signin');
+  });
+
+  // A transient MCP hiccup on the first probe is the main way the guard would
+  // have been skipped. One retry converts that into a definite answer.
+  it('retries a transient probe failure rather than assuming the browser is idle', async () => {
+    let attempts = 0;
+    const executeTool = jest.fn().mockImplementation((_model: string, toolName: string) => {
+      if (toolName === 'playwright_browser_run_code') {
+        attempts += 1;
+        if (attempts === 1) return Promise.reject(new Error('transient MCP error'));
+        return Promise.resolve({
+          raw: { content: [{ type: 'text', text: '### Result\n"https://app.hubspot.com/contacts/123"' }] },
+        });
+      }
+      return Promise.resolve({ raw: { content: [{ type: 'text', text: '### Result\n"navigated"' }] } });
+    });
+    const context = {
+      userId: 'user-123',
+      sessionId: 'session-abc',
+      llmModel: 'test-model',
+      service: {
+        toolRegistry: {
+          getAllTools: () => [
+            { name: 'playwright_browser_navigate' },
+            { name: 'playwright_browser_run_code' },
+          ],
+        },
+        executeTool,
+      },
+    };
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(attempts).toBe(2);
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('browser_on_other_site');
+    expect(navigatedTo(context)).toBeNull();
   });
 
   it('does not mistake a lookalike host for the site', async () => {
