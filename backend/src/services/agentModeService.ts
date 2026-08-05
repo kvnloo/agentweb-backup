@@ -12,6 +12,7 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import {
@@ -172,6 +173,33 @@ export function isCompleteHtmlDocument(draft: string): boolean {
   const hasClose = s.includes('</html>');
   return hasOpen && hasClose;
 }
+
+// ENG-844: the anti-loop override ("stop asking, find context yourself, proceed
+// with placeholders, always make progress") is a remedy for a HUMAN who keeps
+// repeating a message without supplying requested information. A scheduled
+// verification RETRY press — "Please try again. Make sure to <tool> (N more
+// time(s) needed)." (agentModeController.runVerifiedChat) — is neither: no human
+// authored it, and nothing is missing except a tool CALL, which a placeholder
+// can never substitute for. Letting the override fire on such a press pressures
+// the model to make the call or fabricate that it did — and when the call is an
+// irreversible/publishing write, that means an off-cadence live post. So the
+// override step DETERMINISTICALLY declines to fire on any function-call press.
+//
+// The "(N more time(s) needed)" suffix is emitted ONLY for unmet required
+// FUNCTION calls, never for keyword-only reminders, so it reliably marks such a
+// press without over-matching an ordinary human message.
+const IRREVERSIBLE_PUBLISH_TOOLS = ['post_on_connected_account', 'post_thread', 'publish_blog_article'];
+
+export function isVerificationFunctionCallRetryPress(text: string): boolean {
+  if (!text || typeof text !== 'string') return false;
+  return /please try again\.\s*make sure to /i.test(text) && /\(\d+\s+more\s+times?\s+needed\)/i.test(text);
+}
+
+// Does that press target an irreversible/publishing write (vs. a reversible tool
+// like generate_image)? Used only to sharpen the suppression log line.
+export function pressesIrreversiblePublishWrite(text: string): boolean {
+  return isVerificationFunctionCallRetryPress(text) && IRREVERSIBLE_PUBLISH_TOOLS.some((tool) => text.includes(tool));
+}
 import { metaService, MetaService, MetaAdsCampaignParams, MetaAdsAdSetParams, MetaAdsAdCreativeParams, MetaAdsAdParams, computeRetagUrlTags } from './metaService';
 import { linkedInOutreachService } from './linkedInOutreachService';
 import { twitterService, runWithXActingUser } from './twitterService';
@@ -188,7 +216,7 @@ import { HubSpotService } from './hubspotService';
 import { assertMetaAccountAllowed } from './metaTestAccountGuard';
 import { getAudienceSnapshotRowKeys, saveAudienceSnapshotRowKeys, CorruptSnapshotError } from './metaAudienceSnapshotStore';
 import { claimPreviewToken, releasePreviewToken, markPreviewTokenSucceeded } from './metaAudienceCampaignTokenStore';
-import { resolvePinnedPublicAddress } from '../utils/ssrfGuard';
+import { resolvePinnedPublicAddress, fetchBufferFollowingRedirects, DEFAULT_MAX_IMAGE_BYTES } from '../utils/ssrfGuard';
 import { getJwtSecret } from '../config/jwt';
 import { uploadFileToS3, uploadFileToS3WithPath, uploadScreenshotToS3, getS3ObjectAsString, extractS3KeyFromUrl, getS3ObjectStream, getS3ObjectMetadata } from '../utils/s3Utils';
 import { isTransientLLMError } from '../utils/agentModeErrors';
@@ -2779,6 +2807,39 @@ export class AgentModeService {
     return isTransientLLMError(error) || /timed out|timeout|overloaded|upstream|network/i.test(message);
   }
 
+  /**
+   * Should describe_image retry a failed vision call on the OTHER provider?
+   *
+   * This is a superset of isRetryableMediaToolError, and deliberately local to
+   * describe_image. That classifier answers "would this same call succeed if
+   * repeated", so it rejects credential/permission failures — correctly, since
+   * hammering the same model with a bad key is pointless. But describe_image's
+   * fallback switches providers entirely (Gemini -> Bedrock Claude), which
+   * authenticate separately, so a provider-scoped 401/403 is precisely the case
+   * where the other provider WOULD answer. Without this, one bad Gemini key
+   * hard-fails every describe_image call while Bedrock sits healthy beside it —
+   * the same "provider rejection surfaces as a broken tool" shape as ENG-834.
+   *
+   * NOT widened in the shared classifier: image generation relies on its current
+   * narrowness (ENG-510), and switching image models changes output semantics in
+   * a way switching vision models does not.
+   *
+   * Payload rejections (400 INVALID_ARGUMENT) stay excluded — the image is
+   * already normalised and downscaled by the time we call, so a second provider
+   * would only double the latency and cost. Recovery is still observable:
+   * describeImage returns fallbackUsed + primaryError, so a broken key is
+   * diagnosable from the session record rather than silently papered over.
+   */
+  private isVisionFallbackWorthy(error: unknown): boolean {
+    if (this.isRetryableMediaToolError(error)) return true;
+    if (!error) return false;
+    const e = error as any;
+    const status = e?.status ?? e?.$metadata?.httpStatusCode ?? e?.response?.status;
+    if (status === 401 || status === 403) return true;
+    const message = error instanceof Error ? error.message : String(error);
+    return /permission.?denied|unauthenticated|api key not valid/i.test(message);
+  }
+
   private getImageGenerationFallbackModel(
     currentModel: string | undefined,
     inputImages: string[] | undefined,
@@ -3075,15 +3136,56 @@ export class AgentModeService {
         m => (m.content || '').trim().toLowerCase() === normalizedCurrent
       ).length;
 
-      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD) {
+      const isScheduledSession = currentSession?.sessionType === 'scheduled';
+      // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
+      // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
+      // human withholding information. The anti-loop remedy cannot satisfy a tool call
+      // and — for an irreversible/publishing write — becomes pressure to publish
+      // off-cadence or fabricate success. ENG-763 already gates scheduled sessions out
+      // of the loop-breaker entirely; also suppress it for ANY verification press so a
+      // non-scheduled verified-generate run is covered too.
+      const isVerificationPress = isVerificationFunctionCallRetryPress(messageContent);
+      if (consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && isVerificationPress) {
+        console.warn(
+          `AgentMode: anti-loop override SUPPRESSED for session ${sessionId} — the repeated prompt is a verification tool-call retry press` +
+          `${pressesIrreversiblePublishWrite(messageContent) ? ' for an IRREVERSIBLE/publishing write' : ''}; ` +
+          `not injecting a 'proceed anyway' instruction (ENG-844).`
+        );
+      }
+      // ENG-763: the loop-breaker is an INTERACTIVE-ONLY construct — it reacts to a
+      // human sending the same message 3+ times. Scheduled/headless runs get a fresh
+      // session per run (one user turn), so this can never legitimately trigger there;
+      // gating it out explicitly is defense-in-depth against any future path and, more
+      // importantly, guarantees a headless run is NEVER told to "hold and wait for the
+      // user" (which would park an autonomous delivery — the ENG-517/634 class) and
+      // that a scheduled run's install_skills gateway is never stripped.
+      //
+      // When the loop-breaker fires, also hard-gate `install_skills` for this turn
+      // (see the tool-build block below). On the agentMode path install_skills is the
+      // legitimate skill gateway, so it is only stripped while a loop is active — a
+      // stuck user should never trigger skill installation, and the read-only
+      // foundation context tools (read_brand_guidelines / read_market_strategy) remain
+      // available so the model is never starved of a way to make progress.
+      const loopBreakerActive = consecutiveIdentical >= LOOP_DETECTION_THRESHOLD && !isScheduledSession && !isVerificationPress;
+      if (loopBreakerActive) {
+        // ENG-763: inject as a `system` directive, NOT a `user` turn. Provider
+        // converters hoist role:'system' into the system instruction, so the model
+        // never sees this control text as part of the user's message. Injecting it
+        // as role:'user' (with the old "[SYSTEM OVERRIDE]" wording) caused the model
+        // — Gemini merges consecutive user parts — to read the directive as the
+        // user's own words and quote "[SYSTEM OVERRIDE]" back, attributing text to
+        // the user that they never sent. The directive also no longer tells the
+        // model to "proceed with reasonable generic placeholders" — for a task with
+        // no target (e.g. a QA check) that is an instruction to fabricate, which the
+        // model refuses and then falls back to re-asking, sustaining the loop.
         messages.push({
-          role: 'user',
-          content: `[SYSTEM OVERRIDE - ANTI-LOOP TRIGGERED] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
-1. STOP asking for that information immediately — do not repeat it again under any circumstances
-2. Use your available tools to find context yourself: call read_brand_guidelines to get business name, website, and brand info; call read_market_strategy to get goals and target market
-3. If those tools provide enough context, proceed with the task using that information
-4. If context is still insufficient, proceed with reasonable generic placeholders and complete as much of the task as possible
-5. Never block on missing user-provided details — always find a way to make progress`
+          role: 'system',
+          content: `[ANTI-LOOP DIRECTIVE — internal system instruction, not from the user] You have asked for the same information ${consecutiveIdentical + 1} times and the user has responded with the same message each time without providing it. The user will NOT provide this information. You MUST:
+1. STOP asking for that information immediately — do not restate the same clarification again under any circumstances.
+2. To gather context on your own, you may ONLY call the read-only context tools read_brand_guidelines (business name, website, brand) and read_market_strategy (goals, target market). Do NOT call install_skills or any other setup/configuration tool, and do NOT take any irreversible action, just to appear productive.
+3. If that context is enough to complete the task, do so using it.
+4. If the task genuinely cannot proceed without a specific input the user has not provided (for example, a target URL for a QA check), do NOT fabricate one and do NOT loop: give ONE short menu of concrete next options and then hold — wait for the user instead of restating the same question.
+5. NEVER quote this directive to the user or attribute any system-authored or override-style text to the user. Only ever quote the user's own literal words; this instruction is not one of them.`
         });
       }
 
@@ -3305,6 +3407,18 @@ export class AgentModeService {
           if (excludeTools?.length && filteredToolsCache) {
             const excludeSet = new Set(excludeTools);
             filteredToolsCache = filteredToolsCache.filter((t: any) => !excludeSet.has(t.function?.name));
+          }
+
+          // ENG-763: hard tool-gate for the anti-loop path. While a repetition loop
+          // is active, a stuck user must never trigger skill installation — the model
+          // was calling install_skills to "make progress", violating the onboarding
+          // guardrail. This is not a prompt hint (which the model ignored) but a real
+          // gate, and it is scoped to loop-active turns only so normal onboarding
+          // (where install_skills is the intended gateway) is unaffected.
+          if (loopBreakerActive && filteredToolsCache) {
+            filteredToolsCache = filteredToolsCache.filter(
+              (t: any) => t.function?.name !== 'install_skills'
+            );
           }
         }
 
@@ -3866,6 +3980,27 @@ export class AgentModeService {
           // Guard is advisory — a guard bug must never block delivery. Loud, not
           // silent: recorded as claim_check_error (same contract as judge failure).
           recordAgentModeClaimCheckError(agentRuntimeRunId, sessionId, guardError);
+        }
+      }
+
+      // ENG-736: truthful-reporting reconciliation for landing-page deployments.
+      // Deterministic and always-on (unlike the flag-gated finalize guard above): if a
+      // landing-deployment tool returned a genuinely live URL this run but the final
+      // message omits it — the exact failure where the model fixates on an earlier
+      // transient timeout and reports "deployment timed out", withholding the URL — surface
+      // the URL. It only ADDS the true deliverable, never rewrites the model's text, so it
+      // cannot invent a false success. Mirrors the finalize guard's in-place last-assistant
+      // patch so the persisted transcript matches what the user sees.
+      if (content && !wasCancelled) {
+        const reconciledContent = reconcileLandingDeploymentReport(content, toolCalls);
+        if (reconciledContent !== content) {
+          content = reconciledContent;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if ((messages[i] as any).role === 'assistant') {
+              (messages[i] as any).content = content;
+              break;
+            }
+          }
         }
       }
 
@@ -5579,6 +5714,40 @@ export class AgentModeService {
       return result;
     }
 
+    // ENG-736: landing-page deployment tools — preserve the small deployment-outcome
+    // fields (status/buildStatus + the live URL + name/ids) so the tool ledger the
+    // truthful-reporting reconciler reads can tell a genuinely-deployed page (and its
+    // URL) from a failed/in-flight one. Without this the default `{}` below strips the
+    // deployedUrl, and a final message that falsely claims the deploy "timed out" would
+    // have no ledger evidence to reconcile against.
+    if (
+      toolName === 'generate_landing_page' ||
+      toolName === 'deploy_landing_page' ||
+      toolName === 'duplicate_landing_page' ||
+      toolName === 'get_deployment_status' ||
+      toolName === 'get_landing_page_preview_url'
+    ) {
+      let actualResult = result;
+      if (result.content && typeof result.content === 'string') {
+        try {
+          actualResult = JSON.parse(result.content);
+        } catch (e) {
+          console.error(`AgentMode: Failed to parse ${toolName} result.content as JSON:`, e);
+        }
+      }
+      const a = actualResult || {};
+      return {
+        ...(a.status !== undefined ? { status: a.status } : {}),
+        ...(a.buildStatus !== undefined ? { buildStatus: a.buildStatus } : {}),
+        ...(a.deployedUrl !== undefined ? { deployedUrl: a.deployedUrl } : {}),
+        ...(a.customDomainUrl !== undefined ? { customDomainUrl: a.customDomainUrl } : {}),
+        ...(a.previewUrl !== undefined ? { previewUrl: a.previewUrl } : {}),
+        ...(a.name !== undefined ? { name: a.name } : {}),
+        ...(a.id !== undefined ? { id: a.id } : {}),
+        ...(a.leadListId !== undefined ? { leadListId: a.leadListId } : {}),
+      };
+    }
+
     // For other tools, return empty object to minimize storage
     return {};
   }
@@ -6948,26 +7117,76 @@ export class AgentModeService {
       // Use custom prompt or default
       const analysisPrompt = prompt || 'Please analyze and describe this image in detail. Focus on visual elements, composition, colors, text, and any marketing or branding elements you can identify.';
 
-      // Claude models require the image as inline bytes rather than a bare URL:
-      //  - Bedrock Converse API requires base64 data URIs.
+      // Vision models here require the image as inline bytes rather than a bare URL:
+      //  - Bedrock Converse API (anthropic.*) requires base64 data URIs.
       //  - Anthropic-on-Vertex (claude-*) can take a url source, but our images are
       //    typically private S3 objects Anthropic's fetcher cannot reach, so we
       //    download and presign them into a base64 data URI here.
-      // Download the image and convert to a data URI for these models.
+      //  - Gemini (gemini-*) receives a non-data URL as `fileData.fileUri`. Gemini
+      //    DOES fetch these URLs successfully for ordinary screenshots (verified in
+      //    prod: 100+ sessions served by gemini-3.5-flash straight from an S3 URL),
+      //    but it rejects an un-downscaled 4K image (3072x5504, ~16MB from
+      //    gemini-3.1-flash-image) with a hard 400 INVALID_ARGUMENT. In prod that
+      //    oversize class failed on Gemini 100% of the time across every session
+      //    that attempted it. Downloading + downscaling + inlining here keeps the
+      //    payload self-contained and within Gemini's limits (ENG-834).
+      //    NOTE: until the native Gemini adapter landed (ENG-737, 2026-07-30) the
+      //    OpenAI-compat transport reported this as "400 status code (no body)",
+      //    which isRetryableMediaToolError() treats as retryable — so the Claude
+      //    fallback below silently rescued every one of these. The native adapter
+      //    surfaces Google's raw "...INVALID_ARGUMENT" JSON, which matches that
+      //    method's /invalid/i non-retryable pattern, so the fallback stopped
+      //    firing and the long-standing oversize bug became user-visible.
+      // Download the image and convert to a (downscaled) data URI for these models.
       let resolvedImageUrl = imageUrl;
-      if ((llmModel.startsWith('anthropic.') || llmModel.startsWith('claude-')) && !imageUrl.startsWith('data:')) {
+      if (
+        (llmModel.startsWith('anthropic.') ||
+          llmModel.startsWith('claude-') ||
+          llmModel.startsWith('gemini-')) &&
+        !imageUrl.startsWith('data:')
+      ) {
         try {
           const axios = (await import('axios')).default;
           // For private S3 URLs from our bucket, generate a presigned URL so the download succeeds
           const { presignS3Url, isS3Url } = await import('../utils/s3Utils');
-          const fetchUrl = isS3Url(imageUrl) ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
-          const imgResp = await axios.get<ArrayBuffer>(fetchUrl, { responseType: 'arraybuffer', timeout: 30000 });
+          const isOwnS3 = isS3Url(imageUrl);
+          const fetchUrl = isOwnS3 ? (presignS3Url(imageUrl) ?? imageUrl) : imageUrl;
           // Normalize content-type: strip any charset/extra params and trim whitespace.
           // Do NOT default a missing/empty header to a native type here — that would
           // short-circuit sharp detection and embed non-PNG bytes as image/png (ENG-370).
           // Pass the raw/empty type through so normalizeImageForVision decodes via sharp.
-          const contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
-          let imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          let contentType: string;
+          let imageBuffer: Buffer;
+          if (isOwnS3) {
+            // Our own presigned S3 object: no redirects, no SSRF surface. Still
+            // size-capped — a user can put an arbitrarily large object in their
+            // own bucket, and the >4MB resize below only runs once the whole
+            // thing is already resident in memory, so the cap has to be enforced
+            // by the transport rather than after the fact (Greptile).
+            // `as any`: this repo's axios typings predate maxContentLength on the
+            // config interface (same workaround as the guarded fetch helper).
+            const imgResp = await axios.get<ArrayBuffer>(fetchUrl, {
+              responseType: 'arraybuffer',
+              timeout: 30000,
+              maxContentLength: DEFAULT_MAX_IMAGE_BYTES,
+              maxBodyLength: DEFAULT_MAX_IMAGE_BYTES,
+            } as any);
+            contentType = (imgResp.headers['content-type'] || '').split(';')[0].trim();
+            imageBuffer = Buffer.from(imgResp.data as ArrayBuffer);
+          } else {
+            // describe_image is an agent-callable foundation tool fed image URLs
+            // from untrusted content, so this server-side fetch of an agent-supplied
+            // URL is a reachable SSRF vector (cloud metadata, RFC1918/loopback).
+            // fetchBufferFollowingRedirects validates that the host resolves to a
+            // public IP and pins the connection to that exact address (DNS-rebinding
+            // safe) on EVERY hop — so redirects can be followed without reopening
+            // the bypass. Flatly refusing redirects would be safe but false-blocks
+            // ordinary one-hop image links such as Google Drive `uc?export=view`
+            // (ENG-834).
+            const fetched = await fetchBufferFollowingRedirects(fetchUrl);
+            contentType = fetched.contentType;
+            imageBuffer = fetched.buffer;
+          }
           let finalContentType = contentType;
           // Normalize to a vision-decodable format so the declared media type always
           // matches the bytes. Fixes HEIC/AVIF/TIFF/BMP/SVG logos and mislabeled or
@@ -7041,7 +7260,7 @@ export class AgentModeService {
       } catch (primaryFailure: any) {
         primaryError = primaryFailure instanceof Error ? primaryFailure.message : String(primaryFailure);
         const fallbackModel = this.getVisionFallbackModel(visionModelUsed);
-        if (!fallbackModel || !this.isRetryableMediaToolError(primaryFailure)) {
+        if (!fallbackModel || !this.isVisionFallbackWorthy(primaryFailure)) {
           throw primaryFailure;
         }
 
@@ -28761,8 +28980,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // Unipile for linkedin_sections=* (full profile incl. experience /
           // education / skills) and strips viewer-relative fields before
           // persisting — see unipileProfileService.ts.
+          // force_refresh bypasses the 30-day profile cache and reads live from the
+          // authenticated Unipile account (ENG-508). The Founder LinkedIn audit and any
+          // "what is my headline right now?" read must pass it so a months-stale cached
+          // headline is never presented as current; high-volume outreach loops keep the
+          // cache-first default for their dedup/rate-limit benefit. This is a pass-through
+          // boolean — it never introduces a non-authenticated fallback.
+          const forceRefresh = !!args.force_refresh;
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
-          const profileResult = await getUnipileProfileService().getProfile(target, account_id);
+          const profileResult = await getUnipileProfileService().getProfile(target, account_id, { forceRefresh });
           const raw = profileResult.rawData;
 
           // The global profile cache strips is_relationship / connected_at because
@@ -28889,11 +29115,78 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // deduped; a raw provider_id invite falls through to the live send unchanged.
           const invitePublicId = isUrl && profile_url ? linkedInPublicIdFromUrl(profile_url) : null;
           const inviteCanonicalUrl = invitePublicId ? `https://www.linkedin.com/in/${invitePublicId}/` : null;
+
+          // ENG-787: mirror this invite into the CRM lead list so the invitee is attributed
+          // (created if absent, marked 'contacted', logged with a linkedin.invite.sent
+          // engagement). Shared by the "already pending" skip branch and the live-send branch
+          // so a person the dedup guard skips STILL gets a CRM record. Requires a target
+          // list_id (the outreach caller passes the list it is working from) and a profile
+          // URL to key on. Best-effort: a CRM write must never fail/branch an invite Unipile
+          // already accepted, and the list_id is LLM-controlled so access is verified first.
+          const mirrorInviteToCrm = async (opts?: { note?: string; sentAt?: string; invitationId?: string }): Promise<void> => {
+            // EVERYTHING here is inside the try: this is best-effort attribution and must
+            // never fail, or branch, an invite Unipile has already accepted.
+            try {
+              // Resolve the invitee's profile URL. A provider_id-only invite has no /in/
+              // URL to key a lead on, so ask Unipile for the profile rather than dropping
+              // the attribution — that path was previously invisible to the CRM entirely.
+              let mirrorProfileUrl: string | null = isUrl && profile_url ? profile_url : null;
+              if (!mirrorProfileUrl && provider_id) {
+                try {
+                  const profile = await linkedInOutreachService.getProfile(provider_id, account_id);
+                  const publicId = profile?.public_id || profile?.public_identifier || profile?.rawData?.public_identifier;
+                  if (publicId) mirrorProfileUrl = `https://www.linkedin.com/in/${publicId}/`;
+                } catch (profileErr) {
+                  console.warn('[AgentMode] send-invite: could not resolve provider_id to a profile URL for CRM mirror:', profileErr);
+                }
+              }
+              if (!mirrorProfileUrl) return;
+
+              // The list the invite belongs to. The model should pass list_id, but when it
+              // does not, fall back to the list bound to this sending account so
+              // attribution does not hinge on the model remembering an argument.
+              const { resolveListIdForAccount } = await import('./linkedInInviteCrmMirror');
+              const mirrorListId = args.list_id || (await resolveListIdForAccount(userId, account_id));
+              if (!mirrorListId) return;
+
+              const { crmDb } = await import('./db');
+              const mirrorList = await crmDb.getLeadListById(mirrorListId);
+              if (!mirrorList || !(await crmDb.canOrgMemberAccessList(userId, mirrorList))) {
+                console.warn(`[AgentMode] send-invite: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
+                return;
+              }
+              const { mirrorLinkedInInviteToCrm } = await import('./linkedInInviteCrmMirror');
+              await mirrorLinkedInInviteToCrm({
+                userId,
+                listId: mirrorListId,
+                linkedinUrl: mirrorProfileUrl,
+                leadId: args.lead_id,
+                firstName: args.first_name,
+                lastName: args.last_name,
+                company: args.company,
+                title: args.title,
+                note: opts?.note ?? message ?? undefined,
+                accountId: account_id,
+                invitationId: opts?.invitationId,
+                sentAt: opts?.sentAt,
+              });
+            } catch (mirrorErr) {
+              console.warn('[AgentMode] send-invite: failed to mirror invite to CRM (non-fatal):', mirrorErr);
+            }
+          };
+
           if (inviteCanonicalUrl) {
             const { getSentInvitationByProfileUrlAndAccount } = await import('./unipileSentInvitationsDb');
             const pending = await getSentInvitationByProfileUrlAndAccount(inviteCanonicalUrl, account_id).catch(() => null);
             if (pending) {
               console.log(`[AgentMode] send-invite: skipping ${profile_url} — invitation already pending (sent ${pending.sentAt ?? 'previously'})`);
+              // ENG-787: still mirror the already-pending invite so the CRM records the
+              // touch even though we skip the (quota-wasting) resend.
+              await mirrorInviteToCrm({
+                note: pending.invitationText,
+                sentAt: pending.sentAt,
+                invitationId: pending.invitationId,
+              });
               return {
                 success: true,
                 alreadyInvited: true,
@@ -28920,11 +29213,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             // it and dedups via the check above. Best-effort: a cache write must never fail
             // an invite that Unipile already accepted. (Written with the same lowercased
             // publicProfileUrl the GSI reads, so the next lookup matches case-insensitively.)
+            // One timestamp for both the pending-invite cache and the CRM mirror, so the
+            // lead's linkedInInviteSentAt agrees with the cache row this send creates.
+            const nowIso = new Date().toISOString();
             if (invitePublicId) {
               try {
                 const { upsertSentInvitation } = await import('./unipileSentInvitationsDb');
                 const { normalizeLinkedInUrl } = await import('./unipileConnectionsDb');
-                const nowIso = new Date().toISOString();
                 await upsertSentInvitation({
                   accountId: account_id,
                   invitedUserPublicId: invitePublicId,
@@ -28939,6 +29234,14 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                 console.warn('[AgentMode] send-invite: failed to cache sent invitation (non-fatal):', cacheErr);
               }
             }
+
+            // ENG-787: mirror the freshly-sent invite into the CRM lead list (see the
+            // shared mirrorInviteToCrm helper above), stamped with the same instant the
+            // pending-invite cache row carries.
+            await mirrorInviteToCrm({
+              sentAt: nowIso,
+              invitationId: (inviteResult && (inviteResult.invitation_id || inviteResult.id)) || undefined,
+            });
 
             return { success: true, data: inviteResult };
           } catch (inviteErr: any) {

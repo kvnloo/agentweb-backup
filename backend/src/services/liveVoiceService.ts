@@ -93,7 +93,8 @@ function stableToolExecutionKey(toolName: string, args: unknown): string {
 const LIVE_SYSTEM_PROMPT = `You are Emma, an expert marketing assistant having a voice conversation.
 Speak with a neutral General American English accent.
 Respond naturally and conversationally — keep answers concise and direct.
-Be warm and friendly, enthusiastic about good news, thoughtful when analyzing data, encouraging when motivating the user, and concerned when flagging problems.`;
+Be warm and friendly, enthusiastic about good news, thoughtful when analyzing data, encouraging when motivating the user, and concerned when flagging problems.
+Never attribute words to the user that they did not literally say. Only ever quote the user's own actual words — never quote internal or system-authored instructions (including any "override" or "system" text) back as if the user wrote them.`;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -142,6 +143,8 @@ interface LiveEntry {
   lastUserActivityAt?: number;
   /** Number of completed assistant turns in this live session. */
   turnCount: number;
+  /** Tool profile in effect — the onboarding profile hard-gates forbidden tools. */
+  toolProfile: LiveToolProfile;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,15 +342,25 @@ async function openGeminiSession(
       // Enable automatic transcription so transcripts are available in audio-only mode
       inputAudioTranscription: {},
       outputAudioTranscription: {},
-      // Harsha speaks in long, pause-heavy thoughts. Require sustained speech
-      // before barge-in and a full 1.2s pause before committing the turn.
+      // ENG-525: previously tuned LOW/LOW/1200ms for one heavy dogfooder's
+      // pause-heavy speech, which made ordinary turn-taking and barge-in feel
+      // sluggish next to ChatGPT's voice mode. Tightened to HIGH sensitivity
+      // and a sub-second silence window for snappier turn-taking. 800ms
+      // (rather than a more aggressive ~600ms) is a deliberate hedge: this
+      // tuning hasn't been validated against real speech, and the ORIGINAL
+      // 1200ms value existed specifically to stop Emma cutting off
+      // pause-heavy speakers mid-thought — going too aggressive risks
+      // reintroducing that exact failure mode for a different set of users.
+      // Watch the voiceInterrupted / voiceTurnCompleted / responseLatencyMs
+      // telemetry (onboardingTelemetry.ts) after shipping before tightening
+      // further.
       realtimeInputConfig: {
         automaticActivityDetection: {
           disabled: false,
-          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_LOW,
-          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_LOW,
+          startOfSpeechSensitivity: StartSensitivity.START_SENSITIVITY_HIGH,
+          endOfSpeechSensitivity: EndSensitivity.END_SENSITIVITY_HIGH,
           prefixPaddingMs: 200,
-          silenceDurationMs: 1_200,
+          silenceDurationMs: 800,
         },
         activityHandling: ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
       },
@@ -473,9 +486,19 @@ async function loadHistoryForSystemPrompt(sessionId: string): Promise<string> {
       }
     }
 
-    if (lines.length === 0) return '';
+    const historyBlock = lines.length === 0
+      ? ''
+      : `\n\n--- Prior conversation history (for context) ---\n${lines.join('\n')}\n--- End of prior history ---`;
 
-    return `\n\n--- Prior conversation history (for context) ---\n${lines.join('\n')}\n--- End of prior history ---`;
+    // ENG-763: the live-voice path deliberately does NOT inject a cross-message
+    // anti-loop directive. The reported bug surfaced on the agentMode text path
+    // (served by claude-opus-4-8), which is fully fixed there; a purely structural
+    // "3 identical user turns" heuristic on the live path cannot distinguish a
+    // stuck clarification loop from a legitimate repeated request answered with
+    // text-only turns, so it was removed to avoid parking valid repeats. The live
+    // path keeps its other ENG-763 protections: the anti-attribution system-prompt
+    // line and the install_skills onboarding tool-gate.
+    return historyBlock;
   } catch (err: any) {
     console.warn('[liveVoiceService] Failed to load history for system prompt:', err?.message);
     return '';
@@ -644,6 +667,7 @@ async function doStartLiveSession(
     functionDeclarations,
     startedAt,
     turnCount: 0,
+    toolProfile,
   };
 
   // Pass history via system prompt on fresh starts. Code-1000 resumptions already
@@ -1014,6 +1038,20 @@ async function handleIncomingMessage(sessionId: string, message: LiveServerMessa
         const toolName = fc.name!;
         const toolArgs = fc.args ?? {};
         const isOnboardingSafe = ONBOARDING_LIVE_TOOLS.has(toolName);
+
+        // ENG-763: hard tool-gate for the onboarding flow. `install_skills` (and any
+        // other non-onboarding tool) is forbidden during onboarding. The onboarding
+        // profile already omits it from the declared tool set, but a hallucinated or
+        // model-fabricated call must still be blocked here at the gate rather than
+        // executed — prompt instructions alone are not a guardrail.
+        if (entry.toolProfile === 'onboarding' && !isOnboardingSafe) {
+          console.warn(`[liveVoiceService] Blocked forbidden tool "${toolName}" during onboarding for ${sessionId}`);
+          const blockedMsg = `${toolName} is not available during onboarding.`;
+          if (!entry.pendingToolCalls) entry.pendingToolCalls = [];
+          entry.pendingToolCalls.push({ id: fc.id || toolName, name: toolName, arguments: toolArgs, error: blockedMsg });
+          return { id: fc.id, name: toolName, response: { error: blockedMsg } } as any;
+        }
+
         try {
           let execution: Promise<any>;
           if (isOnboardingSafe) {

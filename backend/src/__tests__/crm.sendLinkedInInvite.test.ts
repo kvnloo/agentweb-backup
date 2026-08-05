@@ -38,6 +38,8 @@ const mockGetLeadListById = jest.fn();
 const mockGetLeadById = jest.fn();
 const mockUpdateLead = jest.fn();
 const mockGetUserById = jest.fn();
+const mockFindLeadByLinkedinInList = jest.fn();
+const mockAddLeadEngagement = jest.fn();
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -45,6 +47,11 @@ jest.mock('../services/db', () => ({
     getLeadById: (...args: any[]) => mockGetLeadById(...args),
     updateLead: (...args: any[]) => mockUpdateLead(...args),
     getLeadsByListId: jest.fn().mockResolvedValue({ leads: [] }),
+    // ENG-787: the route mirrors the invite into the CRM. Without these the mirror
+    // throws and the route silently takes its timestamp-only fallback, so every
+    // assertion below would pass even with the mirror broken.
+    findLeadByLinkedinInList: (...args: any[]) => mockFindLeadByLinkedinInList(...args),
+    addLeadEngagement: (...args: any[]) => mockAddLeadEngagement(...args),
   },
   taskDb: { getTaskById: jest.fn() },
   subscriberDb: { getAllTaskSubscribers: jest.fn() },
@@ -137,6 +144,8 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     mockSendInvitation.mockResolvedValue({ ok: true });
     mockUpdateLead.mockResolvedValue(undefined);
     mockUpsertSentInvitation.mockResolvedValue(undefined);
+    mockFindLeadByLinkedinInList.mockResolvedValue(null);
+    mockAddLeadEngagement.mockResolvedValue(undefined);
   });
 
   it('route is registered', () => {
@@ -300,5 +309,28 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-invite', () =>
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true, noteDropped: true }));
     // The dropped note must NOT be cached as if it were delivered.
     expect(mockUpsertSentInvitation).toHaveBeenCalledWith(expect.objectContaining({ invitationText: '' }));
+  });
+
+  // ENG-787: the manual button must mirror into the CRM, not just stamp a timestamp.
+  it('logs a linkedin.invite.sent engagement and marks the lead contacted', async () => {
+    const req: any = {
+      user: { userId: 'test-user-id' },
+      params: { listId: 'list-123', leadId: 'lead-456' },
+      body: { message: 'Hi John' },
+    };
+    const res = makeRes();
+    await handler!(req, res);
+
+    expect(mockAddLeadEngagement).toHaveBeenCalledWith('list-123', 'lead-456', expect.objectContaining({
+      eventType: 'linkedin.invite.sent',
+      eventData: expect.objectContaining({
+        note: 'Hi John',
+        linkedin: LEAD_WITH_LINKEDIN.linkedin,
+      }),
+    }), expect.anything());
+    expect(mockUpdateLead).toHaveBeenCalledWith('list-123', 'lead-456', expect.objectContaining({
+      status: 'contacted',
+      linkedInInviteSentAt: expect.any(String),
+    }));
   });
 });

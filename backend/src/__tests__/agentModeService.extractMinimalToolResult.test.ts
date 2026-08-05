@@ -89,6 +89,56 @@ describe('AgentModeService - extractMinimalToolResult', () => {
     });
   });
 
+  describe('landing-page deployment result extraction (ENG-736)', () => {
+    it('preserves buildStatus + deployedUrl from a get_deployment_status result', () => {
+      const result = {
+        status: 'deployed',
+        buildStatus: 'success',
+        deployedUrl: 'https://example.agentwebforms.com/pilot',
+      };
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'get_deployment_status');
+      expect(minimalResult).toEqual({
+        status: 'deployed',
+        buildStatus: 'success',
+        deployedUrl: 'https://example.agentwebforms.com/pilot',
+      });
+    });
+
+    it('preserves status + deployedUrl + name + ids from a generate_landing_page record', () => {
+      const result = {
+        id: 'page-123',
+        status: 'deployed',
+        deployedUrl: 'https://example.agentwebforms.com/pilot',
+        name: 'Cold Outreach',
+        leadListId: 'list-9',
+        slug: 'pilot',
+        prompt: 'a very long prompt that must be dropped',
+      };
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(result, 'generate_landing_page');
+      expect(minimalResult).toEqual({
+        id: 'page-123',
+        status: 'deployed',
+        deployedUrl: 'https://example.agentwebforms.com/pilot',
+        name: 'Cold Outreach',
+        leadListId: 'list-9',
+      });
+    });
+
+    it('parses an MCP-wrapped (content string) landing result', () => {
+      const wrapped = {
+        content: JSON.stringify({
+          buildStatus: 'success',
+          previewUrl: 'https://preview.example.com',
+        }),
+      };
+      const minimalResult = (agentModeService as any).extractMinimalToolResult(wrapped, 'get_landing_page_preview_url');
+      expect(minimalResult).toEqual({
+        buildStatus: 'success',
+        previewUrl: 'https://preview.example.com',
+      });
+    });
+  });
+
   describe('generate_image result extraction', () => {
     it('should extract imageUrl and filename from generate_image result', () => {
       const result = {

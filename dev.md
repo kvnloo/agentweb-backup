@@ -1,3 +1,39 @@
+## ENG-837: EB accepts a deploy and rejects it later, so "no error" from update-environment proves nothing (2026-08-03)
+
+Production was undeployable for ~17 hours on 2026-08-01 and nobody noticed. The deploy job itself
+ran for 2700s and then reported a generic timeout. Investigation findings:
+
+- **`update-environment` returning 0 does not mean the deploy was accepted.** EB validates
+  asynchronously. PR #2237 changed resource configuration (`.ebextensions` ALB `IdleTimeout`) and
+  instance configuration (`.platform/nginx` + app bundle) in one deploy, which the **immutable**
+  deployment policy forbids. EB took the request, rejected it afterwards with `Cannot update
+  resource configuration and instance configuration simultaneously with immutable deployments`, and
+  left the environment `Ready` on its previous version. Every synchronous signal `eb-deploy.sh`
+  checked was healthy.
+- **`Ready` on the previous version is a terminal rejection wearing a healthy face.** The verify
+  loop polled for `Status=Ready AND VersionLabel=ours`, saw `Ready` with the *old* label, and
+  treated it as "not there yet" forever. It is not a slow success: EB has finished, by declining.
+  This is the same false-green family as ENG-757 — a check that cannot distinguish "not yet" from
+  "never".
+- **The reason was in the EB event log the entire time.** `describe-events --severity ERROR` carried
+  the exact sentence. Nothing read it, so the failure was misattributed twice to the ENG-777
+  autoscaling race — a diagnosis that is usually right (an ephemeral instance is present ~36.9% of
+  the time) and was wrong here. A generic "deploy failed" with no classified reason invites exactly
+  that.
+- **ALB access logs are disabled on prod**, so the per-request forensics path does not exist. Use
+  the per-status-code CloudWatch metrics (`HTTPCode_ELB_5xx_Count` split by code) instead — that is
+  what settled ENG-846's 502-vs-504 question when the access-log route turned out to be unavailable.
+- **Per-PR evidence is necessary and not sufficient.** ENG-757 shipped a gate proving a PR's checks
+  really executed against its head, and it worked, and it still let merges land into a trunk that
+  could not ship. Nobody was checking the destination. `trunk-deploy-state.sh` closes that.
+- **The narrow terminal-pattern list is deliberate.** Failing on any ERROR event would kill
+  recoverable deploys (instance replacement, health-check flaps), and a gate that rejects legitimate
+  deploys gets switched off within a week. Non-terminal events are logged instead, which is itself
+  the fix for the misattribution above.
+
+Open: alerting (AC1) still needs a Slack credential in CI — none exists today, so a failed prod
+deploy is still discoverable only by an agent reading `gh run list`.
+
 ## ENG-757: the stale run was at the current head SHA, so SHA-binding would have confirmed the false green (2026-07-31)
 
 agentweb#2221 spent ~30 minutes displaying "checks passing" while no check could run against it at
