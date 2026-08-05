@@ -26,6 +26,7 @@ import '../emma/tools';
 /** A placement-customized creative: 1:1 Feed + 9:16 Story/Reels via asset_feed_spec. */
 const PLACEMENT_CUSTOMIZED = {
   id: '120210000000000000',
+  account_id: '922903076601160',
   name: 'ICP1 — placement customized',
   object_type: 'SHARE',
   asset_feed_spec: {
@@ -123,6 +124,65 @@ describe('ENG-471 AC1 — AD_CREATIVE GET is exposed to the model', () => {
     ).rejects.toThrow(/creative_id/i);
 
     expect(getAdCreativeSpy).not.toHaveBeenCalled();
+  });
+
+  // A creative id addresses a node GLOBALLY, and one Meta OAuth token can reach
+  // several ad accounts. So "the token worked" is not the same as "this creative
+  // is in the account you selected". Without binding, selecting account A and
+  // passing a creative id from account B returns B's object_story_spec,
+  // url_tags and asset_feed_spec — a tenant boundary crossed by a read that
+  // looks entirely successful.
+  it('refuses a creative belonging to a different ad account', async () => {
+    getAdCreativeSpy.mockResolvedValue({
+      ...PLACEMENT_CUSTOMIZED,
+      account_id: '111111111111111', // a different account the token can also reach
+    } as never);
+
+    await expect(
+      agentModeService.manageMetaAdsAdCreatives(
+        'user-1',
+        'GET',
+        'act_922903076601160',
+        { creative_id: '120210000000000000' },
+      ),
+    ).rejects.toThrow(/belongs to ad account 111111111111111.*not the selected account/i);
+  });
+
+  it('accepts the creative when the account matches, with or without the act_ prefix', async () => {
+    // The selected id arrives as `act_<n>` and Meta returns a bare `<n>`, so a
+    // naive string compare would reject every legitimate read.
+    getAdCreativeSpy.mockResolvedValue({
+      ...PLACEMENT_CUSTOMIZED,
+      account_id: '922903076601160',
+    } as never);
+
+    const result: any = await agentModeService.manageMetaAdsAdCreatives(
+      'user-1',
+      'GET',
+      'act_922903076601160',
+      { creative_id: '120210000000000000' },
+    );
+
+    expect(result.success).toBe(true);
+  });
+
+  it('fails closed when the creative does not say which account owns it', async () => {
+    // account_id is requested explicitly, so its absence on an otherwise valid
+    // node means the assumption behind the check no longer holds. Returning the
+    // creative anyway would silently drop the boundary.
+    getAdCreativeSpy.mockResolvedValue({
+      id: '120210000000000000',
+      name: 'no owner field',
+    } as never);
+
+    await expect(
+      agentModeService.manageMetaAdsAdCreatives(
+        'user-1',
+        'GET',
+        'act_922903076601160',
+        { creative_id: '120210000000000000' },
+      ),
+    ).rejects.toThrow(/could not verify which ad account/i);
   });
 
   it('leaves LIST behaviour untouched', async () => {

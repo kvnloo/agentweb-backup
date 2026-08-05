@@ -14763,8 +14763,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (!params.creative_id) {
           throw new Error('AD_CREATIVE GET requires "params.creative_id" (the creative to read).');
         }
-        const { accessToken } = await this.getMetaCredentials(userId, account_id);
-        const creative = await metaService.getAdCreative(accessToken, params.creative_id);
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        const creative: any = await metaService.getAdCreative(accessToken, params.creative_id);
+
+        // Bind the node to the SELECTED account. A creative id addresses a node
+        // globally, and one Meta OAuth token can reach several ad accounts, so
+        // without this a caller could select account A, pass a creative id from
+        // account B, and receive B's object_story_spec / url_tags /
+        // asset_feed_spec. The token being valid is not the same as the creative
+        // being in scope.
+        //
+        // Fails closed: an unverifiable node is refused rather than returned. We
+        // request account_id explicitly, so its absence on an otherwise valid
+        // node means the assumption behind this check no longer holds.
+        if (creative && creative.id) {
+          const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
+          const owner = norm(creative.account_id);
+          const selected = norm(accountId);
+          if (!owner) {
+            throw new Error(
+              `Could not verify which ad account creative ${params.creative_id} belongs to; refusing to return it.`,
+            );
+          }
+          if (selected && owner !== selected) {
+            throw new Error(
+              `Ad creative ${params.creative_id} belongs to ad account ${owner}, not the selected account ${selected}.`,
+            );
+          }
+        }
+
         return {
           success: true,
           message: `Fetched ad creative ${params.creative_id}`,
