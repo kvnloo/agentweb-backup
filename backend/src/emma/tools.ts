@@ -1,4 +1,5 @@
-import { agentModeService, normalizeMetaCampaignIds } from '../services/agentModeService';
+import { agentModeService } from '../services/agentModeService';
+import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';

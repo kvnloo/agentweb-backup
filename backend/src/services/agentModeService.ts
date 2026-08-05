@@ -78,6 +78,7 @@ import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
+import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -140,31 +141,12 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
   return undefined;
 }
 
-export function normalizeMetaCampaignIds(
-  campaignIds: unknown,
-  legacyCampaignId?: unknown,
-): string[] {
-  if (Array.isArray(campaignIds)) {
-    return [...new Set(campaignIds.map(id => String(id).trim()).filter(Boolean))];
-  }
+// Moved to utils/metaCampaignIds.ts (ENG-821) — it is pure, and emma/tools.ts
+// needs it at dispatch time while 140 test files jest.mock this module.
+// Imported (not just re-exported) because this module calls it internally too;
+// re-exported so any importer of the old path keeps working.
+export { normalizeMetaCampaignIds };
 
-  if (typeof campaignIds === 'string' && campaignIds.trim()) {
-    const trimmed = campaignIds.trim();
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (Array.isArray(parsed)) {
-        return [...new Set(parsed.map(id => String(id).trim()).filter(Boolean))];
-      }
-    } catch {
-      // A bare campaign ID is the supported legacy string shape.
-    }
-    return [trimmed];
-  }
-
-  return typeof legacyCampaignId === 'string' && legacyCampaignId.trim()
-    ? [legacyCampaignId.trim()]
-    : [];
-}
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 
 // Max output tokens for agent-mode LLM turns. Must be large enough to hold a
