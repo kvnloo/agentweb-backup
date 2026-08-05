@@ -5,7 +5,7 @@ import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
-import { userDb, orgDb } from '../services/db';
+import { userDb, orgDb, crmDb } from '../services/db';
 
 const router = express.Router();
 
@@ -244,6 +244,40 @@ router.patch('/connected-accounts/unipile/:accountId/premium', authenticateToken
     }
     console.error('Update LinkedIn Premium flag error:', error);
     res.status(500).json({ error: 'Failed to update LinkedIn Premium status' });
+  }
+});
+
+// Choose which of the customer's own lead lists a Calendly booking gets created/updated
+// in (CRM-forward, ENG-524). Ownership is checked explicitly — getLeadListById has no
+// caller-scoping of its own, so a customer could otherwise point their bookings at a
+// list they don't own.
+router.patch('/connected-accounts/calendly/:accountId/booking-list', authenticateToken, async (req: any, res) => {
+  const userId = req.user.userId;
+  const { accountId } = req.params;
+  const { listId } = req.body;
+
+  if (typeof listId !== 'string' || !listId) {
+    return res.status(400).json({ error: 'listId is required' });
+  }
+
+  try {
+    const list = await crmDb.getLeadListById(listId);
+    if (!list) {
+      return res.status(404).json({ error: `No lead list with id "${listId}"` });
+    }
+    if (list.userId !== userId) {
+      return res.status(403).json({ error: 'You do not own this lead list' });
+    }
+
+    await updateAccountConfig(userId, 'calendly', accountId, { booking_lead_list_id: listId });
+    res.json({ success: true, accountId, booking_lead_list_id: listId });
+  } catch (error: any) {
+    // updateAccountConfig throws when the account isn't connected to this user
+    if (typeof error?.message === 'string' && error.message.includes('No calendly account')) {
+      return res.status(404).json({ error: error.message });
+    }
+    console.error('Update Calendly booking-list error:', error);
+    res.status(500).json({ error: 'Failed to update Calendly booking list' });
   }
 });
 
