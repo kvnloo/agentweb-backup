@@ -83,7 +83,15 @@ describe("reconcileForUser", () => {
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
       jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
@@ -171,7 +179,15 @@ describe("reconcileForUser", () => {
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
       jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
@@ -203,7 +219,9 @@ describe("reconcileForUser", () => {
       expect(triggerIcp).toHaveBeenCalledWith("u2");
       expect(triggerCompetitor).toHaveBeenCalledWith("u2");
       expect(triggerCreativeDir).toHaveBeenCalledWith("u2");
-      expect(triggerAdImage).toHaveBeenCalledWith("u2");
+      expect(triggerAdImage).toHaveBeenCalledWith("u2", {
+        run: { runId: "adimg_test-run", startedAt: "2026-08-04T00:00:00.000Z" },
+      });
       expect(triggerAdCopy).toHaveBeenCalledWith("u2");
 
       // Every step ended in `ready` and stamped its output back to
@@ -222,6 +240,314 @@ describe("reconcileForUser", () => {
       expect(persisted.steps?.adCopy?.status).toBe("ready");
       // Output from each runner was persisted into User.steps[step].output.
       expect(persisted.steps?.icp?.output).toEqual([{ name: "P1" }]);
+    });
+  });
+
+  it("records adImage as FAILED when the service failed the run (ENG-792)", async () => {
+    // The ad-image service signals business failures by patching
+    // adImageStatus, never by throwing. The orchestrator only marks a step
+    // failed when its runner throws, so without the re-raise in runAdImage
+    // this was recorded as "ready" with a null output.
+    delete process.env.EAGER_ONBOARDING_PIPELINE_ENABLED;
+
+    await jest.isolateModulesAsync(async () => {
+      const persisted: Record<string, any> = {
+        userId: "u-eng792",
+        useEagerPipeline: true,
+        companyUrl: "https://acme.test",
+        companyName: "Acme",
+        goal: "growth",
+      };
+
+      const triggerBrandBuild = jest.fn(async () => {
+        persisted.brandGuidelines = { tone: "punchy" };
+      });
+      const triggerIcp = jest.fn(async () => {
+        persisted.icpResult = [{ name: "P1" }];
+      });
+      const triggerCompetitor = jest.fn(async () => {
+        persisted.competitorResult = { per_icp: [] };
+      });
+      const triggerCreativeDir = jest.fn(async () => {
+        persisted.creativeDirResult = { concepts: [] };
+      });
+      // Mirrors the real service on a total-variant failure: adImageFailedPatch
+      // writes status + error + completedAt, and no adImageResult.
+      const triggerAdImage = jest.fn(async () => {
+        persisted.adImageStatus = "failed";
+        persisted.adImageError = "all 3 variants failed";
+        persisted.adImageCompletedAt = new Date().toISOString();
+      });
+      const triggerAdCopy = jest.fn(async () => {
+        persisted.adCopyResult = { copies: [] };
+      });
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn(async () => ({ ...persisted })),
+          updateUser: jest.fn(async (_id: string, patch: any) => {
+            if (patch && patch.steps) {
+              persisted.steps = patch.steps;
+            } else if (patch) {
+              Object.assign(persisted, patch);
+            }
+          }),
+        },
+      }));
+      jest.doMock("../services/onboardingIcpService", () => ({
+        triggerIcpDiscoveryForUser: triggerIcp,
+      }));
+      jest.doMock("../services/onboardingCompetitorService", () => ({
+        triggerCompetitorStrategyForUser: triggerCompetitor,
+      }));
+      jest.doMock("../services/onboardingCreativeDirService", () => ({
+        triggerCreativeDirForUser: triggerCreativeDir,
+      }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
+      jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
+        triggerAdImageGenerationForUser: triggerAdImage,
+      }));
+      jest.doMock("../services/onboardingAdCopyService", () => ({
+        triggerAdCopyForUser: triggerAdCopy,
+      }));
+      jest.doMock("../services/onboardingBrandBuildService", () => ({
+        triggerBrandBuildForUser: triggerBrandBuild,
+      }));
+
+      const {
+        reconcileForUser,
+        _resetOrchestratorForTests,
+      } = require("../services/onboardingOrchestratorWiring");
+      _resetOrchestratorForTests();
+      const {
+        _resetRateLimitState,
+      } = require("../services/onboardingPipelineOrchestrator");
+      _resetRateLimitState();
+      const report = await reconcileForUser("u-eng792");
+
+      expect(triggerAdImage).toHaveBeenCalledWith("u-eng792", {
+        run: { runId: "adimg_test-run", startedAt: "2026-08-04T00:00:00.000Z" },
+      });
+      expect(persisted.steps?.adImage?.status).toBe("failed");
+      expect(persisted.steps?.adImage?.failedReason).toMatch(/all 3 variants failed/);
+      const fired = (report.fired as Array<{ step: string; status: string }>);
+      expect(fired.find((f) => f.step === "adImage")?.status).toBe("failed");
+      // Ad copy is a SIBLING of ad images (both dep on creativeDir), not a
+      // dependent — the Epic deliberately splits image and copy into
+      // independent axes so one failing does not block the other. It must
+      // still run and still succeed.
+      expect(triggerAdCopy).toHaveBeenCalledWith("u-eng792");
+      expect(fired.find((f) => f.step === "adCopy")?.status).toBe("ready");
+    });
+  });
+
+  it("fails creativeDir and gates its real dependents (ENG-792 sibling runners)", async () => {
+    // Unlike adImage (which has no dependents), creativeDir is a real
+    // upstream of both adImage and adCopy — so re-raising its failure does
+    // gate them, which is the DAG behaving as intended.
+    delete process.env.EAGER_ONBOARDING_PIPELINE_ENABLED;
+
+    await jest.isolateModulesAsync(async () => {
+      const persisted: Record<string, any> = {
+        userId: "u-cd",
+        useEagerPipeline: true,
+        companyUrl: "https://acme.test",
+        companyName: "Acme",
+        goal: "growth",
+      };
+
+      const triggerBrandBuild = jest.fn(async () => {
+        persisted.brandGuidelines = { tone: "punchy" };
+      });
+      const triggerIcp = jest.fn(async () => {
+        persisted.icpResult = [{ name: "P1" }];
+      });
+      const triggerCompetitor = jest.fn(async () => {
+        persisted.competitorResult = { per_icp: [] };
+      });
+      const triggerCreativeDir = jest.fn(async () => {
+        persisted.creativeDirStatus = "failed";
+        persisted.creativeDirError = "creative direction model returned nothing";
+        persisted.creativeDirCompletedAt = new Date().toISOString();
+      });
+      const triggerAdImage = jest.fn(async () => undefined);
+      const triggerAdCopy = jest.fn(async () => undefined);
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn(async () => ({ ...persisted })),
+          updateUser: jest.fn(async (_id: string, patch: any) => {
+            if (patch && patch.steps) {
+              persisted.steps = patch.steps;
+            } else if (patch) {
+              Object.assign(persisted, patch);
+            }
+          }),
+        },
+      }));
+      jest.doMock("../services/onboardingIcpService", () => ({
+        triggerIcpDiscoveryForUser: triggerIcp,
+      }));
+      jest.doMock("../services/onboardingCompetitorService", () => ({
+        triggerCompetitorStrategyForUser: triggerCompetitor,
+      }));
+      jest.doMock("../services/onboardingCreativeDirService", () => ({
+        triggerCreativeDirForUser: triggerCreativeDir,
+      }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
+      jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
+        triggerAdImageGenerationForUser: triggerAdImage,
+      }));
+      jest.doMock("../services/onboardingAdCopyService", () => ({
+        triggerAdCopyForUser: triggerAdCopy,
+      }));
+      jest.doMock("../services/onboardingBrandBuildService", () => ({
+        triggerBrandBuildForUser: triggerBrandBuild,
+      }));
+
+      const {
+        reconcileForUser,
+        _resetOrchestratorForTests,
+      } = require("../services/onboardingOrchestratorWiring");
+      _resetOrchestratorForTests();
+      const {
+        _resetRateLimitState,
+      } = require("../services/onboardingPipelineOrchestrator");
+      _resetRateLimitState();
+      const report = await reconcileForUser("u-cd");
+
+      expect(persisted.steps?.creativeDir?.status).toBe("failed");
+      expect(persisted.steps?.creativeDir?.failedReason).toMatch(
+        /creative direction model returned nothing/,
+      );
+      // Both dependents are gated by the upstream-not-ready check.
+      expect(triggerAdImage).not.toHaveBeenCalled();
+      expect(triggerAdCopy).not.toHaveBeenCalled();
+      const fired = (report.fired as Array<{ step: string }>).map((f) => f.step);
+      expect(fired).not.toContain("adImage");
+      expect(fired).not.toContain("adCopy");
+    });
+  });
+
+  it("ignores a STALE failed status left by an earlier attempt (ENG-792)", async () => {
+    // The DAG calls triggerXForUser directly, but the *StartPatch that flips
+    // status to 'running' lives in the startXForUser route wrappers — so a
+    // previous attempt's `failed` can still be on the record when a fresh run
+    // begins. Attributing by completedAt keeps that from failing a run that
+    // actually succeeded, which for icp would gate the entire rest of the DAG.
+    delete process.env.EAGER_ONBOARDING_PIPELINE_ENABLED;
+
+    await jest.isolateModulesAsync(async () => {
+      const stale = new Date(Date.now() - 60_000).toISOString();
+      const persisted: Record<string, any> = {
+        userId: "u-stale",
+        useEagerPipeline: true,
+        companyUrl: "https://acme.test",
+        companyName: "Acme",
+        goal: "growth",
+        // Left over from an earlier run, never cleared.
+        icpStatus: "failed",
+        icpError: "an old failure",
+        icpCompletedAt: stale,
+      };
+
+      const triggerBrandBuild = jest.fn(async () => {
+        persisted.brandGuidelines = { tone: "punchy" };
+      });
+      // Succeeds this time, but does not reset the stale status fields.
+      const triggerIcp = jest.fn(async () => {
+        persisted.icpResult = [{ name: "P1" }];
+      });
+      const triggerCompetitor = jest.fn(async () => {
+        persisted.competitorResult = { per_icp: [] };
+      });
+      const triggerCreativeDir = jest.fn(async () => {
+        persisted.creativeDirResult = { concepts: [] };
+      });
+      const triggerAdImage = jest.fn(async () => {
+        persisted.adImageResult = { variants: [] };
+      });
+      const triggerAdCopy = jest.fn(async () => {
+        persisted.adCopyResult = { copies: [] };
+      });
+
+      jest.doMock("../services/db", () => ({
+        userDb: {
+          getUserById: jest.fn(async () => ({ ...persisted })),
+          updateUser: jest.fn(async (_id: string, patch: any) => {
+            if (patch && patch.steps) {
+              persisted.steps = patch.steps;
+            } else if (patch) {
+              Object.assign(persisted, patch);
+            }
+          }),
+        },
+      }));
+      jest.doMock("../services/onboardingIcpService", () => ({
+        triggerIcpDiscoveryForUser: triggerIcp,
+      }));
+      jest.doMock("../services/onboardingCompetitorService", () => ({
+        triggerCompetitorStrategyForUser: triggerCompetitor,
+      }));
+      jest.doMock("../services/onboardingCreativeDirService", () => ({
+        triggerCreativeDirForUser: triggerCreativeDir,
+      }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
+      jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
+        triggerAdImageGenerationForUser: triggerAdImage,
+      }));
+      jest.doMock("../services/onboardingAdCopyService", () => ({
+        triggerAdCopyForUser: triggerAdCopy,
+      }));
+      jest.doMock("../services/onboardingBrandBuildService", () => ({
+        triggerBrandBuildForUser: triggerBrandBuild,
+      }));
+
+      const {
+        reconcileForUser,
+        _resetOrchestratorForTests,
+      } = require("../services/onboardingOrchestratorWiring");
+      _resetOrchestratorForTests();
+      const {
+        _resetRateLimitState,
+      } = require("../services/onboardingPipelineOrchestrator");
+      _resetRateLimitState();
+      const report = await reconcileForUser("u-stale");
+
+      expect(persisted.steps?.icp?.status).toBe("ready");
+      expect(persisted.steps?.icp?.output).toEqual([{ name: "P1" }]);
+      // The whole DAG still walked — nothing was gated by the stale record.
+      const fired = (report.fired as Array<{ step: string; status: string }>);
+      expect(fired.map((f) => f.step)).toEqual([
+        "brandDna",
+        "icp",
+        "competitor",
+        "creativeDir",
+        "adImage",
+        "adCopy",
+      ]);
+      expect(fired.every((f) => f.status === "ready")).toBe(true);
     });
   });
 
@@ -254,7 +580,15 @@ describe("reconcileForUser", () => {
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: triggerCreativeDir,
       }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
+      }));
       jest.doMock("../services/onboardingAdImageService", () => ({
+        // The eager runner claims the axis for ITS OWN invocation and hands
+        // that identity to the worker — a worker that re-reads identity from
+        // the shared record cannot tell two overlapping runs apart (ENG-792).
+        claimAdImageRun: claimAdImageRunMock,
         triggerAdImageGenerationForUser: triggerAdImage,
       }));
       jest.doMock("../services/onboardingAdCopyService", () => ({
@@ -300,6 +634,10 @@ describe("reconcileForUser", () => {
       }));
       jest.doMock("../services/onboardingCreativeDirService", () => ({
         triggerCreativeDirForUser: jest.fn(),
+      }));
+      const claimAdImageRunMock = jest.fn(async () => ({
+        runId: "adimg_test-run",
+        startedAt: "2026-08-04T00:00:00.000Z",
       }));
       jest.doMock("../services/onboardingAdImageService", () => ({
         triggerAdImageGenerationForUser: jest.fn(),
