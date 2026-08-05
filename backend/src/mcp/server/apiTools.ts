@@ -2100,6 +2100,27 @@ function findAmbiguousMergeTargets(existingSteps: any[], incomingSteps: any[]) {
 }
 
 /**
+ * Two incoming entries that resolve to the same existing step. One request
+ * saying both "rename step 1" and "amend the step titled <its old name>" is a
+ * contradiction; applying them in array order silently lets the later one undo
+ * the earlier, which is the kind of quiet resolution this tool no longer does.
+ */
+function findConflictingMergeTargets(existingSteps: any[], incomingSteps: any[]) {
+  const byIndex = new Map<number, any[]>();
+  for (const { index, incoming } of resolveMergeTargets(existingSteps, incomingSteps)) {
+    if (index === -1) continue;
+    byIndex.set(index, [...(byIndex.get(index) || []), incoming]);
+  }
+  return [...byIndex.entries()]
+    .filter(([, entries]) => entries.length > 1)
+    .map(([index, entries]) => ({
+      stepCount: existingSteps[index]?.stepCount,
+      title: existingSteps[index]?.title,
+      entries: entries.length,
+    }));
+}
+
+/**
  * Fields a replace would blank on steps the caller plainly meant to keep. A
  * step with no counterpart at all is skipped: that is a removal or a rewrite,
  * which the count guard and the dropped-titles diff already report.
@@ -2137,27 +2158,47 @@ function mergeWorkPlanStep(existing: any, incoming: any): any {
 }
 
 /**
- * Merge partial steps into the plan's current steps. Each incoming step targets
- * an existing step by stepCount first, then by (normalized) title; anything
- * that matches nothing is appended. Never removes a step.
+ * Resolve each incoming step to the index it amends, or -1 to append.
+ *
+ * Deliberately stepCount-before-title, the opposite of findStepIndex: here the
+ * caller has explicitly named the step to amend, and the schema says so.
+ * findStepIndex infers identity across two full arrays with no such selector.
+ *
+ * A shared title resolves to nothing rather than to the first match — the same
+ * rule findAmbiguousMergeTargets pre-checks, kept here so the two cannot drift.
+ */
+function resolveMergeTargets(existingSteps: any[], incomingSteps: any[]) {
+  return incomingSteps.map((incoming: any) => {
+    const targetCount = incoming.stepCount;
+    if (targetCount !== undefined && targetCount !== null) {
+      const byCount = existingSteps.findIndex((s: any) => Number(s.stepCount) === Number(targetCount));
+      if (byCount !== -1) return { index: byCount, incoming };
+    }
+    if (incoming.title !== undefined) {
+      const title = normalizeStepTitle(incoming.title);
+      const matches = existingSteps
+        .map((s: any, i: number) => ({ s, i }))
+        .filter(({ s }: any) => normalizeStepTitle(s.title) === title);
+      if (matches.length === 1) return { index: matches[0].i, incoming };
+    }
+    return { index: -1, incoming };
+  });
+}
+
+/**
+ * Merge partial steps into the plan's current steps. Never removes a step.
+ *
+ * Targets are resolved for ALL entries first, against the plan as it was read.
+ * Resolving during application would read a half-mutated array, so one request
+ * could rename a step and then fail to find it for a later, already-validated
+ * entry — turning an amendment into an append, and making the result depend on
+ * the order the entries happened to arrive in. Resolution and the ambiguity
+ * pre-check now share one frame of reference.
  */
 function mergeWorkPlanSteps(existingSteps: any[], incomingSteps: any[]): any[] {
   const merged = existingSteps.map((s: any) => ({ ...s }));
 
-  // Deliberately stepCount-before-title, the opposite of findStepIndex: here
-  // the caller has explicitly named the step to amend, and the schema says so.
-  // findStepIndex infers identity across two full arrays with no such selector.
-  for (const incoming of incomingSteps) {
-    const targetCount = incoming.stepCount;
-    let index = -1;
-    if (targetCount !== undefined && targetCount !== null) {
-      index = merged.findIndex((s: any) => Number(s.stepCount) === Number(targetCount));
-    }
-    if (index === -1 && incoming.title !== undefined) {
-      const title = normalizeStepTitle(incoming.title);
-      index = merged.findIndex((s: any) => normalizeStepTitle(s.title) === title);
-    }
-
+  for (const { index, incoming } of resolveMergeTargets(existingSteps, incomingSteps)) {
     if (index === -1) {
       merged.push(mergeWorkPlanStep({ stepCount: merged.length + 1 }, incoming));
     } else {
@@ -2327,6 +2368,16 @@ mcpToolRegistry.register({
                 ambiguousSteps: ambiguous,
                 howToProceed: [
                   'Retry with stepCount on each ambiguous step to name the one you mean (call action="get" to see the current numbering).',
+                ],
+              });
+            }
+            const conflicting = findConflictingMergeTargets(existingSteps || [], incomingSteps);
+            if (conflicting.length > 0) {
+              return jsonResult({
+                error: `Refusing to merge into work plan ${args.plan_id}: more than one supplied step resolves to the same existing step, so they would silently overwrite each other.`,
+                conflictingSteps: conflicting,
+                howToProceed: [
+                  'Combine the changes for each step into a single entry, then retry.',
                 ],
               });
             }
