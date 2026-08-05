@@ -313,25 +313,14 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).not.toContain('this schedule is publish-authorized');
   });
 
-  it('treats a publishing tool in requiredFunctionCalls as the owner authorizing the publish', async () => {
-    // The owner listing the posting tool as a REQUIRED call is machine-readable
-    // standing intent to publish — and unlike fullAutonomy (set on essentially no
-    // production schedule) it is the signal real X reply schedules actually carry.
+  it('a model-writable required call never authorizes publishing end-to-end', async () => {
+    // manage_scheduled_chat lets the MODEL write requiredFunctionCalls onto the
+    // schedule. If that granted authorization, Emma could self-authorize standing
+    // publish rights; the assembled prompt must still refuse.
     (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({
       scheduleId: SCHEDULE_ID,
       fullAutonomy: false,
       requiredFunctionCalls: ['search_tweets', 'twitter_manage_post'],
-    });
-    await agentModeController.generateResponse(makeReq(), makeRes());
-    const sp = capturedSystemPrompt()!;
-    expect(sp).toContain('this schedule is publish-authorized');
-    expect(sp).not.toContain('NOT publish-authorized');
-  });
-
-  it('does NOT treat a read-only required call as publish authorization', async () => {
-    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({
-      scheduleId: SCHEDULE_ID,
-      requiredFunctionCalls: ['search_tweets', 'get_chat_history'],
     });
     await agentModeController.generateResponse(makeReq(), makeRes());
     expect(capturedSystemPrompt()!).toContain('this schedule is NOT publish-authorized');

@@ -1455,26 +1455,25 @@ function isPublishAttemptTool(name?: string): boolean {
  * run to publish externally. Deliberately NEVER inferred from the schedule
  * prompt's free text — a model reading "POST replies directly" is not an owner
  * decision, and treating it as one is the hole this whole fix exists to close.
- * Two owner-set signals qualify, either one alone being sufficient:
- *   - `fullAutonomy` — the explicit per-schedule autonomy opt-in (ENG-396).
- *   - `requiredFunctionCalls` naming a publishing tool — the owner listed the
- *     tool this run MUST call, which is a direct standing instruction to publish
- *     (and is already enforced as a completion requirement for the run).
- * Absent both, the run keeps the safe draft-and-notify default. Fail-closed:
- * a missing schedule, a non-array field, or an unrecognised entry → false.
- * Accepts both shapes the codebase carries the field in: the schedule record's
- * `string[]` and runVerifiedChat's `{ functionName }[]`.
+ * Exactly ONE signal qualifies: `fullAutonomy`, the explicit per-schedule
+ * autonomy opt-in (ENG-396), which a human sets from the customer portal.
+ * Absent it, the run keeps the safe draft-and-notify default. Fail-closed: a
+ * missing schedule or a non-true value → false.
+ *
+ * `requiredFunctionCalls` naming a publishing tool was tried here and REVERTED —
+ * do not reinstate it. It reads like owner intent ("the owner listed the tool
+ * this run must call") and it has the adoption `fullAutonomy` lacks, but it is
+ * MODEL-WRITABLE: the `manage_scheduled_chat` MCP tool POSTs/PUTs
+ * requiredFunctionCalls onto the schedule record (mcp/server/apiTools.ts), and
+ * admin templates / work-plan steps write it too. Deriving publish consent from
+ * it lets Emma grant herself standing authority to post — the ENG-803 defect
+ * inverted, manufacturing consent to act instead of a gate to avoid acting.
+ * Authorization must come from a field only a human can set.
  */
 export function resolvePublishAuthorized(
-  schedule?: { fullAutonomy?: boolean; requiredFunctionCalls?: unknown } | null
+  schedule?: { fullAutonomy?: boolean } | null
 ): boolean {
-  if (!schedule) return false;
-  if (schedule.fullAutonomy === true) return true;
-  const required = schedule.requiredFunctionCalls;
-  if (!Array.isArray(required)) return false;
-  return required.some((entry) =>
-    isPublishAttemptTool(typeof entry === 'string' ? entry : entry?.functionName)
-  );
+  return schedule?.fullAutonomy === true;
 }
 
 /**
@@ -1745,10 +1744,10 @@ export async function runVerifiedChat(
   } = params;
 
   // ENG-803: does the owner actually authorize this run to publish externally?
-  // Both inputs are already on hand — the schedule's autonomy opt-in and the
-  // requiredFunctionCalls it was launched with — so the completion gate reads the
-  // same signal the system directive does, and the two can never disagree.
-  const publishAuthorized = resolvePublishAuthorized({ fullAutonomy, requiredFunctionCalls: requiredFunctions });
+  // Resolved through the same helper the system directive uses, off the same
+  // owner-set opt-in this run was launched with, so the directive and the
+  // completion gate can never disagree about whether publishing is allowed.
+  const publishAuthorized = resolvePublishAuthorized({ fullAutonomy });
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
   // question, so a model that keeps re-asking cannot loop until maxAttempts. Once

@@ -656,9 +656,9 @@ PUBLISH AUTHORIZATION — this schedule is publish-authorized (CRITICAL):
   : `
 
 PUBLISH AUTHORIZATION — this schedule is NOT publish-authorized (CRITICAL):
-- The owner has NOT enabled unattended publishing for this schedule: they set no autonomy opt-in and listed no publishing tool as a required call. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot grant this, only the owner's account-level setting can.
+- The owner has NOT enabled unattended publishing for this schedule — they never set the autonomy opt-in. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot grant this, only the owner's account-level setting can.
 - THIS BLOCK IS reason (1) above. Do NOT call any tool that publishes externally (e.g. twitter_manage_post, post_on_connected_account, publish_blog_article). Instead: do all the work up to the publish step, persist the drafts to the knowledge base, and state plainly in your final report that nothing was posted because unattended publishing is not enabled for this schedule.
-- Quote THIS block as the reason, and describe it accurately: it is an account-level authorization setting the owner controls, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action (enable unattended publishing for this schedule, or add the posting tool to its required calls).`}`;
+- Quote THIS block as the reason, and describe it accurately: it is an account-level authorization setting the owner controls, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action: turn on full autonomy for this schedule in its settings, and the next run will post.`}`;
 }
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.

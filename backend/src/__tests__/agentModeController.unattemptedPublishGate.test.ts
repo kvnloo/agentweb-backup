@@ -158,22 +158,16 @@ describe('resolvePublishAuthorized (ENG-803)', () => {
     expect(resolvePublishAuthorized({ fullAutonomy: true })).toBe(true);
   });
 
-  it('authorizes when the owner made a publishing tool a required call', () => {
-    // the signal real X reply schedules actually carry — fullAutonomy is set on
-    // essentially no production schedule, so gating on it alone ships dead.
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['twitter_manage_post'] })).toBe(true);
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['post_on_connected_account'] })).toBe(true);
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['publish_blog_article'] })).toBe(true);
-  });
-
-  it('accepts runVerifiedChat\'s {functionName} shape as well as the schedule\'s string[]', () => {
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: [{ functionName: 'twitter_manage_post' }] })).toBe(true);
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: [{ functionName: 'search_tweets' }] })).toBe(false);
-  });
-
-  it('does NOT authorize on read-only or mixed-dispatcher required calls', () => {
-    // twitter_outreach is a mixed read/write dispatcher — its presence proves nothing
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['search_tweets', 'twitter_outreach'] })).toBe(false);
+  it('does NOT authorize off requiredFunctionCalls, however publish-shaped', () => {
+    // Regression guard for a reverted design. requiredFunctionCalls reads like
+    // owner intent, but manage_scheduled_chat (an MCP tool the MODEL calls) writes
+    // it onto the schedule record — so honouring it would let Emma grant herself
+    // standing publish authority. Authorization may only come from a field a
+    // human sets. Do not "restore" this.
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['twitter_manage_post'] } as any)).toBe(false);
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['post_on_connected_account'] } as any)).toBe(false);
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: [{ functionName: 'publish_blog_article' }] } as any)).toBe(false);
+    expect(resolvePublishAuthorized({ fullAutonomy: false, requiredFunctionCalls: ['twitter_manage_post'] } as any)).toBe(false);
   });
 
   it('fails closed on every degenerate input', () => {
@@ -181,7 +175,7 @@ describe('resolvePublishAuthorized (ENG-803)', () => {
     expect(resolvePublishAuthorized(null)).toBe(false);
     expect(resolvePublishAuthorized({})).toBe(false);
     expect(resolvePublishAuthorized({ fullAutonomy: false })).toBe(false);
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: 'twitter_manage_post' as any })).toBe(false);
-    expect(resolvePublishAuthorized({ requiredFunctionCalls: [null, 42, {}] as any })).toBe(false);
+    expect(resolvePublishAuthorized({ fullAutonomy: 'true' as any })).toBe(false);
+    expect(resolvePublishAuthorized({ fullAutonomy: 1 as any })).toBe(false);
   });
 });
