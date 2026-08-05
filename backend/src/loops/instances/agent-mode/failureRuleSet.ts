@@ -34,6 +34,12 @@ export interface AgentFailureProposalPayload {
   invocations: number;
   failureRate: number;
   topErrorClass: string;
+  /**
+   * The decision-layer class this tool's failures cluster into (ENG-820).
+   * Recorded on every agent_tool_failed event and previously ignored by this
+   * policy, which is why 35% of dispatches were not handler bugs.
+   */
+  failureType: string;
   directive: string;
 }
 
@@ -69,6 +75,60 @@ interface ToolStats {
   invocations: number;
   failures: number;
   errorClasses: Map<string, number>;
+  failureTypes: Map<string, number>;
+  sampleMessage: string;
+}
+
+/**
+ * Failure classes that are NOT a handler defect, so they must never be dispatched
+ * as "investigate the handler" (ENG-820).
+ *   by_design            — the tool worked as intended (policy block, empty result)
+ *   model_uninstalled_tool — the model called a tool it does not have; registry/prompt
+ * Both were measured at 23 of 217 failures in the Jul 28 – Aug 1 window.
+ */
+const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_uninstalled_tool']);
+
+/**
+ * Directive per failure class. The whole defect was appending one sentence —
+ * "Investigate the handler + propose a robustness fix" — to every cluster
+ * regardless of what the system already knew about it.
+ */
+function directiveFor(
+  failureType: string,
+  toolName: string,
+  topErrorClass: string,
+  failures: number,
+  denom: number,
+  sampleMessage: string,
+  minFailureRate: number,
+): string {
+  const pct = `${Math.round((failures / (denom || 1)) * 100)}%`;
+  const sample = sampleMessage ? ` Representative failure: "${sampleMessage.slice(0, 160)}".` : '';
+  if (failureType === 'config') {
+    // Not a code change. Someone has to reconnect an account, grant a scope, or
+    // top up a balance — and they need to know which.
+    return (
+      `NOT a handler bug — "${toolName}" failed ${failures}/${denom} (${pct}) with configuration/credential errors.` +
+      `${sample} Resolve the account itself: reconnect or re-authorise the connected account, grant the missing ` +
+      `scope, or top up the depleted balance for "${toolName}". No code change is expected; if the account is ` +
+      `healthy and this persists, reclassify it.`
+    );
+  }
+  if (failureType === 'schema_reject') {
+    // The handler is fine; the declared contract and what the model sends disagree.
+    return (
+      `Contract mismatch, not a handler defect — "${toolName}" rejected ${failures}/${denom} (${pct}) of calls at ` +
+      `validation.${sample} Compare the declared JSON schema against what the handler actually accepts and make ` +
+      `them agree, then add a regression test for the argument shape the model is really sending.`
+    );
+  }
+  return (
+    `Investigate why agent-mode tool "${toolName}" is throwing ${topErrorClass} ` +
+    `at a ${pct} rate.${sample} Reproduce with a failing case, harden the ` +
+    `handler (input validation, retries/backoff, or clearer error surfaced to the model), and ` +
+    `add a regression test. Target: drive the tool success rate back above ` +
+    `${((1 - minFailureRate) * 100).toFixed(0)}%.`
+  );
 }
 
 export class AgentFailureRuleSet
@@ -108,6 +168,8 @@ export class AgentFailureRuleSet
         invocations: 0,
         failures: 0,
         errorClasses: new Map<string, number>(),
+        failureTypes: new Map<string, number>(),
+        sampleMessage: '',
       };
       if (e.eventType === EVT_TOOL_INVOKED) {
         stats.invocations++;
@@ -115,6 +177,10 @@ export class AgentFailureRuleSet
         stats.failures++;
         const ec = strDim(e.dimensions?.errorClass) ?? 'UnknownError';
         stats.errorClasses.set(ec, (stats.errorClasses.get(ec) ?? 0) + 1);
+        const ft = strDim(e.dimensions?.failureType) || '';
+        if (ft) stats.failureTypes.set(ft, (stats.failureTypes.get(ft) ?? 0) + 1);
+        const em = strDim(e.dimensions?.errorMessage) || '';
+        if (em && !stats.sampleMessage) stats.sampleMessage = em;
       }
       byTool.set(toolName, stats);
     }
@@ -157,13 +223,24 @@ export class AgentFailureRuleSet
       if (failureRate < this.minFailureRate) continue;
 
       const topErrorClass = dominantKey(stats.errorClasses);
+      // ENG-820: triage on the failureType the event already carries. An
+      // unclassified failure (pre-backfill events) still dispatches — failing
+      // the other way would hide real bugs.
+      const failureType = stats.failureTypes.size > 0 ? dominantKey(stats.failureTypes) : '';
+      if (NON_DISPATCHABLE_FAILURE_TYPES.has(failureType)) continue;
+      const handlerBug = failureType !== 'config' && failureType !== 'schema_reject';
       proposals.push({
         proposalId: asMutationId(`agent-mode:tool-failure:${stats.toolName}`),
         sourceRuleId: `tool-failure:${stats.toolName}`,
         hypothesis:
           `Tool \`${stats.toolName}\` failed ${stats.failures}/${denom} times ` +
-          `(${(failureRate * 100).toFixed(0)}%) this window, dominated by ${topErrorClass}. ` +
-          `Investigate the handler + propose a robustness fix.`,
+          `(${(failureRate * 100).toFixed(0)}%) this window, dominated by ${topErrorClass}` +
+          `${failureType ? ` [${failureType}]` : ''}. ` +
+          (handlerBug
+            ? `Investigate the handler + propose a robustness fix.`
+            : failureType === 'config'
+              ? `Configuration/credential issue — resolve the account, not the code.`
+              : `Declared schema and handler disagree — fix the contract.`),
         kind: 'code_change',
         payload: {
           toolName: stats.toolName,
@@ -171,12 +248,16 @@ export class AgentFailureRuleSet
           invocations: stats.invocations,
           failureRate,
           topErrorClass,
-          directive:
-            `Investigate why agent-mode tool "${stats.toolName}" is throwing ${topErrorClass} ` +
-            `at a ${(failureRate * 100).toFixed(0)}% rate. Reproduce with a failing case, harden the ` +
-            `handler (input validation, retries/backoff, or clearer error surfaced to the model), and ` +
-            `add a regression test. Target: drive the tool success rate back above ` +
-            `${((1 - this.minFailureRate) * 100).toFixed(0)}%.`,
+          failureType,
+          directive: directiveFor(
+            failureType,
+            stats.toolName,
+            topErrorClass,
+            stats.failures,
+            denom,
+            stats.sampleMessage,
+            this.minFailureRate,
+          ),
         },
         triggeringStats: {
           toolName: stats.toolName,
@@ -192,7 +273,14 @@ export class AgentFailureRuleSet
     // proposal has no failure rate and sorts first as the highest-signal
     // truthfulness pattern) — the orchestrator caps proposals per cycle, so
     // the highest-signal fixes survive the cap.
+    // ENG-820: rank by failure COUNT, not rate. Impact is volume x rate, and
+    // ranking by rate alone hid the single largest source of failures in the
+    // window (save_memory, 33 failures at 33%) behind a tool with 6 failures at
+    // 100%. Rate remains the admission gate above; it is no longer the order.
     proposals.sort((a, b) => {
+      const countA = 'failures' in a.payload ? a.payload.failures : Infinity;
+      const countB = 'failures' in b.payload ? b.payload.failures : Infinity;
+      if (countA !== countB) return countB - countA;
       const rateA = 'failureRate' in a.payload ? a.payload.failureRate : Infinity;
       const rateB = 'failureRate' in b.payload ? b.payload.failureRate : Infinity;
       return rateB - rateA;

@@ -162,8 +162,15 @@ export async function runAgentModeLoopOnce(): Promise<LoopRunResult> {
 const agentModeDigestTemplate: LoopDigestTemplate<number> = {
   logTag: '[agent-mode-loop]',
   header: (date) => `*🤖 Agent Mode — tool reliability ${date}*`,
-  counts: (result) =>
-    `Tool events scanned: ${result.eventsScanned}  |  Failing tools: ${result.proposals.length}`,
+  counts: (result) => {
+    // ENG-820: never render a capped slice as if it were the whole set.
+    const truncated = (result as { proposalsTruncated?: number }).proposalsTruncated ?? 0;
+    const shown = result.proposals.length;
+    const failing = truncated > 0
+      ? `Failing tools: showing ${shown} of ${shown + truncated}`
+      : `Failing tools: ${shown}`;
+    return `Tool events scanned: ${result.eventsScanned}  |  ${failing}`;
+  },
   emptyBody: () => [
     `_No agent-mode tool events in the 7d window — recorder off, or no tool use. Not "healthy", just empty._`,
   ],
@@ -181,6 +188,8 @@ const agentModeDigestTemplate: LoopDigestTemplate<number> = {
 
 /** Test seam. */
 export const _internal = {
+  /** ENG-820: exposed so the rendered counts line is assertable. */
+  digestTemplate: () => agentModeDigestTemplate,
   resetForTesting() {
     runner.resetForTesting();
     recorderSingleton = null;
