@@ -174,16 +174,19 @@ export function filterRequiredFunctionsToAuthorizedScope(
  *    only ever REDUCE what the checker nudges for — it can never reintroduce a
  *    demand for a tool the prompt forbids.
  *
- * An unreadable re-read (`null`) keeps the admitted value rather than failing closed.
- * Failing closed on a throttled DynamoDB read would silently downgrade a legitimately
- * authorized run to draft-only, which is the ticket's original complaint in reverse —
- * and the admitted value was itself resolved fail-closed.
+ * An unreadable re-read (`null`) FAILS CLOSED, like every other ambiguous case in this
+ * module. While the schedule cannot be read we cannot know whether consent still
+ * stands, and the two outcomes are not symmetric: publishing while blind is an
+ * irreversible live post the owner may already have revoked, whereas withholding
+ * produces a draft — which this ticket's own recommendation calls a success state, not
+ * a failure. The nudge loop that made a withheld publish expensive is fixed separately
+ * and unconditionally, so a downgrade here costs a draft, not a burned run.
  */
 export function narrowPublishAuthorization(
   admitted: SchedulePublishAuthorization,
   latest: SchedulePublishAuthorization | null | undefined
 ): SchedulePublishAuthorization {
-  if (!latest) return admitted;
+  if (!latest) return UNAUTHORIZED;
   const tools = admitted.tools.filter(tool => latest.tools.includes(tool));
   return {
     authorized: admitted.authorized && latest.authorized && tools.length > 0,

@@ -1962,7 +1962,15 @@ export async function runVerifiedChat(
         }
         livePublishAuthorization = narrowed;
       } catch (err) {
-        console.error('AgentMode: publish-consent re-check failed; keeping the admitted authorization:', err);
+        // The supplied refresher absorbs its own read failures and fails closed, so
+        // reaching here means the callback itself is broken. Withhold rather than
+        // publish while blind — consistent with every other ambiguous case.
+        console.error('AgentMode: publish-consent refresher threw; withholding publish authorization:', err);
+        const withheld = narrowPublishAuthorization(livePublishAuthorization, null);
+        livePublishAuthorization = withheld;
+        requiredFunctions = requiredFunctions.filter(rf =>
+          filterRequiredFunctionsToAuthorizedScope([rf.functionName], withheld).length > 0
+        );
       }
     }
 
@@ -3146,10 +3154,21 @@ export async function runScheduledChat(
       // in-flight publish instead of taking effect only on the NEXT run. Narrowing
       // is monotonic, so this can never grant rights the admission snapshot lacked.
       refreshPublishAuthorization: async () => {
-        effectivePublishAuthorization = narrowPublishAuthorization(
-          effectivePublishAuthorization,
-          resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(schedule.scheduleId))
-        );
+        // Never throws: a failed read resolves to null, which narrows to UNAUTHORIZED.
+        // Absorbing the failure HERE rather than in runVerifiedChat's catch is what
+        // keeps the two values in step — if this threw, the loop would withhold while
+        // `effectivePublishAuthorization` stayed authorized, and the run record would
+        // once again report requirements the run was never held to.
+        let latest: SchedulePublishAuthorization | null = null;
+        try {
+          latest = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(schedule.scheduleId));
+        } catch (err) {
+          console.error(
+            `AgentMode: publish-consent re-check failed for schedule ${schedule.scheduleId}; ` +
+            'withholding publish authorization for the rest of this run (fail-closed):', err
+          );
+        }
+        effectivePublishAuthorization = narrowPublishAuthorization(effectivePublishAuthorization, latest);
         return effectivePublishAuthorization;
       },
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
