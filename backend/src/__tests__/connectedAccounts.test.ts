@@ -2,7 +2,7 @@ import request from 'supertest';
 import express from 'express';
 import connectedAccountsRouter from '../routes/connectedAccounts';
 import * as connectedAccountsDb from '../services/connectedAccountsDb';
-import { userDb, orgDb } from '../services/db';
+import { userDb, orgDb, crmDb } from '../services/db';
 
 // Mock dependencies
 jest.mock('../services/connectedAccountsDb');
@@ -12,6 +12,9 @@ jest.mock('../services/db', () => ({
     },
     orgDb: {
         getOrgById: jest.fn(),
+    },
+    crmDb: {
+        getLeadListById: jest.fn(),
     },
 }));
 jest.mock('../middleware/auth', () => ({
@@ -602,6 +605,78 @@ describe('Connected Accounts Routes', () => {
             const response = await request(app)
                 .patch('/api/oauth/connected-accounts/unipile/uni-1/premium')
                 .send({ isPremium: true });
+
+            expect(response.status).toBe(500);
+        });
+    });
+
+    describe('PATCH /connected-accounts/calendly/:accountId/booking-list', () => {
+        it('returns 400 when listId is missing', async () => {
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/booking-list')
+                .send({});
+
+            expect(response.status).toBe(400);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('returns 404 when the list does not exist', async () => {
+            (crmDb.getLeadListById as jest.Mock).mockResolvedValue(null);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/booking-list')
+                .send({ listId: 'list-missing' });
+
+            expect(response.status).toBe(404);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('returns 403 when the list belongs to a different user', async () => {
+            (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'someone-else' });
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/booking-list')
+                .send({ listId: 'list-1' });
+
+            expect(response.status).toBe(403);
+            expect(connectedAccountsDb.updateAccountConfig).not.toHaveBeenCalled();
+        });
+
+        it('persists booking_lead_list_id and returns success when the list is owned by the caller', async () => {
+            (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test_user_id' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockResolvedValue(undefined);
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/booking-list')
+                .send({ listId: 'list-1' });
+
+            expect(response.status).toBe(200);
+            expect(response.body).toEqual(expect.objectContaining({ success: true, booking_lead_list_id: 'list-1' }));
+            expect(connectedAccountsDb.updateAccountConfig).toHaveBeenCalledWith(
+                'test_user_id', 'calendly', 'cal-1', { booking_lead_list_id: 'list-1' }
+            );
+        });
+
+        it('returns 404 when the calendly account is not connected to the user', async () => {
+            (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test_user_id' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockRejectedValue(
+                new Error('No calendly account with id "cal-x" connected')
+            );
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-x/booking-list')
+                .send({ listId: 'list-1' });
+
+            expect(response.status).toBe(404);
+        });
+
+        it('returns 500 when updateAccountConfig throws an unexpected error', async () => {
+            (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ listId: 'list-1', userId: 'test_user_id' });
+            (connectedAccountsDb.updateAccountConfig as jest.Mock).mockRejectedValue(new Error('DB down'));
+
+            const response = await request(app)
+                .patch('/api/oauth/connected-accounts/calendly/cal-1/booking-list')
+                .send({ listId: 'list-1' });
 
             expect(response.status).toBe(500);
         });
