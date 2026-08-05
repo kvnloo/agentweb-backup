@@ -1191,7 +1191,10 @@ export class AgentModeService {
           this.toolRegistry.register({
             name: toolHandler.name,
             definition: openAiDef,
-            execute: toolHandler.execute
+            execute: toolHandler.execute,
+            // ENG-822: carry the account-scope flag across the copy. Dropping it
+            // here is what made the registry guard inert for live sessions.
+            requiresUserAccount: toolHandler.requiresUserAccount
           });
         }
       }

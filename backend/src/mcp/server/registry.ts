@@ -1,3 +1,4 @@
+import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
 
 export interface McpToolHandler {
   name: string;
@@ -16,10 +17,7 @@ export interface McpToolHandler {
   requiresUserAccount?: boolean;
 }
 
-/** Anonymous visitors are identified only by an `anon_` userId prefix — the session type is still `regular`. */
-export function isAnonymousUserId(userId: unknown): boolean {
-  return typeof userId !== 'string' || userId.length === 0 || userId.startsWith('anon_');
-}
+export { isAnonymousUserId } from '../anonymousToolAccess';
 
 export class McpToolRegistry {
   private tools: Map<string, McpToolHandler> = new Map();
@@ -67,17 +65,7 @@ export class McpToolRegistry {
     // One check here rather than a per-handler list, because the gate that has
     // to be remembered for each new tool is the gate that silently rots.
     if (handler.requiresUserAccount && isAnonymousUserId(context?.userId)) {
-      return {
-        success: false,
-        // `retryable: false` is load-bearing: both observed sessions called the
-        // tool twice, so the visitor waited through two dead calls. The refusal
-        // has to read as terminal rather than transient.
-        retryable: false,
-        message:
-          `Sign in to use ${name} — it reads information saved to a specific account, ` +
-          `and this session is not signed in. Answer from what is already in the conversation, ` +
-          `or invite the visitor to sign in. Do not call this tool again in this session.`,
-      };
+      return buildAnonymousToolRefusal(name);
     }
 
     return await handler.execute(args, context);
