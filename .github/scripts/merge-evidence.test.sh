@@ -83,6 +83,19 @@ if [ "$sub" = "api" ]; then
     *actions/runs*)
       emit_file workflowruns.json workflowruns_exit '{"total_count":0,"workflow_runs":[]}'
       ;;
+    *pulls/*/files*)
+      # ENG-915: the diff decides whether the backend suite was required here.
+      # `--jq '.[].filename'` is applied by real gh, so the mock emits the
+      # already-projected filename list the script consumes.
+      #
+      # The default is deliberately a NON-backend path. Every case written
+      # before ENG-915 asserts on the draft/path-filter/supersession logic and
+      # says nothing about the backend suite; defaulting to a backend file
+      # would silently add "and the backend jobs must be green" to all of them,
+      # so those fixtures would start failing for a reason they do not test.
+      # Cases that mean to exercise the new rule set files.txt explicitly.
+      emit_file files.txt files_exit 'partner-portal/src/App.tsx'
+      ;;
     *)
       emit_file checkruns.json checkruns_exit '{"total_count":0,"check_runs":[]}'
       ;;
@@ -120,6 +133,15 @@ checkruns() {
   local dir="$1" runs="$2" total
   total="$(printf '%s' "${runs}" | jq 'length')"
   printf '{"total_count":%s,"check_runs":%s}\n' "${total}" "${runs}" >"${dir}/checkruns.json"
+}
+
+# changed_files <dir> <newline-separated paths>
+# The projection real `gh api --jq '.[].filename'` would emit for
+# `pulls/{n}/files`. ENG-915 reads it to decide whether the backend suite was
+# required at this head.
+changed_files() {
+  local dir="$1" files="$2"
+  printf '%s\n' "${files}" >"${dir}/files.txt"
 }
 
 # workflowruns <dir> <json array of {id,workflow_id,run_number,conclusion,check_suite_id}>
@@ -708,6 +730,125 @@ run_gate "${d2}"
 check 'regression proof: the new gate refuses that same state' 3 'NO_EVIDENCE'
 
 # ---------------------------------------------------------------------------
+# ENG-915 AC4 — the Greptile gate reorders work, it must not reduce evidence
+# ---------------------------------------------------------------------------
+#
+# Gating the backend suite on `greptile-review` gives its `skipped` a third
+# meaning: "the gate did not pass". Every case below is a state that reads as a
+# clean PASS to the pre-ENG-915 gate, because the discriminator executed and
+# nothing failed. The suite simply never ran.
+
+# The state that makes this urgent rather than theoretical. `re-run failed jobs`
+# appends to the SAME check suite, so re-running only the gate turns it green
+# and leaves the earlier skips beside it — a payload in which every visible
+# signal is success and the tests were never executed at this head.
+GREPTILE_RERUN_RUNS='[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success"},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped"},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped"},
+  {"name":"Partner portal tests","status":"completed","conclusion":"skipped"},
+  {"name":"CI script tests","status":"completed","conclusion":"skipped"}
+]'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${GREPTILE_RERUN_RUNS}"
+changed_files "${d}" 'backend/src/services/db.ts'
+run_gate "${d}"
+check 'a backend diff whose suite was Greptile-skipped is NO_EVIDENCE, not PASS' 3 'Backend tests (agentMode) (skipped)'
+
+# The same payload with a diff the path filter really does exclude. The skip is
+# then legitimate and the verdict must stay PASS — the new rule has to fire on
+# the diff, not on the mere presence of a skipped backend job, or it would
+# block every frontend-only PR.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${GREPTILE_RERUN_RUNS}"
+changed_files "${d}" 'partner-portal/src/App.tsx
+customer-portal/src/main.tsx'
+run_gate "${d}"
+check 'a frontend-only diff still passes with the backend suite skipped' 0 'PASS'
+
+# ENG-743: tests.yml and eb-deploy.sh are classified as backend changes by the
+# workflow's own paths filter, so they carry the same requirement. Mirrored
+# here, because a PR editing this very gate is exactly the one that must not be
+# able to exempt itself from it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${GREPTILE_RERUN_RUNS}"
+changed_files "${d}" '.github/workflows/tests.yml'
+run_gate "${d}"
+check 'editing tests.yml counts as a backend change and needs the suite' 3 'NO_EVIDENCE'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${GREPTILE_RERUN_RUNS}"
+changed_files "${d}" '.github/scripts/eb-deploy.sh'
+run_gate "${d}"
+check 'editing eb-deploy.sh counts as a backend change and needs the suite' 3 'NO_EVIDENCE'
+
+# The prefixes are anchored at the start of the path. A regex over these
+# strings would match `backend/` anywhere in the path and quietly demand the
+# backend suite of a portal-only PR.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${GREPTILE_RERUN_RUNS}"
+changed_files "${d}" 'partner-portal/src/backend/client.ts'
+run_gate "${d}"
+check 'a nested path merely containing "backend/" is not a backend change' 0 'PASS'
+
+# A backend diff with the suite genuinely green is the case the whole gate
+# exists to let through.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${HEALTHY_RUNS}"
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a backend diff with a green suite passes' 0 'PASS'
+
+# Absent is not the same as skipped, and must not be the same as passed either:
+# a payload that simply never mentions the job is the ENG-757 shape again.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success"},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success"}
+]'
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a backend diff with the suite absent entirely is NO_EVIDENCE' 3 '(ABSENT)'
+
+# Renaming a job must fail closed rather than delete the requirement. With the
+# override pointing at a name nothing reports, the gate blocks.
+TESTS_RUN=$((TESTS_RUN + 1))
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${HEALTHY_RUNS}"
+changed_files "${d}" 'backend/src/server.ts'
+LAST_OUTPUT="$(MERGE_EVIDENCE_MOCK_DIR="${d}" REPO='AgentWebPro/agentweb' PR_NUMBER='2231' \
+  GH_TOKEN='mock' MERGE_EVIDENCE_BACKEND_JOBS='Backend tests (renamed)' \
+  bash "${GATE_SCRIPT}" 2>&1)"
+LAST_EXIT=$?
+check 'MERGE_EVIDENCE_BACKEND_JOBS is honoured and an unknown name fails closed' 3 'Backend tests (renamed) (ABSENT)'
+
+# An unreadable diff is an ERROR, not a verdict: the gate cannot tell whether
+# the requirement applies, which is a statement about the API, not the PR.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${HEALTHY_RUNS}"
+printf '1' >"${d}/files_exit"
+run_gate "${d}"
+check 'an unreadable changed-files API is ERROR, never a pass' 4 'ERROR'
+
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${HEALTHY_RUNS}"
+changed_files "${d}" ''
+run_gate "${d}"
+check 'an empty changed-files list is ERROR, never a pass' 4 'ERROR'
+
+# ---------------------------------------------------------------------------
 # Invariant guard — the discriminator must stay draft-gated ONLY
 # ---------------------------------------------------------------------------
 #
@@ -734,6 +875,57 @@ else
   printf "      draft-vs-path-filter distinction to hold. Found: '%s'\n" "${DISCRIMINATOR_IF}"
   printf "      If this job legitimately gained a path filter, merge-evidence.sh needs a new\n"
   printf "      discriminator — it can no longer tell a draft run from a path-skipped one.\n"
+fi
+
+# ---------------------------------------------------------------------------
+# Invariant guard — the two halves of ENG-915 must stay in step
+# ---------------------------------------------------------------------------
+#
+# The requirement above is only sound while the workflow really does gate the
+# backend suite on the Greptile result, and only reaches the right jobs while
+# the names match. Both are edits somebody makes in tests.yml, in a PR that
+# never opens this file, so assert them from here.
+
+GATE_SH="${SCRIPT_DIR}/merge-evidence.sh"
+
+for job_key in backend-tests-a backend-tests-b; do
+  JOB_IF="$(awk -v job="  ${job_key}:" '
+    $0 == job          { in_job = 1; next }
+    in_job && /^  [a-z]/ { exit }
+    in_job && /^    if:/ { sub(/^    if: */, ""); print; exit }
+  ' "${WORKFLOW}")"
+
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if printf '%s' "${JOB_IF}" | grep -qF "needs.greptile-review.result == 'success'"; then
+    printf "ok    invariant: %s is gated on the Greptile result (ENG-915)\n" "${job_key}"
+  else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf "FAIL  invariant: %s must require needs.greptile-review.result == 'success'.\n" "${job_key}"
+    printf "      Found: '%s'\n" "${JOB_IF}"
+    printf "      Without it the suite runs on every ready-flip again (ENG-915 AC1), and the\n"
+    printf "      backend-suite requirement in merge-evidence.sh is enforcing an ordering that\n"
+    printf "      no longer exists.\n"
+  fi
+done
+
+# The requirement is matched by exact job name. A rename in tests.yml alone
+# would leave merge-evidence.sh demanding a job nobody reports — which fails
+# closed, so it is safe, but it blocks every backend PR until someone finds
+# this. Catch it in the PR that renames the job instead.
+TESTS_RUN=$((TESTS_RUN + 1))
+missing_name=''
+while IFS= read -r job_name; do
+  [ -n "${job_name}" ] || continue
+  grep -qF "name: ${job_name}" "${WORKFLOW}" || missing_name="${job_name}"
+done < <(sed -n '/^BACKEND_JOBS=/,/}"$/p' "${GATE_SH}" \
+  | sed -e 's/^BACKEND_JOBS=.*:-//' -e 's/}"$//')
+
+if [ -z "${missing_name}" ]; then
+  printf "ok    invariant: every MERGE_EVIDENCE_BACKEND_JOBS default names a real job in tests.yml\n"
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf "FAIL  invariant: merge-evidence.sh requires the job '%s', which tests.yml does not define.\n" "${missing_name}"
+  printf "      Rename both together, or the backend-suite requirement blocks every backend PR.\n"
 fi
 
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
