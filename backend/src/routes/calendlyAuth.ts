@@ -2,7 +2,7 @@ import express from 'express';
 import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
-import { getCalendlyConfig } from '../config/integrations';
+import { getCalendlyConfig, CalendlyOAuthConfig } from '../config/integrations';
 import { createAccount, CalendlyConfig } from '../services/connectedAccountsDb';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
@@ -171,6 +171,84 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
   }
 });
 
+// ── Webhook provisioning ─────────────────────────────────────────────────
+//
+// A reconnect (disconnect then re-connect) always attempts to create a fresh
+// webhook subscription. If a previous connect's subscription is still alive
+// at the same callback URL, Calendly rejects the create with
+// { title: 'Already Exists' } — a real incident (ENG-524): this was
+// previously conflated with the genuine plan-tier gate below, showing a
+// customer who did nothing wrong the wrong "upgrade your plan" message.
+//
+// The old subscription's signing key isn't recoverable (Calendly never
+// echoes it back — see the module comment on webhookSigningKey below), so
+// the fix is to find and delete the stale one, then retry with the new key,
+// rather than leaving the account permanently stuck on the wrong message.
+
+interface WebhookProvisionResult {
+  webhookId?: string;
+  active: boolean;
+}
+
+async function createWebhookSubscription(
+  config: CalendlyOAuthConfig,
+  accessToken: string,
+  profile: { organization_uri?: string; user_uri?: string },
+  webhookSigningKey: string,
+) {
+  return axios.post(config.webhookSubscriptionsUrl, {
+    url: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/webhooks/calendly`,
+    events: ['invitee.created'],
+    organization: profile.organization_uri,
+    user: profile.user_uri,
+    scope: 'user',
+    signing_key: webhookSigningKey,
+  }, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+}
+
+async function provisionCalendlyWebhook(
+  config: CalendlyOAuthConfig,
+  accessToken: string,
+  profile: { organization_uri?: string; user_uri?: string },
+  webhookSigningKey: string,
+): Promise<WebhookProvisionResult> {
+  try {
+    const response = await createWebhookSubscription(config, accessToken, profile, webhookSigningKey);
+    return { webhookId: (response.data as any)?.resource?.uri, active: true };
+  } catch (error: any) {
+    const isDuplicate = error?.response?.data?.title === 'Already Exists';
+    if (!isDuplicate) {
+      // The real, verified gate: webhook access requires the CONNECTING account to be on
+      // Calendly Standard/Teams/Enterprise — Free-tier accounts complete OAuth fine and
+      // then get rejected here. Not a bug, not fatal to the connection.
+      console.warn('[Calendly OAuth /connect] webhook subscription not provisioned', error?.response?.data || error.message);
+      return { active: false };
+    }
+
+    console.warn('[Calendly OAuth /connect] duplicate webhook subscription detected — deleting stale one and retrying');
+    try {
+      const existing = await axios.get(config.webhookSubscriptionsUrl, {
+        params: { organization: profile.organization_uri, user: profile.user_uri, scope: 'user' },
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const staleUri = (existing.data as any)?.collection?.[0]?.uri;
+      if (!staleUri) {
+        console.warn('[Calendly OAuth /connect] could not locate the stale webhook subscription to delete');
+        return { active: false };
+      }
+
+      await axios.delete(staleUri, { headers: { Authorization: `Bearer ${accessToken}` } });
+      const retryResponse = await createWebhookSubscription(config, accessToken, profile, webhookSigningKey);
+      return { webhookId: (retryResponse.data as any)?.resource?.uri, active: true };
+    } catch (retryError: any) {
+      console.warn('[Calendly OAuth /connect] retry after deleting stale webhook failed', retryError?.response?.data || retryError.message);
+      return { active: false };
+    }
+  }
+}
+
 // ── POST /connect — persist tokens, auto-provision the booking webhook ─────
 
 router.post('/connect', authenticateToken, async (req: any, res) => {
@@ -196,29 +274,12 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     // per-connection instead of global.
     const webhookSigningKey = crypto.randomBytes(32).toString('hex');
 
-    let webhookId: string | undefined;
-    let bookingTrackingActive = false;
-
-    try {
-      const webhookResponse = await axios.post(config.webhookSubscriptionsUrl, {
-        url: `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/webhooks/calendly`,
-        events: ['invitee.created'],
-        organization: profile.organization_uri,
-        user: profile.user_uri,
-        scope: 'user',
-        signing_key: webhookSigningKey,
-      }, {
-        headers: { Authorization: `Bearer ${tokens.access_token}` },
-      });
-      webhookId = (webhookResponse.data as any)?.resource?.uri;
-      bookingTrackingActive = true;
-    } catch (webhookError: any) {
-      // The real, verified gate: webhook access requires the CONNECTING account to be on
-      // Calendly Standard/Teams/Enterprise — Free-tier accounts complete OAuth fine and
-      // then get rejected here. Not a bug, not fatal to the connection: store the account,
-      // just mark it inactive so the UI can show the upgrade prompt instead of silence.
-      console.warn('[Calendly OAuth /connect] webhook subscription not provisioned', webhookError?.response?.data || webhookError.message);
-    }
+    const { webhookId, active: bookingTrackingActive } = await provisionCalendlyWebhook(
+      config,
+      tokens.access_token,
+      profile,
+      webhookSigningKey,
+    );
 
     const config_: CalendlyConfig = {
       account_type: 'calendly',
