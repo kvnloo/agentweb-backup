@@ -406,7 +406,11 @@ describe('AgentModeService - createHtmlFile', () => {
     // retrying, and the completed draft is delivered as a deterministically
     // rendered HTML document instead of being discarded.
     describe('large-draft render timeout degrades gracefully (ENG-873)', () => {
-      const largeDraft = `# Monthly Competitor Intelligence Report\n\n${'Competitor detail line.\n'.repeat(2000)}`;
+      // Between CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS (20K) and
+      // CREATE_HTML_RENDER_SINGLE_PASS_MAX_DRAFT_CHARS (24K): still rendered in
+      // one pass, but a timeout at this size is a property of the payload, so it
+      // must not be retried.
+      const largeDraft = `# Monthly Competitor Intelligence Report\n\n${'Competitor detail line.\n'.repeat(900)}`;
 
       beforeEach(() => {
         mockGenerateHTML.mockReset();
@@ -487,6 +491,191 @@ describe('AgentModeService - createHtmlFile', () => {
         expect(result.success).toBe(false);
         expect(result.message).toBe('Failed to create HTML file');
         expect(result.error).toContain('timed out');
+
+        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
+      });
+    });
+
+    describe('very large drafts render section by section (ENG-873)', () => {
+      // Over CREATE_HTML_RENDER_SINGLE_PASS_MAX_DRAFT_CHARS (24K): a single
+      // monolithic render at this size is all-or-nothing and times out
+      // deterministically in prod, so the draft is rendered in sections.
+      const section = (n: number) =>
+        `## Competitor ${n}\n\n${`Funding, headcount and recent news for competitor ${n}. `.repeat(120)}`;
+      const chunkedDraft = `# Monthly Competitor Intelligence Report\n\n${[1, 2, 3, 4, 5, 6]
+        .map(section)
+        .join('\n\n')}`;
+
+      beforeEach(() => {
+        mockGenerateHTML.mockReset();
+        jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined);
+      });
+
+      const renderSectionsInOrder = () => {
+        let call = 0;
+        mockGenerateHTML.mockImplementation(async () => {
+          call += 1;
+          return `<h2>Rendered section ${call}</h2>`;
+        });
+      };
+
+      it('splits the draft across several render calls instead of one', async () => {
+        renderSectionsInOrder();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.degraded).toBeUndefined();
+        expect(mockGenerateHTML.mock.calls.length).toBeGreaterThan(1);
+
+        // Every section is asked for as a body FRAGMENT of the same document.
+        const [systemPrompt] = mockGenerateHTML.mock.calls[0];
+        expect(systemPrompt).toMatch(/fragment/i);
+        expect(systemPrompt).not.toContain('<!DOCTYPE');
+
+        // And the fragments are assembled into exactly one document.
+        const [uploadedContent] = mockUploadFileToS3.mock.calls[0];
+        expect(uploadedContent.match(/<!DOCTYPE html>/g)).toHaveLength(1);
+        expect(uploadedContent).toContain('Rendered section 1');
+        expect(uploadedContent).toContain(`Rendered section ${mockGenerateHTML.mock.calls.length}`);
+        expect(uploadedContent).toContain('<title>Monthly Competitor Intelligence Report</title>');
+      });
+
+      it('sends every part of the draft to exactly one section render', async () => {
+        renderSectionsInOrder();
+
+        await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        const sent = mockGenerateHTML.mock.calls.map(([, userPrompt]) => userPrompt).join('\n');
+        [1, 2, 3, 4, 5, 6].forEach((n) => {
+          expect(sent).toContain(`## Competitor ${n}`);
+        });
+      });
+
+      it('unwraps a full document returned for a section', async () => {
+        mockGenerateHTML.mockResolvedValue(
+          '<!DOCTYPE html><html><head><title>x</title></head><body><h2>Section body</h2></body></html>',
+        );
+
+        await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        const [uploadedContent] = mockUploadFileToS3.mock.calls[0];
+        expect(uploadedContent.match(/<!DOCTYPE html>/g)).toHaveLength(1);
+        expect(uploadedContent).not.toContain('<html><head>');
+        expect(uploadedContent).toContain('<h2>Section body</h2>');
+      });
+
+      it('keeps the single-pass render for a draft under the threshold', async () => {
+        mockGenerateHTML.mockResolvedValue(mockHtmlContent);
+
+        await (agentModeService as any).createHtmlFile(
+          'Small Report',
+          'Short draft.',
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
+      });
+
+      it('does not section an email — an email is one assembled layout', async () => {
+        mockGenerateHTML.mockResolvedValue(mockHtmlContent);
+
+        await (agentModeService as any).createHtmlFile(
+          'Monthly Newsletter',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123',
+          'email'
+        );
+
+        expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
+      });
+
+      it('retries a section once on a transient failure', async () => {
+        let call = 0;
+        mockGenerateHTML.mockImplementation(async () => {
+          call += 1;
+          if (call === 1) throw new Error('Stream timed out because of no activity for 300000 ms');
+          return `<h2>Section ${call}</h2>`;
+        });
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.degraded).toBeUndefined();
+
+        consoleWarnSpy.mockRestore();
+      });
+
+      it('degrades to the deterministic document when a section keeps failing', async () => {
+        mockGenerateHTML.mockRejectedValue(
+          new Error('Stream timed out because of no activity for 300000 ms'),
+        );
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.degraded).toBe(true);
+        const [uploadedContent] = mockUploadFileToS3.mock.calls[0];
+        expect(uploadedContent.startsWith('<!DOCTYPE html>')).toBe(true);
+        // Nothing from the completed research is lost.
+        expect(uploadedContent).toContain('Competitor 6');
+
+        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
+      });
+
+      it('degrades when a section renders empty', async () => {
+        mockGenerateHTML.mockResolvedValue('   ');
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.degraded).toBe(true);
 
         consoleErrorSpy.mockRestore();
         consoleWarnSpy.mockRestore();
