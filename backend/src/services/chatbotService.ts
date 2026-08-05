@@ -2485,32 +2485,63 @@ export class ChatbotDB {
    * an unscored session, while the original stays recoverable — so a bulk
    * retraction that turns out to be wrong can be undone from the archive
    * instead of being an irreversible data loss.
+   *
+   * The write is a COMPARE-AND-SWAP against the score the caller actually read.
+   * A sweep reads the session, decides it is out of the cohort, and only then
+   * writes; an admin override or a fresh re-score can land in between, and an
+   * unconditional REMOVE would destroy it. Losing that race is a no-op, not an
+   * error — whoever wrote last owns the row, and the next sweep re-reads it.
    */
   async clearSessionSatisfactionScore(
     sessionId: string,
     previous?: ChatSession["satisfactionScore"]
-  ): Promise<void> {
+  ): Promise<boolean> {
     const params: any = previous
       ? {
           TableName: this.tableName,
           Key: { sessionId },
           UpdateExpression:
             "SET retractedSatisfactionScore = :prev REMOVE satisfactionScore",
+          // An admin override is human judgement and is never retracted, even
+          // if it were written after the read that selected this snapshot.
+          ConditionExpression: `${
+            previous.evaluatedAt
+              ? "satisfactionScore.evaluatedAt = :prevEvaluatedAt"
+              : "attribute_exists(satisfactionScore)"
+          } AND attribute_not_exists(satisfactionScore.adminOverride)`,
           ExpressionAttributeValues: {
             ":prev": { ...previous, retractedAt: new Date().toISOString() },
+            ...(previous.evaluatedAt ? { ":prevEvaluatedAt": previous.evaluatedAt } : {}),
           },
         }
       : {
           TableName: this.tableName,
           Key: { sessionId },
           UpdateExpression: "REMOVE satisfactionScore",
+          ConditionExpression: "attribute_not_exists(satisfactionScore.adminOverride)",
         };
     try {
       await dynamodb.update(params).promise();
+      return true;
     } catch (error) {
+      // Lost the race: the row still holds a score, so the caller must keep its
+      // in-memory copy rather than reporting the session as unscored.
+      if (this.isConditionalCheckFailure(error)) return false;
       console.error("Error clearing session satisfaction score:", error);
       throw error;
     }
+  }
+
+  /**
+   * A retraction whose ConditionExpression failed: the row moved on between the
+   * read and the write, so there is nothing to retract. Distinct from a real
+   * persistence failure, which must still surface.
+   */
+  private isConditionalCheckFailure(error: any): boolean {
+    return (
+      error?.code === "ConditionalCheckFailedException" ||
+      error?.name === "ConditionalCheckFailedException"
+    );
   }
 
   /** Judge-score counterpart of clearSessionSatisfactionScore (same archive semantics). */
@@ -2518,7 +2549,7 @@ export class ChatbotDB {
     sessionId: string,
     judgeId: string,
     previous?: NonNullable<ChatSession["judgeScores"]>[string]
-  ): Promise<void> {
+  ): Promise<boolean> {
     const names = { "#js": "judgeScores", "#rjs": "retractedJudgeScores", "#jid": judgeId };
     try {
       if (!previous) {
@@ -2530,34 +2561,46 @@ export class ChatbotDB {
             ExpressionAttributeNames: { "#js": "judgeScores", "#jid": judgeId },
           })
           .promise();
-        return;
+        return true;
       }
       const archived = { ...previous, retractedAt: new Date().toISOString() };
+      // Same compare-and-swap as clearSessionSatisfactionScore: only retract the
+      // judge score this caller actually read, never a replacement written since.
+      const condition = previous.evaluatedAt
+        ? "#js.#jid.evaluatedAt = :prevEvaluatedAt"
+        : "attribute_exists(#js.#jid)";
+      const pin = previous.evaluatedAt ? { ":prevEvaluatedAt": previous.evaluatedAt } : {};
       try {
         await dynamodb
           .update({
             TableName: this.tableName,
             Key: { sessionId },
             UpdateExpression: "SET #rjs.#jid = :prev REMOVE #js.#jid",
+            ConditionExpression: condition,
             ExpressionAttributeNames: names,
-            ExpressionAttributeValues: { ":prev": archived },
+            ExpressionAttributeValues: { ":prev": archived, ...pin },
           })
           .promise();
       } catch (error: any) {
         // retractedJudgeScores map does not exist yet — create it, same pattern
-        // as updateSessionJudgeScore.
+        // as updateSessionJudgeScore. A lost race is not a missing map: rethrow
+        // it so the outer catch can treat it as the no-op it is.
+        if (this.isConditionalCheckFailure(error)) throw error;
         if (error.code !== "ValidationException") throw error;
         await dynamodb
           .update({
             TableName: this.tableName,
             Key: { sessionId },
             UpdateExpression: "SET #rjs = :map REMOVE #js.#jid",
+            ConditionExpression: condition,
             ExpressionAttributeNames: names,
-            ExpressionAttributeValues: { ":map": { [judgeId]: archived } },
+            ExpressionAttributeValues: { ":map": { [judgeId]: archived }, ...pin },
           })
           .promise();
       }
+      return true;
     } catch (error) {
+      if (this.isConditionalCheckFailure(error)) return false;
       console.error("Error clearing session judge score:", error);
       throw error;
     }

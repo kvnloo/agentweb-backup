@@ -747,7 +747,10 @@ async function retractSatisfactionScore(session: ChatSession): Promise<void> {
   if (!retractionEnabled()) return;
   const previous = session.satisfactionScore;
   try {
-    await chatbotDb.clearSessionSatisfactionScore(session.sessionId, previous);
+    // The write is conditional on `previous` still being the persisted score; a
+    // false return means it was not, so the row keeps a score and the in-memory
+    // copy must keep it too.
+    if (!(await chatbotDb.clearSessionSatisfactionScore(session.sessionId, previous))) return;
     // Keep the in-memory copy consistent: the sync sweep applies scores onto
     // these objects and serialises them straight back to the caller.
     delete (session as any).satisfactionScore;
@@ -762,7 +765,7 @@ async function retractJudgeScore(session: ChatSession, judgeId: string): Promise
   if (!retractionEnabled()) return;
   const previous = session.judgeScores[judgeId];
   try {
-    await chatbotDb.clearSessionJudgeScore(session.sessionId, judgeId, previous);
+    if (!(await chatbotDb.clearSessionJudgeScore(session.sessionId, judgeId, previous))) return;
     delete session.judgeScores[judgeId];
   } catch (err) {
     console.error(`retractJudgeScore: session ${session.sessionId}/${judgeId}:`, err);
