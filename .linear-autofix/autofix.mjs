@@ -351,8 +351,24 @@ async function main() {
     if (tr.fixable === false) {
       log(`Blocked on external action: ${tr.blockedOn || tr.reason || '(unspecified)'} — holding (issue stays in ${issue.state?.name}).`);
       try { await setAutofixLabel(issue, g.blockedLabel); } catch (e) { log('Warn: could not set blocked label:', e.message); }
-      await addComment(issue.id, `⏸️ **Auto-fix on hold — blocked on an external action**\n\n${tr.reason || ''}\n\n**Waiting on:** ${tr.blockedOn || '(see reason)'}\n\nNo fix was attempted and the issue was left in **${issue.state?.name || 'its current state'}**. Once the blocker is resolved, remove the \`${g.blockedLabel}\` label and the poller will pick this bug up on its next cycle.`);
-      updateState(issue.id, { identifier: id, title: issue.title || '', outcome: 'blocked', blockedOn: tr.blockedOn || '', stages, at: new Date().toISOString() });
+      // Provision the worktree + branch even though the fix is blocked, so EVERY issue autofix picks owns a
+      // real repo folder and its chat is immediately full-access (no "make editable" round-trip). Best-effort:
+      // an infra hiccup here must never turn a clean "blocked" triage into a failure — the issue stays blocked
+      // either way, just without the (later retryable) worktree. Card stays in Todo; we only lay down the folder.
+      let provisioned = false;
+      try {
+        const asm = assemble(WT, branch);
+        if (asm.ok) {
+          applyWorktreeIdentity(WT, identity, log);
+          prepareWorktreeDeps(WT);
+          provisioned = true;
+          log(`Worktree provisioned for blocked ${id} at ${WT} on ${branch} — chat is editable.`);
+        } else {
+          log(`Warn: could not provision worktree for blocked ${id} (${asm.repo}): ${asm.err}`);
+        }
+      } catch (e) { log('Warn: worktree provisioning for blocked issue failed:', e.message); }
+      await addComment(issue.id, `⏸️ **Auto-fix on hold — blocked on an external action**\n\n${tr.reason || ''}\n\n**Waiting on:** ${tr.blockedOn || '(see reason)'}\n\nNo fix was attempted and the issue was left in **${issue.state?.name || 'its current state'}**.${provisioned ? ` A workspace and branch (\`${branch}\`) have been prepared, so you can start the fix manually from the autofix chat whenever you like.` : ''} Once the blocker is resolved, remove the \`${g.blockedLabel}\` label and the poller will pick this bug up on its next cycle.`);
+      updateState(issue.id, { identifier: id, title: issue.title || '', outcome: 'blocked', blockedOn: tr.blockedOn || '', ...(provisioned ? { branch } : {}), stages, at: new Date().toISOString() });
       return;
     }
     log('Fixability gate: fixable — proceeding.');
