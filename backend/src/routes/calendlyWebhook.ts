@@ -260,13 +260,18 @@ router.post('/', (req: express.Request, res: express.Response) => {
           console.warn('[Calendly Webhook] No invitee email — skipping CRM-forward');
         } else {
           let listId = resolved.account.config?.booking_lead_list_id as string | undefined;
-          if (listId && !(await crmDb.getLeadListById(listId))) {
-            // The customer picked this list, then deleted it — createLead has no existence
-            // guard on the list it writes into (a separate, pre-existing gap in that shared
-            // function, out of scope here), so using a stale id would silently write an
-            // orphaned lead nobody can see. Treat it the same as "never configured."
-            console.warn(`[Calendly Webhook] Configured booking list ${listId} no longer exists — falling back`);
-            listId = undefined;
+          if (listId) {
+            const configuredList = await crmDb.getLeadListById(listId);
+            // Ownership check, not a truthiness check: createLead's list-metadata update
+            // has no attribute_exists guard, so writing a lead against a deleted listId
+            // partially RESURRECTS a ghost record there (fieldNames/leadCount/listId/
+            // updatedAt only — no userId, no name). A plain "does a row exist" check gets
+            // fooled by that ghost and never falls back (confirmed live). Checking userId
+            // ownership is what actually distinguishes a real list from a ghost.
+            if (!configuredList || configuredList.userId !== resolved.userId) {
+              console.warn(`[Calendly Webhook] Configured booking list ${listId} no longer exists — falling back`);
+              listId = undefined;
+            }
           }
           if (!listId) {
             listId = await resolveOrCreateBookingList(resolved.userId);
