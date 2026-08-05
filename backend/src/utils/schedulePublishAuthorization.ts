@@ -10,69 +10,46 @@ import { isPublishName } from './hardeningGaps';
  * to refusing — while the deterministic required-function checker nudges it up to
  * `maxAttempts` (20) times. That is the loop that burned the reported runs.
  *
- * Authorization must be something the OWNER set on the schedule, at schedule-creation
- * time, that unambiguously means "publish without asking me". Two routes qualify:
+ * Authorization comes ONLY from an explicit, structured, owner-set boolean:
  *
- *  A. `fullAutonomy` on its own. This is the platform's INFORMED consent control: the
- *     schedule form renders it as an amber-bordered warning that explicitly says Emma
- *     will proceed on "irreversible choices that can't be undone after launch". An
- *     owner ticking that has been told what they are waiving.
+ *  A. `autopublishAuthorized` — the dedicated per-schedule consent flag. Its checkbox
+ *     states in plain words that the run will publish to the live account without
+ *     showing the owner the content first. Ticking it is informed consent.
  *
- *  B. `requiredFunctionCalls` naming a publish tool AND the owner's own prompt
- *     explicitly waiving approval. BOTH are needed, and this is the important part:
+ *  B. `fullAutonomy` — the pre-existing broader waiver, rendered as an amber warning
+ *     covering "irreversible choices that can't be undone after launch". Publishing
+ *     is squarely within what that already asks the owner to accept.
  *
- *     The Required Functions picker is a VERIFICATION control ("this run only counts
- *     as successful if it called X"), not a consent surface — its UI carries no
- *     approval-waiver language whatsoever. Treating that tick alone as standing
- *     approval would silently convert schedules whose owner ticked it to VERIFY a
- *     publish into schedules that publish unreviewed. That is not hypothetical: of the
- *     8 production schedules requiring a publish tool, only 3 (the reported Kevin
- *     runs) contain approval-waiver language; the other 5 — including the active
- *     "LUCAS — LinkedIn Thought Leadership" — do not, and must keep drafting.
+ * Deliberately NOT a signal:
  *
- *     Requiring a second, independently-authored signal from the schedule's own prompt
- *     ("Post the FULL text automatically. Do not ask for approval.") makes the intent
- *     unambiguous and owner-stated rather than inferred from a checkbox that never
- *     claimed to mean consent.
+ *  - `requiredFunctionCalls` naming a publish tool. That picker is a VERIFICATION
+ *    control ("this run only counts as successful if it called X") and its UI carries
+ *    no approval-waiver language, so a tick cannot mean consent. 5 of the 8 production
+ *    schedules requiring a publish tool — including the ACTIVE "LUCAS — LinkedIn
+ *    Thought Leadership" — would otherwise have started publishing unreviewed.
  *
- * Everything is fail-closed: no match, an unreadable schedule, or a malformed field
- * all resolve to NOT authorized, i.e. the reversible draft-and-notify outcome.
+ *  - Approval-waiver wording in the schedule's prompt. Intent inferred from prose is
+ *    not consent: the wording is unscoped, so a waiver written about a different step
+ *    ("do not ask for approval when generating images") would authorize a live post.
+ *    A prose matcher can always be narrowed and will always have another hole; consent
+ *    has to be a field the owner deliberately set.
  *
- * Authorization is deliberately PER-TOOL: only the publish tools the owner actually
- * listed are authorized, so requiring `post_on_connected_account` does not silently
- * authorize `publish_landing_page_changes`. Anything not explicitly named stays
- * gated and falls back to the safe draft-and-notify outcome.
+ * Everything is fail-closed: an unreadable schedule, a malformed field, or anything
+ * short of an explicit true resolves to NOT authorized — the reversible
+ * draft-and-notify outcome.
+ *
+ * Authorization is still reported PER-TOOL: `tools` lists only the publish tools the
+ * owner designated, so the directive names exactly those and the required-function
+ * checker filters in lockstep.
  */
 
-/**
- * Explicit approval-waiver phrasings, matched against the schedule's own prompt.
- * Deliberately NARROW: each pattern requires the owner to have written about
- * approval/asking/sign-off, or to have said "post automatically" in as many words.
- * A bare "automatically" is NOT enough — "automatically generate an image" says
- * nothing about publishing unreviewed — so it is not matched.
- */
-const APPROVAL_WAIVER_PATTERNS: RegExp[] = [
-  // "do not ask for approval", "don't wait for my sign-off", "doesn't ask for permission"
-  /\bdo(?:es)?\s*n(?:o|')?t\s+(?:ask|wait|check|stop)\s+(?:for\s+)?(?:my\s+|your\s+|an?\s+|any\s+|the\s+)?(?:approval|sign[-\s]?off|confirmation|permission|review)/i,
-  // "without approval", "without asking", "without my sign-off", "without waiting for review"
-  /\bwithout\s+(?:my\s+|your\s+|any\s+|prior\s+|explicit\s+|human\s+|further\s+|waiting\s+for\s+)*(?:approval|sign[-\s]?off|confirmation|permission|review|asking)/i,
-  // "no approval needed", "no sign-off required"
-  /\bno\s+(?:approval|sign[-\s]?off|confirmation|permission)\s+(?:is\s+)?(?:needed|required|necessary)/i,
-  // "post it automatically", "publish automatically", "automatically post"
-  /\b(?:post|publish|share|tweet)\s+(?:it\s+|them\s+|this\s+|the\s+\S+\s+){0,3}automatically\b/i,
-  /\bautomatically\s+(?:post|publish|share|tweet)\b/i,
-];
-
-/** Does the schedule's own prompt explicitly waive the publish-approval gate? */
-export function promptWaivesPublishApproval(startingMessage?: string): boolean {
-  if (typeof startingMessage !== 'string' || !startingMessage.trim()) return false;
-  return APPROVAL_WAIVER_PATTERNS.some(re => re.test(startingMessage));
-}
 export interface SchedulePublishAuthorizationInput {
+  /** Dedicated per-schedule consent flag — the owner ticked "publish without review". */
+  autopublishAuthorized?: boolean;
+  /** Broader irreversible-action waiver; also covers publishing. */
   fullAutonomy?: boolean;
+  /** Used only to report WHICH publish tools are in scope — never to grant consent. */
   requiredFunctionCalls?: string[];
-  /** The schedule's own prompt — the second, owner-authored consent signal (route B). */
-  startingMessage?: string;
 }
 
 export interface SchedulePublishAuthorization {
@@ -99,12 +76,11 @@ export function resolveSchedulePublishAuthorization(
     new Set(required.filter((name): name is string => typeof name === 'string' && isPublishName(name)))
   );
 
-  // Route A: the informed consent control, sufficient on its own.
-  if (schedule.fullAutonomy === true) return { authorized: true, tools };
+  // Consent is a flag the owner deliberately set — never inferred from the required
+  // -function picker or from wording in the prompt. Strict === true so a truthy
+  // string/number from a loosely-typed caller cannot grant publishing rights.
+  const authorized =
+    schedule.autopublishAuthorized === true || schedule.fullAutonomy === true;
 
-  // Route B: a required publish tool is only consent when the owner's own prompt
-  // ALSO waives approval. The picker alone is a verification control, never a
-  // waiver — see the header note for why that distinction is load-bearing.
-  const authorized = tools.length > 0 && promptWaivesPublishApproval(schedule.startingMessage);
   return { authorized, tools };
 }

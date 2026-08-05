@@ -3099,6 +3099,11 @@ export const scheduleDb = {
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions). Default off.
       fullAutonomy?: boolean;
+      // ENG-827: opt-in authorization to PUBLISH to a live connected account during
+      // an unattended scheduled run, without showing the owner the content first.
+      // Its own consent control precisely because the required-function picker is a
+      // verification control, not a waiver. Default off.
+      autopublishAuthorized?: boolean;
       promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;

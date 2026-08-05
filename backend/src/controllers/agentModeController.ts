@@ -6766,6 +6766,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
+        autopublishAuthorized,
         timezone
       } = req.body;
 
@@ -6846,6 +6847,10 @@ export const agentModeController = {
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
         fullAutonomy: fullAutonomy === true,
+        // ENG-827: opt-in authorization to publish to a live connected account in an
+        // unattended run without pre-review. Its own consent control — the required
+        // -function picker is verification, not a waiver. Default off.
+        autopublishAuthorized: autopublishAuthorized === true,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -6971,6 +6976,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
+        autopublishAuthorized,
         timezone
       } = req.body;
 
@@ -7043,6 +7049,8 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
+        // ENG-827: opt-in unattended publish authorization. Partial-update safe.
+        autopublishAuthorized: autopublishAuthorized !== undefined ? (autopublishAuthorized === true) : ((existingSchedule as any).autopublishAuthorized || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
