@@ -640,6 +640,67 @@ describe('sanitizeGeminiSchema', () => {
     });
   });
 
+  it('always emits `items` for an array — Gemini 400s without it (ENG-845)', () => {
+    // Confirmed against the real API: `{ type: 'array' }` alone fails the whole request
+    // with `properties[a].items: missing field`. Three paths can strip it — a degenerate
+    // tuple, a schema that never declared `items`, and depth/cycle truncation — so the
+    // fallback is applied last, after the union collapse has settled the final type.
+    expect(sanitizeGeminiSchema({ type: 'object', properties: { a: { type: 'array', items: [] } } }))
+      .toEqual({ type: 'object', properties: { a: { type: 'array', items: { type: 'string' } } } });
+    expect(sanitizeGeminiSchema({ type: 'object', properties: { a: { type: 'array', minItems: 1 } } }))
+      .toEqual({ type: 'object', properties: { a: { type: 'array', minItems: 1, items: { type: 'string' } } } });
+    // A union collapsing to `array` must get the fallback too.
+    expect(sanitizeGeminiSchema({ type: 'object', properties: { a: { type: ['array', 'string'] } } }))
+      .toEqual({ type: 'object', properties: { a: { type: 'array', items: { type: 'string' } } } });
+    // A real `items` is never overwritten.
+    expect(sanitizeGeminiSchema({ type: 'array', items: { type: 'number' } }))
+      .toEqual({ type: 'array', items: { type: 'number' } });
+  });
+
+  it('truncates a self-referencing schema instead of overflowing the stack (ENG-845)', () => {
+    // A dereferenced $ref or a hand-built circular object would recurse forever and take
+    // the worker down mid-turn — the very zero-assistant-output signature this fixes.
+    const cyclic: any = { type: 'object', properties: { name: { type: 'string' } } };
+    cyclic.properties.self = cyclic;
+    expect(sanitizeGeminiSchema(cyclic)).toEqual({
+      type: 'object',
+      properties: { name: { type: 'string' }, self: { type: 'object' } },
+    });
+
+    // Mutual recursion (A -> B -> A) must terminate too.
+    const a: any = { type: 'object', properties: {} };
+    const b: any = { type: 'object', properties: { back: a } };
+    a.properties.fwd = b;
+    expect(sanitizeGeminiSchema(a)).toEqual({
+      type: 'object',
+      properties: { fwd: { type: 'object', properties: { back: { type: 'object' } } } },
+    });
+  });
+
+  it('expands a schema object SHARED between siblings in both branches (ENG-845)', () => {
+    // Cycle detection tracks ANCESTRY, not every object ever seen — otherwise a shared
+    // sub-schema (common in generated schemas) would be truncated in whichever branch
+    // happened to be visited second.
+    const shared = { type: 'string', description: 'shared' };
+    expect(sanitizeGeminiSchema({ type: 'object', properties: { x: shared, y: shared } })).toEqual({
+      type: 'object',
+      properties: { x: { type: 'string', description: 'shared' }, y: { type: 'string', description: 'shared' } },
+    });
+  });
+
+  it('caps nesting depth below the limit Gemini itself enforces (ENG-845)', () => {
+    // Gemini rejects beyond `Message recursion depth exceeds maximum of 64`, counted in
+    // protobuf messages — an object level costs two. Measured live: 30-deep objects fail,
+    // 25 passes. We cap at 20 so a pathological schema truncates instead of 400ing.
+    let deep: any = { type: 'string' };
+    for (let i = 0; i < 300; i++) deep = { type: 'object', properties: { n: deep } };
+    let node = sanitizeGeminiSchema(deep);
+    let levels = 0;
+    while (node?.properties?.n) { node = node.properties.n; levels++; }
+    expect(levels).toBe(20);
+    expect(node).toEqual({ type: 'object' });
+  });
+
   it('passes `default`/`example` instance values through untouched', () => {
     // These hold literal INSTANCE data, not sub-schemas, so the keyword filter must
     // not be applied to their contents — Gemini accepts an arbitrary object there.

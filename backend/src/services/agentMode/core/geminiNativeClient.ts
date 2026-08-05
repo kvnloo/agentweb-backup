@@ -41,6 +41,24 @@ export interface GeminiRequestOptions {
  * keywords a Gemini function declaration accepts. Kept in sync with `Schema` in
  * `@google/genai/dist/genai.d.ts`.
  */
+/**
+ * Deepest sub-schema nesting we will emit. Two independent ceilings meet here:
+ *
+ *  - ours: unbounded recursion on a circular schema overflows the stack and kills the
+ *    worker mid-turn, reproducing the zero-assistant-output signature this whole
+ *    ticket is about;
+ *  - Gemini's: the request 400s with `Message recursion depth exceeds maximum of 64`.
+ *    That budget is in PROTOBUF messages, not schema levels, and an object level costs
+ *    two of them (Schema -> properties entry -> Schema) where an array level costs one.
+ *    Measured against the live API: a 40-deep array chain is accepted, a 30-deep OBJECT
+ *    chain is not, and 25 is.
+ *
+ * 20 sits under the tighter (object) ceiling with margin, and is still far beyond any
+ * real tool schema — the deepest in this repo is single digits — so it only ever fires
+ * on a pathological or circular third-party MCP schema.
+ */
+const MAX_SCHEMA_DEPTH = 20;
+
 export const GEMINI_SCHEMA_KEYWORDS = new Set([
   'anyOf', 'default', 'description', 'enum', 'example', 'format', 'items',
   'maxItems', 'maxLength', 'maxProperties', 'maximum', 'minItems', 'minLength',
@@ -91,29 +109,47 @@ export const GEMINI_SCHEMA_KEYWORDS = new Set([
  * when the resolved type is not `array`. Claude/Bedrock accept the union, which is
  * why only gemini-3.5-flash runs failed.
  */
-export function sanitizeGeminiSchema(schema: any): any {
-  if (Array.isArray(schema)) return schema.map(sanitizeGeminiSchema);
+export function sanitizeGeminiSchema(schema: any, depth = 0, ancestors?: Set<any>): any {
+  // NOTE: the explicit arrow matters — `map(sanitizeGeminiSchema)` would pass the
+  // array INDEX as `depth`, silently truncating every member past the limit.
+  if (Array.isArray(schema)) return schema.map((entry) => sanitizeGeminiSchema(entry, depth, ancestors));
   if (!schema || typeof schema !== 'object') return schema;
+
+  // A schema reachable from itself recurses forever, as does a pathologically deep
+  // one; either would take down the worker with a stack overflow rather than a 400.
+  // JSON `$ref` can't produce this (it is stripped before we recurse), but a
+  // dereferenced or hand-built circular object can. Both cases TRUNCATE to a leaf:
+  // the node keeps its own keywords and loses only its children, which stays a valid
+  // schema instead of dropping the parameter outright.
+  const path = ancestors ?? new Set<any>();
+  const truncate = path.has(schema) || depth >= MAX_SCHEMA_DEPTH;
+  if (!truncate) path.add(schema);
+
   const out: any = {};
   for (const [key, value] of Object.entries(schema)) {
     if (!GEMINI_SCHEMA_KEYWORDS.has(key)) continue;
     if (key === 'properties') {
       // Keys here are parameter names, not keywords — recurse into the values only.
-      if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
+      if (truncate || !value || typeof value !== 'object' || Array.isArray(value)) continue;
       const properties: any = {};
-      for (const [name, sub] of Object.entries(value)) properties[name] = sanitizeGeminiSchema(sub);
+      for (const [name, sub] of Object.entries(value)) properties[name] = sanitizeGeminiSchema(sub, depth + 1, path);
       out.properties = properties;
     } else if (key === 'items') {
       // Gemini's `items` is a single Schema; a draft-07 tuple array 400s with
       // `Unknown name "0" at ...items`. Keep the first element so the parameter
       // stays usable instead of dropping the element schema outright.
-      out.items = sanitizeGeminiSchema(Array.isArray(value) ? value[0] : value);
+      if (truncate) continue;
+      out.items = sanitizeGeminiSchema(Array.isArray(value) ? value[0] : value, depth + 1, path);
     } else if (key === 'anyOf') {
-      out.anyOf = sanitizeGeminiSchema(value);
+      if (truncate) continue;
+      out.anyOf = sanitizeGeminiSchema(value, depth + 1, path);
     } else {
       out[key] = value;
     }
   }
+  // Leave the path as we found it so a schema object legitimately SHARED between two
+  // sibling branches is still expanded in both — only true ancestry counts as a cycle.
+  if (!truncate) path.delete(schema);
   if (Array.isArray(out.type)) {
     const members = out.type.filter((t: any) => typeof t === 'string');
     const nonNull = members.filter((t: string) => t !== 'null');
@@ -134,6 +170,16 @@ export function sanitizeGeminiSchema(schema: any): any {
       delete out.minItems;
       delete out.maxItems;
     }
+  }
+  // Gemini REQUIRES `items` on an array — `{ type: 'array' }` alone 400s the whole
+  // request with `properties[x].items: missing field`. Three paths can strip it: a
+  // degenerate tuple (`items: []`), a schema that declared `array` without `items` at
+  // all, and depth/cycle truncation above. Fall back to a string element rather than
+  // let one unusable parameter kill the turn — the model can still call the tool, and
+  // execute() validates against the ORIGINAL schema, so a wrong element type is
+  // rejected there rather than silently accepted.
+  if (out.type === 'array' && (!out.items || typeof out.items !== 'object' || Array.isArray(out.items))) {
+    out.items = { type: 'string' };
   }
   return out;
 }
