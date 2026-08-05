@@ -436,6 +436,18 @@ describe('WorkPlanService', () => {
       expect(rev).toBe('test-plan-id-789');
     });
 
+    it('propagates a genuine write failure instead of dressing it as a conflict', async () => {
+      // Only a failed precondition is interpreted. Anything else must surface
+      // as-is, or a throughput or permissions error would reach the caller as
+      // "someone else edited this" and send them into a pointless retry loop.
+      mockPromise.mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'));
+
+      await expect(
+        workPlanService.updateWorkPlan(plan, { expectedStepsRev: 'rev-1' }),
+      ).rejects.toThrow('ProvisionedThroughputExceededException');
+      expect(mockGet).not.toHaveBeenCalled();
+    });
+
     it('never REMOVEs steps_rev, which would strand every reader holding one', async () => {
       // It is minted here, not supplied by the caller, so it must not be treated
       // as an optional field the caller "cleared" by omitting it.
