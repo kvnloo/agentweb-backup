@@ -727,6 +727,13 @@ interface LLMCallOptions {
    * When omitted, usage is recorded under userId "system".
    */
   usageContext?: LLMUsageContext | null;
+  /**
+   * ENG-893: true when this call belongs to a machine-paced run (scheduled
+   * chats, loops) whose turns fire back-to-back. Such runs never idle past the
+   * default 5-minute prompt cache, so requesting the 1-hour TTL would only add
+   * its 2x write surcharge. Interactive sessions leave this false.
+   */
+  machinePaced?: boolean;
 }
 
 // Diagnosis agent configuration
@@ -1962,18 +1969,16 @@ export class AgentModeService {
     // Note: Newer Claude models require using inference profiles for cross-region access
     const actualModelId = resolveBedrockModelId(modelId);
 
-    // ENG-893: agent-mode conversations are human-paced, so the default
-    // 5-minute prompt-cache TTL expires between turns and the whole prefix is
-    // re-written at 1.25x input instead of read back at 0.1x. Ask for the
-    // 1-hour TTL on the models we have verified honour it. `undefined`
-    // (unlisted or non-Bedrock models) sends the bare block, i.e. today's
-    // 5-minute behaviour. Note Bedrock does NOT reject an unsupported `ttl`,
-    // so the allowlist guards against silent mispricing, not a hard failure.
-    const cacheTtl = bedrockCacheTtl(modelId);
-    // A fresh object per call site: the two checkpoints must not alias.
-    const cachePointBlock = () => ({
-      cachePoint: cacheTtl ? { type: 'default', ttl: cacheTtl } : { type: 'default' },
-    });
+    // ENG-893: human-paced conversations idle past the default 5-minute
+    // prompt-cache TTL between turns, re-writing the whole prefix at 1.25x
+    // input instead of reading it back at 0.1x. Ask for the 1-hour TTL on the
+    // models we have verified honour it. Bedrock does NOT reject an unsupported
+    // `ttl`, so the allowlist guards against silent mispricing, not a crash.
+    //
+    // Resolved PER CALL, never captured here: this client is memoised on the
+    // model registry and shared by every session in the process, so a TTL baked
+    // into the closure would leak one session's pacing to all the others.
+    const modelSupportsExtendedTtl = bedrockCacheTtl(modelId);
 
     // Create OpenAI-compatible wrapper using direct Converse API
     return {
@@ -1982,6 +1987,21 @@ export class AgentModeService {
           create: async (params: any) => {
             // Convert OpenAI messages to Bedrock Converse format
             const { system, messages } = AgentModeService.convertToBedrockConverse(params.messages);
+
+            // ENG-893: a 1-hour write costs 2x input where a 5-minute write
+            // costs 1.25x, and a cache HIT refreshes the TTL for free. So the
+            // extended TTL only pays for itself when turns are far enough apart
+            // to have expired the 5-minute window. Machine-paced runs (scheduled
+            // reports, loops) fire their turns back-to-back and never expire it,
+            // so asking for 1h there is a pure 60% surcharge on every write —
+            // measured at +43% of cache-write spend across the ten costliest
+            // scheduled sessions. This mirrors AWS's own guidance: keep the
+            // 5-minute cache for prompts reused more often than every 5 minutes.
+            const cacheTtl = params.machinePaced ? undefined : modelSupportsExtendedTtl;
+            // A fresh object per call site: the two checkpoints must not alias.
+            const cachePointBlock = () => ({
+              cachePoint: cacheTtl ? { type: 'default', ttl: cacheTtl } : { type: 'default' },
+            });
 
             // --- Prompt caching ---
             // Add cache point after system prompt (~3.5K tokens cached on every call)
@@ -2662,13 +2682,17 @@ export class AgentModeService {
       max_completion_tokens = null,
       temperature = null,
       response_format = { type: "text" },
-      usageContext = null
+      usageContext = null,
+      machinePaced = false
     } = options || {};
 
     const params: any = {
       model: model,
       messages: messages,
       response_format: response_format || { type: "text" },
+      // Consumed only by the Bedrock Converse wrapper's cache-TTL choice; other
+      // providers ignore it (ENG-893).
+      machinePaced,
     };
 
     // Only add tools and tool_choice if tools are provided
@@ -3542,7 +3566,9 @@ export class AgentModeService {
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
-            usageContext: { userId, sessionId, feature: 'agent_task' }
+            usageContext: { userId, sessionId, feature: 'agent_task' },
+            // ENG-893: scheduled runs are machine-paced — no 1-hour TTL.
+            machinePaced: isScheduledSession
           });
         } catch (callError) {
           if (isTransientLLMError(callError) && !backupModelUsed) {
@@ -3564,7 +3590,9 @@ export class AgentModeService {
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
-                usageContext: { userId, sessionId, feature: 'agent_task' }
+                usageContext: { userId, sessionId, feature: 'agent_task' },
+                // ENG-893: same pacing as the primary call it is retrying.
+                machinePaced: isScheduledSession
               });
             } else {
               recordSpanError(chatSpan, callError);

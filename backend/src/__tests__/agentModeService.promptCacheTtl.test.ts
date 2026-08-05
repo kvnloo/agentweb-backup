@@ -182,6 +182,46 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
       expect(lastBlockOfPivot(input)).toEqual({ cachePoint: { type: 'default' } });
     });
 
+    it('omits the 1h TTL for machine-paced runs, which never idle past 5 minutes', async () => {
+      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
+
+      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION, {
+        machinePaced: true,
+      });
+
+      // A 1h write costs 2x vs 1.25x, and a hit refreshes the TTL for free, so
+      // scheduled runs firing turns back-to-back would pay the surcharge and
+      // get nothing — measured at +43% of their cache-write spend.
+      const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
+      expect(input.system[input.system.length - 1]).toEqual({ cachePoint: { type: 'default' } });
+      expect(lastBlockOfPivot(input)).toEqual({ cachePoint: { type: 'default' } });
+    });
+
+    it('does not let one session\'s pacing leak into the next via the cached client', async () => {
+      const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
+
+      // The Bedrock client is memoised on the model registry and shared by every
+      // session in the process. Resolving the TTL when the client is BUILT would
+      // pin whichever pacing happened to construct it first.
+      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION, {
+        machinePaced: true,
+      });
+      const scheduled = (ConverseCommand as jest.Mock).mock.calls[0][0];
+
+      (ConverseCommand as jest.Mock).mockClear();
+      await (agentModeService as any).callLLM('anthropic.claude-opus-5', CONVERSATION, {
+        machinePaced: false,
+      });
+      const interactive = (ConverseCommand as jest.Mock).mock.calls[0][0];
+
+      expect(scheduled.system[scheduled.system.length - 1]).toEqual({
+        cachePoint: { type: 'default' },
+      });
+      expect(interactive.system[interactive.system.length - 1]).toEqual({
+        cachePoint: { type: 'default', ttl: '1h' },
+      });
+    });
+
     it('never mixes TTLs within one request (Bedrock requires longer TTLs first)', async () => {
       const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 
