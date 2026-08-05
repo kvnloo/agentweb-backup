@@ -224,10 +224,11 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
   });
 
   describe('CRM-forward', () => {
-    it('uses the explicitly configured booking_lead_list_id when set, skipping fallback resolution', async () => {
+    it('uses the explicitly configured booking_lead_list_id when the list still exists, skipping fallback resolution', async () => {
+      // 'list-1' is the id the shared getLeadListById mock resolves as existing (see beforeEach).
       const accountWithList = {
         ...mockAccount,
-        config: { ...mockAccount.config, booking_lead_list_id: 'list-explicit' },
+        config: { ...mockAccount.config, booking_lead_list_id: 'list-1' },
       };
       mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
 
@@ -239,7 +240,31 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
 
       expect(mockCreateLeadList).not.toHaveBeenCalled();
       expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
-      expect(mockCreateLead).toHaveBeenCalledWith('list-explicit', expect.objectContaining({ email: 'lead@example.com' }));
+      expect(mockCreateLead).toHaveBeenCalledWith('list-1', expect.objectContaining({ email: 'lead@example.com' }));
+    });
+
+    it('falls back to resolveOrCreateBookingList when the explicitly configured list no longer exists (gap 2)', async () => {
+      // 'list-deleted' isn't 'list-1', so the shared getLeadListById mock resolves it as
+      // not-found — simulating a list the customer picked, then later deleted.
+      const accountWithList = {
+        ...mockAccount,
+        config: { ...mockAccount.config, booking_lead_list_id: 'list-deleted' },
+      };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockCreateLeadList.mockResolvedValue({ listId: 'list-fresh' });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetLeadListById).toHaveBeenCalledWith('list-deleted');
+      expect(mockCreateLeadList).toHaveBeenCalledTimes(1);
+      expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+        USER_ID, 'calendly', mockAccount.account_id, { booking_lead_list_id: 'list-fresh' },
+      );
+      expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }));
     });
 
     it('falls back to resolveOrCreateBookingList and persists the result when no list is configured', async () => {
