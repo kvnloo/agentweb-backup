@@ -61,6 +61,37 @@ console.log('memoryPressureVictims');
   ok(r.victims.length === 0, 'at/below keep floor → no eviction');
 }
 
+// A backstop that cannot fire is dead code. Observed live on 2026-08-05 at 1858MB available against a
+// 3500MB floor: THREE previews up, all hit 4-9 minutes ago, so the flat 10-minute grace protected every
+// one of them and the reap chose nobody. That is not a rare alignment — the previews holding the memory
+// belong to the runs being actively chatted, so under real load lastHit is ALWAYS recent. The grace
+// period therefore has to shrink as the box gets hungrier, instead of holding absolutely.
+console.log('memoryPressureVictims — graduated grace period under critical pressure');
+{
+  // the exact live shape: everything touched inside the normal grace window
+  const recent = { a: { at: iso(9 * 60 * 1000) }, b: { at: iso(8 * 60 * 1000) }, c: { at: iso(4 * 60 * 1000) } };
+  const shaped = { now: NOW, state: recent, access: {}, chat: {}, keep: 1, minIdleMs: 10 * 60 * 1000 };
+
+  // mild pressure (below floor, above critical) → the 10-minute grace still holds, nothing is evicted
+  const mild = memoryPressureVictims(FLOOR, { ...shaped, mem: () => 3000, criticalMB: 2000, criticalMinIdleMs: 2 * 60 * 1000 });
+  ok(mild.victims.length === 0, 'below floor but above critical → full grace period holds, no eviction');
+
+  // critical pressure → grace shrinks to 2m, so the two older stacks become evictable, keep=1 respected
+  const crit = memoryPressureVictims(FLOOR, { ...shaped, mem: () => 1858, criticalMB: 2000, criticalMinIdleMs: 2 * 60 * 1000 });
+  ok(crit.victims.length === 2, 'at critical pressure → the shortened grace frees the two older stacks');
+  ok(ids(crit)[0] === 'a', 'still longest-idle first (a, 9m) — ordering unchanged');
+  ok(!ids(crit).includes('c'), 'the most recently touched stack (4m) survives: keep=1 plus oldest-first');
+
+  // the shortened grace is a floor, not a free-for-all: something touched seconds ago is still protected
+  const justNow = { x: { at: iso(30 * 1000) }, y: { at: iso(20 * 1000) }, z: { at: iso(10 * 1000) } };
+  const none = memoryPressureVictims(FLOOR, { now: NOW, state: justNow, access: {}, chat: {}, keep: 1, minIdleMs: 10 * 60 * 1000, mem: () => 500, criticalMB: 2000, criticalMinIdleMs: 2 * 60 * 1000 });
+  ok(none.victims.length === 0, 'critical pressure still never evicts a preview touched seconds ago');
+
+  // default: no criticalMB configured → behaviour is exactly the pre-existing flat grace
+  const off = memoryPressureVictims(FLOOR, { ...shaped, mem: () => 100 });
+  ok(off.victims.length === 0, 'criticalMB unset → unchanged flat-grace behaviour (opt-in escalation)');
+}
+
 console.log('availMemMB');
 {
   const sample = 'MemTotal:       32000000 kB\nMemFree:          200000 kB\nMemAvailable:    3600000 kB\n';
