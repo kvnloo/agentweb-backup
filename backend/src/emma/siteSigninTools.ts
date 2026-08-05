@@ -81,6 +81,91 @@ function findPlaywrightTool(service: any, suffix: string): string | null {
   return null;
 }
 
+// MCP tool calls have no transport-level timeout (mcpClientService.ts) — reading
+// page.url() is instant, so bound it explicitly rather than let a hung call
+// stall the sign-in.
+const CURRENT_URL_PROBE_TIMEOUT_MS = 8000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
+/** Pull the value out of an MCP result ("### Result\n\"…\"" markdown wrapper). */
+function extractMcpText(result: any): string {
+  if (typeof result === 'string') return result;
+  const contentArray = Array.isArray(result?.raw?.content) ? result.raw.content : null;
+  const text = contentArray
+    ? contentArray.filter((c: any) => c.type === 'text').map((c: any) => c.text).join('\n')
+    : String(result?.content ?? result ?? '');
+  const match = text.match(/^###\s+Result\s*\n([\s\S]*?)(?:\n###\s|$)/i);
+  const raw = match ? match[1].trim() : text.trim();
+  if (raw.startsWith('"') && raw.endsWith('"')) {
+    try { return JSON.parse(raw); } catch { /* use as-is */ }
+  }
+  return raw;
+}
+
+/** True when `host` is the domain itself or a subdomain of it — never a lookalike. */
+function hostBelongsTo(host: string, domain: string): boolean {
+  const h = host.toLowerCase();
+  const d = domain.toLowerCase();
+  return h === d || h.endsWith(`.${d}`);
+}
+
+type PageCheck = { ok: true } | { ok: false; currentHost: string };
+
+/**
+ * Refuse to navigate a browser that is in the middle of something else.
+ *
+ * This is a foundation tool, so it is offered in every session — including ones
+ * driving the browser on an unrelated site. Yanking that browser to a sign-in
+ * page would be visibly wrong. The legitimate case always has the browser
+ * already ON the site (you got redirected to its /signin), so requiring that is
+ * precise rather than restrictive.
+ *
+ * Fails OPEN — if the page cannot be read (no run_code tool, blank page, probe
+ * error or timeout) the sign-in proceeds. The asymmetry is deliberate: wrongly
+ * refusing breaks the scheduled report this tool exists to fix, while wrongly
+ * allowing navigates a page. There is nothing to disrupt on a blank page anyway.
+ */
+async function checkBrowserIsOnSite(context: any, userId: string, domain: string): Promise<PageCheck> {
+  const runCodeTool = findPlaywrightTool(context?.service, 'browser_run_code');
+  if (!runCodeTool) return { ok: true };
+
+  let currentUrl = '';
+  try {
+    const result = await withTimeout(
+      context.service.executeTool(
+        context.llmModel,
+        runCodeTool,
+        { code: 'async (page) => page.url()' },
+        userId,
+        context.sessionId
+      ),
+      CURRENT_URL_PROBE_TIMEOUT_MS,
+      'Current-page probe'
+    );
+    currentUrl = extractMcpText(result);
+  } catch (error: any) {
+    console.warn(`[open_site_signin] Could not read the current page (${error?.message || error}) — proceeding.`);
+    return { ok: true };
+  }
+
+  if (!currentUrl || !/^https?:\/\//i.test(currentUrl)) return { ok: true }; // about:blank / no page
+
+  let host: string;
+  try {
+    host = new URL(currentUrl).hostname;
+  } catch {
+    return { ok: true };
+  }
+
+  return hostBelongsTo(host, domain) ? { ok: true } : { ok: false, currentHost: host };
+}
+
 /** Remove every occurrence of a secret value from a string. */
 function redact(value: string, secrets: string[]): string {
   return secrets.reduce(
@@ -155,6 +240,19 @@ emmaToolRegistry.register({
       return {
         success: false,
         error: 'Playwright browser tools are not available — no active browser session to open the sign-in page in.',
+      };
+    }
+
+    const pageCheck = await checkBrowserIsOnSite(context, userId, profile.domain);
+    if (!pageCheck.ok) {
+      return {
+        success: false,
+        reason: 'browser_on_other_site',
+        error:
+          `The browser is currently on ${pageCheck.currentHost}, not ${profile.domain}. ` +
+          `This tool only opens the ${profile.domain} sign-in page when the browser is already there — ` +
+          `it will not navigate away from work in progress. If you do mean to sign in to ${profile.domain}, ` +
+          'navigate there first and call this again.',
       };
     }
 
