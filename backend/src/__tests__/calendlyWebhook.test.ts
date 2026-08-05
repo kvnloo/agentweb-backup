@@ -223,6 +223,18 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     expect(event.email).toBe('lead@example.com');
   });
 
+  it('sends "Schedule" as the CAPI event name, not the default "Lead" (PRD §6 step 3, matches ENG-522)', async () => {
+    const body = makePayload({ email: 'lead@example.com' });
+    const res = await postSigned(body);
+
+    expect(res.status).toBe(200);
+    await flushPromises();
+
+    expect(mockSendCapiLeadEvent).toHaveBeenCalledTimes(1);
+    const [, , event] = mockSendCapiLeadEvent.mock.calls[0];
+    expect(event.eventName).toBe('Schedule');
+  });
+
   describe('CRM-forward', () => {
     it('uses the explicitly configured booking_lead_list_id when the list still exists, skipping fallback resolution', async () => {
       // 'list-1' is the id the shared getLeadListById mock resolves as existing (see beforeEach).
