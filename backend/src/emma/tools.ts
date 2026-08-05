@@ -1,4 +1,5 @@
 import { agentModeService } from '../services/agentModeService';
+import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
@@ -906,12 +907,17 @@ emmaToolRegistry.register({
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
-  AD_CREATIVE   → LIST, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
+  AD_CREATIVE   → LIST, GET, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
   AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
   DATASET       → LIST, GET_MATCH_QUALITY
+
+AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including asset_feed_spec.
+  LIST is account-wide, capped, and omits asset_feed_spec, so it cannot tell you what a specific
+  creative actually contains. Use GET to verify a creative you just built or swapped onto an ad, and
+  to read a placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
 
 READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimize for (use to verify after a CREATE/UPDATE):
   AD_SET LIST returns optimization_goal, billing_event, destination_type, promoted_object (pixel_id + custom_event_type), bid_strategy, and budgets per ad set. Pass ad_set_id to read a single ad set; pass campaign_id to scope to one campaign's ad sets.
@@ -1048,7 +1054,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "GET", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -1407,13 +1413,10 @@ emmaToolRegistry.register({
   },
   execute: async (args, context) => {
     // Backward-compatible normalization: accept legacy campaign_id or string campaign_ids.
-    const normalizedCampaignIds = Array.isArray(args.campaign_ids)
-      ? args.campaign_ids
-      : (typeof args.campaign_ids === 'string' && args.campaign_ids.trim())
-        ? [args.campaign_ids.trim()]
-        : (typeof args.campaign_id === 'string' && args.campaign_id.trim())
-          ? [args.campaign_id.trim()]
-          : [];
+    const normalizedCampaignIds = normalizeMetaCampaignIds(
+      args.campaign_ids,
+      args.campaign_id,
+    );
 
     return await agentModeService.getMetaAdsMetrics(
       args.timeframe || '7d',
@@ -6379,6 +6382,7 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
+          maxLength: 2000,
           description: 'The fact to remember (max 2000 chars). Be specific and actionable.'
         },
         category: {

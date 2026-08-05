@@ -9,6 +9,18 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-08-05',
+    changes: [
+      'Fixed: Amending One Step of a Work Plan No Longer Deletes the Others',
+      '- Updating a work plan through the Claude connector replaced the entire list of steps with whatever was sent, so editing a single step could silently drop every other one — a seven-step plan could become a one-step plan with no warning, and no way back unless you still had the original to hand',
+      '- You can now amend individual steps and leave the rest untouched, and an update that would remove steps — or blank out settings on the steps it keeps — is refused until you confirm you meant it',
+      '- Any update that changes steps now comes back with a summary of what changed, so a removal cannot pass unnoticed',
+      'Fixed: Two People Editing the Same Work Plan No Longer Overwrite Each Other',
+      '- Saving in the Work Plans editor wrote back the version loaded when you opened it, so a save could quietly undo a change someone made in the meantime — including one Emma made',
+      '- A save built on an out-of-date copy is now refused, and your edits stay in the dialog so you can carry them across to the current version',
+    ],
+  },
+  {
     date: '2026-08-04',
     changes: [
       'Fixed: A Scheduled Run Interrupted by a Deployment Now Says So',
