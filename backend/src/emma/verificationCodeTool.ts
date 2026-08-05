@@ -121,6 +121,27 @@ export function senderDomain(from: unknown): string | null {
   return match ? match[1].toLowerCase() : null;
 }
 
+/**
+ * Does this message's From satisfy the caller's sender filter?
+ *
+ * A bare substring test is too loose when the filter is a domain: "rankai.ai"
+ * appears in `no-reply@rankai.ai.evil.example.com`, so a lookalike sender would
+ * pass the filter and get its content treated as the expected email. When the
+ * filter looks like a domain it is matched against the parsed sender domain
+ * (exact or subdomain); anything else (a full address, a display name) keeps the
+ * substring behaviour.
+ */
+export function senderMatches(from: unknown, filter?: string): boolean {
+  if (!filter) return true;
+  const wanted = filter.toLowerCase().trim();
+  const looksLikeDomain = !wanted.includes('@') && /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(wanted);
+  if (looksLikeDomain) {
+    const domain = senderDomain(from);
+    return domain === wanted || Boolean(domain?.endsWith(`.${wanted}`));
+  }
+  return String(from ?? '').toLowerCase().includes(wanted);
+}
+
 /** Clamp the caller's wait into [0, MAX_WAIT_SECONDS]; non-numeric → the default. */
 export function resolveWaitSeconds(raw: unknown): number {
   // Number(null) is 0 and Number('') is 0 — neither means "wait zero seconds",
@@ -185,8 +206,9 @@ emmaToolRegistry.register({
         link_host: {
           type: 'string',
           description:
-            'return_link only — the domain the sign-in link must be on (e.g. "lu.ma"). ' +
-            'Defaults to the sender\'s domain; set it when a service mails from one domain and links to another.',
+            'REQUIRED with return_link — the domain the sign-in link must be on (e.g. "lu.ma"). ' +
+            'It is not inferred from the email: the expected domain has to come from you, or a spoofed sender would ' +
+            'choose where you get sent. A link pointing anywhere else is ignored, not returned.',
         },
         search_query: {
           type: 'string',
@@ -309,7 +331,7 @@ emmaToolRegistry.register({
       const summaries = [...byId.values()];
 
       const matched = (summaries || []).filter(
-        (email: any) => contains(email?.subject, args?.subject_contains) && contains(email?.from, args?.from_contains)
+        (email: any) => contains(email?.subject, args?.subject_contains) && senderMatches(email?.from, args?.from_contains)
       );
       const arrival = partitionByArrival(matched, { since, invokedAt });
       // A message that predates this call is only acceptable when the CALLER
@@ -352,13 +374,22 @@ emmaToolRegistry.register({
           let magicLink: string | null = null;
           let linkOmitted: string | undefined;
           if (returnLink) {
-            const allowedHost = linkHost || senderDomain(detail.from ?? summary?.from) || undefined;
-            magicLink = allowedHost ? extractMagicLink(detail.body, { allowedHost }) : null;
-            if (!magicLink) {
-              linkOmitted = allowedHost
-                ? `No sign-in link on ${allowedHost} was found in the email. Any other link in it was ignored — ` +
-                  'pass link_host if this sender links to a different domain.'
-                : 'The sender could not be identified, so no link was returned. Pass link_host to name the expected domain.';
+            if (!linkHost) {
+              // The expected host must come from the CALLER, never from the
+              // message: an attacker who gets one email past the filters would
+              // otherwise define its own trusted origin and have the agent
+              // navigate there (Greptile P1, security).
+              linkOmitted =
+                'No link was returned because link_host was not supplied. The expected domain must come from you, ' +
+                'not from the email — otherwise a spoofed sender chooses where you get sent. ' +
+                'Call again with link_host set to the domain the sign-in link should be on.';
+            } else {
+              magicLink = extractMagicLink(detail.body, { allowedHost: linkHost });
+              if (!magicLink) {
+                linkOmitted =
+                  `No sign-in link on ${linkHost} was found in the email — any link pointing elsewhere was ignored, ` +
+                  'not returned.';
+              }
             }
           }
 

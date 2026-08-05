@@ -19,7 +19,7 @@ jest.mock('../../services/emailProviderService', () => ({
   EmailProviderError: class EmailProviderError extends Error {},
 }));
 
-import { resolveWaitSeconds, partitionByArrival, senderDomain } from '../../emma/verificationCodeTool';
+import { resolveWaitSeconds, partitionByArrival, senderDomain, senderMatches } from '../../emma/verificationCodeTool';
 import { emmaToolRegistry } from '../../emma/registry';
 
 const tool = emmaToolRegistry.getTool('read_verification_code');
@@ -131,6 +131,30 @@ describe('senderDomain', () => {
   it('returns null when there is no parseable address', () => {
     expect(senderDomain('RankAI Support')).toBeNull();
     expect(senderDomain(undefined)).toBeNull();
+  });
+});
+
+// A domain filter must be matched as a domain: "rankai.ai" is a substring of
+// no-reply@rankai.ai.evil.example.com, so a lookalike sender would otherwise
+// pass the filter and have its content read as the expected email.
+describe('senderMatches', () => {
+  it('accepts the exact sender domain and its subdomains', () => {
+    expect(senderMatches('RankAI <no-reply@rankai.ai>', 'rankai.ai')).toBe(true);
+    expect(senderMatches('RankAI <no-reply@mail.rankai.ai>', 'rankai.ai')).toBe(true);
+  });
+
+  it('rejects a lookalike domain that merely contains the filter', () => {
+    expect(senderMatches('RankAI <no-reply@rankai.ai.evil.example.com>', 'rankai.ai')).toBe(false);
+    expect(senderMatches('RankAI <no-reply@notrankai.ai>', 'rankai.ai')).toBe(false);
+  });
+
+  it('keeps substring behaviour for a full address or a display name', () => {
+    expect(senderMatches('Founders <founders@agentweb.pro>', 'founders@agentweb.pro')).toBe(true);
+    expect(senderMatches('RankAI Support <x@example.com>', 'RankAI')).toBe(true);
+  });
+
+  it('matches everything when no filter is given', () => {
+    expect(senderMatches('anyone@anywhere.test', undefined)).toBe(true);
   });
 });
 
@@ -384,28 +408,48 @@ describe('read_verification_code — success paths', () => {
     );
   });
 
-  it('returns the magic link alongside the code when the link is on the sender\'s domain', async () => {
+  it('returns the magic link when the caller names the host it must be on', async () => {
     mockListEmails.mockResolvedValue([summary({ from: 'RankAI <no-reply@rankai.ai>' })]);
     mockGetEmails.mockResolvedValue([
       { id: 'msg-1', from: 'RankAI <no-reply@rankai.ai>', body: 'Code 366990 or <a href="https://rankai.ai/api/auth/callback?token=xyz">sign in</a>' },
     ]);
 
-    const result = await tool.execute({ return_link: true, wait_seconds: 0 }, context);
+    const result = await tool.execute(
+      { return_link: true, link_host: 'rankai.ai', wait_seconds: 0 },
+      context
+    );
 
     expect(result.success).toBe(true);
     expect(result.magic_link).toBe('https://rankai.ai/api/auth/callback?token=xyz');
   });
 
+  // Greptile P1 (security): the trusted origin must not come from the message.
+  // A spoofed sender would otherwise nominate its own domain and get the agent
+  // to navigate there.
+  it('returns no link at all when the caller has not named the expected host', async () => {
+    mockListEmails.mockResolvedValue([summary({ from: 'RankAI <no-reply@rankai.ai>' })]);
+    mockGetEmails.mockResolvedValue([
+      { id: 'msg-1', from: 'RankAI <no-reply@rankai.ai>', body: 'Code 366990 <a href="https://rankai.ai/auth?token=xyz">sign in</a>' },
+    ]);
+
+    const result = await tool.execute({ return_link: true, wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(true);
+    expect(result.code).toBe('366990');
+    expect(result.magic_link).toBeUndefined();
+    expect(result.link_omitted).toMatch(/link_host/);
+  });
+
   // Greptile P1 (security): anyone can email you a message matching the filters.
   // A link in it must not be handed back as "the login link" just because it
   // carries a token= or /auth marker.
-  it('does not hand back a login link pointing somewhere other than the sender', async () => {
+  it('does not hand back a login link pointing somewhere other than the named host', async () => {
     mockListEmails.mockResolvedValue([summary({ from: 'RankAI <no-reply@rankai.ai>' })]);
     mockGetEmails.mockResolvedValue([
       { id: 'msg-1', from: 'RankAI <no-reply@rankai.ai>', body: 'Code 366990 <a href="https://evil.example.com/auth?token=xyz">sign in</a>' },
     ]);
 
-    const result = await tool.execute({ return_link: true, wait_seconds: 0 }, context);
+    const result = await tool.execute({ return_link: true, link_host: 'rankai.ai', wait_seconds: 0 }, context);
 
     expect(result.success).toBe(true);
     expect(result.code).toBe('366990');
