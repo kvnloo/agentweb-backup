@@ -309,6 +309,65 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
     });
   });
 
+  describe('idleGapBeforeLatestTurnMs — the pause that justifies the surcharge', () => {
+    // REGRESSION GUARD. This was first implemented off `session.updatedAt` and
+    // it silently disabled the whole feature: the controller saves the incoming
+    // user message (bumping updatedAt) and reloads the session BEFORE the loop
+    // runs, so the measured gap was always ~0 and the 1-hour TTL was never once
+    // requested. Every unit test still passed — only a real browser session
+    // caught it. Hence: measure from the message history.
+    const at = (iso: string, role: string, extra: any = {}) => ({ role, content: 'x', timestamp: iso, ...extra });
+
+    it('measures from the previous message, not from "now"', () => {
+      const gap = AgentModeService.idleGapBeforeLatestTurnMs([
+        at('2026-08-05T10:00:00.000Z', 'user'),
+        at('2026-08-05T10:00:30.000Z', 'assistant'),
+        at('2026-08-05T10:12:00.000Z', 'user'), // user paused 11m30s
+      ]);
+      expect(gap).toBe(11.5 * 60 * 1000);
+    });
+
+    it('falls back to the nearest earlier timestamped message', () => {
+      // Assistant turns often carry their time on metadata, or not at all.
+      const gap = AgentModeService.idleGapBeforeLatestTurnMs([
+        at('2026-08-05T10:00:00.000Z', 'user'),
+        { role: 'assistant', content: 'no timestamp' },
+        { role: 'tool', content: 'r', metadata: { timestamp: '2026-08-05T10:01:00.000Z' } },
+        at('2026-08-05T10:20:00.000Z', 'user'),
+      ]);
+      expect(gap).toBe(19 * 60 * 1000);
+    });
+
+    it('returns 0 for a first turn — no pause to reward', () => {
+      expect(AgentModeService.idleGapBeforeLatestTurnMs([at('2026-08-05T10:00:00.000Z', 'user')])).toBe(0);
+      expect(AgentModeService.idleGapBeforeLatestTurnMs([])).toBe(0);
+      expect(AgentModeService.idleGapBeforeLatestTurnMs(undefined)).toBe(0);
+    });
+
+    it('returns 0 rather than NaN when timestamps are missing or unparseable', () => {
+      expect(
+        AgentModeService.idleGapBeforeLatestTurnMs([
+          { role: 'user', content: 'a' },
+          { role: 'user', content: 'b' },
+        ])
+      ).toBe(0);
+      expect(
+        AgentModeService.idleGapBeforeLatestTurnMs([
+          at('nonsense', 'user'),
+          at('2026-08-05T10:00:00.000Z', 'user'),
+        ])
+      ).toBe(0);
+    });
+
+    it('never returns a negative gap if clocks disagree', () => {
+      const gap = AgentModeService.idleGapBeforeLatestTurnMs([
+        at('2026-08-05T10:10:00.000Z', 'user'),
+        at('2026-08-05T10:00:00.000Z', 'user'),
+      ]);
+      expect(gap).toBe(0);
+    });
+  });
+
   describe('who actually pays for the 1-hour TTL', () => {
     // The surcharge is only worth paying when the prefix will be re-read AFTER
     // the 5-minute window would have lapsed. These are the four populations.

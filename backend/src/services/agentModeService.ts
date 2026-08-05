@@ -3280,23 +3280,19 @@ export class AgentModeService {
       // A 1h cache write costs 2x input where a 5m write costs 1.25x, and a
       // cache HIT refreshes the TTL for free — so the extra 0.75x only pays for
       // itself if the prefix is re-read after the 5-minute window would have
-      // expired. Session TYPE is a poor proxy for that: it correctly excludes
-      // scheduled runs, but still charges the surcharge to a fast back-and-forth
-      // chat and to a one-turn session that writes the cache and ends, neither
-      // of which ever collects the benefit.
+      // lapsed. Session TYPE is a poor proxy: it correctly excludes scheduled
+      // runs, but still charges the surcharge to a fast back-and-forth chat and
+      // to a one-turn session that writes the cache and ends, neither of which
+      // ever collects the benefit.
       //
-      // The honest signal is the pacing the user has actually shown. `updatedAt`
-      // is written only when a message lands, so it is the true time of the last
-      // message; the gap between it and now is exactly how long this user just
-      // took to reply. Someone who has paused once is likely to pause again,
-      // whereas a first turn (gap ~0) and a rapid reply both indicate a prefix
-      // that will be re-read well inside five minutes — or not at all.
-      const msSinceLastMessage = currentSession?.updatedAt
-        ? Date.now() - Date.parse(currentSession.updatedAt)
-        : 0;
-      const userJustPaused =
-        Number.isFinite(msSinceLastMessage) && msSinceLastMessage > PROMPT_CACHE_DEFAULT_TTL_MS;
-      const humanPacedTurn = !isScheduledSession && userJustPaused;
+      // The signal is how long the user actually took to send THIS message,
+      // measured from the message history. Do NOT use `session.updatedAt`: the
+      // controller persists the incoming user message (bumping updatedAt) and
+      // reloads the session BEFORE handing it to this loop, so that gap is
+      // always ~0 and the extended TTL would never be requested at all.
+      const idleGapMs = AgentModeService.idleGapBeforeLatestTurnMs(sessionHistory);
+      const humanPacedTurn =
+        !isScheduledSession && idleGapMs > PROMPT_CACHE_DEFAULT_TTL_MS;
       // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
       // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
       // human withholding information. The anti-loop remedy cannot satisfy a tool call
@@ -5539,6 +5535,41 @@ export class AgentModeService {
    * tools are already allowed is free. Callers log the difference so we can
    * find out how often each case really happens.
    */
+  /**
+   * How long the user took before sending the newest message, in ms, derived
+   * from the message history (ENG-893).
+   *
+   * Measured from history rather than `session.updatedAt` on purpose: the
+   * controller saves the incoming user message and reloads the session before
+   * the loop runs, so updatedAt reflects the message that just arrived, not the
+   * one before it. Returns 0 when there is no earlier timestamped message —
+   * a first turn has no pause to reward.
+   */
+  public static idleGapBeforeLatestTurnMs(history: ReadonlyArray<any> | undefined): number {
+    if (!Array.isArray(history) || history.length < 2) return 0;
+    const stamp = (m: any): number => {
+      const raw = m?.timestamp || m?.metadata?.timestamp;
+      const t = raw ? Date.parse(raw) : NaN;
+      return Number.isFinite(t) ? t : NaN;
+    };
+    // Newest user message = the turn being answered now.
+    let latestIdx = -1;
+    for (let i = history.length - 1; i >= 0; i--) {
+      if (history[i]?.role === 'user' && Number.isFinite(stamp(history[i]))) {
+        latestIdx = i;
+        break;
+      }
+    }
+    if (latestIdx <= 0) return 0;
+    for (let j = latestIdx - 1; j >= 0; j--) {
+      const prev = stamp(history[j]);
+      if (Number.isFinite(prev)) {
+        return Math.max(0, stamp(history[latestIdx]) - prev);
+      }
+    }
+    return 0;
+  }
+
   public static diffToolSets(
     previous: ReadonlySet<string>,
     next: ReadonlySet<string>
