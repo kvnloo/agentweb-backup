@@ -267,6 +267,37 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }));
     });
 
+    // Confirmed live: crmDb.createLead's list-metadata update has no attribute_exists
+    // guard, so writing a lead against a deleted listId partially RESURRECTS a ghost
+    // record there — fieldNames/leadCount/listId/updatedAt only, no userId or name.
+    // A naive truthiness check on getLeadListById's result is fooled by this ghost
+    // and never falls back. Must check ownership (userId), not just existence.
+    it('falls back to resolveOrCreateBookingList when the configured list is a userId-less ghost record', async () => {
+      const accountWithList = {
+        ...mockAccount,
+        config: { ...mockAccount.config, booking_lead_list_id: 'list-ghost' },
+      };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetLeadListById.mockImplementation((id: string) => {
+        if (id === 'list-1') return Promise.resolve({ listId: 'list-1', userId: USER_ID, name: 'Test List', alertEvents: ['api.lead_added', 'api.lead_updated'] });
+        if (id === 'list-ghost') return Promise.resolve({ listId: 'list-ghost', fieldNames: [], leadCount: 1, updatedAt: '2026-01-01T00:00:00Z' }); // no userId, no name
+        return Promise.resolve(null);
+      });
+      mockCreateLeadList.mockResolvedValue({ listId: 'list-fresh' });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockCreateLeadList).toHaveBeenCalledTimes(1);
+      expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+        USER_ID, 'calendly', mockAccount.account_id, { booking_lead_list_id: 'list-fresh' },
+      );
+      expect(mockCreateLead).toHaveBeenCalledWith('list-fresh', expect.objectContaining({ email: 'lead@example.com' }));
+    });
+
     it('falls back to resolveOrCreateBookingList and persists the result when no list is configured', async () => {
       mockCreateLeadList.mockResolvedValue({ listId: 'list-auto-created' });
 
