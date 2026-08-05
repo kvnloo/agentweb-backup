@@ -553,17 +553,27 @@ mcpToolRegistry.register({
         if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
-        // ENG-827: the agent may only ever REVOKE unattended-publish consent, never
-        // grant it. Granting means irreversible public posts the owner never saw, so
-        // it requires a deterministic owner action (the portal checkbox) — a model
-        // setting a boolean from its reading of a conversation is not that. Only a
-        // literal `true` revokes; nothing here can ever send `true` for the grant.
-        if (args.revoke_autopublish === true) body.autopublishAuthorized = false;
         if (args.run_count !== undefined) body.runCount = args.run_count;
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
         const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
+
+        // ENG-827: consent changes do NOT travel on the generic update body — that
+        // route deliberately preserves the stored value so no broad update can grant
+        // publishing, which means a revoke sent there would be silently dropped.
+        // Route it to the dedicated consent endpoint instead. The agent may only
+        // ever REVOKE (`authorized: false`); granting requires the owner's own
+        // action, so no argument here can produce a grant.
+        if (args.revoke_autopublish === true) {
+          const consent = await mcpFetch({
+            method: 'POST',
+            path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/publish-consent`,
+            context: c,
+            body: { authorized: false },
+          });
+          return jsonResult({ ...(data as any), publishConsent: consent });
+        }
         return jsonResult(data);
       }
       case 'toggle': {
