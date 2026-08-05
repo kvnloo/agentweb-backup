@@ -928,5 +928,21 @@ else
   printf "      Rename both together, or the backend-suite requirement blocks every backend PR.\n"
 fi
 
+# Two jobs sharing a per-PR concurrency group cancel each other, which is the
+# problem ENG-915 design wrinkle 4 warns must not come back: the reorder means
+# `greptile-review` now decides whether the suite runs at all, so a group
+# collision involving it would silently cancel the tests rather than merely
+# delay them. Distinct groups are what let these jobs run in the same workflow
+# without racing, so assert every group is unique.
+TESTS_RUN=$((TESTS_RUN + 1))
+dupe_group="$(grep '^      group:' "${WORKFLOW}" | sort | uniq -d)"
+if [ -z "${dupe_group}" ]; then
+  printf "ok    invariant: every job's concurrency group is unique (ENG-915 AC5)\n"
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf "FAIL  invariant: two jobs share a concurrency group, so they will cancel each other:\n"
+  printf "      %s\n" "${dupe_group}"
+fi
+
 printf '\n%s tests, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ]
