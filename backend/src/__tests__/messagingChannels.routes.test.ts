@@ -116,12 +116,48 @@ describe('PUT /whatsapp', () => {
     expect(res.status).toBe(400);
   });
 
-  it('preserves the existing Slack channel when adding WhatsApp', async () => {
+  it('does NOT copy a legacy Slack channel into messagingChannels', async () => {
+    // Greptile P1. Persisting the normalized list would write the user's CURRENT
+    // Slack destination in as an explicit entry, and an explicit entry outranks the
+    // legacy field — so a later admin re-mapping of their Slack channel would be
+    // silently ignored and notifications would keep going to the old channel.
+    // Configuring WhatsApp must not freeze Slack routing.
     await request(app)
       .put('/api/messaging-channels/whatsapp')
       .send({ phone: '+14155550123', optIn: true });
     const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
-    expect(saved.find((c: any) => c.channel === 'slack')?.destination).toBe('C1');
+    expect(saved.some((c: any) => c.channel === 'slack')).toBe(false);
+    expect(saved).toHaveLength(1);
+  });
+
+  it('leaves a legacy Slack user still resolvable on Slack after adding WhatsApp', async () => {
+    // The other half of the same guarantee: not persisting Slack must not mean
+    // losing it. It still resolves through the legacy field at read time.
+    await request(app)
+      .put('/api/messaging-channels/whatsapp')
+      .send({ phone: '+14155550123', optIn: true });
+    const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      slackChannels: ['C-remapped-by-admin'],
+      messagingChannels: saved,
+    });
+    const res = await request(app).get('/api/messaging-channels');
+    const slack = res.body.channels.find((c: any) => c.channel === 'slack');
+    // The admin's NEW channel, not the one present when WhatsApp was configured.
+    expect(slack.destination).toBe('C-remapped-by-admin');
+  });
+
+  it('preserves an explicitly-configured non-WhatsApp entry', async () => {
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      messagingChannels: [{ channel: 'slack', destination: 'C-explicit', enabled: true }],
+    });
+    await request(app)
+      .put('/api/messaging-channels/whatsapp')
+      .send({ phone: '+14155550123', optIn: true });
+    const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
+    expect(saved.find((c: any) => c.channel === 'slack')?.destination).toBe('C-explicit');
   });
 
   it('replaces an existing WhatsApp entry rather than adding a second', async () => {
@@ -147,17 +183,32 @@ describe('PUT /whatsapp', () => {
 });
 
 describe('DELETE /whatsapp', () => {
-  it('removes the WhatsApp entry and keeps the others', async () => {
+  it('removes the WhatsApp entry and keeps explicitly-configured others', async () => {
     userDb.getUserById.mockResolvedValue({
       userId: 'u1',
-      slackChannels: ['C1'],
-      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
+      messagingChannels: [
+        { channel: 'slack', destination: 'C-explicit', enabled: true },
+        { channel: 'whatsapp', destination: '+14155550123', enabled: true },
+      ],
     });
     const res = await request(app).delete('/api/messaging-channels/whatsapp');
     expect(res.status).toBe(200);
     const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
     expect(saved.some((c: any) => c.channel === 'whatsapp')).toBe(false);
     expect(saved.some((c: any) => c.channel === 'slack')).toBe(true);
+  });
+
+  it('does not pin a legacy Slack destination as a side effect of removing WhatsApp', async () => {
+    // Same Greptile P1 as the PUT path: removing WhatsApp must not write the
+    // current Slack destination in as an explicit entry.
+    userDb.getUserById.mockResolvedValue({
+      userId: 'u1',
+      slackChannels: ['C1'],
+      messagingChannels: [{ channel: 'whatsapp', destination: '+14155550123', enabled: true }],
+    });
+    await request(app).delete('/api/messaging-channels/whatsapp');
+    const saved = userDb.updateUser.mock.calls[0][1].messagingChannels;
+    expect(saved).toEqual([]);
   });
 
   it('is a no-op-shaped success when no WhatsApp entry exists', async () => {

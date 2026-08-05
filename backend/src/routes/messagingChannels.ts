@@ -20,6 +20,21 @@ import { toE164, isOptedOut } from '../services/whatsappService';
 
 const router = express.Router();
 
+/**
+ * The channels a user has EXPLICITLY configured, with nothing inferred.
+ *
+ * The read path (GET, and every notification sender) uses normalizeUserChannels,
+ * which folds the legacy slackChannel / slackChannels fields in so Slack-only users
+ * resolve correctly. The WRITE path must not: persisting a normalized list would copy
+ * the user's current Slack destination into an explicit entry, and an explicit entry
+ * outranks the legacy field — freezing their Slack routing at whatever it happened to
+ * be the day they configured WhatsApp.
+ */
+const explicitChannels = (user: any): any[] =>
+  (Array.isArray(user?.messagingChannels) ? user.messagingChannels : []).filter(
+    (c: any) => c && typeof c.channel === 'string' && typeof c.destination === 'string' && c.destination,
+  );
+
 /** GET / — the caller's configured channels, including legacy Slack, normalized. */
 router.get('/', authenticateToken, async (req: any, res: any) => {
   try {
@@ -72,8 +87,13 @@ router.put('/whatsapp', authenticateToken, async (req: any, res: any) => {
     const user = await userDb.getUserById(req.user.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Replace any existing WhatsApp entry; keep every other channel untouched.
-    const others = normalizeUserChannels(user).filter((c) => c.channel !== 'whatsapp');
+    // Persist only EXPLICITLY-configured channels — deliberately not
+    // normalizeUserChannels(), which materializes the legacy slackChannel /
+    // slackChannels fields into explicit entries. Writing those back would freeze the
+    // user's current Slack destination: an explicit entry outranks the legacy field,
+    // so a later admin re-mapping of their Slack channel would be silently ignored and
+    // notifications would keep going to the old channel. Legacy stays legacy.
+    const others = explicitChannels(user).filter((c) => c.channel !== 'whatsapp');
     const messagingChannels = [
       ...others,
       {
@@ -108,7 +128,9 @@ router.delete('/whatsapp', authenticateToken, async (req: any, res: any) => {
     const user = await userDb.getUserById(req.user.userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    const messagingChannels = normalizeUserChannels(user).filter((c) => c.channel !== 'whatsapp');
+    // Explicit entries only — see the note in PUT. Removing WhatsApp must not have
+    // the side effect of pinning the user's Slack destination.
+    const messagingChannels = explicitChannels(user).filter((c) => c.channel !== 'whatsapp');
     await userDb.updateUser(req.user.userId, { messagingChannels } as any);
     res.json({ success: true, channels: messagingChannels });
   } catch (error: any) {
