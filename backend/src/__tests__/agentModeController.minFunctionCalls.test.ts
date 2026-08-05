@@ -745,6 +745,44 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       );
     });
 
+    // ENG-827 (Greptile P1, security): consent revoked while a run is IN FLIGHT must
+    // stop that run publishing. Authorization is resolved once at admission, so
+    // without a per-turn re-check the owner's kill switch does nothing for the
+    // several minutes a publishing run takes.
+    it('STOPS requiring the publish tool when consent is revoked mid-run', async () => {
+      const admitted = {
+        ...publishSchedule,
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      // The owner revokes after the run was admitted: every later re-read is revoked.
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...publishSchedule,
+        autopublishAuthorized: false,
+        autopublishAuthorizedTools: [],
+      } as any);
+      // The model does NOT publish. Under the admitted (authorized) snapshot the
+      // checker would nudge for post_on_connected_account until maxAttempts.
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Consent was withdrawn, so I drafted the post instead of publishing.',
+        toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(admitted as any, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          functionCallDetails: { 'read_brand_guidelines': { actual: 1, required: 1 } },
+          functionCallMisses: [],
+          passed: true,
+          attempt: 1,
+        })
+      );
+    });
+
     it('KEEPS an AUTHORIZED publish tool in functionCallDetails — the scope filters, not the tool name', async () => {
       const authorized = {
         ...publishSchedule,

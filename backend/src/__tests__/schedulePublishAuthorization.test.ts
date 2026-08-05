@@ -1,6 +1,7 @@
 import {
   resolveSchedulePublishAuthorization,
   filterRequiredFunctionsToAuthorizedScope,
+  narrowPublishAuthorization,
 } from '../utils/schedulePublishAuthorization';
 
 /**
@@ -316,5 +317,61 @@ describe('filterRequiredFunctionsToAuthorizedScope (ENG-827)', () => {
         if (/^(post_on_|publish_)/.test(name)) expect(approved).toContain(name);
       }
     }
+  });
+});
+
+/**
+ * ENG-827 — revoking consent must stop a run that is ALREADY executing.
+ *
+ * A scheduled run resolves its authorization once at admission and threads that one
+ * value through every turn (the rule that stops the prompt and the checker
+ * disagreeing). But a run lasts minutes, so without a re-check an owner who hits
+ * revoke mid-run watches it publish anyway from a pre-revocation snapshot. The
+ * combination is monotonic: it may only ever REMOVE authorization.
+ */
+describe('narrowPublishAuthorization (ENG-827 mid-run revocation)', () => {
+  const A = (tools: string[], authorized = tools.length > 0) => ({ authorized, tools });
+
+  it('drops authorization entirely when consent is revoked mid-run', () => {
+    expect(narrowPublishAuthorization(A(['post_on_connected_account']), A([], false)))
+      .toEqual({ authorized: false, tools: [] });
+  });
+
+  it('narrows to the intersection when the approved scope shrinks mid-run', () => {
+    const admitted = A(['post_on_connected_account', 'publish_blog_article']);
+    const latest = A(['post_on_connected_account']);
+    expect(narrowPublishAuthorization(admitted, latest))
+      .toEqual({ authorized: true, tools: ['post_on_connected_account'] });
+  });
+
+  it('CANNOT re-authorize a run admitted unauthorized (grant mid-run does not apply)', () => {
+    expect(narrowPublishAuthorization(A([], false), A(['post_on_connected_account'])))
+      .toEqual({ authorized: false, tools: [] });
+  });
+
+  it('CANNOT widen scope — a tool added mid-run is not reachable until the next run', () => {
+    const out = narrowPublishAuthorization(A(['post_on_connected_account']), A(['post_on_connected_account', 'publish_blog_article']));
+    expect(out.tools).toEqual(['post_on_connected_account']);
+  });
+
+  it('keeps the admitted authorization when the re-read fails (no downgrade on a throttled query)', () => {
+    const admitted = A(['post_on_connected_account']);
+    expect(narrowPublishAuthorization(admitted, null)).toEqual(admitted);
+    expect(narrowPublishAuthorization(admitted, undefined)).toEqual(admitted);
+  });
+
+  it('is idempotent, so re-applying it every turn cannot oscillate', () => {
+    const admitted = A(['post_on_connected_account', 'publish_blog_article']);
+    const latest = A(['post_on_connected_account']);
+    const once = narrowPublishAuthorization(admitted, latest);
+    expect(narrowPublishAuthorization(once, latest)).toEqual(once);
+  });
+
+  it('leaves the checker with no publishing requirement once narrowed to nothing', () => {
+    const narrowed = narrowPublishAuthorization(A(['post_on_connected_account']), A([], false));
+    expect(filterRequiredFunctionsToAuthorizedScope(
+      ['read_brand_guidelines', 'post_on_connected_account'],
+      narrowed
+    )).toEqual(['read_brand_guidelines']);
   });
 });
