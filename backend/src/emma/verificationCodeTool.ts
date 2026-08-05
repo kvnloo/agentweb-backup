@@ -138,7 +138,8 @@ emmaToolRegistry.register({
     description:
       'Read a one-time login/verification code (or magic link) that a website just emailed to the user, from their connected mailbox (Gmail or Outlook). ' +
       'Use this for any email-code or magic-link login during browser automation: trigger the "send code" step in the browser FIRST, then call this tool. ' +
-      'It only accepts messages that arrived AFTER the login attempt, so it can never hand back a stale code from a previous run. ' +
+      'It only accepts messages that arrived AFTER this call, so it can never hand back a stale code from a previous run — ' +
+      'trigger the "send code" step FIRST, then call this. If it reports code_predates_call, re-trigger the send and call again. ' +
       'It polls for up to wait_seconds while the email is in flight. ' +
       'If it returns success=false, the login has NOT been unblocked: report the failure — never invent a code, and never continue as if you were logged in.',
     inputSchema: {
@@ -166,7 +167,10 @@ emmaToolRegistry.register({
         },
         since: {
           type: 'string',
-          description: 'ISO 8601 timestamp. Emails received before this are ignored. Defaults to ~2 minutes before this call, which is what makes stale codes impossible.',
+          description:
+            'ISO 8601 timestamp — the moment you triggered the "send code" step. Emails received before it are ignored. ' +
+            'Omit it and only emails arriving AFTER this call are accepted, which is what makes a stale code impossible: ' +
+            'set it only when the code email may have landed before you got here, and you know it belongs to this attempt.',
         },
         wait_seconds: {
           type: 'number',
@@ -205,7 +209,8 @@ emmaToolRegistry.register({
     const waitSeconds = resolveWaitSeconds(args?.wait_seconds);
     const linkHost = typeof args?.link_host === 'string' ? args.link_host.trim().toLowerCase() : '';
     const invokedAt = Date.now();
-    const since = args?.since && !Number.isNaN(Date.parse(args.since))
+    const hasExplicitSince = Boolean(args?.since) && !Number.isNaN(Date.parse(args?.since));
+    const since = hasExplicitSince
       ? Date.parse(args.since)
       : invokedAt - DEFAULT_FRESHNESS_GRACE_MS;
 
@@ -260,6 +265,7 @@ emmaToolRegistry.register({
     // ── Poll for a fresh matching message ──────────────────────────────────
     const deadline = Date.now() + waitSeconds * 1000;
     let sawStaleMatch = false;
+    let sawPreCallMatch = false;
     let sawFreshMatchWithoutCode = false;
 
     for (;;) {
@@ -306,15 +312,19 @@ emmaToolRegistry.register({
         (email: any) => contains(email?.subject, args?.subject_contains) && contains(email?.from, args?.from_contains)
       );
       const arrival = partitionByArrival(matched, { since, invokedAt });
-      // Last pass — no time left for a newer message, so a grace-window one is
-      // the best evidence available. Until then it is held back, because a
-      // message that predates this call may be the PREVIOUS attempt's code.
-      const isFinalPass = Date.now() + POLL_INTERVAL_MS > deadline;
-      const fresh = arrival.arrivedAfterCall.length > 0
-        ? arrival.arrivedAfterCall
-        : isFinalPass ? arrival.withinGrace : [];
+      // A message that predates this call is only acceptable when the CALLER
+      // anchored the window with an explicit `since` — they know when they
+      // triggered the send, we don't. On a default call it is never returned:
+      // it may be the previous attempt's code, and handing back a stale code
+      // with success:true is the precise failure this tool exists to prevent.
+      // The honest alternative ("no code arrived — re-trigger the send") is
+      // recoverable in a way that typing the wrong code is not.
+      const fresh = hasExplicitSince
+        ? [...arrival.arrivedAfterCall, ...arrival.withinGrace]
+        : arrival.arrivedAfterCall;
 
       if (arrival.stale.length > 0) sawStaleMatch = true;
+      if (!hasExplicitSince && arrival.withinGrace.length > 0) sawPreCallMatch = true;
 
       if (fresh.length > 0) {
         const ids = fresh.slice(0, MAX_BODIES_PER_PASS).map((email: any) => email.id);
@@ -379,6 +389,18 @@ emmaToolRegistry.register({
         message:
           'A matching email arrived but no code could be read from it. Open it with the email tool to check the format ' +
           `(it may use a different length, or be a link-only email — retry with return_link=true). ${NO_FABRICATION_NOTE}`,
+      };
+    }
+
+    if (sawPreCallMatch) {
+      return {
+        success: false,
+        reason: 'code_predates_call',
+        message:
+          'The only matching email arrived BEFORE this check, so it cannot be told apart from a previous ' +
+          'attempt\'s code — it was not returned. Re-trigger the "send code" step in the browser and call this ' +
+          'tool again; if you know the email is from the attempt you just made, call it again with ' +
+          `since set to the moment you triggered the send. ${NO_FABRICATION_NOTE}`,
       };
     }
 

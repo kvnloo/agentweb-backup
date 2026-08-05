@@ -36,7 +36,10 @@ function summary(over: Partial<{ id: string; subject: string; from: string; date
     threadId: 't-1',
     subject: over.subject ?? 'Your RankAI Login Code',
     from: over.from ?? 'founders@agentweb.pro',
-    date: over.date ?? new Date().toISOString(),
+    // Default fixture: arrived AFTER the tool was invoked, which is the only
+    // thing a default call accepts (a pre-call message cannot be told apart
+    // from the previous attempt's code).
+    date: over.date ?? new Date(Date.now() + 5_000).toISOString(),
     snippet: '',
   };
 }
@@ -185,6 +188,40 @@ describe('read_verification_code — failure paths', () => {
 
     expect(result.success).toBe(false);
     expect(result.reason).toBe('only_stale_matches');
+  });
+
+  // Greptile P1 follow-up: the grace window may not silently promote a pre-call
+  // message to "fresh" — it cannot be distinguished from the previous attempt's
+  // code, and typing the wrong one is less recoverable than saying "none yet".
+  it('will not return a code from an email that arrived before the call', async () => {
+    const thirtySecondsAgo = new Date(Date.now() - 30 * 1000).toISOString();
+    mockListEmails.mockResolvedValue([summary({ date: thirtySecondsAgo })]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 366990' }]);
+
+    const result = await tool.execute({ subject_contains: 'Login Code', wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('code_predates_call');
+    expect(result.message).toMatch(/re-trigger/i);
+    expect(JSON.stringify(result)).not.toContain('366990');
+  });
+
+  it('does return a pre-call code when the caller anchored the window with since', async () => {
+    const thirtySecondsAgo = new Date(Date.now() - 30 * 1000).toISOString();
+    mockListEmails.mockResolvedValue([summary({ date: thirtySecondsAgo })]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 366990' }]);
+
+    const result = await tool.execute(
+      {
+        subject_contains: 'Login Code',
+        since: new Date(Date.now() - 60 * 1000).toISOString(),
+        wait_seconds: 0,
+      },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.code).toBe('366990');
   });
 
   it('reports code_not_found when a fresh matching email has no extractable code', async () => {
