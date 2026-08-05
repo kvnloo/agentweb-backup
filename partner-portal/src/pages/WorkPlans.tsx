@@ -86,6 +86,10 @@ interface WorkPlan {
   thumbnail_url?: string;
   thumbnail_source?: 'ai' | 'upload' | 'none';
   thumbnail_alt_text?: string;
+  /** Bumped by every write. The editor sends back the one it loaded so a save
+   *  built from a stale plan is refused rather than overwriting whatever
+   *  changed in between — Emma edits these same plans (ENG-890). */
+  steps_rev?: string;
 }
 
 const visibilityColor = (v: string) => {
@@ -320,9 +324,14 @@ export default function WorkPlans() {
         ...(category && { category }),
       };
       if (editingPlan) {
-        await axios.put(buildApiUrl(`/api/admin/work-plans/${editingPlan.planId}`), body, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        // This save replaces the whole steps array with what the dialog loaded,
+        // so stake the revision it loaded: if anything changed the plan since,
+        // the server refuses rather than silently discarding it (ENG-890).
+        await axios.put(
+          buildApiUrl(`/api/admin/work-plans/${editingPlan.planId}`),
+          { ...body, expectedStepsRev: editingPlan.steps_rev ?? null },
+          { headers: { Authorization: `Bearer ${token}` } },
+        );
         setSuccess("Work plan updated");
       } else {
         await axios.post(buildApiUrl("/api/admin/work-plans"), body, {
@@ -333,6 +342,14 @@ export default function WorkPlans() {
       setDialogOpen(false);
       fetchPlans();
     } catch (err: any) {
+      if (err.response?.status === 409) {
+        // Keep the dialog open — their edits are still in it, and closing would
+        // throw away the work while the plan on screen is the outdated one.
+        setError(
+          "This plan changed while you were editing it — nothing was saved. Copy any changes you want to keep, then close and reopen the plan to start from the current version.",
+        );
+        return;
+      }
       setError(err.response?.data?.message || "Failed to save work plan");
     } finally {
       setSaving(false);
@@ -398,11 +415,21 @@ export default function WorkPlans() {
 
   const toggleVisibility = async (plan: WorkPlan) => {
     try {
+      // Sends one boolean, but the route rewrites the whole plan from the copy
+      // it reads — so a toggle against a row this page loaded minutes ago can
+      // still put back the steps as they were then. Stake the same revision the
+      // row carries (ENG-890).
       await axios.put(buildApiUrl(`/api/admin/work-plans/${plan.planId}`), {
         showInAgentMode: !plan.showInAgentMode,
+        expectedStepsRev: plan.steps_rev ?? null,
       }, { headers: { Authorization: `Bearer ${token}` } });
       fetchPlans();
-    } catch (err) {
+    } catch (err: any) {
+      if (err.response?.status === 409) {
+        setError("This plan changed since the list was loaded — nothing was saved. Refreshing so you can try again.");
+        fetchPlans();
+        return;
+      }
       setError("Failed to update visibility");
     }
   };
