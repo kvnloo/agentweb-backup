@@ -63,7 +63,11 @@ jest.mock('../services/skillService', () => ({
 import { chatbotDb } from '../services/chatbotService';
 import { scheduleDb } from '../services/db';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
-import { reconcileStaleScheduledRuns, recoverAbandonedScheduledRun } from '../controllers/agentModeController';
+import {
+  reconcileStaleScheduledRuns,
+  recoverAbandonedScheduledRun,
+  zeroAssistantIncompleteMessage,
+} from '../controllers/agentModeController';
 
 const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
@@ -326,5 +330,80 @@ describe('recoverAbandonedScheduledRun — resume decision (ENG-657)', () => {
 
     // Over cap → requeue is null, so there is no resume marker to carry.
     expect(mockScheduleDb.claimAbandonedRun).toHaveBeenCalledWith('sched-1', 'run-abc', null);
+  });
+});
+
+// ENG-764: when a run is abandoned because its OWNING PROCESS DIED (an EB immutable
+// deploy terminating the instance mid-run — prod-verified for session d7e4863c), the
+// reconciler knows the cause exactly: it writes "the owning process terminated mid-run"
+// into session.error. The user-facing placeholder, however, used the ENG-209 *budget*
+// copy — telling the user their job was too large and to "split the request into
+// smaller batches". That is a misdiagnosis of the user's own workload for an outage on
+// our side, and it directly contradicts the error written six lines later. ENG-826
+// already established one honest message per failure class (budget / transient /
+// system); the abandoned-by-infra class needs its own rather than borrowing budget's.
+describe('recoverAbandonedScheduledRun — honest abandonment copy (ENG-764)', () => {
+  // Died mid-tool-execution → NOT resumable, so the placeholder path is taken.
+  const danglingTranscript = [
+    { role: 'system', content: 'automated run' },
+    { role: 'user', content: 'Enrich the CRM leads.' },
+    { role: 'assistant', content: 'Enriching…', tool_calls: [
+      { id: 'c1', function: { name: 'enrich_leads_execute' } },
+      { id: 'c2', function: { name: 'enrich_leads_execute' } },
+    ] },
+    { role: 'tool', tool_call_id: 'c1', content: '{"processedCount":5}' },
+  ];
+
+  async function recoverAndReadPlaceholder(): Promise<string> {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue(danglingTranscript as any);
+    const schedule = scheduleWithLease();
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+    const call = mockChatbotDb.addMessageToSession.mock.calls[0][1] as any;
+    return String(call.content);
+  }
+
+  it('does not blame the size of the user\'s job or tell them to split into smaller batches', async () => {
+    const content = await recoverAndReadPlaceholder();
+
+    expect(content).not.toMatch(/split the request into smaller batches/i);
+    expect(content).not.toMatch(/fewer items per run/i);
+    expect(content).not.toMatch(/dozens of competitors/i);
+  });
+
+  it('does not attribute the abandonment to a time or memory budget it did not hit', async () => {
+    const content = await recoverAndReadPlaceholder();
+
+    expect(content).not.toMatch(/time or memory budget/i);
+  });
+
+  it('states the real cause (the process running it stopped) and that it retries automatically', async () => {
+    const content = await recoverAndReadPlaceholder();
+
+    expect(content).toMatch(/interrupted|stopped/i);
+    expect(content).toMatch(/deployment|restart|server/i);
+    expect(content).toMatch(/retried automatically/i);
+  });
+
+  it('keeps the jobIncomplete/isErrorMessage markers the scoring and resume paths key off', async () => {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue(danglingTranscript as any);
+    const schedule = scheduleWithLease();
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    // Copy changed, contract did NOT: sessionScoringService.endsWithRunFailurePlaceholder
+    // and resumePlan.isRunFailurePlaceholder both detect this turn via these flags.
+    expect(mockChatbotDb.addMessageToSession.mock.calls[0][1]).toMatchObject({
+      role: 'assistant',
+      metadata: { jobIncomplete: true, isErrorMessage: true },
+    });
+    expect(mockChatbotDb.updateSessionError.mock.calls[0][1]).toMatch(/abandoned/i);
+  });
+
+  it('leaves the in-process budget failure copy untouched (no cross-contamination)', async () => {
+    // A genuine budget overrun still gets the "split into smaller batches" guidance —
+    // that advice is correct for THAT class and must not be collateral damage here.
+    expect(zeroAssistantIncompleteMessage({ isGenerationTimeout: true })).toMatch(
+      /split the request into smaller batches/i
+    );
   });
 });

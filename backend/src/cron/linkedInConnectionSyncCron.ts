@@ -28,11 +28,56 @@ import {
   upsertSentInvitations,
   pruneStaleSentInvitations,
   profileUrlFromPublicId,
+  getAllSentInvitationsByAccount,
   UnipileSentInvitation,
 } from '../services/unipileSentInvitationsDb';
 
 
 const TAG = '[linkedInConnectionSync]';
+
+/**
+ * True when a freshly-read invitation differs from its cached row in any way a
+ * consumer can observe (ENG-875).
+ *
+ * `syncedAt` is deliberately excluded. It is stamped `now` on every run, so
+ * including it would make every row differ and defeat the check entirely. It is
+ * written but never read anywhere in the codebase — no query, filter or branch
+ * depends on it — so a skipped row keeps its previous value, which then means
+ * "when this row last changed" rather than "when the cron last ran".
+ *
+ * `sentAt` is also excluded, and this one was learned the hard way. The first
+ * version of this function compared it, on the assumption that a changed send
+ * time meant Unipile had corrected it. Production proved that false: LinkedIn
+ * exposes invitation age RELATIVELY ("3 months ago") and Unipile resolves that
+ * to an absolute datetime at the moment of the API call, so `parsed_datetime`
+ * moves every single request. Two real rows, hours after the first deploy:
+ *
+ *   sentAt 2026-05-04T04:38:52.378Z  syncedAt 2026-08-04T04:38:44.973Z
+ *   sentAt 2026-04-04T04:38:25.256Z  syncedAt 2026-08-04T04:38:24.877Z
+ *
+ * — exact whole-month offsets landing on the sync's own time-of-day. Comparing
+ * it made every row differ on every cycle, so the skip never fired once:
+ * `1547 upserted, 0 unchanged` on every account.
+ *
+ * Only the COMPARISON drops it. The write still prefers Unipile's value
+ * (ENG-787, `parsed_datetime ?? cached.sentAt ?? now`) — that contract is
+ * unchanged, and a skipped row simply keeps the value it already had, which is
+ * the stability ENG-787 was after.
+ *
+ * Every other field IS compared. Those are stable identity/content fields, and
+ * a change in one is a real change that must be persisted.
+ */
+export function sentInvitationChanged(
+  cached: UnipileSentInvitation,
+  candidate: UnipileSentInvitation,
+): boolean {
+  return (
+    cached.publicProfileUrl !== candidate.publicProfileUrl ||
+    cached.invitationId !== candidate.invitationId ||
+    cached.invitedUserName !== candidate.invitedUserName ||
+    cached.invitationText !== candidate.invitationText
+  );
+}
 
 /**
  * Kill-switches for the side effects of detecting a newly-accepted LinkedIn
@@ -56,9 +101,28 @@ const TAG = '[linkedInConnectionSync]';
 const isNotifyEnabled = (): boolean => process.env.LINKEDIN_CONNECTION_NOTIFY === 'true';
 const isEnrollEnabled = (): boolean => process.env.LINKEDIN_CONNECTION_ENROLL === 'true';
 
-/** Returns all Unipile account IDs to sync: site-wide settings + all per-user connected accounts. */
-async function getAllUnipileAccountIds(): Promise<string[]> {
+/**
+ * Kill-switch for mirroring pending invitations into the CRM on every sync.
+ * Muted by default: it performs bulk writes into customers' lead lists
+ * unattended, so switching it on is a data-plane decision. Set
+ * LINKEDIN_INVITE_CRM_RECONCILE=true to enable.
+ */
+const isInviteReconcileEnabled = (): boolean => process.env.LINKEDIN_INVITE_CRM_RECONCILE === 'true';
+
+/**
+ * All Unipile account IDs to sync: site-wide settings + every per-user connected
+ * account, plus the owner of each per-user account.
+ *
+ * Site-wide accounts are deliberately absent from `ownerByAccountId` — they belong
+ * to no single customer, so nothing that writes into a customer's CRM may act on
+ * them.
+ */
+async function getAllUnipileAccountIds(): Promise<{
+  ids: string[];
+  ownerByAccountId: Map<string, string>;
+}> {
   const ids = new Set<string>();
+  const ownerByAccountId = new Map<string, string>();
 
   // Site-wide accounts
   try {
@@ -80,13 +144,20 @@ async function getAllUnipileAccountIds(): Promise<string[]> {
       for (const acct of user.connected_accounts as any[]) {
         if (acct.platform === 'unipile') {
           const accountId = acct.config?.unipile_account_id || acct.account_id;
-          if (accountId) ids.add(accountId);
+          if (accountId) {
+            ids.add(accountId);
+            // First owner wins; an account shared across users has no single owner
+            // to attribute to, and overwriting would make the choice arbitrary.
+            if (user.userId && !ownerByAccountId.has(accountId)) {
+              ownerByAccountId.set(accountId, String(user.userId));
+            }
+          }
         }
       }
     }
   } catch { /* ignore */ }
 
-  return Array.from(ids);
+  return { ids: Array.from(ids), ownerByAccountId };
 }
 
 // ─── Core sync logic ──────────────────────────────────────────────────────────
@@ -194,6 +265,30 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
   const toUpsert: UnipileSentInvitation[] = [];
   const stillPendingPublicIds = new Set<string>();
   const now = new Date().toISOString();
+  let unchanged = 0;
+
+  // Unipile occasionally omits parsed_datetime. Stamping `now` in that case would
+  // move sentAt on every ~10-min sync, so downstream consumers keyed on it (the
+  // CRM invite mirror dedupes an engagement by send time) would see the same
+  // invitation as a new one each run. Carry the first-observed value forward
+  // instead — a pending invitation's send time never legitimately changes.
+  // The whole cached row is kept, not just sentAt, so an unchanged invitation
+  // can be recognised and skipped instead of rewritten (ENG-875). Rewriting
+  // every pending invitation on every 10-minute cycle pinned a production CPU
+  // at ~93% for 85 minutes on an account with 700+ pending invites, and cost
+  // the same number of DynamoDB writes each time for no change in content.
+  const cachedByPublicId = new Map<string, UnipileSentInvitation>();
+  let cachePreloaded = false;
+  try {
+    for (const inv of await getAllSentInvitationsByAccount(accountId)) {
+      cachedByPublicId.set(inv.invitedUserPublicId, inv);
+    }
+    cachePreloaded = true;
+  } catch (err) {
+    // Non-fatal — worst case a timestamp-less invitation re-stamps to now and
+    // every row is rewritten, i.e. exactly the previous behaviour.
+    console.warn(`${TAG} could not preload cached invitations for account ${accountId}:`, err);
+  }
 
   let cursor: string | undefined;
   let page = 0;
@@ -212,17 +307,36 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
         '';
       if (!publicId) continue;
 
+      // EVERY pending invitation is recorded here, on every cycle. This set is
+      // what pruneStaleSentInvitations reconciles against, so it must stay a
+      // complete picture of the feed — narrowing the walk would delete valid
+      // rows. The full pagination is load-bearing for correctness.
       stillPendingPublicIds.add(publicId);
-      toUpsert.push({
+
+      const cached = cachedByPublicId.get(publicId);
+      const candidate: UnipileSentInvitation = {
         accountId,
         invitedUserPublicId: publicId,
         publicProfileUrl: profileUrlFromPublicId(publicId),
         invitationId: item.id ?? '',
         invitedUserName: item.invited_user ?? '',
         invitationText: item.invitation_text ?? '',
-        sentAt: item.parsed_datetime ?? now,
+        sentAt: item.parsed_datetime ?? cached?.sentAt ?? now,
         syncedAt: now,
-      });
+      };
+
+      // Only the WRITE is skipped when nothing meaningful changed; the row is
+      // still counted as pending above. `syncedAt` is excluded from the
+      // comparison because it is `now` on every run and would make every row
+      // differ — it is written but never read anywhere in the codebase, so a
+      // skipped row simply keeps its previous value, which then honestly means
+      // "when this row last changed" rather than "when the cron last ran".
+      if (cached && !sentInvitationChanged(cached, candidate)) {
+        unchanged += 1;
+        continue;
+      }
+
+      toUpsert.push(candidate);
     }
 
     cursor = (result as any)?.cursor ?? undefined;
@@ -230,10 +344,62 @@ export async function syncSentInvitationsForAccount(accountId: string): Promise<
   } while (cursor && page < MAX_PAGES);
 
   await upsertSentInvitations(toUpsert);
-  const pruned = await pruneStaleSentInvitations(accountId, stillPendingPublicIds);
+  // Reuse the rows already loaded above rather than scanning the account a
+  // second time in the same cycle. Skipped when the preload failed, so the
+  // prune falls back to reading for itself and stays correct.
+  const pruned = await pruneStaleSentInvitations(
+    accountId,
+    stillPendingPublicIds,
+    cachePreloaded ? Array.from(cachedByPublicId.values()) : undefined,
+  );
 
-  console.log(`${TAG} account=${accountId} pending invitations: ${toUpsert.length} upserted, ${pruned} pruned (pages=${page})`);
+  console.log(`${TAG} account=${accountId} pending invitations: ${toUpsert.length} upserted, ${unchanged} unchanged (skipped), ${pruned} pruned (pages=${page})`);
   return toUpsert.length;
+}
+
+/**
+ * Mirror one account's PENDING sent-invitations into the CRM list bound to it (ENG-787).
+ *
+ * The per-send mirror covers invites that go through this product's send path, but
+ * an invite still escapes it when the model omits `list_id` and no list is bound,
+ * when the profile cannot be resolved, when the CRM write fails (the mirror is
+ * best-effort and never retries), or when the invite was sent directly on LinkedIn
+ * and never touched our code at all. Every one of those is only recoverable while
+ * the invitation is still pending — acceptance drops it from Unipile's feed and the
+ * prune removes it. Reconciling on each sync closes that window to ~10 minutes
+ * instead of "whenever someone remembers to run the backfill".
+ *
+ * Idempotent by construction: the mirror skips an invitation already recorded, so
+ * the steady state is a no-op that reports everything as alreadyRecorded.
+ *
+ * Requires a known owner AND a list bound to the account — a site-wide/shared
+ * account belongs to no single customer and must never write into one's CRM.
+ * Muted behind LINKEDIN_INVITE_CRM_RECONCILE because it is a bulk unattended write.
+ */
+async function reconcileInvitesToCrmForAccount(accountId: string, userId?: string): Promise<void> {
+  if (!isInviteReconcileEnabled() || !userId) return;
+  try {
+    const { resolveListIdForAccount, reconcileSentInvitationsToCrm } =
+      await import('../services/linkedInInviteCrmMirror');
+    const listId = await resolveListIdForAccount(userId, accountId);
+    if (!listId) return;
+    const result = await reconcileSentInvitationsToCrm({
+      accountId,
+      listId,
+      userId,
+      // The cache was just refreshed above — re-pulling the live feed would double
+      // every sync's Unipile calls for no new data.
+      refreshFromLive: false,
+    });
+    if (result.created > 0 || result.updated > result.alreadyRecorded) {
+      console.log(
+        `${TAG} account=${accountId} mirrored invitations into list ${listId}: created=${result.created} updated=${result.updated} (alreadyRecorded=${result.alreadyRecorded})`,
+      );
+    }
+  } catch (err) {
+    // Attribution must never take down the sync.
+    console.error(`${TAG} Invite→CRM reconciliation failed for account ${accountId}:`, err);
+  }
 }
 
 /**
@@ -497,7 +663,7 @@ export async function runLinkedInConnectionSync(): Promise<void> {
   isRunning = true;
 
   try {
-    const accountIds = await getAllUnipileAccountIds();
+    const { ids: accountIds, ownerByAccountId } = await getAllUnipileAccountIds();
 
     if (accountIds.length === 0) {
       console.log(`${TAG} No accounts to sync`);
@@ -536,6 +702,13 @@ export async function runLinkedInConnectionSync(): Promise<void> {
       } catch (err) {
         console.error(`${TAG} Sent-invitation sync failed for account ${accountId}:`, err);
       }
+      // Then mirror those pending invitations into the CRM (ENG-787). Runs here, right
+      // after the refresh, because a pending invitation is the ONLY window in which an
+      // invite is recoverable: once it is accepted or withdrawn it drops off Unipile's
+      // feed and is pruned from the cache. Attribution that depends on a manual backfill
+      // therefore races acceptance, and loses for invites sent outside this product,
+      // sent without a resolvable list, or whose send-time mirror write failed.
+      await reconcileInvitesToCrmForAccount(accountId, ownerByAccountId.get(accountId));
     }
 
     // Auto-enroll leads and send email notifications for newly accepted connections

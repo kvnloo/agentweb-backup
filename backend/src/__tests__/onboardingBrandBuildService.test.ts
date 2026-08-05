@@ -321,6 +321,14 @@ describe("onboardingBrandBuildService", () => {
       expect(promptArg).toMatch(/do not ask the user/i);
       expect(promptArg).toMatch(/update_brand_guidelines/);
       expect(promptArg).toMatch(/update_market_strategy/);
+      // ENG-792: the reported account's logo became a google favicon-proxy
+      // URL that 404s, because Emma generalized the third-party-logo
+      // convention (correct for landing pages) onto the user's OWN logo.
+      // The prompt must forbid it and prefer omitting logoUrl, which
+      // self-heals via ensureBrandLogoPersisted.
+      expect(promptArg).toMatch(/s2\/favicons/);
+      expect(promptArg).toMatch(/NEVER substitute a third-party favicon proxy/);
+      expect(promptArg).toMatch(/OMIT logoUrl/);
 
       // Mirror write: icpResult + competitorResult + statuses
       const writes = userDb.updateUser.mock.calls.map((c: any[]) => c[1]);

@@ -165,6 +165,13 @@ export interface FileUserIssueParams {
   /** Chat session id of the reporter, so eng can jump straight to the offending session. */
   sessionId?: string;
   /**
+   * Stable identity of THIS report by THIS reporter (`utils/reportIntake.reportFingerprint`).
+   * ENG-529 AC5 / ENG-598 option A: stamped on the created Featurebase ticket and looked up before
+   * creating another, so a retry that outlives the in-process replay guard replays instead of
+   * minting a duplicate card. Optional — when absent, filing behaves exactly as before.
+   */
+  reportFingerprint?: string;
+  /**
    * Reporter's funnel stage (user record `funnelStatus`, PR #2025) — drives the Linear-side triage
    * enrichment (stage labels + priority, ENG-187). PRIVATE internal info: never surfaces in
    * Featurebase content or any reporter-facing email.
@@ -282,7 +289,7 @@ async function fileFeatureRequest(p: FileUserIssueParams): Promise<FiledUserResu
 async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   const { findDuplicate, MAX_CANDIDATES } = await import('./dedupService');
   const { listOpenBugCanonicals, listRecentlyResolvedBugCanonicals, createInternalLinearIssue, addIssueComment, raiseIssueTriage, reopenIssue } = await import('./linearService');
-  const { createTicket } = await import('./featurebaseService');
+  const { createTicket, findTicketByMarker } = await import('./featurebaseService');
 
   // Linear-side triage enrichment (ENG-187): the reporter's funnel stage becomes stage labels
   // ("Status: <stage>" + coarse bucket) and sets the priority default. Linear-only — the stage
@@ -293,8 +300,41 @@ async function fileBugReport(p: FileUserIssueParams): Promise<FiledUserResult> {
   const stated = p.priority ? LINEAR_PRIORITY[p.priority.toLowerCase()] : undefined;
   const priority = stated ? Math.min(bugPriorityForFunnel(p.funnelStatus), stated) : bugPriorityForFunnel(p.funnelStatus);
 
+  // 0. ENG-529 AC5 / ENG-598 option A — destination-side idempotency.
+  //    The in-process replay guard (`utils/reportIntake.fileReportOnce`) is bounded and evicts
+  //    settled entries under aggregate pressure, so it CANNOT be the durable guarantee: once an
+  //    entry is evicted — or the process restarts, or a second instance serves the retry — the
+  //    reporter's retry re-runs this filer and mints a second card. That is how one report became
+  //    reporter tickets #169, #170 and #171 on 2026-07-26.
+  //
+  //    The durable check therefore lives here, at the destination. A hit means THIS reporter has
+  //    already filed THIS exact report: return their existing card rather than creating another,
+  //    and skip canonical creation so one bug never splits across two eng tickets.
+  if (p.reportFingerprint) {
+    const existing = await findTicketByMarker(p.reportFingerprint);
+    if (existing) {
+      return {
+        pageId: existing.id,
+        trackerUrl: existing.url,
+        userUrl: existing.url,
+        deduped: true,
+        tracker: 'Featurebase',
+      };
+    }
+  }
+
   // 1. The reporter's OWN private card. Body = their words (what THEY see). Propagates on failure.
-  const ticket = await createTicket({ title: p.title, content: p.description, authorEmail: p.userEmail, authorName: p.userName });
+  //    The fingerprint marker is appended as an HTML comment: it rides in the same `content` text
+  //    the `q` search indexes, and Featurebase renders the card as markdown so the reporter never
+  //    sees it.
+  const ticket = await createTicket({
+    title: p.title,
+    content: p.reportFingerprint
+      ? `${p.description}\n\n<!-- report-fingerprint: ${p.reportFingerprint} -->`
+      : p.description,
+    authorEmail: p.userEmail,
+    authorName: p.userName,
+  });
 
   // 2. Find or create the ONE canonical Linear ticket for this bug (dedup groups reporters).
   const cans = await listOpenBugCanonicals(MAX_CANDIDATES);

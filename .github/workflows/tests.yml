@@ -33,13 +33,13 @@ jobs:
       workflows: ${{ steps.filter.outputs.workflows }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
       - name: Paths filter
         id: filter
-        uses: dorny/paths-filter@v4
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           filters: |
@@ -76,12 +76,12 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -116,12 +116,12 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -144,7 +144,7 @@ jobs:
 
       - name: Post coverage comment on PR
         if: always()
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
             const fs = require('fs');
@@ -202,9 +202,13 @@ jobs:
             }
 
   # These scripts are the ones that decide whether a deploy really happened
-  # (ENG-734), whether Greptile really passed (ENG-754), and whether CI ever ran
-  # at all (ENG-757), so they get their own regression suites. All run the real
-  # script against a mocked CLI — no AWS access, no GitHub access, ~30s.
+  # (ENG-734), whether Greptile really passed (ENG-754), whether CI ever ran
+  # at all (ENG-757), and whether anyone finds out a production deploy failed
+  # (ENG-865), so they get their own regression suites. All run the real script
+  # against a mocked CLI — no AWS access, no GitHub access, no Slack, ~30s.
+  #
+  # The job's gate is the `workflows` filter (`.github/**`), so a new script
+  # here is covered without touching any paths filter.
   ci-scripts-tests:
     name: CI script tests
     needs: detect-changes
@@ -216,7 +220,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Lint CI scripts
         run: shellcheck .github/scripts/*.sh
@@ -229,6 +233,64 @@ jobs:
 
       - name: Run merge-evidence.sh regression suite
         run: bash .github/scripts/merge-evidence.test.sh
+
+      - name: Run trunk-deploy-state.sh regression suite
+        run: bash .github/scripts/trunk-deploy-state.test.sh
+
+      - name: Run deploy-failure-alert.sh regression suite
+        run: bash .github/scripts/deploy-failure-alert.test.sh
+
+      - name: Run eb-config-conflict.sh regression suite
+        run: bash .github/scripts/eb-config-conflict.test.sh
+
+  # ENG-836: prod deploys immutable, which forbids changing resource config and
+  # instance config in one operation. PR #2237 did exactly that, EB accepted the
+  # request then refused it, and production sat undeployable for ~29 hours while
+  # every later merge inherited the same failure.
+  #
+  # Staging cannot catch it — staging is AllAtOnce, which has no such
+  # restriction, so it accepted the identical change and reported green. This
+  # job is the substitute for a check staging structurally cannot perform.
+  #
+  # Runs on the PR diff, so it is deliberately NOT behind the `workflows`
+  # filter: the files it guards are under `backend/`, not `.github/`.
+  eb-config-conflict:
+    name: EB resource/instance config conflict
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    concurrency:
+      group: ${{ github.workflow }}-eb-config-conflict-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Check for a resource+instance config conflict
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Lets a DELETED config be classified by what it removed, rather than
+          # guessed at. Removing a file that declared `aws:elbv2:loadbalancer`
+          # is a resource change; removing one that declared `commands:` is an
+          # instance change. `fetch-depth: 0` above is what makes this readable.
+          EB_CONFLICT_BASE_REF: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # Three dots: only what this PR changed relative to the merge base,
+          # so commits that landed on the base branch meanwhile are not blamed
+          # on this PR.
+          #
+          # --no-renames: with rename detection ON, git reports a rename as the
+          # DESTINATION path only. The classifier would then look that path up
+          # in the base revision, find nothing, and lose every declaration that
+          # existed at the source — so renaming a config while dropping its
+          # resource block, alongside an instance change, would pass. Turning
+          # detection off reports the rename as a delete plus an add, and both
+          # sides get classified: the old path from base, the new from head.
+          git diff --name-only --no-renames "${BASE_SHA}...${HEAD_SHA}" \
+            | bash .github/scripts/eb-config-conflict.sh
 
   # This job used to poll Greptile's own `Greptile Review` check-run and pass on
   # conclusion=success. Greptile marks that check-run success for every completed
@@ -257,7 +319,7 @@ jobs:
       # merges has to gate its own changes, or the fix ships unexercised
       # (the ENG-743 lesson).
       - name: Checkout PR head
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Require a true Greptile 5/5 on this head
         env:
@@ -278,13 +340,13 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -331,7 +393,7 @@ jobs:
           zip -r "builds/${VERSION_LABEL}.zip" dist package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/${VERSION_LABEL}.zip" dist package.json package-lock.json
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -385,12 +447,12 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           cache: 'npm'
           cache-dependency-path: partner-portal/package-lock.json

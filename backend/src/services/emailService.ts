@@ -320,7 +320,7 @@ The AgentWeb Team
           <h2 style="color: #1B2549; margin-top: 0;">Hi ${firstName}, welcome to AgentWeb!</h2>
 
           <p style="color: #333; line-height: 1.6;">
-            We're Harsha, Rui, Fangfang, and Matthew — the founders of AgentWeb. We're personally committed to making sure you get the most out of the product, and we'd love to hear what brought you here.
+            We're Harsha, Fangfang, and Matthew — the founders of AgentWeb. We're personally committed to making sure you get the most out of the product, and we'd love to hear what brought you here.
           </p>
 
           <p style="color: #333; line-height: 1.6;">
@@ -348,7 +348,7 @@ The AgentWeb Team
           </div>
 
           <p style="color: #333; line-height: 1.6; margin-top: 20px;">
-            — Harsha, Rui, Fangfang &amp; Matthew
+            — Harsha, Fangfang &amp; Matthew
           </p>
         </div>
 
@@ -360,7 +360,7 @@ The AgentWeb Team
 
     const text = `Hi ${firstName}, welcome to AgentWeb!
 
-We're Harsha, Rui, Fangfang, and Matthew — the founders of AgentWeb. We're personally committed to making sure you get the most out of the product, and we'd love to hear what brought you here.
+We're Harsha, Fangfang, and Matthew — the founders of AgentWeb. We're personally committed to making sure you get the most out of the product, and we'd love to hear what brought you here.
 
 Just reply to this email with any questions, feedback, or ideas — we read every message and will get back to you directly.
 
@@ -368,7 +368,7 @@ Need help or found an issue? You can also chat with Emma, our AI assistant insid
 
 Open AgentWeb: ${appUrl}
 
-— Harsha, Rui, Fangfang & Matthew
+— Harsha, Fangfang & Matthew
 
 You're receiving this because you just signed up for AgentWeb.
 `;
@@ -954,6 +954,98 @@ Manage your schedules: ${customerFrontendUrl}/agent-mode
       const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
       console.error(`Error sending scheduled chat error emails to ${emailList.join(', ')}:`, error);
       // Don't throw error - email failure shouldn't break the scheduled chat execution
+    }
+  },
+
+  // ENG-826 (#1): sent when a scheduled chat has produced zero assistant output for
+  // every automatic retry (past ZERO_ASSISTANT_MAX_REQUEUES) — i.e. it is now
+  // consistently failing and will NOT be auto-retried again until its next scheduled
+  // slot. Previously this state only produced a server log the owner never saw, so a
+  // customer's schedule (e.g. the gemini-3.5-flash "LinkedIn Post Factory" runs in
+  // ENG-826) could keep failing silently. Best-effort: never throws (a notification
+  // failure must not break the run).
+  async sendScheduledRunFailedEmail(
+    toEmails: string | string[],
+    scheduleName: string,
+    scheduleId: string,
+    opts: { failedAttempts: number; failureClass: 'budget' | 'transient' | 'system' }
+  ) {
+    try {
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const currentDate = new Date().toLocaleDateString('en-US', {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+      });
+      const { failedAttempts } = opts;
+      // Escape the request-derived schedule name before it goes into HTML — a name
+      // containing markup would otherwise render in the recipient's email client.
+      const safeName = this.escapeHtml(scheduleName);
+      // Class-specific guidance for the EXHAUSTED state. Deliberately NOT the per-run
+      // in-chat message: that one promises "will be retried automatically", which would
+      // contradict this email's "won't retry until the next scheduled run" framing.
+      const GUIDANCE: Record<'budget' | 'transient' | 'system', string> = {
+        budget: 'The run looks too large to finish in a single pass — splitting it into smaller batches (fewer items per run) should let each run complete.',
+        transient: 'This looks like a temporary problem (a rate limit or a brief service hiccup). It may well recover on the next scheduled run; if it keeps happening, contact support.',
+        system: 'This looks like a system error rather than a time or size limit, so retrying alone may not fix it — please contact support if it continues.',
+      };
+      const userMessage = GUIDANCE[opts.failureClass] || GUIDANCE.system;
+
+      const html = `
+        <html>
+        <head>
+          <style>
+            body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background-color: #f8f9fa; }
+            .container { max-width: 800px; margin: 0 auto; background-color: white; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background-color: #dc3545; color: white; padding: 20px; border-radius: 8px 8px 0 0; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 20px; }
+            .error-section { background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 4px; }
+            .error-section h3 { margin-top: 0; color: #856404; }
+            .footer { background-color: #f8f9fa; padding: 20px; border-radius: 0 0 8px 8px; text-align: center; }
+            .button { display: inline-block; background-color: #1976d2; color: white !important; padding: 12px 24px; text-decoration: none; border-radius: 4px; margin: 10px 0; }
+          </style>
+        </head>
+        <body>
+          <div class="container">
+            <div class="header">
+              <h1>⚠️ Scheduled Chat Keeps Failing</h1>
+              <p style="margin: 5px 0 0 0; opacity: 0.9;">${safeName}</p>
+            </div>
+            <div class="content">
+              <div class="error-section">
+                <h3>Your scheduled chat has failed ${failedAttempts} times in a row</h3>
+                <p style="margin: 0; line-height: 1.6;">
+                  <strong>"${safeName}"</strong> last attempted to run at <strong>${currentDate}</strong> and produced no result.
+                  It has now failed on every automatic retry, so it will not be retried again until its next scheduled run.
+                </p>
+                <p style="margin: 10px 0 0 0; line-height: 1.6;">${userMessage}</p>
+              </div>
+            </div>
+            <div class="footer">
+              <a class="button" href="${customerFrontendUrl}/agent-mode?tab=scheduled">Review your schedules</a>
+              <p style="margin-top: 15px; font-size: 12px; color: #6c757d;">This is an automated email from your scheduled chat.</p>
+            </div>
+          </div>
+        </body>
+        </html>
+      `;
+
+      const text = `Scheduled Chat Keeps Failing: ${scheduleName}
+
+"${scheduleName}" last attempted to run at ${currentDate} and produced no result. It has now failed ${failedAttempts} times in a row on every automatic retry, so it will not be retried again until its next scheduled run.
+
+${userMessage}
+
+---
+Review your schedules: ${customerFrontendUrl}/agent-mode?tab=scheduled`;
+
+      const subject = `⚠️ Scheduled Chat Keeps Failing: ${scheduleName}`;
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      await this.sendEmail(emailList, subject, text, html);
+      console.log(`Scheduled run-failed email sent to recipients: ${emailList.join(', ')} (schedule ${scheduleId})`);
+    } catch (error) {
+      const emailList = Array.isArray(toEmails) ? toEmails : [toEmails];
+      console.error(`Error sending scheduled run-failed email to ${emailList.join(', ')}:`, error);
+      // Don't throw — a notification failure must not break the scheduled chat flow.
     }
   },
 

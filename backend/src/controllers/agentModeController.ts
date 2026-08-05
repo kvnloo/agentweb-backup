@@ -70,16 +70,132 @@ export const RECONCILE_INTERVAL_MS = 2 * 60 * 1000; // reconciler sweep cadence
 const SCHEDULED_RUN_INSTANCE_ID: string = require('uuid').v4();
 
 // User-facing fallback shown when a scheduled run terminates with zero assistant
-// output (crash/timeout/context-limit). A silent, empty session reads as a total
-// failure to the user (ENG-209: a 40-competitor report produced no output). This
-// guarantees the session is never left blank — the user always sees a structured
-// "job incomplete" message with a concrete next step (split into smaller batches).
+// output because it genuinely ran out of its time/memory/size budget (a big job
+// that timed out, hit the context limit, was OOM-killed, or ran but emitted no
+// assistant turn). A silent, empty session reads as a total failure to the user
+// (ENG-209: a 40-competitor report produced no output). The "split into smaller
+// batches" next step only makes sense for THIS class of failure — see
+// SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE for the deterministic-error class.
 const SCHEDULED_JOB_INCOMPLETE_MESSAGE =
   "This scheduled run stopped before it could produce a response, so no results were generated. " +
   "Large jobs that research many items in a single run — for example, dozens of competitors in one report — " +
   "can exceed the run's time or memory budget and end without finishing. " +
   "The run will be retried automatically. If this keeps happening, split the request into smaller batches " +
   "(fewer items per run) so each run can complete and report its results.";
+
+// ENG-826: user-facing fallback for a zero-output run that failed on a DETERMINISTIC
+// system/provider error (e.g. a schema-validation 400, an auth failure, a content
+// filter), NOT a time/memory budget overrun. Blaming job size here is misleading and
+// the "split into smaller batches" advice is useless — the run would fail identically
+// however small it is. The failing session's stored assistant message used to assert
+// the budget cause unconditionally, sending anyone debugging from the transcript down
+// the wrong path (the ENG-826 gemini-3.5-flash union-schema 400 read as a size limit).
+// Wording note: this per-run message is shown for EVERY failed attempt (including the
+// early ones that will still auto-retry), so it only promises recording + automatic
+// retry + a support contact. The proactive owner email (ENG-826 #1) is sent separately
+// and ONLY once the retries are exhausted (see the requeue-exhaustion branch below), so
+// it is not claimed here — that would over-promise on attempts that haven't exhausted yet.
+const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
+  "This scheduled run stopped before it could produce a response, so no results were generated. " +
+  "It ran into an unexpected system error — not a time or size limit — so retrying or splitting the " +
+  "request into smaller batches won't help on its own. The run has been recorded as failed and will " +
+  "be retried automatically. If it keeps failing, please contact support.";
+
+// ENG-826 edge case: a TRANSIENT failure (rate limit, 429/5xx, timeout, dropped
+// connection) is neither a size/budget overrun nor a deterministic error. It really
+// does recover on retry — so it must NOT get the system-error copy that says "retrying
+// won't help" (that copy is only true for deterministic errors). Give it its own honest
+// message: temporary, auto-retried, usually self-clearing.
+const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
+  "This scheduled run stopped before it could produce a response, so no results were generated. " +
+  "It hit a temporary problem — a rate limit or a brief service hiccup — not a time or size limit. " +
+  "It has been recorded and will be retried automatically, and a transient issue like this usually " +
+  "clears on its own. If it keeps happening, please contact support.";
+
+// ENG-764: a run ABANDONED because its owning process died (prod-verified: an EB
+// immutable deploy terminated the instance mid-run) is not a budget overrun either.
+// The reconciler used to persist the budget copy here, telling the user their job was
+// too large and to split it into smaller batches — a misdiagnosis of the user's own
+// workload for an outage on our side, and a direct contradiction of the accurate
+// "the owning process terminated mid-run" that the same recovery writes to
+// session.error. Splitting the request genuinely cannot help: the next deploy would
+// interrupt a smaller run just the same. Be honest about the cause, and reassure —
+// the requeue (and, on a safe boundary, the ENG-657 resume) recovers it unattended.
+const SCHEDULED_RUN_ABANDONED_MESSAGE =
+  "This scheduled run was interrupted before it could finish — the server process running it stopped " +
+  "mid-run, which normally happens during a routine deployment or restart on our side. " +
+  "Nothing is wrong with your request, and splitting it into smaller batches would not have helped. " +
+  "The run has been recorded as failed and will be retried automatically. " +
+  "If it keeps happening, please contact support.";
+
+// ENG-826: classify a zero-output scheduled-run failure so the persisted message and
+// the `failureClass` metadata match the ACTUAL cause. Precedence:
+//  1) 'budget' — context-limit, generation timeout, worker OOM/replacement, or a run
+//     that emitted no assistant turn: the "split into smaller batches" guidance applies.
+//  2) 'transient' — rate limit / 5xx / timeout / dropped connection: recovers on the
+//     automatic retry (checked AFTER budget because isContextLimitError is excluded
+//     from transient, and worker-shutdown/zero-output are budget-shaped by definition).
+//  3) 'system' — everything else (deterministic provider/validation errors like the
+//     gemini union-schema 400, auth, content filters): retrying won't help on its own.
+// Exported for direct unit testing.
+export type ScheduledRunFailureClass = 'budget' | 'transient' | 'system';
+
+export function classifyZeroAssistantFailure(error: unknown): ScheduledRunFailureClass {
+  const budgetShaped =
+    isContextLimitError(error) ||
+    isWorkerShutdownError(error) ||
+    isZeroAssistantOutputError(error) ||
+    Boolean((error as any)?.isGenerationTimeout);
+  if (budgetShaped) return 'budget';
+  if (isTransientLLMError(error)) return 'transient';
+  return 'system';
+}
+
+// The reconciler path has no error object to classify, but it does not need one: a
+// stale lease means the owning process died, so it uses SCHEDULED_RUN_ABANDONED_MESSAGE
+// directly rather than falling back to the budget copy (ENG-764).
+export function zeroAssistantIncompleteMessage(error: unknown): string {
+  switch (classifyZeroAssistantFailure(error)) {
+    case 'budget':
+      return SCHEDULED_JOB_INCOMPLETE_MESSAGE;
+    case 'transient':
+      return SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE;
+    default:
+      return SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE;
+  }
+}
+
+// ENG-826 (recommendation #4): compact run-health summary surfaced on each schedule
+// in the list so an owner can see a run of consecutive failures — e.g. the 3 silent
+// gemini-3.5-flash failures in this issue — straight on the card, without opening the
+// run-history panel. getScheduledChats deliberately strips the full runResults array
+// for payload size, so the client can't derive this itself; we compute it server-side.
+export interface ScheduleRunHealth {
+  lastRunStatus: 'success' | 'failure' | 'pending_user_input' | null;
+  lastRunAt: string | null;
+  // Failures counted back from the MOST RECENT run, stopping at the first non-failure.
+  // A 'success' or a 'pending_user_input' (parked, awaiting a human) breaks the streak —
+  // a park is not a failure. So this reflects an ongoing, unresolved failure run only.
+  consecutiveFailures: number;
+}
+
+export function computeScheduleRunHealth(runResults: any[] | undefined | null): ScheduleRunHealth {
+  const results = Array.isArray(runResults) ? runResults : [];
+  if (results.length === 0) {
+    return { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 };
+  }
+  const last = results[results.length - 1] || {};
+  let consecutiveFailures = 0;
+  for (let i = results.length - 1; i >= 0; i--) {
+    if (results[i]?.status === 'failure') consecutiveFailures++;
+    else break;
+  }
+  return {
+    lastRunStatus: last.status ?? null,
+    lastRunAt: last.createdAt ?? null,
+    consecutiveFailures,
+  };
+}
 
 // ENG-657: injected as the user turn when RESUMING an abandoned scheduled run
 // (its instance was terminated mid-flight, e.g. by a deploy). The full transcript
@@ -745,6 +861,420 @@ export function scheduledRunSignalsIncompleteWork(content: string): boolean {
   return INCOMPLETE_WORK_PATTERNS.some((re) => re.test(content));
 }
 
+// ENG-844: Deterministic detector for a scheduled run that LEGITIMATELY
+// short-circuited on a conditional CADENCE guard — e.g. a schedule that runs
+// DAILY but is instructed to publish only on Mon/Wed/Fri, running on a
+// non-publishing day. Such a run correctly produces ZERO write calls
+// (post_on_connected_account / generate_image) BY DESIGN and reports a skip.
+//
+// Without recognising this, runVerifiedChat keeps retrying to satisfy the
+// schedule's requiredFunctionCalls, re-sending an identical "Please try again.
+// Make sure to <write tool> (1 more time needed)" prompt. That pressure is aimed
+// at IRREVERSIBLE, live-publishing tools, and repeating the identical prompt
+// eventually trips the anti-loop override in agentModeService — pushing a
+// correctly-behaving agent toward off-cadence publishing or fabricating success.
+//
+// A freeform-text match ALONE is unsafe: a genuine FAILURE worded as a skip
+// ("Skipping today's post — I couldn't access LinkedIn", "No post today; auth
+// failed") would be silently waived, un-auditing a live publishing pipeline
+// (the retry + fileAutoIssue + oncall path would never fire). So the carve-out
+// only fires when ALL of these hold:
+//   0. the SCHEDULE'S OWN INSTRUCTION authorizes a conditional skip (defines the
+//      cadence / non-publishing-day rule) — the authorization comes from the human
+//      who wrote the schedule, not from the model's post-hoc prose; and
+//   1. the skip is tied to a CADENCE/weekday rationale, not a bare "skip today"
+//      (a self-contained cadence phrase, or a skip declaration + a cadence
+//      rationale in the same turn);
+//   2. NO failure/tool-error signal appears in the turn's prose; and
+//   3. NO tool call in the run actually errored (the non-spoofable ledger check
+//      used elsewhere — `'error' in toolCall`); and
+//   4. if the turn asserts a specific weekday as "today", it agrees with the
+//      server's actual weekday (a hallucinated/mis-dated skip is rejected).
+//
+// This is DISTINCT from scheduledRunSignalsIncompleteWork (which detects a run
+// that left SOME items undone and should continue). Here the WHOLE run is a
+// deliberate no-op.
+
+// A phrase that BY ITSELF expresses a cadence/weekday skip (rationale baked in).
+const CADENCE_SKIP_PATTERNS: RegExp[] = [
+  /\bnon-?publishing\s+day\b/i,
+  /\bnot\s+a\s+(?:publishing|posting)\s+day\b/i,
+  /\btoday\s+is\s+(?:not\s+a\s+(?:publishing|posting)\s+day|a\s+(?:non-?publishing|skip|rest|off)\s+day)\b/i,
+  /\b(?:rest|off|skip|non-?publishing)\s+day\s+for\s+this\s+(?:schedule|cadence)\b/i,
+  /\bcreat(?:e|ing)\s+and\s+publish(?:ing)?\s+nothing\b/i,
+];
+
+// A bare skip declaration. On its own this is ambiguous (a failure can be worded
+// the same way), so it only counts as a cadence skip when paired with a
+// CADENCE_RATIONALE match below.
+const SKIP_DECLARATION_PATTERNS: RegExp[] = [
+  /\bskipp?(?:ing|ed)?\s+(?:today|this\s+(?:run|cycle|schedule|post))\b/i,
+  /\bno\s+(?:post|publishing|publish)\s+(?:today|scheduled\s+(?:for\s+)?today)\b/i,
+  /\bnothing\s+to\s+(?:post|publish)\s+today\b/i,
+];
+
+// Evidence the skip is driven by the schedule's PUBLISHING CADENCE (a weekday
+// window), not by an error — this is what separates a legitimate skip from a
+// failure dressed up as one.
+const CADENCE_RATIONALE_PATTERNS: RegExp[] = [
+  /\bcadence\b/i,
+  /\bonly\s+(?:publish|post)(?:es|ing|s)?\b/i,
+  /\b(?:publish|post)(?:es|ing|s)?\s+only\b/i,
+  /\bonly\s+on\s+(?:mon|tue|wed|thu|fri|sat|sun)/i,
+  /\b(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\s*[\/,]\s*(?:mon|tue|wed|thu|fri|sat|sun)/i,
+  /\bnon-?publishing\s+day\b/i,
+  /\bnot\s+a\s+(?:publishing|posting)\s+day\b/i,
+];
+
+// A run that hit a FAILURE (missing access, auth, timeout, tool error) is NOT a
+// cadence skip — it must still retry + alert. Any of these veto the carve-out.
+const SKIP_FAILURE_SIGNAL_PATTERNS: RegExp[] = [
+  // Contractions only fire on a real apostrophe so words like "current" (…nt) do
+  // not false-veto: couldn't, wasn't, isn't, can't, don't, won't, …
+  /\b\w+n['’]t\b/i,
+  /\b(?:cannot|could\s+not|was\s+not\s+able|were\s+not\s+able|not\s+able\s+to|unable\s+to)\b/i,
+  /\b(?:failed(?:\s+to)?|failure|errored?|an?\s+error|timed?\s*out|time[\s-]?out)\b/i,
+  /\b(?:unauthori[sz]ed|not\s+authori[sz]ed|no\s+access|access\s+denied|permission\s+denied|forbidden|rate[\s-]?limit)\b/i,
+  /\bauth(?:entication|orization)?\s+(?:fail(?:ed|ure)?|error|issue|problem)\b/i,
+  /\b(?:token\s+expired|invalid\s+(?:token|credential))/i,
+];
+
+const WEEKDAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
+
+// Extract a weekday the turn asserts is TODAY (e.g. "Today is Sunday",
+// "Sunday, which is a non-publishing day"). Returns the 0–6 index or null.
+function assertedTodayWeekday(content: string): number | null {
+  const m =
+    content.match(/\btoday\s+is\s+(?:a\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i) ||
+    content.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\s*,?\s+(?:which\s+)?is\s+(?:a\s+)?(?:non-?publishing|not\s+a\s+(?:publishing|posting))/i);
+  if (!m) return null;
+  return WEEKDAY_NAMES.indexOf(m[1].toLowerCase());
+}
+
+// The waiver must be AUTHORIZED BY THE SCHEDULE OWNER, not merely asserted by the
+// model. These match the OWNER'S configured instruction (the schedule's starting
+// message) for evidence it defines a conditional publishing cadence — "publish
+// only on Mon/Wed/Fri", a named "non-publishing day", or an explicit "if today is
+// X … publish nothing / skip". Without this, a model that spontaneously claims a
+// skip on a day it was actually supposed to publish would silently waive its
+// required write calls (Greptile P1, ENG-844): the skip prose is the model's, but
+// the authorization to skip has to come from the human who wrote the schedule.
+const SCHEDULE_SKIP_AUTHORIZATION_PATTERNS: RegExp[] = [
+  /\b(?:publish|post|posts?|publishing)\s+only\s+(?:on|when|if)\b/i,
+  /\bonly\s+(?:publish|post)(?:es|ing|s)?\b/i,
+  /\b(?:publish|post)(?:es|ing|s)?\s+only\s+on\b/i,
+  /\bonly\s+on\s+(?:mon|tue|wed|thu|fri|sat|sun)/i,
+  /\bnon-?publishing\s+day\b/i,
+  /\bnot\s+a\s+(?:publishing|posting)\s+day\b/i,
+  /\bif\b[^.]*\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post))/i,
+  /\b(?:skip|publish\s+nothing|post\s+nothing|no\s+post)\b[^.]*\b(?:mon|tue|wed|thu|fri|sat|sun|weekend|weekday)/i,
+];
+
+function instructionAuthorizesConditionalSkip(instruction: string): boolean {
+  if (!instruction || typeof instruction !== 'string') return false;
+  const text = instruction.replace(/<[^>]+>/g, ' ');
+  return SCHEDULE_SKIP_AUTHORIZATION_PATTERNS.some((re) => re.test(text));
+}
+
+const WEEKDAY_ABBREV_TO_INDEX: Record<string, number> = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6,
+};
+
+// Every ACCEPTED spelling of a weekday → 0–6. Matched only as whole tokens (see
+// WEEKDAY_TOKEN) so "monetary"/"wedding"/"satisfaction" are NOT read as Mon/Wed/Sat
+// (Greptile P1: a loose `(mon|tue|…)[a-z]*` prefix invented cadences, ENG-844).
+const WEEKDAY_WORD_TO_INDEX: Record<string, number> = {
+  sunday: 0, sun: 0,
+  monday: 1, mon: 1,
+  tuesday: 2, tue: 2, tues: 2,
+  wednesday: 3, wed: 3, weds: 3,
+  thursday: 4, thu: 4, thur: 4, thurs: 4,
+  friday: 5, fri: 5,
+  saturday: 6, sat: 6,
+};
+// Whole-token weekday matcher — full names or the exact accepted abbreviations,
+// never an arbitrary word that merely starts with those three letters.
+const WEEKDAY_TOKEN = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
+// A range like "Mon-Fri" / "Monday to Friday" / "Monday through Friday".
+const WEEKDAY_RANGE = /\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b\s*(?:-|–|—|to|through|thru|till|until)\s*\b(sunday|saturday|monday|tuesday|wednesday|thursday|friday|sun|mon|tues?|weds?|thurs?|thu|fri|sat)\b/gi;
+
+// A singleton weekday counts as a cadence day only if what immediately follows it
+// marks it as a LIST ITEM — end of clause, a separator/connective, or a cadence
+// keyword — and NOT a possessive or an unrelated noun. This is what distinguishes
+// "publish only on Mon/Wed/Fri" (a cadence) from "publish only on Monday's
+// approval" or "publish only on the Monday team" (an approval gate that merely
+// names a day), which would otherwise invent a cadence and waive required calls
+// (Greptile P1, ENG-844).
+// NB: range connectives (-, –, —, to, through, thru, till, until) are deliberately
+// NOT "listy" here. A day followed by one is a RANGE start — handled by WEEKDAY_RANGE
+// with its OWN trailing-context check — so if the whole range is bound to a noun
+// ("Monday to Friday team approves") both the range AND its endpoint singletons are
+// rejected, instead of the leading day leaking through (Greptile P1, ENG-844).
+const AFTER_CADENCE_DAY = /^\s*(?:$|[,/&.;:!?()]|(?:and|or|then|otherwise|else|per|please|publish\w*|post\w*|posting|only|nothing|create|creating|skip\w*|days?|weekly|week|schedule|cadence)\b|(?:sun|mon|tue|wed|thu|fri|sat))/i;
+function followsAsCadenceDay(after: string): boolean {
+  if (/^['’]/.test(after)) return false; // possessive: "Monday's approval"
+  return AFTER_CADENCE_DAY.test(after);
+}
+
+// Extract every weekday named in a text fragment (Mon, Tuesday, THU, …) as 0–6
+// indices, expanding inclusive ranges ("Mon-Fri" → Mon,Tue,Wed,Thu,Fri, wrapping
+// Sun..Sat) and the "weekend"/"weekday" shorthands. EVERY path — singletons,
+// ranges, and shorthands — must pass the grammatical-context guard
+// (followsAsCadenceDay), so an approval clause that merely contains a range or
+// shorthand ("publish only on Mon-Fri's approval", "weekend approvals") does not
+// get reinterpreted as a cadence (Greptile P1, ENG-844). Order/dupes don't matter —
+// callers collect into a Set.
+function weekdaysInFragment(fragment: string): number[] {
+  const out: number[] = [];
+  const followsHere = (matchEnd: number) => followsAsCadenceDay(fragment.slice(matchEnd));
+  for (const m of fragment.matchAll(WEEKDAY_RANGE)) {
+    const a = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
+    const b = WEEKDAY_WORD_TO_INDEX[m[2].toLowerCase()];
+    if (a === undefined || b === undefined) continue;
+    if (!followsHere((m.index ?? 0) + m[0].length)) continue;
+    for (let i = a, steps = 0; steps < 7; i = (i + 1) % 7, steps++) {
+      out.push(i);
+      if (i === b) break;
+    }
+  }
+  for (const m of fragment.matchAll(WEEKDAY_TOKEN)) {
+    const idx = WEEKDAY_WORD_TO_INDEX[m[1].toLowerCase()];
+    if (idx === undefined) continue;
+    if (!followsHere((m.index ?? 0) + m[0].length)) continue;
+    out.push(idx);
+  }
+  for (const m of fragment.matchAll(/\bweekends?\b/gi)) {
+    if (followsHere(m.index + m[0].length)) out.push(0, 6);
+  }
+  for (const m of fragment.matchAll(/\bweekdays?\b/gi)) {
+    if (followsHere(m.index + m[0].length)) out.push(1, 2, 3, 4, 5);
+  }
+  return out;
+}
+
+// Parse the schedule OWNER'S instruction into the day-sets that define its
+// publishing cadence: the days it publishes on ("publish only on Mon/Wed/Fri")
+// and/or the days it explicitly skips ("if Tue/Thu/Sat/Sun, publish nothing").
+// Used to cross-check the actual RUN DATE — a skip claimed on a real publishing
+// day must NOT be waived even if the model omits or mislabels the weekday
+// (Greptile P1, ENG-844). Clause-scoped so a "publish" clause and a "skip" clause
+// in the same instruction are classified independently; an ambiguous day-bearing
+// clause (neither keyword) is ignored rather than guessed.
+function parseScheduleCadence(instruction: string): { publishDays: Set<number>; skipDays: Set<number> } {
+  const publishDays = new Set<number>();
+  const skipDays = new Set<number>();
+  if (!instruction || typeof instruction !== 'string') return { publishDays, skipDays };
+  const text = instruction.replace(/<[^>]+>/g, ' ');
+  const skipKeyword = /\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post)|non-?publishing|not\s+a\s+(?:publishing|posting)\s+day)\b/i;
+  const publishOnlyKeyword = /\b(?:publish|post|publishing)\s+only\b|\bonly\s+(?:publish|post|on)\b/i;
+  for (const clause of text.split(/[.;\n]+/)) {
+    const days = weekdaysInFragment(clause);
+    if (days.length === 0) continue;
+    const isSkip = skipKeyword.test(clause);
+    const isPublishOnly = publishOnlyKeyword.test(clause);
+    // A "publish only on <days>" clause names the PUBLISH days; a skip clause names
+    // the SKIP days. Publish-only wins a tie (its days are the positive cadence).
+    if (isPublishOnly) days.forEach((d) => publishDays.add(d));
+    else if (isSkip) days.forEach((d) => skipDays.add(d));
+  }
+  return { publishDays, skipDays };
+}
+
+// The owner's weekday cadence ("publish Mon/Wed/Fri") is expressed in the
+// SCHEDULE'S local calendar, so the cadence day-of-week must be read in the
+// schedule's timezone — evaluating it in UTC mis-judges the day for any run near
+// a midnight boundary and can waive a skip on the owner's actual publishing day
+// (Greptile P1, ENG-844). Falls back to UTC when no/invalid timezone is given.
+// NB: the model-asserted-weekday VETO stays UTC on purpose — the model is handed
+// its "Current date" as a UTC calendar date, so that is the reference IT reasons in.
+// True iff `tz` is a valid IANA timezone identifier (e.g. "America/Los_Angeles").
+// Intl.DateTimeFormat throws RangeError on an unknown zone. Used to validate the
+// timezone persisted on a schedule so the cadence check has a trustworthy value
+// (ENG-844).
+export function isValidIanaTimeZone(tz: unknown): tz is string {
+  if (typeof tz !== 'string' || tz.trim().length === 0) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function weekdayInTimeZone(when: Date, timeZone?: string): number {
+  if (!timeZone) return when.getUTCDay();
+  try {
+    const wd = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(when);
+    const idx = WEEKDAY_ABBREV_TO_INDEX[wd.slice(0, 3).toLowerCase()];
+    return idx ?? when.getUTCDay();
+  } catch {
+    return when.getUTCDay();
+  }
+}
+
+// A legitimate cadence skip makes NO write of consequence — not just none of the
+// schedule's REQUIRED minimums. A run can call other side-effecting tools not in
+// requiredFunctions (send_email_from_sender, add_leads_to_list, launch_campaign,
+// save_*, set_*, …); any such call means the run was not a clean no-op and must
+// not be laundered into a successful skip (Greptile P1, ENG-844).
+//
+// Detection is fail-SAFE: rather than enumerate write verbs (an allowlist that
+// leaks — `email`, `add_*`, `assign_*`, `manage_*`, `freeze_*` all slipped past an
+// earlier verb list), we allowlist READ/CONTEXT tools and treat EVERYTHING ELSE as
+// a side effect. A new or unrecognized tool therefore counts as a write until
+// proven read-only, so no write can be silently concealed.
+// Reads are named verb-FIRST (get_*, read_*, list_*, describe_*, analyze_*), so
+// anchor to the leading token — otherwise a write like `add_leads_to_list` or
+// `create_lead_list` would be mistaken for a read because it merely CONTAINS a read
+// word. Irregular read names that don't lead with a read verb are listed exactly.
+const READ_ONLY_TOOL = /^(?:get|read|list|fetch|search|describe|analy[sz]e|ask|audit|lookup|view|show|load|query|count|retrieve|summari[sz]e|inspect)(?:_|$)/i;
+const READ_ONLY_TOOL_EXACT = new Set(['account_summary', 'you_search_web', 'web_search']);
+function isReadOnlyToolName(name: string): boolean {
+  return READ_ONLY_TOOL_EXACT.has(name) || READ_ONLY_TOOL.test(name);
+}
+function isWriteToolCall(toolCall: any): boolean {
+  const name = typeof toolCall?.name === 'string' ? toolCall.name : '';
+  return name.length > 0 && !isReadOnlyToolName(name);
+}
+
+// Reconstruct the tool calls an abandoned session already made, for an ENG-657
+// resume. A message can carry BOTH the request-only assistant `tool_calls` and the
+// persisted EXECUTION ledger `metadata.toolCalls`; prefer the executed ledger
+// because only it carries result/error markers. Preferring the request list would
+// drop a FAILED abandoned call's error, which the conditional-skip error-veto needs
+// to reject a failed run (Greptile P1, ENG-844). Falls back to the request list
+// only for a message that has no executed ledger. Each returned entry keeps the
+// name and, when the call failed, its error.
+export function reconstructPriorToolCalls(messages: any[]): Array<{ name: string; error?: any }> {
+  if (!Array.isArray(messages)) return [];
+  return messages.flatMap((m: any) => {
+    const executed = Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : [];
+    const requested = Array.isArray(m?.tool_calls) ? m.tool_calls : [];
+    const calls = executed.length ? executed : requested;
+    return calls
+      .map((tc: any) => {
+        const name = tc?.function?.name || tc?.name;
+        if (!name) return null;
+        return (tc && typeof tc === 'object' && tc.error != null) ? { name, error: tc.error } : { name };
+      })
+      .filter(Boolean);
+  }) as Array<{ name: string; error?: any }>;
+}
+
+export function scheduledRunSignalsConditionalSkip(
+  content: string,
+  options: { toolCalls?: any[]; now?: Date; instruction?: string; timezone?: string } = {}
+): boolean {
+  if (!content || typeof content !== 'string') return false;
+
+  const now = options.now ?? new Date();
+  // UTC weekday — the reference the MODEL reasons in (its "Current date" is a UTC
+  // calendar date), used only for the model-asserted-weekday VETO in step (4).
+  const todayIdx = now.getUTCDay();
+  // The OWNER'S cadence weekday, read in the schedule's timezone — the reference
+  // the cadence day-lists ("publish Mon/Wed/Fri") are expressed in (Greptile P1).
+  const cadenceDayIdx = weekdayInTimeZone(now, options.timezone);
+  // Tracks whether the skip has been corroborated against the actual RUN DATE
+  // (by the parsed cadence and/or the model naming today's weekday). When an
+  // instruction is provided we REQUIRE this before waiving (see final gate).
+  let runDateCorroborated = false;
+
+  // (0) Authorization + run-date gate: only honor a skip the SCHEDULE OWNER
+  // authorized, ON a day that owner's cadence actually excludes. When the caller
+  // supplies the schedule's instruction (it always does on the real scheduled
+  // path):
+  //   - the instruction must itself define a conditional cadence (else a
+  //     model-authored skip on a run carrying write-call minimums is unauthorized);
+  //   - and TODAY must be a non-publishing day under that cadence. Parsing the
+  //     instruction's publish/skip day-lists lets us reject a skip emitted ON a
+  //     publishing day even when the model omits or mislabels the weekday — the
+  //     deeper form of the same bug (Greptile P1, ENG-844).
+  // Undefined instruction (pure text-classifier callers) leaves this gate inert.
+  const instruction = options.instruction;
+  const instructionProvided = typeof instruction === 'string' && instruction.length > 0;
+  if (instructionProvided) {
+    if (!instructionAuthorizesConditionalSkip(instruction!)) return false;
+    const { publishDays, skipDays } = parseScheduleCadence(instruction!);
+    if (publishDays.size > 0) {
+      // Positive cadence: today (in the schedule's timezone) must fall OUTSIDE the
+      // publish window.
+      if (publishDays.has(cadenceDayIdx)) return false;
+      runDateCorroborated = true;
+    } else if (skipDays.size > 0) {
+      // Only a skip-day list was given: today (schedule timezone) must be one of
+      // the named skip days.
+      if (!skipDays.has(cadenceDayIdx)) return false;
+      runDateCorroborated = true;
+    }
+  }
+
+  // Emma emits HTML (the marketing persona renders <strong>, <ul>, <table>…), so
+  // strip tags before matching — otherwise "<strong>Sunday</strong>" hides the
+  // weekday assertion and a "<td>Failed</td><td>0</td>" completion ledger is read
+  // as prose. Verified against the real ENG-844 session (442e7880…): both
+  // happened, and without this the carve-out never fired on the actual skip.
+  const text = content.replace(/<[^>]+>/g, ' ');
+
+  // (1) Must be a cadence-anchored skip, not a bare "skip today".
+  const isCadenceSkip =
+    CADENCE_SKIP_PATTERNS.some((re) => re.test(text)) ||
+    (SKIP_DECLARATION_PATTERNS.some((re) => re.test(text)) &&
+      CADENCE_RATIONALE_PATTERNS.some((re) => re.test(text)));
+  if (!isCadenceSkip) return false;
+
+  // (2) A failure worded as a skip is not a cadence skip. But FIRST neutralize a
+  // zero/none-valued failure ledger — a clean run routinely reports "Failed: 0" /
+  // "Failed  0" (a "<td>Failed</td><td>0</td>" cell) / "failures: none", which is
+  // a SUCCESS signal, not a failure. Only the ledger's own value is dropped
+  // (label THEN count); a nonzero or asserted failure ("Failed 1", "post failed",
+  // "auth failed", "couldn't reach the API") is untouched and still vetoes. NB:
+  // matching a zero that PRECEDES the word (`0 failed`) is deliberately avoided —
+  // once tags are stripped, the prior ledger row's count ("Succeeded 0") sits
+  // right before the next row's "Failed" and would falsely neutralize it.
+  const failureScan = text.replace(
+    /\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi,
+    ' '
+  );
+  if (SKIP_FAILURE_SIGNAL_PATTERNS.some((re) => re.test(failureScan))) return false;
+
+  // (3) Non-spoofable ledger check: a legitimate cadence skip makes NO write calls
+  // AND no tool errors. Any tool error means this was a failure, not a skip; any
+  // WRITE call — even one not in the schedule's requiredFunctions, e.g.
+  // send_email_from_sender — means the run had an external side effect and is not
+  // a clean no-op, so it must not be waived (Greptile P1, ENG-844).
+  const toolCalls = options.toolCalls;
+  if (Array.isArray(toolCalls) &&
+      toolCalls.some((tc) => (tc && typeof tc === 'object' && 'error' in tc) || isWriteToolCall(tc))) {
+    return false;
+  }
+
+  // (4) Weekday cross-check — VETO ONLY. If the turn names a weekday as "today" it
+  // must agree with the actual UTC weekday (getUTCDay — the model is handed its
+  // "Current date" as a UTC calendar date via new Date().toISOString(), see
+  // generateMarketingResponse; a server-LOCAL getDay would desync on a non-UTC
+  // host). This is deliberately UTC even though the cadence check uses the
+  // schedule timezone: the veto validates the MODEL's claim, and the model reasons
+  // in UTC. This catches a
+  // grossly mis-dated skip. It does NOT corroborate the waiver: the model naming
+  // today's weekday only proves it knows the date, not that today is genuinely a
+  // non-publishing day. For a schedule whose cadence is not weekday-based (e.g.
+  // "publish only when approved"), a correctly-named weekday says nothing about
+  // whether a skip is legitimate — so authorization to skip must come only from
+  // the OWNER's parsed weekday cadence in step (0), never the model's self-report
+  // (Greptile, ENG-844).
+  const asserted = assertedTodayWeekday(text);
+  if (asserted !== null && asserted !== todayIdx) return false;
+
+  // (5) When the schedule instruction is provided (the real scheduled path always
+  // provides it), the skip MUST be corroborated against the run date by the OWNER's
+  // parsed weekday cadence (step 0). If the instruction authorizes a skip but names
+  // no weekday cadence we can evaluate against today, fail closed rather than waive
+  // a possibly-missed publication on an audited pipeline (Greptile, ENG-844).
+  if (instructionProvided && !runDateCorroborated) return false;
+
+  return true;
+}
+
 // Deterministic, TOOL-CALL-based completion detector for scheduled runs (ENG-518).
 //
 // Some workflows split a mutation into a dry-run PREVIEW tool and a write-back
@@ -1060,6 +1590,11 @@ type RunVerifiedChatResult = {
   // confirm). `success` stays true (a deliverable existed for HTTP callers), but the
   // SCHEDULED path treats this as a failed run (records failure + oncall).
   deferredUnresolved?: boolean;
+  // ENG-844: set when a scheduled run legitimately short-circuited on a conditional
+  // guard (e.g. a Mon/Wed/Fri schedule running on a non-publishing day) and correctly
+  // produced zero write calls. The run is a SUCCESSFUL skip — required write-call
+  // minimums are waived instead of retry-pressed toward irreversible publishing.
+  conditionalSkip?: boolean;
 };
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -1101,7 +1636,18 @@ export async function runVerifiedChat(
     // just the continuation turns — otherwise a resumed run would be wrongly marked
     // `passed: false` for calls it made before the interruption, and the verify
     // retry loop could re-prompt the model into re-running a completed side-effect.
-    priorToolCalls?: Array<{ name: string }>;
+    // `error` is preserved (ENG-844) so the conditional-skip error-veto can reject a
+    // resumed run whose ABANDONED portion had a failed tool call — reconstructing only
+    // names would hide that failure and let it be recorded as a clean skip.
+    priorToolCalls?: Array<{ name: string; error?: any }>;
+    // Injectable clock for the conditional-skip run-date cross-check (ENG-844).
+    // Production leaves it undefined (the detector uses `new Date()`); tests pin it
+    // so the cadence-vs-today check is deterministic regardless of the day CI runs.
+    now?: Date;
+    // Schedule's IANA timezone (ENG-844): the owner's weekday cadence is read in
+    // this zone so a run near a midnight boundary is judged on the owner's calendar
+    // day, not UTC. Undefined falls back to UTC.
+    scheduleTimezone?: string;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -1619,6 +2165,68 @@ export async function runVerifiedChat(
       });
       const allRequirementsMet = (!workPlan || workPlanCompleted) && allKeywordsMet && allFunctionCallsMet;
 
+      // ENG-844: A scheduled run that legitimately short-circuited on a conditional
+      // guard (e.g. a "publish only Mon/Wed/Fri" schedule running on a non-publishing
+      // day) produces zero write calls BY DESIGN and reports a clean skip. Do NOT keep
+      // retrying to satisfy requiredFunctionCalls — that pressure is aimed at
+      // IRREVERSIBLE publishing tools (post_on_connected_account / generate_image) and,
+      // because each retry re-sends an identical prompt, eventually trips the anti-loop
+      // override. Treat it as a SUCCESSFUL skip: waive the unmet write-call minimums and
+      // exit cleanly. Scoped to scheduled runs (completionGate) so interactive/image/
+      // revision callers are unaffected, and only fires when a required call is actually
+      // unmet — a run that DID publish flows through the normal success path below.
+      //
+      // A true cadence skip makes ZERO write calls by design. If ANY required write
+      // call was actually made (a partially-executed run — e.g. it published to one
+      // destination then emitted skip wording), this is NOT a skip: waiving here would
+      // launder partial external state into a clean "skip" and clear the misses on the
+      // still-unmet calls. Require every required call to have zero invocations before
+      // the carve-out is even eligible (Greptile P1, ENG-844).
+      const noRequiredWriteCallsMade = requiredFunctions.every(
+        (reqFunc) => countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) === 0
+      );
+      // The no-side-effects skip invariant must see the WHOLE task's tool calls,
+      // including any made in an abandoned portion that this run resumed. Those
+      // live in params.priorToolCalls (seeded into the required-call counts but not
+      // into allToolCalls), so a resumed non-required write — e.g. an email sent
+      // before the interruption — would otherwise be invisible to the write-veto
+      // and a partial run could be laundered into a clean skip (Greptile P1, ENG-844).
+      const skipLedgerToolCalls = [...(params.priorToolCalls ?? []), ...allToolCalls];
+      if (completionGate && !allFunctionCallsMet && noRequiredWriteCallsMade &&
+          scheduledRunSignalsConditionalSkip(allContent, { toolCalls: skipLedgerToolCalls, instruction: startingMessage, now: params.now, timezone: params.scheduleTimezone })) {
+        // Low-severity breadcrumb: a conditional skip is a SUCCESSFUL run, but it is
+        // waiving write-call minimums on an audited publishing pipeline, so keep it
+        // observable (and threaded into runResults via `conditionalSkip`) rather than
+        // laundering it through the silent success path (ENG-844).
+        const waivedWriteCalls = requiredFunctions
+          .filter((reqFunc) => countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) < reqFunc.minCount)
+          .map((reqFunc) => reqFunc.functionName);
+        console.log(
+          `AgentMode runVerifiedChat: session ${sessionId} legitimately short-circuited on a conditional ` +
+          `CADENCE skip day (no write calls, no tool errors) — recording a successful skip without pressing ` +
+          `for required write calls. Unmet write minimums waived: ${waivedWriteCalls.join(', ') || '(none)'}`
+        );
+        const skipFunctionStatus = requiredFunctions.map((reqFunc) => {
+          const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
+          return { functionName: reqFunc.functionName, requiredCount: reqFunc.minCount, actualCount, met: actualCount >= reqFunc.minCount };
+        });
+        return {
+          success: true,
+          conditionalSkip: true,
+          content: allContent,
+          toolCalls: allToolCalls,
+          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+          keywordMisses: [],
+          functionCallMatches: requiredFunctions.filter(reqFunc =>
+            countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting) >= reqFunc.minCount
+          ).map(reqFunc => reqFunc.functionName),
+          functionCallMisses: [],
+          functionStatus: skipFunctionStatus,
+          attempts: attempt,
+          workPlanCompleted: workPlanCompleted || !workPlan,
+        };
+      }
+
       // Deterministic completion gate (opt-in, scheduled runs only): if all other
       // requirements are met but the latest turn admits it left work unfinished,
       // spend one more continuation turn instead of returning success — unless we
@@ -1798,7 +2406,10 @@ export async function runScheduledChat(
   schedule: any,
   userId: string,
   isTest: boolean = false,
-  preGeneratedRunId?: string
+  preGeneratedRunId?: string,
+  // Injectable clock forwarded to the conditional-skip run-date cross-check
+  // (ENG-844). Production omits it; tests pin it for a deterministic weekday.
+  nowOverride?: Date
 ): Promise<MarketingActionCarrier & {
   scheduleId: string;
   runId: string;
@@ -2141,7 +2752,7 @@ export async function runScheduledChat(
     let isResumeRun = false;
     // ENG-657: tool calls the abandoned portion already made, seeded into the
     // resumed run's verification so requiredFunctionCalls counts the whole task.
-    let resumePriorToolCalls: Array<{ name: string }> = [];
+    let resumePriorToolCalls: Array<{ name: string; error?: any }> = [];
     const pendingResumeSessionId: string | undefined =
       !isTest && typeof schedule.pendingResumeSessionId === 'string' && schedule.pendingResumeSessionId
         ? schedule.pendingResumeSessionId
@@ -2306,16 +2917,9 @@ export async function runScheduledChat(
       // reloads the full transcript from the DB.
       isResumeRun = true;
       sessionId = pendingResumeSessionId;
-      // Credit the abandoned portion's tool calls to this run's verification.
-      resumePriorToolCalls = (resumeSession.messages || []).flatMap((m: any) => {
-        const calls = (Array.isArray(m?.tool_calls) && m.tool_calls.length)
-          ? m.tool_calls
-          : (Array.isArray(m?.metadata?.toolCalls) ? m.metadata.toolCalls : []);
-        return calls
-          .map((tc: any) => tc?.function?.name || tc?.name)
-          .filter(Boolean)
-          .map((name: string) => ({ name }));
-      });
+      // Credit the abandoned portion's tool calls to this run's verification,
+      // preferring the executed ledger so a failed prior call keeps its error (ENG-844).
+      resumePriorToolCalls = reconstructPriorToolCalls(resumeSession.messages || []);
       console.log(`runScheduledChat: RESUMING abandoned session ${sessionId} for schedule ${schedule.scheduleId} (${schedule.scheduleName}); ${resumePriorToolCalls.length} prior tool call(s) carried into verification`);
     }
 
@@ -2350,9 +2954,42 @@ export async function runScheduledChat(
     // Set the session title to the schedule name
     await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
 
-    // Update the session with the selected model from the schedule
+    // Update the session with the selected model from the schedule.
+    // ENG-892: schedule.llmModel is written straight from an admin request body
+    // with no allow-list check, and this is an internal db call, so it bypasses
+    // the validation on the picker endpoints. Stamping it raw recorded a model
+    // that never ran whenever generation fell back — on exactly the scheduled
+    // sessions the daily reports analyse. Resolve first so the stored value is
+    // what generation will resolve to.
     const defaultModel = await agentModeService.getScheduledChatsDefaultModel();
-    const modelToUse = schedule.llmModel || defaultModel;
+    const requestedModel = schedule.llmModel || defaultModel;
+    const scheduleModelResolution = agentModeService.resolveGenerationModel(requestedModel);
+    const modelToUse = scheduleModelResolution.model;
+    if (scheduleModelResolution.fellBack) {
+      // Fail loud, not partial. The run still completes on the fallback, but the
+      // admin's pin is dead and the UI keeps showing the model they chose — the
+      // ENG-806 failure mode, where an alias-valued setting sat inert for two
+      // months. resolveConfiguredModel alerts for AW-Settings; schedules only
+      // console.warn'd. Fire-and-forget so the run never blocks on it.
+      void sendAgentModeOncallAlert({
+        subject: 'AgentMode: unsupported model pinned on a scheduled chat',
+        message:
+          `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${requestedModel}", which is ` +
+          `not a served model even after legacy-alias resolution. The run fell back to "${modelToUse}", so the ` +
+          `pin is inert and every run of this schedule is using a model nobody chose.`,
+        context: {
+          Schedule: schedule.scheduleId,
+          'Pinned Model': requestedModel,
+          'Actually Used': modelToUse,
+        },
+        // One alert per (schedule, bad value) per hour: a daily schedule with a
+        // permanently bad pin must not flood oncall.
+        dedupeKey: `schedule_model_invalid:${schedule.scheduleId}:${requestedModel}`,
+        dedupeWindowMs: 60 * 60 * 1000,
+      }).catch((alertError) => {
+        console.error('AgentMode: Failed to send unsupported schedule-model alert:', alertError);
+      });
+    }
     await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
 
     // Convert schedule format to runVerifiedChat format
@@ -2408,7 +3045,13 @@ export async function runScheduledChat(
       fullAutonomy: schedule.fullAutonomy === true,
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
-      parkNotifiable: true
+      parkNotifiable: true,
+      // ENG-844: forward the injectable clock so the conditional-skip run-date
+      // cross-check is deterministic under test (undefined in production).
+      now: nowOverride,
+      // ENG-844: the owner's weekday cadence is evaluated in the schedule's
+      // timezone (falls back to UTC when unset).
+      scheduleTimezone: schedule.timezone
     });
 
     // ENG-396: the run parked on a blocking AskUserQuestion with no human present.
@@ -2527,7 +3170,14 @@ export async function runScheduledChat(
       sessionId: sessionId,
       attempt: result.attempts,
       createdAt: new Date().toISOString(),
-      summary: generatedSummary
+      summary: generatedSummary,
+      // ENG-844: a legitimate conditional-cadence skip (e.g. a Mon/Wed/Fri
+      // schedule running on a non-publishing day) is a SUCCESSFUL run that
+      // produced zero write calls BY DESIGN. Persist a distinguishing marker so
+      // a skip is not indistinguishable from a real publish in runResults /
+      // downstream reporting — a bare success would otherwise hide the waived
+      // write-call minimums.
+      ...(result.conditionalSkip ? { conditionalSkip: true } : {}),
     };
 
     // Save the result to database (without actualResponse to save space)
@@ -2670,15 +3320,23 @@ export async function runScheduledChat(
       // instead of an empty session. Done BEFORE requeue so the failed session
       // is self-explanatory; the requeue (below) runs in a fresh session.
       if (sessionId) {
+        // ENG-826: pick the message that matches the ACTUAL failure. A deterministic
+        // provider/validation error (e.g. the gemini-3.5-flash union-schema 400) must
+        // not be reported as a time/memory-budget overrun with "split into smaller
+        // batches" advice that can't help — that mislabels the transcript for anyone
+        // debugging it. Budget-shaped failures keep the original guidance.
+        const failureClass = classifyZeroAssistantFailure(error);
+        const incompleteMessage = zeroAssistantIncompleteMessage(error);
         try {
           await chatbotDb.addMessageToSession(sessionId, {
             role: 'assistant',
-            content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+            content: incompleteMessage,
             timestamp: new Date().toISOString(),
             metadata: {
               timestamp: new Date().toISOString(),
               isErrorMessage: true,
               jobIncomplete: true,
+              failureClass,
             },
           });
         } catch (persistError) {
@@ -2718,8 +3376,51 @@ export async function runScheduledChat(
           }
         } else {
           console.error(
-            `Scheduled chat ${schedule.scheduleId} exceeded zero-output requeue limit (${ZERO_ASSISTANT_MAX_REQUEUES}); alerting without requeue.`
+            `Scheduled chat ${schedule.scheduleId} exceeded zero-output requeue limit (${ZERO_ASSISTANT_MAX_REQUEUES}); notifying owner.`
           );
+          // ENG-826 (#1): the automatic retries are exhausted — the schedule is
+          // consistently failing and won't auto-retry until its next slot. Proactively
+          // notify the owner instead of only logging (the old behaviour left the owner
+          // unaware). Recipients: the schedule's configured notification list, else the
+          // owner's account email. Best-effort — a notification failure must never break
+          // the run.
+          //
+          // The alert fires on each exhausted failing run. Past the requeue cap the
+          // schedule is NOT requeued, so this is at most once per natural slot while it
+          // stays broken — standard "notify while failing" behavior. We deliberately do
+          // NOT persist a separate "already alerted" flag for dedup: that write can't be
+          // atomic with the email send, so any such flag inevitably diverges from actual
+          // delivery (a duplicate alert if the write fails after a send, or a missed alert
+          // if the ordering is inverted). No dedup state means no divergence to get wrong.
+          try {
+            let recipients: string[] = Array.isArray(schedule.emailNotifications)
+              ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+              : [];
+            if (recipients.length === 0) {
+              const owner = await userDb.getUserById(userId);
+              if (owner?.email) recipients = [owner.email];
+            }
+            if (recipients.length > 0) {
+              await emailService.sendScheduledRunFailedEmail(
+                recipients,
+                schedule.scheduleName,
+                schedule.scheduleId,
+                {
+                  failedAttempts: nextRetryCount,
+                  failureClass: classifyZeroAssistantFailure(error),
+                }
+              );
+            } else {
+              console.error(
+                `No notification recipients for repeatedly-failing schedule ${schedule.scheduleId}; owner alert skipped.`
+              );
+            }
+          } catch (notifyError) {
+            console.error(
+              `Failed to send owner failure alert for schedule ${schedule.scheduleId}:`,
+              notifyError
+            );
+          }
         }
       }
     }
@@ -2896,7 +3597,10 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
       } else {
         await chatbotDb.addMessageToSession(lease.sessionId, {
           role: 'assistant',
-          content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+          // ENG-764: honest cause — the process died, this was not a budget overrun.
+          // The jobIncomplete/isErrorMessage markers are unchanged: sessionScoringService
+          // and resumePlan both detect this placeholder by metadata, never by its text.
+          content: SCHEDULED_RUN_ABANDONED_MESSAGE,
           timestamp: nowIso,
           metadata: { timestamp: nowIso, isErrorMessage: true, jobIncomplete: true },
         });
@@ -6015,7 +6719,8 @@ export const agentModeController = {
         variableValues,
         frequencyIntervalDays,
         selfImprove,
-        fullAutonomy
+        fullAutonomy,
+        timezone
       } = req.body;
 
       if (!scheduleName || !startingMessage || !scheduleFrequency) {
@@ -6039,6 +6744,14 @@ export const agentModeController = {
         if (!Number.isInteger(runCount) || (runCount !== -1 && runCount < 1)) {
           return res.status(400).json({ error: 'runCount must be -1 (unlimited) or a positive integer' });
         }
+      }
+
+      // ENG-844: an optional IANA timezone. Persisted so scheduled-run cadence
+      // checks (e.g. "publish only Mon/Wed/Fri") are evaluated on the owner's local
+      // calendar day rather than UTC. Reject a malformed value loudly rather than
+      // silently storing garbage the cadence check would ignore.
+      if (timezone !== undefined && !isValidIanaTimeZone(timezone)) {
+        return res.status(400).json({ error: 'timezone must be a valid IANA timezone identifier (e.g. America/Los_Angeles)' });
       }
 
       // If sessionId is provided, verify it exists and belongs to user
@@ -6087,6 +6800,9 @@ export const agentModeController = {
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
         fullAutonomy: fullAutonomy === true,
+        // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
+        // client didn't send one — the cadence check then falls back to UTC).
+        ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
         status: 'active',
         nextRunTime: scheduledNextRunTime,
         createdAt: now.toISOString(),
@@ -6170,10 +6886,15 @@ export const agentModeController = {
       });
 
       // Exclude runResults to keep response size manageable (run history is
-      // available via the dedicated GET /scheduled-chats/:id/test-history endpoint)
-      const scheduledChatsWithoutRunResults = scheduledChats.map(({ runResults, ...rest }: any) => rest);
+      // available via the dedicated GET /scheduled-chats/:id/test-history endpoint),
+      // but first derive a compact runHealth summary (ENG-826 #4) so the list can
+      // flag consecutive failures on the card without fetching full history.
+      const scheduledChatsWithHealth = scheduledChats.map(({ runResults, ...rest }: any) => ({
+        ...rest,
+        runHealth: computeScheduleRunHealth(runResults),
+      }));
 
-      res.json(scheduledChatsWithoutRunResults);
+      res.json(scheduledChatsWithHealth);
     } catch (error) {
       console.error('AgentMode: Get scheduled chats error:', error);
       res.status(500).json({ error: 'Failed to get scheduled chats' });
@@ -6203,7 +6924,8 @@ export const agentModeController = {
         variableValues,
         frequencyIntervalDays,
         selfImprove,
-        fullAutonomy
+        fullAutonomy,
+        timezone
       } = req.body;
 
       // Verify schedule exists and belongs to user (before validation so we can merge)
@@ -6241,6 +6963,11 @@ export const agentModeController = {
         }
       }
 
+      // ENG-844: validate an optional IANA timezone update (persisted for cadence).
+      if (timezone !== undefined && !isValidIanaTimeZone(timezone)) {
+        return res.status(400).json({ error: 'timezone must be a valid IANA timezone identifier (e.g. America/Los_Angeles)' });
+      }
+
       const now = new Date();
 
       // Determine nextRunTime: use provided value or keep existing
@@ -6273,6 +7000,11 @@ export const agentModeController = {
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
+        // ENG-844: update the owner's timezone when a valid one is supplied; keep
+        // the existing value otherwise (partial-update safe).
+        ...(isValidIanaTimeZone(timezone)
+          ? { timezone }
+          : ((existingSchedule as any).timezone ? { timezone: (existingSchedule as any).timezone } : {})),
       };
 
       // Whenever the prompt actually changes, snapshot the PREVIOUS prompt into the
@@ -8132,8 +8864,22 @@ export const agentModeController = {
         return res.status(400).json({ error: 'llmModel is required' });
       }
 
+      // ENG-892: the picker used to persist whatever string arrived, so ids that
+      // are not served at all (e.g. 'claude-sonnet-4-5') were stored and later
+      // reported as the model a session ran on. Accept only what generation would
+      // accept — `fellBack` is true exactly when the id is not in the allow-list
+      // after legacy-alias resolution — and store the canonical id so the field
+      // stays comparable to the per-message `llm` provenance.
+      const resolution = agentModeService.resolveGenerationModel(llmModel);
+      if (resolution.fellBack) {
+        return res.status(400).json({
+          error: `Unsupported model '${llmModel}'. Choose a model returned by the supported-models endpoint.`,
+        });
+      }
+      const canonicalModel = resolution.model;
+
       // Block non-admins from using opus models
-      if (llmModel.includes('opus') && !user.isAdmin) {
+      if (canonicalModel.includes('opus') && !user.isAdmin) {
         return res.status(403).json({ error: 'Opus models are not available for your account' });
       }
 
@@ -8149,7 +8895,7 @@ export const agentModeController = {
       }
 
       // Update the session's llmModel
-      const updatedSession = await chatbotDb.updateSessionLlmModel(sessionId, llmModel);
+      const updatedSession = await chatbotDb.updateSessionLlmModel(sessionId, canonicalModel);
 
       res.json({ llmModel: updatedSession.llmModel });
     } catch (error) {
@@ -8169,8 +8915,20 @@ export const agentModeController = {
         return res.status(400).json({ error: 'llmModel is required' });
       }
 
+      // ENG-892: same allow-list guard as the authenticated picker. This path
+      // matters more, not less — an interactive-share viewer writes to the
+      // owner's real session, so an unserved id here mislabels someone else's
+      // session.
+      const resolution = agentModeService.resolveGenerationModel(llmModel);
+      if (resolution.fellBack) {
+        return res.status(400).json({
+          error: `Unsupported model '${llmModel}'. Choose a model returned by the supported-models endpoint.`,
+        });
+      }
+      const canonicalModel = resolution.model;
+
       // Shared sessions are non-admin; block opus models
-      if (llmModel.includes('opus')) {
+      if (canonicalModel.includes('opus')) {
         return res.status(403).json({ error: 'Opus models are not available for shared sessions' });
       }
 
@@ -8197,7 +8955,7 @@ export const agentModeController = {
       }
 
       // Update the session's llmModel
-      const updatedSession = await chatbotDb.updateSessionLlmModel(shareId, llmModel);
+      const updatedSession = await chatbotDb.updateSessionLlmModel(shareId, canonicalModel);
 
       res.json({ llmModel: updatedSession.llmModel });
     } catch (error) {

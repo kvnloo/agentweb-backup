@@ -402,6 +402,38 @@ export async function listPostVoters(postId: string, limit = 100): Promise<PostV
   return voters.map((v) => ({ email: v.email, name: v.name }));
 }
 
+/**
+ * Find an existing ticket carrying `marker` in its searchable text, or null.
+ *
+ * ENG-529 AC5 / ENG-598 option A. Featurebase exposes no idempotency key on create, so the only
+ * way to make bug filing idempotent AT THE DESTINATION — the one place that survives a process
+ * restart, an evicted in-process replay entry, or a second instance — is to stamp a fingerprint on
+ * the ticket and look it up before creating another.
+ *
+ * `q` is the correct parameter (`search` returns 400) and it genuinely filters: verified against
+ * the live API, an absent marker returns 0 of 10 otherwise-returned tickets. That check matters —
+ * a `q` that were accepted-but-ignored would return an UNRELATED ticket and make a retry silently
+ * replay the wrong report, which is worse than the duplicate it set out to prevent.
+ *
+ * Returns null on any lookup failure. A failed lookup must never block a genuine first filing: the
+ * cost of a missed dedupe is one duplicate card, the cost of a hard failure is a lost bug report.
+ */
+export async function findTicketByMarker(marker: string): Promise<CreatedTicket | null> {
+  if (!marker) return null;
+  try {
+    const data = await featurebaseFetch(`/tickets?q=${encodeURIComponent(marker)}&limit=10`, { method: 'GET' });
+    const items: any[] = Array.isArray(data?.data) ? data.data : [];
+    // `q` is a text search, not an exact-match filter, so confirm the marker really is present
+    // rather than trusting a fuzzy hit.
+    const hit = items.find((t) => typeof t?.content === 'string' && t.content.includes(marker));
+    if (!hit?.id || hit?.ticketNumber == null) return null;
+    return { id: hit.id, number: hit.ticketNumber, url: hit.ticketUrl || '' };
+  } catch (e) {
+    console.warn('[featurebase] findTicketByMarker failed:', e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
 /** Set a ticket's status (keyed by ticketNumber). Used by the resolve bridge to flip cards on fix. */
 export async function patchTicketStatus(ticketNumber: number, statusId: string): Promise<void> {
   await featurebaseFetch(`/tickets/${ticketNumber}`, {
