@@ -34,6 +34,7 @@ import { getAccountByCalendlyUserUri, updateAccountConfig } from '../services/co
 import { userDb, crmDb } from '../services/db';
 import { metaService } from '../services/metaService';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
+import { leadListAlertService } from '../services/leadListAlertService';
 
 const router = express.Router();
 
@@ -276,6 +277,25 @@ router.post('/', (req: express.Request, res: express.Response) => {
             .catch((err: any) => console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err));
           void externalCrmSyncService.autoSyncLead(resolved.userId, listId, lead, 'attio', eventType)
             .catch((err: any) => console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err));
+
+          // Same alert mechanism /forward-lead already uses — per-list opt-in via
+          // list.alertEvents, so this only notifies the customer if they've already
+          // configured this specific list to alert on lead-added/updated.
+          try {
+            const list = await crmDb.getLeadListById(listId);
+            if (list) {
+              const alertEventType = eventType === 'created' ? 'api.lead_added' : 'api.lead_updated';
+              await leadListAlertService.notifyLeadListOwnerIfConfigured(
+                list,
+                lead,
+                alertEventType,
+                { source: 'calendly_booking', bookingUri: parsed.payload.uri },
+                new Date().toISOString(),
+              );
+            }
+          } catch (alertError: any) {
+            console.error('[Calendly Webhook] Lead alert failed:', alertError?.message ?? alertError);
+          }
 
           console.log(`[Calendly Webhook] CRM-forward: lead ${eventType} in list ${listId} for user ${resolved.userId}`);
         }
