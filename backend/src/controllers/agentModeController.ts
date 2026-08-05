@@ -22,7 +22,7 @@ import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } fro
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { isPublishName } from '../utils/hardeningGaps';
-import { resolveSchedulePublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
+import { resolveSchedulePublishAuthorization, getRequiredPublishTools, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -6850,6 +6850,7 @@ export const agentModeController = {
         // granted only through POST .../publish-consent, which enforces the
         // owner-only boundary that a generic create/update body cannot.
         autopublishAuthorized: false,
+        autopublishAuthorizedTools: [],
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -7051,6 +7052,9 @@ export const agentModeController = {
         // preserved as-is here and can only be changed via POST .../publish-consent,
         // so a delegated session or a broad update body can never grant it.
         autopublishAuthorized: (existingSchedule as any).autopublishAuthorized === true,
+        autopublishAuthorizedTools: Array.isArray((existingSchedule as any).autopublishAuthorizedTools)
+          ? (existingSchedule as any).autopublishAuthorizedTools
+          : [],
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
@@ -7611,12 +7615,12 @@ export const agentModeController = {
         });
       }
 
+      // The scope the owner is consenting to RIGHT NOW. Recorded alongside the flag
+      // so a later edit to requiredFunctionCalls cannot silently re-scope the
+      // consent onto publishing tools they never saw.
+      const approvedTools = getRequiredPublishTools((schedule as any).requiredFunctionCalls);
       if (authorized) {
-        const { tools } = resolveSchedulePublishAuthorization({
-          autopublishAuthorized: true,
-          requiredFunctionCalls: (schedule as any).requiredFunctionCalls,
-        });
-        if (tools.length === 0) {
+        if (approvedTools.length === 0) {
           return res.status(400).json({
             error:
               'This schedule does not require a publishing tool, so enabling unattended publishing would have no effect. Add the publishing tool (e.g. post_on_connected_account) to the schedule\'s required functions first.',
@@ -7626,6 +7630,8 @@ export const agentModeController = {
 
       await scheduleDb.updateSchedule(scheduleId, {
         autopublishAuthorized: authorized,
+        // Bind the consent to exactly what was on screen when it was given.
+        autopublishAuthorizedTools: authorized ? approvedTools : [],
         autopublishAuthorizedAt: authorized ? new Date().toISOString() : null,
         autopublishAuthorizedBy: authorized ? user.userId : null,
         updatedAt: new Date().toISOString(),

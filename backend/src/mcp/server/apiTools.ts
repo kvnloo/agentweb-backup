@@ -557,24 +557,27 @@ mcpToolRegistry.register({
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
 
         // ENG-827: consent changes do NOT travel on the generic update body — that
         // route deliberately preserves the stored value so no broad update can grant
         // publishing, which means a revoke sent there would be silently dropped.
-        // Route it to the dedicated consent endpoint instead. The agent may only
-        // ever REVOKE (`authorized: false`); granting requires the owner's own
-        // action, so no argument here can produce a grant.
+        // Route it to the dedicated consent endpoint, and do it BEFORE the ordinary
+        // update: if the update then fails, the schedule is already in the SAFER
+        // state (not publishing). Revoking after would leave consent enabled
+        // whenever the second call failed. The agent may only ever REVOKE
+        // (`authorized: false`); no argument here can produce a grant.
+        let publishConsent: any;
         if (args.revoke_autopublish === true) {
-          const consent = await mcpFetch({
+          publishConsent = await mcpFetch({
             method: 'POST',
             path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/publish-consent`,
             context: c,
             body: { authorized: false },
           });
-          return jsonResult({ ...(data as any), publishConsent: consent });
         }
-        return jsonResult(data);
+
+        const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
+        return jsonResult(publishConsent ? { ...(data as any), publishConsent } : data);
       }
       case 'toggle': {
         const data = await mcpFetch({ method: 'PATCH', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/toggle`, context: c, body: { status: args.status } });

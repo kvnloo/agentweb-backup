@@ -50,7 +50,7 @@
  */
 
 import { scheduleDb } from '../services/db';
-import { resolveSchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
+import { getRequiredPublishTools } from '../utils/schedulePublishAuthorization';
 
 interface Outcome {
   scheduleId: string;
@@ -82,10 +82,7 @@ export async function grantSchedulePublishConsent(
 
     // Consent with no designated publish tool authorizes nothing, so granting it
     // here would look like it worked and change no behaviour at all.
-    const { tools } = resolveSchedulePublishAuthorization({
-      autopublishAuthorized: true,
-      requiredFunctionCalls: (schedule as any).requiredFunctionCalls,
-    });
+    const tools = getRequiredPublishTools((schedule as any).requiredFunctionCalls);
     if (tools.length === 0) {
       outcomes.push({
         scheduleId,
@@ -103,6 +100,9 @@ export async function grantSchedulePublishConsent(
 
     await scheduleDb.updateSchedule(scheduleId, {
       autopublishAuthorized: true,
+      // Bind the consent to the scope confirmed with the owner, so a later edit to
+      // requiredFunctionCalls cannot re-scope it onto tools they never approved.
+      autopublishAuthorizedTools: tools,
       // Audit trail: who attested to the owner's confirmation, and when.
       autopublishAuthorizedAt: new Date().toISOString(),
       autopublishAuthorizedBy: confirmedBy,

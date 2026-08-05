@@ -53,8 +53,22 @@ export interface SchedulePublishAuthorizationInput {
    * copy spells out that posts go live unseen and cannot be un-published.
    */
   autopublishAuthorized?: boolean;
-  /** Used only to report WHICH publish tools are in scope — never to grant consent. */
+  /**
+   * The publish tools the owner could see when they consented, recorded at grant
+   * time. Consent is bound to THIS list: it is not a standing licence that follows
+   * whatever the schedule later requires.
+   */
+  autopublishAuthorizedTools?: string[];
+  /** The schedule's current requirements — narrows scope, never grants consent. */
   requiredFunctionCalls?: string[];
+}
+
+/** The publish tools a schedule currently requires, de-duplicated in order. */
+export function getRequiredPublishTools(requiredFunctionCalls?: string[]): string[] {
+  const required = Array.isArray(requiredFunctionCalls) ? requiredFunctionCalls : [];
+  return Array.from(
+    new Set(required.filter((name): name is string => typeof name === 'string' && isPublishName(name)))
+  );
 }
 
 export interface SchedulePublishAuthorization {
@@ -76,10 +90,21 @@ export function resolveSchedulePublishAuthorization(
 ): SchedulePublishAuthorization {
   if (!schedule) return UNAUTHORIZED;
 
-  const required = Array.isArray(schedule.requiredFunctionCalls) ? schedule.requiredFunctionCalls : [];
-  const tools = Array.from(
-    new Set(required.filter((name): name is string => typeof name === 'string' && isPublishName(name)))
-  );
+  const requiredPublishTools = getRequiredPublishTools(schedule.requiredFunctionCalls);
+
+  // Consent is bound to the scope it was granted for. `autopublishAuthorizedTools`
+  // is the list the owner could see when they ticked the box; anything the schedule
+  // requires LATER is outside what they approved. Without this, editing
+  // requiredFunctionCalls after a grant would silently re-scope standing consent
+  // onto tools the owner never saw — e.g. a consent for post_on_connected_account
+  // quietly becoming one for publish_landing_page_changes.
+  //
+  // An approved list is REQUIRED for a grant to mean anything: consent recorded
+  // without one has unknown scope, so it authorizes nothing (fail-closed).
+  const approved = Array.isArray(schedule.autopublishAuthorizedTools)
+    ? schedule.autopublishAuthorizedTools.filter((t): t is string => typeof t === 'string')
+    : [];
+  const tools = requiredPublishTools.filter(t => approved.includes(t));
 
   // CONSENT and SCOPE are separate, and BOTH are required.
   //

@@ -3104,6 +3104,10 @@ export const scheduleDb = {
       // Its own consent control precisely because the required-function picker is a
       // verification control, not a waiver. Default off.
       autopublishAuthorized?: boolean;
+      // ENG-827: the publish tools the owner could see when they consented. Consent
+      // is bound to THIS list, so a later edit to requiredFunctionCalls cannot
+      // silently re-scope it onto tools they never approved.
+      autopublishAuthorizedTools?: string[];
       promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;
