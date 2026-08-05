@@ -163,6 +163,110 @@ describe('read_verification_code — success paths', () => {
     expect(mockGetEmails).toHaveBeenCalledWith('user-123', 'founders@agentweb.pro', ['wanted']);
   });
 
+  // A Gmail filter that archives the code email, or a busy inbox, hides the
+  // message from the INBOX scan entirely. Gmail search sees it either way.
+  it('finds a code the inbox scan cannot see, via Gmail search', async () => {
+    mockListEmails.mockResolvedValue([]);
+    mockSearchEmails.mockResolvedValue([summary({ id: 'archived', from: 'RankAI <no-reply@rankai.ai>' })]);
+    mockGetEmails.mockResolvedValue([{ id: 'archived', body: 'Your code is 366990' }]);
+
+    const result = await tool.execute(
+      { subject_contains: 'RankAI Login Code', from_contains: 'rankai.ai', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.code).toBe('366990');
+
+    const query = mockSearchEmails.mock.calls[0][2];
+    expect(query).toContain('newer_than:');
+    expect(query).toContain('subject:"RankAI Login Code"');
+    expect(query).toContain('from:rankai.ai');
+  });
+
+  it('still applies the local filters to search hits, so a loose query cannot widen the match', async () => {
+    mockSearchEmails.mockResolvedValue([summary({ id: 'wrong-sender', from: 'noreply@elsewhere.com' })]);
+    mockListEmails.mockResolvedValue([]);
+    mockGetEmails.mockResolvedValue([{ id: 'wrong-sender', body: 'Your code is 366990' }]);
+
+    const result = await tool.execute(
+      { from_contains: 'rankai.ai', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.reason).toBe('no_matching_email');
+    expect(mockGetEmails).not.toHaveBeenCalled();
+  });
+
+  it('strips quotes from filter text so they cannot break the search query', async () => {
+    mockSearchEmails.mockResolvedValue([]);
+    mockListEmails.mockResolvedValue([]);
+
+    await tool.execute({ subject_contains: 'a "quoted" \\ code', wait_seconds: 0 }, context);
+
+    const query = mockSearchEmails.mock.calls[0][2];
+    expect(query).toBe('newer_than:1d subject:"a quoted  code"');
+  });
+
+  it('falls back to the inbox scan when the search itself fails', async () => {
+    mockSearchEmails.mockRejectedValue(new Error('search unavailable'));
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 366990' }]);
+
+    const result = await tool.execute({ subject_contains: 'Login Code', wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(true);
+    expect(result.code).toBe('366990');
+  });
+
+  it('reads a message returned by both sources only once', async () => {
+    mockSearchEmails.mockResolvedValue([summary()]);
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 366990' }]);
+
+    const result = await tool.execute({ wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(true);
+    expect(mockGetEmails).toHaveBeenCalledWith('user-123', 'founders@agentweb.pro', ['msg-1']);
+  });
+
+  it('does not issue a Gmail-syntax search against a non-Gmail mailbox', async () => {
+    mockResolveEmailAccount.mockResolvedValue({
+      platform: 'outlook',
+      provider: { listEmails: mockListEmails, searchEmails: mockSearchEmails, getEmails: mockGetEmails },
+    });
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 998877' }]);
+
+    const result = await tool.execute(
+      { account_id: 'work-outlook', subject_contains: 'Login Code', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockSearchEmails).not.toHaveBeenCalled();
+  });
+
+  it('honours an explicit search_query instead of building one', async () => {
+    mockSearchEmails.mockResolvedValue([summary()]);
+    mockListEmails.mockResolvedValue([]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 366990' }]);
+
+    const result = await tool.execute(
+      { search_query: 'from:rankai.ai newer_than:2d', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockSearchEmails).toHaveBeenCalledWith(
+      'user-123',
+      'founders@agentweb.pro',
+      'from:rankai.ai newer_than:2d',
+      expect.any(Number)
+    );
+  });
+
   it('returns the magic link alongside the code when asked', async () => {
     mockListEmails.mockResolvedValue([summary()]);
     mockGetEmails.mockResolvedValue([
