@@ -99,6 +99,16 @@ export const BEDROCK_EXTENDED_CACHE_TTL_MODELS: ReadonlySet<string> = new Set([
   'anthropic.claude-opus-4-8',
   'anthropic.claude-sonnet-4-5-20250929-v1:0',
   'anthropic.claude-haiku-4-5-20251001-v1:0',
+  // AWS's prompt-caching table lists the 4.6 models as 5-minute-only, but that
+  // is stale. Measured in us-west-2 with a write/read pair either side of an
+  // idle gap: Sonnet 4.6 read back 88,624 tokens after 8m45s (2026-08-04) and
+  // again after 11m43s (2026-08-05); Opus 4.6 read back 85,424 after 11m43s.
+  // In every run the default-TTL control expired and re-cached in full, so the
+  // 1h request is what kept the cache alive. Kept honest by cacheWriteCost,
+  // which bills whatever TTL comes back — so if AWS ever does enforce 5m here,
+  // we pay 1.25x, not 2x.
+  'anthropic.claude-sonnet-4-6',
+  'anthropic.claude-opus-4-6-v1',
 ]);
 
 /**
