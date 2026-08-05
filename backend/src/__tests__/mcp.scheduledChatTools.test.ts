@@ -95,11 +95,37 @@ describe('Scheduled Chat MCP Tools', () => {
   // reading of a conversation, which is the same inferred-consent failure that
   // already sank three earlier signals. Keep this surface closed.
   describe('manage_scheduled_chat - publish consent is not agent-settable', () => {
-    it('does not expose autopublish_authorized in the tool schema', () => {
+    it('exposes only a REVOKE lever, never a grant, in the tool schema', () => {
       const def = mcpToolRegistry.getTool('manage_scheduled_chat')?.definition as any;
       const props = def?.inputSchema?.properties || {};
+      expect(Object.keys(props)).toContain('revoke_autopublish');
       expect(Object.keys(props)).not.toContain('autopublish_authorized');
-      expect(JSON.stringify(def)).not.toContain('autopublish');
+      // and the description must tell the model it cannot grant it
+      expect(props.revoke_autopublish.description).toMatch(/cannot grant/i);
+    });
+
+    it('REVOKES consent when asked, sending autopublishAuthorized=false', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        revoke_autopublish: true,
+      } as any, context);
+      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(body.autopublishAuthorized).toBe(false);
+    });
+
+    it('never sends a GRANT, whatever the model passes', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        revoke_autopublish: false,
+        autopublish_authorized: true,
+        autopublishAuthorized: true,
+      } as any, context);
+      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(body.autopublishAuthorized).toBeUndefined();
     });
 
     it('never forwards an autopublish field to the API on create, even if passed', async () => {
