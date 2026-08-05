@@ -2587,16 +2587,36 @@ export class ChatbotDB {
         // it so the outer catch can treat it as the no-op it is.
         if (this.isConditionalCheckFailure(error)) throw error;
         if (error.code !== "ValidationException") throw error;
-        await dynamodb
-          .update({
-            TableName: this.tableName,
-            Key: { sessionId },
-            UpdateExpression: "SET #rjs = :map REMOVE #js.#jid",
-            ConditionExpression: condition,
-            ExpressionAttributeNames: names,
-            ExpressionAttributeValues: { ":map": { [judgeId]: archived }, ...pin },
-          })
-          .promise();
+        try {
+          await dynamodb
+            .update({
+              TableName: this.tableName,
+              Key: { sessionId },
+              UpdateExpression: "SET #rjs = :map REMOVE #js.#jid",
+              // Whole-map assignment, so it may only run while there is no map:
+              // two first-time retractions can race into this branch together,
+              // and without the guard the loser would erase the winner's archive.
+              ConditionExpression: `attribute_not_exists(#rjs) AND ${condition}`,
+              ExpressionAttributeNames: names,
+              ExpressionAttributeValues: { ":map": { [judgeId]: archived }, ...pin },
+            })
+            .promise();
+        } catch (fallbackError: any) {
+          if (!this.isConditionalCheckFailure(fallbackError)) throw fallbackError;
+          // The map exists now (someone created it first), so the per-key write
+          // works. If instead the judge score itself moved, this retry fails its
+          // condition too and the outer catch reports the no-op.
+          await dynamodb
+            .update({
+              TableName: this.tableName,
+              Key: { sessionId },
+              UpdateExpression: "SET #rjs.#jid = :prev REMOVE #js.#jid",
+              ConditionExpression: condition,
+              ExpressionAttributeNames: names,
+              ExpressionAttributeValues: { ":prev": archived, ...pin },
+            })
+            .promise();
+        }
       }
       return true;
     } catch (error) {
