@@ -41,8 +41,10 @@ jest.mock("../services/onboardingAdImageChatSessionMirror", () => ({
 import {
   AD_IMAGE_SYSTEM_PROMPT,
   buildSixLayerPromptForVariant,
+  claimAdImageRun,
   extractAdImageBrandContext,
   generateAdImagesForUser,
+  isBrandLogoFetchable,
   pickFormatSplit,
   startAdImageGenerationForUser,
   triggerAdImageGenerationForUser,
@@ -436,6 +438,15 @@ describe("onboardingAdImageService", () => {
       jest.clearAllMocks();
     });
 
+    // Run identity. adImageStartPatch stamps adImageStartedAt BEFORE the
+    // trigger reads the user, so a faithful fixture carries the same value on
+    // both reads — that is what marks the run as owning the axis. Fixtures
+    // that stamp only the second read would look like a foreign newer run.
+    const RUN_AT = "2026-08-04T00:00:00.000Z";
+    // The nonce adImageStartPatch mints alongside RUN_AT. This, not the
+    // timestamp, is what proves ownership.
+    const RUN_ID = "adimg_11111111-1111-4111-8111-111111111111";
+
     it("returns silently when user is missing", async () => {
       userDb.getUserById.mockResolvedValue(null);
       await triggerAdImageGenerationForUser("missing");
@@ -448,16 +459,20 @@ describe("onboardingAdImageService", () => {
           userId: "u1",
           creativeDirStatus: "running",
           icpResult: [onePersona],
+          adImageStartedAt: RUN_AT,
         })
         .mockResolvedValueOnce({
           userId: "u1",
           adImageStatus: "running",
-          adImageStartedAt: new Date().toISOString(),
+          adImageStartedAt: RUN_AT,
         });
       userDb.updateUser.mockResolvedValue({});
       const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       errSpy.mockRestore();
 
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
@@ -477,7 +492,10 @@ describe("onboardingAdImageService", () => {
       userDb.updateUser.mockResolvedValue({});
       const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       errSpy.mockRestore();
       const written = userDb.updateUser.mock.calls[0][1];
       expect(written.adImageStatus).toBe("failed");
@@ -491,7 +509,10 @@ describe("onboardingAdImageService", () => {
       userDb.updateUser.mockResolvedValue({});
       const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       errSpy.mockRestore();
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("failed");
@@ -511,11 +532,14 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce({
           userId: "u1",
           adImageStatus: "running",
-          adImageStartedAt: new Date().toISOString(),
+          adImageStartedAt: RUN_AT,
         });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       expect(userDb.updateUser).toHaveBeenCalledTimes(1);
       const written = userDb.updateUser.mock.calls[0][1];
       expect(written.adImageStatus).toBe("ready");
@@ -535,16 +559,20 @@ describe("onboardingAdImageService", () => {
           creativeDirResult: creativeDir,
           icpResult: [onePersona],
           brandGuidelines: { brandData: { brandName: "Linear", primaryColor: "#5E6AD2" } },
+          adImageStartedAt: RUN_AT,
         })
         .mockResolvedValueOnce({
           userId: "u1",
           adImageStatus: "running",
-          adImageStartedAt: new Date().toISOString(),
+          adImageStartedAt: RUN_AT,
         });
       userDb.updateUser.mockResolvedValue({});
       const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       errSpy.mockRestore();
 
       expect(gen.callCount).toBe(0);
@@ -553,6 +581,50 @@ describe("onboardingAdImageService", () => {
       expect(written.adImageStatus).toBe("failed");
       expect(written.adImageError).toMatch(/logo/i);
       expect(written.adImageError).toMatch(/brand/i);
+    });
+
+    it("fails the run when the persisted logo URL is present but unfetchable — never ships broken placeholders (ENG-792)", async () => {
+      // Reproduces the reported bug: the account's logo is a Google
+      // favicon-service URL that 301→404s for a domain with no crawlable
+      // favicon, so every variant's input-image fetch throws. Before the fix
+      // the run shipped 3 placeholders as "ready"; now the unfetchable logo is
+      // treated like a missing one and the run fails with an actionable error.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: {
+            brandData: {
+              brandName: "DramaBreak",
+              logoUrl:
+                "https://www.google.com/s2/favicons?domain=dramabreak.ai&sz=128",
+            },
+          },
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      const gen = new FakeImageGen(okResponder);
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        // The persisted favicon URL fails the real preflight; simulate that.
+        verifyLogoUrl: async () => false,
+      });
+      errSpy.mockRestore();
+
+      expect(gen.callCount).toBe(0);
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("failed");
+      expect(written.adImageError).toMatch(/logo/i);
+      expect(written.adImageError).toMatch(/re-upload|brand config/i);
     });
 
     it("resolves the ORG brandGuidelines for org members — an org-level logo satisfies the gate", async () => {
@@ -572,7 +644,7 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce({
           userId: "u1",
           adImageStatus: "running",
-          adImageStartedAt: new Date().toISOString(),
+          adImageStartedAt: RUN_AT,
         });
       orgDb.getOrgById.mockResolvedValue({
         orgId: "org1",
@@ -583,7 +655,10 @@ describe("onboardingAdImageService", () => {
       });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
 
       expect(orgDb.getOrgById).toHaveBeenCalledWith("org1");
       const written = userDb.updateUser.mock.calls[0][1];
@@ -609,7 +684,7 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce({
           userId: "u1",
           adImageStatus: "running",
-          adImageStartedAt: new Date().toISOString(),
+          adImageStartedAt: RUN_AT,
         });
       orgDb.getOrgById.mockResolvedValue({
         orgId: "org1",
@@ -620,7 +695,10 @@ describe("onboardingAdImageService", () => {
       });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
 
       expect(gen.lastParams[0].logoImage).toBe("https://s3/org/current.png");
     });
@@ -640,11 +718,14 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce({
           userId: "u1",
           adImageStatus: "running",
-          adImageStartedAt: new Date().toISOString(),
+          adImageStartedAt: RUN_AT,
         });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       const written = userDb.updateUser.mock.calls[0][1];
       expect(written.adImageStatus).toBe("ready");
       expect(gen.lastParams[0].logoImage).toBe("https://s3/att/logo.png");
@@ -662,11 +743,20 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce({ userId: "u1", adImageStatus: "idle" });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       expect(userDb.updateUser).not.toHaveBeenCalled();
     });
 
-    it("patches with adImageFailedPatch when image generator throws", async () => {
+    it("fails the run when EVERY variant fails (ENG-792 — no 'ready' with zero images)", async () => {
+      // Regression for the reported account. Each variant is individually
+      // caught and folded into a placeholder, and the run used to ship as
+      // "ready" on that basis. But zero live variants also means the
+      // chat-session mirror never runs, so /images renders "No images found"
+      // while onboarding reports three ad images — the exact reported
+      // symptom. Total failure must be a failed run.
       userDb.getUserById
         .mockResolvedValueOnce({
           userId: "u1",
@@ -683,16 +773,517 @@ describe("onboardingAdImageService", () => {
           throw new Error("hard crash inside generator");
         },
       };
-      // The orchestrator wraps each variant in its own try/catch — a thrown
-      // error becomes a placeholder, NOT a failed run. Verify the run still
-      // ends in 'ready' with placeholders. (Hard failures are routed via the
-      // partial-failure path because we always want the UI to render
-      // something.)
-      await triggerAdImageGenerationForUser("u1", { imageGen: throwingGen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: throwingGen as any,
+        verifyLogoUrl: async () => true,
+      });
       errSpy.mockRestore();
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("failed");
+      expect(written.adImageError).toMatch(/no usable images/i);
+      // A failed run must not leave placeholder variants behind for the UI to
+      // try to render.
+      expect(written.adImageResult).toBeUndefined();
+    });
+
+    it("still ships 'ready' on a PARTIAL failure (ENG-792 scope guard)", async () => {
+      // Only total failure is fatal. One good variant is degraded-but-usable,
+      // and blocking onboarding over a single flaky variant would be worse
+      // than shipping what did land.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+        })
+        .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
+      userDb.updateUser.mockResolvedValue({});
+      let call = 0;
+      const flakyGen = {
+        generateImage: async () => {
+          call += 1;
+          return call === 1
+            ? { success: true, imageUrl: "https://s3/real-1.png" }
+            : { success: false, error: "model flaked" };
+        },
+      };
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: flakyGen as any,
+        verifyLogoUrl: async () => true,
+      });
       const written = userDb.updateUser.mock.calls[0][1];
       expect(written.adImageStatus).toBe("ready");
       expect(written.adImageResult.variants).toHaveLength(3);
+    });
+
+    it("drops a terminal failure when a strictly newer run owns the axis", async () => {
+      // A slow run must not stomp a newer one. Run identity is
+      // adImageStartedAt: this run entered on `older`, but by the time it
+      // finished the axis had been restarted at `newer`.
+      const older = "2026-08-04T00:00:00.000Z";
+      const newer = "2026-08-04T00:05:00.000Z";
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: older,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: newer,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const throwingGen = {
+        generateImage: async () => {
+          throw new Error("hard crash inside generator");
+        },
+      };
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: throwingGen as any,
+        verifyLogoUrl: async () => true,
+      });
+      warnSpy.mockRestore();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("drops an UNSTAMPED run's failure when the axis carries a start (Greptile)", async () => {
+      // The eager DAG can invoke the trigger without going through
+      // adImageStartPatch, so such a run has no start identity of its own. If
+      // the axis nonetheless carries a stamp, that stamp was written by
+      // somebody else — a run that DID start properly — and the unstamped
+      // invocation must not outrank it.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+          // no adImageStartedAt — never went through the start patch
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      warnSpy.mockRestore();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("still writes an unstamped run's failure when the axis is also unstamped", async () => {
+      // Nothing to compare: no evidence any other run exists. Swallowing the
+      // failure here is what produced this ticket, so we write.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+        })
+        .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
+      userDb.updateUser.mockResolvedValue({});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      errSpy.mockRestore();
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("failed");
+    });
+
+    it("drops a stale LOGO-GATE failure when a newer run owns the axis (Greptile)", async () => {
+      // The gates that fire before generation had the same race: a slow
+      // preflight resolving late would terminate whatever run currently held
+      // the axis. Only the owning run may publish a terminal state.
+      const older = "2026-08-04T00:00:00.000Z";
+      const newer = "2026-08-04T00:05:00.000Z";
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: {
+            brandData: { logoUrl: "https://dead/logo.png" },
+          },
+          adImageStartedAt: older,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: newer,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      warnSpy.mockRestore();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    // The ownership checks above all decide from a READ. Between that read and
+    // the write they authorise, a newer run can stamp the axis — so the write
+    // must restate the decision as a DynamoDB condition, and treat an unmet
+    // condition exactly like the stale branch (Greptile round 3).
+    const conditionOf = (call: any[]) => call[2]?.condition;
+
+    it("abandons before generating when the injected run identity lost the axis (Greptile)", async () => {
+      userDb.getUserById.mockResolvedValue({
+        userId: "u1",
+        creativeDirStatus: "ready",
+        creativeDirResult: creativeDir,
+        icpResult: [onePersona],
+        brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+        adImageStatus: "running",
+        adImageStartedAt: RUN_AT,
+        adImageRunId: "adimg_someone-else",
+      });
+      userDb.updateUser.mockResolvedValue({});
+      const gen = new FakeImageGen(okResponder);
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+        run: { runId: RUN_ID, startedAt: RUN_AT },
+      });
+      warnSpy.mockRestore();
+
+      expect(gen.callCount).toBe(0);
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("proceeds normally when the injected run identity still owns the axis", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const gen = new FakeImageGen(okResponder);
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+        run: { runId: RUN_ID, startedAt: RUN_AT },
+      });
+
+      expect(gen.callCount).toBe(3);
+      expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("ready");
+      expect(conditionOf(userDb.updateUser.mock.calls[0])).toEqual({
+        expression: "#axisRun = :axisRun",
+        names: { "#axisRun": "adImageRunId" },
+        values: { ":axisRun": RUN_ID },
+      });
+    });
+
+    it("drops a terminal failure from a DIFFERENT run that shares our start timestamp (Greptile)", async () => {
+      // adImageStartedAt is millisecond-resolution, so two runs starting in
+      // the same millisecond carry byte-identical stamps. Ordering alone
+      // cannot separate them — each would be authorised to write the other
+      // off. The nonce can, and does.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+          adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT, // same millisecond…
+          adImageRunId: "adimg_22222222-2222-4222-8222-222222222222", // …different run
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      warnSpy.mockRestore();
+      expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+
+    it("conditions a terminal failure on the run nonce it read", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+          adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      errSpy.mockRestore();
+
+      const condition = conditionOf(userDb.updateUser.mock.calls[0]);
+      expect(condition.expression).toBe("#axisRun = :axisRun");
+      expect(condition.names).toEqual({ "#axisRun": "adImageRunId" });
+      expect(condition.values).toEqual({ ":axisRun": RUN_ID });
+    });
+
+    it("conditions a nonce-less (legacy) axis on the timestamp AND the nonce still being absent", async () => {
+      // Records written before the nonce shipped only have a timestamp. The
+      // extra attribute_not_exists is what stops a run that starts mid-write
+      // — and therefore mints a nonce — from being overwritten on the
+      // strength of a colliding millisecond.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      errSpy.mockRestore();
+
+      const condition = conditionOf(userDb.updateUser.mock.calls[0]);
+      expect(condition.expression).toBe(
+        "attribute_not_exists(#axisRun) AND #axisStart = :axisStart",
+      );
+      expect(condition.names).toEqual({
+        "#axisRun": "adImageRunId",
+        "#axisStart": "adImageStartedAt",
+      });
+      expect(condition.values).toEqual({ ":axisStart": RUN_AT });
+    });
+
+    it("conditions a terminal failure on ABSENCE when the axis it read was unstamped", async () => {
+      // Writing `#axisStart = :axisStart` with an undefined value would be an
+      // invalid expression; an unstamped axis must assert non-existence so a
+      // run that stamps one mid-write still wins.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+        })
+        .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
+      userDb.updateUser.mockResolvedValue({});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => false,
+      });
+      errSpy.mockRestore();
+
+      const condition = conditionOf(userDb.updateUser.mock.calls[0]);
+      expect(condition.expression).toBe(
+        "attribute_not_exists(#axisRun) AND attribute_not_exists(#axisStart)",
+      );
+      expect(condition.values).toBeUndefined();
+    });
+
+    it("swallows a ConditionalCheckFailedException on the failure write — a run started mid-write", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://dead/logo.png" } },
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("The conditional request failed"), {
+          code: "ConditionalCheckFailedException",
+        }),
+      );
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+      const errSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+
+      await expect(
+        triggerAdImageGenerationForUser("u1", {
+          imageGen: new FakeImageGen(okResponder) as any,
+          verifyLogoUrl: async () => false,
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("restarted mid-write"),
+        expect.objectContaining({ userId: "u1" }),
+      );
+      warnSpy.mockRestore();
+      errSpy.mockRestore();
+    });
+
+    it("re-throws a non-conditional failure-write error instead of hiding it", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "running",
+          icpResult: [onePersona],
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockRejectedValue(new Error("dynamo exploded"));
+
+      await expect(
+        triggerAdImageGenerationForUser("u1", {
+          imageGen: new FakeImageGen(okResponder) as any,
+          verifyLogoUrl: async () => true,
+        }),
+      ).rejects.toThrow("dynamo exploded");
+    });
+
+    it("conditions the READY publish on the axis identity it read", async () => {
+      // Widest window on the axis: the chat-session mirror runs between the
+      // read that authorises the publish and the publish itself.
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+          adImageRunId: RUN_ID,
+        });
+      userDb.updateUser.mockResolvedValue({});
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: new FakeImageGen(okResponder) as any,
+        verifyLogoUrl: async () => true,
+      });
+
+      expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("ready");
+      expect(conditionOf(userDb.updateUser.mock.calls[0])).toEqual({
+        expression: "#axisRun = :axisRun",
+        names: { "#axisRun": "adImageRunId" },
+        values: { ":axisRun": RUN_ID },
+      });
+    });
+
+    it("swallows a ConditionalCheckFailedException on the ready write", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockRejectedValue(
+        Object.assign(new Error("The conditional request failed"), {
+          code: "ConditionalCheckFailedException",
+        }),
+      );
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+      await expect(
+        triggerAdImageGenerationForUser("u1", {
+          imageGen: new FakeImageGen(okResponder) as any,
+          verifyLogoUrl: async () => true,
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("stale completion"),
+        expect.objectContaining({ userId: "u1" }),
+      );
+      warnSpy.mockRestore();
+    });
+
+    it("re-throws a non-conditional ready-write error instead of hiding it", async () => {
+      userDb.getUserById
+        .mockResolvedValueOnce({
+          userId: "u1",
+          creativeDirStatus: "ready",
+          creativeDirResult: creativeDir,
+          icpResult: [onePersona],
+          brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+          adImageStartedAt: RUN_AT,
+        })
+        .mockResolvedValueOnce({
+          userId: "u1",
+          adImageStatus: "running",
+          adImageStartedAt: RUN_AT,
+        });
+      userDb.updateUser.mockRejectedValue(new Error("dynamo exploded"));
+
+      await expect(
+        triggerAdImageGenerationForUser("u1", {
+          imageGen: new FakeImageGen(okResponder) as any,
+          verifyLogoUrl: async () => true,
+        }),
+      ).rejects.toThrow("dynamo exploded");
     });
 
     it("falls back to empty personas when icpResult is non-array", async () => {
@@ -707,7 +1298,10 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("ready");
     });
 
@@ -723,7 +1317,10 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce({ userId: "u1", adImageStatus: "running" });
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("ready");
     });
 
@@ -739,9 +1336,109 @@ describe("onboardingAdImageService", () => {
         .mockResolvedValueOnce(null);
       userDb.updateUser.mockResolvedValue({});
       const gen = new FakeImageGen(okResponder);
-      await triggerAdImageGenerationForUser("u1", { imageGen: gen as any });
+      await triggerAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
       // Patch returned null because current was {} → updateUser not called
       expect(userDb.updateUser).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("isBrandLogoFetchable (ENG-792 logo preflight)", () => {
+    const pngHeaders = { "content-type": "image/png" };
+
+    it("returns true for a 2xx image response with a non-empty body", async () => {
+      const ok = await isBrandLogoFetchable("https://s3/logo.png", {
+        httpGet: async () => ({
+          status: 200,
+          headers: pngHeaders,
+          data: Buffer.from([137, 80, 78, 71]),
+        }),
+      });
+      expect(ok).toBe(true);
+    });
+
+    it("returns false when the fetch throws (favicon 404, DNS, timeout)", async () => {
+      const ok = await isBrandLogoFetchable(
+        "https://www.google.com/s2/favicons?domain=dramabreak.ai&sz=128",
+        {
+          httpGet: async () => {
+            throw new Error("Request failed with status code 404");
+          },
+        }
+      );
+      expect(ok).toBe(false);
+    });
+
+    it("returns false for a non-2xx status from an injected fetcher", async () => {
+      const ok = await isBrandLogoFetchable("https://s3/logo.png", {
+        httpGet: async () => ({ status: 404, headers: pngHeaders, data: Buffer.from([1]) }),
+      });
+      expect(ok).toBe(false);
+    });
+
+    it("returns false when the body is empty even on a 200", async () => {
+      const ok = await isBrandLogoFetchable("https://s3/logo.png", {
+        httpGet: async () => ({ status: 200, headers: pngHeaders, data: Buffer.alloc(0) }),
+      });
+      expect(ok).toBe(false);
+    });
+
+    it("returns false when a 200 serves an HTML error body, not an image", async () => {
+      const ok = await isBrandLogoFetchable("https://cdn/error", {
+        httpGet: async () => ({
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+          data: Buffer.from("<!doctype html><html>not found</html>"),
+        }),
+      });
+      expect(ok).toBe(false);
+    });
+
+    it("allows an unknown/empty content-type through (extension is sniffed later)", async () => {
+      const ok = await isBrandLogoFetchable("https://s3/logo.png", {
+        httpGet: async () => ({ status: 200, headers: {}, data: Buffer.from([1, 2, 3]) }),
+      });
+      expect(ok).toBe(true);
+    });
+
+    it("allows a generic binary content-type through (getImageMimeType sniffs it)", async () => {
+      // S3 objects lacking ContentType metadata / some CDNs serve real image
+      // bytes as octet-stream; these generate fine downstream and must not hard-fail.
+      for (const ct of ["application/octet-stream", "binary/octet-stream"]) {
+        const ok = await isBrandLogoFetchable("https://s3/logo.png", {
+          httpGet: async () => ({
+            status: 200,
+            headers: { "content-type": ct },
+            data: Buffer.from([137, 80, 78, 71]),
+          }),
+        });
+        expect(ok).toBe(true);
+      }
+    });
+
+    it("returns false when a 200 serves a JSON error body, not an image", async () => {
+      const ok = await isBrandLogoFetchable("https://cdn/error", {
+        httpGet: async () => ({
+          status: 200,
+          headers: { "content-type": "application/json" },
+          data: Buffer.from('{"error":"not found"}'),
+        }),
+      });
+      expect(ok).toBe(false);
+    });
+
+    it("returns false for an empty or non-string URL without fetching", async () => {
+      let called = false;
+      const httpGet = async () => {
+        called = true;
+        return { status: 200, headers: pngHeaders, data: Buffer.from([1]) };
+      };
+      expect(await isBrandLogoFetchable("", { httpGet })).toBe(false);
+      expect(await isBrandLogoFetchable("   ", { httpGet })).toBe(false);
+      expect(await isBrandLogoFetchable(undefined as any, { httpGet })).toBe(false);
+      expect(called).toBe(false);
     });
   });
 
@@ -843,6 +1540,35 @@ describe("onboardingAdImageService", () => {
     });
   });
 
+  describe("claimAdImageRun", () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      userDb.updateUser.mockResolvedValue({});
+    });
+
+    it("publishes a start patch and returns THAT run's identity", async () => {
+      const run = await claimAdImageRun("u1");
+
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      const written = userDb.updateUser.mock.calls[0][1];
+      expect(written.adImageStatus).toBe("running");
+      // The identity handed back is the one just published — not a re-read of
+      // the record, which is what let two overlapping runs share a nonce.
+      expect(run.runId).toBe(written.adImageRunId);
+      expect(run.startedAt).toBe(written.adImageStartedAt);
+    });
+
+    it("gives every claim a distinct identity, even back-to-back (Greptile)", async () => {
+      // Both eager and direct entry points claim through here, so two
+      // overlapping starts must never come away holding the same nonce —
+      // that is precisely what makes the conditional terminal write able to
+      // tell the runs apart.
+      const [a, b] = [await claimAdImageRun("u1"), await claimAdImageRun("u1")];
+      expect(a.runId).not.toBe(b.runId);
+      expect(userDb.updateUser).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe("startAdImageGenerationForUser", () => {
     beforeEach(() => {
       jest.clearAllMocks();
@@ -856,6 +1582,41 @@ describe("onboardingAdImageService", () => {
       const startPatch = userDb.updateUser.mock.calls[0][1];
       expect(startPatch.adImageStatus).toBe("running");
       expect(startPatch.adImageStartedAt).toBeTruthy();
+      expect(startPatch.adImageRunId).toMatch(/^adimg_/);
+    });
+
+    it("hands its own nonce to the worker, which abandons when a later start has taken the axis (Greptile)", async () => {
+      // Two overlapping starts: by the time THIS start's worker reads the
+      // record, the second start has already stamped its own nonce. Re-reading
+      // identity from the record would make both workers adopt that same
+      // nonce — both would generate, and both would be authorised to overwrite
+      // the other's creatives. Carrying the minted nonce hand-to-hand instead,
+      // the loser recognises it lost and stops before generating anything.
+      userDb.updateUser.mockResolvedValue({});
+      userDb.getUserById.mockResolvedValue({
+        userId: "u1",
+        creativeDirStatus: "ready",
+        creativeDirResult: creativeDir,
+        icpResult: [onePersona],
+        brandGuidelines: { brandData: { logoUrl: "https://s3/brand/logo.png" } },
+        adImageStatus: "running",
+        adImageStartedAt: "2026-08-04T00:00:00.000Z",
+        adImageRunId: "adimg_a-later-start-owns-this",
+      });
+      const gen = new FakeImageGen(okResponder);
+      const warnSpy = jest.spyOn(console, "warn").mockImplementation(() => {});
+
+      await startAdImageGenerationForUser("u1", {
+        imageGen: gen as any,
+        verifyLogoUrl: async () => true,
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      warnSpy.mockRestore();
+
+      expect(gen.callCount).toBe(0);
+      // Only the start patch itself — the worker wrote nothing.
+      expect(userDb.updateUser).toHaveBeenCalledTimes(1);
+      expect(userDb.updateUser.mock.calls[0][1].adImageStatus).toBe("running");
     });
   });
 });

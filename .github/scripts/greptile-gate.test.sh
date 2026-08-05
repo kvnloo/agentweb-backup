@@ -142,6 +142,23 @@ greptile_comments() {
     "$(greptile_body "$(score_line "$1")" "$(footer "$2")")"
 }
 
+# greptile_comments_with_reply <score> <sha> -> the verdict comment PLUS a later,
+# footerless Greptile reply. Replying to a Greptile finding makes it answer in
+# thread, so the newest Greptile comment is not the verdict — the shape that
+# stalled agentweb#2266 until the 20-minute timeout despite a landed 5/5.
+greptile_comments_with_reply() {
+  jq -n --arg body "$(greptile_body "$(score_line "$1")" "$(footer "$2")")" '
+    [
+      {id: 1, created_at: "2026-07-29T15:00:00Z", updated_at: "2026-07-29T15:00:00Z",
+       user: {login: "harshmoney123", type: "User"}, body: "looks good to me"},
+      {id: 3, created_at: "2026-07-29T15:39:33Z", updated_at: "2026-07-29T15:47:46Z",
+       user: {login: "greptile-apps[bot]", type: "Bot"}, body: $body},
+      {id: 4, created_at: "2026-07-29T16:10:00Z", updated_at: "2026-07-29T16:10:00Z",
+       user: {login: "greptile-apps[bot]", type: "Bot"},
+       body: "That is a good, well-reasoned explanation. I am satisfied — no further action needed on that thread."}
+    ]'
+}
+
 # ---------------------------------------------------------------------------
 # Runner + assertions
 # ---------------------------------------------------------------------------
@@ -209,6 +226,22 @@ M=$(new_mock_dir)
 set_comments "$M" 1 "$(greptile_comments '4/5' "${HEAD}")"
 run_gate "$M"
 check 'AC1: 4/5 on the current head fails the gate' 1 'Greptile scored 4/5'
+
+# Regression (agentweb#2266): a landed 5/5 must still be found when Greptile has
+# posted a later, footerless reply in thread. Selecting the newest Greptile
+# comment locked onto the reply, reported "no verdict footer yet", and polled to
+# the 20-minute timeout on a PR Greptile had already passed.
+M=$(new_mock_dir)
+set_comments "$M" 1 "$(greptile_comments_with_reply '5/5' "${HEAD}")"
+run_gate "$M"
+check 'reply-after-verdict: a 5/5 behind a threaded reply still passes' 0 'Greptile 5/5'
+
+# The same shape must not become a way to sneak a bad score through: the verdict
+# comment is still the one that decides.
+M=$(new_mock_dir)
+set_comments "$M" 1 "$(greptile_comments_with_reply '3/5' "${HEAD}")"
+run_gate "$M"
+check 'reply-after-verdict: a 3/5 behind a threaded reply still fails' 1 'Greptile scored 3/5'
 
 # AC1 — a true 5/5 on the current head passes.
 M=$(new_mock_dir)
