@@ -25,10 +25,26 @@ jest.mock('aws-sdk', () => ({
 }));
 
 // Mock axios
-jest.mock('axios', () => ({
-  get: jest.fn(),
-  post: jest.fn()
-}));
+// `create` matters even though this suite never calls it: when SLACK_BOT_TOKEN is
+// set in the environment, importing agentModeService constructs a Slack WebClient
+// at module load, which calls axios.create(). Without it the suite fails to load.
+jest.mock('axios', () => {
+  const instance = {
+    get: jest.fn(),
+    post: jest.fn(),
+    request: jest.fn(),
+    defaults: { headers: { common: {}, post: {} } },
+    interceptors: {
+      request: { use: jest.fn(), eject: jest.fn() },
+      response: { use: jest.fn(), eject: jest.fn() }
+    }
+  };
+  return {
+    get: jest.fn(),
+    post: jest.fn(),
+    create: jest.fn(() => instance)
+  };
+});
 
 // Mock crypto
 jest.mock('crypto', () => ({
