@@ -193,24 +193,27 @@ router.post('/', (req: express.Request, res: express.Response) => {
       const memberships = parsed.payload?.scheduled_event?.event_memberships ?? [];
       const signatureHeader = req.headers['calendly-webhook-signature'] as string | undefined;
 
+      // Each customer's webhook subscription is scope:'user' (calendlyAuth.ts), so an event
+      // with 2+ independently-connected hosts produces a SEPARATE delivery per subscription —
+      // identical payload, but each signed with that host's own webhook_signing_key. We can't
+      // know in advance which membership this particular delivery belongs to, so try every
+      // connected candidate's key rather than committing to the first membership that resolves
+      // to a connected account — otherwise a later host's delivery is silently dropped whenever
+      // an earlier-listed host is also connected (confirmed as a real gap, not just untested).
       let resolved: { userId: string; account: any } | null = null;
       for (const membership of memberships) {
         if (!membership.user) continue;
         const candidate = await getAccountByCalendlyUserUri(membership.user);
-        if (candidate) {
+        if (!candidate) continue;
+        const candidateKey: string | undefined = (candidate.account.config as any)?.webhook_signing_key;
+        if (candidateKey && verifyCalendlySignature(candidateKey, rawBody, signatureHeader)) {
           resolved = candidate;
           break;
         }
       }
 
       if (!resolved) {
-        console.warn('[Calendly Webhook] No connected account found for any event_memberships user_uri — dropping');
-        return;
-      }
-
-      const signingKey: string | undefined = resolved.account.config?.webhook_signing_key;
-      if (!signingKey || !verifyCalendlySignature(signingKey, rawBody, signatureHeader)) {
-        console.warn(`[Calendly Webhook] Signature verification failed for user ${resolved.userId} — dropping`);
+        console.warn('[Calendly Webhook] No connected account\'s key verified this delivery — dropping');
         return;
       }
 
