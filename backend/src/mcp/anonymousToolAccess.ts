@@ -28,8 +28,20 @@ export function isAnonymousUserId(userId: unknown): boolean {
   return typeof userId !== 'string' || userId.length === 0 || userId.startsWith('anon_');
 }
 
+export const ANONYMOUS_REFUSAL_REASON = 'anonymous_session_account_scoped_tool';
+
 export interface AnonymousToolRefusal {
-  success: false;
+  /**
+   * Marks the call as DEFERRED — skipped without executing — rather than failed.
+   * Deliberately NOT `success: false`: `utils/toolResultError.ts` converts any
+   * `success:false` result into an Error, which would file this by-design
+   * refusal as `agent_tool_failed`, inflate the reliability ratio, and feed the
+   * failure-cluster policy. It is the same reasoning `toolDeferred` and
+   * `toolPartialFailure` already encode — a call that did not run is neither a
+   * success nor a bug.
+   */
+  deferred: true;
+  reason: string;
   retryable: false;
   message: string;
 }
@@ -43,7 +55,8 @@ export interface AnonymousToolRefusal {
  */
 export function buildAnonymousToolRefusal(toolName: string): AnonymousToolRefusal {
   return {
-    success: false,
+    deferred: true,
+    reason: ANONYMOUS_REFUSAL_REASON,
     retryable: false,
     message:
       `Sign in to use ${toolName} — it reads information saved to a specific account, ` +

@@ -51,7 +51,8 @@ describe('ENG-822 — user-scoped tools refuse anonymous sessions', () => {
   it('returns an actionable sign-in message, never "User not found"', async () => {
     const result: any = await registry.execute('read_brand_guidelines', {}, { userId: ANON });
 
-    expect(result.success).toBe(false);
+    expect(result.deferred).toBe(true);
+    expect(result.success).toBeUndefined(); // NOT success:false — that becomes agent_tool_failed
     expect(JSON.stringify(result)).not.toMatch(/user not found/i);
     expect(result.message).toMatch(/sign in/i);
   });
@@ -68,7 +69,7 @@ describe('ENG-822 — user-scoped tools refuse anonymous sessions', () => {
     // Fails closed: an absent id cannot identify an account either.
     const result: any = await registry.execute('read_brand_guidelines', {}, {});
 
-    expect(result.success).toBe(false);
+    expect(result.deferred).toBe(true);
     expect(handler).not.toHaveBeenCalled();
   });
 

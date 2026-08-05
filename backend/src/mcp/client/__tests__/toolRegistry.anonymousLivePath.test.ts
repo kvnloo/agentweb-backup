@@ -47,6 +47,10 @@ describe('ENG-822 — the live Emma dispatch path enforces the anonymous refusal
     expect(JSON.stringify(result)).not.toMatch(/user not found/i);
     expect(result.message).toMatch(/sign in/i);
     expect(result.retryable).toBe(false);
+    // Deferred, not failed: `success:false` is converted to an Error by
+    // utils/toolResultError and would file this as agent_tool_failed.
+    expect(result.deferred).toBe(true);
+    expect(result.success).toBeUndefined();
   });
 
   it('still runs the handler for a signed-in session', async () => {
@@ -101,4 +105,41 @@ describe('ENG-822 — the live Emma dispatch path enforces the anonymous refusal
     expect(JSON.stringify(result)).not.toMatch(/user not found/i);
     expect(result.message).toMatch(/sign in/i);
   }, 60_000);
+});
+
+/**
+ * AC4 — "zero `agent_tool_failed` events". The refusal has to stay out of the
+ * failure ratio, not merely avoid the words "User not found".
+ *
+ * `utils/toolResultError.ts` turns ANY result with `success: false` into an
+ * Error, which the dispatcher then records via `recorder.toolFailed`. So a
+ * refusal shaped as `{success:false}` would read correctly to the user and still
+ * file a failure, inflate `failedRunRate`, and feed the failure-cluster policy
+ * that auto-files ENG issues. This pins the shape that avoids that.
+ */
+describe('ENG-822 — the refusal is accounted as deferred, never as a failure', () => {
+  it('is not classified as a tool error', () => {
+    const { toolResultError } = require('../../../utils/toolResultError');
+    const { buildAnonymousToolRefusal } = require('../../anonymousToolAccess');
+
+    expect(toolResultError(buildAnonymousToolRefusal('read_brand_guidelines'))).toBeNull();
+  });
+
+  it('would have been classified as an error if shaped as success:false', () => {
+    // The control that proves the assertion above is meaningful rather than
+    // vacuous — this is exactly the shape the first version of the fix used.
+    const { toolResultError } = require('../../../utils/toolResultError');
+
+    expect(toolResultError({ success: false, message: 'Sign in to use …' })).toBeInstanceOf(Error);
+  });
+
+  it('carries a named reason so deferrals stay distinguishable in telemetry', () => {
+    const { buildAnonymousToolRefusal, ANONYMOUS_REFUSAL_REASON } = require('../../anonymousToolAccess');
+    const refusal: any = buildAnonymousToolRefusal('read_market_strategy');
+
+    expect(refusal.deferred).toBe(true);
+    expect(refusal.reason).toBe(ANONYMOUS_REFUSAL_REASON);
+    // Must not collide with the media-budget deferral, which has its own reason.
+    expect(refusal.reason).not.toBe('media_generation_time_budget');
+  });
 });
