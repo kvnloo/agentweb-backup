@@ -21,7 +21,13 @@ import { extractMagicLink, extractVerificationCode } from './verificationCodeExt
 
 const DEFAULT_CODE_LENGTH = 6;
 const DEFAULT_WAIT_SECONDS = 90;
-const MAX_WAIT_SECONDS = 300;
+/**
+ * A whole agent-mode turn is capped at AGENT_MODE_GENERATION_TIMEOUT_MS (600s).
+ * A single tool holding a big slice of that is how a turn gets killed with
+ * completed work unsaved (ENG-510), so this ceiling stays well under it. Login
+ * codes arrive in seconds — a longer wait buys nothing but risk.
+ */
+const MAX_WAIT_SECONDS = 180;
 const POLL_INTERVAL_MS = 5_000;
 /** How far back a message may be and still count as "this login attempt". */
 const DEFAULT_FRESHNESS_GRACE_MS = 2 * 60 * 1000;
@@ -66,6 +72,16 @@ function parsedTime(value: unknown): number {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Clamp the caller's wait into [0, MAX_WAIT_SECONDS]; non-numeric → the default. */
+export function resolveWaitSeconds(raw: unknown): number {
+  // Number(null) is 0 and Number('') is 0 — neither means "wait zero seconds",
+  // they mean the caller said nothing.
+  if (raw === null || raw === undefined || raw === '') return DEFAULT_WAIT_SECONDS;
+  const requested = Number(raw);
+  if (!Number.isFinite(requested)) return DEFAULT_WAIT_SECONDS;
+  return Math.min(Math.max(requested, 0), MAX_WAIT_SECONDS);
+}
 
 emmaToolRegistry.register({
   name: 'read_verification_code',
@@ -130,10 +146,7 @@ emmaToolRegistry.register({
     const codeLength = Number(args?.code_length) > 0 ? Number(args.code_length) : DEFAULT_CODE_LENGTH;
     const alphanumeric = args?.alphanumeric === true;
     const returnLink = args?.return_link === true;
-    const waitSeconds = Math.min(
-      Math.max(Number.isFinite(Number(args?.wait_seconds)) ? Number(args.wait_seconds) : DEFAULT_WAIT_SECONDS, 0),
-      MAX_WAIT_SECONDS
-    );
+    const waitSeconds = resolveWaitSeconds(args?.wait_seconds);
     const since = args?.since && !Number.isNaN(Date.parse(args.since))
       ? Date.parse(args.since)
       : Date.now() - DEFAULT_FRESHNESS_GRACE_MS;
