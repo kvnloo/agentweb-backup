@@ -164,23 +164,34 @@ const NO_GOAL_PHRASES = new Set<string>([...GREETING_PHRASES, ...NO_TASK_PHRASES
  * zero-task sessions back into the ≤3 cohort (ENG-830).
  *
  * Deliberately narrow: 1–4 name-shaped words (letters plus `.`/`'`/`-`, no
- * digits) followed by a colon AND whitespace AND remaining text. A label prefix
- * on a real request ("Reminder: send the report") also matches, but its
- * remainder is substantive and still fails the phrase check, so stripping it
- * changes nothing.
+ * digits) followed by a colon AND whitespace AND remaining text. That shape
+ * also matches a label prefix on a genuine instruction ("Reply to this: Hi",
+ * "Note: ok"), whose remainder IS a no-goal phrase — stripping it there would
+ * misclassify a real request as a zero-task session and silently drop it from
+ * the cohort, inverting the err-toward-scoring invariant below. So the strip is
+ * applied only to sessions that actually carry the prefix: Slack-relayed ones.
  */
 const SENDER_NAME_PREFIX = /^[\p{L}][\p{L}.'’-]*(?:[ \t]+[\p{L}][\p{L}.'’-]*){0,3}:[ \t]+(?=\S)/u;
 
 /**
- * Normalize a user message for no-goal matching: drop a relayed sender-name
- * prefix, lowercase, drop everything that is not a letter/digit/space
- * (punctuation, emoji), then collapse runs of whitespace.
- * E.g. "Hi 👋" → "hi", "Good morning!" → "good morning",
- * "Fangfang Tan: Hi" → "hi".
+ * True for sessions whose user turns are relayed from Slack and therefore
+ * persisted as `"<Display Name>: <text>"`. routes/slack.ts writes that prefix on
+ * every Slack path — the suggested-reply flow (`slack-triggered`) and the bot
+ * flows (`slack-bot`, `slack-bot-admin`) alike — so match on the shared prefix.
  */
-function normalizeUserTurn(text: string): string {
-  return text
-    .replace(SENDER_NAME_PREFIX, "")
+function isSlackRelayedSession(pageIdentifier?: string): boolean {
+  return typeof pageIdentifier === "string" && pageIdentifier.startsWith("slack");
+}
+
+/**
+ * Normalize a user message for no-goal matching: optionally drop a relayed
+ * sender-name prefix (Slack-origin sessions only), lowercase, drop everything
+ * that is not a letter/digit/space (punctuation, emoji), then collapse runs of
+ * whitespace. E.g. "Hi 👋" → "hi", "Good morning!" → "good morning",
+ * "Fangfang Tan: Hi" (Slack) → "hi".
+ */
+function normalizeUserTurn(text: string, stripSenderPrefix: boolean): string {
+  return (stripSenderPrefix ? text.replace(SENDER_NAME_PREFIX, "") : text)
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .replace(/\s+/g, " ")
@@ -202,18 +213,21 @@ function normalizeUserTurn(text: string): string {
  * no-goal phrase for the session to qualify. Any substantive turn — a request,
  * a question, or any text not in `NO_GOAL_PHRASES` — returns false so the
  * session is scored normally. Erring toward scoring avoids silently hiding a
- * genuinely unsatisfied session.
+ * genuinely unsatisfied session. For the same reason the sender-name prefix is
+ * stripped only when `pageIdentifier` marks the session as Slack-relayed, so a
+ * labelled instruction ("Reply to this: Hi") stays scorable elsewhere.
  */
-export function isNoTaskSession(messages: ChatMessage[] = []): boolean {
+export function isNoTaskSession(messages: ChatMessage[] = [], pageIdentifier?: string): boolean {
   const userTexts = (messages || [])
     .filter((m: any) => m.role === "user")
     .map((m: any) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")));
 
   if (userTexts.length === 0) return false;
 
+  const stripSenderPrefix = isSlackRelayedSession(pageIdentifier);
   let sawNoGoalTurn = false;
   for (const raw of userTexts) {
-    const norm = normalizeUserTurn(raw);
+    const norm = normalizeUserTurn(raw, stripSenderPrefix);
     if (norm === "") continue; // non-substantive (e.g. emoji-only) — not a goal
     if (!NO_GOAL_PHRASES.has(norm)) return false; // substantive content → scorable
     sawNoGoalTurn = true;
@@ -656,7 +670,7 @@ export async function scoreSessionWithJudgeIfNeeded(
   // to complete, so the judge scores it low on goalCompletion as a pure scoring
   // artifact. Exclude it from the satisfaction cohort (ENG-168, ENG-830) — same
   // skip-and-return-null treatment as sub-threshold and in-flight sessions.
-  if (isNoTaskSession(session.messages)) {
+  if (isNoTaskSession(session.messages, session.pageIdentifier)) {
     return null;
   }
 
@@ -736,7 +750,7 @@ export async function scoreSessionIfNeeded(
   // to complete, so the judge scores it low on goalCompletion as a pure scoring
   // artifact. Exclude it from the satisfaction cohort (ENG-168, ENG-830) — same
   // skip-and-return-null treatment as sub-threshold and in-flight sessions.
-  if (isNoTaskSession(session.messages)) {
+  if (isNoTaskSession(session.messages, session.pageIdentifier)) {
     return null;
   }
 
