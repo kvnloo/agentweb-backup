@@ -398,9 +398,11 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
       expect(ConverseCommand).toHaveBeenCalled();
       const input = (ConverseCommand as jest.Mock).mock.calls[0][0];
       // System array should have the text + cachePoint
+      // ENG-893: Sonnet 4.6 is an extended-TTL model, so the checkpoint carries
+      // ttl:'1h'. The TTL-specific assertions live in promptCacheTtl.test.ts.
       expect(input.system).toEqual([
         { text: 'System prompt here' },
-        { cachePoint: { type: 'default' } },
+        { cachePoint: { type: 'default', ttl: '1h' } },
       ]);
     });
 
@@ -421,7 +423,7 @@ describe('AgentModeService - Bedrock Converse message conversion', () => {
       // messages[1] (assistant) should have cachePoint appended (second-to-last)
       const secondToLast = input.messages[input.messages.length - 2];
       const lastBlock = secondToLast.content[secondToLast.content.length - 1];
-      expect(lastBlock).toEqual({ cachePoint: { type: 'default' } });
+      expect(lastBlock).toEqual({ cachePoint: { type: 'default', ttl: '1h' } });
     });
 
     it('should NOT add conversation cachePoint for short conversations (<=2 messages)', async () => {

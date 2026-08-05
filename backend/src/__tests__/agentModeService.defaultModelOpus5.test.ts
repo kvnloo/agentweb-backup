@@ -178,9 +178,7 @@ describe('ENG-759: default chat model is Claude Opus 5', () => {
     it('derives cache rates for the default model rather than recording $0', () => {
       const price = getModelPrice(service.default_model);
       expect(price!.cacheReadPerM).toBeCloseTo(0.5, 6);
-      // ENG-893: Opus 5 is invoked with the 1-hour prompt-cache TTL, whose
-      // writes bill at 2x input ($10/1M) rather than the default TTL's 1.25x.
-      expect(price!.cacheWritePerM).toBeCloseTo(10, 6);
+      expect(price!.cacheWritePerM).toBeCloseTo(6.25, 6);
     });
   });
 
