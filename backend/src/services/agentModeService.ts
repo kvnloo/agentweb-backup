@@ -355,7 +355,9 @@ function recordAgentModeToolTelemetry(
         // as a failure (it carries no error signal).
         void recorder.toolDeferred(runId, {
           toolName,
-          reason: 'media_generation_time_budget',
+          // A handler-supplied deferral names its own reason (ENG-822); the
+          // media-budget path keeps the original default.
+          reason: (r.result as any)?.reason || 'media_generation_time_budget',
           iteration,
           sessionId,
           ...(budgetContext?.mediaAssetsProducedThisRun != null
@@ -1191,7 +1193,10 @@ export class AgentModeService {
           this.toolRegistry.register({
             name: toolHandler.name,
             definition: openAiDef,
-            execute: toolHandler.execute
+            execute: toolHandler.execute,
+            // ENG-822: carry the account-scope flag across the copy. Dropping it
+            // here is what made the registry guard inert for live sessions.
+            requiresUserAccount: toolHandler.requiresUserAccount
           });
         }
       }
