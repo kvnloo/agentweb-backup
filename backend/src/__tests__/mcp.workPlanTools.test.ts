@@ -746,6 +746,65 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(putCalls()).toHaveLength(1);
     });
 
+    // A title is only an identity if it is unique. Two steps sharing one is
+    // legal and does happen ("Review", "Follow up"), and both the diff and the
+    // content matcher have to stay honest when it does.
+    describe('duplicate step titles', () => {
+      const duplicatePlan = {
+        planId: 'wp-1',
+        steps: [
+          { stepCount: 1, title: 'Review', description: 'first review', requiredFunctionCalls: ['a'] },
+          { stepCount: 2, title: 'Review', description: 'second review', requiredFunctionCalls: ['b'] },
+          { stepCount: 3, title: 'Ship', description: 'ship it' },
+        ],
+      };
+      function mockDuplicateFetches() {
+        mockMcpFetch.mockImplementation(async (opts: any) =>
+          opts.method === 'GET' ? JSON.parse(JSON.stringify(duplicatePlan)) : { planId: 'wp-1' }
+        );
+      }
+
+      it('reports a dropped step whose title still exists on another step', async () => {
+        mockDuplicateFetches();
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          confirm_step_removal: true,
+          steps: [
+            { stepCount: 1, title: 'Review', description: 'first review', requiredFunctionCalls: ['a'] },
+            { stepCount: 2, title: 'Ship', description: 'ship it' },
+          ],
+        }, context);
+
+        const { stepsChange } = JSON.parse(result.content[0].text);
+        expect(stepsChange.stepsRemoved).toBe(1);
+        // One 'Review' survived, so a set-membership diff would call this empty.
+        expect(stepsChange.droppedStepTitles).toEqual(['Review']);
+      });
+
+      it('pairs steps by position, not by an ambiguous title, when detecting content loss', async () => {
+        mockDuplicateFetches();
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps: [
+            { stepCount: 1, title: 'Review', description: 'first review', requiredFunctionCalls: ['a'] },
+            { stepCount: 2, title: 'Review', description: 'second review' },
+            { stepCount: 3, title: 'Ship', description: 'ship it' },
+          ],
+        }, context);
+
+        const payload = JSON.parse(result.content[0].text);
+        // Only step 2 lost its requiredFunctionCalls. Matching on the shared
+        // title would have paired both against step 1 and reported nothing.
+        expect(payload.stepContentLoss).toEqual([
+          { stepCount: 2, title: 'Review', fields: ['requiredFunctionCalls'] },
+        ]);
+      });
+    });
+
     it('never fires in merge mode, which cannot blank a field it was not given', async () => {
       mockPlanFetches();
 
