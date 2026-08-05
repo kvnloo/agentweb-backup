@@ -175,7 +175,10 @@ async function main() {
   // truthful. See orphanPreviewProcs for the four guards that keep a process-killing sweep safe.
   if (config.previewReapOrphans !== false) {
     try {
-      const reaped = reapOrphanPreviewProcs(log, { minAgeSec: (config.previewOrphanMinutes ?? 15) * 60 });
+      const reaped = reapOrphanPreviewProcs(log, {
+        minAgeSec: (config.previewOrphanMinutes ?? 15) * 60,
+        dryRun: config.previewOrphanDryRun !== false,   // observe-only until the bring-up failures are understood
+      });
       if (reaped.length) log(`reaped ${reaped.length} orphaned preview process(es)`);
     } catch (e) { log(`orphan-preview reap failed: ${e.message}`); }
   }

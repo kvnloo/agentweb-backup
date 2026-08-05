@@ -12,7 +12,7 @@
 // its own `ts-node --transpile-only -O {...}` running, 76 seconds old. Matching on worktree path alone
 // would have killed an agent's in-flight build. Shape + age is what makes it safe.
 // Run: node test/preview-orphan-reap.test.mjs
-import { orphanPreviewProcs } from '../preview/policy.mjs';
+import { orphanPreviewProcs, reapOrphanPreviewProcs } from '../preview/policy.mjs';
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log(`  ✅ ${m}`); } else { fail++; console.log(`  ❌ ${m}`); } };
@@ -101,6 +101,25 @@ console.log('orphanPreviewProcs — the live ENG-845 shape');
   const got = run(procs, { state: { 'eng-845': { ports: { api: 31102 }, procs: { backend: { pid: 999 } } } } });
   ok(got.length === 3 && got.includes(177871) && got.includes(178195) && got.includes(178873), 'reaps the three forgotten servers');
   ok(!got.includes(326663), "and leaves the agent's live ts-node alone — the exact near-miss from the incident");
+}
+
+// dryRun is the default posture at the call site: this sweep kills processes and has already been wrong
+// once in production, and bring-ups here have been seen dying BEFORE recording state — leaving a stack
+// that is genuinely serving yet indistinguishable from an abandoned one. Observe first, arm later.
+console.log('reapOrphanPreviewProcs — dry-run posture');
+{
+  const orphan = [P(50, BACKEND('ENG-845'), { age: 9999 })];
+  const common = { procs: orphan, state: {}, root: ROOT, minAgeSec: 900 };
+  const killed = []; const lines = [];
+  const n = reapOrphanPreviewProcs((m) => lines.push(m), { ...common, dryRun: true, kill: (pid) => killed.push(pid) });
+  ok(killed.length === 0, 'dryRun → nothing is signalled');
+  ok(n.length === 0, 'dryRun → reports nothing reaped');
+  ok(lines.some((l) => l.includes('[dry-run] WOULD stop') && l.includes('50')), 'dryRun → still logs the candidate, so the evidence accumulates');
+
+  const killed2 = []; const lines2 = [];
+  const n2 = reapOrphanPreviewProcs((m) => lines2.push(m), { ...common, dryRun: false, kill: (pid) => killed2.push(pid) });
+  ok(killed2.join() === '50' && n2.join() === '50', 'armed → signals the orphan and reports it');
+  ok(lines2.some((l) => l.startsWith('stopping ')), 'armed → logs it as an action, not a hypothetical');
 }
 
 console.log(fail ? `\n❌ ${fail} FAILED — ${pass} passed, ${fail} failed` : `\n✅ ALL PASSED — ${pass} passed, 0 failed`);

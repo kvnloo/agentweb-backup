@@ -220,6 +220,16 @@ export const config = {
                                    // worktree path — a worktree also hosts type-checks, jest, portal builds
                                    // and claude turns, and ENG-845 was locked with 2 live turns at the time.
                                    // false = leave orphans running.
+  previewOrphanDryRun: true,       // OBSERVE-ONLY: log what the reap WOULD stop, signal nothing. On its first
+                                   // live pass (2026-08-05 13:40) the reap killed the backend of a bring-up
+                                   // 24 minutes into its run, through a window where no state entry existed
+                                   // at all. And bring-ups here have been seen dying BEFORE they record state
+                                   // (eng-803 and eng-873 both did within the hour), which leaves a stack that
+                                   // is genuinely serving — ports listening, requests answered — yet
+                                   // indistinguishable from an abandoned one by any signal available to gc.
+                                   // Until that upstream failure is understood, a process-killing sweep should
+                                   // watch and report. Read the `[dry-run] WOULD stop` lines in poll.log; when
+                                   // they are right for a sustained period, set this false to arm it.
   previewOrphanMinutes: 15,        // how old an unrecorded preview server must be before it counts as an
                                    // orphan. A bring-up spawns its servers well before it records them, and
                                    // bring-ups have been observed taking 15+ minutes on this box, so this is

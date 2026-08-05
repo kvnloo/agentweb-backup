@@ -326,13 +326,23 @@ export function orphanPreviewProcs({
 
 // Effectful wrapper: SIGTERM each orphan (SIGKILL is left to the next sweep — on the live cleanup every
 // one of the ten exited on TERM alone, and a wrapper's children go with it). Returns what it signalled.
-export function reapOrphanPreviewProcs(log = () => {}, opts = {}) {
+// `dryRun` logs what it WOULD stop and signals nothing. It defaults ON at the call site (see gc.mjs)
+// because this sweep has already been wrong once in production: on its first live pass it killed the
+// backend of a bring-up 24 minutes into its run, through a window where no state entry existed at all.
+// Worse, bring-ups on this box have been observed dying BEFORE they record state — eng-803 and eng-873
+// both did within an hour — which leaves a stack that is genuinely serving (ports listening, requests
+// answered) yet indistinguishable from an abandoned one by any signal available here. Until that
+// upstream failure is understood, the honest posture for a process-killing sweep is to observe and
+// report. The log lines are the evidence needed to decide whether arming it is safe.
+export function reapOrphanPreviewProcs(log = () => {}, { dryRun = false, kill = (pid) => process.kill(pid, 'SIGTERM'), ...opts } = {}) {
   const orphans = orphanPreviewProcs(opts);
   const reaped = [];
   for (const p of orphans) {
     const mb = Math.round((p.rssKB || 0) / 1024);
-    log(`orphan preview process ${p.pid} (${Math.round(p.ageSec / 60)}m old${mb ? `, ${mb}MB` : ''}) belongs to no live preview — stopping: ${p.args.slice(0, 90)}`);
-    try { process.kill(p.pid, 'SIGTERM'); reaped.push(p.pid); } catch { /* already gone */ }
+    const what = `orphan preview process ${p.pid} (${Math.round(p.ageSec / 60)}m old${mb ? `, ${mb}MB` : ''}) belongs to no live preview: ${p.args.slice(0, 90)}`;
+    if (dryRun) { log(`[dry-run] WOULD stop ${what}`); continue; }
+    log(`stopping ${what}`);
+    try { kill(p.pid); reaped.push(p.pid); } catch { /* already gone */ }
   }
   return reaped;
 }
