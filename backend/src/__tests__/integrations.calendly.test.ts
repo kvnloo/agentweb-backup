@@ -57,7 +57,10 @@ describe('getCalendlyConfig', () => {
 
     // webhooks:read is included even though the code never calls it — Calendly's dashboard
     // force-selects it alongside webhooks:write, so it's granted either way (ENG-524).
+    // event_types:read was added to resolve a connected user's scheduling link (GET
+    // /event_types), used by the webhook-receiver verification spike (ENG-524).
     expect(config.scopes.sort()).toEqual([
+      'event_types:read',
       'scheduled_events:read',
       'users:read',
       'webhooks:read',
