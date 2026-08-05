@@ -27,6 +27,7 @@ jest.mock('../services/db', () => ({
 import axios from 'axios';
 import {
   MISSING_BRAND_LOGO_ERROR,
+  classifyBrandLogoUrl,
   downloadBrandLogoToS3,
   ensureBrandLogoPersisted,
   getPersistedBrandLogoUrl,
@@ -329,9 +330,12 @@ describe('ensureBrandLogoPersisted (deterministic onboarding step — AC-1)', ()
       .fn()
       .mockResolvedValue({ status: 'uploaded', url: 'https://s3/brand/logo.png' }),
     persist: jest.fn().mockResolvedValue({ success: true }),
+    // Injected so the existing-logo probe (ENG-792) stays hermetic — without
+    // it these cases would make a real network call for the fixture URL.
+    classifyExisting: jest.fn().mockResolvedValue('usable' as const),
   });
 
-  it('skips when a logo is already persisted (Emma did her job)', async () => {
+  it('skips when a logo is already persisted AND still loads (Emma did her job)', async () => {
     const deps = baseDeps();
     deps.resolveBrand.mockResolvedValue({
       brandData: { logoUrl: 'https://s3/already.png' },
@@ -344,7 +348,65 @@ describe('ensureBrandLogoPersisted (deterministic onboarding step — AC-1)', ()
       logoUrl: 'https://s3/already.png',
       reason: 'already-present',
     });
+    expect(deps.classifyExisting).toHaveBeenCalledWith('https://s3/already.png');
     expect(deps.discoverLogoUrl).not.toHaveBeenCalled();
+    expect(deps.persist).not.toHaveBeenCalled();
+  });
+
+  it('rediscovers when the persisted logo is definitively broken (ENG-792)', async () => {
+    // The reported account: Emma wrote a google.com/s2/favicons URL for a site
+    // whose logo is inline SVG, and it 404s. Structurally "present", so this
+    // step used to short-circuit and every ad-image run then died on it.
+    const deps = baseDeps();
+    deps.resolveBrand.mockResolvedValue({
+      brandData: {
+        logoUrl: 'https://www.google.com/s2/favicons?domain=dramabreak.ai&sz=128',
+      },
+    });
+    deps.classifyExisting.mockResolvedValue('broken' as const);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const out = await ensureBrandLogoPersisted('u1', 'https://acme.com', deps);
+
+    warnSpy.mockRestore();
+    expect(deps.discoverLogoUrl).toHaveBeenCalledWith('https://acme.com');
+    expect(out.persisted).toBe(true);
+    expect(out.logoUrl).toBe('https://s3/brand/logo.png');
+    expect(out.reason).toBe('persisted');
+  });
+
+  it('KEEPS a persisted logo when the probe is inconclusive (no transient overwrite)', async () => {
+    // A timeout/5xx must never cost an account its real logo.
+    const deps = baseDeps();
+    deps.resolveBrand.mockResolvedValue({
+      brandData: { logoUrl: 'https://s3/real-uploaded-logo.png' },
+    });
+    deps.classifyExisting.mockResolvedValue('unknown' as const);
+
+    const out = await ensureBrandLogoPersisted('u1', 'https://acme.com', deps);
+
+    expect(out.reason).toBe('already-present');
+    expect(out.logoUrl).toBe('https://s3/real-uploaded-logo.png');
+    expect(deps.discoverLogoUrl).not.toHaveBeenCalled();
+    expect(deps.persist).not.toHaveBeenCalled();
+  });
+
+  it('leaves a broken persisted logo alone when rediscovery finds nothing', async () => {
+    // Falling through must not make things worse: if there is no replacement,
+    // we report no-logo-found and never persist a second broken value. The
+    // ad-image preflight is what surfaces this to the user.
+    const deps = baseDeps();
+    deps.resolveBrand.mockResolvedValue({
+      brandData: { logoUrl: 'https://dead/logo.png' },
+    });
+    deps.classifyExisting.mockResolvedValue('broken' as const);
+    deps.discoverLogoUrl.mockResolvedValue(null);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const out = await ensureBrandLogoPersisted('u1', 'https://acme.com', deps);
+
+    warnSpy.mockRestore();
+    expect(out.reason).toBe('no-logo-found');
     expect(deps.persist).not.toHaveBeenCalled();
   });
 
@@ -437,5 +499,118 @@ describe('ensureBrandLogoPersisted (deterministic onboarding step — AC-1)', ()
     expect(out.persisted).toBe(false);
     expect(out.reason).toBe('error');
     expect(out.detail).toMatch(/Puppeteer crashed/);
+  });
+});
+
+describe('classifyBrandLogoUrl (ENG-792 shared usability probe)', () => {
+  const png = { 'content-type': 'image/png' };
+
+  it('is usable for a 2xx image response with bytes', async () => {
+    const out = await classifyBrandLogoUrl('https://s3/logo.png', {
+      httpGet: async () => ({
+        status: 200,
+        headers: png,
+        data: Buffer.from([137, 80, 78, 71]),
+      }),
+    });
+    expect(out).toBe('usable');
+  });
+
+  it('is usable for generic-binary and absent content-types', async () => {
+    // S3 objects with no ContentType metadata serve real bytes as
+    // octet-stream and generate fine downstream (getImageMimeType sniffs the
+    // extension), so these must not be classified broken.
+    for (const ct of ['application/octet-stream', 'binary/octet-stream']) {
+      expect(
+        await classifyBrandLogoUrl('https://s3/logo.png', {
+          httpGet: async () => ({
+            status: 200,
+            headers: { 'content-type': ct },
+            data: Buffer.from([1, 2, 3]),
+          }),
+        }),
+      ).toBe('usable');
+    }
+    expect(
+      await classifyBrandLogoUrl('https://s3/logo.png', {
+        httpGet: async () => ({ status: 200, headers: {}, data: Buffer.from([1]) }),
+      }),
+    ).toBe('usable');
+  });
+
+  it('is broken for a rejected 4xx carrying an axios response (the favicon case)', async () => {
+    const out = await classifyBrandLogoUrl(
+      'https://www.google.com/s2/favicons?domain=dramabreak.ai&sz=128',
+      {
+        httpGet: async () => {
+          const err: any = new Error('Request failed with status code 404');
+          err.response = { status: 404, headers: png };
+          throw err;
+        },
+      },
+    );
+    expect(out).toBe('broken');
+  });
+
+  it('is broken for a non-2xx 4xx surfaced by a non-throwing fetcher', async () => {
+    const out = await classifyBrandLogoUrl('https://cdn/gone.png', {
+      httpGet: async () => ({ status: 404, headers: png, data: Buffer.from([1]) }),
+    });
+    expect(out).toBe('broken');
+  });
+
+  it('is broken for an empty body or a textual error body served with 200', async () => {
+    expect(
+      await classifyBrandLogoUrl('https://s3/logo.png', {
+        httpGet: async () => ({ status: 200, headers: png, data: Buffer.alloc(0) }),
+      }),
+    ).toBe('broken');
+    for (const ct of ['text/html; charset=utf-8', 'application/json']) {
+      expect(
+        await classifyBrandLogoUrl('https://cdn/error', {
+          httpGet: async () => ({
+            status: 200,
+            headers: { 'content-type': ct },
+            data: Buffer.from('<!doctype html>'),
+          }),
+        }),
+      ).toBe('broken');
+    }
+  });
+
+  it('is broken for an empty or non-string URL, without fetching', async () => {
+    let called = false;
+    const httpGet = async () => {
+      called = true;
+      return { status: 200, headers: png, data: Buffer.from([1]) };
+    };
+    expect(await classifyBrandLogoUrl('', { httpGet })).toBe('broken');
+    expect(await classifyBrandLogoUrl('   ', { httpGet })).toBe('broken');
+    expect(await classifyBrandLogoUrl(undefined as any, { httpGet })).toBe('broken');
+    expect(called).toBe(false);
+  });
+
+  it('is UNKNOWN — never broken — for timeouts, DNS errors and 5xx', async () => {
+    // This is what protects a real logo from being replaced on a blip.
+    const bare = await classifyBrandLogoUrl('https://slow/logo.png', {
+      httpGet: async () => {
+        throw new Error('timeout of 15000ms exceeded');
+      },
+    });
+    expect(bare).toBe('unknown');
+
+    const server = await classifyBrandLogoUrl('https://flaky/logo.png', {
+      httpGet: async () => {
+        const err: any = new Error('Request failed with status code 503');
+        err.response = { status: 503, headers: png };
+        throw err;
+      },
+    });
+    expect(server).toBe('unknown');
+
+    const surfaced = await classifyBrandLogoUrl('https://flaky/logo.png', {
+      httpGet: async () => ({ status: 503, headers: png, data: Buffer.from([1]) }),
+    });
+    expect(surfaced).toBe('unknown');
   });
 });
