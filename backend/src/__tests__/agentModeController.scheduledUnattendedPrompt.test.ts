@@ -347,6 +347,8 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
       fullAutonomy: false,
       requiredFunctionCalls: ['post_on_connected_account'],
       autopublishAuthorized: true,
+      // consent is bound to the scope approved at grant time
+      autopublishAuthorizedTools: ['post_on_connected_account'],
     } as any);
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;

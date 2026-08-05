@@ -55,6 +55,9 @@ describe('POST /scheduled-chats/:id/publish-consent (ENG-827)', () => {
     expect(patch.autopublishAuthorized).toBe(true);
     expect(patch.autopublishAuthorizedBy).toBe(OWNER);
     expect(patch.autopublishAuthorizedAt).toEqual(expect.any(String));
+    // consent is bound to the scope on screen at grant time, so a later edit to
+    // requiredFunctionCalls cannot re-scope it onto tools never approved
+    expect(patch.autopublishAuthorizedTools).toEqual(['post_on_connected_account']);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ autopublishAuthorized: true }));
   });
 
@@ -79,6 +82,7 @@ describe('POST /scheduled-chats/:id/publish-consent (ENG-827)', () => {
     const [, patch] = (mockDb.updateSchedule as jest.Mock).mock.calls[0];
     expect(patch.autopublishAuthorized).toBe(false);
     expect(patch.autopublishAuthorizedBy).toBeNull();
+    expect(patch.autopublishAuthorizedTools).toEqual([]);
   });
 
   it('REFUSES a grant when the schedule designates no publishing tool', async () => {

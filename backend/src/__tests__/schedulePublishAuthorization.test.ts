@@ -58,8 +58,8 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
       requiredFunctionCalls: ['post_on_connected_account'],
     });
     expect(result.authorized).toBe(false);
-    // tools are still REPORTED so the required-function checker can filter on them
-    expect(result.tools).toEqual(['post_on_connected_account']);
+    // `tools` is the AUTHORIZED scope, so an unconsented schedule reports none
+    expect(result.tools).toEqual([]);
   });
 
   it('does NOT authorize the real LUCAS shape (publish tool required, no consent flag)', () => {
@@ -67,7 +67,7 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
       requiredFunctionCalls: ['generate_image', 'post_on_connected_account'],
     });
     expect(result.authorized).toBe(false);
-    expect(result.tools).toEqual(['post_on_connected_account']);
+    expect(result.tools).toEqual([]);
   });
 
   // ── Prompt wording is NOT consent (Greptile P1 #3) ──────────────────────────
@@ -120,6 +120,7 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
   it('AUTHORIZES on autopublishAuthorized, reporting the designated tools', () => {
     const result = resolveSchedulePublishAuthorization({
       autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
       requiredFunctionCalls: ['post_on_connected_account'],
     });
     expect(result).toEqual({ authorized: true, tools: ['post_on_connected_account'] });
@@ -135,7 +136,7 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
       requiredFunctionCalls: ['post_on_connected_account'],
     } as any);
     expect(result.authorized).toBe(false);
-    expect(result.tools).toEqual(['post_on_connected_account']);
+    expect(result.tools).toEqual([]);
   });
 
   it('does NOT authorize on fullAutonomy even combined with every other non-consent signal', () => {
@@ -150,6 +151,7 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
   it('AUTHORIZES on the mixed required-list shape, returning only the publish tools', () => {
     const result = resolveSchedulePublishAuthorization({
       autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
       requiredFunctionCalls: [
         'read_brand_guidelines',
         'generate_image',
@@ -164,10 +166,54 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
   it('covers publish tools by prefix and de-duplicates them in declaration order', () => {
     const result = resolveSchedulePublishAuthorization({
       autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['publish_blog_article', 'post_on_connected_account'],
       requiredFunctionCalls: ['publish_blog_article', 'post_on_connected_account', 'publish_blog_article'],
     });
     expect(result.authorized).toBe(true);
     expect(result.tools).toEqual(['publish_blog_article', 'post_on_connected_account']);
+  });
+
+  // ── Consent is BOUND to the scope it was granted for (Greptile P1 #8) ──────
+  // Without this, editing requiredFunctionCalls after a grant silently re-scopes
+  // standing consent onto tools the owner never saw.
+  it('does NOT extend consent to a publish tool added AFTER the grant', () => {
+    const result = resolveSchedulePublishAuthorization({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
+      // the owner later added a second publishing tool they never consented to
+      requiredFunctionCalls: ['post_on_connected_account', 'publish_landing_page_changes'],
+    });
+    expect(result.authorized).toBe(true);
+    expect(result.tools).toEqual(['post_on_connected_account']);
+    expect(result.tools).not.toContain('publish_landing_page_changes');
+  });
+
+  it('drops to unauthorized when the approved tool is removed from the schedule', () => {
+    const result = resolveSchedulePublishAuthorization({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
+      requiredFunctionCalls: ['publish_landing_page_changes'],
+    });
+    expect(result).toEqual({ authorized: false, tools: [] });
+  });
+
+  it('fails closed when consent is recorded with no approved scope', () => {
+    // Unknown scope — cannot be treated as a licence for whatever is required now.
+    expect(
+      resolveSchedulePublishAuthorization({
+        autopublishAuthorized: true,
+        requiredFunctionCalls: ['post_on_connected_account'],
+      })
+    ).toEqual({ authorized: false, tools: [] });
+  });
+
+  it('ignores a malformed approved-tools list rather than trusting it', () => {
+    const result = resolveSchedulePublishAuthorization({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: [null, 42, {}] as any,
+      requiredFunctionCalls: ['post_on_connected_account'],
+    });
+    expect(result).toEqual({ authorized: false, tools: [] });
   });
 
   // ── Tool scoping ───────────────────────────────────────────────────────────
@@ -176,6 +222,7 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
     // publish gate, so they never appear in the authorized tool list.
     const result = resolveSchedulePublishAuthorization({
       autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
       requiredFunctionCalls: ['send_email', 'linkedin_outreach', 'twitter_manage_post'],
     });
     expect(result.tools).toEqual([]);
@@ -184,6 +231,7 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
   it('scopes the reported tools to the ones the owner actually named', () => {
     const result = resolveSchedulePublishAuthorization({
       autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
       requiredFunctionCalls: ['post_on_connected_account'],
     });
     expect(result.tools).toEqual(['post_on_connected_account']);

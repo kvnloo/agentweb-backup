@@ -120,6 +120,11 @@ describe('Scheduled Chat MCP Tools', () => {
       const put = calls.find(c => c.method === 'PUT');
       const consent = calls.find(c => c.path.endsWith('/publish-consent'));
 
+      // ORDER matters: revoke first. If the ordinary update then fails, the
+      // schedule is already in the safer (not publishing) state. Revoking after
+      // would leave consent enabled whenever the second call failed.
+      expect(calls.indexOf(consent)).toBeLessThan(calls.indexOf(put));
+
       // the generic update must NOT carry consent — it would be ignored there
       expect(put.body).not.toHaveProperty('autopublishAuthorized');
       // the revoke must actually land on the endpoint that can apply it
