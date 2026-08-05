@@ -153,9 +153,18 @@ router.put("/:planId", async (req, res) => {
       ...(showLoginSignup !== undefined && { showLoginSignup }),
       ...(defaultModel !== undefined && { defaultModel }),
     };
-    await workPlanService.updateWorkPlan(updated);
+    // Same stake as the admin PUT: `null` means "the plan I read had no
+    // revision", so presence of the key is what counts (ENG-890).
+    const stake = "expectedStepsRev" in req.body
+      ? { expectedStepsRev: req.body.expectedStepsRev }
+      : undefined;
+    await workPlanService.updateWorkPlan(updated, ...(stake ? [stake] as const : [] as const));
     res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
   } catch (error: any) {
+    // A competing write landed between the caller's read and this one.
+    if (error?.message === "Work plan steps changed") {
+      return res.status(409).json({ message: "Work plan changed since it was read — re-read it and retry" });
+    }
     // The plan was deleted between the read above and the write.
     if (error?.message === "Work plan not found") {
       return res.status(404).json({ message: "Work plan not found" });

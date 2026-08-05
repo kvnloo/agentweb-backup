@@ -108,6 +108,12 @@ router.put("/:planId", async (req, res) => {
     if (steps !== undefined && !Array.isArray(steps)) {
       return res.status(400).json({ message: "steps must be an array" });
     }
+    // A caller that decided this write was safe by reading the plan first can
+    // stake the revision it saw. `null` is a real value here ("the plan had no
+    // revision"), so presence of the key is what counts (ENG-890).
+    const stake = "expectedStepsRev" in req.body
+      ? { expectedStepsRev: req.body.expectedStepsRev }
+      : undefined;
     const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
     const normalizedSteps = normalized?.steps;
     const warnings = normalized?.warnings ?? [];
@@ -125,9 +131,15 @@ router.put("/:planId", async (req, res) => {
       ...(category !== undefined && { category }),
       ...(visibility !== undefined && { visibility }),
     };
-    await workPlanService.updateWorkPlan(updated);
+    await workPlanService.updateWorkPlan(updated, ...(stake ? [stake] as const : [] as const));
     res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
   } catch (error: any) {
+    // A competing write landed between the caller's read and this one, so the
+    // payload was judged against steps that no longer exist. Retryable, unlike
+    // the 404 below — hence a distinct status (ENG-890).
+    if (error?.message === "Work plan steps changed") {
+      return res.status(409).json({ message: "Work plan changed since it was read — re-read it and retry" });
+    }
     // The plan was deleted between the read above and the write.
     if (error?.message === "Work plan not found") {
       return res.status(404).json({ message: "Work plan not found" });
