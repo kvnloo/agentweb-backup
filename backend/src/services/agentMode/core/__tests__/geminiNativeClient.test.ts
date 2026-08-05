@@ -677,6 +677,28 @@ describe('sanitizeGeminiSchema', () => {
     });
   });
 
+  it('truncates a cycle reached through `items` or `anyOf`, not just `properties` (ENG-845)', () => {
+    // Each schema-bearing key has its own truncation branch, so each needs its own
+    // cycle. An array whose element type is itself, and a union with itself as a member,
+    // are both reachable from a dereferenced $ref in a generated schema.
+    const cyclicArray: any = { type: 'array' };
+    cyclicArray.items = cyclicArray;
+    // The truncated leaf is an array, so the items fallback applies — never a bare
+    // `{ type: 'array' }`, which Gemini rejects outright.
+    expect(sanitizeGeminiSchema(cyclicArray)).toEqual({
+      type: 'array',
+      items: { type: 'array', items: { type: 'string' } },
+    });
+
+    const cyclicUnion: any = { type: 'object', properties: { v: { type: 'string' } } };
+    cyclicUnion.anyOf = [cyclicUnion];
+    expect(sanitizeGeminiSchema(cyclicUnion)).toEqual({
+      type: 'object',
+      properties: { v: { type: 'string' } },
+      anyOf: [{ type: 'object' }],
+    });
+  });
+
   it('expands a schema object SHARED between siblings in both branches (ENG-845)', () => {
     // Cycle detection tracks ANCESTRY, not every object ever seen — otherwise a shared
     // sub-schema (common in generated schemas) would be truncated in whichever branch
