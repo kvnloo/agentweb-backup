@@ -107,8 +107,9 @@ describe('Slack and WhatsApp as peers', () => {
     await expect(notifyReporterShipped(base)).resolves.toBe('sent');
   });
 
-  it('does NOT release the claim when one of two channels failed', async () => {
-    // Releasing would let a retry re-deliver the Slack message that already landed.
+  it('releases ONLY the failed channel claim, so a retry re-sends just that one', async () => {
+    // Greptile P1. Claims are per channel, so the failed channel can be retried
+    // without re-delivering the Slack message that already landed.
     userDb.getUserByEmail.mockResolvedValue({
       userId: 'u1',
       slackChannels: ['C1'],
@@ -116,7 +117,37 @@ describe('Slack and WhatsApp as peers', () => {
     });
     whatsapp.sendMessage.mockRejectedValue(new Error('boom'));
     await notifyReporterShipped(base);
-    expect(settingsService.releaseSetMember).not.toHaveBeenCalled();
+    expect(settingsService.releaseSetMember).toHaveBeenCalledTimes(1);
+    expect(settingsService.releaseSetMember).toHaveBeenCalledWith(
+      'ship-notify:post-1:whatsapp',
+      'u@e.com',
+    );
+  });
+
+  it('re-sends only the previously-failed channel on a replay', async () => {
+    // The behavior the per-channel claim exists for: Slack already landed (its claim
+    // is held), WhatsApp did not (its claim is free). A retry must reach WhatsApp
+    // and must NOT re-ping Slack.
+    userDb.getUserByEmail.mockResolvedValue({
+      userId: 'u1',
+      slackChannels: ['C1'],
+      messagingChannels: [WA],
+    });
+    settingsService.claimSetMember.mockImplementation(async (key: string) =>
+      key !== 'ship-notify:post-1',
+    );
+    await expect(notifyReporterShipped(base)).resolves.toBe('sent');
+    expect(whatsapp.sendMessage).toHaveBeenCalledTimes(1);
+    expect(postSlackMessage).not.toHaveBeenCalled();
+  });
+
+  it('keeps Slack on the legacy un-suffixed key so deploying cannot re-notify', async () => {
+    // Items notified before per-channel claims hold a claim under the old key.
+    // Suffixing Slack's key would make every one of them look unclaimed and
+    // re-deliver "your feature shipped!" on the next replay.
+    userDb.getUserByEmail.mockResolvedValue({ userId: 'u1', slackChannels: ['C1'] });
+    await notifyReporterShipped(base);
+    expect(settingsService.claimSetMember).toHaveBeenCalledWith('ship-notify:post-1', 'u@e.com');
   });
 
   it('releases the claim only when every channel failed', async () => {
@@ -131,14 +162,27 @@ describe('Slack and WhatsApp as peers', () => {
     expect(settingsService.releaseSetMember).toHaveBeenCalledWith('ship-notify:post-1', 'u@e.com');
   });
 
-  it('takes exactly one claim regardless of channel count', async () => {
+  it('takes one claim per channel, under distinct keys', async () => {
     userDb.getUserByEmail.mockResolvedValue({
       userId: 'u1',
       slackChannels: ['C1'],
       messagingChannels: [WA],
     });
     await notifyReporterShipped(base);
-    expect(settingsService.claimSetMember).toHaveBeenCalledTimes(1);
+    const keys = settingsService.claimSetMember.mock.calls.map((c: any[]) => c[0]);
+    expect(keys).toEqual(['ship-notify:post-1', 'ship-notify:post-1:whatsapp']);
+  });
+
+  it('reports already_sent when every channel was claimed by a prior delivery', async () => {
+    userDb.getUserByEmail.mockResolvedValue({
+      userId: 'u1',
+      slackChannels: ['C1'],
+      messagingChannels: [WA],
+    });
+    settingsService.claimSetMember.mockResolvedValue(false);
+    await expect(notifyReporterShipped(base)).resolves.toBe('already_sent');
+    expect(postSlackMessage).not.toHaveBeenCalled();
+    expect(whatsapp.sendMessage).not.toHaveBeenCalled();
   });
 
   it('honors the ship-notify opt-out for every channel, not just Slack', async () => {

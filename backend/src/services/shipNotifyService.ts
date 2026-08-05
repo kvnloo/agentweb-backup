@@ -47,7 +47,22 @@ export interface ShipNotifyParams {
   kind: 'feature_request' | 'bug';
 }
 
-const markerKey = (itemId: string) => `ship-notify:${itemId}`;
+/**
+ * Idempotency marker, scoped PER CHANNEL.
+ *
+ * It used to be one marker per reporter. That silently dropped a channel: when Slack
+ * succeeded and WhatsApp failed transiently, the reporter-level claim stayed consumed,
+ * so the webhook retry returned 'already_sent' and WhatsApp never got the message.
+ * Per-channel claims give exactly-once per channel AND let a retry re-attempt only the
+ * channel that failed.
+ *
+ * Slack deliberately keeps the LEGACY un-suffixed key. Items already notified before
+ * this change hold a claim under that key, and moving Slack to a suffixed key would
+ * make every one of them look unclaimed — re-delivering "your feature shipped!" to
+ * customers on the next webhook replay. WhatsApp is new, so it has no such history.
+ */
+const markerKey = (itemId: string, channel: MessagingChannel) =>
+  channel === 'slack' ? `ship-notify:${itemId}` : `ship-notify:${itemId}:${channel}`;
 
 /** Only plain http(s) URLs with no Slack control chars make it into the message. */
 const safeUrl = (url?: string) => (url && /^https?:\/\/[^\s<>|]+$/.test(url) ? url : undefined);
@@ -75,11 +90,6 @@ export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNo
     }
     if (targets.length === 0) return 'no_channel';
 
-    // Claim BEFORE the send: exactly one winner per item × reporter, even across
-    // concurrent deliveries / replays. Losing the claim means someone else sent it.
-    const claimed = await settingsService.claimSetMember(markerKey(p.itemId), p.email);
-    if (!claimed) return 'already_sent';
-
     const url = safeUrl(p.url);
     // Greet by first name so the message is addressed to the requester, not the room —
     // customer channels are shared. (A real <@mention> needs the users:read.email bot
@@ -87,7 +97,31 @@ export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNo
     const firstName = (user.displayName || '').trim().split(/\s+/)[0];
 
     let anySent = false;
+    let anyAttempted = false;
     for (const target of targets) {
+      // Claim per channel BEFORE the send: exactly one winner per item × reporter ×
+      // channel, even across concurrent deliveries and replays. Losing the claim means
+      // this channel already went out — skip it, but keep going, because a sibling
+      // channel may still be owed the message.
+      const key = markerKey(p.itemId, target.channel);
+      let claimed = false;
+      try {
+        claimed = await settingsService.claimSetMember(key, p.email);
+      } catch (ce) {
+        // A claim that ERRORS is not a claim that was already taken. We cannot
+        // establish idempotency, so we skip the send (no ping beats a maybe-duplicate)
+        // but must report failure — reporting 'already_sent' here would assert
+        // something we do not know and would suppress the retry that fixes it.
+        console.warn(
+          `[ship-notify] claim for ${target.channel} failed:`,
+          ce instanceof Error ? ce.message : ce,
+        );
+        anyAttempted = true;
+        continue;
+      }
+      if (!claimed) continue;
+      anyAttempted = true;
+
       // Titles are user-generated — anyone can author a public Featurebase post — so
       // they are escaped per channel. On Slack that stops a title smuggling a
       // <!channel> broadcast or a <url|label> disguised link into a shared customer
@@ -116,22 +150,23 @@ export async function notifyReporterShipped(p: ShipNotifyParams): Promise<ShipNo
           `[ship-notify] ${target.channel} send to ${target.destination} for ${p.email} failed:`,
           e instanceof Error ? e.message : e,
         );
+        // Release only THIS channel's claim so a retry re-attempts it alone. A sibling
+        // channel that already landed keeps its own claim and is not re-delivered.
+        // A failed release costs a missed ping, never a duplicate — and email, which
+        // has already gone out, is unaffected either way.
+        try {
+          await settingsService.releaseSetMember(key, p.email);
+        } catch (re) {
+          console.warn('[ship-notify] claim release failed:', re instanceof Error ? re.message : re);
+        }
       }
     }
 
-    if (!anySent) {
-      // Release the claim so a delivery retry can re-attempt. Released only when NO
-      // channel landed — releasing because one of two failed would re-deliver the one
-      // that succeeded. Release failing too just costs a missed ping (never a
-      // duplicate) — the email baseline is unaffected either way.
-      try {
-        await settingsService.releaseSetMember(markerKey(p.itemId), p.email);
-      } catch (re) {
-        console.warn('[ship-notify] claim release failed:', re instanceof Error ? re.message : re);
-      }
-      return 'failed';
-    }
-    return 'sent';
+    if (anySent) return 'sent';
+    // Nothing was even attempted: every channel was already claimed by a previous
+    // delivery. That is the replay case, not a failure.
+    if (!anyAttempted) return 'already_sent';
+    return 'failed';
   } catch (e) {
     console.warn(`[ship-notify] notifying ${p.email} failed:`, e instanceof Error ? e.message : e);
     return 'failed';
