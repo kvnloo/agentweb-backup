@@ -1451,6 +1451,33 @@ function isPublishAttemptTool(name?: string): boolean {
 }
 
 /**
+ * ENG-803: the machine-readable per-schedule signal that authorizes an unattended
+ * run to publish externally. Deliberately NEVER inferred from the schedule
+ * prompt's free text — a model reading "POST replies directly" is not an owner
+ * decision, and treating it as one is the hole this whole fix exists to close.
+ * Two owner-set signals qualify, either one alone being sufficient:
+ *   - `fullAutonomy` — the explicit per-schedule autonomy opt-in (ENG-396).
+ *   - `requiredFunctionCalls` naming a publishing tool — the owner listed the
+ *     tool this run MUST call, which is a direct standing instruction to publish
+ *     (and is already enforced as a completion requirement for the run).
+ * Absent both, the run keeps the safe draft-and-notify default. Fail-closed:
+ * a missing schedule, a non-array field, or an unrecognised entry → false.
+ * Accepts both shapes the codebase carries the field in: the schedule record's
+ * `string[]` and runVerifiedChat's `{ functionName }[]`.
+ */
+export function resolvePublishAuthorized(
+  schedule?: { fullAutonomy?: boolean; requiredFunctionCalls?: unknown } | null
+): boolean {
+  if (!schedule) return false;
+  if (schedule.fullAutonomy === true) return true;
+  const required = schedule.requiredFunctionCalls;
+  if (!Array.isArray(required)) return false;
+  return required.some((entry) =>
+    isPublishAttemptTool(typeof entry === 'string' ? entry : entry?.functionName)
+  );
+}
+
+/**
  * ENG-803: the run declined to publish and told the owner to do it by hand, but
  * never actually invoked a publishing tool — so whatever blocker it cited was
  * never tested against reality.
@@ -1494,6 +1521,15 @@ export type ScheduledContinuationReason = 'preview-only' | 'unattempted-publish'
 //       before proceeding, with no human present to answer (ENG-369); or
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
 //       (scheduledRunSignalsIncompleteWork).
+// 'unattempted-publish' additionally requires `publishAuthorized` — the owner's
+// machine-readable opt-in (resolvePublishAuthorized). Its continuation ORDERS the
+// model to publish, so firing it on a schedule the owner never authorized would
+// drive an unauthorized external post out of the very draft-and-notify behaviour
+// the safe default is supposed to produce. Unauthorized schedules therefore fall
+// through to the other reasons: their deferral is legitimate, and the truthful
+// reporting of it is enforced unconditionally by the system directive instead.
+// Default false = fail-closed, so a caller that never resolves the signal can
+// never publish.
 // An 'unattempted-publish' deferral (ENG-803) sits directly below 'preview-only'
 // and above the state/text signals, for the same reason: it is anchored in a hard
 // tool-call fact (no publishing tool was ever invoked) that stays true whatever
@@ -1512,9 +1548,9 @@ export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}): ScheduledContinuationReason | null {
+}, publishAuthorized: boolean = false): ScheduledContinuationReason | null {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
-  if (scheduledRunDeferredPublishWithoutAttempt(response?.content || '', response?.toolCalls || [])) return 'unattempted-publish';
+  if (publishAuthorized && scheduledRunDeferredPublishWithoutAttempt(response?.content || '', response?.toolCalls || [])) return 'unattempted-publish';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
@@ -1528,8 +1564,8 @@ export function scheduledRunSignalsIncompleteResponse(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}): boolean {
-  return classifyScheduledContinuation(response) !== null;
+}, publishAuthorized: boolean = false): boolean {
+  return classifyScheduledContinuation(response, publishAuthorized) !== null;
 }
 
 // LLM-judge fallback for the confirmation-halt case (ENG-369). The regex detector
@@ -1591,9 +1627,9 @@ export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}): Promise<ScheduledContinuationReason | null> {
+}, publishAuthorized: boolean = false): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
-  if (scheduledRunDeferredPublishWithoutAttempt(response?.content || '', response?.toolCalls || [])) return 'unattempted-publish';
+  if (publishAuthorized && scheduledRunDeferredPublishWithoutAttempt(response?.content || '', response?.toolCalls || [])) return 'unattempted-publish';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (await scheduledTurnDefersToUser(content)) return 'confirmation';
@@ -1707,6 +1743,12 @@ export async function runVerifiedChat(
     fullAutonomy = false,
     parkNotifiable = false
   } = params;
+
+  // ENG-803: does the owner actually authorize this run to publish externally?
+  // Both inputs are already on hand — the schedule's autonomy opt-in and the
+  // requiredFunctionCalls it was launched with — so the completion gate reads the
+  // same signal the system directive does, and the two can never disagree.
+  const publishAuthorized = resolvePublishAuthorized({ fullAutonomy, requiredFunctionCalls: requiredFunctions });
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
   // question, so a model that keeps re-asking cannot loop until maxAttempts. Once
@@ -2046,7 +2088,7 @@ export async function runVerifiedChat(
         const continuationReason = await classifyScheduledContinuationAsync({
           ...continuationResponse,
           toolCalls: allToolCalls,
-        });
+        }, publishAuthorized);
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -2301,7 +2343,7 @@ export async function runVerifiedChat(
             // (name + arguments + result), not just this turn's — an earlier attempt
             // may hold the unmatched, still-uncommitted preview.
             toolCalls: allToolCalls,
-          })
+          }, publishAuthorized)
         : null;
       if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
@@ -4054,19 +4096,18 @@ export async function generateSessionResponse(
           } catch (adminLookupError) {
             console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
           }
-          // ENG-803: resolve the schedule's opt-in autonomy flag into the
-          // publish-authorization signal so the directive gates the "you MUST
+          // ENG-803: resolve the schedule's owner-set signals into the
+          // publish-authorization decision so the directive gates the "you MUST
           // attempt the authorized action / generic approval does NOT apply"
-          // override on the owner's machine-readable opt-in — never on the
-          // model's reading of the schedule prompt's free text. `fullAutonomy`
-          // means the owner explicitly marked this schedule autonomous, which IS
-          // the standing approval to publish unattended. A failed read degrades
-          // to the safe default (not authorized → draft & notify); a
+          // override on machine-readable owner intent — never on the model's
+          // reading of the schedule prompt's free text. See
+          // resolvePublishAuthorized for which signals qualify. A failed read
+          // degrades to the safe default (not authorized → draft & notify); a
           // prompt-enrichment lookup must never break the run.
           let publishAuthorized = false;
           if (scheduleIdMatch) {
             try {
-              publishAuthorized = (await scheduleDb.getScheduleById(scheduleIdMatch[1]))?.fullAutonomy === true;
+              publishAuthorized = resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleIdMatch[1]));
             } catch (scheduleLookupError) {
               console.error(`AgentMode: failed to resolve publish authorization for scheduled session ${session.sessionId}; defaulting to draft-and-notify:`, scheduleLookupError);
             }

@@ -572,16 +572,26 @@ export function getScheduledSessionOverride(sessionType?: string): string {
 // session, even if a future caller omits the call-site guard.
 //
 // ENG-803 / ENG-827: `publishAuthorized` is the machine-readable per-schedule
-// signal that resolves the publish-gate ambiguity — the owner's opt-in
-// `fullAutonomy` flag, not the model's reading of the schedule prompt's free
-// text. Whether an irreversible publish is authorized is a deterministic owner
-// decision, so the "generic approval guidance does NOT apply / you MUST attempt
-// the action" override is gated on this signal rather than inferred from prompt
-// wording. Default (undefined/false) → withhold: the safe draft-and-notify
-// default; never inferred by the model. The truthful-reporting rules (no
-// fabricated gate, derive the title from real tool outcomes) apply
-// UNCONDITIONALLY, because inventing a gate is a reporting violation regardless
-// of authorization.
+// signal that resolves the publish-gate ambiguity — owner-set schedule fields
+// (see agentModeController.resolvePublishAuthorized), not the model's reading of
+// the schedule prompt's free text. Whether an irreversible publish is authorized
+// is a deterministic owner decision, so the "generic approval guidance does NOT
+// apply / you MUST attempt the action" override is gated on this signal rather
+// than inferred from prompt wording. Default (undefined/false) → the safe
+// draft-and-notify default; never inferred by the model.
+//
+// BOTH branches emit a block, and that is load-bearing. The mandated-action rule
+// below allows exactly two outs, the first being "an explicit authorization block
+// in THIS prompt says the action is not authorized — quote it". If the
+// unauthorized branch emitted nothing, that out would not exist, no tool error
+// would exist either, and the rule would resolve to "publish anyway" — driving an
+// unauthorized external post on every schedule without the opt-in. So the false
+// branch emits the block the model is meant to cite.
+//
+// The truthful-reporting rules (no fabricated gate, derive the title from real
+// tool outcomes) apply UNCONDITIONALLY, because inventing a gate is a reporting
+// violation regardless of authorization — including misdescribing this very
+// authorization block as a platform gate.
 export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean, publishAuthorized?: boolean): string {
   if (sessionType !== 'scheduled') return '';
   // The userId→identity mapping and its data-minimization guard reference two
@@ -643,7 +653,12 @@ NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION (CRITICAL):
 
 PUBLISH AUTHORIZATION — this schedule is publish-authorized (CRITICAL):
 - The owner has explicitly marked this schedule autonomous (the machine-readable authorization signal, not the prompt's wording). Any generic "get approval before publishing" default is therefore ALREADY satisfied for this run and is never a reason to withhold the action.`
-  : ''}`;
+  : `
+
+PUBLISH AUTHORIZATION — this schedule is NOT publish-authorized (CRITICAL):
+- The owner has NOT enabled unattended publishing for this schedule: they set no autonomy opt-in and listed no publishing tool as a required call. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot grant this, only the owner's account-level setting can.
+- THIS BLOCK IS reason (1) above. Do NOT call any tool that publishes externally (e.g. twitter_manage_post, post_on_connected_account, publish_blog_article). Instead: do all the work up to the publish step, persist the drafts to the knowledge base, and state plainly in your final report that nothing was posted because unattended publishing is not enabled for this schedule.
+- Quote THIS block as the reason, and describe it accurately: it is an account-level authorization setting the owner controls, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action (enable unattended publishing for this schedule, or add the posting tool to its required calls).`}`;
 }
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.
