@@ -30,7 +30,7 @@ import {
   assembleFromBranch, prepareWorktreeDeps, detectChangedRepos, pushChanged, unpushedRepos, countCommits, ensureProxy,
   headShas, resetTo, ensureOpenPrs, touchedPreviewFiles, commitsDropped, assigneeBranchPrefix, kebab,
 } from '../autofix.mjs';
-import { atConcurrentPreviewCap, runningPreviewIds } from '../preview/policy.mjs';
+import { atConcurrentPreviewCap, runningPreviewIds, availMemMB } from '../preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BASE = path.resolve(__dirname, '..');            // .linear-autofix/
@@ -649,7 +649,7 @@ function chatArgs(cap, sessionId, modelOverride) {
     // resumed sessions too). Full-access only: read-only turns can't run curl/git-writes anyway. Constant
     // text → prompt cache stays warm across turns. safetyPrompt keeps the agent inside its worktree (it
     // once escaped into the main checkout and switched the repo's branch).
-    const appends = [CHAT.capabilityPrompt, CHAT.safetyPrompt, CHAT.watchPrompt].filter(Boolean);
+    const appends = [CHAT.capabilityPrompt, CHAT.safetyPrompt, CHAT.watchPrompt, CHAT.resourcePrompt].filter(Boolean);
     if (appends.length) a.push('--append-system-prompt', appends.join('\n\n'));
   }
   // Deny only the reference-heavy skills (config.chat.skillDenylist) so they can't auto-load into a
@@ -2053,10 +2053,11 @@ for (const sig of ['SIGTERM', 'SIGINT']) {
 // this in-server tick re-invokes it every cadence until it finishes (or hits the cap). Memory-gated and
 // strictly one-at-a-time, so N concurrent watched PRs can never stampede the box. Watches live in
 // state.json, so a server restart transparently resumes them.
-function availMemMB() {
-  try { const m = readFileSync('/proc/meminfo', 'utf8').match(/^MemAvailable:\s+(\d+)\s+kB/m); return m ? Math.round(+m[1] / 1024) : null; }
-  catch { return null; }
-}
+// availMemMB is imported from preview/policy.mjs (not a local /proc/meminfo read) so this gate sees the
+// same number the preview reap does: the tightest of the HOST's MemAvailable and the headroom left in
+// the capped cgroups we run inside. A host-only read made this gate unreachable — on 2026-08-05 the host
+// showed 16-20GB free while this very service was being killed for hitting its own 12G ceiling, so the
+// watch loop kept firing new turns into a cgroup that had nothing left to give.
 const WATCH_CONTINUE_MSG = (goal) => [
   '**Background wake-up.** You earlier registered a watch and are being automatically re-invoked to continue it — this entire conversation is intact, so pick up exactly where you left off.',
   `Your goal / what you are waiting for: ${goal}`,

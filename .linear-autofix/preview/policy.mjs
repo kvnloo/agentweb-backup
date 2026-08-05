@@ -12,8 +12,10 @@ import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { config } from '../config.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CGROUP_ROOT = '/sys/fs/cgroup';
 const STATE = path.join(__dirname, 'preview-state.json');       // bug -> { at, urls, ... }   (preview.mjs)
 const ACCESS = path.join(__dirname, 'preview-access.json');     // bug -> last URL-open ISO   (proxy.mjs)
 const CHAT_STATE = path.join(__dirname, '..', 'chat', 'chat-state.json'); // IDENT -> { messages: [{at}] }
@@ -113,13 +115,52 @@ export function evictIdlePreviews(maxIdleMs, log = () => {}) {
   return evicted;
 }
 
-// Available memory (MB) from /proc/meminfo's MemAvailable — the kernel's own estimate of what a new
-// workload could claim without swapping (accounts for reclaimable cache), so a truer pressure signal
-// than `free`. Returns null if unreadable, so callers treat "unknown" as "no pressure" (never evict
-// blindly). `now`-free and injectable for tests.
-export function availMemMB(read = () => readFileSync('/proc/meminfo', 'utf8')) {
-  try { const m = read().match(/^MemAvailable:\s+(\d+)\s+kB/m); return m ? Math.round(+m[1] / 1024) : null; }
-  catch { return null; }
+// Headroom (MB) left inside one cgroup-v2 memory budget: its effective ceiling minus current usage.
+// The ceiling is MemoryHigh when set, else MemoryMax — MemoryHigh is the number that bites first, since
+// crossing it makes the kernel throttle and reclaim inside the cgroup rather than hand out more memory.
+// "max" (uncapped) or an unreadable/cgroup-v1 path → null = "unknown", so callers never invent pressure.
+export function cgroupHeadroomMB(rel, read = (r, f) => readFileSync(path.join(CGROUP_ROOT, r, f), 'utf8')) {
+  const num = (f) => {
+    try { const v = String(read(rel, f)).trim(); return v === 'max' ? Infinity : (/^\d+$/.test(v) ? +v : null); }
+    catch { return null; }
+  };
+  const current = num('memory.current');
+  if (current == null || current === Infinity) return null;
+  const ceiling = Math.min(num('memory.high') ?? Infinity, num('memory.max') ?? Infinity);
+  if (!Number.isFinite(ceiling)) return null;                 // uncapped cgroup → the host reading governs
+  return Math.max(0, Math.round((ceiling - current) / (1024 * 1024)));
+}
+
+// Available memory (MB): the TIGHTEST budget we actually live under — the host's MemAvailable AND the
+// headroom left in every managed cgroup we run inside (config.memoryCgroups).
+//
+// The host part is /proc/meminfo's MemAvailable, the kernel's own estimate of what a new workload could
+// claim without swapping (accounts for reclaimable cache), so a truer signal than `free`.
+//
+// The cgroup part was added 2026-08-05, after autofix-chat.service was OOM-killed four times in 56
+// minutes while this function cheerfully reported 16-20GB free. It was reading the 31G HOST; the wall we
+// were hitting was the unit's 12G MemoryHigh. Every consumer of this number — previewMemFloorMB's reap,
+// chat.watch.minMemMB's deferral — was therefore a dead control that could never fire, and the first
+// thing to notice the ceiling was systemd killing the unit and 297 processes with it. Previews and heavy
+// builds land in EITHER cgroup depending on who started them (chat server → system.slice, cron/SSH →
+// user-1000.slice), and both are capped, so we report the minimum across both: either one hitting its
+// wall is a real failure, and the reap frees whichever it belongs to.
+//
+// Returns null only when nothing at all is readable — callers keep treating "unknown" as "no pressure"
+// and never evict blindly. Everything injectable for tests.
+export function availMemMB({
+  meminfo = () => readFileSync('/proc/meminfo', 'utf8'),
+  cgroups = config.memoryCgroups ?? [],
+  readCgroup = undefined,
+} = {}) {
+  const readings = [];
+  try { const m = meminfo().match(/^MemAvailable:\s+(\d+)\s+kB/m); if (m) readings.push(Math.round(+m[1] / 1024)); }
+  catch { /* unreadable /proc → fall through to the cgroup readings */ }
+  for (const rel of cgroups) {
+    const h = readCgroup ? cgroupHeadroomMB(rel, readCgroup) : cgroupHeadroomMB(rel);
+    if (h != null) readings.push(h);
+  }
+  return readings.length ? Math.min(...readings) : null;
 }
 
 // Pure OOM-eviction decision: given the current memory reading and preview state, which bugs should be

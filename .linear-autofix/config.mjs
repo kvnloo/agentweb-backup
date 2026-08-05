@@ -174,10 +174,21 @@ export const config = {
   previewIdleHours: 24,            // gc.mjs stops any preview untouched this long — same "last hit" signal
                                    // as the cap eviction (URL last opened, bring-up time, or chat activity),
                                    // so an actively-used preview is never reaped. Set 0 to disable.
-  previewMemFloorMB: 3500,         // OOM backstop (gc.mjs): when MemAvailable drops below this, stop the
+  previewMemFloorMB: 3500,         // OOM backstop (gc.mjs): when available memory drops below this, stop the
                                    // longest-idle preview stack(s) NOW — regardless of Linear status or the
                                    // 24h idle age — since a few live stacks exhaust RAM long before 24h.
                                    // Matches the watch loop's memory gate (chat.watch.minMemMB). 0 disables.
+  memoryCgroups: [                 // cgroups whose remaining headroom counts as "available memory", alongside
+                                   // the host's MemAvailable — see availMemMB() in preview/policy.mjs. Both of
+                                   // these carry a MemoryHigh/MemoryMax cap (/etc/systemd/system/*/10-memory.conf),
+                                   // and work lands in one or the other depending on WHO started it, so we take
+                                   // the tightest of the two. Without this the floor above was unreachable: on
+                                   // 2026-08-05 the host showed 16-20GB free while autofix-chat.service was
+                                   // killed four times in 56 minutes for hitting its own 12G ceiling.
+                                   // [] = host-only reading (correct on an uncapped box).
+    'system.slice/autofix-chat.service',  // chat server, every claude turn + MCP server, chat-started previews
+    'user.slice/user-1000.slice',         // cron autofix cycles (run.sh → autofix.mjs → tsc), SSH, their previews
+  ],
   previewMemKeep: 1,               // never let the memory-pressure reap drop below this many live previews.
   previewMemMinIdleMinutes: 10,    // and never let it stop a preview touched within this window (a human
                                    // actively opening its URL / chatting on it), even under pressure.
@@ -335,6 +346,23 @@ export const config = {
       'its routes, so restarting it only breaks things). If anything OUTSIDE your worktree looks broken, ' +
       'REPORT it and stop — do not try to fix it. Escaping your assigned repo can corrupt the shared repo ' +
       'and take down the whole system for everyone.',
+    // Resource rule, also pinned to the SYSTEM prompt (compaction-proof) on every full turn. Added
+    // 2026-08-05: autofix-chat.service was OOM-killed FOUR times in 56 minutes, each kill taking every
+    // in-flight turn with it. The trigger was an agent running `tsc --noEmit` with a 6GB heap by hand
+    // (3.2GB resident) next to another agent's `vite build` (1.3GB), on top of the live preview stacks —
+    // all inside ONE capped cgroup. The pipeline's own checks never do this: autofix.mjs already runs
+    // tsc under `flock /tmp/aw-heavy-build.lock` with NODE_OPTIONS=--max-old-space-size=4096. Agents
+    // typing the command themselves bypassed both, so the discipline has to be stated to them.
+    resourcePrompt:
+      'RESOURCES — serialize heavy builds. A type-check, bundler build or test run (`tsc --noEmit`, ' +
+      '`vite build`, `jest`) each peaks at 1-4GB, and every worktree on this box shares ONE ' +
+      'memory-capped cgroup with the chat server and all other in-flight turns. Two of them at once is ' +
+      'what OOMs the box and kills everyone\'s work mid-turn (it happened four times on 2026-08-05). So ' +
+      'never run one bare: wrap it in the machine-wide build lock with a bounded heap — ' +
+      '`NODE_OPTIONS=--max-old-space-size=4096 flock /tmp/aw-heavy-build.lock <command>`. flock simply ' +
+      'waits its turn, it does not fail, so this is always safe to add. The autofix pipeline runs its ' +
+      'own tsc/jest exactly this way — match it. Also scope the command: type-check or test only the ' +
+      'package you actually changed, never the whole repo, and never raise the heap above 4096.',
     // Autonomous background "watch": a chat has NO free-running execution between turns (each `claude -p`
     // exits when the turn ends). So a task that must WAIT for something (CI to finish, a PR to become
     // mergeable) can't be done in one turn. Instead the agent ends a waiting turn with a `[[WATCH: …]]`
