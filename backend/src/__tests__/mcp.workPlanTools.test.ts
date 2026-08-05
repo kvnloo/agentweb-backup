@@ -919,6 +919,68 @@ describe('Predefined Work Plan MCP Tools', () => {
         expect(body.steps[0].description).toBe('first review');
       });
 
+      // Third Greptile round on PR #2269, and the structural one. The preflight
+      // resolved titles against the plan as READ, but application resolved them
+      // against the array as it was being mutated. One request could therefore
+      // rename a step and then, with an already-validated later entry, fail to
+      // find it — turning an amendment into an append.
+      it('refuses two entries that resolve to the same step, instead of letting one undo the other', async () => {
+        mockMcpFetch.mockImplementation(async (opts: any) =>
+          opts.method === 'GET'
+            ? { planId: 'wp-1', steps: [
+                { stepCount: 1, title: 'Alpha', description: 'a' },
+                { stepCount: 2, title: 'Beta', description: 'b' },
+              ] }
+            : { planId: 'wp-1' }
+        );
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [
+            { stepCount: 1, title: 'Renamed' },
+            { title: 'Alpha', description: 'also me' },
+          ],
+        }, context);
+
+        // Applying both in array order would let the second entry's title put
+        // 'Alpha' back, silently undoing the rename. Under the previous
+        // mutating resolution it instead appended a spurious third step.
+        expect(putCalls()).toHaveLength(0);
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload.error).toMatch(/resolves to the same existing step/i);
+        expect(payload.conflictingSteps).toEqual([
+          { stepCount: 1, title: 'Alpha', entries: 2 },
+        ]);
+      });
+
+      it('gives the same result whichever order the entries arrive in', async () => {
+        mockMcpFetch.mockImplementation(async (opts: any) =>
+          opts.method === 'GET'
+            ? { planId: 'wp-1', steps: [
+                { stepCount: 1, title: 'Alpha', description: 'a' },
+                { stepCount: 2, title: 'Beta', description: 'b' },
+              ] }
+            : { planId: 'wp-1' }
+        );
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [
+            { title: 'Beta', description: 'beta amended' },
+            { stepCount: 1, title: 'Renamed' },
+          ],
+        }, context);
+
+        const body = (putCalls()[0][0] as any).body;
+        expect(body.steps).toHaveLength(2);
+        expect(body.steps[0].title).toBe('Renamed');
+        expect(body.steps[1].description).toBe('beta amended');
+      });
+
       it('reports a dropped step whose title still exists on another step', async () => {
         mockDuplicateFetches();
 
