@@ -14748,10 +14748,29 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAdCreatives(userId, account_id);
+      case 'GET': {
+        // Read ONE creative back by id (ENG-471). The service method has existed
+        // and is already used by COPY_AD/RETAG_UTM — only the model-facing
+        // contract was missing, so Emma could build a placement-customized
+        // creative and had no way to verify what she had just made.
+        //
+        // Not a thin alias for LIST: LIST is account-wide, capped, and omits
+        // asset_feed_spec, which is exactly the field a faithful clone needs.
+        if (!params.creative_id) {
+          throw new Error('AD_CREATIVE GET requires "params.creative_id" (the creative to read).');
+        }
+        const { accessToken } = await this.getMetaCredentials(userId, account_id);
+        const creative = await metaService.getAdCreative(accessToken, params.creative_id);
+        return {
+          success: true,
+          message: `Fetched ad creative ${params.creative_id}`,
+          creative,
+        };
+      }
       case 'CREATE':
         return this.createMetaAdsAdCreative(userId, { ...params, account_id });
       case 'UPLOAD_IMAGE':
@@ -16513,6 +16532,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'AD_CREATIVE':
         if (action === 'CREATE') {
           MetaService.validateCreativeParams('CREATE', params);
+        } else if (action === 'GET' && !params.creative_id) {
+          // Caught here as well as in the dispatch so the model gets the same
+          // message whichever layer sees it first. A GET with no id must never
+          // fall through to something account-wide.
+          throw new Error('AD_CREATIVE GET requires "params.creative_id".');
         }
         break;
 
