@@ -215,4 +215,48 @@ describeLive('ENG-737 live native gemini adapter', () => {
       expect(typeof choice.message.content).toBe('string');
     }
   });
+
+  it('sanitizes NESTED sub-schemas, not just the top level (ENG-845)', async () => {
+    // `anyOf` is the one composition keyword the genai `Schema` models, so it survives
+    // the allowlist — which makes its members model-facing and means they must be
+    // sanitized too. Confirmed against this API: an unknown keyword nested inside an
+    // `anyOf` member 400s the whole request exactly as a top-level one does —
+    //   Unknown name "contentEncoding" at '...properties[0].value.any_of[0]'
+    // and two levels down, through a member's own `properties` —
+    //   Unknown name "propertyNames" at '...any_of[0].properties[0].value'
+    // Both paths are covered here so the recursion can't silently regress to a
+    // top-level-only filter, which would reopen the zero-assistant-output class.
+    const client = makeClient();
+    const res: any = await client.chat.completions.create({
+      model: MODEL,
+      messages: [{ role: 'user', content: 'Call store_payload with the string payload "v1".' }],
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'store_payload',
+          description: 'Store a payload supplied either as a string or as a structured object',
+          parameters: {
+            type: 'object',
+            properties: {
+              payload: {
+                description: 'Either an encoded string or a structured record.',
+                anyOf: [
+                  { type: 'string', contentEncoding: 'base64', pattern: '^v\\d+$' },
+                  { type: 'object', properties: { id: { type: 'string', propertyNames: { type: 'string' } } } },
+                ],
+              },
+            },
+            required: ['payload'],
+          },
+        },
+      }],
+      tool_choice: 'auto',
+    });
+    const choice = res.choices[0];
+    if (choice.message.tool_calls) {
+      expect(choice.message.tool_calls[0].function.name).toBe('store_payload');
+    } else {
+      expect(typeof choice.message.content).toBe('string');
+    }
+  });
 });
