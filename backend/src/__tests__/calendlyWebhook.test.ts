@@ -29,6 +29,7 @@ const mockCreateLeadList = jest.fn();
 const mockGetLeadByEmail = jest.fn();
 const mockCreateLead = jest.fn();
 const mockUpdateLead = jest.fn();
+const mockGetLeadListById = jest.fn();
 jest.mock('../services/db', () => ({
   userDb: { getUserById: (...a: any[]) => mockGetUserById(...a) },
   crmDb: {
@@ -37,6 +38,7 @@ jest.mock('../services/db', () => ({
     getLeadByEmail: (...a: any[]) => mockGetLeadByEmail(...a),
     createLead: (...a: any[]) => mockCreateLead(...a),
     updateLead: (...a: any[]) => mockUpdateLead(...a),
+    getLeadListById: (...a: any[]) => mockGetLeadListById(...a),
   },
 }));
 
@@ -58,6 +60,13 @@ const mockAutoSyncLead = jest.fn();
 jest.mock('../services/externalCrmSyncService', () => ({
   externalCrmSyncService: {
     autoSyncLead: (...a: any[]) => mockAutoSyncLead(...a),
+  },
+}));
+
+const mockNotifyLeadListOwnerIfConfigured = jest.fn();
+jest.mock('../services/leadListAlertService', () => ({
+  leadListAlertService: {
+    notifyLeadListOwnerIfConfigured: (...a: any[]) => mockNotifyLeadListOwnerIfConfigured(...a),
   },
 }));
 
@@ -150,6 +159,8 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     mockGetLeadListsByUserId.mockResolvedValue([]);
     mockCreateLeadList.mockResolvedValue({ listId: 'list-auto-created' });
     mockUpdateAccountConfig.mockResolvedValue(undefined);
+    mockGetLeadListById.mockResolvedValue({ listId: 'list-1', userId: USER_ID, name: 'Test List', alertEvents: ['api.lead_added', 'api.lead_updated'] });
+    mockNotifyLeadListOwnerIfConfigured.mockResolvedValue(undefined);
   });
 
   it('returns 200 immediately without a signature header, and does not call CAPI', async () => {
@@ -310,6 +321,66 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
 
       expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
       expect(mockCreateLead).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('Lead-added/updated alert (gap 4)', () => {
+    it('fires an api.lead_added alert when a new lead is created', async () => {
+      mockGetLeadByEmail.mockResolvedValue(null);
+      const createdLead = { leadId: 'lead-new', email: 'lead@example.com' };
+      mockCreateLead.mockResolvedValue(createdLead);
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockNotifyLeadListOwnerIfConfigured).toHaveBeenCalledWith(
+        expect.objectContaining({ listId: 'list-1' }),
+        createdLead,
+        'api.lead_added',
+        expect.any(Object),
+        expect.any(String),
+      );
+    });
+
+    it('fires an api.lead_updated alert when an existing lead is updated', async () => {
+      const existingLead = { leadId: 'lead-existing', email: 'lead@example.com', customFields: {} };
+      mockGetLeadByEmail.mockResolvedValue(existingLead);
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockNotifyLeadListOwnerIfConfigured).toHaveBeenCalledWith(
+        expect.objectContaining({ listId: 'list-1' }),
+        existingLead,
+        'api.lead_updated',
+        expect.any(Object),
+        expect.any(String),
+      );
+    });
+
+    it('does not throw and still completes the CRM-forward leg when the alert call fails', async () => {
+      mockNotifyLeadListOwnerIfConfigured.mockRejectedValue(new Error('email service down'));
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockCreateLead).toHaveBeenCalledTimes(1);
+      expect(mockAutoSyncLead).toHaveBeenCalled();
     });
   });
 });
