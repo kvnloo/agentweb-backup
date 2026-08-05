@@ -334,12 +334,12 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
   // waives approval. The toggle is surfaced as governing mid-run questions, so no
   // owner automating a daily post ticks it — authorization has to come from the
   // owner's own configuration, or the fix never fires for a single real schedule.
-  it('AUTHORIZES publishing on the reported shape (required tool + prompt waiver), fullAutonomy OFF', async () => {
+  it('AUTHORIZES publishing when the owner set autopublishAuthorized, fullAutonomy OFF', async () => {
     jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
       scheduleId: SCHEDULE_ID,
       fullAutonomy: false,
       requiredFunctionCalls: ['post_on_connected_account'],
-      startingMessage: 'Post the FULL text automatically. Do not ask for approval.',
+      autopublishAuthorized: true,
     } as any);
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
@@ -404,13 +404,11 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
   // publish tool but never waived approval — the active "LUCAS — LinkedIn Thought
   // Leadership" shape, and 5 of the 8 production publish-requiring schedules — must
   // keep drafting, not silently start publishing to a live account.
-  it('WITHHOLDS when a publish tool is required but the prompt never waives approval', async () => {
+  it('WITHHOLDS when a publish tool is required but no consent flag is set', async () => {
     jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
       scheduleId: SCHEDULE_ID,
       fullAutonomy: false,
       requiredFunctionCalls: ['generate_image', 'post_on_connected_account'],
-      startingMessage:
-        'Generate an image automatically and draft a LinkedIn thought-leadership post.',
     } as any);
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
