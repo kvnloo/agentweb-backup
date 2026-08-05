@@ -726,6 +726,43 @@ export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<stri
 };
 
 /**
+ * Find the user (and the specific connected account) that owns a given Calendly
+ * user_uri. Used by the incoming booking webhook (ENG-524) to resolve who a
+ * delivery belongs to. Matches on user_uri, not organization_uri — the webhook
+ * subscription is created with scope 'user' bound to a specific user_uri, and a
+ * real invitee.created payload carries no organization_uri at all (confirmed via
+ * a live test delivery), so organization_uri isn't usable as an anchor here.
+ * Returns the account alongside the userId (not just the userId, unlike
+ * getUserIdByHubSpotPortalId) since the caller needs config.webhook_signing_key
+ * immediately, and a user could in principle connect multiple Calendly accounts.
+ */
+export const getAccountByCalendlyUserUri = async (
+  userUri: string
+): Promise<{ userId: string; account: ConnectedAccountConfig } | null> => {
+  try {
+    const { userDb } = await import('./db');
+    const users = await userDb.getAllUsers();
+
+    for (const user of users) {
+      // normalizeAccounts (not a direct User.connected_accounts iteration, unlike
+      // getUserIdByHubSpotPortalId above) — db.ts's local connected_accounts type is a
+      // stale, narrower union that was never updated to include 'calendly' (or several
+      // other real platforms), separate from this file's richer ConnectedAccountConfig.
+      const accounts = normalizeAccounts((user as User).connected_accounts);
+      for (const account of accounts) {
+        if (account.platform === 'calendly' && (account.config as CalendlyConfig).user_uri === userUri) {
+          return { userId: user.userId, account };
+        }
+      }
+    }
+    return null;
+  } catch (error) {
+    console.error('Error resolving Calendly user_uri to account:', error);
+    return null;
+  }
+};
+
+/**
  * Check if an account token is still valid
  * First checks expiry timestamp, then verifies via API if not expired
  */
