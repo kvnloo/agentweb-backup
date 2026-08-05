@@ -3290,9 +3290,16 @@ export class AgentModeService {
       // controller persists the incoming user message (bumping updatedAt) and
       // reloads the session BEFORE handing it to this loop, so that gap is
       // always ~0 and the extended TTL would never be requested at all.
-      const idleGapMs = AgentModeService.idleGapBeforeLatestTurnMs(sessionHistory);
+      // STICKY on purpose: any pause in this session, not just the latest one.
+      // Checking only the newest gap leaves the fast->slow transition uncovered
+      // — a turn that followed a quick reply writes a 5-minute cache, and the
+      // user's next pause then expires it. Modelled on the ticket's own session
+      // that costs 7 extra full re-caches and roughly half the saving ($19.25 vs
+      // $12.44). A user who has paused once has shown they are human-paced, and
+      // the measured sessions keep pausing (20 of 33 turns there exceeded 5 min).
+      const longestPauseMs = AgentModeService.longestUserPauseMs(sessionHistory);
       const humanPacedTurn =
-        !isScheduledSession && idleGapMs > PROMPT_CACHE_DEFAULT_TTL_MS;
+        !isScheduledSession && longestPauseMs > PROMPT_CACHE_DEFAULT_TTL_MS;
       // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
       // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
       // human withholding information. The anti-loop remedy cannot satisfy a tool call
@@ -5545,29 +5552,27 @@ export class AgentModeService {
    * one before it. Returns 0 when there is no earlier timestamped message —
    * a first turn has no pause to reward.
    */
-  public static idleGapBeforeLatestTurnMs(history: ReadonlyArray<any> | undefined): number {
+  public static longestUserPauseMs(history: ReadonlyArray<any> | undefined): number {
     if (!Array.isArray(history) || history.length < 2) return 0;
     const stamp = (m: any): number => {
       const raw = m?.timestamp || m?.metadata?.timestamp;
       const t = raw ? Date.parse(raw) : NaN;
       return Number.isFinite(t) ? t : NaN;
     };
-    // Newest user message = the turn being answered now.
-    let latestIdx = -1;
-    for (let i = history.length - 1; i >= 0; i--) {
-      if (history[i]?.role === 'user' && Number.isFinite(stamp(history[i]))) {
-        latestIdx = i;
-        break;
+    let longest = 0;
+    for (let i = 1; i < history.length; i++) {
+      if (history[i]?.role !== 'user') continue;
+      const at = stamp(history[i]);
+      if (!Number.isFinite(at)) continue;
+      for (let j = i - 1; j >= 0; j--) {
+        const prev = stamp(history[j]);
+        if (Number.isFinite(prev)) {
+          longest = Math.max(longest, at - prev);
+          break;
+        }
       }
     }
-    if (latestIdx <= 0) return 0;
-    for (let j = latestIdx - 1; j >= 0; j--) {
-      const prev = stamp(history[j]);
-      if (Number.isFinite(prev)) {
-        return Math.max(0, stamp(history[latestIdx]) - prev);
-      }
-    }
-    return 0;
+    return Math.max(0, longest);
   }
 
   public static diffToolSets(

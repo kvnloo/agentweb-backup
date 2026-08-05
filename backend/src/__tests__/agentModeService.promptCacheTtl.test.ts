@@ -309,7 +309,7 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
     });
   });
 
-  describe('idleGapBeforeLatestTurnMs — the pause that justifies the surcharge', () => {
+  describe('longestUserPauseMs — the pause that justifies the surcharge', () => {
     // REGRESSION GUARD. This was first implemented off `session.updatedAt` and
     // it silently disabled the whole feature: the controller saves the incoming
     // user message (bumping updatedAt) and reloads the session BEFORE the loop
@@ -319,7 +319,7 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
     const at = (iso: string, role: string, extra: any = {}) => ({ role, content: 'x', timestamp: iso, ...extra });
 
     it('measures from the previous message, not from "now"', () => {
-      const gap = AgentModeService.idleGapBeforeLatestTurnMs([
+      const gap = AgentModeService.longestUserPauseMs([
         at('2026-08-05T10:00:00.000Z', 'user'),
         at('2026-08-05T10:00:30.000Z', 'assistant'),
         at('2026-08-05T10:12:00.000Z', 'user'), // user paused 11m30s
@@ -329,7 +329,7 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
 
     it('falls back to the nearest earlier timestamped message', () => {
       // Assistant turns often carry their time on metadata, or not at all.
-      const gap = AgentModeService.idleGapBeforeLatestTurnMs([
+      const gap = AgentModeService.longestUserPauseMs([
         at('2026-08-05T10:00:00.000Z', 'user'),
         { role: 'assistant', content: 'no timestamp' },
         { role: 'tool', content: 'r', metadata: { timestamp: '2026-08-05T10:01:00.000Z' } },
@@ -339,28 +339,41 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
     });
 
     it('returns 0 for a first turn — no pause to reward', () => {
-      expect(AgentModeService.idleGapBeforeLatestTurnMs([at('2026-08-05T10:00:00.000Z', 'user')])).toBe(0);
-      expect(AgentModeService.idleGapBeforeLatestTurnMs([])).toBe(0);
-      expect(AgentModeService.idleGapBeforeLatestTurnMs(undefined)).toBe(0);
+      expect(AgentModeService.longestUserPauseMs([at('2026-08-05T10:00:00.000Z', 'user')])).toBe(0);
+      expect(AgentModeService.longestUserPauseMs([])).toBe(0);
+      expect(AgentModeService.longestUserPauseMs(undefined)).toBe(0);
     });
 
     it('returns 0 rather than NaN when timestamps are missing or unparseable', () => {
       expect(
-        AgentModeService.idleGapBeforeLatestTurnMs([
+        AgentModeService.longestUserPauseMs([
           { role: 'user', content: 'a' },
           { role: 'user', content: 'b' },
         ])
       ).toBe(0);
       expect(
-        AgentModeService.idleGapBeforeLatestTurnMs([
+        AgentModeService.longestUserPauseMs([
           at('nonsense', 'user'),
           at('2026-08-05T10:00:00.000Z', 'user'),
         ])
       ).toBe(0);
     });
 
+    it('is sticky: reports an EARLIER pause even when the latest turn was fast', () => {
+      // Without this, a turn following a quick reply writes a 5-minute cache and
+      // the user's next pause expires it — half the saving, measured.
+      const gap = AgentModeService.longestUserPauseMs([
+        at('2026-08-05T10:00:00.000Z', 'user'),
+        at('2026-08-05T10:00:10.000Z', 'assistant'),
+        at('2026-08-05T10:20:00.000Z', 'user'), // 19m50s pause
+        at('2026-08-05T10:20:05.000Z', 'assistant'),
+        at('2026-08-05T10:20:30.000Z', 'user'), // fast reply now
+      ]);
+      expect(gap).toBeGreaterThan(5 * 60 * 1000);
+    });
+
     it('never returns a negative gap if clocks disagree', () => {
-      const gap = AgentModeService.idleGapBeforeLatestTurnMs([
+      const gap = AgentModeService.longestUserPauseMs([
         at('2026-08-05T10:10:00.000Z', 'user'),
         at('2026-08-05T10:00:00.000Z', 'user'),
       ]);
