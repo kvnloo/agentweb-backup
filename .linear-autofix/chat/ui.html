@@ -739,6 +739,14 @@ async function loadIssues() {
     // Skip DOM churn when nothing changed (also keeps click targets stable).
     const j = JSON.stringify(S.issues) + S.showAll + S.search + S.sel + JSON.stringify(S.filter);
     if (j !== lastIssuesJson) { lastIssuesJson = j; renderIssues(); }
+    // Self-heal a drifted composer: if the server says the OPEN chat has a live turn but our button shows
+    // idle (event stream dropped, an early 'done', or a turn started in another tab), flip to Stop and make
+    // sure the stream is connected so the turn is stoppable and its output shows. Only idle->busy is healed
+    // here; busy->idle is left to the turn's own done/aborted events so we never race an in-flight send.
+    if (S.sel) {
+      const cur = S.issues.find((i) => i.identifier === S.sel);
+      if (cur && cur.chat && cur.chat.busy && !S.busy) { setBusy(true); ensureStream(); }
+    }
   } catch { /* server briefly down */ }
 }
 // A standalone-chat row — same two-line shape/fonts as an ENG card: line 1 is 💬 + title + time + ⋯,
@@ -1355,6 +1363,10 @@ function openEvents(id) {
     handleEvent(e);
   };
 }
+// Reconnect the open chat's event stream only when it's actually dead (CLOSED) or missing — the server
+// replays the current turn on connect, so this is how a self-heal makes a running turn's output reappear.
+// Guarded on readyState so we never orphan a live EventSource (openEvents overwrites S.es).
+function ensureStream() { if (S.sel && (!S.es || S.es.readyState === 2)) openEvents(S.sel); }
 function handleEvent(e) {
   switch (e.type) {
     case 'turn_start': {
@@ -1664,10 +1676,22 @@ async function sendMessage(message, atts = []) {
   });
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
-    addSys('⚠ ' + (err.error || `request failed (${r.status})`), 'err');
     bubble.remove();
-    if (!S.queue.length) { $('input').value = message; autosize(); }
-    setBusy(false);
+    // A 409 "turn already running" is the SERVER reporting a live turn — trust it over our local flag,
+    // which can drift when the event stream drops or a turn was started in another tab. Flip to the Stop
+    // state and make sure the stream is connected so the turn is stoppable and its output resumes, instead
+    // of clearing busy and stranding a Send button with no way to stop (the ENG-915 wedge).
+    const running = r.status === 409 && /turn is (already )?running/i.test(err.error || '');
+    if (running) {
+      setBusy(true);
+      ensureStream();
+      if (!S.queue.length) { $('input').value = message; autosize(); } // keep the text; it queues on the next send
+      addSys('⏳ A turn is already running here — reconnected to it. Your message is back in the box; press Stop to end the turn, or send again to queue it.');
+    } else {
+      addSys('⚠ ' + (err.error || `request failed (${r.status})`), 'err');
+      if (!S.queue.length) { $('input').value = message; autosize(); }
+      setBusy(false);
+    }
   }
 }
 // Upload each picked file to the issue's attachment store; returns [{name, path}] the agent can Read.
@@ -2295,6 +2319,9 @@ try { if (localStorage.getItem('sidePos') === 'right') setSidePos('right'); } ca
 // ---------- boot ----------
 loadIssues();
 setInterval(loadIssues, 30000);
+// Re-poll the moment the tab regains focus so a composer that drifted to a stale Send state (see the
+// self-heal in loadIssues) snaps back to Stop right away instead of waiting up to 30s for the next tick.
+window.addEventListener('focus', loadIssues);
 loadPreviews();                          // running-previews dropdown badge + list
 setInterval(loadPreviews, 30000);
 // Restore the issue named in the URL hash (a refresh, a bookmark, or a shared link), and follow
