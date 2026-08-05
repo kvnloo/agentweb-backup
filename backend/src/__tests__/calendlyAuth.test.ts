@@ -320,4 +320,87 @@ describe('POST /connect', () => {
       .send({ tokenSessionId: fin.body.tokenSessionId });
     expect(res.status).toBe(500);
   });
+
+  // A reconnect (disconnect then re-connect) always attempts to create a fresh webhook
+  // subscription. If a previous connect's subscription is still alive at the same
+  // callback URL, Calendly rejects the create with { title: 'Already Exists' } — a real
+  // incident, previously mislabeled as the plan-tier gate (wrong "upgrade your plan"
+  // message shown to a customer who did nothing wrong).
+  describe('duplicate webhook subscription (reconnect case)', () => {
+    const duplicateError = {
+      response: { status: 409, data: { title: 'Already Exists', message: 'Hook with this url already exists' } },
+    };
+    const staleListResponse = (over: any = {}) => ({
+      data: { collection: [{ uri: 'https://api.calendly.com/webhook_subscriptions/STALE111111111' }], ...over },
+    });
+
+    it('deletes the stale subscription and retries, succeeding with the new one', async () => {
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce(duplicateError); // initial create: rejected as duplicate
+      axios.get.mockResolvedValueOnce(staleListResponse()); // list: finds the stale one
+      axios.delete = jest.fn().mockResolvedValueOnce({ data: {} }); // delete: succeeds
+      axios.post.mockResolvedValueOnce(webhookCreatedResponse({ uri: 'https://api.calendly.com/webhook_subscriptions/FRESH2222222222' })); // retry create: succeeds
+
+      const res = await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.upgradeRequired).toBeUndefined();
+      expect(res.body.account.config.booking_tracking_active).toBe(true);
+      expect(res.body.account.config.webhook_id).toBe('https://api.calendly.com/webhook_subscriptions/FRESH2222222222');
+      expect(axios.delete).toHaveBeenCalledWith(
+        'https://api.calendly.com/webhook_subscriptions/STALE111111111',
+        expect.objectContaining({ headers: expect.objectContaining({ Authorization: expect.stringContaining('Bearer') }) }),
+      );
+    });
+
+    it('falls back to the upgrade-required message when no stale subscription can be found', async () => {
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce(duplicateError);
+      axios.get.mockResolvedValueOnce({ data: { collection: [] } }); // list: nothing found
+
+      const res = await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.upgradeRequired).toBe(true);
+      expect(res.body.account.config.booking_tracking_active).toBe(false);
+    });
+
+    it('falls back to the upgrade-required message when the retry after cleanup also fails', async () => {
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce(duplicateError); // initial create
+      axios.get.mockResolvedValueOnce(staleListResponse()); // list finds stale
+      axios.delete = jest.fn().mockResolvedValueOnce({ data: {} }); // delete succeeds
+      axios.post.mockRejectedValueOnce(new Error('still failing')); // retry create fails
+
+      const res = await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.upgradeRequired).toBe(true);
+      expect(res.body.account.config.booking_tracking_active).toBe(false);
+    });
+
+    // Regression guard: a genuine plan-tier rejection (no `title: 'Already Exists'`) must
+    // NOT be routed through the duplicate-cleanup path — it should hit the original,
+    // simple fallback exactly like the "plan does not support webhooks" test above.
+    it('does not attempt duplicate cleanup for a non-duplicate failure', async () => {
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce({
+        response: { status: 403, data: { message: 'You must be on a paid plan to use this feature.' } },
+      });
+
+      const res = await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.upgradeRequired).toBe(true);
+      expect(axios.get).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ params: expect.anything() }));
+    });
+  });
 });
