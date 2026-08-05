@@ -501,6 +501,7 @@ mcpToolRegistry.register({
         email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
         self_improve: { type: 'boolean', description: 'When true, after each run a reflection turn reviews the result and may automatically refine starting_message so future runs do better. Off by default (create/update).' },
+        autopublish_authorized: { type: 'boolean', description: 'When true, this schedule may PUBLISH to the user\'s live connected accounts during an unattended run without showing them the content first — posts go live automatically and cannot be un-published. Off by default; only set it when the user has explicitly asked for their posts to go out automatically without their review. It only takes effect for the publishing tools listed in required_function_calls (e.g. post_on_connected_account), so set that too. Leave off and each run drafts the content and notifies the owner to approve it (create/update).' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] }, description: 'Variable definitions for the starting message (create/update)' },
         variable_values: { type: 'object', description: 'Initial variable values (create/update)' },
@@ -529,6 +530,7 @@ mcpToolRegistry.register({
         if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
+        if (args.autopublish_authorized !== undefined) body.autopublishAuthorized = args.autopublish_authorized;
         if (args.run_count !== undefined) body.runCount = args.run_count;
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
@@ -552,6 +554,7 @@ mcpToolRegistry.register({
         if (args.email_notifications !== undefined) body.emailNotifications = args.email_notifications;
         if (args.daily_digest !== undefined) body.dailyDigest = args.daily_digest;
         if (args.self_improve !== undefined) body.selfImprove = args.self_improve;
+        if (args.autopublish_authorized !== undefined) body.autopublishAuthorized = args.autopublish_authorized;
         if (args.run_count !== undefined) body.runCount = args.run_count;
         if (args.variables !== undefined) body.variables = args.variables;
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
