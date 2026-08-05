@@ -272,6 +272,11 @@ router.post('/scheduled-chats/:scheduleId/variables', asyncHandler(agentModeCont
 // Test scheduled chat
 router.post('/scheduled-chats/:scheduleId/test', asyncHandler(agentModeController.testScheduledChat));
 
+// POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
+// ENG-827: owner-only grant/revoke of unattended publish consent. Separate from the
+// generic update so the irreversible permission has its own enforceable boundary.
+router.post('/scheduled-chats/:scheduleId/publish-consent', asyncHandler(agentModeController.setScheduledChatPublishConsent));
+
 // PATCH /api/agent-mode/scheduled-chats/:scheduleId/toggle
 // Toggle scheduled chat status (enable/disable)
 router.patch('/scheduled-chats/:scheduleId/toggle', asyncHandler(agentModeController.toggleScheduledChatStatus));

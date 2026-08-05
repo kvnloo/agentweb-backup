@@ -6766,7 +6766,6 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
-        autopublishAuthorized,
         timezone
       } = req.body;
 
@@ -6847,10 +6846,10 @@ export const agentModeController = {
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
         fullAutonomy: fullAutonomy === true,
-        // ENG-827: opt-in authorization to publish to a live connected account in an
-        // unattended run without pre-review. Its own consent control — the required
-        // -function picker is verification, not a waiver. Default off.
-        autopublishAuthorized: autopublishAuthorized === true,
+        // ENG-827: a new schedule NEVER starts with unattended publish consent. It is
+        // granted only through POST .../publish-consent, which enforces the
+        // owner-only boundary that a generic create/update body cannot.
+        autopublishAuthorized: false,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -6976,7 +6975,6 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
-        autopublishAuthorized,
         timezone
       } = req.body;
 
@@ -7049,8 +7047,10 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
-        // ENG-827: opt-in unattended publish authorization. Partial-update safe.
-        autopublishAuthorized: autopublishAuthorized !== undefined ? (autopublishAuthorized === true) : ((existingSchedule as any).autopublishAuthorized || false),
+        // ENG-827: publish consent is NOT settable through the generic update. It is
+        // preserved as-is here and can only be changed via POST .../publish-consent,
+        // so a delegated session or a broad update body can never grant it.
+        autopublishAuthorized: (existingSchedule as any).autopublishAuthorized === true,
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
@@ -7562,6 +7562,84 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Test scheduled chat error:', error);
       res.status(500).json({ error: 'Failed to test scheduled chat' });
+    }
+  },
+
+  /**
+   * POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
+   *
+   * ENG-827: the owner-facing grant/revoke path for unattended publish consent.
+   *
+   * Consent to publish to a live connected account without the owner seeing the
+   * content first is the one irreversible permission on a schedule, so it gets its
+   * own endpoint instead of riding on the generic update. That makes the boundary
+   * explicit and enforceable rather than implicit in a field on a big PUT body:
+   *
+   *   - the caller must be the schedule's OWNER. A delegated admin session acts as
+   *     the customer everywhere else, but it must not be able to hand out this
+   *     permission on their behalf — the whole point is that a specific human
+   *     accepted that posts go out unseen.
+   *   - granting requires the schedule to actually designate a publishing tool.
+   *     Consent with no scope authorizes nothing (see
+   *     resolveSchedulePublishAuthorization), so accepting it would silently do
+   *     nothing while looking like it worked.
+   *   - every grant records who consented and when, so it is auditable later.
+   *
+   * REVOKING is always allowed — it only ever makes runs safer.
+   */
+  async setScheduledChatPublishConsent(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+      const { authorized } = req.body;
+
+      if (typeof authorized !== 'boolean') {
+        return res.status(400).json({ error: 'Invalid body: `authorized` must be a boolean' });
+      }
+
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      // Only the owner may GRANT. A delegated admin can still revoke (safer state).
+      const delegated = (req as any).delegateInfo?.isDelegated === true;
+      if (authorized && delegated) {
+        return res.status(403).json({
+          error:
+            'Publishing without review can only be enabled by the account owner, not from a delegated session. Ask the owner to turn on "Publish without my review" on this schedule.',
+        });
+      }
+
+      if (authorized) {
+        const { tools } = resolveSchedulePublishAuthorization({
+          autopublishAuthorized: true,
+          requiredFunctionCalls: (schedule as any).requiredFunctionCalls,
+        });
+        if (tools.length === 0) {
+          return res.status(400).json({
+            error:
+              'This schedule does not require a publishing tool, so enabling unattended publishing would have no effect. Add the publishing tool (e.g. post_on_connected_account) to the schedule\'s required functions first.',
+          });
+        }
+      }
+
+      await scheduleDb.updateSchedule(scheduleId, {
+        autopublishAuthorized: authorized,
+        autopublishAuthorizedAt: authorized ? new Date().toISOString() : null,
+        autopublishAuthorizedBy: authorized ? user.userId : null,
+        updatedAt: new Date().toISOString(),
+      } as any);
+
+      res.json({
+        autopublishAuthorized: authorized,
+        message: authorized
+          ? 'This schedule will now publish to your connected accounts without showing you the content first.'
+          : 'This schedule will now draft content and notify you for approval instead of publishing.',
+      });
+    } catch (error) {
+      console.error('AgentMode: Set scheduled chat publish consent error:', error);
+      res.status(500).json({ error: 'Failed to update publish consent' });
     }
   },
 
