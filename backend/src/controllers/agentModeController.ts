@@ -18,7 +18,6 @@ import { planScheduledRunResume, isRunFailurePlaceholder } from '../services/age
 import { emitProgress, registerProgressCallback, getLatestProgress, progressStore, requestCancel, clearCancel } from '../utils/sseProgress';
 import { MAX_MESSAGE_SIZE_PER_SESSION } from '../config';
 import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorkerShutdownError } from '../utils/agentModeErrors';
-import { isPublishName } from '../utils/hardeningGaps';
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
@@ -1443,112 +1442,10 @@ export function scheduledRunAwaitsConfirmation(content: string): boolean {
   return AWAITING_CONFIRMATION_PATTERNS.some((re) => re.test(normalized));
 }
 
-// ENG-803: a scheduled run that parks its output for a human to publish. Drawn
-// from the verbatim wording of session 0fe2e743 ("5 queued for manual approval",
-// "the active X publishing gate requires human approval", "I did not auto-post
-// replies"), which the existing confirmation detector scores as null — the run
-// never asks a question, it just declines to act and reports the decline.
-const DEFERRED_PUBLISH_PATTERNS: RegExp[] = [
-  /\b(?:queued|saved|drafted|held|parked)\b[^.\n]{0,60}\bfor\s+(?:manual|human|your)\s+(?:approval|review|sign-?off)/i,
-  /\b(?:pending|awaiting)\s+(?:manual\s+|human\s+|your\s+)?(?:approval|review|sign-?off)/i,
-  /\brequires?\s+(?:human|manual|your)\s+approval/i,
-  /\b(?:publish(?:ing)?|posting|unattended\s+publish)\s+gate\b/i,
-  /\bdid\s+not\s+(?:auto-?)?(?:post|publish|reply)\b/i,
-];
-
-// The tools that actually publish content to an external destination. Reuses the
-// canonical publish set (publish_*, post_on_*) and adds the *_manage_post family
-// — twitter_manage_post is the ONLY way to post a tweet or reply, so a run that
-// never called it demonstrably never attempted to publish. Deliberately EXCLUDES
-// twitter_outreach/linkedin_outreach: those are mixed read/write dispatchers
-// (search_tweets alongside send_dm), so their presence proves nothing either way.
-function isPublishAttemptTool(name?: string): boolean {
-  if (!name || typeof name !== 'string') return false;
-  return isPublishName(name) || /_manage_post$/.test(name);
-}
-
-/**
- * ENG-803: whether an unattended run may publish externally. Deterministic and
- * resolved HERE, never inferred by the model from the schedule prompt's free
- * text — a model reading "POST replies directly" and concluding it is authorized
- * is the hole this fix exists to close.
- *
- * DEFAULT IS AUTHORIZED, and that is deliberate. Scheduled runs have always
- * published; there was never a gate in front of `twitter_manage_post`. ENG-803
- * is a report of the agent INVENTING a restriction, so answering it with a real
- * platform-wide restriction would be the wrong cure: measured against the live
- * table, 25 active schedules are publishing-shaped (4 requiring a publish tool
- * outright, 21 whose prompt tells Emma to post/publish/tweet/reply), and a
- * default-deny would silently convert all of them into drafting-only runs. The
- * fabrication being fixed was 1 failure in 62 scored sessions; trading that for
- * ~25 broken schedules is a strictly worse outcome.
- *
- * So the owner control is an OPT-OUT: `requirePublishApproval === true` means
- * "hold my runs at the publish step and tell me what's waiting". Anything else —
- * false, absent, a legacy row that predates the field — keeps today's behaviour.
- * Because absence means authorized, no backfill is needed and no existing
- * schedule changes behaviour when this ships.
- *
- * Note this is NOT fail-open in the dangerous direction: it preserves an
- * existing capability rather than granting a new one. The model still cannot
- * talk its way into publishing (the value is read off the record, not the
- * prompt), and it still cannot set the value — `requirePublishApproval` is
- * absent from the `manage_scheduled_chat` MCP allowlist, so only a human writes
- * it. A lookup failure resolves to the status quo, not to a new grant.
- *
- * Three signals were tried as an opt-IN and REJECTED — do not reinstate any.
- *
- * `fullAutonomy` (ENG-396) is a DIFFERENT consent: Emma will "proceed with her
- * recommended option" rather than pause when she needs a mid-run decision. That
- * is consent to decide unaided, not to publish under the owner's name.
- *
- * `requiredFunctionCalls` naming a publishing tool is MODEL-WRITABLE — the
- * `manage_scheduled_chat` MCP tool PUTs it onto the schedule record
- * (mcp/server/apiTools.ts), as do admin templates and work-plan steps. Honouring
- * it lets Emma grant herself standing authority to post.
- *
- * The schedule prompt's free text is model-read, never an owner decision.
- *
- * The rule they share: an authorization signal must mean exactly the capability
- * being granted, and must be writable only by a human.
- */
-export function resolvePublishAuthorized(
-  schedule?: { requirePublishApproval?: boolean } | null
-): boolean {
-  return schedule?.requirePublishApproval !== true;
-}
-
-/**
- * ENG-803: the run declined to publish and told the owner to do it by hand, but
- * never actually invoked a publishing tool — so whatever blocker it cited was
- * never tested against reality.
- *
- * The conjunction is what makes this safe. Calling the tool AT ALL clears the
- * gate, error or not:
- *   - a run that published → tool called → never fires;
- *   - a run that hit a GENUINE gate (expired credentials, missing permission)
- *     → tool called, error returned → never fires, and the run correctly reports
- *     the real error;
- *   - only a run asserting a block it never attempted → fires.
- * That is exactly the fabricated-gate case, and nothing else.
- */
-export function scheduledRunDeferredPublishWithoutAttempt(
-  content: string,
-  toolCalls: any[]
-): boolean {
-  if (!content || typeof content !== 'string') return false;
-  const normalized = stripMarkdownEmphasis(content);
-  if (!DEFERRED_PUBLISH_PATTERNS.some((re) => re.test(normalized))) return false;
-  const attempted = (Array.isArray(toolCalls) ? toolCalls : []).some((tc) =>
-    isPublishAttemptTool(tc?.name)
-  );
-  return !attempted;
-}
-
 // The distinct reasons a scheduled run's latest turn needs one more
 // continuation before it can be considered finished. null = no continuation
 // needed. Ordered by precedence when more than one signal is present.
-export type ScheduledContinuationReason = 'preview-only' | 'unattempted-publish' | 'budget' | 'confirmation' | 'unfinished';
+export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmation' | 'unfinished';
 
 // Classify why (if at all) a scheduled run's latest turn needs a continuation:
 //   (a) 'budget' — the run was truncated because it exhausted its step budget
@@ -1562,26 +1459,6 @@ export type ScheduledContinuationReason = 'preview-only' | 'unattempted-publish'
 //       before proceeding, with no human present to answer (ENG-369); or
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
 //       (scheduledRunSignalsIncompleteWork).
-// 'unattempted-publish' additionally requires `publishAuthorized`, resolved from
-// the schedule by resolvePublishAuthorized (authorized unless the owner ticked
-// requirePublishApproval). Its continuation ORDERS the model to publish, so
-// firing it on a schedule whose owner asked to approve first would drive an
-// unwanted external post out of the very draft-and-notify behaviour they chose.
-// The parameter defaults to FALSE here rather than following the schedule
-// default: an unspecified caller has given no schedule to read, and no caller
-// should be able to trigger a publish order by omission. Schedule-driven callers
-// pass the resolved value explicitly. Approval-required schedules therefore fall
-// through to the other reasons: their deferral is legitimate, and the truthful
-// reporting of it is enforced unconditionally by the system directive instead.
-// Default false = fail-closed, so a caller that never resolves the signal can
-// never publish.
-// An 'unattempted-publish' deferral (ENG-803) sits directly below 'preview-only'
-// and above the state/text signals, for the same reason: it is anchored in a hard
-// tool-call fact (no publishing tool was ever invoked) that stays true whatever
-// the closing text said, and its continuation message is more specific than the
-// generic ones — "actually call the posting tool now". Session 0fe2e743 scored
-// null under every reason below it, because the run never asked a question and
-// never admitted unfinished work; it calmly reported a blocker it had invented.
 // A 'preview-only' write-back gap (ENG-518) takes precedence over everything: it
 // is a hard, tool-call-based fact (a list was previewed as enrichable but its
 // execute counterpart never committed it) that stays true whatever the closing
@@ -1593,9 +1470,8 @@ export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}, publishAuthorized: boolean = false): ScheduledContinuationReason | null {
+}): ScheduledContinuationReason | null {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
-  if (publishAuthorized && scheduledRunDeferredPublishWithoutAttempt(response?.content || '', response?.toolCalls || [])) return 'unattempted-publish';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
@@ -1609,8 +1485,8 @@ export function scheduledRunSignalsIncompleteResponse(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}, publishAuthorized: boolean = false): boolean {
-  return classifyScheduledContinuation(response, publishAuthorized) !== null;
+}): boolean {
+  return classifyScheduledContinuation(response) !== null;
 }
 
 // LLM-judge fallback for the confirmation-halt case (ENG-369). The regex detector
@@ -1672,9 +1548,8 @@ export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}, publishAuthorized: boolean = false): Promise<ScheduledContinuationReason | null> {
+}): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
-  if (publishAuthorized && scheduledRunDeferredPublishWithoutAttempt(response?.content || '', response?.toolCalls || [])) return 'unattempted-publish';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   if (await scheduledTurnDefersToUser(content)) return 'confirmation';
@@ -1746,16 +1621,6 @@ export async function runVerifiedChat(
     // for IMMUTABLE questions. This is a deliberate, default-off WAIVER of the
     // human protection on irreversible decisions (owner opted in per-schedule).
     fullAutonomy?: boolean;
-    // ENG-803: the schedule's own unattended-publishing opt-in
-    // (requirePublishApproval), resolved by the caller. Gates the
-    // 'unattempted-publish' continuation, which ORDERS the model to call the
-    // posting tool — firing that on a schedule whose owner asked to approve
-    // publishing first would manufacture an unwanted external post out of the
-    // draft-and-notify behaviour they chose. Deliberately NOT derived from
-    // fullAutonomy: that is consent to decide unaided, not consent to publish.
-    // Defaults false so an unspecified caller never triggers a publish order;
-    // schedule-driven callers pass resolvePublishAuthorized(schedule).
-    publishAuthorized?: boolean;
     // ENG-636: does a PARK on this run actually reach a human? Only true for
     // callers with a notification/answer channel: runScheduledChat (owner email)
     // and the interactive verifiedGenerate endpoint (the live session renders the
@@ -1796,7 +1661,6 @@ export async function runVerifiedChat(
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
-    publishAuthorized = false,
     parkNotifiable = false
   } = params;
 
@@ -2074,17 +1938,6 @@ export async function runVerifiedChat(
               'enrich_leads_execute — deliver that preview report instead.\n' +
               'Then complete the rest of the requested workflow (e.g. recommendations, ' +
               'drafts) and produce the final report.'
-          : completionGateReason === 'unattempted-publish'
-            ? 'Your previous response deferred publishing to a human — it queued or ' +
-              'drafted the output for manual approval, or cited a publishing/approval ' +
-              'gate — but you never actually called the tool that performs the publish ' +
-              '(e.g. twitter_manage_post, post_on_connected_account), so that blocker ' +
-              'was never tested. This is an automated run with no human present: nobody ' +
-              'will approve the queue. Do NOT restate the blocker. Call the publishing ' +
-              'tool now for each item the task asked you to publish, respecting any cap ' +
-              'or eligibility rule the task specified. If a call genuinely fails, report ' +
-              'the tool name and its verbatim error, and only then fall back to saving ' +
-              'the drafts. Never assert a gate you have not actually hit.'
           : completionGateReason === 'budget'
             ? 'The previous run was cut short because it exhausted its processing-step ' +
               'budget before it could produce the final deliverable. Using the data ' +
@@ -2138,7 +1991,7 @@ export async function runVerifiedChat(
         const continuationReason = await classifyScheduledContinuationAsync({
           ...continuationResponse,
           toolCalls: allToolCalls,
-        }, publishAuthorized);
+        });
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -2393,7 +2246,7 @@ export async function runVerifiedChat(
             // (name + arguments + result), not just this turn's — an earlier attempt
             // may hold the unmatched, still-uncommitted preview.
             toolCalls: allToolCalls,
-          }, publishAuthorized)
+          })
         : null;
       if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
@@ -3190,9 +3043,6 @@ export async function runScheduledChat(
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
       fullAutonomy: schedule.fullAutonomy === true,
-      // ENG-803: the schedule's separate unattended-publishing opt-in. Gates the
-      // continuation that orders the posting tool to actually run.
-      publishAuthorized: resolvePublishAuthorized(schedule),
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,
@@ -4152,28 +4002,7 @@ export async function generateSessionResponse(
           } catch (adminLookupError) {
             console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
           }
-          // ENG-803: resolve the schedule's owner-set signals into the
-          // publish-authorization decision so the directive gates the "you MUST
-          // attempt the authorized action / generic approval does NOT apply"
-          // override on machine-readable owner intent — never on the model's
-          // reading of the schedule prompt's free text. See
-          // resolvePublishAuthorized for which signals qualify. A failed read
-          // degrades to the safe default (not authorized → draft & notify); a
-          // prompt-enrichment lookup must never break the run.
-          // Starts TRUE because publishing is the pre-existing behaviour of every
-          // scheduled run; the owner opts OUT via requirePublishApproval. A failed
-          // lookup therefore degrades to the status quo rather than silently
-          // halting publishing for schedules that work today — a prompt-enrichment
-          // read must never change what the run is allowed to do.
-          let publishAuthorized = true;
-          if (scheduleIdMatch) {
-            try {
-              publishAuthorized = resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleIdMatch[1]));
-            } catch (scheduleLookupError) {
-              console.error(`AgentMode: failed to resolve publish approval setting for scheduled session ${session.sessionId}; keeping the existing publish behaviour:`, scheduleLookupError);
-            }
-          }
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, publishAuthorized);
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
@@ -6894,7 +6723,6 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
-        requirePublishApproval,
         timezone
       } = req.body;
 
@@ -6975,12 +6803,6 @@ export const agentModeController = {
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
         fullAutonomy: fullAutonomy === true,
-        // ENG-803: owner opt-OUT holding this schedule's runs at the publish step.
-        // Default false = publish, which is what scheduled runs have always done.
-        // Kept distinct from fullAutonomy (consent to decide unaided is not the
-        // same question) and absent from the manage_scheduled_chat MCP allowlist,
-        // so only the owner can change it.
-        requirePublishApproval: requirePublishApproval === true,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -7106,7 +6928,6 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
-        requirePublishApproval,
         timezone
       } = req.body;
 
@@ -7179,11 +7000,6 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
-        // ENG-803: owner opt-out from unattended publishing. Partial-update safe —
-        // an update that omits it must never silently set or clear it.
-        requirePublishApproval: requirePublishApproval !== undefined
-          ? (requirePublishApproval === true)
-          : ((existingSchedule as any).requirePublishApproval || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),

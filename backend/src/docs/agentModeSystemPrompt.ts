@@ -551,9 +551,38 @@ When you confirm a filed item, share the tracking link from the tool result so t
 
 // Injected at the end of the system prompt when the session is a scheduled automated run.
 // Returns an empty string for non-scheduled sessions.
+//
+// ENG-803 appends two truthful-execution rules here. They live in THIS function,
+// not in getUnattendedExecutionDirective, on purpose: they are about REPORTING
+// and are independent of whether the run is authorized to publish. ENG-827 owns
+// publish authorization and emits its own PUBLISH AUTHORIZATION block from
+// getUnattendedExecutionDirective; these rules deliberately state no
+// authorization of their own, so the two compose in either merge order and
+// neither duplicates nor contradicts the other.
+//
+// ENG-803 deliberately adds NO second publish flag. An earlier revision of this
+// fix carried its own per-schedule authorization signal; it was dropped once
+// ENG-827 (PR #2263) landed `autopublishAuthorized` for the same concept, since
+// two flags governing one irreversible permission is both a merge conflict and a
+// product bug. The reported failure was the agent INVENTING a gate and then
+// titling the run "Replies queued" having posted nothing — a reporting defect,
+// which is what these two rules address. Whether a given schedule may publish is
+// ENG-827's question, answered by its block; rule (1) below defers to it.
 export function getScheduledSessionOverride(sessionType?: string): string {
   if (sessionType !== 'scheduled') return '';
-  return '\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.';
+  return `\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.
+
+NO FABRICATED PLATFORM OR PUBLISH GATE (CRITICAL — Truthful Reporting):
+- Never assert a platform, publishing, permission, or "unattended publish" gate as a fact unless an actual tool call in THIS session returned that gate/permission error. If no tool call returned a gate or permission error, you may NOT claim a gate exists — inventing one to justify skipping a required action is a fabrication and a reporting violation.
+- If, and only if, a tool call genuinely returns a gate/permission/credential error, name the SPECIFIC tool and the verbatim error you received — never a gate you have not actually hit. Then persist the drafts to the knowledge base, save memory, and file a product issue via report_product_issues so the real blocker is surfaced.
+- If this prompt contains an explicit PUBLISH AUTHORIZATION block, describe it accurately as what it is — a setting the owner chose on this schedule — and never as a platform, X/Twitter, API, or credential gate. Restating it as a platform gate is the same fabrication.
+- Derive your title and summary from actual tool-call outcomes. A run that posted nothing must NOT claim replies/posts were "queued", "posted", or "sent" — if nothing was posted, say so plainly and state the reason.
+
+NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION (CRITICAL):
+- When the schedule's instructions direct you to perform an action (post, reply, send, publish, update) and the tool that performs it is available to you, you MUST actually call that tool. Drafting the content and reporting it as "queued", "ready", or "pending approval" is NOT completion — e.g. twitter_manage_post (action "reply") to reply on X, post_on_connected_account to post a new tweet.
+- There are exactly TWO acceptable reasons not to perform a mandated action, and you must cite which one applies: (1) an explicit authorization block in THIS system prompt states the action is not authorized for this run — quote that block; or (2) a tool call you ACTUALLY made returned an error — quote the tool name and its error. Nothing else qualifies.
+- Your own caution is NOT a reason. "This run is scheduled/unattended" is NOT by itself a reason. A generic preference for human approval is NOT a reason. If neither (1) nor (2) applies, perform the action.
+- If (1) or (2) genuinely applies, say plainly that nothing was posted/sent, give that specific reason, persist the drafts, and surface the concrete unblocking action for the owner.`;
 }
 
 // Directive injected for scheduled / automated unattended runs.
@@ -570,47 +599,7 @@ export function getScheduledSessionOverride(sessionType?: string): string {
 // Self-guards on sessionType (like getScheduledSessionOverride) so it is safe to
 // call unconditionally and never leaks the unattended block into a non-scheduled
 // session, even if a future caller omits the call-site guard.
-//
-// ENG-803 / ENG-827: `publishAuthorized` is resolved deterministically from the
-// schedule record (see agentModeController.resolvePublishAuthorized), never from
-// the model's reading of the schedule prompt's free text. It is TRUE by default,
-// because scheduled runs have always published and ENG-803 is a report of the
-// agent inventing a restriction — answering it with a real platform-wide
-// restriction would break the ~25 active schedules that publish today. The owner
-// opts OUT per schedule via requirePublishApproval; only then does the run hold
-// at the publish step.
-//
-// BOTH branches emit a block, and that is load-bearing. The mandated-action rule
-// below allows exactly two outs, the first being "an explicit authorization block
-// in THIS prompt says the action is not authorized — quote it". If the
-// approval-required branch emitted nothing, that out would not exist, no tool
-// error would exist either, and the rule would resolve to "publish anyway" —
-// overriding the owner's explicit request to approve first. So that branch emits
-// the block the model is meant to cite.
-//
-// The truthful-reporting rules (no fabricated gate, derive the title from real
-// tool outcomes) apply UNCONDITIONALLY, because inventing a gate is a reporting
-// violation regardless of authorization — including misdescribing this very
-// authorization block as a platform gate.
-//
-// WHERE THE OWNER FLIPS IT: the approval-required branch tells the owner they can
-// turn OFF "Require approval before publishing", so that control has to exist or
-// the instruction is a dead end. It is the switch in the Customer Portal's
-// schedule form —
-// src/components/agent-mode/schedule/ScheduleFormPanel.tsx in the SEPARATE
-// agentweb-customer-portal repo (PR #1002), which submits the form to
-// POST/PUT /api/agent-mode/scheduled-chats. That is why the control is not
-// greppable from this repo. The half of the path that DOES live here — the two
-// handlers reading `requirePublishApproval` off req.body, coercing it strictly,
-// and preserving it across partial updates — is pinned by
-// agentModeController.publishOptInWritePath.test.ts. Deliberately absent from
-// the manage_scheduled_chat MCP allowlist so only a human can set it
-// (pinned by agentModeController.unattemptedPublishGate.test.ts).
-// `publishAuthorized` defaults to TRUE so an omitted argument matches
-// resolvePublishAuthorized's own default (and the pre-existing product
-// behaviour). A caller that forgets to pass it must not silently halt publishing
-// on schedules that work today.
-export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean, publishAuthorized: boolean = true): string {
+export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean): string {
   if (sessionType !== 'scheduled') return '';
   // The userId→identity mapping and its data-minimization guard reference two
   // admin-only tools (get_chat_history, list_all_clients). Inject this slice
@@ -655,29 +644,7 @@ COMPLETION GATE (before final output):
 - Before producing your final report, run a completion check: verify that every entity has had every required step either completed or explicitly marked blocked-with-reason. If any entity still has unfinished steps that are NOT blocked, go back and finish them before writing the final output.
 
 SURFACE GAPS AS ACTIONABLE ITEMS:
-- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.
-
-NO FABRICATED PLATFORM OR PUBLISH GATE (CRITICAL — Truthful Reporting):
-- Never assert a platform, publishing, permission, or "unattended publish" gate as a fact unless an actual tool call in THIS session returned that gate/permission error. If no tool call returned a gate or permission error, you may NOT claim a gate exists — inventing one to justify skipping a required action is a fabrication and a reporting violation.
-- If, and only if, a tool call genuinely returns a gate/permission/credential error, name the SPECIFIC tool and the verbatim error you received — never a gate you have not actually hit. Then fall back to the good pattern: persist the drafts to the knowledge base, save memory, and file a product issue via report_product_issues so the real blocker is surfaced.
-- Derive your title and summary from actual tool-call outcomes. A run that posted nothing must NOT claim replies/posts were "queued", "posted", or "sent" — if nothing was posted, say so plainly and state the reason.
-
-NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION (CRITICAL):
-- When the schedule's instructions direct you to perform an action (post, reply, send, publish, update) and the tool that performs it is available to you, you MUST actually call that tool. Drafting the content and reporting it as "queued", "ready", or "pending approval" is NOT completion — e.g. twitter_manage_post (action "reply") to reply on X, post_on_connected_account to post a new tweet.
-- There are exactly TWO acceptable reasons not to perform a mandated action, and you must cite which one applies: (1) an explicit authorization block in THIS system prompt states the action is not authorized for this run — quote that block; or (2) a tool call you ACTUALLY made returned an error — quote the tool name and its error. Nothing else qualifies.
-- Your own caution is NOT a reason. "This run is scheduled/unattended" is NOT by itself a reason. A generic preference for human approval is NOT a reason. If neither (1) nor (2) applies, perform the action.
-- If (1) or (2) genuinely applies, say plainly that nothing was posted/sent, give that specific reason, persist the drafts, and surface the concrete unblocking action for the owner.${publishAuthorized
-  ? `
-
-PUBLISH AUTHORIZATION — this schedule publishes without approval (CRITICAL):
-- The owner has NOT asked to approve publishing for this schedule, so publishing is authorized for this run. This is the account-level setting that decides it, resolved from the schedule record — not something you infer from the prompt's wording, and not something you may override.
-- Any generic "get approval before publishing to social" default is therefore ALREADY satisfied for this run and is NEVER a reason to withhold the action. Neither is the run being scheduled or unattended. If the task says to post, reply, or publish, CALL THE TOOL.`
-  : `
-
-PUBLISH AUTHORIZATION — this schedule requires approval before publishing (CRITICAL):
-- The owner has turned ON "Require approval before publishing" for this schedule. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot override the setting.
-- THIS BLOCK IS reason (1) above. Do NOT call any tool that publishes externally (e.g. twitter_manage_post, post_on_connected_account, publish_blog_article). Instead: do all the work up to the publish step, persist the drafts to the knowledge base, and state plainly in your final report that nothing was posted because this schedule requires approval before publishing.
-- Quote THIS block as the reason, and describe it accurately: it is an account-level setting the owner chose, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action, naming the setting exactly: turn OFF "Require approval before publishing" in this schedule's settings, and the next run will post. Do NOT point them at "Full autonomy" — that setting governs whether Emma decides unaided mid-run and does NOT affect publishing, so following it would leave the next run blocked in exactly the same place.`}`;
+- In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.`;
 }
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.
