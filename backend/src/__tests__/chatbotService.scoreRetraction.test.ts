@@ -110,13 +110,17 @@ describe("ENG-830 — retraction is conditional on the score it read", () => {
       expect(errorSpy).toHaveBeenCalled();
     });
 
-    it("stays conditional for a legacy score that carries no evaluatedAt", async () => {
-      const legacy = { ...previousScore, evaluatedAt: undefined } as any;
+    it("pins a legacy score with no evaluatedAt to the whole snapshot", async () => {
+      // attribute_exists would NOT be invalidated by a replacement write, so the
+      // only honest pin left is the score object itself.
+      const legacy = { score: 3, reason: "legacy", evaluatedMessageIndex: 3 } as any;
 
       await chatbotDb.clearSessionSatisfactionScore("s1", legacy);
 
       const params = update.mock.calls[0][0];
-      expect(params.ConditionExpression).toContain("attribute_exists(satisfactionScore)");
+      expect(params.ConditionExpression).toContain("satisfactionScore = :prevSnapshot");
+      expect(params.ConditionExpression).not.toContain("attribute_exists(satisfactionScore)");
+      expect(params.ExpressionAttributeValues[":prevSnapshot"]).toEqual(legacy);
       expect(params.ExpressionAttributeValues[":prevEvaluatedAt"]).toBeUndefined();
     });
   });
@@ -142,6 +146,16 @@ describe("ENG-830 — retraction is conditional on the score it read", () => {
       expect(fallback.UpdateExpression).toBe("SET #rjs = :map REMOVE #js.#jid");
       expect(fallback.ConditionExpression).toContain("#js.#jid.evaluatedAt = :prevEvaluatedAt");
       expect(fallback.ExpressionAttributeValues[":prevEvaluatedAt"]).toBe(previousJudgeScore.evaluatedAt);
+    });
+
+    it("pins a legacy judge score with no evaluatedAt to the whole snapshot", async () => {
+      const legacy = { score: 3, reason: "legacy", evaluatedMessageIndex: 3, judgeName: "Probe" } as any;
+
+      await chatbotDb.clearSessionJudgeScore("s1", "judge_1", legacy);
+
+      const params = update.mock.calls[0][0];
+      expect(params.ConditionExpression).toContain("#js.#jid = :prevSnapshot");
+      expect(params.ExpressionAttributeValues[":prevSnapshot"]).toEqual(legacy);
     });
 
     it("refuses to clobber an archive map another retraction created first", async () => {
