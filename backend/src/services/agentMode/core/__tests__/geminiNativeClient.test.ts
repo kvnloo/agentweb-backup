@@ -657,6 +657,48 @@ describe('sanitizeGeminiSchema', () => {
       .toEqual({ type: 'array', items: { type: 'number' } });
   });
 
+  it('salvages a real element type from prefixItems/contains before guessing (ENG-845)', () => {
+    // An invented element type is a lie the model acts on — told an array-of-objects is
+    // an array-of-strings it sends strings, execute() rejects them against the ORIGINAL
+    // schema, and the user sees a tool error. `prefixItems` (the draft-2020 tuple form,
+    // used by @playwright/mcp and friends) and `contains` both describe the element and
+    // are dropped by the allowlist, so we read them off the input before falling back.
+    expect(sanitizeGeminiSchema({
+      type: 'array',
+      prefixItems: [{ type: 'object', properties: { id: { type: 'string' } } }],
+    })).toEqual({ type: 'array', items: { type: 'object', properties: { id: { type: 'string' } } } });
+
+    expect(sanitizeGeminiSchema({ type: 'array', contains: { type: 'number' } }))
+      .toEqual({ type: 'array', items: { type: 'number' } });
+
+    // A donor that sanitizes to something Gemini still can't use falls through to the guess.
+    expect(sanitizeGeminiSchema({ type: 'array', contains: { readOnly: true } }))
+      .toEqual({ type: 'array', items: { type: 'string' } });
+  });
+
+  it('reports a degraded schema once, and stays silent on a clean one (ENG-845)', () => {
+    // Silence is what made the original ENG-845 failure expensive to find, so every
+    // degradation is surfaced — but aggregated, or a pathological schema would emit a
+    // line per node.
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      sanitizeGeminiSchema({ type: 'object', properties: { a: { type: 'array', items: { type: 'number' } } } });
+      expect(warn).not.toHaveBeenCalled();
+
+      sanitizeGeminiSchema({
+        type: 'object',
+        properties: { a: { type: 'array' }, b: { type: 'array' }, c: { type: 'array', contains: { type: 'number' } } },
+      });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        'Gemini schema sanitizer degraded a tool schema:',
+        expect.objectContaining({ guessedArrayItems: 2, salvagedArrayItems: 1, truncatedNodes: 0 }),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('truncates a self-referencing schema instead of overflowing the stack (ENG-845)', () => {
     // A dereferenced $ref or a hand-built circular object would recurse forever and take
     // the worker down mid-turn — the very zero-assistant-output signature this fixes.

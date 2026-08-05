@@ -59,6 +59,16 @@ export interface GeminiRequestOptions {
  */
 const MAX_SCHEMA_DEPTH = 20;
 
+/** Degradations accumulated while sanitizing one tool schema, reported once at the end. */
+interface SanitizeReport {
+  /** Nodes flattened to a leaf by the cycle guard or the depth cap. */
+  truncated: number;
+  /** Arrays whose element type was recovered from `prefixItems`/`contains`. */
+  salvagedItems: number;
+  /** Arrays whose element type had to be invented as `string`. */
+  blindItems: number;
+}
+
 export const GEMINI_SCHEMA_KEYWORDS = new Set([
   'anyOf', 'default', 'description', 'enum', 'example', 'format', 'items',
   'maxItems', 'maxLength', 'maxProperties', 'maximum', 'minItems', 'minLength',
@@ -109,11 +119,16 @@ export const GEMINI_SCHEMA_KEYWORDS = new Set([
  * when the resolved type is not `array`. Claude/Bedrock accept the union, which is
  * why only gemini-3.5-flash runs failed.
  */
-export function sanitizeGeminiSchema(schema: any, depth = 0, ancestors?: Set<any>): any {
+export function sanitizeGeminiSchema(schema: any, depth = 0, ancestors?: Set<any>, report?: SanitizeReport): any {
   // NOTE: the explicit arrow matters — `map(sanitizeGeminiSchema)` would pass the
   // array INDEX as `depth`, silently truncating every member past the limit.
-  if (Array.isArray(schema)) return schema.map((entry) => sanitizeGeminiSchema(entry, depth, ancestors));
+  if (Array.isArray(schema)) return schema.map((entry) => sanitizeGeminiSchema(entry, depth, ancestors, report));
   if (!schema || typeof schema !== 'object') return schema;
+
+  // Degradations are collected across the whole traversal and reported ONCE by the
+  // outermost call, so a pathological schema logs a single summary rather than a line
+  // per node. Silence is what made the original ENG-845 failure so expensive to find.
+  const notes: SanitizeReport = report ?? { truncated: 0, blindItems: 0, salvagedItems: 0 };
 
   // A schema reachable from itself recurses forever, as does a pathologically deep
   // one; either would take down the worker with a stack overflow rather than a 400.
@@ -124,6 +139,7 @@ export function sanitizeGeminiSchema(schema: any, depth = 0, ancestors?: Set<any
   const path = ancestors ?? new Set<any>();
   const truncate = path.has(schema) || depth >= MAX_SCHEMA_DEPTH;
   if (!truncate) path.add(schema);
+  else notes.truncated++;
 
   const out: any = {};
   for (const [key, value] of Object.entries(schema)) {
@@ -132,17 +148,17 @@ export function sanitizeGeminiSchema(schema: any, depth = 0, ancestors?: Set<any
       // Keys here are parameter names, not keywords — recurse into the values only.
       if (truncate || !value || typeof value !== 'object' || Array.isArray(value)) continue;
       const properties: any = {};
-      for (const [name, sub] of Object.entries(value)) properties[name] = sanitizeGeminiSchema(sub, depth + 1, path);
+      for (const [name, sub] of Object.entries(value)) properties[name] = sanitizeGeminiSchema(sub, depth + 1, path, notes);
       out.properties = properties;
     } else if (key === 'items') {
       // Gemini's `items` is a single Schema; a draft-07 tuple array 400s with
       // `Unknown name "0" at ...items`. Keep the first element so the parameter
       // stays usable instead of dropping the element schema outright.
       if (truncate) continue;
-      out.items = sanitizeGeminiSchema(Array.isArray(value) ? value[0] : value, depth + 1, path);
+      out.items = sanitizeGeminiSchema(Array.isArray(value) ? value[0] : value, depth + 1, path, notes);
     } else if (key === 'anyOf') {
       if (truncate) continue;
-      out.anyOf = sanitizeGeminiSchema(value, depth + 1, path);
+      out.anyOf = sanitizeGeminiSchema(value, depth + 1, path, notes);
     } else {
       out[key] = value;
     }
@@ -172,16 +188,51 @@ export function sanitizeGeminiSchema(schema: any, depth = 0, ancestors?: Set<any
     }
   }
   // Gemini REQUIRES `items` on an array — `{ type: 'array' }` alone 400s the whole
-  // request with `properties[x].items: missing field`. Three paths can strip it: a
+  // request with `properties[x].items: missing field`. Several paths can strip it: a
   // degenerate tuple (`items: []`), a schema that declared `array` without `items` at
-  // all, and depth/cycle truncation above. Fall back to a string element rather than
-  // let one unusable parameter kill the turn — the model can still call the tool, and
-  // execute() validates against the ORIGINAL schema, so a wrong element type is
-  // rejected there rather than silently accepted.
-  if (out.type === 'array' && (!out.items || typeof out.items !== 'object' || Array.isArray(out.items))) {
-    out.items = { type: 'string' };
+  // all, and depth/cycle truncation above.
+  //
+  // Guessing `string` is the LAST resort, because an invented element type is a lie the
+  // model acts on: told an array-of-objects is an array-of-strings, it sends strings,
+  // execute() rejects them against the ORIGINAL schema, and the user sees a tool error.
+  // So first salvage a real element type from the draft-2020 keywords the allowlist
+  // drops before we ever reach here — `prefixItems` (the modern tuple form, which
+  // `@playwright/mcp` and other draft-2020 schemas use instead of tuple `items`) and
+  // `contains`. Both describe the element and are strictly better than a guess.
+  if (out.type === 'array' && !isUsableItems(out.items)) {
+    const donor = Array.isArray((schema as any).prefixItems)
+      ? (schema as any).prefixItems[0]
+      : (schema as any).contains;
+    if (donor && typeof donor === 'object' && !Array.isArray(donor)) {
+      const salvaged = sanitizeGeminiSchema(donor, depth + 1, path, notes);
+      if (isUsableItems(salvaged)) {
+        out.items = salvaged;
+        notes.salvagedItems++;
+      }
+    }
+    if (!isUsableItems(out.items)) {
+      out.items = { type: 'string' };
+      notes.blindItems++;
+    }
+  }
+
+  // Outermost call reports once. These are all cases where the request now SUCCEEDS
+  // where it previously 400'd or crashed — but with a schema less precise than the tool
+  // author wrote, so it must not pass silently.
+  if (depth === 0 && !report && (notes.truncated || notes.blindItems || notes.salvagedItems)) {
+    console.warn('Gemini schema sanitizer degraded a tool schema:', {
+      truncatedNodes: notes.truncated,        // cycle or depth cap hit
+      salvagedArrayItems: notes.salvagedItems, // element type recovered from prefixItems/contains
+      guessedArrayItems: notes.blindItems,     // element type invented as `string`
+      maxDepth: MAX_SCHEMA_DEPTH,
+    });
   }
   return out;
+}
+
+/** Gemini needs a typed sub-schema here; an empty or non-object `items` still 400s. */
+function isUsableItems(items: any): boolean {
+  return !!items && typeof items === 'object' && !Array.isArray(items) && typeof items.type === 'string';
 }
 
 /** Convert one OpenAI message `content` value into an array of Gemini parts. */
