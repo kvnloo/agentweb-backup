@@ -140,11 +140,11 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     // Default owner-admin lookup to a deterministic non-admin so the base suite
     // never makes a real DB call; admin-gating cases below override this per-test.
     jest.spyOn(userDb, 'getUserById').mockResolvedValue({ userId: USER_ID, isAdmin: false } as any);
-    // ENG-803: the controller resolves the schedule's fullAutonomy opt-in into the
+    // ENG-803: the controller resolves the schedule's publishing opt-in into the
     // publish-authorization signal via getScheduleById. Default it to a
     // deterministic not-authorized schedule so the base suite never makes a real
     // DB call; the publish-authorization cases below override this per-test.
-    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: false } as any);
+    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, unattendedPublishAuthorized: false } as any);
     // Worker returns a normal success so generateResponse completes without error.
     mockWorker.runInWorker.mockResolvedValue({
       content: 'Report delivered.',
@@ -288,17 +288,18 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
   // Wiring probe for the fix, exercising the full assembly path end-to-end
   // (controller → getScheduleById → directive → prompt).
   //
-  // The reported schedule (081d18dd, "Harsha X Reply Guy") carries NO
-  // fullAutonomy attribute, and a prod scan on 2026-08-04 found 0 of 897
-  // schedules with it set. So the anti-fabrication rules AND the
-  // "don't substitute a draft for the action you were told to take" rule must
-  // ride on EVERY scheduled run regardless of the signal — gating them on
-  // fullAutonomy would make them dead code for 100% of real traffic. Only the
-  // publish-AUTHORIZATION block stays gated (ENG-827 owns that policy).
+  // The reported schedule (081d18dd, "Harsha X Reply Guy") carries neither
+  // autonomy attribute, and a prod scan on 2026-08-04 found 0 of 897 schedules
+  // with fullAutonomy set. So the anti-fabrication rules AND the "don't
+  // substitute a draft for the action you were told to take" rule must ride on
+  // EVERY scheduled run regardless of the signal — gating them on an opt-in
+  // would make them dead code for 100% of real traffic. Only the
+  // publish-AUTHORIZATION block is gated, on the schedule's own
+  // unattendedPublishAuthorized opt-in.
 
   it('injects the fabrication ban and the mandated-action rule on a NON-authorized schedule', async () => {
     // this is the reported schedule's exact shape — the fix must reach it.
-    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: false });
+    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, unattendedPublishAuthorized: false });
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
     expect(sp).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
@@ -319,15 +320,23 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     // publish rights; the assembled prompt must still refuse.
     (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({
       scheduleId: SCHEDULE_ID,
-      fullAutonomy: false,
       requiredFunctionCalls: ['search_tweets', 'twitter_manage_post'],
     });
     await agentModeController.generateResponse(makeReq(), makeRes());
     expect(capturedSystemPrompt()!).toContain('this schedule is NOT publish-authorized');
   });
 
-  it('adds the publish-authorization block when the schedule opted into fullAutonomy', async () => {
+  it('fullAutonomy alone never authorizes publishing end-to-end', async () => {
+    // ENG-396's opt-in is consent to DECIDE unaided, not consent to publish. An
+    // existing full-autonomy schedule must not be silently converted into a
+    // publishing one (Greptile consent-boundary P1 on PR #2260).
     (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: true });
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    expect(capturedSystemPrompt()!).toContain('this schedule is NOT publish-authorized');
+  });
+
+  it('adds the publish-authorization block when the owner granted the publishing opt-in', async () => {
+    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID, unattendedPublishAuthorized: true });
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
     // the machine-readable owner opt-in adds authorization on top…
