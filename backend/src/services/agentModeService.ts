@@ -1162,6 +1162,8 @@ export class AgentModeService {
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
         await import('../emma/solveRecaptchaTool');
+        await import('../emma/siteSigninTools');
+        await import('../emma/verificationCodeTool');
         await import('../emma/calendarTools');
         await import('../emma/localAgentTools');
 
@@ -5074,6 +5076,15 @@ export class AgentModeService {
 
     // Timing
     'wait_seconds',
+
+    // Magic-link / email-code login recovery (ENG-795). Foundation rather than
+    // skill-scoped because the tool lists of the DB-defined skills (e.g. "Browser
+    // automation") are data, not code: a tool added here would otherwise be
+    // invisible to every existing session and every scheduled run until someone
+    // edited each skill row by hand. loadFoundationTools unions
+    // DEFAULT_FOUNDATION_TOOLS, so a stale prod override cannot strip them.
+    'read_verification_code',
+    'open_site_signin',
 
     // Session Notifications (no email integration required)
     'notify_session',
