@@ -2,7 +2,7 @@
 // teardown itself is a spawn; proving the decision proves the reap. Reuses the same lastHit() signal
 // as the idle/cap eviction, so an actively-used preview (recent URL open / chat) is never a victim.
 // Run: node test/preview-mem-pressure.test.mjs
-import { memoryPressureVictims, availMemMB } from '../preview/policy.mjs';
+import { memoryPressureVictims, availMemMB, cgroupHeadroomMB } from '../preview/policy.mjs';
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log(`  ✅ ${m}`); } else { fail++; console.log(`  ❌ ${m}`); } };
@@ -64,9 +64,64 @@ console.log('memoryPressureVictims');
 console.log('availMemMB');
 {
   const sample = 'MemTotal:       32000000 kB\nMemFree:          200000 kB\nMemAvailable:    3600000 kB\n';
-  ok(availMemMB(() => sample) === Math.round(3600000 / 1024), 'parses MemAvailable kB → MB');
-  ok(availMemMB(() => 'garbage') === null, 'no MemAvailable line → null');
-  ok(availMemMB(() => { throw new Error('boom'); }) === null, 'unreadable /proc/meminfo → null');
+  const noCg = { cgroups: [] };   // host-only reading (the pre-2026-08-05 behaviour)
+  ok(availMemMB({ meminfo: () => sample, ...noCg }) === Math.round(3600000 / 1024), 'parses MemAvailable kB → MB');
+  ok(availMemMB({ meminfo: () => 'garbage', ...noCg }) === null, 'no MemAvailable line → null');
+  ok(availMemMB({ meminfo: () => { throw new Error('boom'); }, ...noCg }) === null, 'unreadable /proc/meminfo → null');
+}
+
+// The Aug-5 lesson: the box was killed FOUR times in 56 minutes while `MemAvailable` read 16-20GB free,
+// because the real ceiling was the cgroup's MemoryHigh (12G), not the host's 31G. A host-only reading
+// makes previewMemFloorMB/chat.watch.minMemMB dead controls — they never fire, and the first thing that
+// notices the ceiling is systemd killing the unit. So availMemMB must report the TIGHTEST budget we live
+// under: the host, AND every managed cgroup we run inside.
+const MB = 1024 * 1024;
+const cg = (cur, high, max) => (_rel, file) =>
+  ({ 'memory.current': String(cur * MB), 'memory.high': high === 'max' ? 'max' : String(high * MB), 'memory.max': max === 'max' ? 'max' : String(max * MB) }[file]);
+
+console.log('cgroupHeadroomMB');
+{
+  ok(cgroupHeadroomMB('u.slice', cg(9000, 13000, 14000)) === 4000, 'headroom = MemoryHigh − current (high is the effective ceiling)');
+  ok(cgroupHeadroomMB('u.slice', cg(9000, 'max', 14000)) === 5000, 'no MemoryHigh set → falls back to MemoryMax');
+  ok(cgroupHeadroomMB('u.slice', cg(9000, 'max', 'max')) === null, 'neither limit set (uncapped cgroup) → null = unknown');
+  ok(cgroupHeadroomMB('u.slice', cg(15000, 13000, 14000)) === 0, 'already over the ceiling → 0, never negative');
+  ok(cgroupHeadroomMB('u.slice', () => { throw new Error('ENOENT'); }) === null, 'cgroup v1 / unreadable → null (never invents pressure)');
+  ok(cgroupHeadroomMB('u.slice', () => 'nonsense') === null, 'unparseable values → null');
+}
+
+console.log('availMemMB — cgroup-aware');
+{
+  const host = (mb) => () => `MemAvailable: ${mb * 1024} kB\n`;
+  // The exact Aug-5 shape: host looks healthy, the cgroup is 300MB from the wall.
+  ok(availMemMB({ meminfo: host(20000), cgroups: ['a'], readCgroup: cg(12700, 13000, 14000) }) === 300,
+    'cgroup headroom below host MemAvailable → reports the CGROUP number (the Aug-5 bug)');
+  ok(availMemMB({ meminfo: host(900), cgroups: ['a'], readCgroup: cg(2000, 13000, 14000) }) === 900,
+    'host tighter than the cgroup → reports the host number');
+  // Two managed cgroups (autofix-chat.service + user-1000.slice): the tightest one wins, since either
+  // hitting its wall is a real failure.
+  const two = (rel, file) => (rel === 'tight' ? cg(12800, 13000, 14000) : cg(2000, 13000, 14000))(rel, file);
+  ok(availMemMB({ meminfo: host(20000), cgroups: ['loose', 'tight'], readCgroup: two }) === 200,
+    'multiple managed cgroups → the tightest headroom wins');
+  ok(availMemMB({ meminfo: host(4000), cgroups: ['a'], readCgroup: () => { throw new Error('ENOENT'); } }) === 4000,
+    'unreadable cgroup → falls back to the host reading (back-compat, no false pressure)');
+  ok(availMemMB({ meminfo: () => 'garbage', cgroups: ['a'], readCgroup: cg(9000, 13000, 14000) }) === 4000,
+    'unreadable host but a known cgroup → still reports the cgroup headroom');
+  ok(availMemMB({ meminfo: () => 'garbage', cgroups: ['a'], readCgroup: () => { throw new Error('x'); } }) === null,
+    'nothing readable → null = unknown, callers never evict blindly');
+}
+
+// End-to-end: the eviction decision must fire on cgroup pressure alone. This is the case that did NOT
+// happen four times today — 3500MB floor, 20GB host free, cgroup 300MB from its ceiling.
+console.log('memoryPressureVictims under cgroup-only pressure');
+{
+  const mem = () => availMemMB({
+    meminfo: () => `MemAvailable: ${20000 * 1024} kB\n`,
+    cgroups: ['a'],
+    readCgroup: cg(12700, 13000, 14000),
+  });
+  const r = memoryPressureVictims(FLOOR, { ...base, keep: 1, mem });
+  ok(ids(r).includes('old1'), 'host free but cgroup near its wall → the idle stack IS evicted');
+  ok(!ids(r).includes('active'), 'and the actively-used preview is still protected');
 }
 
 console.log(`\n${fail === 0 ? '✅ ALL PASSED' : '❌ FAILURES'} — ${pass} passed, ${fail} failed`);

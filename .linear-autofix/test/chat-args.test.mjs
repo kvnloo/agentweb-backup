@@ -16,6 +16,7 @@ const CHAT = {
   capabilityPrompt: 'Linear access: ... (persistent capability text)',
   safetyPrompt: 'SAFETY — you are CONFINED to your own assigned repo ... (compaction-proof guard)',
   watchPrompt: 'BACKGROUND WORK — end a waiting turn with [[WATCH: …]] ... (compaction-proof)',
+  resourcePrompt: 'RESOURCES — wrap heavy builds in flock + a 4GB heap cap ... (compaction-proof)',
 };
 function chatArgs(cap, sessionId, modelOverride) {
   const m = CHAT[cap] || {};
@@ -24,7 +25,7 @@ function chatArgs(cap, sessionId, modelOverride) {
   if (cap === 'readOnly') a.push('--allowedTools', (m.allowedTools || []).join(','));
   else {
     a.push('--dangerously-skip-permissions');
-    const appends = [CHAT.capabilityPrompt, CHAT.safetyPrompt, CHAT.watchPrompt].filter(Boolean);
+    const appends = [CHAT.capabilityPrompt, CHAT.safetyPrompt, CHAT.watchPrompt, CHAT.resourcePrompt].filter(Boolean);
     if (appends.length) a.push('--append-system-prompt', appends.join('\n\n'));
   }
   const denied = (CHAT.skillDenylist || []).map((s) => `Skill(${s})`);
@@ -38,6 +39,10 @@ const appendedText = (a) => { const i = a.indexOf('--append-system-prompt'); ret
 const hasCapability = (a) => { const t = appendedText(a); return !!t && t.includes(CHAT.capabilityPrompt); };
 const hasSafetyGuard = (a) => { const t = appendedText(a); return !!t && t.includes(CHAT.safetyPrompt); };
 const hasWatchGuide = (a) => { const t = appendedText(a); return !!t && t.includes(CHAT.watchPrompt); };
+// The Aug-5 OOM lesson: an agent running `tsc`/`vite build` by hand inside a turn bypassed both the
+// machine-wide build lock and the 4GB heap cap the pipeline uses, and those unserialized spikes are
+// what pushed the chat cgroup into its ceiling. The rule has to survive /compact like the others.
+const hasResourceRule = (a) => { const t = appendedText(a); return !!t && t.includes(CHAT.resourcePrompt); };
 
 // helper: are all denylisted skills passed as `Skill(<name>)` after a --disallowedTools flag?
 const deniesSkills = (a, names) => {
@@ -58,7 +63,8 @@ console.log('chatArgs — heavyweight skills denied, the rest kept');
   ok(hasCapability(full), 'full cap appends the persistent capability to the system prompt (survives /compact)');
   ok(hasSafetyGuard(full), 'full cap appends the worktree-isolation safety guard (compaction-proof)');
   ok(hasWatchGuide(full), 'full cap appends the background-watch guide (compaction-proof)');
-  ok(full.filter((x) => x === '--append-system-prompt').length === 1, 'capability + safety + watch share ONE --append-system-prompt flag');
+  ok(hasResourceRule(full), 'full cap appends the heavy-build resource rule (compaction-proof)');
+  ok(full.filter((x) => x === '--append-system-prompt').length === 1, 'capability + safety + watch + resources share ONE --append-system-prompt flag');
   ok(full.includes('--resume') && full[full.indexOf('--resume') + 1] === 'sess-123', 'resume sid still passed');
 
   // the denials come as separate values under ONE --disallowedTools, and --resume stays last
