@@ -17,13 +17,27 @@ import * as crypto from 'crypto';
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
 const mockGetAccountByCalendlyUserUri = jest.fn();
+const mockUpdateAccountConfig = jest.fn();
 jest.mock('../services/connectedAccountsDb', () => ({
   getAccountByCalendlyUserUri: (...a: any[]) => mockGetAccountByCalendlyUserUri(...a),
+  updateAccountConfig: (...a: any[]) => mockUpdateAccountConfig(...a),
 }));
 
 const mockGetUserById = jest.fn();
+const mockGetLeadListsByUserId = jest.fn();
+const mockCreateLeadList = jest.fn();
+const mockGetLeadByEmail = jest.fn();
+const mockCreateLead = jest.fn();
+const mockUpdateLead = jest.fn();
 jest.mock('../services/db', () => ({
   userDb: { getUserById: (...a: any[]) => mockGetUserById(...a) },
+  crmDb: {
+    getLeadListsByUserId: (...a: any[]) => mockGetLeadListsByUserId(...a),
+    createLeadList: (...a: any[]) => mockCreateLeadList(...a),
+    getLeadByEmail: (...a: any[]) => mockGetLeadByEmail(...a),
+    createLead: (...a: any[]) => mockCreateLead(...a),
+    updateLead: (...a: any[]) => mockUpdateLead(...a),
+  },
 }));
 
 const mockResolveMetaPixelForUser = jest.fn();
@@ -38,6 +52,13 @@ jest.mock('../services/metaService', () => ({
 const mockGetMetaAccountCredentials = jest.fn();
 jest.mock('../services/metaAccountCredentials', () => ({
   getMetaAccountCredentials: (...a: any[]) => mockGetMetaAccountCredentials(...a),
+}));
+
+const mockAutoSyncLead = jest.fn();
+jest.mock('../services/externalCrmSyncService', () => ({
+  externalCrmSyncService: {
+    autoSyncLead: (...a: any[]) => mockAutoSyncLead(...a),
+  },
 }));
 
 // ─── App setup ───────────────────────────────────────────────────────────────
@@ -122,6 +143,13 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     mockResolveMetaPixelForUser.mockResolvedValue({ pixelId: 'pixel-1', accountId: 'act-1' });
     mockGetMetaAccountCredentials.mockResolvedValue({ accountId: 'act-1', accessToken: 'meta-token', accountName: 'Ad Account' });
     mockSendCapiLeadEvent.mockResolvedValue({ success: true, fbtraceId: 'trace-1' });
+    mockGetLeadByEmail.mockResolvedValue(null);
+    mockCreateLead.mockResolvedValue({ leadId: 'lead-1', email: 'lead@example.com' });
+    mockUpdateLead.mockResolvedValue(undefined);
+    mockAutoSyncLead.mockResolvedValue(undefined);
+    mockGetLeadListsByUserId.mockResolvedValue([]);
+    mockCreateLeadList.mockResolvedValue({ listId: 'list-auto-created' });
+    mockUpdateAccountConfig.mockResolvedValue(undefined);
   });
 
   it('returns 200 immediately without a signature header, and does not call CAPI', async () => {
@@ -179,5 +207,109 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     expect(accessToken).toBe('meta-token');
     expect(event.eventId).toBe('https://api.calendly.com/scheduled_events/evt-2/invitees/inv-2');
     expect(event.email).toBe('lead@example.com');
+  });
+
+  describe('CRM-forward', () => {
+    it('uses the explicitly configured booking_lead_list_id when set, skipping fallback resolution', async () => {
+      const accountWithList = {
+        ...mockAccount,
+        config: { ...mockAccount.config, booking_lead_list_id: 'list-explicit' },
+      };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetLeadListsByUserId).not.toHaveBeenCalled();
+      expect(mockCreateLeadList).not.toHaveBeenCalled();
+      expect(mockUpdateAccountConfig).not.toHaveBeenCalled();
+      expect(mockCreateLead).toHaveBeenCalledWith('list-explicit', expect.objectContaining({ email: 'lead@example.com' }));
+    });
+
+    it('falls back to resolveOrCreateBookingList and persists the result when no list is configured', async () => {
+      mockGetLeadListsByUserId.mockResolvedValue([]);
+      mockCreateLeadList.mockResolvedValue({ listId: 'list-auto-created' });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockCreateLeadList).toHaveBeenCalledTimes(1);
+      expect(mockUpdateAccountConfig).toHaveBeenCalledWith(
+        USER_ID, 'calendly', mockAccount.account_id, { booking_lead_list_id: 'list-auto-created' },
+      );
+      expect(mockCreateLead).toHaveBeenCalledWith('list-auto-created', expect.objectContaining({ email: 'lead@example.com' }));
+    });
+
+    it('creates a new lead and auto-syncs as "created" when no existing lead matches the email', async () => {
+      mockGetLeadByEmail.mockResolvedValue(null);
+      mockCreateLead.mockResolvedValue({ leadId: 'lead-new', email: 'lead@example.com' });
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockCreateLead).toHaveBeenCalledTimes(1);
+      expect(mockUpdateLead).not.toHaveBeenCalled();
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', expect.objectContaining({ leadId: 'lead-new' }), 'hubspot', 'created');
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', expect.objectContaining({ leadId: 'lead-new' }), 'attio', 'created');
+    });
+
+    it('updates the existing lead and auto-syncs as "updated" when a lead with that email already exists', async () => {
+      const existingLead = { leadId: 'lead-existing', email: 'lead@example.com', customFields: { foo: 'bar' } };
+      mockGetLeadByEmail.mockResolvedValue(existingLead);
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockCreateLead).not.toHaveBeenCalled();
+      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
+        customFields: expect.objectContaining({ foo: 'bar' }),
+      }));
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', existingLead, 'hubspot', 'updated');
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', existingLead, 'attio', 'updated');
+    });
+
+    it('still sends the CAPI event when the CRM-forward leg throws', async () => {
+      mockGetLeadListsByUserId.mockRejectedValue(new Error('crm down'));
+      mockCreateLeadList.mockRejectedValue(new Error('crm down'));
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockSendCapiLeadEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it('still runs CRM-forward when the Meta pixel cannot be resolved', async () => {
+      mockResolveMetaPixelForUser.mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' });
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
+      expect(mockCreateLead).toHaveBeenCalledTimes(1);
+    });
   });
 });
