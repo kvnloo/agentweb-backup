@@ -185,6 +185,24 @@ describe('ENG-471 AC1 — AD_CREATIVE GET is exposed to the model', () => {
     ).rejects.toThrow(/could not verify which ad account/i);
   });
 
+  it('fails closed when the SELECTED account cannot be determined', async () => {
+    // The mirror of the unverifiable-owner case, and the subtler one: a guard
+    // written as `if (selected && owner !== selected)` treats an empty resolved
+    // account as "no mismatch" and waves through every creative the token can
+    // reach — reopening the exact bypass the check exists to close. Both sides
+    // must be known for the comparison to mean anything.
+    credentialsSpy.mockResolvedValue({ accountId: '', accessToken: 'test-token' } as never);
+
+    await expect(
+      agentModeService.manageMetaAdsAdCreatives(
+        'user-1',
+        'GET',
+        'act_922903076601160',
+        { creative_id: '120210000000000000' },
+      ),
+    ).rejects.toThrow(/could not determine which ad account was selected/i);
+  });
+
   it('leaves LIST behaviour untouched', async () => {
     // LIST is account-wide and omits asset_feed_spec — that is why GET was
     // needed. Adding GET must not quietly change what LIST does.
