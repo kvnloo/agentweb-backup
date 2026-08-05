@@ -353,7 +353,7 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).toContain('PRE-AUTHORIZED to publish');
     expect(sp).not.toContain('NOT pre-authorized to publish');
     // the directive must name the exact tool the owner designated
-    expect(sp).toContain('they explicitly designated post_on_connected_account');
+    expect(sp).toContain('designated post_on_connected_account');
   });
 
   // ── Single-source authorization (Greptile P1) ────────────────────────────────
@@ -380,7 +380,7 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     const sp = capturedSystemPrompt()!;
     expect(sp).toContain('PRE-AUTHORIZED to publish');
     expect(sp).not.toContain('NOT pre-authorized to publish');
-    expect(sp).toContain('they explicitly designated post_on_connected_account');
+    expect(sp).toContain('designated post_on_connected_account');
     expect(scheduleDb.getScheduleById).not.toHaveBeenCalled();
   });
 

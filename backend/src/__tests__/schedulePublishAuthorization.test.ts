@@ -93,6 +93,29 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
     expect(result.authorized).toBe(false);
   });
 
+  // ── Consent without SCOPE authorizes nothing (Greptile P1 #5, security) ─────
+  // The owner may consent but designate no publishing tool. Authorizing that turns
+  // an empty scope into a licence to reach for ANY live-publishing tool — an
+  // unscoped mandate they never granted. Consent and scope are both required.
+  it('does NOT authorize consent with no designated publish tool', () => {
+    expect(resolveSchedulePublishAuthorization({ autopublishAuthorized: true }))
+      .toEqual({ authorized: false, tools: [] });
+    expect(
+      resolveSchedulePublishAuthorization({
+        autopublishAuthorized: true,
+        requiredFunctionCalls: [],
+      })
+    ).toEqual({ authorized: false, tools: [] });
+  });
+
+  it('does NOT authorize consent whose required tools contain nothing publishable', () => {
+    const result = resolveSchedulePublishAuthorization({
+      autopublishAuthorized: true,
+      requiredFunctionCalls: ['you_search_web', 'create_social_media_posts', 'send_email'],
+    });
+    expect(result).toEqual({ authorized: false, tools: [] });
+  });
+
   // ── Authorized: an explicit, owner-set consent flag ─────────────────────────
   it('AUTHORIZES on autopublishAuthorized, reporting the designated tools', () => {
     const result = resolveSchedulePublishAuthorization({
