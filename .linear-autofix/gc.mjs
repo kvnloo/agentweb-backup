@@ -13,7 +13,7 @@ import { resolveIssue, addComment } from './linear.mjs';
 import { lockActive } from './lock.mjs';
 import { gitRepoOp, pruneRepoLocks } from './repo-lock.mjs';
 import { admissionWithdrawal } from './admission.mjs';
-import { evictIdlePreviews, evictUnderMemoryPressure, stalePreviews } from './preview/policy.mjs';
+import { evictIdlePreviews, evictUnderMemoryPressure, reconcileDeadPreviews, stalePreviews } from './preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..');
@@ -158,6 +158,16 @@ async function main() {
   // (which skips locked/in-flight worktrees). Best-effort; never let it block the rest of the GC pass.
   try { const ab = await abortWithdrawnInFlight(); if (ab.length) log(`aborted ${ab.length} withdrawn in-flight run(s): ${ab.join(', ')}`); }
   catch (e) { log(`withdrawal-abort sweep failed: ${e.message}`); }
+
+  // Liveness first: clear previews whose processes are gone (chat-server restart, OOM kill) but whose
+  // state + routes still advertise them. This runs BEFORE the two reaps below on purpose — they rank
+  // and protect previews by idle time without knowing which are corpses, so a dead stack could occupy
+  // the `previewMemKeep` slot and get spared while a LIVE one was evicted in its place. Clearing first
+  // makes every decision after it operate on stacks that actually exist.
+  if (config.previewReconcileDead !== false) {
+    try { reconcileDeadPreviews(log, { isLocked: lockActive }); }
+    catch (e) { log(`dead-preview reconcile failed: ${e.message}`); }
+  }
 
   // Reap previews untouched for previewIdleHours (default 24h), independent of worktree state — a
   // long-abandoned preview holds ~0.8GB even while its issue is still open. Uses the same last-hit

@@ -201,6 +201,16 @@ export const config = {
                                    // escalation (flat grace, pre-2026-08-05 behaviour).
   previewMemCriticalMinIdleMinutes: 2, // the shortened grace. Still a real floor — a preview touched seconds ago
                                    // survives at any pressure, and previewMemKeep still holds.
+  previewReconcileDead: true,      // each gc sweep, clear previews recorded as running whose processes are
+                                   // actually gone. A chat-server restart or an OOM kill takes the whole
+                                   // subtree (KillMode=control-group), but preview-state.json and routes.json
+                                   // kept advertising the stack — so its URLs 502 and it still counted against
+                                   // maxConcurrentPreviews until a human noticed. Nothing checked liveness
+                                   // anywhere before 2026-08-05, when five teardowns in one hour (4 OOM kills
+                                   // + 1 restart) left every stack listed-but-dead. It CLEARS rather than
+                                   // revives on purpose: post-OOM every preview is dead at once, so reviving
+                                   // would fire N concurrent portal builds into a box that just ran out of
+                                   // memory. false = leave stale entries alone.
   previewAutoRefreshOnHeadChange: true, // a preview is a bring-up-time snapshot (ts-node backend + built-once
                                    // portals); when the branch advances past the commit it was brought up
                                    // from, gc.mjs refreshes it — cheap ts-node restart for a backend-only

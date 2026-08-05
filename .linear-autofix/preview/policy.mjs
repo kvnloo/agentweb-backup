@@ -201,6 +201,83 @@ export function memoryPressureVictims(floorMB, {
   return { avail, victims: ranked.slice(0, Math.max(0, bugs.length - keep)), critical };
 }
 
+// Pure liveness decision: which previews are recorded as running but have lost their processes?
+//
+// Nothing used to check this. A chat-server restart or an OOM kill takes the whole process subtree
+// (KillMode=control-group), but preview-state.json and routes.json keep advertising the stack — so its
+// URLs 502, and it still counts against maxConcurrentPreviews, until a human notices. On 2026-08-05 that
+// happened five times (four oomd kills plus one deliberate restart); after the restart all NINE recorded
+// processes across three stacks were dead while all three were still listed.
+//
+// Skips, in order of how badly getting them wrong would hurt: `starting` entries have no procs recorded
+// YET, so judging them would tear down a bring-up that is actively in flight; entries with no procs map
+// can't be judged at all; and a locked bug has a run/turn/rebuild mid-flight that may be restarting its
+// own stack. Partial death counts as death — a half-alive stack still 502s on whatever died, and the
+// teardown reaps the survivors. Everything injectable.
+export function deadPreviewIds({
+  state = readJson(STATE),
+  alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } },
+  isLocked = () => false,
+  bound = listeningPortChecker(),
+} = {}) {
+  const dead = [];
+  for (const [b, entry] of Object.entries(state)) {
+    if (!entry || entry.starting) continue;                       // bring-up in flight — never touch
+    const pids = Object.values(entry.procs || {}).map((p) => p?.pid).filter((p) => Number.isInteger(p));
+    if (!pids.length) continue;                                   // nothing recorded → nothing to judge
+    if (isLocked(b)) continue;                                    // a run/turn/rebuild owns it right now
+    if (pids.every(alive)) continue;                              // fully alive → nothing to do
+    // Recorded pids are not the last word: a stack can be serving under a LATER generation of processes
+    // than state.json remembers (seen live 2026-08-05 — eng-845's three recorded pids dead while seven
+    // live node processes for that worktree were still up). Clearing on the pid signal alone would drop
+    // the state of something still answering and orphan it. A still-listening port is exactly what makes
+    // the difference between 200 and 502 — the symptom this sweep exists to fix — so it vetoes teardown.
+    const ports = Object.values(entry.ports || {}).filter((p) => Number.isInteger(p));
+    if (ports.some(bound)) continue;
+    dead.push(b);
+  }
+  return dead;
+}
+
+// Returns a `bound(port)` predicate over the listening TCP sockets, snapshotted ONCE per call so a sweep
+// of N previews costs one read rather than N. Reads /proc/net/tcp{,6} directly (no `ss` dependency):
+// column 2 is local_address as HEX_IP:HEX_PORT, column 4 is the socket state, and 0A is TCP_LISTEN.
+// An unreadable /proc means "unknown", and unknown must never be read as "nothing is listening" — that
+// would remove the veto and let the sweep tear down live stacks — so it reports every port as bound.
+export function listeningPortChecker(read = (f) => readFileSync(f, 'utf8')) {
+  const ports = new Set();
+  let ok = false;
+  for (const f of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let txt; try { txt = read(f); } catch { continue; }
+    ok = true;
+    for (const line of txt.split('\n').slice(1)) {
+      const col = line.trim().split(/\s+/);
+      if (col.length > 3 && col[3] === '0A') {
+        const p = parseInt(String(col[1]).split(':')[1], 16);
+        if (Number.isInteger(p)) ports.add(p);
+      }
+    }
+  }
+  return ok ? (p) => ports.has(p) : () => true;                   // unreadable → veto everything (fail safe)
+}
+
+// Effectful wrapper: clears every dead preview's state + routes via the normal teardown path (which is
+// idempotent — it signals pids that are already gone and then drops the entry), so the proxy stops
+// advertising a route nobody serves and the live-preview cap counts only real stacks.
+//
+// It CLEARS rather than revives, deliberately. After an OOM kill every preview is dead at once, so a
+// reviving sweep would launch three concurrent portal builds into a box that just ran out of memory —
+// re-triggering the exact failure it is meant to clean up after. Clearing is truthful and cheap; whoever
+// still needs the preview re-enables it, and that path already exists.
+export function reconcileDeadPreviews(log = () => {}, opts = {}) {
+  const dead = deadPreviewIds(opts);
+  for (const b of dead) {
+    log(`preview ${b} is recorded as running but its processes are gone (restart/OOM kill) — clearing stale state + route`);
+    spawnSync('node', [PREVIEW, 'down', b], { stdio: 'inherit' });
+  }
+  return dead;
+}
+
 // OOM backstop, independent of Linear status AND of the 24h idle age. Thin effectful wrapper around
 // memoryPressureVictims: logs + spawns the teardown. Called from gc.mjs each sweep. Returns evicted ids.
 export function evictUnderMemoryPressure(floorMB, opts = {}, log = () => {}) {
