@@ -9,6 +9,10 @@ jest.mock('../services/subscriptionService', () => ({
     'create_work_plan',
     'modify_work_plan',
     'set_work_plan_status',
+    // ENG-827 publish-scope cases below: the subscription check runs on the raw
+    // required list, so both must be allowed for the run to reach the checker.
+    'read_brand_guidelines',
+    'post_on_connected_account',
   ]),
 }));
 
@@ -700,6 +704,74 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       expect(mockRes.json).toHaveBeenCalledWith(
         expect.objectContaining({
           message: 'Scheduled chat updated successfully'
+        })
+      );
+    });
+  });
+
+  // ENG-827: the persisted run record must report the requirements the run was
+  // actually HELD TO. Building it from the raw schedule config instead recorded
+  // `post_on_connected_account {required: 1, actual: 0}` next to an empty
+  // functionCallMisses on a passing run — a contradiction nothing downstream can
+  // tell apart from a genuine silent miss (the ENG-479 / ENG-764 false-failure
+  // shape). Observed on a live preview run before it was fixed.
+  describe('run record reflects the publish-scope-filtered requirements (ENG-827)', () => {
+    const publishSchedule = {
+      ...baseSchedule,
+      keywords: [],
+      requiredFunctionCalls: ['read_brand_guidelines', 'post_on_connected_account'],
+      functionCallMinCalls: {},
+    };
+
+    it('OMITS an unauthorized publish tool from functionCallDetails, and still passes in ONE attempt', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(publishSchedule as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Drafted the post; holding publication for your approval.',
+        toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(publishSchedule as any, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          functionCallDetails: { 'read_brand_guidelines': { actual: 1, required: 1 } },
+          functionCallMisses: [],
+          passed: true,
+          attempt: 1,
+        })
+      );
+    });
+
+    it('KEEPS an AUTHORIZED publish tool in functionCallDetails — the scope filters, not the tool name', async () => {
+      const authorized = {
+        ...publishSchedule,
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(authorized as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Published the post.',
+        toolCalls: [
+          { name: 'read_brand_guidelines', arguments: {} },
+          { name: 'post_on_connected_account', arguments: {} },
+        ],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(authorized as any, mockUserId, true);
+
+      expect(result).toEqual(
+        expect.objectContaining({
+          functionCallDetails: {
+            'read_brand_guidelines': { actual: 1, required: 1 },
+            'post_on_connected_account': { actual: 1, required: 1 },
+          },
+          passed: true,
         })
       );
     });
