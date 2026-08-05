@@ -115,4 +115,44 @@ describe('POST /scheduled-chats/:id/publish-consent (ENG-827)', () => {
     }
     expect(mockDb.updateSchedule).not.toHaveBeenCalled();
   });
+
+  // Greptile P1 #10 (security): the generic update must not WRITE consent fields at
+  // all. updateSchedule builds a partial SET expression, so omitting them preserves
+  // the stored values. Copying them forward from the handler's own earlier read is
+  // a read-modify-write: a revocation landing in between would be silently
+  // resurrected, re-enabling publishing after the owner turned it off.
+  describe('generic update must not resurrect consent', () => {
+    it('never sends consent fields in the update patch', async () => {
+      const existing = {
+        scheduleId: SCHEDULE_ID,
+        userId: OWNER,
+        scheduleName: 'Daily post',
+        startingMessage: 'Write it',
+        scheduleFrequency: 'daily',
+        frequency: 'daily',
+        requiredFunctionCalls: ['post_on_connected_account'],
+        emailNotifications: ['o@example.com'],
+        // stored consent that a concurrent revoke may be clearing right now
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      (mockDb.getScheduleById as jest.Mock).mockResolvedValue(existing);
+
+      const req = {
+        user: { userId: OWNER, email: 'o@example.com' },
+        params: { scheduleId: SCHEDULE_ID },
+        body: { scheduleName: 'Renamed', autopublishAuthorized: true, autopublishAuthorizedTools: ['x'] },
+      } as unknown as Request;
+
+      await agentModeController.updateScheduledChat(req, makeRes());
+
+      const patches = (mockDb.updateSchedule as jest.Mock).mock.calls.map(c => c[1] || {});
+      for (const patch of patches) {
+        expect(patch).not.toHaveProperty('autopublishAuthorized');
+        expect(patch).not.toHaveProperty('autopublishAuthorizedTools');
+        expect(patch).not.toHaveProperty('autopublishAuthorizedAt');
+        expect(patch).not.toHaveProperty('autopublishAuthorizedBy');
+      }
+    });
+  });
 });
