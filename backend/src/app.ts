@@ -57,6 +57,7 @@ import youtubeAuthRoutes from "./routes/youtubeAuth";
 import googleAdsAuthRoutes from "./routes/googleAdsAuth";
 import fathomAuthRoutes from "./routes/fathomAuth";
 import fathomWebhookRoutes from "./routes/fathomWebhook";
+import calendlyWebhookRoutes from "./routes/calendlyWebhook";
 import fathomOnboardingAdminRoutes from "./routes/fathomOnboardingAdmin";
 import hubspotAuthRoutes from "./routes/hubspotAuth";
 import attioAuthRoutes from "./routes/attioAuth";
@@ -256,6 +257,7 @@ app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 app.use("/api/stripe/connect/webhook", express.raw({ type: "application/json" }));
 // HubSpot webhook needs raw body for HMAC-SHA256 signature verification.
 app.use("/api/webhooks/hubspot", express.raw({ type: "application/json" }));
+app.use("/api/webhooks/calendly", express.raw({ type: "application/json" })); // raw body needed for HMAC signature verification
 // Linear webhook (bug-resolve bridge) needs raw body for HMAC signature verification — before express.json().
 app.use("/api/integrations/linear/webhook", express.raw({ type: "application/json" }));
 // Featurebase webhook (Slack ship-notify) signs the raw body too — before express.json().
@@ -315,6 +317,7 @@ app.use("/api/settings", settingsRoutes);
 app.use("/api/image-models", imageModelsRoutes);
 app.use("/api/webhooks", webhookRoutes);
 app.use("/api/webhooks/fathom", fathomWebhookRoutes);
+app.use("/api/webhooks/calendly", calendlyWebhookRoutes);
 app.use("/api", devEnvRoutes);
 app.use("/api/benchmark", benchmarkRoutes);
 app.use("/api/seo", seoRoutes);
