@@ -867,6 +867,43 @@ describe('Predefined Work Plan MCP Tools', () => {
         ]);
       });
 
+      // Second Greptile round on PR #2269. The ambiguity check skipped any step
+      // carrying a stepCount, but the merge only USES that count if it matches
+      // an existing step — otherwise it falls back to first-match-by-title. So a
+      // stale or invented count was a way straight past the guard and onto the
+      // wrong duplicate.
+      it('refuses when the stepCount does not exist and the title is ambiguous', async () => {
+        mockDuplicateFetches();
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 99, title: 'Review', description: 'stale count' }],
+        }, context);
+
+        expect(putCalls()).toHaveLength(0);
+        expect(JSON.parse(result.content[0].text).ambiguousSteps).toEqual([
+          { title: 'Review', matchingStepCounts: [1, 2] },
+        ]);
+      });
+
+      it('still falls back to a unique title when the stepCount does not exist', async () => {
+        mockDuplicateFetches();
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 99, title: 'Ship', description: 'shipped' }],
+        }, context);
+
+        // 'Ship' names exactly one step, so there is nothing ambiguous to refuse.
+        const body = (putCalls()[0][0] as any).body;
+        expect(body.steps).toHaveLength(3);
+        expect(body.steps[2].description).toBe('shipped');
+      });
+
       it('accepts the same merge once a stepCount disambiguates it', async () => {
         mockDuplicateFetches();
 
