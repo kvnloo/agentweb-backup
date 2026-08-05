@@ -3519,13 +3519,19 @@ export class AgentModeService {
             // this ticket). Moving the skill-context message out of index 1 does
             // NOT avoid it — the tool change alone is sufficient.
             //
-            // Do NOT "fix" this by pre-declaring every tool up front. Measured
-            // 2026-08-05 against prod: 191 distinct tools across 74 skills at
-            // ~941 tokens per definition is ~180k tokens of schema carried on
-            // every turn. At Opus 5 cache-read rates that is ~$0.09/turn, i.e.
-            // ~$9.27 over the 103-turn session — MORE than the ~$6.47 of
-            // re-cache it would save, before counting the context it consumes
-            // and the loss of hard tool gating (ENG-260 / ENG-280).
+            // Sizing it, measured against prod on 2026-08-05 across the eight
+            // costliest sessions: 31 installs, 3.28M re-cached tokens, ~$32.78
+            // — about 5% of those sessions' $653 of spend (1.8%-18% each).
+            //
+            // Do NOT "fix" this by pre-declaring every tool up front. 191
+            // distinct tools across 74 skills at ~941 tokens per definition is
+            // ~180k tokens of schema carried on EVERY turn, ~$0.09/turn at Opus
+            // 5 cache-read rates. Installs are only 31 of ~1,186 assistant calls
+            // (2.6%), so that trades a per-call tax for a per-install saving and
+            // loses on every session measured — worse on the long ones, which
+            // are the expensive ones: -$18.59 over 315 calls, -$16.61 over 224,
+            // -$2.80 over 103. Before counting the context it consumes and the
+            // loss of hard tool gating (ENG-260 / ENG-280).
             //
             // Batching installs does not help either: that session's five
             // installs landed in five different user turns as the user changed
