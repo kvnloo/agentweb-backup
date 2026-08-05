@@ -819,6 +819,44 @@ changed_files "${d}" 'backend/src/server.ts'
 run_gate "${d}"
 check 'a backend diff with the suite absent entirely is NO_EVIDENCE' 3 '(ABSENT)'
 
+# A re-run at a head whose suite already went green must not lose that result.
+# Suite 100 ran the tests to success; suite 200 is a re-run whose Greptile gate
+# came back below 5/5, so the tests skipped. The head is unchanged, so the
+# green in suite 100 tested exactly this code. Reporting NO_EVIDENCE here would
+# be wrong on the facts AND unfixable by the author, since pushing anything to
+# clear it changes the head this evidence belongs to.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":100},"id":1},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":100},"id":2},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":100},"id":3},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":100},"id":4},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":200},"id":5},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"skipped","check_suite":{"id":200},"id":6},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"skipped","check_suite":{"id":200},"id":7}
+]'
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'a re-run that skipped the suite does not discard an earlier green at the same head' 0 'PASS'
+
+# The safety half of the same rule: "ever passed" must not become "ignore a
+# later failure". A failing re-run is caught by the classification pass long
+# before the backend requirement is consulted, so the earlier success cannot
+# rescue it.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" '[
+  {"name":"Detect changed projects","status":"completed","conclusion":"success","check_suite":{"id":100},"id":1},
+  {"name":"Require Greptile Review","status":"completed","conclusion":"success","check_suite":{"id":100},"id":2},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"success","check_suite":{"id":100},"id":3},
+  {"name":"Backend tests (all other + coverage)","status":"completed","conclusion":"success","check_suite":{"id":100},"id":4},
+  {"name":"Backend tests (agentMode)","status":"completed","conclusion":"failure","check_suite":{"id":200},"id":6}
+]'
+changed_files "${d}" 'backend/src/server.ts'
+run_gate "${d}"
+check 'an earlier green never masks a later failure at the same head' 1 'FAIL'
+
 # Renaming a job must fail closed rather than delete the requirement. With the
 # override pointing at a name nothing reports, the gate blocks.
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -889,11 +927,16 @@ fi
 GATE_SH="${SCRIPT_DIR}/merge-evidence.sh"
 
 for job_key in backend-tests-a backend-tests-b; do
+  # The condition is a `>-` block scalar, so collect every line of it rather
+  # than the `if:` line alone — reading only the first line would find the
+  # folding indicator and silently assert nothing.
   JOB_IF="$(awk -v job="  ${job_key}:" '
-    $0 == job          { in_job = 1; next }
+    $0 == job            { in_job = 1; next }
     in_job && /^  [a-z]/ { exit }
-    in_job && /^    if:/ { sub(/^    if: */, ""); print; exit }
-  ' "${WORKFLOW}")"
+    in_job && /^    if:/ { sub(/^    if: */, ""); collecting = 1; print; next }
+    collecting && /^      / { print; next }
+    collecting           { exit }
+  ' "${WORKFLOW}" | tr '\n' ' ')"
 
   TESTS_RUN=$((TESTS_RUN + 1))
   if printf '%s' "${JOB_IF}" | grep -qF "needs.greptile-review.result == 'success'"; then
@@ -905,6 +948,28 @@ for job_key in backend-tests-a backend-tests-b; do
     printf "      Without it the suite runs on every ready-flip again (ENG-915 AC1), and the\n"
     printf "      backend-suite requirement in merge-evidence.sh is enforcing an ordering that\n"
     printf "      no longer exists.\n"
+  fi
+
+  # The outage bypass must stay narrowed to `unavailable`. Widening it to any
+  # non-success result — or to `always()` without a result check — would let a
+  # REFUSED 3/5 run the suite, which is AC1 deleted.
+  TESTS_RUN=$((TESTS_RUN + 1))
+  if printf '%s' "${JOB_IF}" | grep -qF "needs.greptile-review.outputs.verdict == 'unavailable'"; then
+    if printf '%s' "${JOB_IF}" | grep -qE "verdict != 'pass'|result != 'success'|result != 'failure'"; then
+      TESTS_FAILED=$((TESTS_FAILED + 1))
+      printf "FAIL  invariant: %s bypasses the gate on a NEGATED condition.\n" "${job_key}"
+      printf "      Found: '%s'\n" "${JOB_IF}"
+      printf "      The bypass must name 'unavailable' positively; a negation lets a refused\n"
+      printf "      3/5 through and deletes ENG-915 AC1.\n"
+    else
+      printf "ok    invariant: %s bypasses only on the 'unavailable' verdict\n" "${job_key}"
+    fi
+  else
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    printf "FAIL  invariant: %s has lost the Greptile-outage bypass.\n" "${job_key}"
+    printf "      Found: '%s'\n" "${JOB_IF}"
+    printf "      Without it a Greptile outage costs every PR its test feedback, not just\n"
+    printf "      its merge.\n"
   fi
 done
 

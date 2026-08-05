@@ -407,6 +407,14 @@ if [ "${superseded_suites}" != "[]" ]; then
   fi
 fi
 
+# Kept for the backend-suite requirement in section 7, which asks a different
+# question from the rest of the gate: not "what is the latest state of this
+# job" but "did this job ever pass against this head". Both passes above are
+# about currency, and currency is the wrong lens for that one question,
+# because the head SHA is immutable — a green suite at this SHA tested exactly
+# this code and cannot be un-tested by a later run choosing to skip it.
+runs_after_supersession="${runs_json}"
+
 # Pass 2 — WITHIN a surviving suite, keep the newest run per context.
 # Re-running a job adds a new check-run beside the old one under the same name
 # in the same suite, so without this a re-run that fixed a failure would still
@@ -622,10 +630,27 @@ if [ -n "${touches_backend}" ]; then
   missing=''
   while IFS= read -r job; do
     [ -n "${job}" ] || continue
-    job_state="$(printf '%s' "${runs_json}" | jq -r --arg job "${job}" '
-        [ .check_runs[] | select(.name == $job) ]
-        | max_by(.id // 0)
-        | if . == null then "ABSENT" else (.conclusion // "pending") end' 2>/dev/null)"
+    # "Did it ever pass at this head", not "is the newest entry a pass".
+    #
+    # Without this, re-running the workflow at a head whose suite had already
+    # gone green reports NO_EVIDENCE the moment the re-run's Greptile gate
+    # comes back below 5/5: the tests skip, the skip is newer than the success,
+    # and a real green run at this exact SHA is discarded. That verdict is
+    # wrong on the facts — the suite did execute against this code — and it is
+    # unfixable by the author, because pushing to clear it changes the head.
+    #
+    # Safe because of where this sits: section 7 is reached only after the
+    # classification above found nothing failed and nothing is pending. A later
+    # FAILURE at this head is counted there (both suites survive pass 1, so a
+    # failing re-run is visible) and exits before reaching this line. So this
+    # can only ever rescue a success that a SKIP superseded — never mask a
+    # failure with an earlier pass.
+    job_state="$(printf '%s' "${runs_after_supersession}" | jq -r --arg job "${job}" '
+        [ .check_runs[] | select(.name == $job) ] as $rows
+        | if ($rows | length) == 0 then "ABSENT"
+          elif any($rows[]; .conclusion == "success") then "success"
+          else ($rows | max_by(.id // 0) | .conclusion // "pending")
+          end' 2>/dev/null)"
     jq_exit=$?
     if [ "${jq_exit}" -ne 0 ] || [ -z "${job_state}" ]; then
       surface 'check-runs response (raw)' "${runs_json}"
