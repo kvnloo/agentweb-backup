@@ -96,6 +96,18 @@ describe('renderMarkdownReportDocument', () => {
       expect(html).not.toContain('---------');
     });
 
+    it('does not stall on a long pipe-and-dash line that is not a separator', () => {
+      // Scraped tables produce long near-miss separator lines. Matching one with
+      // a backtracking regex took ~100s on a 10K-char line and blocked the event
+      // loop, so the always-works fallback could hang the backend.
+      const nearMiss = `|${'---|'.repeat(3000)}+`;
+      const start = Date.now();
+      const html = renderMarkdownReportDocument('Scraped', ['| Company | Funding |', nearMiss].join('\n'));
+      expect(Date.now() - start).toBeLessThan(1000);
+      // The near-miss line is not a separator, so no table is opened.
+      expect(html).not.toContain('<table');
+    });
+
     it('keeps wrapped paragraph lines together and ends the paragraph at the next block', () => {
       // Real drafts run blocks together without blank separator lines, so a
       // paragraph must stop at whatever block starts next.
