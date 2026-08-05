@@ -128,6 +128,8 @@ function buildBrandPrompt(input: {
     `- Do NOT call update_market_strategy or regenerate_market_strategy in this session, and do NOT offer to regenerate the market strategy. ICPs and competitor research are handled by separate steps after the user reviews the brand.`,
     `- Do NOT ask the user to verify anything mid-flight.`,
     `- Do NOT call any work-plan tools, do NOT create GTM plans, email campaigns, or landing pages.`,
+    `- logoUrl must be a direct link to an image the SITE ITSELF serves — the <img> in its header, an og:image, or its own /favicon.ico. NEVER substitute a third-party favicon proxy such as https://www.google.com/s2/favicons?domain=<domain>. That service returns 404 for any domain it has not crawled, and the dead URL then breaks every ad-image generation for this account.`,
+    `- If the site's logo is an inline SVG or otherwise has no linkable image URL, OMIT logoUrl entirely rather than approximating it. A deterministic step after this session discovers and pins a logo whenever you leave one unset — an omitted logoUrl self-heals, a wrong one does not.`,
     `- After update_brand_guidelines succeeds, reply with a single line "DONE" and stop.`,
     `- If a step is impossible (e.g. site is unreachable), reply "FAILED: <reason>" and stop. Do NOT loop indefinitely.`,
   ].join("\n");
