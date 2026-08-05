@@ -26117,12 +26117,16 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       // immediately instead. (Complete-HTML drafts already returned above and are
       // not size-limited.)
       if (contentDraft.length > CREATE_HTML_RENDER_MAX_DRAFT_CHARS) {
-        console.warn(`AgentMode: create_html_file — draft too large to render in one file (${contentDraft.length} chars > ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS})`);
-        return {
-          success: false,
-          message: 'Draft too large to render into a single HTML file',
-          error: `content_draft is too large to render into one HTML file in a single pass (${contentDraft.length} characters, limit ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}). Either provide the draft as a complete, self-contained HTML document (which is saved directly without limit), or split it into smaller sections and create multiple files.`
-        };
+        console.warn(`AgentMode: create_html_file — draft too large for an LLM render (${contentDraft.length} chars > ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}); delivering it deterministically instead`);
+        // ENG-873: keep ENG-472's "spend nothing on a render that cannot finish"
+        // rule, but not its "return nothing" outcome — that is the same way the
+        // 40-competitor report was stranded, only at a larger size. The
+        // deterministic renderer has no size ceiling and costs no LLM call, so
+        // the completed work is still delivered as the requested HTML file.
+        return await this.deliverDeterministicHtmlFallback(
+          title, contentDraft, userId, documentType,
+          new Error(`content_draft is too large for the styled render (${contentDraft.length} characters, limit ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}) — split it into smaller sections, or send a complete self-contained HTML document, which is saved verbatim with no size limit`),
+        );
       }
 
       // Use Claude model by default (check for Claude in model name)
