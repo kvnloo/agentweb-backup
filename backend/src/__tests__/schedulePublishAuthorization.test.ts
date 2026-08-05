@@ -1,4 +1,7 @@
-import { resolveSchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
+import {
+  resolveSchedulePublishAuthorization,
+  filterRequiredFunctionsToAuthorizedScope,
+} from '../utils/schedulePublishAuthorization';
 
 /**
  * ENG-827 — the schedule-level publish authorization signal.
@@ -243,5 +246,75 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
     const result = resolveSchedulePublishAuthorization({ requiredFunctionCalls: required });
     expect(result.tools).not.toBe(required);
     expect(required).toEqual(['post_on_connected_account']);
+  });
+});
+
+/**
+ * The prompt/checker invariant (Greptile P1 #9).
+ *
+ * The deterministic required-function checker must never nudge for a publishing
+ * tool the system prompt forbids — that contradiction is what burned ~21 turns per
+ * run in the reported sessions. Both sides derive from the same authorization, but
+ * the filter has to key on the authorized TOOL SET: with consent bound to a scope,
+ * `authorized` can be true while some required publish tool sits outside it.
+ */
+describe('filterRequiredFunctionsToAuthorizedScope (ENG-827)', () => {
+  const auth = (tools: string[], authorized = tools.length > 0) => ({ authorized, tools });
+
+  it('keeps a publish tool that is within the approved scope', () => {
+    expect(
+      filterRequiredFunctionsToAuthorizedScope(
+        ['you_search_web', 'post_on_connected_account'],
+        auth(['post_on_connected_account'])
+      )
+    ).toEqual(['you_search_web', 'post_on_connected_account']);
+  });
+
+  // The partial-scope case: authorized, but only for SOME of the required publish
+  // tools. The unapproved one must be dropped, or the checker demands what the
+  // prompt prohibits.
+  it('DROPS a required publish tool outside the approved scope, even when authorized', () => {
+    expect(
+      filterRequiredFunctionsToAuthorizedScope(
+        ['post_on_connected_account', 'publish_landing_page_changes', 'generate_image'],
+        auth(['post_on_connected_account'])
+      )
+    ).toEqual(['post_on_connected_account', 'generate_image']);
+  });
+
+  it('drops every publish tool when the run is not authorized', () => {
+    expect(
+      filterRequiredFunctionsToAuthorizedScope(
+        ['post_on_connected_account', 'publish_blog_article', 'you_search_web'],
+        auth([], false)
+      )
+    ).toEqual(['you_search_web']);
+  });
+
+  it('never touches non-publishing requirements', () => {
+    const required = ['you_search_web', 'send_email', 'generate_image', 'linkedin_outreach'];
+    expect(filterRequiredFunctionsToAuthorizedScope(required, auth([], false))).toEqual(required);
+  });
+
+  it('is safe on a missing/malformed required list', () => {
+    expect(filterRequiredFunctionsToAuthorizedScope(undefined, auth(['post_on_connected_account']))).toEqual([]);
+    expect(filterRequiredFunctionsToAuthorizedScope('nope' as any, auth([]))).toEqual([]);
+  });
+
+  // The end-to-end property, stated directly: whatever survives the filter is
+  // something the prompt will also have authorized.
+  it('never yields a publishing requirement outside the authorized tool set', () => {
+    const cases: Array<[string[], string[]]> = [
+      [['post_on_connected_account', 'publish_blog_article'], ['post_on_connected_account']],
+      [['publish_landing_page_changes'], ['post_on_connected_account']],
+      [['post_on_account', 'post_on_connected_account'], ['post_on_account']],
+      [['publish_blog_article'], []],
+    ];
+    for (const [required, approved] of cases) {
+      const out = filterRequiredFunctionsToAuthorizedScope(required, auth(approved));
+      for (const name of out) {
+        if (/^(post_on_|publish_)/.test(name)) expect(approved).toContain(name);
+      }
+    }
   });
 });
