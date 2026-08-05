@@ -176,6 +176,20 @@ export const CREATE_HTML_RENDER_MAX_DRAFT_CHARS = 60000;
 // drafts — where a timeout really is a one-off blip — keep the retry.
 export const CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS = 20000;
 
+// Largest draft still rendered by ONE monolithic LLM call. Above it the render
+// is all-or-nothing at a size where prod says it does not reliably fit the
+// per-call budget (see the observed cliff above), so the draft is rendered
+// section by section instead and the fragments are assembled locally. That
+// keeps the styled design for exactly the large reports that used to strand —
+// degrading to plain built-in styling stays the last resort, not the plan.
+export const CREATE_HTML_RENDER_SINGLE_PASS_MAX_DRAFT_CHARS = 24000;
+
+// Target size of one section render. Comfortably inside the smallest draft size
+// observed to render successfully in prod (23,010 chars), so no single section
+// is anywhere near the per-call budget, and small enough that the 60K ceiling
+// splits into a handful of parallel calls rather than dozens.
+export const CREATE_HTML_RENDER_CHUNK_MAX_CHARS = 12000;
+
 // Is this render error a per-call TIMEOUT (as opposed to a throttle, 5xx or
 // terminal error)? Bedrock surfaces these as TimeoutError/ModelTimeoutException,
 // or — for the streaming render — as "Stream timed out because of no activity
@@ -26243,7 +26257,25 @@ Please generate a complete, professional HTML document that properly formats and
       // minutes reaching the identical failure. Below it, ENG-203's retry still
       // applies: a small draft that times out really did hit a one-off blip.
       const timeoutIsDeterministic = contentDraft.length > CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS;
-      for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
+
+      // ENG-873: a draft too big for one render is not rendered in one call at
+      // all. Emails are excluded — an email is a single assembled table layout
+      // that cannot be stitched together from independently designed pieces.
+      const renderInSections =
+        !isEmail && contentDraft.length > CREATE_HTML_RENDER_SINGLE_PASS_MAX_DRAFT_CHARS;
+      if (renderInSections) {
+        try {
+          htmlContent = await this.renderHtmlDraftInSections(
+            title, contentDraft, formatRequirements, userId, sessionId, llmService,
+          );
+        } catch (sectionError) {
+          console.error(`AgentMode: sectioned HTML render failed on a ${contentDraft.length}-char draft (session ${sessionId}):`, sectionError instanceof Error ? sectionError.message : sectionError);
+          renderFailure = sectionError;
+        }
+      }
+      // Sectioned drafts have already been rendered (or failed) above.
+      const singlePassAttempts = renderInSections ? 0 : maxRenderAttempts;
+      for (let attempt = 1; attempt <= singlePassAttempts; attempt++) {
         try {
           htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
           break;
@@ -26321,6 +26353,104 @@ Please generate a complete, professional HTML document that properly formats and
   }
 
   /**
+   * ENG-873 — render a draft that is too large for one call as N section
+   * renders, then assemble the fragments into a single document under one
+   * stylesheet (supplied by chunkedHtmlRender, not by the model, so sections
+   * cannot drift apart visually).
+   *
+   * Sections render concurrently: each is well inside the per-call budget, so
+   * the wall-clock cost is roughly one render rather than N. A section that
+   * fails transiently is retried once — losing an hour of research to one blip
+   * on one section of the report is exactly the failure being fixed here. If a
+   * section still cannot render, this throws and the caller degrades to the
+   * deterministic document, which never loses content.
+   */
+  private async renderHtmlDraftInSections(
+    title: string,
+    contentDraft: string,
+    formatRequirements: string,
+    userId: string,
+    sessionId: string,
+    llmService: {
+      generateHTML: (
+        systemPrompt: string,
+        userPrompt: string,
+        onUsage: any,
+        context: any,
+      ) => Promise<string>;
+    },
+  ): Promise<string> {
+    const { splitDraftIntoRenderChunks, extractHtmlFragment, assembleChunkedHtmlDocument } =
+      await import('../utils/chunkedHtmlRender');
+
+    const chunks = splitDraftIntoRenderChunks(contentDraft, CREATE_HTML_RENDER_CHUNK_MAX_CHARS);
+    if (chunks.length === 0) {
+      throw new Error('content_draft contains no renderable content');
+    }
+    console.log(`AgentMode: create_html_file — rendering a ${contentDraft.length}-char draft as ${chunks.length} sections (session ${sessionId})`);
+
+    const systemPrompt = `You are an expert web developer rendering ONE SECTION of a larger HTML report. Convert the section of the content draft you are given into clean, professional HTML.
+
+Return ONLY the HTML body fragment for this section:
+- No document-level markup at all — no doctype, no html/head/body tags, no stylesheet block and no scripts. The surrounding document and its stylesheet already exist.
+- Use semantic tags (h2, h3, p, ul, ol, table/thead/tbody/tr/th/td, blockquote). They are already styled by the document's stylesheet, so do NOT add CSS, class names or style attributes.
+- Present the section's content faithfully and completely — every entity, row and figure in it must appear in your output.
+- Do not add an introduction, conclusion, or navigation for the report as a whole: other sections are rendered separately and assembled around yours.
+
+DATA ACCURACY RULES (CRITICAL):
+- NEVER invent, estimate, approximate, or round numeric values
+- Use ONLY the exact numbers, names, dates and links provided — copy them verbatim
+- NEVER use placeholder labels like "Competitor A" or "Label 1" — use the actual names
+- If a value is not present in the section, omit it rather than guessing
+
+CHARTS (if the section's data calls for one):
+- Use a QuickChart image only: https://quickchart.io/chart?v=2.9.4&c=<URL-encoded Chart.js v2 JSON config> as the src of an <img>
+- Every string in the chart config JSON must have BOTH an opening and a closing quote, and the whole config must be URL-encoded
+- Do not use inline Chart.js or any other script: sections are assembled into one page, so scripts and canvas ids would collide${formatRequirements ? `\n\nAdditional Format Requirements:\n${formatRequirements}` : ''}`;
+
+    const renderSection = async (chunk: string, index: number): Promise<string> => {
+      const userPrompt = `Report title: ${title}
+
+This is section ${index + 1} of ${chunks.length} of the report.${index > 0 ? ' Do not repeat the report title — an earlier section already carries it.' : ''}
+
+Section content:
+${chunk}
+
+Return the HTML body fragment for this section only.`;
+      const maxSectionAttempts = 2;
+      for (let attempt = 1; attempt <= maxSectionAttempts; attempt++) {
+        try {
+          const rendered = await llmService.generateHTML(
+            systemPrompt,
+            userPrompt,
+            this.makeToolUsageCallback(sessionId, 'createHTMLFile'),
+            { userId, sessionId, feature: 'content_gen' },
+          );
+          const fragment = extractHtmlFragment(rendered);
+          if (!fragment) {
+            throw new Error(`section ${index + 1} of ${chunks.length} rendered empty`);
+          }
+          return fragment;
+        } catch (sectionError) {
+          // A streamed render timeout arrives as a bare "Stream timed out
+          // because of no activity for 300000 ms" with no name or code, so
+          // isTransientLLMError alone does not recognise it — but on a section
+          // this small a timeout really is a blip, so it is worth one retry.
+          const isTransient = isTransientLLMError(sectionError) || isRenderTimeoutError(sectionError);
+          if (attempt === maxSectionAttempts || !isTransient) throw sectionError;
+          console.warn(`AgentMode: section ${index + 1}/${chunks.length} render failed transiently, retrying once:`, sectionError instanceof Error ? sectionError.message : sectionError);
+          await this.sleep(1000);
+        }
+      }
+      // Unreachable: the loop either returns a fragment or throws.
+      throw new Error(`section ${index + 1} of ${chunks.length} could not be rendered`);
+    };
+
+    const fragments = await Promise.all(chunks.map(renderSection));
+    return assembleChunkedHtmlDocument(title, fragments);
+  }
+
+  /**
    * ENG-873 — graceful degradation for create_html_file. When the styled render
    * cannot run, convert the draft to HTML deterministically (no LLM, no network,
    * no size ceiling) and deliver THAT, so a downstream formatting failure can
@@ -26339,9 +26469,9 @@ Please generate a complete, professional HTML document that properly formats and
     const reason = renderFailure instanceof Error ? renderFailure.message : String(renderFailure);
     let uploadResult: { success: boolean; url?: string; error?: string };
     try {
-      const { renderMarkdownReportDocument } = await import('../utils/markdownHtmlReport');
+      const { renderMarkdownReportDocumentAsync } = await import('../utils/markdownHtmlReport');
       const { uploadFileToS3 } = await import('../utils/s3Utils');
-      const fallbackHtml = renderMarkdownReportDocument(title, contentDraft);
+      const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
       const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
       uploadResult = await uploadFileToS3(fallbackHtml, filename, userId, 'text/html');
       if (!uploadResult.success || !uploadResult.url) {
