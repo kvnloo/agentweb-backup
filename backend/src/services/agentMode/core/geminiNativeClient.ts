@@ -41,7 +41,7 @@ export interface GeminiRequestOptions {
  * keywords a Gemini function declaration accepts. Kept in sync with `Schema` in
  * `@google/genai/dist/genai.d.ts`.
  */
-const GEMINI_SCHEMA_KEYWORDS = new Set([
+export const GEMINI_SCHEMA_KEYWORDS = new Set([
   'anyOf', 'default', 'description', 'enum', 'example', 'format', 'items',
   'maxItems', 'maxLength', 'maxProperties', 'maximum', 'minItems', 'minLength',
   'minProperties', 'minimum', 'nullable', 'pattern', 'properties',
