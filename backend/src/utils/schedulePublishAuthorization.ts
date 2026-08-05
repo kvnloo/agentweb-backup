@@ -150,3 +150,43 @@ export function filterRequiredFunctionsToAuthorizedScope(
   const required = Array.isArray(requiredFunctionCalls) ? requiredFunctionCalls : [];
   return required.filter(name => !isPublishName(name) || authorization.tools.includes(name));
 }
+
+/**
+ * Combine the authorization a run was admitted under with a later re-read, keeping
+ * whichever is MORE RESTRICTIVE.
+ *
+ * A scheduled run resolves its authorization once at admission and threads that one
+ * value through every turn — that single-resolution rule is what stops the checker
+ * and the prompt disagreeing. But a run lasts minutes, so an owner who revokes
+ * consent mid-run would otherwise watch it publish anyway from a snapshot taken
+ * before they hit the switch. Revocation has to bite immediately; it is the only
+ * control they have once a run is live.
+ *
+ * The combination is deliberately MONOTONIC — it can only ever remove authorization,
+ * never add it:
+ *
+ *  - it cannot re-authorize a run that was admitted unauthorized, so a grant landing
+ *    mid-run never turns a draft-and-notify run into a publishing one behind the
+ *    owner's back;
+ *  - it cannot widen scope, so a tool added to the approved list mid-run is not
+ *    reachable until the next run;
+ *  - narrowing is idempotent and cannot oscillate, so re-applying it every turn can
+ *    only ever REDUCE what the checker nudges for — it can never reintroduce a
+ *    demand for a tool the prompt forbids.
+ *
+ * An unreadable re-read (`null`) keeps the admitted value rather than failing closed.
+ * Failing closed on a throttled DynamoDB read would silently downgrade a legitimately
+ * authorized run to draft-only, which is the ticket's original complaint in reverse —
+ * and the admitted value was itself resolved fail-closed.
+ */
+export function narrowPublishAuthorization(
+  admitted: SchedulePublishAuthorization,
+  latest: SchedulePublishAuthorization | null | undefined
+): SchedulePublishAuthorization {
+  if (!latest) return admitted;
+  const tools = admitted.tools.filter(tool => latest.tools.includes(tool));
+  return {
+    authorized: admitted.authorized && latest.authorized && tools.length > 0,
+    tools: admitted.authorized && latest.authorized ? tools : []
+  };
+}

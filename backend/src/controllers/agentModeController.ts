@@ -22,7 +22,7 @@ import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } fro
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { isPublishName } from '../utils/hardeningGaps';
-import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
+import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -1641,6 +1641,17 @@ export async function runVerifiedChat(
     // split verdict (Greptile P1). Undefined for callers with no schedule, which
     // fall back to the per-turn lookup inside generateSessionResponse.
     publishAuthorization?: SchedulePublishAuthorization;
+    /**
+     * ENG-827: re-reads the schedule's CURRENT publish authorization. Called at the
+     * top of each attempt and combined with the admitted value via
+     * narrowPublishAuthorization, which can only ever remove authorization. This is
+     * what makes revoking consent take effect on a run that is already in flight —
+     * without it the owner's kill switch does nothing until the next run, which for
+     * a multi-minute publishing run is exactly when they need it. Resolution stays
+     * single-source: one refreshed value narrows the prompt directive and the
+     * required-function list together, so they still cannot disagree.
+     */
+    refreshPublishAuthorization?: () => Promise<SchedulePublishAuthorization | null>;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -1648,15 +1659,22 @@ export async function runVerifiedChat(
     userId,
     startingMessage,
     keywords = [],
-    requiredFunctions = [],
     maxAttempts = 20,
     attachments = [],
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
     parkNotifiable = false,
-    publishAuthorization
+    publishAuthorization,
+    refreshPublishAuthorization
   } = params;
+
+  // ENG-827: both of these NARROW mid-run when the owner revokes consent, and are
+  // always narrowed together from one value so the checker can never demand a tool
+  // the prompt forbids. Not `const`, because revocation must bite during a live run
+  // — a snapshot taken at admission would publish minutes after the owner said stop.
+  let livePublishAuthorization = publishAuthorization;
+  let requiredFunctions = params.requiredFunctions ?? [];
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
   // question, so a model that keeps re-asking cannot loop until maxAttempts. Once
@@ -1904,6 +1922,37 @@ export async function runVerifiedChat(
   while (attempt < maxAttempts) {
     attempt++;
 
+    // ENG-827: re-check consent before every turn so a revocation lands mid-run
+    // instead of a run publishing from an admission-time snapshot minutes after the
+    // owner switched it off. narrowPublishAuthorization only ever REMOVES rights, so
+    // this can neither re-authorize a run nor widen its scope. The prompt directive
+    // and the checker's required list are narrowed from that one value in the same
+    // step — the invariant that stops the checker nudging for a tool the prompt
+    // forbids (the ~21-turn loop this ticket is about) holds turn by turn, not just
+    // at admission. A failed re-read keeps the admitted value rather than downgrading
+    // an authorized run on a throttled query.
+    if (refreshPublishAuthorization && livePublishAuthorization) {
+      try {
+        // The CALLER applies narrowPublishAuthorization and owns the running value,
+        // so the rule lives in exactly one place and the caller still holds the final
+        // effective authorization to report the run against. Here we only consume it.
+        const narrowed = (await refreshPublishAuthorization()) ?? livePublishAuthorization;
+        if (narrowed.tools.length !== livePublishAuthorization.tools.length) {
+          console.log(
+            `AgentMode: publish consent narrowed mid-run for session ${sessionId} — ` +
+            `authorized tools [${livePublishAuthorization.tools.join(', ') || 'none'}] -> ` +
+            `[${narrowed.tools.join(', ') || 'none'}]`
+          );
+          requiredFunctions = requiredFunctions.filter(rf =>
+            filterRequiredFunctionsToAuthorizedScope([rf.functionName], narrowed).length > 0
+          );
+        }
+        livePublishAuthorization = narrowed;
+      } catch (err) {
+        console.error('AgentMode: publish-consent re-check failed; keeping the admitted authorization:', err);
+      }
+    }
+
     try {
       // Prepare user message for this attempt
       let userMessage = startingMessage;
@@ -1958,7 +2007,7 @@ export async function runVerifiedChat(
           defaultModel,
           [],
           undefined, undefined, undefined, undefined, undefined, undefined,
-          publishAuthorization
+          livePublishAuthorization
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -2087,7 +2136,7 @@ export async function runVerifiedChat(
         defaultModel,
         attachmentsForThisAttempt,
         undefined, undefined, undefined, undefined, undefined, undefined,
-        publishAuthorization
+        livePublishAuthorization
       );
 
       if (!hasAssistantOutput(response)) {
@@ -3012,6 +3061,10 @@ export async function runScheduledChat(
     // scope. `tools` is empty when unauthorized, so this still drops every publish
     // requirement in that case.
     const publishAuthorization = resolveSchedulePublishAuthorization(schedule);
+    // ENG-827: the authorization this run is CURRENTLY operating under. Starts at the
+    // admitted value and is narrowed — never widened — by each mid-run re-check, so it
+    // also ends up holding the final state the run's record must be reported against.
+    let effectivePublishAuthorization = publishAuthorization;
     const requiredFunctions = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, publishAuthorization)
       .map((funcName: string) => ({
         functionName: funcName,
@@ -3063,6 +3116,17 @@ export async function runScheduledChat(
       // ENG-827: same object that filtered `requiredFunctions` above, so the prompt
       // and the checker state one decision rather than two independent reads.
       publishAuthorization,
+      // ENG-827: consent can be withdrawn while this run is still executing, and a
+      // run lasts minutes. Re-read it each turn so revoking actually stops an
+      // in-flight publish instead of taking effect only on the NEXT run. Narrowing
+      // is monotonic, so this can never grant rights the admission snapshot lacked.
+      refreshPublishAuthorization: async () => {
+        effectivePublishAuthorization = narrowPublishAuthorization(
+          effectivePublishAuthorization,
+          resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(schedule.scheduleId))
+        );
+        return effectivePublishAuthorization;
+      },
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,
@@ -3168,12 +3232,20 @@ export async function runScheduledChat(
     // Nothing downstream can tell that apart from a genuine silent miss, which is
     // the false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
     // feeds the checker, the prompt and this record.
-    requiredFunctions.forEach(({ functionName, minCount }) => {
-      finalFunctionCallDetails[functionName] = {
-        actual: actualFunctionCallCounts[functionName] || 0,
-        required: minCount
-      };
-    });
+    // ENG-827: report against `effectivePublishAuthorization` — the authorization the
+    // run FINISHED under, which differs from the admitted one when the owner revoked
+    // consent mid-run. Reading the raw schedule config here instead persisted a
+    // self-contradicting record: post_on_connected_account {required: 1, actual: 0}
+    // next to an empty functionCallMisses on a passing run. Nothing downstream can
+    // tell that apart from a genuine silent miss — the false-failure shape ENG-479 /
+    // ENG-764 had to unpick.
+    filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization)
+      .forEach((functionName: string) => {
+        finalFunctionCallDetails[functionName] = {
+          actual: actualFunctionCallCounts[functionName] || 0,
+          required: functionCallMinCalls[functionName] || 1
+        };
+      });
 
     // ENG-635: a run that met its requirements but still deferred to an absent human
     // (deferredUnresolved) produced no real deliverable — record it as a failure so it
