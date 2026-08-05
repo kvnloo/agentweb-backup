@@ -2284,6 +2284,10 @@ mcpToolRegistry.register({
           try {
             const current = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
             existingSteps = Array.isArray(current?.steps) ? current.steps : [];
+            // Stake the read: everything below is judged against these steps, so
+            // a write that lands in between has to fail rather than quietly make
+            // that judgement wrong (ENG-890).
+            body.expectedStepsRev = current?.steps_rev ?? null;
           } catch (error: any) {
             // Fail closed in both modes: without the current steps we can
             // neither merge nor tell whether a replace would delete steps, and
@@ -2330,7 +2334,22 @@ mcpToolRegistry.register({
           }
         }
 
-        const data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+        let data: any;
+        try {
+          data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+        } catch (error: any) {
+          // The stake above was rejected. Nothing was written, and a blind retry
+          // would re-send a payload built from steps that no longer exist.
+          if (String(error?.message || '').includes('409')) {
+            return jsonResult({
+              error: `Work plan ${args.plan_id} changed while this update was being prepared, so nothing was saved.`,
+              howToProceed: [
+                'Re-read the plan with action="get" and retry the change against its current steps.',
+              ],
+            });
+          }
+          throw error;
+        }
         if (stepsChange && data && typeof data === 'object' && !Array.isArray(data)) {
           return jsonResult({ ...data, stepsChange });
         }
