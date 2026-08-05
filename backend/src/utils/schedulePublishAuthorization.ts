@@ -10,29 +10,33 @@ import { isPublishName } from './hardeningGaps';
  * to refusing — while the deterministic required-function checker nudges it up to
  * `maxAttempts` (20) times. That is the loop that burned the reported runs.
  *
- * Authorization comes ONLY from an explicit, structured, owner-set boolean:
+ * Authorization comes from EXACTLY ONE signal: `autopublishAuthorized`, the dedicated
+ * per-schedule consent flag. Its checkbox states in plain words that the run will
+ * publish to the live connected account without showing the owner the content first,
+ * that posts go live automatically, and that they cannot be un-published. Ticking it
+ * is informed consent. Nothing else grants it.
  *
- *  A. `autopublishAuthorized` — the dedicated per-schedule consent flag. Its checkbox
- *     states in plain words that the run will publish to the live account without
- *     showing the owner the content first. Ticking it is informed consent.
- *
- *  B. `fullAutonomy` — the pre-existing broader waiver, rendered as an amber warning
- *     covering "irreversible choices that can't be undone after launch". Publishing
- *     is squarely within what that already asks the owner to accept.
- *
- * Deliberately NOT a signal:
+ * Three other signals were tried and each was rejected for the SAME reason — a control
+ * whose own wording does not tell the owner that publishing-without-review is what
+ * they are agreeing to cannot serve as consent for it:
  *
  *  - `requiredFunctionCalls` naming a publish tool. That picker is a VERIFICATION
  *    control ("this run only counts as successful if it called X") and its UI carries
- *    no approval-waiver language, so a tick cannot mean consent. 5 of the 8 production
- *    schedules requiring a publish tool — including the ACTIVE "LUCAS — LinkedIn
- *    Thought Leadership" — would otherwise have started publishing unreviewed.
+ *    no approval-waiver language. 5 of the 8 production schedules requiring a publish
+ *    tool — including the ACTIVE "LUCAS — LinkedIn Thought Leadership" — would
+ *    otherwise have started publishing unreviewed.
  *
  *  - Approval-waiver wording in the schedule's prompt. Intent inferred from prose is
  *    not consent: the wording is unscoped, so a waiver written about a different step
  *    ("do not ask for approval when generating images") would authorize a live post.
- *    A prose matcher can always be narrowed and will always have another hole; consent
- *    has to be a field the owner deliberately set.
+ *    A prose matcher can always be narrowed and will always have another hole.
+ *
+ *  - `fullAutonomy`. It reads "if Emma needs a decision mid-run, she'll proceed with
+ *    her recommended option instead of pausing to ask you" — it governs how a blocking
+ *    AskUserQuestion is ANSWERED (see ENG-396/ENG-517), not whether a live write may
+ *    happen. An owner ticking it consented to Emma picking between options, not to
+ *    Emma posting content they never saw. It remains in force for question handling
+ *    and is deliberately irrelevant here.
  *
  * Everything is fail-closed: an unreadable schedule, a malformed field, or anything
  * short of an explicit true resolves to NOT authorized — the reversible
@@ -44,10 +48,11 @@ import { isPublishName } from './hardeningGaps';
  */
 
 export interface SchedulePublishAuthorizationInput {
-  /** Dedicated per-schedule consent flag — the owner ticked "publish without review". */
+  /**
+   * The ONLY consent signal — the owner ticked "Publish without my review", whose
+   * copy spells out that posts go live unseen and cannot be un-published.
+   */
   autopublishAuthorized?: boolean;
-  /** Broader irreversible-action waiver; also covers publishing. */
-  fullAutonomy?: boolean;
   /** Used only to report WHICH publish tools are in scope — never to grant consent. */
   requiredFunctionCalls?: string[];
 }
@@ -76,11 +81,12 @@ export function resolveSchedulePublishAuthorization(
     new Set(required.filter((name): name is string => typeof name === 'string' && isPublishName(name)))
   );
 
-  // Consent is a flag the owner deliberately set — never inferred from the required
-  // -function picker or from wording in the prompt. Strict === true so a truthy
-  // string/number from a loosely-typed caller cannot grant publishing rights.
-  const authorized =
-    schedule.autopublishAuthorized === true || schedule.fullAutonomy === true;
+  // Consent is the one flag the owner deliberately set for THIS purpose — never
+  // inferred from the required-function picker, from prompt wording, or from
+  // fullAutonomy (which governs how blocking questions are answered, not whether a
+  // live write may happen). Strict === true so a truthy string/number from a
+  // loosely-typed caller cannot grant publishing rights.
+  const authorized = schedule.autopublishAuthorized === true;
 
   return { authorized, tools };
 }
