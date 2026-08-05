@@ -251,7 +251,7 @@ router.post('/', (req: express.Request, res: express.Response) => {
           });
 
           if (result.success) {
-            console.log(`[Calendly Webhook] CAPI Lead event sent for user ${resolved.userId} (fbtrace_id=${result.fbtraceId ?? 'n/a'})`);
+            console.log(`[Calendly Webhook] CAPI Schedule event sent for user ${resolved.userId} (fbtrace_id=${result.fbtraceId ?? 'n/a'})`);
           } else {
             console.error(`[Calendly Webhook] CAPI send failed for user ${resolved.userId}: ${result.error}`);
           }
