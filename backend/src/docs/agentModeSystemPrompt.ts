@@ -592,6 +592,19 @@ export function getScheduledSessionOverride(sessionType?: string): string {
 // tool outcomes) apply UNCONDITIONALLY, because inventing a gate is a reporting
 // violation regardless of authorization — including misdescribing this very
 // authorization block as a platform gate.
+//
+// WHERE THE OWNER FLIPS IT: the unauthorized branch tells the owner to turn on
+// "Publish without approval", so that control has to exist or the instruction is
+// a dead end. It is the switch in the Customer Portal's schedule form —
+// src/components/agent-mode/schedule/ScheduleFormPanel.tsx in the SEPARATE
+// agentweb-customer-portal repo (PR #1002), which submits the form to
+// POST/PUT /api/agent-mode/scheduled-chats. That is why the control is not
+// greppable from this repo. The half of the path that DOES live here — the two
+// handlers reading `unattendedPublishAuthorized` off req.body, coercing it
+// strictly, and preserving it across partial updates — is pinned by
+// agentModeController.publishOptInWritePath.test.ts. Deliberately absent from
+// the manage_scheduled_chat MCP allowlist so only a human can grant it
+// (pinned by agentModeController.unattemptedPublishGate.test.ts).
 export function getUnattendedExecutionDirective(sessionType?: string, isAdmin?: boolean, publishAuthorized?: boolean): string {
   if (sessionType !== 'scheduled') return '';
   // The userId→identity mapping and its data-minimization guard reference two
