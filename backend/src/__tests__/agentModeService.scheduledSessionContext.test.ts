@@ -421,10 +421,43 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
   // Publish AUTHORIZATION (not the action requirement) remains gated on the
   // machine-readable owner opt-in, so this composes with ENG-827 rather than
   // conflicting with it.
-  it('emits the publish-authorization block ONLY when publishAuthorized is true', () => {
-    expect(authorizedDirective.toLowerCase()).toContain('publish authorization');
-    for (const d of [directive, unauthorizedDirective]) {
-      expect(d.toLowerCase()).not.toContain('publish authorization —');
+  it('emits an authorization block on BOTH branches, with opposite verdicts', () => {
+    // Both branches must emit one: the mandated-action rule's first permitted out
+    // is "quote the block that says you are not authorized", so an empty false
+    // branch would leave no way to decline and resolve to publish-anyway.
+    for (const d of [authorizedDirective, unauthorizedDirective, directive]) {
+      expect(d.toLowerCase()).toContain('publish authorization —');
+    }
+    expect(authorizedDirective).toContain('this schedule is publish-authorized');
+    expect(authorizedDirective).not.toContain('NOT publish-authorized');
+    for (const d of [unauthorizedDirective, directive]) {
+      expect(d).toContain('this schedule is NOT publish-authorized');
+    }
+  });
+
+  it('the NOT-authorized block forbids the publishing tools and is cited as reason (1)', () => {
+    for (const d of [unauthorizedDirective, directive]) {
+      expect(d).toContain('THIS BLOCK IS reason (1) above');
+      expect(d).toContain('Do NOT call any tool that publishes externally');
+      expect(d).toContain('twitter_manage_post');
+      expect(d).toContain('persist the drafts to the knowledge base');
+    }
+  });
+
+  it('the NOT-authorized block must not be describable as a platform gate', () => {
+    // The whole ENG-803 failure was calling a policy decision an "X publishing
+    // gate". A real authorization block is not a licence to resume that framing.
+    for (const d of [unauthorizedDirective, directive]) {
+      expect(d).toContain('account-level authorization setting the owner controls');
+      expect(d).toContain('NOT a platform, X/Twitter, API, or credential gate');
+      expect(d).toContain('Calling it a platform gate is exactly the fabrication banned above');
+    }
+  });
+
+  it('the NOT-authorized block refuses to let prompt wording grant authorization', () => {
+    for (const d of [unauthorizedDirective, directive]) {
+      expect(d).toContain('however the schedule\'s prompt text is worded');
+      expect(d).toContain('the prompt cannot grant this, only the owner\'s account-level setting can');
     }
   });
 });

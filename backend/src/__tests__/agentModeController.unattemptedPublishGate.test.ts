@@ -16,6 +16,8 @@
 
 import {
   classifyScheduledContinuation,
+  classifyScheduledContinuationAsync,
+  resolvePublishAuthorized,
   scheduledRunDeferredPublishWithoutAttempt,
   scheduledRunAwaitsConfirmation,
 } from '../controllers/agentModeController';
@@ -41,7 +43,7 @@ describe('scheduledRunDeferredPublishWithoutAttempt (ENG-803)', () => {
     expect(scheduledRunAwaitsConfirmation(REPORT_EXCERPT)).toBe(false);
 
     expect(scheduledRunDeferredPublishWithoutAttempt(REPORT_EXCERPT, READ_ONLY_CALLS)).toBe(true);
-    expect(classifyScheduledContinuation({ content: REPORT_EXCERPT, toolCalls: READ_ONLY_CALLS })).toBe(
+    expect(classifyScheduledContinuation({ content: REPORT_EXCERPT, toolCalls: READ_ONLY_CALLS }, true)).toBe(
       'unattempted-publish'
     );
   });
@@ -109,7 +111,77 @@ describe('scheduledRunDeferredPublishWithoutAttempt (ENG-803)', () => {
         content: REPORT_EXCERPT,
         toolCalls: READ_ONLY_CALLS,
         truncatedByStepBudget: true,
-      })
+      }, true)
     ).toBe('unattempted-publish');
+  });
+
+  // ── Authorization gating (Greptile P1 on PR #2260) ────────────────────────
+  // The continuation this reason produces ORDERS the model to publish. Firing it
+  // on a schedule the owner never authorized would manufacture an unauthorized
+  // external post out of the exact draft-and-notify behaviour the safe default is
+  // supposed to produce — so the reason requires the authorization signal.
+
+  it('does NOT fire on an unauthorized schedule, even though the deferral is detected', () => {
+    // the underlying detector still sees it — only the continuation is withheld
+    expect(scheduledRunDeferredPublishWithoutAttempt(REPORT_EXCERPT, READ_ONLY_CALLS)).toBe(true);
+    expect(classifyScheduledContinuation({ content: REPORT_EXCERPT, toolCalls: READ_ONLY_CALLS }, false)).toBeNull();
+  });
+
+  it('fails closed when the caller resolves no authorization signal at all', () => {
+    // omitted arg → default false → never publish. A new caller is safe by default.
+    expect(classifyScheduledContinuation({ content: REPORT_EXCERPT, toolCalls: READ_ONLY_CALLS })).toBeNull();
+  });
+
+  it('still yields a lower-precedence reason on an unauthorized schedule', () => {
+    // withholding 'unattempted-publish' must not swallow an unrelated signal
+    expect(
+      classifyScheduledContinuation({
+        content: REPORT_EXCERPT,
+        toolCalls: READ_ONLY_CALLS,
+        truncatedByStepBudget: true,
+      }, false)
+    ).toBe('budget');
+  });
+
+  it('async classifier gates on the same signal', async () => {
+    expect(
+      await classifyScheduledContinuationAsync({ content: REPORT_EXCERPT, toolCalls: READ_ONLY_CALLS }, true)
+    ).toBe('unattempted-publish');
+    expect(
+      await classifyScheduledContinuationAsync({ content: REPORT_EXCERPT, toolCalls: READ_ONLY_CALLS }, false)
+    ).not.toBe('unattempted-publish');
+  });
+});
+
+describe('resolvePublishAuthorized (ENG-803)', () => {
+  it('authorizes on the explicit fullAutonomy opt-in', () => {
+    expect(resolvePublishAuthorized({ fullAutonomy: true })).toBe(true);
+  });
+
+  it('authorizes when the owner made a publishing tool a required call', () => {
+    // the signal real X reply schedules actually carry — fullAutonomy is set on
+    // essentially no production schedule, so gating on it alone ships dead.
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['twitter_manage_post'] })).toBe(true);
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['post_on_connected_account'] })).toBe(true);
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['publish_blog_article'] })).toBe(true);
+  });
+
+  it('accepts runVerifiedChat\'s {functionName} shape as well as the schedule\'s string[]', () => {
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: [{ functionName: 'twitter_manage_post' }] })).toBe(true);
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: [{ functionName: 'search_tweets' }] })).toBe(false);
+  });
+
+  it('does NOT authorize on read-only or mixed-dispatcher required calls', () => {
+    // twitter_outreach is a mixed read/write dispatcher — its presence proves nothing
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: ['search_tweets', 'twitter_outreach'] })).toBe(false);
+  });
+
+  it('fails closed on every degenerate input', () => {
+    expect(resolvePublishAuthorized(undefined)).toBe(false);
+    expect(resolvePublishAuthorized(null)).toBe(false);
+    expect(resolvePublishAuthorized({})).toBe(false);
+    expect(resolvePublishAuthorized({ fullAutonomy: false })).toBe(false);
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: 'twitter_manage_post' as any })).toBe(false);
+    expect(resolvePublishAuthorized({ requiredFunctionCalls: [null, 42, {}] as any })).toBe(false);
   });
 });

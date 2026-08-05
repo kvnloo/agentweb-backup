@@ -305,8 +305,36 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).toContain('report_product_issues');
     expect(sp).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
     expect(sp).toContain('twitter_manage_post');
-    // …but a non-authorized schedule still gets no publish authorization.
-    expect(sp).not.toContain('PUBLISH AUTHORIZATION —');
+    // …and a non-authorized schedule gets an explicit REFUSAL block, not silence:
+    // without it the mandated-action rule has no citable "not authorized" out and
+    // would resolve to publishing anyway (Greptile P1 on PR #2260).
+    expect(sp).toContain('this schedule is NOT publish-authorized');
+    expect(sp).toContain('THIS BLOCK IS reason (1) above');
+    expect(sp).not.toContain('this schedule is publish-authorized');
+  });
+
+  it('treats a publishing tool in requiredFunctionCalls as the owner authorizing the publish', async () => {
+    // The owner listing the posting tool as a REQUIRED call is machine-readable
+    // standing intent to publish — and unlike fullAutonomy (set on essentially no
+    // production schedule) it is the signal real X reply schedules actually carry.
+    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({
+      scheduleId: SCHEDULE_ID,
+      fullAutonomy: false,
+      requiredFunctionCalls: ['search_tweets', 'twitter_manage_post'],
+    });
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    const sp = capturedSystemPrompt()!;
+    expect(sp).toContain('this schedule is publish-authorized');
+    expect(sp).not.toContain('NOT publish-authorized');
+  });
+
+  it('does NOT treat a read-only required call as publish authorization', async () => {
+    (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({
+      scheduleId: SCHEDULE_ID,
+      requiredFunctionCalls: ['search_tweets', 'get_chat_history'],
+    });
+    await agentModeController.generateResponse(makeReq(), makeRes());
+    expect(capturedSystemPrompt()!).toContain('this schedule is NOT publish-authorized');
   });
 
   it('adds the publish-authorization block when the schedule opted into fullAutonomy', async () => {
@@ -320,12 +348,12 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
   });
 
-  it('withholds only the authorization block when fullAutonomy is absent (safe default)', async () => {
-    // owner never opted in → schedule item lacks the flag entirely.
+  it('falls back to the NOT-authorized block when no signal is present (safe default)', async () => {
+    // owner never opted in → schedule item lacks both signals entirely.
     (scheduleDb.getScheduleById as jest.Mock).mockResolvedValue({ scheduleId: SCHEDULE_ID });
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
-    expect(sp).not.toContain('PUBLISH AUTHORIZATION —');
+    expect(sp).toContain('this schedule is NOT publish-authorized');
     expect(sp).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
     expect(sp).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
   });
@@ -338,7 +366,8 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     // closed on authorization while still shipping the truthful-reporting rules.
     expect(sp).toBeDefined();
     expect(sp!).toContain('[AUTOMATED UNATTENDED EXECUTION]');
-    expect(sp!).not.toContain('PUBLISH AUTHORIZATION —');
+    expect(sp!).toContain('this schedule is NOT publish-authorized');
+    expect(sp!).not.toContain('this schedule is publish-authorized');
     expect(sp!).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
     expect(sp!).toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
   });
