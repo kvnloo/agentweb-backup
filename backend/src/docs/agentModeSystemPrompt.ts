@@ -652,13 +652,13 @@ NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION (CRITICAL):
   ? `
 
 PUBLISH AUTHORIZATION — this schedule is publish-authorized (CRITICAL):
-- The owner has explicitly marked this schedule autonomous (the machine-readable authorization signal, not the prompt's wording). Any generic "get approval before publishing" default is therefore ALREADY satisfied for this run and is never a reason to withhold the action.`
+- The owner has explicitly turned on "Publish without approval" for this schedule (the machine-readable authorization signal, not the prompt's wording). Any generic "get approval before publishing" default is therefore ALREADY satisfied for this run and is never a reason to withhold the action.`
   : `
 
 PUBLISH AUTHORIZATION — this schedule is NOT publish-authorized (CRITICAL):
-- The owner has NOT enabled unattended publishing for this schedule — they never set the autonomy opt-in. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot grant this, only the owner's account-level setting can.
+- The owner has NOT enabled unattended publishing for this schedule — they never turned on its "Publish without approval" setting. Publishing externally on their behalf is therefore NOT authorized for this run, however the schedule's prompt text is worded — the prompt cannot grant this, only that setting can.
 - THIS BLOCK IS reason (1) above. Do NOT call any tool that publishes externally (e.g. twitter_manage_post, post_on_connected_account, publish_blog_article). Instead: do all the work up to the publish step, persist the drafts to the knowledge base, and state plainly in your final report that nothing was posted because unattended publishing is not enabled for this schedule.
-- Quote THIS block as the reason, and describe it accurately: it is an account-level authorization setting the owner controls, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action: turn on full autonomy for this schedule in its settings, and the next run will post.`}`;
+- Quote THIS block as the reason, and describe it accurately: it is an account-level authorization setting the owner controls, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action, naming the setting exactly: turn on "Publish without approval" in this schedule's settings, and the next run will post. Do NOT point them at "Full autonomy" — that setting governs whether Emma decides unaided mid-run and does NOT authorize publishing, so following it would leave the next run blocked in exactly the same place.`}`;
 }
 
 // Additional context injected ONLY when Emma runs as the sidebar/popup in the Customer Portal.

@@ -454,10 +454,22 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     }
   });
 
+  it('the unblocking action names the setting that actually grants authorization', () => {
+    // Drift guard: the signal moved from fullAutonomy to the schedule's own
+    // publishing opt-in, and this instruction was left pointing at the old
+    // toggle. An owner who followed it would enable full autonomy, get no
+    // publishing, and hit the identical block next run.
+    for (const d of [unauthorizedDirective, directive]) {
+      expect(d).toContain('"Publish without approval"');
+      expect(d).toContain('Do NOT point them at "Full autonomy"');
+      expect(d).not.toContain('turn on full autonomy');
+    }
+  });
+
   it('the NOT-authorized block refuses to let prompt wording grant authorization', () => {
     for (const d of [unauthorizedDirective, directive]) {
       expect(d).toContain('however the schedule\'s prompt text is worded');
-      expect(d).toContain('the prompt cannot grant this, only the owner\'s account-level setting can');
+      expect(d).toContain('the prompt cannot grant this, only that setting can');
     }
   });
 });
