@@ -222,6 +222,22 @@ describe('ENG-893 — Bedrock prompt-cache TTL', () => {
       });
     });
 
+    it('never leaks the machinePaced hint into a non-Bedrock request body', async () => {
+      // `params` is handed verbatim to client.chat.completions.create() for
+      // every provider and the OpenAI SDK forwards unknown body fields to the
+      // API, where Azure returns 400 on an unrecognised argument. Only the
+      // Bedrock wrapper may ever see this field.
+      const created: any[] = [];
+      (agentModeService as any).llmModels['gpt-5-chat-2'].client = {
+        chat: { completions: { create: async (p: any) => { created.push(p); return { choices: [{ message: { content: 'ok' } }] }; } } },
+      };
+
+      await (agentModeService as any).callLLM('gpt-5-chat-2', CONVERSATION, { machinePaced: true });
+
+      expect(created).toHaveLength(1);
+      expect(created[0]).not.toHaveProperty('machinePaced');
+    });
+
     it('never mixes TTLs within one request (Bedrock requires longer TTLs first)', async () => {
       const { ConverseCommand } = require('@aws-sdk/client-bedrock-runtime');
 

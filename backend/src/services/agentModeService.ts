@@ -2690,10 +2690,17 @@ export class AgentModeService {
       model: model,
       messages: messages,
       response_format: response_format || { type: "text" },
-      // Consumed only by the Bedrock Converse wrapper's cache-TTL choice; other
-      // providers ignore it (ENG-893).
-      machinePaced,
     };
+
+    // ENG-893: cache-TTL hint for the Bedrock Converse wrapper, which reads it
+    // off `params` and never forwards it to ConverseCommand. Set ONLY for
+    // Bedrock models: `params` is handed verbatim to
+    // `client.chat.completions.create()` for every provider, and the OpenAI SDK
+    // forwards unknown body fields to the API — Azure OpenAI rejects an
+    // unrecognised argument with a 400, which would break every GPT turn.
+    if (model.startsWith('anthropic.')) {
+      params.machinePaced = machinePaced;
+    }
 
     // Only add tools and tool_choice if tools are provided
     if (tools && tools.length > 0) {
