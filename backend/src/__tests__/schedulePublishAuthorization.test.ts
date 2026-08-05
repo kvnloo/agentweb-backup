@@ -354,10 +354,14 @@ describe('narrowPublishAuthorization (ENG-827 mid-run revocation)', () => {
     expect(out.tools).toEqual(['post_on_connected_account']);
   });
 
-  it('keeps the admitted authorization when the re-read fails (no downgrade on a throttled query)', () => {
+  // Greptile review #19: keeping the admitted value while the schedule cannot be read
+  // let a revoked run keep publishing. The outcomes are not symmetric — publishing
+  // blind is an irreversible post the owner may already have revoked; withholding is a
+  // draft, which this ticket calls a success state.
+  it('FAILS CLOSED when the re-read is unavailable, rather than publishing while blind', () => {
     const admitted = A(['post_on_connected_account']);
-    expect(narrowPublishAuthorization(admitted, null)).toEqual(admitted);
-    expect(narrowPublishAuthorization(admitted, undefined)).toEqual(admitted);
+    expect(narrowPublishAuthorization(admitted, null)).toEqual({ authorized: false, tools: [] });
+    expect(narrowPublishAuthorization(admitted, undefined)).toEqual({ authorized: false, tools: [] });
   });
 
   it('is idempotent, so re-applying it every turn cannot oscillate', () => {
