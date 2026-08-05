@@ -104,15 +104,40 @@ describe('Scheduled Chat MCP Tools', () => {
       expect(props.revoke_autopublish.description).toMatch(/cannot grant/i);
     });
 
-    it('REVOKES consent when asked, sending autopublishAuthorized=false', async () => {
+    // The revoke must reach the DEDICATED consent endpoint. Sending it on the
+    // generic update body looks correct but is silently dropped: that route
+    // deliberately preserves the stored consent value so no broad update can grant
+    // publishing. Asserting the request is *sent* is not enough — assert where.
+    it('REVOKES via the dedicated consent endpoint, not the generic update body', async () => {
       mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
       await mcpToolRegistry.execute('manage_scheduled_chat', {
         action: 'update',
         schedule_id: 'sc-1',
         revoke_autopublish: true,
       } as any, context);
-      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
-      expect(body.autopublishAuthorized).toBe(false);
+
+      const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
+      const put = calls.find(c => c.method === 'PUT');
+      const consent = calls.find(c => c.path.endsWith('/publish-consent'));
+
+      // the generic update must NOT carry consent — it would be ignored there
+      expect(put.body).not.toHaveProperty('autopublishAuthorized');
+      // the revoke must actually land on the endpoint that can apply it
+      expect(consent).toBeDefined();
+      expect(consent.method).toBe('POST');
+      expect(consent.path).toBe('/api/agent-mode/scheduled-chats/sc-1/publish-consent');
+      expect(consent.body).toEqual({ authorized: false });
+    });
+
+    it('does not touch consent at all when revoke_autopublish is absent or false', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        revoke_autopublish: false,
+      } as any, context);
+      const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
+      expect(calls.find(c => c.path.endsWith('/publish-consent'))).toBeUndefined();
     });
 
     it('never sends a GRANT, whatever the model passes', async () => {
@@ -124,8 +149,11 @@ describe('Scheduled Chat MCP Tools', () => {
         autopublish_authorized: true,
         autopublishAuthorized: true,
       } as any, context);
-      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
-      expect(body.autopublishAuthorized).toBeUndefined();
+      const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
+      expect(calls[0].body.autopublishAuthorized).toBeUndefined();
+      // and nothing may reach the consent endpoint asking to enable publishing
+      const consent = calls.find(c => c.path.endsWith('/publish-consent'));
+      expect(consent).toBeUndefined();
     });
 
     it('never forwards an autopublish field to the API on create, even if passed', async () => {
