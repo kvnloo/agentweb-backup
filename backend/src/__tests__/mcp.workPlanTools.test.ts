@@ -44,6 +44,10 @@ describe('Predefined Work Plan MCP Tools', () => {
 
   const context = { userId: 'user-123', agentUserId: 'user-123' };
 
+  /** The mcpFetch calls that carry a payload — i.e. everything but the
+   *  pre-update read the destructive-steps guard performs (ENG-890). */
+  const writeCalls = () => mockMcpFetch.mock.calls.filter((call: any) => call[0].method !== 'GET');
+
   // ─── FAIL tests: invalid inputs, boundary conditions, error paths ────
 
   describe('registration', () => {
@@ -195,7 +199,9 @@ describe('Predefined Work Plan MCP Tools', () => {
   // ─── ENG-889: step fields are documented snake_case but the admin route
   // reads them camelCase. Both casings must reach the route as camelCase.
   describe('manage_predefined_work_plan - step field casing', () => {
-    const stepBodyOf = (call: number) => ((mockMcpFetch.mock.calls[call][0] as any).body.steps);
+    // An update reads the plan before writing (ENG-890), so the first call is a
+    // bodyless GET. Index over the write calls to keep asserting on the payload.
+    const stepBodyOf = (call: number) => ((writeCalls()[call][0] as any).body.steps);
 
     it('maps the documented snake_case required_function_calls to requiredFunctionCalls on create', async () => {
       mockMcpFetch.mockResolvedValue({ id: 'wp-new' });
@@ -419,7 +425,7 @@ describe('Predefined Work Plan MCP Tools', () => {
           visibility: 'public',
         }, context);
 
-        expect('visibility' in (mockMcpFetch.mock.calls[0][0] as any).body).toBe(false);
+        expect('visibility' in (writeCalls()[0][0] as any).body).toBe(false);
       },
     );
   });
@@ -443,6 +449,604 @@ describe('Predefined Work Plan MCP Tools', () => {
           steps: [{ title: 'New Step' }],
         }),
       }));
+    });
+  });
+
+  // ─── ENG-890: partial step payloads must not silently wipe the plan ──────
+  describe('manage_predefined_work_plan - update step safety', () => {
+    const existingPlan = {
+      planId: 'wp-1',
+      title: 'Meta Launch Gate',
+      steps_rev: 'rev-1',
+      steps: [
+        { stepCount: 1, title: 'Step 1: Scope', description: 'old scope', requiredFunctionCalls: ['a'], skillIds: ['s1'] },
+        { stepCount: 2, title: 'Step 2: Inventory', description: 'inventory', requiredFunctionCalls: [], skillIds: [] },
+        { stepCount: 3, title: 'Step 3: Placements', description: 'placements', requiredFunctionCalls: [], skillIds: [] },
+        { stepCount: 4, title: 'Step 4: Audit', description: 'audit', requiredFunctionCalls: [], skillIds: [] },
+        { stepCount: 5, title: 'Step 5: Journey', description: 'journey', requiredFunctionCalls: [], skillIds: [] },
+        { stepCount: 6, title: 'Step 6: Verdict', description: 'verdict', requiredFunctionCalls: [], skillIds: [] },
+        { stepCount: 7, title: 'Step 7: Hand-off', description: 'handoff', requiredFunctionCalls: [], skillIds: [] },
+      ],
+    };
+
+    /** GET returns the current plan; PUT returns the saved plan. */
+    function mockPlanFetches(saved: any = { planId: 'wp-1', message: 'Updated' }) {
+      mockMcpFetch.mockImplementation(async (opts: any) =>
+        opts.method === 'GET' ? JSON.parse(JSON.stringify(existingPlan)) : saved
+      );
+    }
+    const putCalls = () => mockMcpFetch.mock.calls.filter((c: any) => c[0].method === 'PUT');
+
+    it('refuses a shrinking replace and does NOT issue the PUT', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: [{ title: 'Step 1: Scope', description: 'amended scope' }],
+      }, context);
+
+      expect(putCalls()).toHaveLength(0);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toBeDefined();
+      expect(payload.stepsWouldBeRemoved).toBe(6);
+      expect(payload.removedStepTitles).toContain('Step 7: Hand-off');
+    });
+
+    it('rejects a non-array steps payload without calling the API', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: { title: 'Step 1: Scope' },
+      }, context);
+
+      expect(putCalls()).toHaveLength(0);
+      expect(JSON.parse(result.content[0].text).error).toMatch(/array/i);
+    });
+
+    it('fails closed in replace mode when the pre-update read fails', async () => {
+      mockMcpFetch.mockImplementation(async (opts: any) => {
+        if (opts.method === 'GET') throw new Error('HTTP 503: Service Unavailable');
+        return { planId: 'wp-1', message: 'Updated' };
+      });
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: [{ title: 'Step 1: Scope', description: 'amended scope' }],
+      }, context);
+
+      expect(putCalls()).toHaveLength(0);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/failed to read its current steps/i);
+      expect(payload.error).toContain('HTTP 503: Service Unavailable');
+    });
+
+    it('merge mode amends the targeted step and keeps every other step', async () => {
+      mockPlanFetches();
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps_mode: 'merge',
+        steps: [{ title: 'Step 1: Scope', description: 'amended scope' }],
+      }, context);
+
+      const body = (putCalls()[0][0] as any).body;
+      expect(body.steps).toHaveLength(7);
+      expect(body.steps[0].description).toBe('amended scope');
+      expect(body.steps[0].requiredFunctionCalls).toEqual(['a']);
+      expect(body.steps[0].skillIds).toEqual(['s1']);
+      expect(body.steps[6].title).toBe('Step 7: Hand-off');
+    });
+
+    it('merge mode targets by step_count when titles are being renamed', async () => {
+      mockPlanFetches();
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps_mode: 'merge',
+        steps: [{ step_count: 3, title: 'Step 3: Placement settings' }],
+      }, context);
+
+      const body = (putCalls()[0][0] as any).body;
+      expect(body.steps).toHaveLength(7);
+      expect(body.steps[2].title).toBe('Step 3: Placement settings');
+      expect(body.steps[2].description).toBe('placements');
+    });
+
+    it('merge mode appends steps that match nothing existing', async () => {
+      mockPlanFetches();
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps_mode: 'merge',
+        steps: [{ title: 'Step 8: Retro', description: 'new step' }],
+      }, context);
+
+      const body = (putCalls()[0][0] as any).body;
+      expect(body.steps).toHaveLength(8);
+      expect(body.steps[7]).toEqual(expect.objectContaining({ stepCount: 8, title: 'Step 8: Retro' }));
+    });
+
+    it('allows a shrinking replace when confirm_step_removal is true and reports the diff', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        confirm_step_removal: true,
+        steps: [{ title: 'Step 1: Scope', description: 'amended scope' }],
+      }, context);
+
+      expect(putCalls()).toHaveLength(1);
+      expect((putCalls()[0][0] as any).body.steps).toHaveLength(1);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.stepsChange).toEqual(expect.objectContaining({
+        mode: 'replace', stepsBefore: 7, stepsAfter: 1, stepsRemoved: 6,
+      }));
+    });
+
+    it('replaces without confirmation when no step is dropped', async () => {
+      mockPlanFetches();
+
+      // Carries each step's stored fields through: this test is about the step
+      // COUNT being unchanged, and a payload that dropped them would (rightly)
+      // be stopped by the content guard instead.
+      const rewritten = existingPlan.steps.map((s) => ({ ...s, description: 'rewritten' }));
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: rewritten,
+      }, context);
+
+      expect(putCalls()).toHaveLength(1);
+      expect((putCalls()[0][0] as any).body.steps).toHaveLength(7);
+      expect(JSON.parse(result.content[0].text).stepsChange.stepsRemoved).toBe(0);
+    });
+
+    it('does not read the plan when steps are not being changed', async () => {
+      mockPlanFetches();
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        title: 'Renamed plan',
+      }, context);
+
+      expect(mockMcpFetch.mock.calls.filter((c: any) => c[0].method === 'GET')).toHaveLength(0);
+      expect(putCalls()).toHaveLength(1);
+      expect((putCalls()[0][0] as any).body.steps).toBeUndefined();
+    });
+
+    // The guard's decision is only as good as the snapshot it read. Staking that
+    // read means a plan changed in the meantime fails the write instead of
+    // overwriting it with a payload that was only safe against the old steps.
+    describe('staking the inspected plan', () => {
+      it('sends the revision it read back with the write', async () => {
+        mockPlanFetches();
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 1, description: 'amended' }],
+        }, context);
+
+        expect((putCalls()[0][0] as any).body.expectedStepsRev).toBe('rev-1');
+      });
+
+      it('stakes null when the plan predates the revision field', async () => {
+        mockMcpFetch.mockImplementation(async (opts: any) =>
+          opts.method === 'GET'
+            ? { planId: 'wp-1', steps: existingPlan.steps }
+            : { planId: 'wp-1' }
+        );
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 1, description: 'amended' }],
+        }, context);
+
+        const body = (putCalls()[0][0] as any).body;
+        expect('expectedStepsRev' in body).toBe(true);
+        expect(body.expectedStepsRev).toBeNull();
+      });
+
+      it('does not stake a revision on a metadata-only update, which never read one', async () => {
+        mockPlanFetches();
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          welcome_message: 'hello',
+        }, context);
+
+        expect('expectedStepsRev' in (putCalls()[0][0] as any).body).toBe(false);
+      });
+
+      it('turns a lost race into a retry instruction rather than an opaque failure', async () => {
+        mockMcpFetch.mockImplementation(async (opts: any) => {
+          if (opts.method === 'GET') return JSON.parse(JSON.stringify(existingPlan));
+          throw new Error('API error (409): Work plan steps changed');
+        });
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 1, description: 'amended' }],
+        }, context);
+
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload.error).toMatch(/changed while/i);
+        expect(payload.howToProceed).toEqual(expect.arrayContaining([expect.stringMatching(/retry/i)]));
+      });
+
+      it('does not swallow an unrelated write failure as a lost race', async () => {
+        mockMcpFetch.mockImplementation(async (opts: any) => {
+          if (opts.method === 'GET') return JSON.parse(JSON.stringify(existingPlan));
+          throw new Error('API error (500): Failed to update work plan');
+        });
+
+        await expect(mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 1, description: 'amended' }],
+        }, context)).rejects.toThrow(/500/);
+      });
+    });
+
+    it('documents the replace semantics and the merge escape hatch in the tool description', () => {
+      const def = mcpToolRegistry.getTool('manage_predefined_work_plan')!.definition as any;
+      expect(def.description).toMatch(/replaces the entire/i);
+      expect(def.inputSchema.properties.steps_mode).toBeDefined();
+      expect(def.inputSchema.properties.confirm_step_removal).toBeDefined();
+    });
+
+    it('tells the caller not to send fields it is not changing in merge mode', () => {
+      // Live-verified gap: asked to change only a description, the model filled
+      // in a placeholder title as well, and merge applied it as a rename. The
+      // stepsChange diff reported it, so it was not silent — but the step still
+      // ended up renamed when nobody asked for that.
+      const def = mcpToolRegistry.getTool('manage_predefined_work_plan')!.definition as any;
+      expect(def.inputSchema.properties.steps_mode.description).toMatch(/only the fields you are actually changing/i);
+      expect(def.inputSchema.properties.steps_mode.description).toMatch(/renames that step/i);
+    });
+  });
+
+  // ─── ENG-890 residual: the count guard above cannot see a replace that keeps
+  // every step but blanks their contents. The admin route rebuilds each step
+  // from a fixed field list (services/workPlanSteps.ts), defaulting
+  // requiredFunctionCalls/skillIds to [], so re-sending the array as
+  // title+description strips every tool requirement and skill attachment with
+  // an unchanged step count — invisible to a length check.
+  describe('manage_predefined_work_plan - update step content safety', () => {
+    const existingPlan = {
+      planId: 'wp-1',
+      title: 'Meta Pre-Launch Gate',
+      steps: [
+        { stepCount: 1, title: 'Step 1: Scope', description: 'scope', requiredFunctionCalls: ['list_connected_accounts'], skillIds: ['sk-1'] },
+        { stepCount: 2, title: 'Step 2: Inventory', description: 'inventory', requiredFunctionCalls: ['call_meta_marketing_api'], skillIds: ['sk-1'], userInstructions: 'read carefully', expectedAssetCount: 4 },
+      ],
+    };
+
+    function mockPlanFetches(saved: any = { planId: 'wp-1', message: 'Updated' }) {
+      mockMcpFetch.mockImplementation(async (opts: any) =>
+        opts.method === 'GET' ? JSON.parse(JSON.stringify(existingPlan)) : saved
+      );
+    }
+    const putCalls = () => mockMcpFetch.mock.calls.filter((c: any) => c[0].method === 'PUT');
+
+    it('refuses a same-count replace that blanks step contents, and does NOT issue the PUT', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: [
+          { title: 'Step 1: Scope', description: 'scope' },
+          { title: 'Step 2: Inventory', description: 'inventory, reworded' },
+        ],
+      }, context);
+
+      expect(putCalls()).toHaveLength(0);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.error).toMatch(/would blank/i);
+      expect(payload.stepsWouldBeRemoved).toBe(0);
+      expect(payload.stepContentLoss).toEqual([
+        { stepCount: 1, title: 'Step 1: Scope', fields: ['requiredFunctionCalls', 'skillIds'] },
+        { stepCount: 2, title: 'Step 2: Inventory', fields: ['requiredFunctionCalls', 'skillIds', 'userInstructions', 'expectedAssetCount'] },
+      ]);
+    });
+
+    it('matches by title when the caller renumbers, so a reordered rewrite is still caught', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: [
+          { stepCount: 1, title: 'Step 2: Inventory', description: 'inventory' },
+          { stepCount: 2, title: 'Step 1: Scope', description: 'scope', required_function_calls: ['list_connected_accounts'], skill_ids: ['sk-1'] },
+        ],
+      }, context);
+
+      expect(putCalls()).toHaveLength(0);
+      const payload = JSON.parse(result.content[0].text);
+      // Step 1 kept its contents under its new position; only step 2 lost any.
+      expect(payload.stepContentLoss).toEqual([
+        { stepCount: 2, title: 'Step 2: Inventory', fields: ['requiredFunctionCalls', 'skillIds', 'userInstructions', 'expectedAssetCount'] },
+      ]);
+    });
+
+    it('allows the blanking replace once confirm_step_removal is set, and reports the loss', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        confirm_step_removal: true,
+        steps: [
+          { title: 'Step 1: Scope', description: 'scope' },
+          { title: 'Step 2: Inventory', description: 'inventory' },
+        ],
+      }, context);
+
+      expect(putCalls()).toHaveLength(1);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.stepsChange.stepsRemoved).toBe(0);
+      expect(payload.stepsChange.stepContentLoss).toHaveLength(2);
+    });
+
+    it('does NOT refuse a deliberate rewrite whose steps are all new', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: [
+          { title: 'Brand new step A', description: 'a' },
+          { title: 'Brand new step B', description: 'b' },
+        ],
+      }, context);
+
+      // Nothing was kept, so there is no step the caller plainly meant to
+      // preserve — the dropped titles in stepsChange already say what happened.
+      expect(putCalls()).toHaveLength(1);
+      const payload = JSON.parse(result.content[0].text);
+      expect(payload.stepsChange.stepContentLoss).toBeUndefined();
+      expect(payload.stepsChange.droppedStepTitles).toEqual(['Step 1: Scope', 'Step 2: Inventory']);
+    });
+
+    it('does not fire when the replace preserves the step contents', async () => {
+      mockPlanFetches();
+
+      await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps: existingPlan.steps.map((s) => ({ ...s })),
+      }, context);
+
+      expect(putCalls()).toHaveLength(1);
+    });
+
+    // A title is only an identity if it is unique. Two steps sharing one is
+    // legal and does happen ("Review", "Follow up"), and both the diff and the
+    // content matcher have to stay honest when it does.
+    describe('duplicate step titles', () => {
+      const duplicatePlan = {
+        planId: 'wp-1',
+        steps: [
+          { stepCount: 1, title: 'Review', description: 'first review', requiredFunctionCalls: ['a'] },
+          { stepCount: 2, title: 'Review', description: 'second review', requiredFunctionCalls: ['b'] },
+          { stepCount: 3, title: 'Ship', description: 'ship it' },
+        ],
+      };
+      function mockDuplicateFetches() {
+        mockMcpFetch.mockImplementation(async (opts: any) =>
+          opts.method === 'GET' ? JSON.parse(JSON.stringify(duplicatePlan)) : { planId: 'wp-1' }
+        );
+      }
+
+      // Raised by Greptile on PR #2269. The diff matcher already refuses to
+      // treat a shared title as an identity; merge did not, so a title-only
+      // amendment silently landed on whichever duplicate came first.
+      it('refuses a title-only merge when the title matches more than one step', async () => {
+        mockDuplicateFetches();
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ title: 'Review', description: 'which one?' }],
+        }, context);
+
+        expect(putCalls()).toHaveLength(0);
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload.error).toMatch(/matches more than one step/i);
+        expect(payload.ambiguousSteps).toEqual([
+          { title: 'Review', matchingStepCounts: [1, 2] },
+        ]);
+      });
+
+      // Second Greptile round on PR #2269. The ambiguity check skipped any step
+      // carrying a stepCount, but the merge only USES that count if it matches
+      // an existing step — otherwise it falls back to first-match-by-title. So a
+      // stale or invented count was a way straight past the guard and onto the
+      // wrong duplicate.
+      it('refuses when the stepCount does not exist and the title is ambiguous', async () => {
+        mockDuplicateFetches();
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 99, title: 'Review', description: 'stale count' }],
+        }, context);
+
+        expect(putCalls()).toHaveLength(0);
+        expect(JSON.parse(result.content[0].text).ambiguousSteps).toEqual([
+          { title: 'Review', matchingStepCounts: [1, 2] },
+        ]);
+      });
+
+      it('still falls back to a unique title when the stepCount does not exist', async () => {
+        mockDuplicateFetches();
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 99, title: 'Ship', description: 'shipped' }],
+        }, context);
+
+        // 'Ship' names exactly one step, so there is nothing ambiguous to refuse.
+        const body = (putCalls()[0][0] as any).body;
+        expect(body.steps).toHaveLength(3);
+        expect(body.steps[2].description).toBe('shipped');
+      });
+
+      it('accepts the same merge once a stepCount disambiguates it', async () => {
+        mockDuplicateFetches();
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [{ stepCount: 2, title: 'Review', description: 'the second one' }],
+        }, context);
+
+        const body = (putCalls()[0][0] as any).body;
+        expect(body.steps[1].description).toBe('the second one');
+        expect(body.steps[0].description).toBe('first review');
+      });
+
+      // Third Greptile round on PR #2269, and the structural one. The preflight
+      // resolved titles against the plan as READ, but application resolved them
+      // against the array as it was being mutated. One request could therefore
+      // rename a step and then, with an already-validated later entry, fail to
+      // find it — turning an amendment into an append.
+      it('refuses two entries that resolve to the same step, instead of letting one undo the other', async () => {
+        mockMcpFetch.mockImplementation(async (opts: any) =>
+          opts.method === 'GET'
+            ? { planId: 'wp-1', steps: [
+                { stepCount: 1, title: 'Alpha', description: 'a' },
+                { stepCount: 2, title: 'Beta', description: 'b' },
+              ] }
+            : { planId: 'wp-1' }
+        );
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [
+            { stepCount: 1, title: 'Renamed' },
+            { title: 'Alpha', description: 'also me' },
+          ],
+        }, context);
+
+        // Applying both in array order would let the second entry's title put
+        // 'Alpha' back, silently undoing the rename. Under the previous
+        // mutating resolution it instead appended a spurious third step.
+        expect(putCalls()).toHaveLength(0);
+        const payload = JSON.parse(result.content[0].text);
+        expect(payload.error).toMatch(/resolves to the same existing step/i);
+        expect(payload.conflictingSteps).toEqual([
+          { stepCount: 1, title: 'Alpha', entries: 2 },
+        ]);
+      });
+
+      it('gives the same result whichever order the entries arrive in', async () => {
+        mockMcpFetch.mockImplementation(async (opts: any) =>
+          opts.method === 'GET'
+            ? { planId: 'wp-1', steps: [
+                { stepCount: 1, title: 'Alpha', description: 'a' },
+                { stepCount: 2, title: 'Beta', description: 'b' },
+              ] }
+            : { planId: 'wp-1' }
+        );
+
+        await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps_mode: 'merge',
+          steps: [
+            { title: 'Beta', description: 'beta amended' },
+            { stepCount: 1, title: 'Renamed' },
+          ],
+        }, context);
+
+        const body = (putCalls()[0][0] as any).body;
+        expect(body.steps).toHaveLength(2);
+        expect(body.steps[0].title).toBe('Renamed');
+        expect(body.steps[1].description).toBe('beta amended');
+      });
+
+      it('reports a dropped step whose title still exists on another step', async () => {
+        mockDuplicateFetches();
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          confirm_step_removal: true,
+          steps: [
+            { stepCount: 1, title: 'Review', description: 'first review', requiredFunctionCalls: ['a'] },
+            { stepCount: 2, title: 'Ship', description: 'ship it' },
+          ],
+        }, context);
+
+        const { stepsChange } = JSON.parse(result.content[0].text);
+        expect(stepsChange.stepsRemoved).toBe(1);
+        // One 'Review' survived, so a set-membership diff would call this empty.
+        expect(stepsChange.droppedStepTitles).toEqual(['Review']);
+      });
+
+      it('pairs steps by position, not by an ambiguous title, when detecting content loss', async () => {
+        mockDuplicateFetches();
+
+        const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+          action: 'update',
+          plan_id: 'wp-1',
+          steps: [
+            { stepCount: 1, title: 'Review', description: 'first review', requiredFunctionCalls: ['a'] },
+            { stepCount: 2, title: 'Review', description: 'second review' },
+            { stepCount: 3, title: 'Ship', description: 'ship it' },
+          ],
+        }, context);
+
+        const payload = JSON.parse(result.content[0].text);
+        // Only step 2 lost its requiredFunctionCalls. Matching on the shared
+        // title would have paired both against step 1 and reported nothing.
+        expect(payload.stepContentLoss).toEqual([
+          { stepCount: 2, title: 'Review', fields: ['requiredFunctionCalls'] },
+        ]);
+      });
+    });
+
+    it('never fires in merge mode, which cannot blank a field it was not given', async () => {
+      mockPlanFetches();
+
+      const result = await mcpToolRegistry.execute('manage_predefined_work_plan', {
+        action: 'update',
+        plan_id: 'wp-1',
+        steps_mode: 'merge',
+        steps: [{ stepCount: 1, description: 'amended scope' }],
+      }, context);
+
+      expect(putCalls()).toHaveLength(1);
+      const body = (putCalls()[0][0] as any).body;
+      expect(body.steps[0].requiredFunctionCalls).toEqual(['list_connected_accounts']);
+      expect(body.steps[1].expectedAssetCount).toBe(4);
+      expect(JSON.parse(result.content[0].text).stepsChange.stepContentLoss).toBeUndefined();
     });
   });
 

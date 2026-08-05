@@ -80,6 +80,7 @@ import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
+import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -141,6 +142,13 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 
   return undefined;
 }
+
+// Moved to utils/metaCampaignIds.ts (ENG-821) — it is pure, and emma/tools.ts
+// needs it at dispatch time while 140 test files jest.mock this module.
+// Imported (not just re-exported) because this module calls it internally too;
+// re-exported so any importer of the old path keeps working.
+export { normalizeMetaCampaignIds };
+
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 
 // Max output tokens for agent-mode LLM turns. Must be large enough to hold a
@@ -6124,13 +6132,10 @@ export class AgentModeService {
         };
 
       case 'get_meta_ads_metrics':
-        const normalizedCampaignIds = Array.isArray(args.campaign_ids)
-          ? args.campaign_ids
-          : (typeof args.campaign_ids === 'string' && args.campaign_ids.trim())
-            ? [args.campaign_ids.trim()]
-            : (typeof args.campaign_id === 'string' && args.campaign_id.trim())
-              ? [args.campaign_id.trim()]
-              : [];
+        const normalizedCampaignIds = normalizeMetaCampaignIds(
+          args.campaign_ids,
+          args.campaign_id,
+        );
 
         if (normalizedCampaignIds.length === 0) {
           return {
@@ -10400,7 +10405,7 @@ export class AgentModeService {
       const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
-      if (!filters || filters.length === 0) {
+      if ((!filters || filters.length === 0) && !options?.search?.trim()) {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
       }
 
@@ -16514,12 +16519,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     requestedAccountId?: string,
   ): Promise<any> {
     try {
-      const rawCampaignIds = Array.isArray(campaign_ids)
-        ? campaign_ids
-        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
-      const campaignFilterIds = [
-        ...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))
-      ];
+      const campaignFilterIds = normalizeMetaCampaignIds(campaign_ids);
       console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
       if (campaignFilterIds.length === 0) {
         return {

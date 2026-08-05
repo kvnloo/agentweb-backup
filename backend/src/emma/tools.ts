@@ -1,4 +1,5 @@
 import { agentModeService } from '../services/agentModeService';
+import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
@@ -1407,13 +1408,10 @@ emmaToolRegistry.register({
   },
   execute: async (args, context) => {
     // Backward-compatible normalization: accept legacy campaign_id or string campaign_ids.
-    const normalizedCampaignIds = Array.isArray(args.campaign_ids)
-      ? args.campaign_ids
-      : (typeof args.campaign_ids === 'string' && args.campaign_ids.trim())
-        ? [args.campaign_ids.trim()]
-        : (typeof args.campaign_id === 'string' && args.campaign_id.trim())
-          ? [args.campaign_id.trim()]
-          : [];
+    const normalizedCampaignIds = normalizeMetaCampaignIds(
+      args.campaign_ids,
+      args.campaign_id,
+    );
 
     return await agentModeService.getMetaAdsMetrics(
       args.timeframe || '7d',
@@ -6379,6 +6377,7 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
+          maxLength: 2000,
           description: 'The fact to remember (max 2000 chars). Be specific and actionable.'
         },
         category: {
