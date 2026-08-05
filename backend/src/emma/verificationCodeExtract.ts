@@ -82,8 +82,13 @@ export interface ExtractCodeOptions {
 }
 
 export interface ExtractLinkOptions {
-  /** Only accept links whose host contains this string (e.g. "rankai.ai"). */
-  hostContains?: string;
+  /**
+   * Only accept links served by this host or a subdomain of it (e.g. "rankai.ai").
+   * Matched against the parsed hostname, never as a substring of the URL — an
+   * attacker controls their own path and query, so `evil.com/?ref=rankai.ai`
+   * would otherwise pass an origin check.
+   */
+  allowedHost?: string;
 }
 
 /**
@@ -220,12 +225,23 @@ function collectUrls(body: string): string[] {
 export function extractMagicLink(body: string, options: ExtractLinkOptions = {}): string | null {
   if (typeof body !== 'string' || body.length === 0) return null;
 
-  const hostContains = options.hostContains?.toLowerCase();
+  const allowedHost = options.allowedHost?.toLowerCase().trim();
 
   for (const url of collectUrls(body)) {
     const lower = url.toLowerCase();
     if (LINK_DENY_MARKERS.some((marker) => lower.includes(marker))) continue;
-    if (hostContains && !lower.includes(hostContains)) continue;
+
+    if (allowedHost) {
+      let hostname: string;
+      try {
+        hostname = new URL(url).hostname.toLowerCase();
+      } catch {
+        continue;
+      }
+      // Host equality or a subdomain — never a substring of the whole URL.
+      if (hostname !== allowedHost && !hostname.endsWith(`.${allowedHost}`)) continue;
+    }
+
     if (!LINK_ALLOW_MARKERS.some((marker) => lower.includes(marker))) continue;
     return url;
   }

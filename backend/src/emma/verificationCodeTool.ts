@@ -29,8 +29,14 @@ const DEFAULT_WAIT_SECONDS = 90;
  */
 const MAX_WAIT_SECONDS = 180;
 const POLL_INTERVAL_MS = 5_000;
-/** How far back a message may be and still count as "this login attempt". */
-const DEFAULT_FRESHNESS_GRACE_MS = 2 * 60 * 1000;
+/**
+ * How far back a message may be and still count as "this login attempt" — only
+ * as a last resort (see partitionByArrival). Sized to cover clock skew on the
+ * sender's Date header plus the seconds between triggering "send code" and this
+ * call, and no more: every extra second widens the window in which the previous
+ * attempt's code could be mistaken for this one's.
+ */
+const DEFAULT_FRESHNESS_GRACE_MS = 60 * 1000;
 const INBOX_SCAN_SIZE = 25;
 /** Bodies fetched per pass — codes land at the top of the inbox, not page 3. */
 const MAX_BODIES_PER_PASS = 5;
@@ -72,6 +78,48 @@ function parsedTime(value: unknown): number {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Split matching messages by when they arrived relative to THIS call.
+ *
+ * The grace window exists to absorb clock skew and the seconds between the
+ * agent triggering "send code" and calling this tool. On its own it also admits
+ * the PREVIOUS attempt's code when that happened to arrive moments earlier —
+ * exactly the stale-code failure this tool exists to prevent (Greptile P1). So
+ * the buckets stay separate and the caller prefers `arrivedAfterCall`, falling
+ * back to `withinGrace` only once there is no time left for a newer message.
+ *
+ * An unparseable date sorts as stale: a message we cannot place in time is not
+ * evidence of a fresh code.
+ */
+export function partitionByArrival(
+  emails: any[],
+  window: { since: number; invokedAt: number }
+): { arrivedAfterCall: any[]; withinGrace: any[]; stale: any[] } {
+  const arrivedAfterCall: any[] = [];
+  const withinGrace: any[] = [];
+  const stale: any[] = [];
+
+  for (const email of emails || []) {
+    const at = parsedTime(email?.date);
+    if (at >= window.invokedAt) arrivedAfterCall.push(email);
+    else if (at >= window.since) withinGrace.push(email);
+    else stale.push(email);
+  }
+
+  const newestFirst = (a: any, b: any) => parsedTime(b?.date) - parsedTime(a?.date);
+  return {
+    arrivedAfterCall: arrivedAfterCall.sort(newestFirst),
+    withinGrace: withinGrace.sort(newestFirst),
+    stale: stale.sort(newestFirst),
+  };
+}
+
+/** Domain of an email address, from a bare or display-name form. Null if absent. */
+export function senderDomain(from: unknown): string | null {
+  const match = String(from ?? '').match(/[^\s<>"']+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})/);
+  return match ? match[1].toLowerCase() : null;
+}
 
 /** Clamp the caller's wait into [0, MAX_WAIT_SECONDS]; non-numeric → the default. */
 export function resolveWaitSeconds(raw: unknown): number {
@@ -126,7 +174,15 @@ emmaToolRegistry.register({
         },
         return_link: {
           type: 'boolean',
-          description: 'Also return the sign-in link found in the email (for magic-link logins that have no typed code).',
+          description:
+            'Also return the sign-in link found in the email (for magic-link logins that have no typed code). ' +
+            'Only a link on the sender\'s own domain is returned — a link pointing anywhere else is ignored, not handed back.',
+        },
+        link_host: {
+          type: 'string',
+          description:
+            'return_link only — the domain the sign-in link must be on (e.g. "lu.ma"). ' +
+            'Defaults to the sender\'s domain; set it when a service mails from one domain and links to another.',
         },
         search_query: {
           type: 'string',
@@ -147,9 +203,11 @@ emmaToolRegistry.register({
     const alphanumeric = args?.alphanumeric === true;
     const returnLink = args?.return_link === true;
     const waitSeconds = resolveWaitSeconds(args?.wait_seconds);
+    const linkHost = typeof args?.link_host === 'string' ? args.link_host.trim().toLowerCase() : '';
+    const invokedAt = Date.now();
     const since = args?.since && !Number.isNaN(Date.parse(args.since))
       ? Date.parse(args.since)
-      : Date.now() - DEFAULT_FRESHNESS_GRACE_MS;
+      : invokedAt - DEFAULT_FRESHNESS_GRACE_MS;
 
     const { bootstrapEmailProviders, resolveEmailAccount, getEmailProvider } = await import(
       '../services/emailProviderService'
@@ -247,11 +305,16 @@ emmaToolRegistry.register({
       const matched = (summaries || []).filter(
         (email: any) => contains(email?.subject, args?.subject_contains) && contains(email?.from, args?.from_contains)
       );
-      const fresh = matched
-        .filter((email: any) => parsedTime(email?.date) >= since)
-        .sort((a: any, b: any) => parsedTime(b?.date) - parsedTime(a?.date));
+      const arrival = partitionByArrival(matched, { since, invokedAt });
+      // Last pass — no time left for a newer message, so a grace-window one is
+      // the best evidence available. Until then it is held back, because a
+      // message that predates this call may be the PREVIOUS attempt's code.
+      const isFinalPass = Date.now() + POLL_INTERVAL_MS > deadline;
+      const fresh = arrival.arrivedAfterCall.length > 0
+        ? arrival.arrivedAfterCall
+        : isFinalPass ? arrival.withinGrace : [];
 
-      if (matched.length > fresh.length) sawStaleMatch = true;
+      if (arrival.stale.length > 0) sawStaleMatch = true;
 
       if (fresh.length > 0) {
         const ids = fresh.slice(0, MAX_BODIES_PER_PASS).map((email: any) => email.id);
@@ -270,13 +333,32 @@ emmaToolRegistry.register({
           if (!detail || detail.error || !detail.body) continue;
           const summary = fresh.find((email: any) => email.id === detail.id);
           const code = extractVerificationCode(detail.body, { codeLength, alphanumeric });
-          const magicLink = returnLink ? extractMagicLink(detail.body) : null;
+
+          // A sign-in link is only trustworthy if it goes where the mail came
+          // from: anyone can send a message matching the filters, and a link
+          // carrying "token=" is not evidence it belongs to the sender
+          // (Greptile P1, security). The caller can name the host explicitly for
+          // senders that mail from a different domain than they link to.
+          let magicLink: string | null = null;
+          let linkOmitted: string | undefined;
+          if (returnLink) {
+            const allowedHost = linkHost || senderDomain(detail.from ?? summary?.from) || undefined;
+            magicLink = allowedHost ? extractMagicLink(detail.body, { allowedHost }) : null;
+            if (!magicLink) {
+              linkOmitted = allowedHost
+                ? `No sign-in link on ${allowedHost} was found in the email. Any other link in it was ignored — ` +
+                  'pass link_host if this sender links to a different domain.'
+                : 'The sender could not be identified, so no link was returned. Pass link_host to name the expected domain.';
+            }
+          }
+
           if (!code && !magicLink) continue;
 
           return {
             success: true,
             code: code ?? undefined,
             magic_link: magicLink ?? undefined,
+            link_omitted: linkOmitted,
             subject: detail.subject ?? summary?.subject,
             from: detail.from ?? summary?.from,
             received_at: detail.date ?? summary?.date,

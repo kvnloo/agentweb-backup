@@ -106,11 +106,33 @@ describe('extractMagicLink', () => {
     expect(extractMagicLink(body)).toBe('https://rankai.ai/api/auth/callback?token=xyz123&captchaKey=k');
   });
 
-  it('only returns a link on the requested host when hostContains is given', () => {
+  it('only returns a link on the requested host when allowedHost is given', () => {
     const body =
       'https://tracking.example.com/verify?token=aaa and https://rankai.ai/verify?token=bbb';
-    expect(extractMagicLink(body, { hostContains: 'rankai.ai' })).toBe(
+    expect(extractMagicLink(body, { allowedHost: 'rankai.ai' })).toBe(
       'https://rankai.ai/verify?token=bbb'
     );
+  });
+
+  it('accepts a subdomain of the allowed host', () => {
+    const body = 'https://mail.rankai.ai/verify?token=bbb';
+    expect(extractMagicLink(body, { allowedHost: 'rankai.ai' })).toBe(
+      'https://mail.rankai.ai/verify?token=bbb'
+    );
+  });
+
+  // The host must be matched as a host, not as a substring of the URL: an
+  // attacker controls their own path and query, so "rankai.ai" appears wherever
+  // they want it to.
+  it('rejects a lookalike host and the allowed host smuggled into a path or query', () => {
+    expect(
+      extractMagicLink('https://rankai.ai.evil.example.com/verify?token=x', { allowedHost: 'rankai.ai' })
+    ).toBeNull();
+    expect(
+      extractMagicLink('https://evil.example.com/verify?token=x&ref=rankai.ai', { allowedHost: 'rankai.ai' })
+    ).toBeNull();
+    expect(
+      extractMagicLink('https://notrankai.ai/verify?token=x', { allowedHost: 'rankai.ai' })
+    ).toBeNull();
   });
 });

@@ -247,6 +247,37 @@ emmaToolRegistry.register({
       };
     }
 
+    // The destination comes from a secret and the credential is appended to it,
+    // so it is validated BEFORE the key is attached: a stale, mistyped or
+    // tampered signinUrl must never carry the bypass key to another host, or
+    // over cleartext where it is readable in transit.
+    const configuredUrl = String(credentials[profile.signinUrlField]);
+    let url: URL;
+    try {
+      url = new URL(configuredUrl);
+    } catch {
+      return {
+        success: false,
+        error: `The ${secretName} secret's signinUrl is not a valid URL ("${configuredUrl}"). Report this rather than continuing.`,
+      };
+    }
+    if (url.protocol !== 'https:') {
+      return {
+        success: false,
+        error:
+          `The ${secretName} secret's signinUrl uses ${url.protocol}// — refusing to send the ${profile.domain} ` +
+          'credential over anything but https. Report this rather than continuing.',
+      };
+    }
+    if (!hostBelongsTo(url.hostname, profile.domain)) {
+      return {
+        success: false,
+        error:
+          `The ${secretName} secret's signinUrl points at ${url.hostname}, which is not ${profile.domain}. ` +
+          'Refusing to send the credential to an unexpected host — report this rather than continuing.',
+      };
+    }
+
     const navigateTool = findPlaywrightTool(context?.service, 'browser_navigate');
     if (!navigateTool) {
       return {
@@ -268,7 +299,6 @@ emmaToolRegistry.register({
       };
     }
 
-    const url = new URL(String(credentials[profile.signinUrlField]));
     const secretValues: string[] = [];
     for (const [param, field] of Object.entries(profile.secretQueryParams)) {
       url.searchParams.set(param, String(credentials[field]));

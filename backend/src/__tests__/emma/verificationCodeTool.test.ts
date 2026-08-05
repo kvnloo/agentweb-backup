@@ -19,7 +19,7 @@ jest.mock('../../services/emailProviderService', () => ({
   EmailProviderError: class EmailProviderError extends Error {},
 }));
 
-import { resolveWaitSeconds } from '../../emma/verificationCodeTool';
+import { resolveWaitSeconds, partitionByArrival, senderDomain } from '../../emma/verificationCodeTool';
 import { emmaToolRegistry } from '../../emma/registry';
 
 const tool = emmaToolRegistry.getTool('read_verification_code');
@@ -74,6 +74,60 @@ describe('read_verification_code — wait window', () => {
 
   it('passes a reasonable request through unchanged', () => {
     expect(resolveWaitSeconds(45)).toBe(45);
+  });
+});
+
+// Greptile P1: the grace window that absorbs clock skew also admitted the
+// PREVIOUS login's code when it happened to arrive shortly before this attempt —
+// the exact failure this tool exists to prevent. A message that predates the
+// call is now held back while there is still time for a genuinely new one.
+describe('read_verification_code — arrival partitioning', () => {
+  const invokedAt = Date.parse('2026-08-05T12:00:00.000Z');
+  const window = { invokedAt, since: invokedAt - 60_000 };
+  const at = (offsetMs: number) => ({ id: `m${offsetMs}`, date: new Date(invokedAt + offsetMs).toISOString() });
+
+  it('treats a message that arrived after the call as unambiguously ours', () => {
+    const result = partitionByArrival([at(5_000)], window);
+    expect(result.arrivedAfterCall.map((e) => e.id)).toEqual(['m5000']);
+    expect(result.withinGrace).toHaveLength(0);
+    expect(result.stale).toHaveLength(0);
+  });
+
+  it('holds a pre-call message in the grace bucket rather than treating it as ours', () => {
+    const result = partitionByArrival([at(-30_000)], window);
+    expect(result.arrivedAfterCall).toHaveLength(0);
+    expect(result.withinGrace.map((e) => e.id)).toEqual(['m-30000']);
+  });
+
+  it('treats anything older than the window as stale', () => {
+    const result = partitionByArrival([at(-90_000)], window);
+    expect(result.withinGrace).toHaveLength(0);
+    expect(result.stale.map((e) => e.id)).toEqual(['m-90000']);
+  });
+
+  it('orders each bucket newest first', () => {
+    const result = partitionByArrival([at(1_000), at(9_000), at(5_000)], window);
+    expect(result.arrivedAfterCall.map((e) => e.id)).toEqual(['m9000', 'm5000', 'm1000']);
+  });
+
+  it('treats an unparseable date as stale rather than as a fresh code', () => {
+    const result = partitionByArrival([{ id: 'bad', date: 'not a date' }], window);
+    expect(result.stale.map((e) => e.id)).toEqual(['bad']);
+  });
+});
+
+describe('senderDomain', () => {
+  it('reads the domain out of a display-name address', () => {
+    expect(senderDomain('RankAI <no-reply@rankai.ai>')).toBe('rankai.ai');
+  });
+
+  it('reads a bare address and lowercases it', () => {
+    expect(senderDomain('Founders@AgentWeb.pro')).toBe('agentweb.pro');
+  });
+
+  it('returns null when there is no parseable address', () => {
+    expect(senderDomain('RankAI Support')).toBeNull();
+    expect(senderDomain(undefined)).toBeNull();
   });
 });
 
@@ -293,16 +347,48 @@ describe('read_verification_code — success paths', () => {
     );
   });
 
-  it('returns the magic link alongside the code when asked', async () => {
-    mockListEmails.mockResolvedValue([summary()]);
+  it('returns the magic link alongside the code when the link is on the sender\'s domain', async () => {
+    mockListEmails.mockResolvedValue([summary({ from: 'RankAI <no-reply@rankai.ai>' })]);
     mockGetEmails.mockResolvedValue([
-      { id: 'msg-1', body: 'Code 366990 or <a href="https://rankai.ai/api/auth/callback?token=xyz">sign in</a>' },
+      { id: 'msg-1', from: 'RankAI <no-reply@rankai.ai>', body: 'Code 366990 or <a href="https://rankai.ai/api/auth/callback?token=xyz">sign in</a>' },
     ]);
 
     const result = await tool.execute({ return_link: true, wait_seconds: 0 }, context);
 
     expect(result.success).toBe(true);
     expect(result.magic_link).toBe('https://rankai.ai/api/auth/callback?token=xyz');
+  });
+
+  // Greptile P1 (security): anyone can email you a message matching the filters.
+  // A link in it must not be handed back as "the login link" just because it
+  // carries a token= or /auth marker.
+  it('does not hand back a login link pointing somewhere other than the sender', async () => {
+    mockListEmails.mockResolvedValue([summary({ from: 'RankAI <no-reply@rankai.ai>' })]);
+    mockGetEmails.mockResolvedValue([
+      { id: 'msg-1', from: 'RankAI <no-reply@rankai.ai>', body: 'Code 366990 <a href="https://evil.example.com/auth?token=xyz">sign in</a>' },
+    ]);
+
+    const result = await tool.execute({ return_link: true, wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(true);
+    expect(result.code).toBe('366990');
+    expect(result.magic_link).toBeUndefined();
+    expect(result.link_omitted).toMatch(/rankai\.ai/);
+  });
+
+  it('accepts a caller-supplied link_host for senders that mail from a different domain', async () => {
+    mockListEmails.mockResolvedValue([summary({ from: 'Luma <no-reply@luma-mail.com>' })]);
+    mockGetEmails.mockResolvedValue([
+      { id: 'msg-1', from: 'Luma <no-reply@luma-mail.com>', body: '<a href="https://lu.ma/verify?token=xyz">sign in</a>' },
+    ]);
+
+    const result = await tool.execute(
+      { return_link: true, link_host: 'lu.ma', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.magic_link).toBe('https://lu.ma/verify?token=xyz');
   });
 
   it('uses the explicitly supplied account instead of auto-resolving', async () => {

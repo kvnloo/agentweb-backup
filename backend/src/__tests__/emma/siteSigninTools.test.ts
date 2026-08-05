@@ -116,6 +116,53 @@ describe('open_site_signin — failure paths', () => {
     expect(context.service.executeTool).not.toHaveBeenCalled();
   });
 
+  // Greptile P2 (security): the destination comes from a secret, and the bypass
+  // key is appended to it. A stale, mistyped or tampered signinUrl would hand
+  // the credential to the wrong host — or send it in cleartext.
+  it('refuses to send the credential to a host outside the site', async () => {
+    mockGetRankAICredentials.mockResolvedValue({ ...CREDENTIALS, signinUrl: 'https://evil.example.com/signin' });
+    const context = buildContext();
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain('evil.example.com');
+    expect(result.error).toContain('rankai.ai');
+    expect(context.service.executeTool).not.toHaveBeenCalled();
+  });
+
+  it('refuses to send the credential over cleartext http', async () => {
+    mockGetRankAICredentials.mockResolvedValue({ ...CREDENTIALS, signinUrl: 'http://rankai.ai/signin' });
+    const context = buildContext();
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/https/i);
+    expect(context.service.executeTool).not.toHaveBeenCalled();
+  });
+
+  it('rejects a lookalike host in the configured signin URL', async () => {
+    mockGetRankAICredentials.mockResolvedValue({ ...CREDENTIALS, signinUrl: 'https://rankai.ai.evil.example.com/signin' });
+    const context = buildContext();
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(result.success).toBe(false);
+    expect(context.service.executeTool).not.toHaveBeenCalled();
+  });
+
+  it('reports a malformed signin URL instead of throwing', async () => {
+    mockGetRankAICredentials.mockResolvedValue({ ...CREDENTIALS, signinUrl: 'not a url' });
+    const context = buildContext();
+
+    const result = await tool.execute({ site: 'rankai' }, context);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/signinUrl/);
+    expect(context.service.executeTool).not.toHaveBeenCalled();
+  });
+
   it('errors when no browser session is active', async () => {
     const result = await tool.execute({ site: 'rankai' }, buildContext(false));
 
