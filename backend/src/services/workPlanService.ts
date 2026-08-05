@@ -407,7 +407,9 @@ export class WorkPlanService {
 
     plan.visibility = 'pending_review';
     plan.reviewFeedback = undefined;
-    await this.updateWorkPlan(plan);
+    // Stake the read: this writes the whole plan back, steps included, so
+    // without it a concurrent step edit is silently reverted (ENG-890).
+    await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
     return plan;
   }
 
@@ -418,7 +420,7 @@ export class WorkPlanService {
 
     plan.visibility = 'public';
     plan.showInAgentMode = true;
-    await this.updateWorkPlan(plan);
+    await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
     return plan;
   }
 
@@ -429,7 +431,7 @@ export class WorkPlanService {
 
     plan.visibility = 'private';
     plan.reviewFeedback = feedback;
-    await this.updateWorkPlan(plan);
+    await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
     return plan;
   }
 

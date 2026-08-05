@@ -217,6 +217,9 @@ router.post("/:planId/submit-for-review", async (req, res) => {
 
     res.json(plan);
   } catch (error: any) {
+    if (error.message === 'Work plan steps changed') {
+      return res.status(409).json({ message: "Work plan changed since it was read — re-read it and retry" });
+    }
     if (error.message === 'Work plan not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Not authorized') return res.status(403).json({ message: error.message });
     if (error.message === 'Only private plans can be submitted for review') return res.status(400).json({ message: error.message });

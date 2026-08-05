@@ -2076,6 +2076,25 @@ function diffStepTitles(from: any[], to: any[]): any[] {
 }
 
 /**
+ * Incoming merge steps that name no stepCount and whose title matches more than
+ * one existing step. Amending "whichever came first" is a silent wrong-step
+ * edit, so the caller is asked to disambiguate instead.
+ */
+function findAmbiguousMergeTargets(existingSteps: any[], incomingSteps: any[]) {
+  const ambiguous: { title: any; matchingStepCounts: any[] }[] = [];
+  for (const incoming of incomingSteps) {
+    if (incoming.stepCount !== undefined && incoming.stepCount !== null) continue;
+    if (incoming.title === undefined) continue;
+    const title = normalizeStepTitle(incoming.title);
+    const matches = existingSteps.filter((s: any) => normalizeStepTitle(s.title) === title);
+    if (matches.length > 1) {
+      ambiguous.push({ title: incoming.title, matchingStepCounts: matches.map((s: any) => s.stepCount) });
+    }
+  }
+  return ambiguous;
+}
+
+/**
  * Fields a replace would blank on steps the caller plainly meant to keep. A
  * step with no counterpart at all is skipped: that is a removal or a rewrite,
  * which the count guard and the dropped-titles diff already report.
@@ -2296,6 +2315,16 @@ mcpToolRegistry.register({
           }
 
           if (mode === 'merge') {
+            const ambiguous = findAmbiguousMergeTargets(existingSteps || [], incomingSteps);
+            if (ambiguous.length > 0) {
+              return jsonResult({
+                error: `Refusing to merge into work plan ${args.plan_id}: ${ambiguous.length === 1 ? 'a step title matches' : 'some step titles match'} more than one step, so there is no way to tell which one to amend.`,
+                ambiguousSteps: ambiguous,
+                howToProceed: [
+                  'Retry with stepCount on each ambiguous step to name the one you mean (call action="get" to see the current numbering).',
+                ],
+              });
+            }
             body.steps = mergeWorkPlanSteps(existingSteps || [], incomingSteps);
           } else {
             body.steps = incomingSteps;

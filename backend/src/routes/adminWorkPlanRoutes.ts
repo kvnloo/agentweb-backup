@@ -172,6 +172,9 @@ router.post("/:planId/approve", async (req, res) => {
     const plan = await workPlanService.approveWorkPlan(req.params.planId);
     res.json(plan);
   } catch (error: any) {
+    if (error.message === 'Work plan steps changed') {
+      return res.status(409).json({ message: "Work plan changed since it was read — re-read it and retry" });
+    }
     if (error.message === 'Work plan not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Plan is not pending review') return res.status(400).json({ message: error.message });
     console.error("Error approving work plan:", error);
@@ -188,6 +191,9 @@ router.post("/:planId/reject", async (req, res) => {
     const plan = await workPlanService.rejectWorkPlan(req.params.planId, feedback);
     res.json(plan);
   } catch (error: any) {
+    if (error.message === 'Work plan steps changed') {
+      return res.status(409).json({ message: "Work plan changed since it was read — re-read it and retry" });
+    }
     if (error.message === 'Work plan not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Plan is not pending review') return res.status(400).json({ message: error.message });
     console.error("Error rejecting work plan:", error);
