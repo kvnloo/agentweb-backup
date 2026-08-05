@@ -211,6 +211,19 @@ export const config = {
                                    // revives on purpose: post-OOM every preview is dead at once, so reviving
                                    // would fire N concurrent portal builds into a box that just ran out of
                                    // memory. false = leave stale entries alone.
+  previewReapOrphans: true,        // each gc sweep, SIGTERM preview servers that state has forgotten — an
+                                   // earlier generation left running by a restarted (or half-restarted)
+                                   // preview, holding RAM and ports with nothing left to stop it. Live on
+                                   // 2026-08-05: ENG-845 had TEN such processes 3.9h old holding 2498MB
+                                   // (incl. a 1.7GB worker) serving 31100/52100/51100 while state recorded
+                                   // 31102/52102/51101. Matches on preview-server COMMAND SHAPE, never on
+                                   // worktree path — a worktree also hosts type-checks, jest, portal builds
+                                   // and claude turns, and ENG-845 was locked with 2 live turns at the time.
+                                   // false = leave orphans running.
+  previewOrphanMinutes: 15,        // how old an unrecorded preview server must be before it counts as an
+                                   // orphan. A bring-up spawns its servers well before it records them, and
+                                   // bring-ups have been observed taking 15+ minutes on this box, so this is
+                                   // the guard against reaping a preview that is still coming up.
   previewAutoRefreshOnHeadChange: true, // a preview is a bring-up-time snapshot (ts-node backend + built-once
                                    // portals); when the branch advances past the commit it was brought up
                                    // from, gc.mjs refreshes it — cheap ts-node restart for a backend-only

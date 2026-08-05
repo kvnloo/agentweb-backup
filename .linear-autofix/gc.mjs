@@ -13,7 +13,7 @@ import { resolveIssue, addComment } from './linear.mjs';
 import { lockActive } from './lock.mjs';
 import { gitRepoOp, pruneRepoLocks } from './repo-lock.mjs';
 import { admissionWithdrawal } from './admission.mjs';
-import { evictIdlePreviews, evictUnderMemoryPressure, reconcileDeadPreviews, stalePreviews } from './preview/policy.mjs';
+import { evictIdlePreviews, evictUnderMemoryPressure, reconcileDeadPreviews, reapOrphanPreviewProcs, stalePreviews } from './preview/policy.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const agentRoot = path.resolve(__dirname, '..');
@@ -167,6 +167,17 @@ async function main() {
   if (config.previewReconcileDead !== false) {
     try { reconcileDeadPreviews(log, { isLocked: lockActive }); }
     catch (e) { log(`dead-preview reconcile failed: ${e.message}`); }
+  }
+
+  // Then the mirror problem: preview SERVERS that state has forgotten. A restarted (or half-restarted)
+  // preview can leave an earlier generation running — holding RAM and ports, recorded nowhere, so nothing
+  // would ever stop it. Runs AFTER the reconcile above so the "recorded pids" set it trusts is already
+  // truthful. See orphanPreviewProcs for the four guards that keep a process-killing sweep safe.
+  if (config.previewReapOrphans !== false) {
+    try {
+      const reaped = reapOrphanPreviewProcs(log, { minAgeSec: (config.previewOrphanMinutes ?? 15) * 60 });
+      if (reaped.length) log(`reaped ${reaped.length} orphaned preview process(es)`);
+    } catch (e) { log(`orphan-preview reap failed: ${e.message}`); }
   }
 
   // Reap previews untouched for previewIdleHours (default 24h), independent of worktree state — a

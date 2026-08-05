@@ -8,7 +8,7 @@
 // issue} are old. So an actively-used preview (recent URL hit or recent chat) is never the longest
 // idle and survives; only genuinely-abandoned ones get reclaimed.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, readlinkSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -16,6 +16,10 @@ import { config } from '../config.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CGROUP_ROOT = '/sys/fs/cgroup';
+// Absolute worktree root (config.worktreesDir is relative to the agentweb repo root, one level above
+// .linear-autofix). The orphan reaper refuses to touch anything outside it — above all the shared main
+// checkout, where a preview-shaped process would be the real running system.
+const WORKTREE_ROOT = path.resolve(__dirname, '..', '..', config.worktreesDir || '../autofix-worktrees');
 const STATE = path.join(__dirname, 'preview-state.json');       // bug -> { at, urls, ... }   (preview.mjs)
 const ACCESS = path.join(__dirname, 'preview-access.json');     // bug -> last URL-open ISO   (proxy.mjs)
 const CHAT_STATE = path.join(__dirname, '..', 'chat', 'chat-state.json'); // IDENT -> { messages: [{at}] }
@@ -259,6 +263,82 @@ export function listeningPortChecker(read = (f) => readFileSync(f, 'utf8')) {
     }
   }
   return ok ? (p) => ports.has(p) : () => true;                   // unreadable → veto everything (fail safe)
+}
+
+// A preview server is exactly two command shapes. Matching on these — rather than on "runs inside a
+// worktree" — is the whole safety story of the reaper below: a worktree also hosts type-checks, jest
+// runs, portal BUILDS, claude turns and their MCP servers, and killing one of those mid-flight destroys
+// an agent's work. The near-miss that proved it: during the 2026-08-05 cleanup, ENG-845 was locked with
+// two active turns, one of which was running `ts-node --transpile-only -O {...}` 76 seconds old — same
+// binary, same worktree, different shape. `vite build` is deliberately NOT matched; only `vite preview`.
+const PREVIEW_SHAPES = [
+  /\bts-node\s+--transpile-only\s+src\/server\.ts\s*$/,       // the preview backend (ts-node from source)
+  /\bvite\s+preview\s+--port\s+\d+/,                          // a built portal being served
+];
+
+// Which running processes are preview servers that state has FORGOTTEN? A preview can be restarted (or
+// half-restarted) leaving an earlier generation alive: still holding RAM, still bound to ports, recorded
+// nowhere, so nothing will ever stop it. Live on 2026-08-05, ENG-845 held TEN such processes 3.9 hours
+// old at 2498MB (including a 1.7GB worker) serving 31100/52100/51100, while state recorded 31102/52102/
+// 51101 and routes.json had dropped the bug entirely — pure dead weight on a box whose failure mode is
+// running out of memory.
+//
+// Four independent guards, because this kills things: the SHAPE must be a preview server; the process
+// must live under the worktree root (never the shared main checkout); it must not be a pid the state
+// still records (that is the live generation); and it must be older than `minAgeSec`, since a bring-up
+// spawns its servers well before it records them — bring-ups were observed taking 15+ minutes here. A
+// bug marked `starting` is skipped outright as belt-and-braces on that last point. Everything injectable.
+export function orphanPreviewProcs({
+  procs = listPreviewCandidates(),
+  state = readJson(STATE),
+  root = WORKTREE_ROOT,
+  minAgeSec = 15 * 60,
+} = {}) {
+  const recorded = new Set();
+  const starting = new Set();
+  for (const [b, e] of Object.entries(state)) {
+    if (e?.starting) starting.add(b.toLowerCase());
+    for (const p of Object.values(e?.procs || {})) if (Number.isInteger(p?.pid)) recorded.add(p.pid);
+  }
+  const rootPrefix = root.endsWith('/') ? root : `${root}/`;
+  return procs.filter((p) => {
+    if (!p || !PREVIEW_SHAPES.some((re) => re.test(p.args))) return false;   // not a preview server
+    if (!String(p.cwd || '').startsWith(rootPrefix)) return false;           // outside the worktree root
+    if (recorded.has(p.pid)) return false;                                   // the live generation
+    if (p.ageSec < minAgeSec) return false;                                  // may be a bring-up in flight
+    const bug = String(p.cwd).slice(rootPrefix.length).split('/')[0].toLowerCase();
+    if (starting.has(bug)) return false;                                     // bring-up in flight, for sure
+    return true;
+  });
+}
+
+// Effectful wrapper: SIGTERM each orphan (SIGKILL is left to the next sweep — on the live cleanup every
+// one of the ten exited on TERM alone, and a wrapper's children go with it). Returns what it signalled.
+export function reapOrphanPreviewProcs(log = () => {}, opts = {}) {
+  const orphans = orphanPreviewProcs(opts);
+  const reaped = [];
+  for (const p of orphans) {
+    const mb = Math.round((p.rssKB || 0) / 1024);
+    log(`orphan preview process ${p.pid} (${Math.round(p.ageSec / 60)}m old${mb ? `, ${mb}MB` : ''}) belongs to no live preview — stopping: ${p.args.slice(0, 90)}`);
+    try { process.kill(p.pid, 'SIGTERM'); reaped.push(p.pid); } catch { /* already gone */ }
+  }
+  return reaped;
+}
+
+// Snapshot of running processes as {pid, ageSec, rssKB, args, cwd}. cwd comes from /proc/<pid>/cwd
+// because the `npm exec` wrappers carry no worktree path in argv and can only be attributed that way.
+export function listPreviewCandidates(spawn = spawnSync, readLink = (p) => readlinkSync(p)) {
+  const r = spawn('ps', ['-eo', 'pid=,etimes=,rss=,args='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  if (r.status !== 0 || !r.stdout) return [];
+  const out = [];
+  for (const line of r.stdout.split('\n')) {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.*)$/);
+    if (!m) continue;
+    let cwd = null;
+    try { cwd = readLink(`/proc/${m[1]}/cwd`); } catch { continue; }   // exited, or not ours to inspect
+    out.push({ pid: +m[1], ageSec: +m[2], rssKB: +m[3], args: m[4], cwd });
+  }
+  return out;
 }
 
 // Effectful wrapper: clears every dead preview's state + routes via the normal teardown path (which is
