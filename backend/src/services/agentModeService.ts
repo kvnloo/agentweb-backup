@@ -57,6 +57,8 @@ import { meterUsageFromResponse } from '../utils/llmClients';
 import { BEDROCK_BEARER_TOKEN_MODELS, bedrockCacheTtl, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
+  cacheWriteCost,
+  CacheWriteByTtl,
   imageGenerationCostUsd,
   videoGenerationCostUsd,
 } from '../utils/llmPricing';
@@ -2061,12 +2063,24 @@ export class AgentModeService {
             const cacheReadTokens = usage.cacheReadInputTokens || 0;
             const cacheWriteTokens = usage.cacheWriteInputTokens || 0;
 
+            // ENG-893: cacheDetails breaks the write down by the TTL Bedrock
+            // actually applied. It is both the prod-log proof that the 1-hour
+            // checkpoint was honoured rather than silently ignored, AND what the
+            // ledger bills against — asking for `ttl: '1h'` does not guarantee
+            // getting it, so we price what came back.
+            const cacheWriteByTtl: Record<string, number> | undefined =
+              Array.isArray(usage.cacheDetails) && usage.cacheDetails.length > 0
+                ? usage.cacheDetails.reduce((acc: Record<string, number>, d: any) => {
+                    const ttl = typeof d?.ttl === 'string' ? d.ttl : undefined;
+                    const tokens = Number(d?.inputTokens) || 0;
+                    if (ttl && tokens > 0) acc[ttl] = (acc[ttl] || 0) + tokens;
+                    return acc;
+                  }, {})
+                : undefined;
+
             if (cacheReadTokens > 0 || cacheWriteTokens > 0) {
-              // ENG-893: cacheDetails breaks the write down by the TTL Bedrock
-              // actually applied — the only way to confirm from prod logs that
-              // the 1-hour checkpoint was honoured rather than silently ignored.
-              const ttlBreakdown = (usage.cacheDetails || [])
-                .map((d: any) => `${d?.ttl}:${d?.inputTokens}`)
+              const ttlBreakdown = Object.entries(cacheWriteByTtl || {})
+                .map(([ttl, tokens]) => `${ttl}:${tokens}`)
                 .join(',');
               console.log(`AgentMode: Bedrock cache — read: ${cacheReadTokens}, write: ${cacheWriteTokens}${ttlBreakdown ? ` (${ttlBreakdown})` : ''}, uncached input: ${inputTokens}, output: ${outputTokens}`);
             }
@@ -2104,6 +2118,10 @@ export class AgentModeService {
                 total_tokens: inputTokens + outputTokens,
                 cache_read_input_tokens: cacheReadTokens,
                 cache_creation_input_tokens: cacheWriteTokens,
+                // ENG-893: the TTL Bedrock actually applied per write bucket, so
+                // cost is billed at the honoured rate rather than the one we asked
+                // for. Undefined when the response carried no breakdown.
+                cache_creation_by_ttl: cacheWriteByTtl,
               },
             };
           },
@@ -2735,6 +2753,8 @@ export class AgentModeService {
               outputTokens: usage.completion_tokens || 0,
               cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
               cacheWriteTokens: usage.cache_creation_input_tokens || 0,
+              // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
+              cacheWriteByTtl: usage.cache_creation_by_ttl,
             });
           }
         } catch {
@@ -2787,17 +2807,28 @@ export class AgentModeService {
    * Estimate cost in USD for an LLM call based on model pricing.
    * Prices are per 1M tokens (input/output).
    */
-  private estimateCost(model: string, inputTokens: number, outputTokens: number, cacheReadTokens: number = 0, cacheWriteTokens: number = 0): number {
+  private estimateCost(
+    model: string,
+    inputTokens: number,
+    outputTokens: number,
+    cacheReadTokens: number = 0,
+    cacheWriteTokens: number = 0,
+    /** ENG-893: per-TTL cache-write split from Bedrock's `usage.cacheDetails`. */
+    cacheWriteByTtl?: CacheWriteByTtl
+  ): number {
     // Single source of truth for rates: llmPricing.MODEL_PRICING (via getModelPrice).
     // Unknown models fall back to Sonnet pricing here, preserving long-standing behavior.
     const price = getModelPrice(model);
     const inputPrice = price?.inPerM ?? 3;
     const outputPrice = price?.outPerM ?? 15;
-    // Cache reads are 10% of input price; cache writes are 125% of input price.
+    // Cache reads are 10% of input price. Cache WRITES depend on the TTL that was
+    // applied (1.25x at 5m, 2x at 1h), so they bill off the response's breakdown
+    // when Bedrock reported one — see cacheWriteCost (ENG-893).
     const cacheReadPrice = price?.cacheReadPerM ?? inputPrice * 0.1;
-    const cacheWritePrice = price?.cacheWritePerM ?? inputPrice * 1.25;
+    const effectivePrice = price ?? { inPerM: inputPrice, outPerM: outputPrice };
     return (inputTokens * inputPrice + outputTokens * outputPrice
-      + cacheReadTokens * cacheReadPrice + cacheWriteTokens * cacheWritePrice) / 1_000_000;
+      + cacheReadTokens * cacheReadPrice
+      + cacheWriteCost(effectivePrice, cacheWriteTokens, cacheWriteByTtl)) / 1_000_000;
   }
 
   /** Cost per image generation in USD (fixed per-generation pricing, sourced from llmPricing). */
@@ -3568,6 +3599,7 @@ export class AgentModeService {
               responseUsage.completion_tokens || 0,
               responseUsage.cache_read_input_tokens || 0,
               responseUsage.cache_creation_input_tokens || 0,
+              responseUsage.cache_creation_by_ttl,
             ),
           };
         }
