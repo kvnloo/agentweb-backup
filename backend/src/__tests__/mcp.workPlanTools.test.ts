@@ -710,6 +710,16 @@ describe('Predefined Work Plan MCP Tools', () => {
       expect(def.inputSchema.properties.steps_mode).toBeDefined();
       expect(def.inputSchema.properties.confirm_step_removal).toBeDefined();
     });
+
+    it('tells the caller not to send fields it is not changing in merge mode', () => {
+      // Live-verified gap: asked to change only a description, the model filled
+      // in a placeholder title as well, and merge applied it as a rename. The
+      // stepsChange diff reported it, so it was not silent — but the step still
+      // ended up renamed when nobody asked for that.
+      const def = mcpToolRegistry.getTool('manage_predefined_work_plan')!.definition as any;
+      expect(def.inputSchema.properties.steps_mode.description).toMatch(/only the fields you are actually changing/i);
+      expect(def.inputSchema.properties.steps_mode.description).toMatch(/renames that step/i);
+    });
   });
 
   // ─── ENG-890 residual: the count guard above cannot see a replace that keeps

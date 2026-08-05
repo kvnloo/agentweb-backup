@@ -2293,7 +2293,7 @@ mcpToolRegistry.register({
         steps_mode: {
           type: 'string',
           enum: ['replace', 'merge'],
-          description: 'How to apply "steps" on update. "replace" (default) overwrites the whole array. "merge" patches the supplied steps into the existing plan by stepCount (or title) and appends unmatched ones, leaving every other step intact.'
+          description: 'How to apply "steps" on update. "replace" (default) overwrites the whole array. "merge" patches the supplied steps into the existing plan by stepCount (or title) and appends unmatched ones, leaving every other step intact. In "merge", send ONLY the fields you are actually changing on each step, plus stepCount to say which step you mean: every field you include is applied, so passing a title you did not mean to change RENAMES that step. Do not fill in placeholder values for fields you are leaving alone.'
         },
         confirm_step_removal: {
           type: 'boolean',
