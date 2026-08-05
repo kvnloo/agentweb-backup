@@ -161,6 +161,28 @@ export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
 // isCompleteHtmlDocument) and are NOT subject to this cap.
 export const CREATE_HTML_RENDER_MAX_DRAFT_CHARS = 60000;
 
+// Above this draft size, a render TIMEOUT is deterministic rather than transient:
+// the draft cannot be re-rendered inside the same per-call budget, so ENG-203's
+// retry only spends another full 5-minute window arriving at the same failure.
+// A 40-competitor report (~45K-char draft) timed out on every attempt, twice in a
+// row, and ended the run with no deliverable at all (ENG-873). Kept well below
+// CREATE_HTML_RENDER_MAX_DRAFT_CHARS so ordinary drafts — where a timeout really
+// is a one-off blip — keep the retry.
+export const CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS = 20000;
+
+// Is this render error a per-call TIMEOUT (as opposed to a throttle, 5xx or
+// terminal error)? Bedrock surfaces these as TimeoutError/ModelTimeoutException,
+// or — for the streaming render — as "Stream timed out because of no activity
+// for 300000 ms", which carries no distinguishing name or code.
+export function isRenderTimeoutError(error: unknown): boolean {
+  if (!error) return false;
+  const e = error as any;
+  if (e.name === 'TimeoutError' || e.name === 'ModelTimeoutException') return true;
+  if (e.code === 'ETIMEDOUT' || e.code === 'ECONNABORTED') return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /timed?\s?out|timeout/i.test(message);
+}
+
 // A create_html_file content_draft that is already a complete HTML document does
 // not need the internal HTML-generation LLM call — re-rendering HTML->HTML is
 // wasted cost/latency, risks the model altering the user's content, and is the
@@ -26203,6 +26225,13 @@ Please generate a complete, professional HTML document that properly formats and
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
       const maxRenderAttempts = 3;
       let htmlContent = '';
+      let renderFailure: unknown = null;
+      // ENG-873: above this draft size a render TIMEOUT is a property of the
+      // payload, not a blip — the same monolithic render cannot fit in the same
+      // per-call budget on a second attempt, so a retry just spends another five
+      // minutes reaching the identical failure. Below it, ENG-203's retry still
+      // applies: a small draft that times out really did hit a one-off blip.
+      const timeoutIsDeterministic = contentDraft.length > CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS;
       for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
         try {
           htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
@@ -26210,6 +26239,12 @@ Please generate a complete, professional HTML document that properly formats and
         } catch (renderError) {
           const isLastAttempt = attempt === maxRenderAttempts;
           const isTransient = isTransientLLMError(renderError);
+          const renderErrorText = renderError instanceof Error ? renderError.message : renderError;
+          if (timeoutIsDeterministic && isRenderTimeoutError(renderError)) {
+            console.error(`AgentMode: HTML render timed out on a ${contentDraft.length}-char draft (session ${sessionId}) — too large to re-render inside the per-call budget, degrading instead of retrying:`, renderErrorText);
+            renderFailure = renderError;
+            break;
+          }
           if (isLastAttempt || !isTransient) {
             // Distinguish exhaustion from a terminal error. If every attempt hit a
             // transient timeout, the render likely can't finish inside the per-call
@@ -26218,18 +26253,30 @@ Please generate a complete, professional HTML document that properly formats and
             // chunking the render (ENG-203 follow-up). Log it distinctly so these are
             // greppable and separable from one-off blips and terminal errors.
             if (isLastAttempt && isTransient) {
-              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderError instanceof Error ? renderError.message : renderError);
+              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderErrorText);
             }
-            throw renderError;
+            renderFailure = renderError;
+            break;
           }
           const backoffMs = 1000 * Math.pow(2, attempt - 1);
-          console.warn(`AgentMode: HTML render attempt ${attempt}/${maxRenderAttempts} failed with a transient error, retrying in ${backoffMs}ms:`, renderError instanceof Error ? renderError.message : renderError);
+          console.warn(`AgentMode: HTML render attempt ${attempt}/${maxRenderAttempts} failed with a transient error, retrying in ${backoffMs}ms:`, renderErrorText);
           await this.sleep(backoffMs);
         }
       }
 
-      if (!htmlContent || htmlContent.trim().length === 0) {
-        throw new Error('LLM did not generate HTML content');
+      if (!renderFailure && (!htmlContent || htmlContent.trim().length === 0)) {
+        renderFailure = new Error('LLM did not generate HTML content');
+      }
+
+      // ENG-873: the styled render is a FORMATTING step at the very end of a run
+      // that may have cost an hour of research. Losing it must never lose the
+      // work: render the draft deterministically and deliver that instead of
+      // returning nothing (which is what stranded a completed 40-competitor
+      // report — two monolithic renders, two timeouts, no deliverable at all).
+      if (renderFailure) {
+        return await this.deliverDeterministicHtmlFallback(
+          title, contentDraft, userId, documentType, renderFailure,
+        );
       }
 
       // Upload to S3
@@ -26259,6 +26306,51 @@ Please generate a complete, professional HTML document that properly formats and
         message: 'Failed to create HTML file',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
+    }
+  }
+
+  /**
+   * ENG-873 — graceful degradation for create_html_file. When the styled render
+   * cannot run, convert the draft to HTML deterministically (no LLM, no network,
+   * no size ceiling) and deliver THAT, so a downstream formatting failure can
+   * never discard the upstream work that produced the draft.
+   *
+   * Throws the original render failure if the fallback itself cannot be
+   * delivered — the caller's catch then reports the real error, as before.
+   */
+  private async deliverDeterministicHtmlFallback(
+    title: string,
+    contentDraft: string,
+    userId: string,
+    documentType: 'document' | 'email',
+    renderFailure: unknown,
+  ): Promise<any> {
+    const reason = renderFailure instanceof Error ? renderFailure.message : String(renderFailure);
+    let uploadResult: { success: boolean; url?: string; error?: string };
+    try {
+      const { renderMarkdownReportDocument } = await import('../utils/markdownHtmlReport');
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const fallbackHtml = renderMarkdownReportDocument(title, contentDraft);
+      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      uploadResult = await uploadFileToS3(fallbackHtml, filename, userId, 'text/html');
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+      }
+      console.warn(`AgentMode: create_html_file — styled render failed (${reason}); delivered a deterministically rendered fallback document instead:`, uploadResult.url);
+      return {
+        success: true,
+        s3_url: uploadResult.url,
+        filename,
+        title,
+        document_type: documentType,
+        rendered: false,
+        degraded: true,
+        degraded_reason: reason,
+        message: `HTML file created, but with basic built-in styling: the styled render step failed (${reason}), so the draft was converted to HTML directly. The full content is intact — nothing was lost. Do NOT call create_html_file again with the same draft; it will fail the same way. Give the user this file and mention the simpler styling. If they want the richer design, send a complete self-contained HTML document as content_draft (that is saved verbatim, with no size limit) or split the report into smaller sections.`,
+      };
+    } catch (fallbackError) {
+      console.error('AgentMode: create_html_file — deterministic fallback also failed:', fallbackError);
+      throw renderFailure;
     }
   }
 
