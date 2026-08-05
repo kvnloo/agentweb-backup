@@ -1192,10 +1192,16 @@ function coerceJsonContainerForSchema(value: unknown, schema: any): { changed: b
 function validateJsonSchemaConstraints(name: string, value: unknown, schema: any): AgentToolContractIssue[] {
   const issues: AgentToolContractIssue[] = [];
 
+  // Measured in UTF-16 code units (`.length`), NOT code points, because that is
+  // what the runtime guards downstream use — e.g. accountMemoryDb.addMemory
+  // rejects on `content.length > 2000`. Counting code points here would let
+  // 1,001 emoji through the contract (1,001 code points) and fail them at
+  // execution (2,002 code units), which is the declared-vs-enforced mismatch
+  // this whole change exists to remove.
   if (
     typeof value === 'string' &&
     typeof schema?.maxLength === 'number' &&
-    Array.from(value).length > schema.maxLength
+    value.length > schema.maxLength
   ) {
     issues.push({
       code: 'invalid_args',
