@@ -2494,34 +2494,24 @@ export class ChatbotDB {
    */
   async clearSessionSatisfactionScore(
     sessionId: string,
-    previous?: ChatSession["satisfactionScore"]
+    previous: NonNullable<ChatSession["satisfactionScore"]>
   ): Promise<boolean> {
-    const params: any = previous
-      ? {
+    const pin = this.pinTo("satisfactionScore", previous.evaluatedAt);
+    try {
+      await dynamodb
+        .update({
           TableName: this.tableName,
           Key: { sessionId },
-          UpdateExpression:
-            "SET retractedSatisfactionScore = :prev REMOVE satisfactionScore",
+          UpdateExpression: "SET retractedSatisfactionScore = :prev REMOVE satisfactionScore",
           // An admin override is human judgement and is never retracted, even
           // if it were written after the read that selected this snapshot.
-          ConditionExpression: `${
-            previous.evaluatedAt
-              ? "satisfactionScore.evaluatedAt = :prevEvaluatedAt"
-              : "attribute_exists(satisfactionScore)"
-          } AND attribute_not_exists(satisfactionScore.adminOverride)`,
+          ConditionExpression: `${pin.expression} AND attribute_not_exists(satisfactionScore.adminOverride)`,
           ExpressionAttributeValues: {
             ":prev": { ...previous, retractedAt: new Date().toISOString() },
-            ...(previous.evaluatedAt ? { ":prevEvaluatedAt": previous.evaluatedAt } : {}),
+            ...pin.values(previous),
           },
-        }
-      : {
-          TableName: this.tableName,
-          Key: { sessionId },
-          UpdateExpression: "REMOVE satisfactionScore",
-          ConditionExpression: "attribute_not_exists(satisfactionScore.adminOverride)",
-        };
-    try {
-      await dynamodb.update(params).promise();
+        })
+        .promise();
       return true;
     } catch (error) {
       // Lost the race: the row still holds a score, so the caller must keep its
@@ -2530,6 +2520,27 @@ export class ChatbotDB {
       console.error("Error clearing session satisfaction score:", error);
       throw error;
     }
+  }
+
+  /**
+   * The compare-and-swap pin for a retraction: what must still be true of the
+   * persisted score for it to be the one the caller read.
+   *
+   * `evaluatedAt` is stamped fresh by every writer, so it identifies a specific
+   * score. Without it — a legacy row — the only honest pin is the score object
+   * itself: `attribute_exists` would survive a replacement write and let the
+   * retraction archive the wrong score.
+   */
+  private pinTo(path: string, evaluatedAt?: string) {
+    return evaluatedAt
+      ? {
+          expression: `${path}.evaluatedAt = :prevEvaluatedAt`,
+          values: (_previous: any) => ({ ":prevEvaluatedAt": evaluatedAt }),
+        }
+      : {
+          expression: `${path} = :prevSnapshot`,
+          values: (previous: any) => ({ ":prevSnapshot": previous }),
+        };
   }
 
   /**
@@ -2548,28 +2559,15 @@ export class ChatbotDB {
   async clearSessionJudgeScore(
     sessionId: string,
     judgeId: string,
-    previous?: NonNullable<ChatSession["judgeScores"]>[string]
+    previous: NonNullable<ChatSession["judgeScores"]>[string]
   ): Promise<boolean> {
     const names = { "#js": "judgeScores", "#rjs": "retractedJudgeScores", "#jid": judgeId };
     try {
-      if (!previous) {
-        await dynamodb
-          .update({
-            TableName: this.tableName,
-            Key: { sessionId },
-            UpdateExpression: "REMOVE #js.#jid",
-            ExpressionAttributeNames: { "#js": "judgeScores", "#jid": judgeId },
-          })
-          .promise();
-        return true;
-      }
       const archived = { ...previous, retractedAt: new Date().toISOString() };
       // Same compare-and-swap as clearSessionSatisfactionScore: only retract the
       // judge score this caller actually read, never a replacement written since.
-      const condition = previous.evaluatedAt
-        ? "#js.#jid.evaluatedAt = :prevEvaluatedAt"
-        : "attribute_exists(#js.#jid)";
-      const pin = previous.evaluatedAt ? { ":prevEvaluatedAt": previous.evaluatedAt } : {};
+      const { expression: condition, values } = this.pinTo("#js.#jid", previous.evaluatedAt);
+      const pin = values(previous);
       try {
         await dynamodb
           .update({
