@@ -783,6 +783,41 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       );
     });
 
+    // The system prompt (and its PUBLISH AUTHORIZATION directive) is assembled ONCE on
+    // the session's first message, so narrowing the authorization reaches the checker
+    // but NOT the model. Without carrying the withdrawal in the turn message, a revoked
+    // run would stop being nudged while still believing it was authorized to publish.
+    it('TELLS THE MODEL the authorization is void after a mid-run revocation', async () => {
+      const admitted = {
+        ...publishSchedule,
+        requiredFunctionCalls: ['read_brand_guidelines', 'analyze_competitors', 'post_on_connected_account'],
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue({
+        ...publishSchedule,
+        autopublishAuthorized: false,
+        autopublishAuthorizedTools: [],
+      } as any);
+      // Never satisfies analyze_competitors, so the run takes more than one turn and we
+      // can inspect what the SECOND turn actually sent to the model.
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Drafted only.',
+        toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      await runScheduledChat(admitted as any, mockUserId, true);
+
+      const messagesSent = mockGenerateMarketingResponseWorkerService.runInWorker.mock.calls
+        .map((c: any[]) => JSON.stringify(c));
+      const revocationTurns = messagesSent.filter((m: string) => m.includes('PUBLISH AUTHORIZATION WITHDRAWN'));
+      expect(revocationTurns.length).toBeGreaterThan(0);
+      expect(revocationTurns[0]).toContain('no longer authorized to publish with any tool');
+    });
+
     it('KEEPS an AUTHORIZED publish tool in functionCallDetails — the scope filters, not the tool name', async () => {
       const authorized = {
         ...publishSchedule,
