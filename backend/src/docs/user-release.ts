@@ -11,6 +11,11 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-08-04',
     changes: [
+      'Fixed: A Scheduled Run Interrupted by a Deployment Now Says So',
+      '- If we shipped an update while one of your scheduled runs was working, the run could stop partway through — and the note left in the chat told you the job was too large and to split it into smaller batches',
+      '- That advice was wrong: nothing was wrong with your request, and a smaller batch would have been interrupted in exactly the same way',
+      '- The note now states the real cause — the run was interrupted on our side — and confirms it is retried automatically, so you are not sent off rewriting a schedule that was never the problem',
+      '- Interrupted runs are also no longer counted as poor-quality results in our internal quality reporting, so genuine issues stand out instead of being buried',
       'Fixed: Work Plan Steps Built Over the API No Longer Lose Their Settings',
       '- When you created a work plan through the Claude connector, the tool bindings on each step could come back empty even though the request succeeded — the field name shown in the tool description was not the one the system read, and nothing warned you',
       '- Both spellings are now accepted, and the tool description lists the settings a step really supports, including the skills you can attach to it',
