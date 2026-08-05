@@ -30,9 +30,10 @@
  */
 import express from 'express';
 import crypto from 'crypto';
-import { getAccountByCalendlyUserUri } from '../services/connectedAccountsDb';
+import { getAccountByCalendlyUserUri, updateAccountConfig } from '../services/connectedAccountsDb';
 import { userDb, crmDb } from '../services/db';
 import { metaService } from '../services/metaService';
+import { externalCrmSyncService } from '../services/externalCrmSyncService';
 
 const router = express.Router();
 
@@ -197,31 +198,89 @@ router.post('/', (req: express.Request, res: express.Response) => {
         return;
       }
 
-      const pixelResolution = await metaService.resolveMetaPixelForUser(owner, resolved.userId);
-      if ('unresolved' in pixelResolution) {
-        console.log(`[Calendly Webhook] Meta pixel unresolved for user ${resolved.userId}: ${pixelResolution.reason} — booking saved, CAPI skipped`);
-        return;
-      }
-
-      const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
-      const { accessToken } = await getMetaAccountCredentials(owner, resolved.userId, pixelResolution.accountId);
-
       const { firstName, lastName } = splitName(parsed.payload);
       const createdAtMs = parsed.payload.created_at ? Date.parse(parsed.payload.created_at) : NaN;
       const eventTimeSeconds = Number.isFinite(createdAtMs) ? Math.floor(createdAtMs / 1000) : undefined;
 
-      const result = await metaService.sendCapiLeadEvent(pixelResolution.pixelId, accessToken, {
-        eventId: parsed.payload.uri,
-        email: parsed.payload.email,
-        firstName,
-        lastName,
-        eventTimeSeconds,
-      });
+      // Two independent legs from here — CAPI attribution and CRM-forward. Each gets
+      // its own try/catch so a failure in one (e.g. no Meta ad account connected, or a
+      // CRM write error) never prevents the other from running.
 
-      if (result.success) {
-        console.log(`[Calendly Webhook] CAPI Lead event sent for user ${resolved.userId} (fbtrace_id=${result.fbtraceId ?? 'n/a'})`);
-      } else {
-        console.error(`[Calendly Webhook] CAPI send failed for user ${resolved.userId}: ${result.error}`);
+      try {
+        const pixelResolution = await metaService.resolveMetaPixelForUser(owner, resolved.userId);
+        if ('unresolved' in pixelResolution) {
+          console.log(`[Calendly Webhook] Meta pixel unresolved for user ${resolved.userId}: ${pixelResolution.reason} — booking saved, CAPI skipped`);
+        } else {
+          const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
+          const { accessToken } = await getMetaAccountCredentials(owner, resolved.userId, pixelResolution.accountId);
+
+          const result = await metaService.sendCapiLeadEvent(pixelResolution.pixelId, accessToken, {
+            eventId: parsed.payload.uri,
+            email: parsed.payload.email,
+            firstName,
+            lastName,
+            eventTimeSeconds,
+          });
+
+          if (result.success) {
+            console.log(`[Calendly Webhook] CAPI Lead event sent for user ${resolved.userId} (fbtrace_id=${result.fbtraceId ?? 'n/a'})`);
+          } else {
+            console.error(`[Calendly Webhook] CAPI send failed for user ${resolved.userId}: ${result.error}`);
+          }
+        }
+      } catch (capiError: any) {
+        console.error('[Calendly Webhook] CAPI leg failed:', capiError?.message ?? capiError);
+      }
+
+      try {
+        const email = parsed.payload.email;
+        if (!email) {
+          console.warn('[Calendly Webhook] No invitee email — skipping CRM-forward');
+        } else {
+          let listId = resolved.account.config?.booking_lead_list_id as string | undefined;
+          if (!listId) {
+            listId = await resolveOrCreateBookingList(resolved.userId);
+            await updateAccountConfig(resolved.userId, 'calendly', resolved.account.account_id, {
+              booking_lead_list_id: listId,
+            });
+          }
+
+          const existingLead = await crmDb.getLeadByEmail(listId, email.trim().toLowerCase());
+          let lead: any;
+          let eventType: 'created' | 'updated';
+          if (existingLead) {
+            await crmDb.updateLead(listId, existingLead.leadId, {
+              customFields: {
+                ...(existingLead.customFields || {}),
+                lastBookedAt: new Date().toISOString(),
+                lastBookingUri: parsed.payload.uri,
+              },
+            });
+            lead = existingLead;
+            eventType = 'updated';
+          } else {
+            lead = await crmDb.createLead(listId, {
+              email: email.trim(),
+              firstName,
+              lastName,
+              customFields: {
+                source: 'calendly_booking',
+                bookedAt: new Date().toISOString(),
+                bookingUri: parsed.payload.uri,
+              },
+            });
+            eventType = 'created';
+          }
+
+          void externalCrmSyncService.autoSyncLead(resolved.userId, listId, lead, 'hubspot', eventType)
+            .catch((err: any) => console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err));
+          void externalCrmSyncService.autoSyncLead(resolved.userId, listId, lead, 'attio', eventType)
+            .catch((err: any) => console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err));
+
+          console.log(`[Calendly Webhook] CRM-forward: lead ${eventType} in list ${listId} for user ${resolved.userId}`);
+        }
+      } catch (crmError: any) {
+        console.error('[Calendly Webhook] CRM-forward leg failed:', crmError?.message ?? crmError);
       }
     } catch (error: any) {
       console.error('[Calendly Webhook] Unexpected error:', error?.message ?? error);
