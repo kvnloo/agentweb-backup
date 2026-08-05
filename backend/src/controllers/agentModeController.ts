@@ -3160,12 +3160,18 @@ export async function runScheduledChat(
       actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
     });
 
-    expectedFunctionCalls.forEach((funcCall: string) => {
-      const actualCount = actualFunctionCallCounts[funcCall] || 0;
-      const requiredCount = functionCallMinCalls[funcCall] || 1;
-      finalFunctionCallDetails[funcCall] = {
-        actual: actualCount,
-        required: requiredCount
+    // ENG-827: report the requirements this run was actually HELD TO, which is the
+    // publish-scope-filtered list the checker used above — not the raw schedule
+    // config. Reading the unfiltered config here persisted a self-contradicting
+    // record on an unauthorized run: `post_on_connected_account {required: 1,
+    // actual: 0}` sitting next to an empty functionCallMisses and passed: true.
+    // Nothing downstream can tell that apart from a genuine silent miss, which is
+    // the false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
+    // feeds the checker, the prompt and this record.
+    requiredFunctions.forEach(({ functionName, minCount }) => {
+      finalFunctionCallDetails[functionName] = {
+        actual: actualFunctionCallCounts[functionName] || 0,
+        required: minCount
       };
     });
 
