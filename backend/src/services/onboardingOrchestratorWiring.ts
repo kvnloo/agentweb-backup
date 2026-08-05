@@ -151,10 +151,18 @@ async function runCreativeDir(userId: string): Promise<unknown> {
 async function runAdImage(userId: string): Promise<unknown> {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const {
+    claimAdImageRun,
     triggerAdImageGenerationForUser,
   } = require("./onboardingAdImageService");
   const startedAtMs = Date.now();
-  await triggerAdImageGenerationForUser(userId);
+  // Claim the axis for THIS invocation and hand the identity to the worker.
+  // The orchestrator only fires a step that is not already ready/running with
+  // these inputs (see shouldFire), so firing means a genuinely new run. Going
+  // through the trigger without an identity would make the worker adopt
+  // whatever the record names when it reads — two overlapping eager starts
+  // would then share one nonce and could overwrite each other (Greptile).
+  const run = await claimAdImageRun(userId);
+  await triggerAdImageGenerationForUser(userId, { run });
   const user = (await userDb.getUserById(userId)) as Record<string, unknown> | null;
   // Covers all three ad-image gates: missing logo, unfetchable logo, and
   // every variant failing. Note this does NOT gate ad copy — adCopy deps on

@@ -1191,6 +1191,28 @@ export async function triggerAdImageGenerationForUser(
 }
 
 /**
+ * Claim the ad-image axis for a NEW run: mint the run's identity, publish it,
+ * and hand it back so the caller can pass it to the worker it is about to
+ * launch.
+ *
+ * Every entry point that starts a run must go through here. A worker that
+ * instead re-reads its identity from the User record is not identifying
+ * ITSELF — it adopts whichever run the record names at read time, so two
+ * overlapping starts both adopt the later nonce, both pass the conditional
+ * terminal write, and each can overwrite the other's result (Greptile).
+ */
+export async function claimAdImageRun(
+  userId: string,
+): Promise<AdImageRunIdentity> {
+  const startPatch = adImageStartPatch();
+  await userDb.updateUser(userId, startPatch as any);
+  return {
+    runId: startPatch.adImageRunId,
+    startedAt: startPatch.adImageStartedAt,
+  };
+}
+
+/**
  * Synchronous entry point for routes — flips status to `running` and
  * launches background work.
  */
@@ -1204,11 +1226,7 @@ export async function startAdImageGenerationForUser(
     verifyLogoUrl?: (logoUrl: string) => Promise<boolean>;
   } = {}
 ): Promise<void> {
-  // Keep the nonce this start minted: it is what makes the worker below THIS
-  // run rather than "whichever run the record happens to name by the time the
-  // worker reads it" (see the `run` dep on triggerAdImageGenerationForUser).
-  const startPatch = adImageStartPatch();
-  await userDb.updateUser(userId, startPatch as any);
+  const run = await claimAdImageRun(userId);
   // Eager DAG sub-task 2: orchestrator owns step ordering for opted-in
   // users; cheap no-op gated inside the orchestrator for everyone else.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -1223,11 +1241,5 @@ export async function startAdImageGenerationForUser(
     void reconcileForUser(userId);
     return;
   }
-  void triggerAdImageGenerationForUser(userId, {
-    ...deps,
-    run: {
-      runId: startPatch.adImageRunId,
-      startedAt: startPatch.adImageStartedAt,
-    },
-  });
+  void triggerAdImageGenerationForUser(userId, { ...deps, run });
 }
