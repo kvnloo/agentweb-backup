@@ -161,13 +161,19 @@ export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
 // isCompleteHtmlDocument) and are NOT subject to this cap.
 export const CREATE_HTML_RENDER_MAX_DRAFT_CHARS = 60000;
 
-// Above this draft size, a render TIMEOUT is deterministic rather than transient:
-// the draft cannot be re-rendered inside the same per-call budget, so ENG-203's
-// retry only spends another full 5-minute window arriving at the same failure.
-// A 40-competitor report (~45K-char draft) timed out on every attempt, twice in a
-// row, and ended the run with no deliverable at all (ENG-873). Kept well below
-// CREATE_HTML_RENDER_MAX_DRAFT_CHARS so ordinary drafts — where a timeout really
-// is a one-off blip — keep the retry.
+// Above this draft size, a render TIMEOUT is deterministic rather than transient,
+// so ENG-203's retry only spends another full 5-minute window arriving at the
+// identical failure. Backstop for the streaming render (see the createLLMService
+// call in createHTMLFile): streaming is what actually stops the 5-minute
+// socket-inactivity timer from firing mid-generation, but if a render still times
+// out on a draft this large, the size — not a blip — is why.
+//
+// The threshold is empirical, from the create_html_file calls in prod:
+//   timed out: 45,000 / 42,232 / 37,604 / 31,213 / 25,580-char drafts
+//   succeeded: 23,010 / 22,456 / 11,975 / 11,825-char drafts
+// so the cliff sat between ~23K and ~25.5K. 20K keeps a margin under the smallest
+// observed success, and well below CREATE_HTML_RENDER_MAX_DRAFT_CHARS so ordinary
+// drafts — where a timeout really is a one-off blip — keep the retry.
 export const CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS = 20000;
 
 // Is this render error a per-call TIMEOUT (as opposed to a throttle, 5xx or
@@ -26110,8 +26116,13 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       // Import LLMService
       const { createLLMService } = await import('../utils/llmService');
-      // Use high token limit for HTML generation — reports like GTM audits can be large
-      const llmService = createLLMService(defaultClaudeModel, 0.8, 64000);
+      // Use high token limit for HTML generation — reports like GTM audits can be large.
+      // ENG-873: stream the render. A 64K-token document routinely takes longer than
+      // the Bedrock client's 5-minute socket-inactivity timeout to generate, and a
+      // NON-streaming call puts nothing on the socket until it is completely done —
+      // so every large report timed out deterministically. Streaming keeps bytes
+      // flowing, so the inactivity timer never fires mid-generation.
+      const llmService = createLLMService(defaultClaudeModel, 0.8, 64000, { streaming: true });
 
       // Email mode produces a one-off newsletter/marketing email rendered in
       // HTML that is safe across email clients (Gmail, Outlook, Apple Mail).
@@ -26436,8 +26447,11 @@ Please generate a complete, professional HTML document that properly formats and
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
       const { createLLMService } = await import('../utils/llmService');
-      // Use 16K tokens for HTML template generation to avoid truncation
-      const llmService = createLLMService(defaultClaudeModel, 0.8, 16384);
+      // Use 16K tokens for HTML template generation to avoid truncation.
+      // Streamed for the same reason as the create_html_file render above
+      // (ENG-873) — a 16K-token template can also outrun the 5-minute
+      // socket-inactivity timeout when the call returns nothing until it ends.
+      const llmService = createLLMService(defaultClaudeModel, 0.8, 16384, { streaming: true });
 
       // Build system prompt for HTML template creation
       const systemPrompt = `You are an expert web developer and HTML email template designer. Your task is to create or enhance an HTML email template based on the provided HTML content and instructions.
