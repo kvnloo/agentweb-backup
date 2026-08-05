@@ -116,6 +116,7 @@ export const INTEGRATION_CONFIG = {
       'webhooks:write',        // POST /webhook_subscriptions — provisions the booking webhook
       'webhooks:read',         // Calendly's dashboard force-selects this alongside webhooks:write; we don't call it, but it will be granted regardless
       'scheduled_events:read', // required alongside webhooks:write for invitee.created events
+      'event_types:read',      // GET /event_types — used to resolve a connected user's scheduling link (ENG-524 webhook-receiver verification spike)
     ],
   },
 
