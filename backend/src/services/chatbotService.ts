@@ -283,6 +283,12 @@ export interface ChatSession {
       outputQuality: number;
     };
   }>;
+  // Scores retracted because the session turned out to be outside the
+  // satisfaction cohort (zero-task — ENG-830). The original score is MOVED here
+  // rather than deleted: consumers see an unscored session (which is the point),
+  // but the retraction stays fully reversible and auditable.
+  retractedSatisfactionScore?: ChatSession["satisfactionScore"] & { retractedAt?: string };
+  retractedJudgeScores?: Record<string, NonNullable<ChatSession["judgeScores"]>[string] & { retractedAt?: string }>;
   sessionSummary?: {
     summary: string;        // LLM-generated summary of what was achieved
     evaluatedAt: string;    // ISO timestamp
@@ -2466,21 +2472,39 @@ export class ChatbotDB {
   }
 
   /**
-   * Remove a previously persisted satisfaction score.
+   * Retract a previously persisted satisfaction score by ARCHIVING it.
    *
    * Used when a session is re-examined and turns out to be outside the
    * satisfaction cohort altogether (e.g. a zero-task session scored before that
    * exclusion existed — ENG-830). Scoring skips such sessions, so without an
    * explicit retraction the stale score would linger forever and keep inflating
-   * the ≤3 cohort. The score is derived, recomputable data: if the session later
-   * gains a real request, the next sweep scores it again from scratch.
+   * the ≤3 cohort.
+   *
+   * The score is MOVED to `retractedSatisfactionScore` in the same atomic
+   * update, never dropped. Consumers read `satisfactionScore` and correctly see
+   * an unscored session, while the original stays recoverable — so a bulk
+   * retraction that turns out to be wrong can be undone from the archive
+   * instead of being an irreversible data loss.
    */
-  async clearSessionSatisfactionScore(sessionId: string): Promise<void> {
-    const params = {
-      TableName: this.tableName,
-      Key: { sessionId },
-      UpdateExpression: "REMOVE satisfactionScore",
-    };
+  async clearSessionSatisfactionScore(
+    sessionId: string,
+    previous?: ChatSession["satisfactionScore"]
+  ): Promise<void> {
+    const params: any = previous
+      ? {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression:
+            "SET retractedSatisfactionScore = :prev REMOVE satisfactionScore",
+          ExpressionAttributeValues: {
+            ":prev": { ...previous, retractedAt: new Date().toISOString() },
+          },
+        }
+      : {
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: "REMOVE satisfactionScore",
+        };
     try {
       await dynamodb.update(params).promise();
     } catch (error) {
@@ -2489,19 +2513,50 @@ export class ChatbotDB {
     }
   }
 
-  /** Remove one judge's previously persisted score (see clearSessionSatisfactionScore). */
-  async clearSessionJudgeScore(sessionId: string, judgeId: string): Promise<void> {
-    const params = {
-      TableName: this.tableName,
-      Key: { sessionId },
-      UpdateExpression: "REMOVE #js.#jid",
-      ExpressionAttributeNames: {
-        "#js": "judgeScores",
-        "#jid": judgeId,
-      },
-    };
+  /** Judge-score counterpart of clearSessionSatisfactionScore (same archive semantics). */
+  async clearSessionJudgeScore(
+    sessionId: string,
+    judgeId: string,
+    previous?: NonNullable<ChatSession["judgeScores"]>[string]
+  ): Promise<void> {
+    const names = { "#js": "judgeScores", "#rjs": "retractedJudgeScores", "#jid": judgeId };
     try {
-      await dynamodb.update(params).promise();
+      if (!previous) {
+        await dynamodb
+          .update({
+            TableName: this.tableName,
+            Key: { sessionId },
+            UpdateExpression: "REMOVE #js.#jid",
+            ExpressionAttributeNames: { "#js": "judgeScores", "#jid": judgeId },
+          })
+          .promise();
+        return;
+      }
+      const archived = { ...previous, retractedAt: new Date().toISOString() };
+      try {
+        await dynamodb
+          .update({
+            TableName: this.tableName,
+            Key: { sessionId },
+            UpdateExpression: "SET #rjs.#jid = :prev REMOVE #js.#jid",
+            ExpressionAttributeNames: names,
+            ExpressionAttributeValues: { ":prev": archived },
+          })
+          .promise();
+      } catch (error: any) {
+        // retractedJudgeScores map does not exist yet — create it, same pattern
+        // as updateSessionJudgeScore.
+        if (error.code !== "ValidationException") throw error;
+        await dynamodb
+          .update({
+            TableName: this.tableName,
+            Key: { sessionId },
+            UpdateExpression: "SET #rjs = :map REMOVE #js.#jid",
+            ExpressionAttributeNames: names,
+            ExpressionAttributeValues: { ":map": { [judgeId]: archived } },
+          })
+          .promise();
+      }
     } catch (error) {
       console.error("Error clearing session judge score:", error);
       throw error;

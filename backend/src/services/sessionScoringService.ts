@@ -724,10 +724,30 @@ export async function scoreSessionWithJudge(
  * one bad session cannot abort the whole scoring pass. An admin-overridden
  * score is human judgement and is never retracted.
  */
+/**
+ * Whether retraction may WRITE to production.
+ *
+ * The forward half of ENG-830 (never score a zero-task session again) is pure
+ * logic and needs no data change. Retracting scores persisted BEFORE the fix is
+ * a bulk mutation of production data, which CLAUDE.md puts behind the
+ * database/data-plane approval gate. Gating it on an env var decouples the two:
+ * the code merges and ships the forward fix immediately, and the historical
+ * cleanup is switched on separately once approved — by flipping an Elastic
+ * Beanstalk env var, with no redeploy, and reversible the same way.
+ *
+ * Read per call (not cached at module load) so the flag takes effect on the
+ * next sweep rather than requiring a process restart.
+ */
+function retractionEnabled(): boolean {
+  return process.env.SCORING_RETRACT_STALE_SCORES === "true";
+}
+
 async function retractSatisfactionScore(session: ChatSession): Promise<void> {
   if (!session.satisfactionScore || session.satisfactionScore.adminOverride) return;
+  if (!retractionEnabled()) return;
+  const previous = session.satisfactionScore;
   try {
-    await chatbotDb.clearSessionSatisfactionScore(session.sessionId);
+    await chatbotDb.clearSessionSatisfactionScore(session.sessionId, previous);
     // Keep the in-memory copy consistent: the sync sweep applies scores onto
     // these objects and serialises them straight back to the caller.
     delete (session as any).satisfactionScore;
@@ -739,8 +759,10 @@ async function retractSatisfactionScore(session: ChatSession): Promise<void> {
 /** Judge-score counterpart of retractSatisfactionScore. */
 async function retractJudgeScore(session: ChatSession, judgeId: string): Promise<void> {
   if (!session.judgeScores?.[judgeId]) return;
+  if (!retractionEnabled()) return;
+  const previous = session.judgeScores[judgeId];
   try {
-    await chatbotDb.clearSessionJudgeScore(session.sessionId, judgeId);
+    await chatbotDb.clearSessionJudgeScore(session.sessionId, judgeId, previous);
     delete session.judgeScores[judgeId];
   } catch (err) {
     console.error(`retractJudgeScore: session ${session.sessionId}/${judgeId}:`, err);

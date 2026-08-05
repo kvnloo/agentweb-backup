@@ -91,6 +91,13 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockGetSetting.mockResolvedValue(null);
   mockCallLLM.mockResolvedValue(llmReply(FULL_SCORE));
+  // Retraction writes to production data and is gated behind the data-plane
+  // approval flag; enable it for the retraction tests specifically.
+  process.env.SCORING_RETRACT_STALE_SCORES = 'true';
+});
+
+afterEach(() => {
+  delete process.env.SCORING_RETRACT_STALE_SCORES;
 });
 
 // ---------------------------------------------------------------- A. crash wins
@@ -246,19 +253,46 @@ describe('ENG-830 D — stale scores on no-task sessions are retracted', () => {
 
   it('clears a persisted satisfaction score so the session leaves the ≤3 cohort', async () => {
     const session = alreadyScored();
+    const original = session.satisfactionScore;
     expect(await scoreSessionIfNeeded(session)).toBeNull();
 
-    expect(mockClearSessionSatisfactionScore).toHaveBeenCalledWith('s1');
+    // archived, not dropped — the retraction stays reversible
+    expect(mockClearSessionSatisfactionScore).toHaveBeenCalledWith('s1', original);
     expect(session.satisfactionScore).toBeUndefined(); // in-memory copy too
     expect(mockCallLLM).not.toHaveBeenCalled();        // no LLM spend to retract
   });
 
   it('clears a persisted judge score as well', async () => {
     const session = alreadyScored();
+    const original = session.judgeScores!.judge_1;
     expect(await scoreSessionWithJudgeIfNeeded(session, JUDGE)).toBeNull();
 
-    expect(mockClearSessionJudgeScore).toHaveBeenCalledWith('s1', 'judge_1');
+    expect(mockClearSessionJudgeScore).toHaveBeenCalledWith('s1', 'judge_1', original);
     expect(session.judgeScores?.judge_1).toBeUndefined();
+  });
+
+  it('writes NOTHING to production while the data-plane flag is off, but still excludes', async () => {
+    delete process.env.SCORING_RETRACT_STALE_SCORES;
+    const session = alreadyScored();
+
+    // the session is still kept out of the cohort — only the cleanup is gated
+    expect(await scoreSessionIfNeeded(session)).toBeNull();
+    expect(await scoreSessionWithJudgeIfNeeded(session, JUDGE)).toBeNull();
+
+    expect(mockClearSessionSatisfactionScore).not.toHaveBeenCalled();
+    expect(mockClearSessionJudgeScore).not.toHaveBeenCalled();
+    expect(mockUpdateSessionSatisfactionScore).not.toHaveBeenCalled();
+    expect(session.satisfactionScore).toBeDefined(); // untouched
+  });
+
+  it('the flag is read per call, so flipping it takes effect without a restart', async () => {
+    delete process.env.SCORING_RETRACT_STALE_SCORES;
+    expect(await scoreSessionIfNeeded(alreadyScored())).toBeNull();
+    expect(mockClearSessionSatisfactionScore).not.toHaveBeenCalled();
+
+    process.env.SCORING_RETRACT_STALE_SCORES = 'true';
+    expect(await scoreSessionIfNeeded(alreadyScored())).toBeNull();
+    expect(mockClearSessionSatisfactionScore).toHaveBeenCalled();
   });
 
   it('is idempotent — a session with nothing to retract issues no write', async () => {
@@ -296,7 +330,7 @@ describe('ENG-830 D — stale scores on no-task sessions are retracted', () => {
     });
 
     expect(await scoreSessionIfNeeded(session)).toBeNull();
-    expect(mockClearSessionSatisfactionScore).toHaveBeenCalledWith('s1');
+    expect(mockClearSessionSatisfactionScore).toHaveBeenCalledWith('s1', expect.anything());
     expect(mockUpdateSessionSatisfactionScore).not.toHaveBeenCalled();
   });
 
