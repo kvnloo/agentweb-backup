@@ -611,6 +611,35 @@ describe('sanitizeGeminiSchema', () => {
     });
   });
 
+  it('recurses into `anyOf` members so a nested bad keyword is stripped too (ENG-845)', () => {
+    // `anyOf` is the one composition keyword Gemini's `Schema` DOES model, so it
+    // survives the allowlist — which means its MEMBERS are still model-facing and
+    // must themselves be sanitized. A member carrying an unknown keyword would
+    // otherwise 400 the whole request exactly as a top-level one does.
+    const input = {
+      type: 'object',
+      properties: {
+        payload: {
+          anyOf: [
+            { type: 'string', pattern: '^v\\d+$', contentEncoding: 'base64' },
+            { type: 'object', properties: { id: { type: 'string', readOnly: true } }, additionalProperties: false },
+          ],
+        },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        payload: {
+          anyOf: [
+            { type: 'string', pattern: '^v\\d+$' },
+            { type: 'object', properties: { id: { type: 'string' } } },
+          ],
+        },
+      },
+    });
+  });
+
   it('passes `default`/`example` instance values through untouched', () => {
     // These hold literal INSTANCE data, not sub-schemas, so the keyword filter must
     // not be applied to their contents — Gemini accepts an arbitrary object there.
