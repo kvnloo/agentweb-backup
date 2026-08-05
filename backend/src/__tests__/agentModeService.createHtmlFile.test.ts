@@ -181,7 +181,33 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(createLLMService).toHaveBeenCalledWith(
         'anthropic.claude-sonnet-4-6',
         0.8,
-        64000
+        64000,
+        expect.any(Object)
+      );
+    });
+
+    // ENG-873: the render is fetched with a NON-streaming ConverseCommand by
+    // default, which puts no bytes on the socket until the whole document is
+    // generated — so anything taking over five minutes trips the Bedrock
+    // client's socket-inactivity timeout deterministically, and retrying
+    // reproduces it. Streaming keeps the timer reset. This is the root-cause
+    // fix; the deterministic fallback below is only the backstop.
+    it('streams the render so a long generation cannot trip the inactivity timeout', async () => {
+      const { createLLMService } = require('../utils/llmService');
+
+      await (agentModeService as any).createHtmlFile(
+        'Test Title',
+        'Test content',
+        '',
+        'user123',
+        'session123'
+      );
+
+      expect(createLLMService).toHaveBeenCalledWith(
+        'anthropic.claude-sonnet-4-6',
+        0.8,
+        64000,
+        expect.objectContaining({ streaming: true })
       );
     });
 
