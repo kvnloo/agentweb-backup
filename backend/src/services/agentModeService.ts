@@ -14243,22 +14243,25 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
-  async generateScheduledChatSummary(startingMessage: string, response: string, executedToolNames?: string[]): Promise<string | null> {
+  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[]): Promise<string | null> {
     try {
       // ENG-803: the summary becomes the run's title suffix, so it must describe
       // what the run DID, not what its prose claimed. Previously this saw only the
       // request and the response text, which let a run that posted nothing be
-      // titled "Replies queued". Ground it in the tools that actually executed.
-      const executed = Array.from(new Set((executedToolNames || []).filter(Boolean))).slice(0, 40);
-      const evidence = executed.length > 0 ? executed.join(', ') : 'none';
+      // titled "Replies queued". Ground it in the tools that actually SUCCEEDED —
+      // the caller filters out errored and preflight-rejected calls, because a
+      // failed twitter_manage_post is evidence that nothing was posted, not
+      // evidence that something was (Greptile review #19).
+      const succeeded = Array.from(new Set((succeededToolNames || []).filter(Boolean))).slice(0, 40);
+      const evidence = succeeded.length > 0 ? succeeded.join(', ') : 'none';
       const response_ = await this.callLLM(DIAGNOSIS_MODEL, [
         {
           role: 'system',
-          content: `You are a task summarizer. Given a user's request, the agent's response, and the list of tools the agent ACTUALLY executed, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). The summary must reflect the executed tools, not the response's claims: if no tool that posts, publishes, or sends was executed, do NOT use words like "Posted", "Published", "Sent", or "Queued" — describe what actually happened instead (e.g. "Drafts Prepared", "Nothing Posted"). Return ONLY the summary, nothing else.`
+          content: `You are a task summarizer. Given a user's request, the agent's response, and the list of tools that ran SUCCESSFULLY, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). The summary must reflect that list, not the response's claims. The list contains ONLY calls that succeeded — a tool that was attempted and failed is absent from it, so treat it as not having happened. If no tool that posts, publishes, or sends appears in the list, do NOT use words like "Posted", "Published", "Sent", or "Queued" — describe what actually happened instead (e.g. "Drafts Prepared", "Nothing Posted", "Posting Failed"). Return ONLY the summary, nothing else.`
         },
         {
           role: 'user',
-          content: `Request: ${startingMessage.slice(0, 300)}\n\nTools actually executed: ${evidence}\n\nResult: ${response.slice(0, 500)}`
+          content: `Request: ${startingMessage.slice(0, 300)}\n\nTools that ran SUCCESSFULLY (failed calls are excluded): ${evidence}\n\nResult: ${response.slice(0, 500)}`
         }
       ], {
         max_completion_tokens: 20,

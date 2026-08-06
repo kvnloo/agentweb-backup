@@ -3145,8 +3145,22 @@ export async function runScheduledChat(
     try {
       // ENG-803: ground the title suffix in the tools that actually ran, so a run
       // that posted nothing cannot be titled "Replies queued".
-      const executedToolNames = (result.toolCalls || []).map((call: any) => call?.name).filter(Boolean);
-      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content, executedToolNames);
+      //
+      // SUCCEEDED, not merely ATTEMPTED (Greptile review #19). The ledger keeps
+      // failed and preflight-rejected calls too, so passing every name through would
+      // hand the summarizer a `twitter_manage_post` entry for a call that errored —
+      // and it would faithfully title the run "Replies Posted". That is precisely
+      // ENG-803's false-success title, re-created by the fix meant to prevent it.
+      //
+      // A call counts only when it has no top-level `error` (the repo-wide failure
+      // marker — see countFailedToolCalls) and its result did not report
+      // success:false, which is how preflight rejections come back while still
+      // looking like a completed call.
+      const succeededToolNames = (result.toolCalls || [])
+        .filter((call: any) => call && !('error' in call) && call?.result?.success !== false)
+        .map((call: any) => call?.name)
+        .filter(Boolean);
+      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content, succeededToolNames);
       if (summary) {
         generatedSummary = summary;
         const summaryTitle = `${sessionTitle} — ${summary}`;

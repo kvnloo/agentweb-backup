@@ -36,7 +36,7 @@ describe('generateScheduledChatSummary — grounded in executed tool calls (ENG-
     jest.restoreAllMocks();
   });
 
-  it('sends the executed tool names to the summarizer as evidence', async () => {
+  it('sends the succeeded tool names to the summarizer as evidence', async () => {
     mockSummary('Drafts Prepared');
 
     await agentModeService.generateScheduledChatSummary(
@@ -46,8 +46,8 @@ describe('generateScheduledChatSummary — grounded in executed tool calls (ENG-
     );
 
     const user = sentUserContent();
-    expect(user).toContain('Tools actually executed:');
-    const evidenceLine = user.split('Tools actually executed: ')[1].split('\n')[0];
+    expect(user).toContain('Tools that ran SUCCESSFULLY');
+    const evidenceLine = user.split('Tools that ran SUCCESSFULLY (failed calls are excluded): ')[1].split('\n')[0];
     // the read tools the run DID call are listed, de-duplicated…
     expect(evidenceLine).toBe('twitter_outreach, get_brand_guidelines');
     // …and the posting tool it skipped is absent from the evidence, even though
@@ -63,7 +63,8 @@ describe('generateScheduledChatSummary — grounded in executed tool calls (ENG-
     ]);
 
     const system = sentSystemContent();
-    expect(system).toContain('must reflect the executed tools');
+    expect(system).toContain('must reflect that list, not the response\'s claims');
+    expect(system).toContain('a tool that was attempted and failed is absent from it');
     expect(system).toContain('Queued');
   });
 
@@ -72,7 +73,7 @@ describe('generateScheduledChatSummary — grounded in executed tool calls (ENG-
 
     await agentModeService.generateScheduledChatSummary('Reply to mentions', 'All done!', []);
 
-    expect(sentUserContent()).toContain('Tools actually executed: none');
+    expect(sentUserContent()).toContain('Tools that ran SUCCESSFULLY (failed calls are excluded): none');
   });
 
   it('treats an omitted tool list as no evidence rather than crashing (back-compat)', async () => {
@@ -82,7 +83,7 @@ describe('generateScheduledChatSummary — grounded in executed tool calls (ENG-
     const summary = await agentModeService.generateScheduledChatSummary('Weekly report', 'Done.');
 
     expect(summary).toBe('Report Generated');
-    expect(sentUserContent()).toContain('Tools actually executed: none');
+    expect(sentUserContent()).toContain('Tools that ran SUCCESSFULLY (failed calls are excluded): none');
   });
 
   it('de-duplicates and caps the evidence list so a long run cannot bloat the prompt', async () => {
@@ -94,7 +95,7 @@ describe('generateScheduledChatSummary — grounded in executed tool calls (ENG-
       ...many, // duplicates collapse
     ]);
 
-    const listed = sentUserContent().split('Tools actually executed: ')[1].split('\n')[0];
+    const listed = sentUserContent().split('Tools that ran SUCCESSFULLY (failed calls are excluded): ')[1].split('\n')[0];
     const names = listed.split(', ');
     expect(names.length).toBe(40);
     expect(new Set(names).size).toBe(40);
