@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import {
   readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, statSync, unlinkSync, rmSync, createWriteStream, readdirSync,
 } from 'node:fs';
+import { writeFile as writeFileAsync, rename as renameAsync } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from '../config.mjs';
@@ -85,7 +86,7 @@ const loadChatState = () => {
     const data = JSON.parse(readFileSync(chatStatePath, 'utf8'));
     chatStateCache = { mtimeMs, data };
     return data;
-  } catch { return {}; }
+  } catch { return chatStateCache.data || {}; } // stat/read blip, or file not flushed yet → serve last good in-memory state
 };
 // Read-modify-write against a fresh read (same discipline as autofix's updateState).
 // Give every message a stable, monotonic `mid`. Edit/delete address a message by mid, NOT by array
@@ -114,15 +115,60 @@ function resolveMsgIndex(msgs, body) {
 // message. Temp-file + rename makes the multi-MB write crash-safe — a mid-write crash can no longer
 // truncate the live file. Stays fully synchronous, so the cross-process fresh-read-modify-write
 // discipline (see updateIssueEntry) is unchanged.
-function writeChatState(obj) {
+// Write-behind persistence. chat-state.json is one big file (tens of MB — every issue's transcript),
+// so JSON.stringify + write of it costs ~0.5s of BLOCKED event loop. Doing that synchronously on every
+// message meant that while ANY issue streamed a turn, the single-threaded server froze ~0.5s at a time
+// and EVERY other chat (CHAT-5 etc.) went unresponsive. So writeChatState now updates the in-memory
+// cache SYNCHRONOUSLY — in-process reads via loadChatState stay correct and immediate — and persists to
+// disk ASYNCHRONOUSLY, coalescing a burst of writes into a single flush off the hot path. The chat
+// server is the SOLE writer of this file (gc.mjs / preview policy only read it), so deferring the disk
+// write introduces no cross-process lost-update race; read-only consumers just observe the latest state
+// a fraction of a second later. Durability across restarts is preserved by flushChatStateSync() in the
+// SIGTERM/SIGINT handler, and chat-state is a rebuildable index of the CLI sessions (the real transcript
+// source of truth), so at most a few hundred ms of un-flushed tail is ever at risk (only on a hard kill).
+let flushDirty = false;   // in-memory cache has unpersisted changes
+let flushTimer = null;    // pending debounce timer (coalesces a burst into one flush)
+let flushing = false;     // a flush is in flight; trailing writes reschedule when it settles
+function scheduleFlush() {
+  flushDirty = true;
+  if (flushTimer || flushing) return;
+  flushTimer = setTimeout(() => { flushTimer = null; flushChatStateAsync(); }, 120);
+}
+async function flushChatStateAsync() {
+  if (flushing || !flushDirty || !chatStateCache.data) return;
+  flushing = true; flushDirty = false;
   const tmp = `${chatStatePath}.tmp.${process.pid}`;
-  writeFileSync(tmp, JSON.stringify(obj));
-  renameSync(tmp, chatStatePath);
-  // Refresh the read cache to the object we just wrote so the very next loadChatState() is instant
-  // AND consistent with disk (never relies on mtime resolution for in-process writes). If the post-
-  // write stat fails, invalidate so the next read re-parses fresh rather than serving a wrong mtime.
-  try { chatStateCache = { mtimeMs: statSync(chatStatePath).mtimeMs, data: obj }; }
-  catch { chatStateCache = { mtimeMs: -1, data: null }; }
+  try {
+    const str = JSON.stringify(chatStateCache.data); // the ~350ms serialize — now at most once per window
+    await writeFileAsync(tmp, str);                  // I/O off the event loop (was a blocking writeFileSync)
+    await renameAsync(tmp, chatStatePath);
+    try { chatStateCache.mtimeMs = statSync(chatStatePath).mtimeMs; } catch { /* mtime refresh best-effort */ }
+  } catch (e) {
+    flushDirty = true; // couldn't persist — keep the dirty flag so we retry
+    log('chat-state flush failed, will retry:', e.message);
+  } finally {
+    flushing = false;
+    if (flushDirty) scheduleFlush(); // more writes landed during the flush (or it failed) → run again
+  }
+}
+// Synchronous flush for shutdown: a graceful restart (systemctl → SIGTERM) must persist any write-behind
+// tail before the process exits. Safe to call from a signal handler (fully synchronous).
+function flushChatStateSync() {
+  if (!flushDirty || !chatStateCache.data) return;
+  flushDirty = false;
+  try {
+    const tmp = `${chatStatePath}.tmp.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(chatStateCache.data));
+    renameSync(tmp, chatStatePath);
+    try { chatStateCache.mtimeMs = statSync(chatStatePath).mtimeMs; } catch { /* best-effort */ }
+  } catch (e) { console.error('[chat] chat-state final flush failed:', e.message); }
+}
+function writeChatState(obj) {
+  // Update the read cache to the new object immediately (in-process reads see it at once; disk mtime is
+  // unchanged until the flush, and loadChatState's cache-hit returns this object regardless), then queue
+  // the expensive serialize+write to run asynchronously and coalesced.
+  chatStateCache = { mtimeMs: chatStateCache.mtimeMs, data: obj };
+  scheduleFlush();
 }
 
 function updateChatState(identifier, fn) {
@@ -2084,6 +2130,7 @@ process.on('uncaughtException', (e) => console.error('[chat] uncaught:', e));
 process.on('unhandledRejection', (e) => console.error('[chat] unhandled rejection:', e));
 for (const sig of ['SIGTERM', 'SIGINT']) {
   process.on(sig, () => {
+    flushChatStateSync(); // persist any write-behind tail before we exit (graceful restart durability)
     for (const [id, t] of activeTurns) {
       if (t.child?.pid) { try { process.kill(-t.child.pid, 'SIGKILL'); } catch { /* gone */ } }
       if (t.lockPath) { try { unlinkSync(t.lockPath); } catch { /* gone */ } }
