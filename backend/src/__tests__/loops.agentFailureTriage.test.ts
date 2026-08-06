@@ -289,3 +289,60 @@ describe('ENG-820 — mixed classes and non-tool proposals', () => {
     expect(line).toContain('showing 8 of 13');
   });
 });
+
+/**
+ * Greptile round 3 — the same defect as the message mismatch, one level deeper.
+ * Fixing `sampleMessage` per class left `topErrorClass` aggregated globally, so
+ * the directive could still cite an error class from a cohort it was not
+ * advising on. Every field the operator reads has to come from the same cohort.
+ */
+describe('ENG-820 — the cited error class matches the chosen failure class', () => {
+  const rules = () => new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2 });
+
+  /**
+   * A genuine mismatch needs the GLOBAL dominant error class to differ from the
+   * SELECTED cohort's. Two cohorts sharing a class is not enough — my first
+   * attempt at this test had config=auth(12) / bug=TypeErrorClass(8), where
+   * global and cohort both resolve to `auth`, so it passed with the fix
+   * reverted and proved nothing.
+   *
+   * Here: config is dominant by count (12 v 8), but its own top class is
+   * `throttle` (7), while `auth` totals 5 + 8 = 13 globally. So global says
+   * `auth`, the config cohort says `throttle`.
+   */
+  const mixedCohort = (tool: string) => [
+    ...toolEvents(tool, 40, 8, 'bug', 'auth', 'TypeError: boom'),
+    ...toolEvents(tool, 0, 7, 'config', 'throttle', 'rate limited — raise the quota'),
+    ...toolEvents(tool, 0, 5, 'config', 'auth', 'token expired — reconnect'),
+  ];
+
+  it('cites the dominant class of the SELECTED cohort, not the global one', async () => {
+    const proposals = await rules().evaluate(mixedCohort('mixed_ec'), WINDOW);
+    const p: any = payloads(proposals).find((x: any) => x.toolName === 'mixed_ec');
+
+    expect(p.failureType).toBe('config');
+    expect(p.topErrorClass).toBe('throttle');
+    // `auth` is the GLOBAL winner (13) and belongs mostly to the bug cohort.
+    expect(p.topErrorClass).not.toBe('auth');
+  });
+
+  it('does not leak the other cohort into the hypothesis either', async () => {
+    // The hypothesis is what lands in the Slack digest, so it carries the same
+    // obligation as the directive.
+    const proposals = await rules().evaluate(mixedCohort('mixed_ec2'), WINDOW);
+    const prop: any = proposals.find((x: any) => x.payload?.toolName === 'mixed_ec2');
+
+    expect(prop.hypothesis).toContain('throttle');
+    expect(prop.hypothesis).toContain('[config]');
+  });
+
+  it('falls back to the global aggregate for unclassified failures', async () => {
+    // With no failureType there is no cohort, and global IS the right cohort.
+    const events = toolEvents('legacy_ec', 10, 8, '', 'LegacyClass', 'old failure');
+
+    const proposals = await rules().evaluate(events, WINDOW);
+    const p: any = payloads(proposals).find((x: any) => x.toolName === 'legacy_ec');
+
+    expect(p.topErrorClass).toBe('LegacyClass');
+  });
+});

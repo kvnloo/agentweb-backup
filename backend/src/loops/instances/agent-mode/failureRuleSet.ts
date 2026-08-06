@@ -83,6 +83,14 @@ interface ToolStats {
    * and send the operator to reconnect an account over a TypeError.
    */
   messagesByType: Map<string, string>;
+  /**
+   * Error classes counted PER failure class. `errorClasses` above stays global
+   * for the unclassified fallback, but the directive must cite an error class
+   * from the same cohort it is advising on — otherwise a config-dominant tool
+   * reports the error class of its handful of bug failures, and the operator
+   * is told to reconnect an account on the evidence of a TypeError.
+   */
+  errorClassesByType: Map<string, Map<string, number>>;
 }
 
 /**
@@ -176,6 +184,7 @@ export class AgentFailureRuleSet
         errorClasses: new Map<string, number>(),
         failureTypes: new Map<string, number>(),
         messagesByType: new Map<string, string>(),
+        errorClassesByType: new Map<string, Map<string, number>>(),
       };
       if (e.eventType === EVT_TOOL_INVOKED) {
         stats.invocations++;
@@ -189,6 +198,9 @@ export class AgentFailureRuleSet
         // Store under this event's OWN class, so the directive can quote a
         // message that actually belongs to the class it is advising on.
         if (em && !stats.messagesByType.has(ft)) stats.messagesByType.set(ft, em);
+        const perType = stats.errorClassesByType.get(ft) ?? new Map<string, number>();
+        perType.set(ec, (perType.get(ec) ?? 0) + 1);
+        stats.errorClassesByType.set(ft, perType);
       }
       byTool.set(toolName, stats);
     }
@@ -230,13 +242,19 @@ export class AgentFailureRuleSet
       if (stats.failures < this.minFailures) continue;
       if (failureRate < this.minFailureRate) continue;
 
-      const topErrorClass = dominantKey(stats.errorClasses);
       // ENG-820: triage on the failureType the event already carries. An
       // unclassified failure (pre-backfill events) still dispatches — failing
       // the other way would hide real bugs.
       const failureType = stats.failureTypes.size > 0 ? dominantKey(stats.failureTypes) : '';
       if (NON_DISPATCHABLE_FAILURE_TYPES.has(failureType)) continue;
       const handlerBug = failureType !== 'config' && failureType !== 'schema_reject';
+      // Cite an error class from the SAME cohort as the chosen failure class.
+      // Falls back to the global aggregate only when the class has none of its
+      // own (i.e. unclassified failures), where global IS the right cohort.
+      const cohort = stats.errorClassesByType.get(failureType);
+      const topErrorClass = cohort && cohort.size > 0
+        ? dominantKey(cohort)
+        : dominantKey(stats.errorClasses);
       proposals.push({
         proposalId: asMutationId(`agent-mode:tool-failure:${stats.toolName}`),
         sourceRuleId: `tool-failure:${stats.toolName}`,
