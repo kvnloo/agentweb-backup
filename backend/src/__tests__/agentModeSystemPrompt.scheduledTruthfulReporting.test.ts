@@ -5,27 +5,38 @@
  * posted nothing (session 0fe2e743-6324-4720-af62-a8867464ecbb; also reported by
  * ruiw@ on session f0a09def).
  *
- * The two rules under test are REPORTING rules and carry no authorization of
- * their own — ENG-827 (PR #2263) owns whether a schedule may publish and emits
- * its own PUBLISH AUTHORIZATION block from getUnattendedExecutionDirective.
- * These assertions therefore pin the composition boundary as much as the text:
- * the block must ban the fabrication unconditionally, must defer to an
- * authorization block if one is present, and must never itself grant or withhold
- * permission to publish. A second publish flag here would contradict ENG-827.
+ * Two halves are pinned here, and they have to move together:
+ *
+ *  - the REPORTING rules, which are unconditional — inventing a gate is a
+ *    reporting violation whichever way authorization resolved; and
+ *  - the PUBLISH AUTHORIZATION decision, which must ALWAYS be stated. Two earlier
+ *    revisions failed on opposite sides of this: an unqualified mandate whose
+ *    "you are not authorized" escape hatch could never occur (Greptile review #11),
+ *    then a carve-out that deferred to a block which did not exist, leaving the
+ *    skipped-tool failure reachable (review #15). Both are one bug — a decision
+ *    nobody makes. So every scheduled run now carries exactly one of the two
+ *    branches, and the tests assert that both exist and that they are mutually
+ *    exclusive.
  */
 
 import { getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 
 describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)', () => {
+  // Default (no argument) is the AUTHORIZED branch — publishing is the pre-existing
+  // behaviour of every scheduled run, so an omitted argument must not silently halt
+  // publishing on the ~25 active publishing-shaped schedules.
   const scheduled = getScheduledSessionOverride('scheduled');
+  const approvalRequired = getScheduledSessionOverride('scheduled', false);
 
-  it('emits nothing at all for non-scheduled sessions', () => {
+  it('emits nothing at all for non-scheduled sessions, on either branch', () => {
     // The rules are unattended-run rules; an interactive session has a human who
     // can be asked, so injecting a "you MUST call the tool" mandate there would
     // override the ordinary approval flow.
     expect(getScheduledSessionOverride('regular')).toBe('');
     expect(getScheduledSessionOverride(undefined)).toBe('');
     expect(getScheduledSessionOverride('slack')).toBe('');
+    expect(getScheduledSessionOverride('regular', false)).toBe('');
+    expect(getScheduledSessionOverride('regular', true)).toBe('');
   });
 
   it('keeps the pre-existing "do not suggest creating a schedule" override intact', () => {
@@ -50,13 +61,16 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
       expect(scheduled).toContain('persist the drafts to the knowledge base');
     });
 
-    it('forbids restating an owner-set authorization block as a platform gate', () => {
-      // The failure mode survives ENG-827: given a real PUBLISH AUTHORIZATION
-      // block the model can still describe it as an "X publishing gate", which is
-      // the same lie about the same run. Accuracy is required about that block too.
-      expect(scheduled).toContain('PUBLISH AUTHORIZATION');
-      expect(scheduled).toContain('a setting the owner chose on this schedule');
-      expect(scheduled).toContain('never as a platform, X/Twitter, API, or credential gate');
+    it('forbids restating the owner-set authorization block as a platform gate', () => {
+      // The failure mode outlives the authorization fix: given a REAL block the
+      // model can still describe it as an "X publishing gate", which is the same
+      // lie about the same run. Accuracy is required about the block itself, on
+      // both branches.
+      for (const variant of [scheduled, approvalRequired]) {
+        expect(variant).toContain('PUBLISH AUTHORIZATION');
+        expect(variant).toContain('an account-level setting the owner chose on this schedule');
+        expect(variant).toContain('never as a platform, X/Twitter, API, or credential gate');
+      }
     });
 
     it('ties the title and summary to real tool outcomes, banning the reported "queued" title', () => {
@@ -73,37 +87,77 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
       expect(scheduled).toContain('you MUST actually call that tool');
     });
 
-    it('allows exactly two outs — an authorization block, or a real tool error', () => {
-      expect(scheduled).toContain('exactly TWO acceptable reasons');
-      expect(scheduled).toContain('an explicit authorization block in THIS system prompt');
-      expect(scheduled).toContain('a tool call you ACTUALLY made returned an error');
-      expect(scheduled).toContain('Nothing else qualifies');
+    it('allows exactly two outs — the authorization block, or a real tool error', () => {
+      for (const variant of [scheduled, approvalRequired]) {
+        expect(variant).toContain('exactly TWO acceptable reasons');
+        expect(variant).toContain('the PUBLISH AUTHORIZATION block below states this run is not authorized to publish');
+        expect(variant).toContain('a tool call you ACTUALLY made returned an error');
+        expect(variant).toContain('Nothing else qualifies');
+      }
     });
 
-    // Greptile review #11 (P1, and an earlier P1 here in the opposite direction):
-    // the two-outs rule's escape hatch is "quote the authorization block". On main
-    // today NO such block exists — ENG-827 has not merged — so applying the mandate
-    // to publishing would leave the escape hatch unreachable and resolve to
-    // "publish anyway" on every scheduled run, with no owner control able to say
-    // no. A gated rule whose escape branch cannot occur is not gated at all.
-    it('carves external publishing OUT of the mandate and delegates it to the authorization block', () => {
-      expect(scheduled).toContain('PUBLISHING EXTERNALLY');
-      expect(scheduled).toContain('governed SOLELY by the PUBLISH AUTHORIZATION block');
-      expect(scheduled).toContain('publish when it authorizes publishing, and draft-and-notify when it withholds');
-      // the two-outs rule is explicitly scoped to everything else
-      expect(scheduled).toContain('For every OTHER mandated action');
+    // Greptile review #11 and review #15 are the two halves of one requirement:
+    // the mandate must actually require the tool (#15), AND its "not authorized"
+    // escape hatch must be genuinely reachable (#11). Emitting a branch in every
+    // case is what satisfies both — a gated rule whose escape branch cannot occur
+    // is not gated at all.
+    it('ALWAYS states a publish decision — never leaves it to model judgment', () => {
+      expect(scheduled).toContain('PUBLISH AUTHORIZATION');
+      expect(approvalRequired).toContain('PUBLISH AUTHORIZATION');
+      // the two branches are mutually exclusive
+      expect(scheduled).toContain('publishes without approval');
+      expect(scheduled).not.toContain('requires approval before publishing');
+      expect(approvalRequired).toContain('requires approval before publishing');
+      expect(approvalRequired).not.toContain('publishes without approval');
+      // and neither ever defers the decision back to the model
+      expect(scheduled).not.toContain('apply your normal judgment');
+      expect(approvalRequired).not.toContain('apply your normal judgment');
     });
 
-    it('is an explicit NO-OP on publishing when no authorization block is present', () => {
-      // Neither direction: it must not order publishing (that was Greptile #11), and
-      // it must not withhold it either — a default-deny would silently convert the
-      // ~25 active publishing-shaped schedules into drafting-only runs, which is the
-      // regression an earlier revision of this fix shipped and had to reverse.
-      expect(scheduled).toContain('neither grants you permission to publish nor removes any you already have');
-      expect(scheduled).toContain('apply your normal judgment');
-      // but truthfulness is NOT optional in that case — it is the whole ticket
-      expect(scheduled).toContain('the reporting rules above still bind in full');
-      expect(scheduled).toContain('never dress it up as a platform gate');
+    it('AUTHORIZED branch requires the tool the reported run skipped (review #15)', () => {
+      expect(scheduled).toContain('publishing IS authorized for this run');
+      expect(scheduled).toContain('CALL THE TOOL');
+      expect(scheduled).toContain('twitter_manage_post to reply on X');
+      expect(scheduled).toContain('post_on_connected_account');
+      // the exact rationalisations session 0fe2e743 used, closed explicitly
+      expect(scheduled).toContain('ALREADY SATISFIED');
+      expect(scheduled).toContain('Neither is the run being scheduled or unattended');
+      expect(scheduled).toContain('neither is the absence of a human to ask');
+      // and reason (1) must be explicitly unavailable, so it cannot be misquoted
+      expect(scheduled).toContain('Reason (1) above does NOT apply to this run');
+    });
+
+    it('APPROVAL-REQUIRED branch is the reachable escape hatch (review #11)', () => {
+      expect(approvalRequired).toContain('THIS BLOCK IS reason (1) above');
+      expect(approvalRequired).toContain('Do NOT call any tool that publishes externally');
+      expect(approvalRequired).toContain('twitter_manage_post');
+      // draft-and-notify is a COMPLETE terminal state, not a failure to retry
+      expect(approvalRequired).toContain('COMPLETE terminal state');
+      expect(approvalRequired).toContain('It is not unfinished work');
+      expect(approvalRequired).toContain('State it ONCE and stop');
+    });
+
+    it('APPROVAL-REQUIRED branch must not become the next fabricated gate', () => {
+      // A legitimate block described as a platform gate just relaunches ENG-803's
+      // fabrication in sanctioned clothing, so the accurate description is mandated.
+      expect(approvalRequired).toContain('an account-level setting the owner chose, NOT a platform, X/Twitter, API, or credential gate');
+      expect(approvalRequired).toContain('exactly the fabrication banned above');
+    });
+
+    it('names the setting exactly, and steers away from the wrong one', () => {
+      // An unblocking instruction that points at a control which does not govern
+      // publishing leaves the next run stuck in the same place — an earlier P1.
+      expect(approvalRequired).toContain('turn OFF "Require approval before publishing"');
+      expect(approvalRequired).toContain('Do NOT point them at "Full autonomy"');
+      expect(approvalRequired).toContain('does NOT affect publishing');
+    });
+
+    it('defaults to AUTHORIZED so no existing schedule silently stops publishing', () => {
+      // The population fact behind this: 25 of 96 active schedules are
+      // publishing-shaped. A default-deny would convert all of them to drafting-only,
+      // trading a 1-in-62-session fabrication for 25 broken schedules.
+      expect(getScheduledSessionOverride('scheduled')).toContain('publishes without approval');
+      expect(getScheduledSessionOverride('scheduled', undefined as any)).toContain('publishes without approval');
     });
 
     it('closes the three excuses the reported run actually used', () => {
@@ -113,35 +167,23 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
     });
 
     it('requires an honest "nothing was posted" report WHENEVER an action is skipped', () => {
-      // Deliberately unconditional — it binds on the carved-out publishing path too,
-      // where the model keeps its judgment but not its licence to misdescribe.
-      expect(scheduled).toContain('Whenever a mandated action is not performed');
-      expect(scheduled).toContain('say plainly that nothing was posted/sent');
-      expect(scheduled).toContain('give that specific real reason');
-      expect(scheduled).toContain('surface the concrete unblocking action for the owner');
+      for (const variant of [scheduled, approvalRequired]) {
+        expect(variant).toContain('Whenever a mandated action is not performed');
+        expect(variant).toContain('say plainly that nothing was posted/sent');
+        expect(variant).toContain('give that specific real reason');
+        expect(variant).toContain('surface the concrete unblocking action for the owner');
+      }
     });
   });
 
-  describe('composition with ENG-827 (PR #2263) — no competing publish flag', () => {
-    // ENG-827 resolves publish authorization deterministically from the schedule's
-    // `autopublishAuthorized` consent flag and emits the PUBLISH AUTHORIZATION
-    // block. If ENG-803 also asserted a permission state, the two would contradict
-    // each other in whichever order they merge. This block must only ever DEFER.
-    it('asserts no authorization state of its own', () => {
-      expect(scheduled).not.toContain('PRE-AUTHORIZED to publish');
-      expect(scheduled).not.toContain('NOT pre-authorized to publish');
-      expect(scheduled).not.toContain('requirePublishApproval');
-      expect(scheduled).not.toContain('Require approval before publishing');
-    });
-
-    it('does not order publishing, so a withheld ENG-827 run is never pushed to post', () => {
-      // The delegation is what makes this safe in BOTH merge orders: with ENG-827's
-      // withheld block present the model must draft-and-notify, with its authorized
-      // block present the model must post, and with neither present this PR changes
-      // nothing about publishing at all.
-      expect(scheduled).not.toContain('CALL THE TOOL');
-      expect(scheduled).not.toContain('publishing is authorized for this run');
-      expect(scheduled).not.toContain('you MUST call');
+  describe('the reporting rules bind on BOTH branches', () => {
+    it('bans the fabricated gate regardless of how authorization resolved', () => {
+      for (const variant of [scheduled, approvalRequired]) {
+        expect(variant).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
+        expect(variant).toContain('you may NOT claim a gate exists');
+        expect(variant).toContain('Derive your title and summary from actual tool-call outcomes');
+        expect(variant).toContain('"queued"');
+      }
     });
   });
 });
