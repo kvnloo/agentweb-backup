@@ -8335,7 +8335,18 @@ export const accountMemoryDb = {
     if (!content || content.trim().length === 0) {
       throw new Error('Content is required');
     }
-    if (content.length > 2000) {
+    // Counted in Unicode characters (code points), matching the `maxLength: 2000`
+    // the memory tools advertise in JSON Schema and that the tool gateway
+    // enforces. `content.length` counts UTF-16 code units, so it rejected 1,001
+    // emoji — 1,001 characters, well inside the declared limit — turning a
+    // schema-valid call into a runtime throw (ENG-821). Declared and enforced
+    // have to use the same unit or the contract is a lie for astral input.
+    //
+    // Only ever accepts MORE than before, never less, so nothing previously
+    // valid becomes invalid. Worst-case stored size roughly doubles (2,000
+    // astral chars ≈ 8 KB UTF-8) — negligible against DynamoDB's 400 KB limit.
+    // The other three memory guards below/above match this unit deliberately.
+    if (Array.from(content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 
@@ -8436,7 +8447,9 @@ export const accountMemoryDb = {
     if (updates.content !== undefined && updates.content.trim().length === 0) {
       throw new Error('Content cannot be empty');
     }
-    if (updates.content !== undefined && updates.content.length > 2000) {
+    // Code points, not UTF-16 code units — same unit as the declared
+    // `maxLength: 2000` and the addMemory guard (ENG-821).
+    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 
@@ -8500,7 +8513,9 @@ export const orgMemoryDb = {
     if (!content || content.trim().length === 0) {
       throw new Error('Content is required');
     }
-    if (content.length > 2000) {
+    // Code points, not UTF-16 code units — same unit as the declared
+    // `maxLength: 2000` and the addMemory guard (ENG-821).
+    if (Array.from(content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 
@@ -8600,7 +8615,9 @@ export const orgMemoryDb = {
     if (updates.content !== undefined && updates.content.trim().length === 0) {
       throw new Error('Content cannot be empty');
     }
-    if (updates.content !== undefined && updates.content.length > 2000) {
+    // Code points, not UTF-16 code units — same unit as the declared
+    // `maxLength: 2000` and the addMemory guard (ENG-821).
+    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 

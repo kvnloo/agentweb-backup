@@ -63,6 +63,62 @@ export const BEDROCK_BEARER_TOKEN_MODELS: ReadonlySet<string> = new Set([
   'anthropic.claude-sonnet-5',
 ]);
 
+/** Prompt-cache time-to-live accepted by the Converse API's `cachePoint` block. */
+export type BedrockCacheTtl = '5m' | '1h';
+
+/**
+ * Bedrock models whose model card lists "5 minutes, 1 hour" under Supported TTL
+ * — i.e. the ones that accept `cachePoint: { type: 'default', ttl: '1h' }`.
+ *
+ * ENG-893: agent-mode sessions are human-paced. Every user pause longer than the
+ * default 5-minute TTL expired the cache and re-wrote the entire 100k+ token
+ * prefix at 1.25x the input rate; in the session that surfaced this, 31 of 103
+ * turns paid an 80k-185k full re-cache and cache writes were 77% of the bill.
+ * The 1-hour TTL converts those misses into 0.1x cache reads.
+ *
+ * This is an ALLOWLIST on purpose, but NOT because Bedrock rejects an
+ * unsupported `ttl` — it does not. Probed live in us-west-2 on 2026-08-04:
+ * Sonnet 4.6 and Opus 4.6, which the AWS prompt-caching table lists as
+ * "5 minutes" only, both ACCEPT `ttl: '1h'` and echo
+ * `cacheDetails: [{ ttl: '1h', ... }]`. So a wrong entry here fails SILENTLY
+ * (billed at the 2x write rate below while possibly only getting 5m of cache),
+ * not loudly. Unlisted models send the bare `{ type: 'default' }` block.
+ *
+ * Sonnet 4.6 is omitted despite accepting the field only because AWS documents
+ * it as 5m-only; a same-session probe showed its 1h cache surviving an 8m45s
+ * idle gap, so adding it (with the matching 2x price) is a live follow-up
+ * worth taking — see ENG-893 for the measurement.
+ *
+ * Cache writes at the 1-hour TTL are billed at 2x the input rate rather than
+ * 1.25x, so every id here MUST be priced accordingly in `llmPricing.ts`. The
+ * drift guard lives in `__tests__/agentModeService.promptCacheTtl.test.ts`.
+ */
+export const BEDROCK_EXTENDED_CACHE_TTL_MODELS: ReadonlySet<string> = new Set([
+  'anthropic.claude-opus-5',
+  'anthropic.claude-sonnet-5',
+  'anthropic.claude-opus-4-8',
+  'anthropic.claude-sonnet-4-5-20250929-v1:0',
+  'anthropic.claude-haiku-4-5-20251001-v1:0',
+  // AWS's prompt-caching table lists the 4.6 models as 5-minute-only, but that
+  // is stale. Measured in us-west-2 with a write/read pair either side of an
+  // idle gap: Sonnet 4.6 read back 88,624 tokens after 8m45s (2026-08-04) and
+  // again after 11m43s (2026-08-05); Opus 4.6 read back 85,424 after 11m43s.
+  // In every run the default-TTL control expired and re-cached in full, so the
+  // 1h request is what kept the cache alive. Kept honest by cacheWriteCost,
+  // which bills whatever TTL comes back — so if AWS ever does enforce 5m here,
+  // we pay 1.25x, not 2x.
+  'anthropic.claude-sonnet-4-6',
+  'anthropic.claude-opus-4-6-v1',
+]);
+
+/**
+ * The `ttl` to put on a Converse `cachePoint` for this model, or `undefined`
+ * when the field must be omitted (5-minute-only or non-Bedrock models).
+ */
+export function bedrockCacheTtl(modelId: string): BedrockCacheTtl | undefined {
+  return BEDROCK_EXTENDED_CACHE_TTL_MODELS.has(modelId) ? '1h' : undefined;
+}
+
 /**
  * Resolve an app model id to the id Bedrock expects.
  *

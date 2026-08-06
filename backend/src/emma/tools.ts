@@ -1,4 +1,5 @@
 import { agentModeService } from '../services/agentModeService';
+import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
@@ -906,12 +907,17 @@ emmaToolRegistry.register({
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
-  AD_CREATIVE   → LIST, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
+  AD_CREATIVE   → LIST, GET, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
   AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
   DATASET       → LIST, GET_MATCH_QUALITY
+
+AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including asset_feed_spec.
+  LIST is account-wide, capped, and omits asset_feed_spec, so it cannot tell you what a specific
+  creative actually contains. Use GET to verify a creative you just built or swapped onto an ad, and
+  to read a placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
 
 READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimize for (use to verify after a CREATE/UPDATE):
   AD_SET LIST returns optimization_goal, billing_event, destination_type, promoted_object (pixel_id + custom_event_type), bid_strategy, and budgets per ad set. Pass ad_set_id to read a single ad set; pass campaign_id to scope to one campaign's ad sets.
@@ -1048,7 +1054,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "GET", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -1407,13 +1413,10 @@ emmaToolRegistry.register({
   },
   execute: async (args, context) => {
     // Backward-compatible normalization: accept legacy campaign_id or string campaign_ids.
-    const normalizedCampaignIds = Array.isArray(args.campaign_ids)
-      ? args.campaign_ids
-      : (typeof args.campaign_ids === 'string' && args.campaign_ids.trim())
-        ? [args.campaign_ids.trim()]
-        : (typeof args.campaign_id === 'string' && args.campaign_id.trim())
-          ? [args.campaign_id.trim()]
-          : [];
+    const normalizedCampaignIds = normalizeMetaCampaignIds(
+      args.campaign_ids,
+      args.campaign_id,
+    );
 
     return await agentModeService.getMetaAdsMetrics(
       args.timeframe || '7d',
@@ -1843,6 +1846,8 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'read_brand_guidelines',
+  // ENG-822: reads/writes account-scoped data; refused in anonymous sessions.
+  requiresUserAccount: true,
   definition: {
     name: 'read_brand_guidelines',
     description: 'Read the current user\'s brand guidelines (brand data and attachments). Returns exists=false if not set.',
@@ -1860,6 +1865,8 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'update_brand_guidelines',
+  // ENG-822: reads/writes account-scoped data; refused in anonymous sessions.
+  requiresUserAccount: true,
   definition: {
     name: 'update_brand_guidelines',
     description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), pass refreshMarketStrategy=true so the same operation also refreshes market strategy positioning by regenerating ICPs and competitors from the updated brand. This REPLACES current ICPs and competitors while preserving the business overview. For a small single-field edit, leave refreshMarketStrategy false/omitted.',
@@ -1937,6 +1944,8 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'read_market_strategy',
+  // ENG-822: reads/writes account-scoped data; refused in anonymous sessions.
+  requiresUserAccount: true,
   definition: {
     name: 'read_market_strategy',
     description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set.',
@@ -1954,6 +1963,8 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'update_market_strategy',
+  // ENG-822: reads/writes account-scoped data; refused in anonymous sessions.
+  requiresUserAccount: true,
   definition: {
     name: 'update_market_strategy',
     description: 'Update the user\'s market strategy. IMPORTANT: Use read_market_strategy first to fetch the latest data, then only update the fields that need to be changed. Can update business overview, competitors, and ideal customer profiles.',
@@ -2001,6 +2012,8 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'regenerate_market_strategy',
+  // ENG-822: reads/writes account-scoped data; refused in anonymous sessions.
+  requiresUserAccount: true,
   definition: {
     name: 'regenerate_market_strategy',
     description: 'Regenerate the user\'s market strategy (ideal customer profiles and competitors) from their CURRENT brand guidelines, so the strategy matches the latest brand. DESTRUCTIVE: this REPLACES the existing competitors and ICPs (the business overview is preserved). Only call this AFTER the user has explicitly confirmed they want to regenerate — if they already have competitors/ICPs, first tell them how many will be replaced and get a clear yes. Takes ~30-60s. Typically used as part of a brand re-setup when the user chose to also refresh their positioning/market strategy (option 2 of the brand re-setup scope question).',
@@ -6379,6 +6392,7 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
+          maxLength: 2000,
           description: 'The fact to remember (max 2000 chars). Be specific and actionable.'
         },
         category: {

@@ -1192,6 +1192,27 @@ function coerceJsonContainerForSchema(value: unknown, schema: any): { changed: b
 function validateJsonSchemaConstraints(name: string, value: unknown, schema: any): AgentToolContractIssue[] {
   const issues: AgentToolContractIssue[] = [];
 
+  // Measured in Unicode characters (code points) via `Array.from`, which is what
+  // JSON Schema `maxLength` means. The schema is what we advertise to the model,
+  // so this validator must enforce exactly that and nothing stricter.
+  //
+  // The downstream runtime guard is held to the same unit — see
+  // accountMemoryDb.addMemory in services/db.ts, which also counts code points.
+  // Both sides must move together: measuring UTF-16 code units here would reject
+  // 1,001 emoji that the declared `maxLength: 2000` plainly accepts, which is a
+  // contract stricter than its schema — the exact defect ENG-821 exists to fix.
+  if (
+    typeof value === 'string' &&
+    typeof schema?.maxLength === 'number' &&
+    Array.from(value).length > schema.maxLength
+  ) {
+    issues.push({
+      code: 'invalid_args',
+      path: `$.${name}`,
+      message: `Argument "${name}" must be at most ${schema.maxLength} character(s).`,
+    });
+  }
+
   if (Array.isArray(value)) {
     if (typeof schema?.minItems === 'number' && value.length < schema.minItems) {
       issues.push({
