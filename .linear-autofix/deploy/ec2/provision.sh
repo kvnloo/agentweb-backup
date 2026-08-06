@@ -83,7 +83,8 @@ TAGS="{Key=Name,Value=${NAME_TAG}}"
 [ -n "$PURPOSE_TAG" ] && TAGS="${TAGS},{Key=purpose,Value=${PURPOSE_TAG}},{Key=env-name,Value=${NAME_TAG}}"
 RUN_ARGS=(--region "$REGION" --image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE"
   --key-name "$KEY_NAME" --security-group-ids "$SG_ID"
-  --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${VOLUME_GB},VolumeType=gp3}"
+  # Encrypted-at-rest per ENG-543 criterion 2. Default AWS-managed EBS key (aws/ebs) — no custom KMS key.
+  --block-device-mappings "DeviceName=/dev/xvda,Ebs={VolumeSize=${VOLUME_GB},VolumeType=gp3,Encrypted=true}"
   --tag-specifications "ResourceType=instance,Tags=[${TAGS}]")
 [ -n "$IAM_PROFILE" ] && RUN_ARGS+=(--iam-instance-profile "Name=$IAM_PROFILE")
 
