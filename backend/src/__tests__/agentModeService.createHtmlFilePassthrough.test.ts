@@ -99,12 +99,23 @@ describe('AgentModeService.createHtmlFile — ENG-472 (skip redundant render / f
     expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
   });
 
-  it('fails fast with an actionable error for an oversized NON-HTML draft (no 15-min render timeout)', async () => {
+  // ENG-472 made an oversized draft fail fast instead of burning ~15 minutes on
+  // renders that cannot finish. ENG-873 keeps the "spend nothing on the LLM"
+  // half and drops the "deliver nothing" half: a deterministic render has no
+  // size ceiling, so the completed work still comes back as a file.
+  it('delivers an oversized NON-HTML draft deterministically instead of returning nothing', async () => {
     const huge = 'This is a long plain-text chapter. '.repeat(3000); // ~105K chars, not HTML
     const res = await service.createHtmlFile('Mega Guide', huge, '', 'user-1', 'sess-1', 'document');
 
-    expect(res.success).toBe(false);
+    expect(res.success).toBe(true);
+    expect(res.degraded).toBe(true);
+    expect(res.s3_url).toBeDefined();
+    // No LLM spend: the whole point of the ENG-472 ceiling.
     expect(mockGenerateHTML).not.toHaveBeenCalled();
-    expect((res.error || '').toLowerCase()).toMatch(/too large|split|smaller/);
+    expect((res.message || '').toLowerCase()).toMatch(/too large|split|smaller/);
+
+    const [uploadedContent] = (mockUpload as jest.Mock).mock.calls[0];
+    expect(uploadedContent.startsWith('<!DOCTYPE html>')).toBe(true);
+    expect(uploadedContent).toContain('long plain-text chapter');
   });
 });

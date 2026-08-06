@@ -36,6 +36,27 @@ export interface LLMUsageContext {
   sessionId?: string;
 }
 
+export interface LLMServiceOptions {
+  /**
+   * Stream the model response instead of waiting for the whole body.
+   *
+   * The Bedrock client below sets a 5-minute `requestTimeout`, which @smithy
+   * implements as a SOCKET-INACTIVITY timer (`req.setTimeout`) that throws
+   * "Stream timed out because of no activity for 300000 ms". A non-streaming
+   * ConverseCommand puts no bytes on that socket until the model has finished
+   * generating the ENTIRE response, so any generation that takes longer than
+   * five minutes times out deterministically — the failure is a property of the
+   * output size, and retrying is guaranteed to reproduce it (ENG-873: a
+   * 40-competitor report timed out on every attempt, in two consecutive months).
+   *
+   * Streaming switches to ConverseStreamCommand, so chunks arrive continuously
+   * and reset the inactivity timer — a long generation no longer trips it at
+   * all. Opt-in per call site because it changes how every response on this
+   * instance is fetched; enable it where the output is expected to be large.
+   */
+  streaming?: boolean;
+}
+
 export class LLMService {
   private chatModel: AzureChatOpenAI | ChatBedrockConverse | null;
   private modelName: string;
@@ -48,7 +69,7 @@ export class LLMService {
    *   reject ANY non-default temperature with a 400 `unsupported_value`, which
    *   callers then swallow — silently disabling whatever they were doing.
    */
-  constructor(modelName?: string, temperature: number | null = 0.8, maxTokens?: number) {
+  constructor(modelName?: string, temperature: number | null = 0.8, maxTokens?: number, options: LLMServiceOptions = {}) {
     const model = modelName || process.env.AZURE_OPENAI_DEPLOYMENT || 'gpt-4';
     this.modelName = model;
     this.isGemini = model.toLowerCase().includes('gemini');
@@ -93,6 +114,7 @@ export class LLMService {
         client: bedrockClient,
         ...(temperature === null ? {} : { temperature }),
         ...(maxTokens && { maxTokens }),
+        ...(options.streaming ? { streaming: true } : {}),
       });
     } else {
       const endpoint = process.env.AZURE_OPENAI_ENDPOINT || '';
@@ -108,6 +130,7 @@ export class LLMService {
         azureOpenAIApiVersion: process.env.AZURE_OPENAI_API_VERSION || '2024-08-01-preview',
         ...(temperature === null ? {} : { temperature }),
         ...(maxTokens && { maxTokens }),
+        ...(options.streaming ? { streaming: true } : {}),
       });
     }
   }
@@ -554,7 +577,8 @@ The HTML must be a complete, well-formed HTML document with proper DOCTYPE, head
 export function createLLMService(
   modelName?: string,
   temperature: number | null = 0.8,
-  maxTokens?: number
+  maxTokens?: number,
+  options: LLMServiceOptions = {}
 ): LLMService {
-  return new LLMService(modelName, temperature, maxTokens);
+  return new LLMService(modelName, temperature, maxTokens, options);
 }
