@@ -52,3 +52,17 @@ if [ ! -f "$CREDMARK" ] || [ "$(( $(date +%s) - $(stat -c %Y "$CREDMARK" 2>/dev/
   node "$HERE/check-creds.mjs" >>"$HERE/poll.log" 2>&1
   touch "$CREDMARK"
 fi
+
+# Poll heartbeat (ENG-655): emit ONE CloudWatch datapoint only here, at the very END of the cycle — so
+# it fires solely on a SUCCESSFUL run (set -e aborts earlier on any failed stage, and a wedged/crashed
+# poller never reaches this line). Its absence is the signal: the `no-successful-poll-15m` alarm treats
+# missing data as breaching. Namespace/instance are fixed because the least-priv runner role is scoped to
+# PutMetricData on AgentWeb/Autofix only, and Harsha's alarm binds to this exact InstanceId. Region is
+# explicit (cron's minimal env carries none). Never aborts the cycle (|| …): a transient CloudWatch blip
+# must not turn an otherwise-good cycle into a false failure.
+aws cloudwatch put-metric-data \
+  --region us-west-2 \
+  --namespace AgentWeb/Autofix \
+  --metric-name PollSuccess --value 1 --unit Count \
+  --dimensions InstanceId=i-0cb38aac2332941dc \
+  >>"$HERE/poll.log" 2>&1 || echo "[autofix] warning: poll heartbeat put-metric-data failed" >>"$HERE/poll.log"

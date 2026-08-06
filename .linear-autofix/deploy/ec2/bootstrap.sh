@@ -186,6 +186,28 @@ sudo systemctl enable --now amazon-ssm-agent >/dev/null 2>&1 \
   && echo "    amazon-ssm-agent enabled (grant the role AmazonSSMManagedInstanceCore to register — ENG-562)." \
   || echo "    amazon-ssm-agent present/enable attempted — registration still needs role SSM perms (ENG-562)."
 
+# ENG-655: CloudWatch agent — the disk/memory metric source for the disk>85% / mem>90% alarms. Emits
+# mem_used_percent + disk_used_percent (root filesystem) to the CWAgent namespace every 60s. The runner's
+# least-privilege role is scoped to cloudwatch:PutMetricData on {AgentWeb/Autofix, CWAgent}, so no IAM
+# change is needed. append_dimensions resolves InstanceId from IMDS (NOT ec2:DescribeTags — so it never
+# trips the AccessDenied canary), and aggregation_dimensions [[InstanceId]] also publishes an
+# InstanceId-only rollup so the alarms can bind on InstanceId alone. Idempotent: re-copies the config and
+# re-runs fetch-config (which restarts the agent cleanly) each run.
+echo "==> CloudWatch agent (disk/mem metric source for the CWAgent-namespace alarms)"
+if ! rpm -q amazon-cloudwatch-agent >/dev/null 2>&1; then
+  sudo dnf -y install amazon-cloudwatch-agent >/dev/null 2>&1 || true
+fi
+CWA_CFG_SRC="$WORKDIR/.linear-autofix/deploy/ec2/cloudwatch-agent-config.json"
+CWA_CTL=/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+if [ -f "$CWA_CFG_SRC" ] && [ -x "$CWA_CTL" ]; then
+  sudo cp "$CWA_CFG_SRC" /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+  sudo "$CWA_CTL" -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json >/dev/null 2>&1 \
+    && echo "    amazon-cloudwatch-agent configured + running (mem_used_percent, disk_used_percent → CWAgent)." \
+    || echo "    WARNING: amazon-cloudwatch-agent fetch-config failed — check /opt/aws/amazon-cloudwatch-agent/logs/."
+else
+  echo "    WARNING: CW agent config ($CWA_CFG_SRC) or ctl not found — skipping (older checkout / install failed?)."
+fi
+
 cat <<EOF
 
 ==> Bootstrap complete. Remaining interactive steps (see RUNBOOK.md):
