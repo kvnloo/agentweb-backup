@@ -110,12 +110,25 @@ export function resolvePublishAuthorized(
 /**
  * Extract a scheduleId from a chat session's pageIdentifier.
  *
- * Scheduled sessions are stamped `"<title>|scheduleId:<uuid>"` when the run is
+ * Scheduled sessions are stamped `"<title>|scheduleId:<id>"` when the run is
  * dispatched (see runScheduledChat). Returns null for any session that is not a
  * scheduled run, or whose identifier is missing or malformed.
+ *
+ * ANCHORED TO THE STAMPED SUFFIX, DELIBERATELY (Greptile review #17, security).
+ * `<title>` is the owner-supplied schedule name, so it is attacker-controlled text
+ * sitting IN FRONT of the authoritative id. An unanchored search takes the FIRST
+ * match, so naming a schedule `Evil scheduleId:aaaa` yields
+ * `"Evil scheduleId:aaaa|scheduleId:<real>"` and the parser would return `aaaa` —
+ * binding this run's publish authorization to a DIFFERENT schedule's setting. That
+ * turns a display string into an authorization primitive: point it at any schedule
+ * with no opt-out and an approval-required run is told to publish.
+ *
+ * Requiring the `|` separator AND end-of-string pins it to the segment the
+ * dispatcher actually appends, which is always last, so no amount of title text can
+ * select the record.
  */
 export function extractScheduleId(pageIdentifier?: string | null): string | null {
   if (!pageIdentifier || typeof pageIdentifier !== 'string') return null;
-  const match = pageIdentifier.match(/scheduleId:([a-f0-9-]+)/);
+  const match = pageIdentifier.match(/\|scheduleId:([a-f0-9-]+)\s*$/);
   return match ? match[1] : null;
 }

@@ -98,6 +98,39 @@ describe('extractScheduleId (ENG-803)', () => {
     ).toBe('081d18dd');
   });
 
+  // Greptile review #17 (security). runScheduledChat builds the identifier as
+  // `${sessionTitle}|scheduleId:${id}`, and sessionTitle comes from the OWNER-SUPPLIED
+  // schedule name — attacker-controlled text sitting in front of the authoritative id.
+  // An unanchored search returns the FIRST match, so a schedule named
+  // "Evil scheduleId:aaaa" would bind this run's publish authorization to schedule
+  // `aaaa` instead of its own: point it at any schedule with no opt-out and an
+  // approval-required run gets told to publish. The parser must read only the segment
+  // the dispatcher appends, which is always last.
+  describe('a crafted schedule name cannot select the authorization record', () => {
+    it('ignores a scheduleId token planted in the title', () => {
+      expect(extractScheduleId('Evil scheduleId:aaaa|scheduleId:081d18dd')).toBe('081d18dd');
+    });
+
+    it('ignores a planted token that even mimics the pipe separator', () => {
+      expect(extractScheduleId('Evil|scheduleId:aaaa|scheduleId:081d18dd')).toBe('081d18dd');
+    });
+
+    it('ignores several planted tokens', () => {
+      expect(
+        extractScheduleId('scheduleId:aaa scheduleId:bbb|scheduleId:ccc|scheduleId:081d18dd')
+      ).toBe('081d18dd');
+    });
+
+    it('requires the pipe separator, so a bare token in free text resolves to nothing', () => {
+      // Resolves to null -> the caller WITHHOLDS, which is the safe direction.
+      expect(extractScheduleId('Evil scheduleId:aaaa')).toBeNull();
+    });
+
+    it('tolerates trailing whitespace on a legitimate stamp', () => {
+      expect(extractScheduleId('My schedule|scheduleId:081d18dd  ')).toBe('081d18dd');
+    });
+  });
+
   it('handles a full uuid', () => {
     expect(extractScheduleId('x|scheduleId:1c20ada1-f1b8-4bd6-a47f-ca79c5c985ff')).toBe(
       '1c20ada1-f1b8-4bd6-a47f-ca79c5c985ff'
