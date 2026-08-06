@@ -58,12 +58,44 @@ export const CHUNKED_REPORT_STYLESHEET = `
 const SECTION_HEADING = /^\s{0,3}#{1,3}\s+\S/;
 const ANY_HEADING = /^\s{0,3}#{1,6}\s+\S/;
 
+/** A fenced code block delimiter (``` or ~~~, optionally with an info string). */
+const CODE_FENCE = /^\s{0,3}(`{3,}|~{3,})/;
+
+/**
+ * Track whether we are inside a fenced code block while walking lines.
+ *
+ * A fence's contents are literal: a `# comment` line inside one is NOT a
+ * heading, and a blank line inside one does NOT end a paragraph. Splitting on
+ * either would hand the model half a fence and it would render the remainder as
+ * ordinary prose, so both split passes below consult this.
+ */
+function makeFenceTracker(): (line: string) => boolean {
+  let open: string | null = null;
+  return (line: string): boolean => {
+    const fence = CODE_FENCE.exec(line);
+    if (fence) {
+      const marker = fence[1];
+      if (open === null) {
+        open = marker;
+        return true; // the opening delimiter itself is fenced content
+      }
+      if (marker[0] === open[0] && marker.length >= open.length) {
+        open = null;
+        return true; // the closing delimiter too
+      }
+    }
+    return open !== null;
+  };
+}
+
 /** Group the draft's lines into sections: a heading plus everything under it. */
 function splitIntoSections(draft: string): string[] {
   const sections: string[] = [];
   let current: string[] = [];
+  const isFenced = makeFenceTracker();
   for (const line of draft.split('\n')) {
-    if (SECTION_HEADING.test(line) && current.some((l) => l.trim())) {
+    const fenced = isFenced(line);
+    if (!fenced && SECTION_HEADING.test(line) && current.some((l) => l.trim())) {
       sections.push(current.join('\n'));
       current = [];
     }
@@ -75,10 +107,23 @@ function splitIntoSections(draft: string): string[] {
 
 /** Split one oversized section into paragraph-sized pieces. Never splits a line. */
 function splitIntoParagraphs(section: string): string[] {
-  return section
-    .split(/\n\s*\n/)
-    .map((paragraph) => paragraph.trim())
-    .filter(Boolean);
+  const paragraphs: string[] = [];
+  let current: string[] = [];
+  const isFenced = makeFenceTracker();
+  const flush = () => {
+    const paragraph = current.join('\n').trim();
+    if (paragraph) paragraphs.push(paragraph);
+    current = [];
+  };
+  for (const line of section.split('\n')) {
+    if (!isFenced(line) && !line.trim()) {
+      flush();
+      continue;
+    }
+    current.push(line);
+  }
+  flush();
+  return paragraphs;
 }
 
 /**
