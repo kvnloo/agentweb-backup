@@ -271,6 +271,23 @@ ssh -i <key> -L 8790:localhost:8790 ec2-user@<public-ip>
   are emitting; bind disk/mem to the exact dimensions listed above, and the poll alarm with
   `TreatMissingData=breaching`.
 
+### Encrypted storage (ENG-543 criterion 2)
+
+- **New instances are encrypted at rest.** `provision.sh` launches the root EBS volume with
+  `Encrypted=true` (default AWS-managed `aws/ebs` key, no custom KMS key), so every future provision
+  satisfies the encrypted-storage criterion automatically.
+- **The current live instance `i-0cb38aac2332941dc` is NOT encrypted.** It was provisioned before this
+  change, and **EBS cannot be encrypted in place.** Remediation is a deliberate, downtime-incurring
+  operator action — not something the runner automates:
+  1. Stop the instance.
+  2. Snapshot the root volume.
+  3. Copy the snapshot with `--encrypted` (`Encrypted=true`).
+  4. Create a new volume from the encrypted snapshot.
+  5. Detach the old root volume / attach the new encrypted one (or relaunch from an encrypted AMI).
+  6. Start the instance.
+- **Why it's worth scheduling:** `.linear-autofix/.env` (Linear API key + per-person tokens) lives on
+  that unencrypted root volume. Until the box is re-encrypted, those secrets are at rest unencrypted.
+
 ## 9. Granting access to other users
 
 The security group only allows the **provisioner's** IP on port 22 (and your IP changes
