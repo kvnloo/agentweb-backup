@@ -11,6 +11,13 @@ export const userReleaseNotes: UserReleaseNote[] = [
   {
     date: '2026-08-05',
     changes: [
+      'New: Emma Can Finish an Email-Code Login on Her Own, Including in Scheduled Runs',
+      '- Sites that sign you in with a one-time code emailed to you used to stop an unattended run dead: nobody was there to read the code out of the inbox and hand it over, so the run ended with nothing',
+      '- Emma now reads the code straight from your connected Gmail or Outlook and finishes the login herself — and she only accepts a code that arrived after she asked for one, so a leftover code from last week is never retyped',
+      '- If no code arrives, she says exactly what happened and stops. She will never invent a code, and never carry on as though she had signed in',
+      'Fixed: The Weekly RankAI SEO & GEO Report Was Producing Nothing Every Week',
+      '- Once the saved rankai.ai session expired, every run hit the sign-in page, could not get past its bot check, and finished with an empty report',
+      '- Emma can now re-open that sign-in page with the access RankAI granted us and complete the login by email code, so the report picks itself back up without anyone logging in by hand',
       'Fixed: Amending One Step of a Work Plan No Longer Deletes the Others',
       '- Updating a work plan through the Claude connector replaced the entire list of steps with whatever was sent, so editing a single step could silently drop every other one — a seven-step plan could become a one-step plan with no warning, and no way back unless you still had the original to hand',
       '- You can now amend individual steps and leave the rest untouched, and an update that would remove steps — or blank out settings on the steps it keeps — is refused until you confirm you meant it',
