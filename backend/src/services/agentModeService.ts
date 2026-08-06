@@ -7118,27 +7118,40 @@ export class AgentModeService {
   /**
    * ENG-803: does this call publish CONTENT to an external account?
    *
-   * Scoped deliberately. `twitter_manage_post` is a dispatcher whose actions are
-   * mostly reads (get_tweet_metrics, list_replies, get_retweeters, ...) alongside a
-   * few that publish; blocking the whole tool would break a reply run's ability to
-   * even FIND the mentions it is supposed to answer. Only the actions that put new
-   * content in front of an audience count — which is exactly what an owner means by
-   * "review before publishing".
+   * Scoped per dispatcher, because tools like twitter_manage_post and
+   * linkedin_manage_post mix publishing actions with pure reads. Blocking a whole
+   * dispatcher would stop an approval-required reply run from even FINDING the
+   * mentions it is supposed to draft answers to — it would produce nothing at all,
+   * not even the drafts the owner is waiting for.
    *
-   * Engagement actions (like, retweet) and delete_tweet are deliberately NOT treated
-   * as publishing: they surface no authored content, and delete is governed by its
-   * own confirmation rules.
+   * "Publishing" here means the action puts something on the owner's public presence
+   * under their name. That includes reshares (retweet / repost), not just authored
+   * text: an owner who asked to approve before publishing did not agree to have
+   * their feed posted to on their behalf either. Pure engagement signals that create
+   * no post (like, react, unlike, unretweet) and reads are excluded, as is
+   * delete_tweet — removal is governed by its own confirmation rules.
    */
-  private static readonly X_PUBLISHING_ACTIONS = new Set(['reply', 'post_thread', 'quote_tweet']);
+  private static readonly DISPATCHER_PUBLISHING_ACTIONS: Record<string, Set<string>> = {
+    twitter_manage_post: new Set(['reply', 'post_thread', 'quote_tweet', 'retweet']),
+    linkedin_manage_post: new Set(['comment', 'repost']),
+  };
 
   private static isExternalContentPublish(toolName: string, args: any): boolean {
     // publish_* / post_on_* — whole-tool publishers.
     if (isPublishName(toolName)) return true;
-    if (/_manage_post$/.test(toolName)) {
-      const action = typeof args?.action === 'string' ? args.action : '';
-      return AgentModeService.X_PUBLISHING_ACTIONS.has(action);
-    }
-    return false;
+    if (!/_manage_post$/.test(toolName)) return false;
+
+    const known = AgentModeService.DISPATCHER_PUBLISHING_ACTIONS[toolName];
+    const action = typeof args?.action === 'string' ? args.action : '';
+    // An UNKNOWN *_manage_post dispatcher is treated as publishing (Greptile review
+    // #22 flagged exactly this gap for linkedin_manage_post). A tool named
+    // "manage post" is a posting surface by definition, so a new one must not get a
+    // free pass simply because nobody added it here. The cost of the conservative
+    // default is that a read action on a future dispatcher is blocked on the
+    // minority of schedules that require approval; the cost of the permissive
+    // default is publishing without the consent the owner explicitly withheld.
+    if (!known) return true;
+    return known.has(action);
   }
 
   /**
@@ -7155,43 +7168,83 @@ export class AgentModeService {
    * ACTUALLY made returned an error" — so the run reports an accurate blocker
    * instead of inventing one. That is the same ticket's other half.
    *
-   * FAILS OPEN, deliberately. This is defence in depth behind the prompt, which
-   * already withholds when the schedule cannot be read. Making the enforcement layer
-   * fail closed would let one throttled DynamoDB read stop publishing across the ~25
-   * active publishing-shaped schedules — trading a rare, prompt-covered miss for a
-   * broad outage. Only a schedule we positively READ as approval-required blocks.
+   * FAILS CLOSED for scheduled runs (Greptile review #22). An earlier revision
+   * allowed the call when a lookup threw, reasoning that a blip should not stop
+   * publishing — but that let a transient DynamoDB error publish irreversibly past
+   * an owner's explicit setting, and it contradicted the same asymmetry argument
+   * this fix already applies at the prompt layer: when the answer cannot be
+   * verified, take the RECOVERABLE outcome. A blocked publish saves the drafts and
+   * retries next run; a published post cannot be withdrawn.
+   *
+   * A session we can read that is NOT scheduled returns immediately, so the attended
+   * paths that share this dispatcher (the Emma sidebar via chatbotService, and
+   * liveVoiceService) are unaffected — there is no owner schedule setting to apply
+   * to them, and a human is present.
    */
+  private static publishApprovalBlock(toolName: string, reason: 'required' | 'unverifiable') {
+    const detail =
+      reason === 'required'
+        ? `this schedule has "Require approval before publishing" turned ON, so ${toolName} cannot publish on the owner's behalf in an unattended run.`
+        : `${toolName} cannot publish in this unattended run because its schedule's publish-approval setting could not be verified, and publishing is irreversible.`;
+    return {
+      success: false as const,
+      error:
+        `Blocked: ${detail} ` +
+        `This is an account-level setting on the schedule — it is NOT a platform, X/Twitter, LinkedIn, API, or credential limit. ` +
+        `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`,
+      publishApprovalRequired: true as const,
+    };
+  }
+
   private async blockedByScheduledPublishApproval(
     toolName: string,
     args: any,
     sessionId: string
   ): Promise<{ success: false; error: string; publishApprovalRequired: true } | null> {
     if (!sessionId || !AgentModeService.isExternalContentPublish(toolName, args)) return null;
+
+    let session: any;
     try {
-      const session = await chatbotDb.getChatSession(sessionId);
-      if (session?.sessionType !== 'scheduled') return null;
-      const scheduleId = extractScheduleId((session as any)?.pageIdentifier);
-      if (!scheduleId) return null;
-      if (resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId))) return null;
-      console.warn(
-        `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} requires approval before publishing.`
-      );
-      return {
-        success: false,
-        error:
-          `Blocked: this schedule has "Require approval before publishing" turned ON, so ${toolName} cannot publish on the owner's behalf in an unattended run. ` +
-          `This is an account-level setting the owner chose for this schedule — it is NOT a platform, X/Twitter, API, or credential limit. ` +
-          `Save the drafts, report plainly that nothing was published, and tell the owner they can turn that setting OFF for this schedule to let the next run post.`,
-        publishApprovalRequired: true,
-      };
-    } catch (error) {
-      // See the fail-open note above: the prompt layer already covers this case.
-      console.error(
-        `AgentMode ENG-803: could not verify publish approval for session ${sessionId}; allowing ${toolName} rather than halting publishing:`,
-        error
-      );
-      return null;
+      session = await chatbotDb.getChatSession(sessionId);
+    } catch (firstError) {
+      // One retry absorbs a single throttled read before we resort to blocking.
+      try {
+        session = await chatbotDb.getChatSession(sessionId);
+      } catch (retryError) {
+        console.error(
+          `AgentMode ENG-803: could not read session ${sessionId} to verify publish approval for ${toolName}; blocking rather than publishing unverified:`,
+          retryError
+        );
+        return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+      }
     }
+
+    // Attended / non-scheduled sessions have no owner schedule setting to enforce.
+    if (session?.sessionType !== 'scheduled') return null;
+
+    const scheduleId = extractScheduleId(session?.pageIdentifier);
+    if (!scheduleId) {
+      console.warn(
+        `AgentMode ENG-803: scheduled session ${sessionId} has no parseable scheduleId; blocking ${toolName} rather than assuming approval.`
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+
+    try {
+      // resolvePublishAuthorized also returns false for a missing/deleted schedule.
+      if (resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId))) return null;
+    } catch (scheduleError) {
+      console.error(
+        `AgentMode ENG-803: could not read schedule ${scheduleId} to verify publish approval for ${toolName}; blocking rather than publishing unverified:`,
+        scheduleError
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+
+    console.warn(
+      `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} requires approval before publishing.`
+    );
+    return AgentModeService.publishApprovalBlock(toolName, 'required');
   }
 
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
