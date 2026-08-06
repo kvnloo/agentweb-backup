@@ -20,6 +20,9 @@ jest.mock("../services/workPlanService", () => ({
     createWorkPlan: jest.fn(),
     getWorkPlan: jest.fn(),
     updateWorkPlan: jest.fn(),
+    approveWorkPlan: jest.fn(),
+    rejectWorkPlan: jest.fn(),
+    submitForReview: jest.fn(),
   },
 }));
 
@@ -489,6 +492,147 @@ describe("a plan deleted between read and write answers 404, not 500", () => {
       .put("/api/admin/work-plans/p")
       .send({ title: "Renamed" });
 
+    expect(res.status).toBe(500);
+  });
+});
+
+// ENG-890: the MCP tool's destructive-step guard reads the plan, decides the
+// payload is safe, then writes. A competing write in that window makes the
+// decision stale, so the guard has to be able to stake its read.
+describe("a step revision lets a caller stake the plan it inspected", () => {
+  const stored = {
+    planId: "p", title: "T", steps: [{ stepCount: 1, title: "S" }], ownerId: "user-1",
+    visibility: "system", isBuiltIn: true,
+    createdAt: "2026-08-04T00:00:00Z", updatedAt: "2026-08-04T00:00:00Z",
+    steps_rev: "rev-1",
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.getWorkPlan.mockResolvedValue(stored);
+    workPlanService.updateWorkPlan.mockResolvedValue(undefined);
+  });
+
+  it("forwards expectedStepsRev to the service on the admin PUT", async () => {
+    await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(workPlanService.updateWorkPlan).toHaveBeenCalledWith(
+      expect.any(Object),
+      { expectedStepsRev: "rev-1" },
+    );
+  });
+
+  it("forwards a null revision, which is not the same as not staking one", async () => {
+    // null means "the plan I read had no revision yet" — a real precondition.
+    // Dropping it would let a write land on a plan that has since gained one.
+    await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: null });
+
+    expect(workPlanService.updateWorkPlan).toHaveBeenCalledWith(
+      expect.any(Object),
+      { expectedStepsRev: null },
+    );
+  });
+
+  it("stakes nothing when the caller did not send one", async () => {
+    await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed" });
+
+    // An empty stake, which the service reads as "unconditioned" — the key's
+    // absence is the signal, so this must not carry expectedStepsRev at all.
+    expect(workPlanService.updateWorkPlan).toHaveBeenCalledWith(expect.any(Object), {});
+  });
+
+  it("never persists expectedStepsRev as a plan field", async () => {
+    await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(workPlanService.updateWorkPlan.mock.calls[0][0]).not.toHaveProperty("expectedStepsRev");
+  });
+
+  it("returns the revision the write produced, not the stale one it read", async () => {
+    // `updated` is built by spreading the plan that was read, so it carries the
+    // pre-write revision. Echoing that back hands the caller a value its own
+    // write has already superseded — a guaranteed 409 on the next staked write.
+    workPlanService.updateWorkPlan.mockResolvedValue("rev-2");
+
+    const res = await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.steps_rev).toBe("rev-2");
+  });
+
+  it("answers 409, not 500, when the plan moved under the caller", async () => {
+    workPlanService.updateWorkPlan.mockRejectedValue(new Error("Work plan steps changed"));
+
+    const res = await request(app)
+      .put("/api/admin/work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.message).toMatch(/changed/i);
+  });
+
+  it("answers 409 on the user PUT too", async () => {
+    // The user route only edits a plan the caller owns, so it needs the private
+    // shape — a system plan is refused at the authorization check.
+    workPlanService.getWorkPlan.mockResolvedValue({
+      ...stored, visibility: "private", isBuiltIn: false, ownerId: "user-1",
+    });
+    workPlanService.updateWorkPlan.mockRejectedValue(new Error("Work plan steps changed"));
+
+    const res = await request(app)
+      .put("/api/user-work-plans/p")
+      .send({ title: "Renamed", expectedStepsRev: "rev-1" });
+
+    expect(res.status).toBe(409);
+  });
+});
+
+// Raised by Greptile on PR #2269. These three now stake the plan they read, so
+// they can fail with a conflict — which without a mapping falls through to the
+// generic 500 and reads as "the server broke" rather than "retry".
+describe("review transitions answer 409 on a lost race", () => {
+  const conflict = () => new Error("Work plan steps changed");
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    workPlanService.getWorkPlan.mockResolvedValue({
+      planId: "p", title: "T", steps: [], ownerId: "user-1",
+      visibility: "pending_review", isBuiltIn: false,
+      createdAt: "2026-08-05T00:00:00Z", updatedAt: "2026-08-05T00:00:00Z",
+    });
+  });
+
+  it("on approve", async () => {
+    workPlanService.approveWorkPlan.mockRejectedValue(conflict());
+    const res = await request(app).post("/api/admin/work-plans/p/approve");
+    expect(res.status).toBe(409);
+    expect(res.body.message).toMatch(/changed/i);
+  });
+
+  it("on reject", async () => {
+    workPlanService.rejectWorkPlan.mockRejectedValue(conflict());
+    const res = await request(app).post("/api/admin/work-plans/p/reject").send({ feedback: "no" });
+    expect(res.status).toBe(409);
+  });
+
+  it("on submit for review", async () => {
+    workPlanService.submitForReview.mockRejectedValue(conflict());
+    const res = await request(app).post("/api/user-work-plans/p/submit-for-review");
+    expect(res.status).toBe(409);
+  });
+
+  it("still returns 500 for a genuine failure on approve", async () => {
+    workPlanService.approveWorkPlan.mockRejectedValue(new Error("ProvisionedThroughputExceeded"));
+    const res = await request(app).post("/api/admin/work-plans/p/approve");
     expect(res.status).toBe(500);
   });
 });
