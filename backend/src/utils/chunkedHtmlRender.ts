@@ -181,12 +181,199 @@ export function splitDraftIntoRenderChunks(draft: string, maxChars: number): str
 }
 
 /**
- * Reduce whatever the model returned for one section to a body fragment.
+ * Elements dropped together with everything inside them: they execute, load
+ * external content, or carry their own scripting/styling context, so unwrapping
+ * them and keeping the children would be worse than losing the block.
+ */
+const UNSAFE_CONTAINERS =
+  'script|style|iframe|frame|frameset|object|embed|applet|template|noscript|svg|math|form|select|textarea|canvas|audio|video';
+
+/**
+ * Everything a report section is allowed to be made of. Anything else is
+ * UNWRAPPED — the tag goes, its text stays — so a stray wrapper costs markup,
+ * never content.
+ */
+const ALLOWED_ELEMENTS = new Set([
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'br', 'hr', 'div', 'span',
+  'section', 'article', 'header', 'footer', 'aside', 'main', 'nav',
+  'ul', 'ol', 'li', 'dl', 'dt', 'dd',
+  'table', 'thead', 'tbody', 'tfoot', 'tr', 'th', 'td', 'caption', 'colgroup', 'col',
+  'a', 'img', 'figure', 'figcaption',
+  'strong', 'b', 'em', 'i', 'u', 's', 'del', 'ins', 'small', 'sup', 'sub', 'mark',
+  'abbr', 'time', 'code', 'pre', 'blockquote', 'details', 'summary',
+]);
+
+const VOID_ELEMENTS = new Set(['br', 'hr', 'img', 'col', 'wbr']);
+
+/** Attributes allowed on any element. Note the absence of class/id/style. */
+const GLOBAL_ATTRIBUTES = new Set(['title', 'lang', 'dir']);
+
+/** Per-element attributes, on top of the global ones. */
+const ELEMENT_ATTRIBUTES: Record<string, Set<string>> = {
+  a: new Set(['href', 'target', 'rel']),
+  img: new Set(['src', 'alt', 'width', 'height']),
+  th: new Set(['colspan', 'rowspan', 'scope']),
+  td: new Set(['colspan', 'rowspan']),
+  col: new Set(['span']),
+  colgroup: new Set(['span']),
+  ol: new Set(['start', 'type']),
+  time: new Set(['datetime']),
+};
+
+/** Attributes whose value is a URL and therefore needs a scheme check. */
+const URL_ATTRIBUTES = new Set(['href', 'src']);
+
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", colon: ':',
+  tab: '\t', newline: '\n', sol: '/',
+};
+
+/** Decode the entity forms a browser would resolve before acting on a URL. */
+function decodeEntities(value: string): string {
+  return value
+    .replace(/&#x([0-9a-f]{1,6});?/gi, (_m, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d{1,7});?/g, (_m, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&([a-z]+);/gi, (m, name) => NAMED_ENTITIES[String(name).toLowerCase()] ?? m);
+}
+
+/**
+ * Allow only schemes that cannot execute. Entities and control characters are
+ * resolved first, because `java&#115;cript:` and `java\tscript:` are both
+ * `javascript:` by the time the browser follows the link.
+ */
+function isSafeUrl(value: string): boolean {
+  const url = decodeEntities(value).replace(/[\u0000-\u0020\u007f]/g, '').toLowerCase();
+  if (!url) return false;
+  const scheme = /^([a-z][a-z0-9+.-]*):/.exec(url);
+  return scheme ? /^(https?|mailto|tel)$/.test(scheme[1]) : true;
+}
+
+/**
+ * Escape an attribute value without double-encoding entities the model already
+ * wrote — a QuickChart config arrives full of `&amp;`, and re-escaping it would
+ * put a literal "&amp;" in the URL and break the chart.
+ */
+function escapeAttributeValue(value: string): string {
+  return value
+    .replace(/&(?![a-zA-Z][a-zA-Z0-9]{1,31};|#\d{1,7};|#x[0-9a-fA-F]{1,6};)/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+const ATTRIBUTE_TOKEN =
+  /([a-zA-Z_:][a-zA-Z0-9_:.-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'`=<>]+)))?/g;
+
+function sanitizeAttributes(element: string, raw: string): string {
+  const allowed = ELEMENT_ATTRIBUTES[element];
+  let out = '';
+  ATTRIBUTE_TOKEN.lastIndex = 0;
+  let attribute: RegExpExecArray | null;
+  while ((attribute = ATTRIBUTE_TOKEN.exec(raw)) !== null) {
+    const name = attribute[1].toLowerCase();
+    const value = attribute[2] ?? attribute[3] ?? attribute[4] ?? '';
+    // `on*` is re-checked here even though no handler is on any allowlist:
+    // this is the one rule that must not depend on the lists staying correct.
+    if (name.startsWith('on')) continue;
+    if (!GLOBAL_ATTRIBUTES.has(name) && !allowed?.has(name)) continue;
+    if (URL_ATTRIBUTES.has(name) && !isSafeUrl(value)) continue;
+    out += ` ${name}="${escapeAttributeValue(value)}"`;
+  }
+  return out;
+}
+
+/**
+ * Quote-aware, so a `>` inside an attribute value does not end the tag early.
+ *
+ * A bare `<` is excluded from the unquoted run: without that, `<a<b<c ` repeated
+ * makes every `<` scan the rest of the input for a `>` that never comes — 4s of
+ * blocked event loop on 56K of it. Anything that fails to match here is escaped
+ * as text below, so failing fast cannot let markup through.
+ */
+const TAG_TOKEN = /<(\/)?([a-zA-Z][a-zA-Z0-9:-]*)((?:"[^"]*"|'[^']*'|[^>"'<])*)>/g;
+
+/** Escape text that sits between tags: a `<` here is not a tag we recognised. */
+function escapeTextNode(text: string): string {
+  return text.replace(/</g, '&lt;');
+}
+
+/**
+ * Remove HTML comments by scanning rather than by regex: `<!--` repeated without
+ * a terminator makes a lazy `[\s\S]*?` rescan the tail from every marker (1.7s
+ * on 60K chars). An unterminated marker drops only itself — whatever follows is
+ * sanitised as ordinary content.
+ */
+function stripComments(html: string): string {
+  let out = '';
+  let cursor = 0;
+  for (;;) {
+    const start = html.indexOf('<!--', cursor);
+    if (start === -1) return out + html.slice(cursor);
+    out += html.slice(cursor, start);
+    const end = html.indexOf('-->', start + 4);
+    // No terminator left in the string means none for any later marker either,
+    // so drop the remaining markers in one pass instead of re-scanning the tail
+    // from each of them.
+    if (end === -1) return out + html.slice(start + 4).split('<!--').join('');
+    cursor = end + 3;
+  }
+}
+
+/**
+ * Rebuild the fragment from an allowlist of elements and attributes.
+ *
+ * A section's HTML is model output derived from scraped research, and the
+ * assembled document is uploaded and served as text/html — so it must not be
+ * able to carry an event handler, an active element or a `javascript:` URL into
+ * the reader's browser. Every surviving tag and attribute is re-emitted from
+ * this function, so nothing reaches the page that was not explicitly allowed.
+ */
+function sanitizeFragmentHtml(fragment: string): string {
+  // Comments and the doctype first: a comment can hide markup, and neither
+  // belongs in a body fragment. Anything else declaration-shaped (`<![CDATA[`,
+  // `<?xml`) is left to be escaped as text — it is not a tag, so it cannot
+  // introduce markup, and scanning for its terminator is what turns a stream of
+  // unterminated `<!` into quadratic work.
+  let html = stripComments(fragment).replace(/<!doctype[^>]{0,200}>/gi, '');
+
+  // Executable/active containers go with their content. Repeated because one
+  // pass leaves the inner element of a nested pair behind. The attribute run is
+  // bounded so a run of unterminated openers cannot rescan the whole fragment
+  // each time; an opener too long to match is unwrapped by the allowlist below.
+  const container = new RegExp(`<(${UNSAFE_CONTAINERS})\\b[^>]{0,1000}>[\\s\\S]*?<\\/\\1\\s*>`, 'gi');
+  for (let pass = 0; pass < 3; pass++) {
+    const stripped = html.replace(container, '');
+    if (stripped === html) break;
+    html = stripped;
+  }
+
+  let out = '';
+  let cursor = 0;
+  TAG_TOKEN.lastIndex = 0;
+  let tag: RegExpExecArray | null;
+  while ((tag = TAG_TOKEN.exec(html)) !== null) {
+    out += escapeTextNode(html.slice(cursor, tag.index));
+    cursor = TAG_TOKEN.lastIndex;
+    const name = tag[2].toLowerCase();
+    if (!ALLOWED_ELEMENTS.has(name)) continue; // unwrap: drop the tag, keep the text
+    if (tag[1]) {
+      if (!VOID_ELEMENTS.has(name)) out += `</${name}>`;
+      continue;
+    }
+    const attributes = sanitizeAttributes(name, tag[3]);
+    out += VOID_ELEMENTS.has(name) ? `<${name}${attributes} />` : `<${name}${attributes}>`;
+  }
+  return out + escapeTextNode(html.slice(cursor));
+}
+
+/**
+ * Reduce whatever the model returned for one section to a SAFE body fragment.
  *
  * The prompt asks for a fragment, but the assembly must not depend on that: a
  * model that returns a whole document, wraps it in a code fence, or emits its
- * own <style>/<script> would otherwise produce a broken or self-conflicting
- * page. Stripping style/script also keeps one section from restyling — or
+ * own <style>/<script> would otherwise produce a broken, self-conflicting or
+ * unsafe page. The output is rebuilt from an allowlist (see
+ * sanitizeFragmentHtml), which also keeps one section from restyling — or
  * scripting — the rest of the report.
  */
 export function extractHtmlFragment(modelOutput: string): string {
@@ -202,15 +389,11 @@ export function extractHtmlFragment(modelOutput: string): string {
     html = body[1];
   } else {
     html = html
-      .replace(/<!DOCTYPE[^>]*>/gi, '')
-      .replace(/<\/?html[^>]*>/gi, '')
-      .replace(/<head[^>]*>[\s\S]*?<\/head\s*>/gi, '');
+      .replace(/<head[^>]*>[\s\S]*?<\/head\s*>/gi, '')
+      .replace(/<\/?html[^>]*>/gi, '');
   }
 
-  return html
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '')
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, '')
-    .trim();
+  return sanitizeFragmentHtml(html).trim();
 }
 
 /** Assemble rendered section fragments into one self-contained document. */
