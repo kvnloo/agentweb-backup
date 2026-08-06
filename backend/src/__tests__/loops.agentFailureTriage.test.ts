@@ -422,7 +422,21 @@ describe('ENG-820 — a non-actionable majority never hides an actionable minori
  * actionable class, so every number and every sentence describes exactly one
  * cohort.
  */
-describe('ENG-820 — one proposal per actionable failure class', () => {
+/**
+ * Mixed actionable cohorts (Greptile rounds 5 and 6).
+ *
+ * An earlier revision emitted one proposal PER actionable class, which described
+ * each cohort exactly. It was reverted: `sourceRuleId` is the cooldown key —
+ * `CooldownRuleSet` matches it exactly against persisted learning records — so
+ * class-qualifying it orphans every historical record and re-dispatches tools
+ * that are deliberately on cooldown. That is a persistence-semantics change,
+ * not a digest change, and it is tracked as its own issue.
+ *
+ * What is kept here: the dominant actionable class drives the remedy, and every
+ * other actionable cohort is NAMED, so nothing is silently folded into another
+ * class's count.
+ */
+describe('ENG-820 — mixed actionable cohorts stay visible under one tool identity', () => {
   const rules = () => new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2 });
 
   const mixed = (tool: string) => [
@@ -430,59 +444,44 @@ describe('ENG-820 — one proposal per actionable failure class', () => {
     ...toolEvents(tool, 0, 8, 'bug', 'TypeErrorClass', 'TypeError: boom'),
   ];
 
-  it('emits a separate proposal for each class, not one merged 18-failure entry', async () => {
+  it('emits exactly one proposal per tool, keyed at tool level', async () => {
     const proposals = await rules().evaluate(mixed('two_faults'), WINDOW);
-    const mine = payloads(proposals).filter((p: any) => p.toolName === 'two_faults');
-
-    expect(mine).toHaveLength(2);
-    expect(mine.map((p: any) => p.failureType).sort()).toEqual(['bug', 'config']);
-    // Neither claims the other's volume.
-    expect(mine.find((p: any) => p.failureType === 'config').failures).toBe(10);
-    expect(mine.find((p: any) => p.failureType === 'bug').failures).toBe(8);
-  });
-
-  it('gives the handler bugs their own remediation instead of dropping them', async () => {
-    const proposals = await rules().evaluate(mixed('two_faults2'), WINDOW);
-    const bug: any = payloads(proposals).find(
-      (p: any) => p.toolName === 'two_faults2' && p.failureType === 'bug',
-    );
-
-    expect(bug).toBeDefined();
-    expect(bug.directive).toMatch(/investigate/i);
-    expect(bug.topErrorClass).toBe('TypeErrorClass');
-  });
-
-  it('keeps each proposal internally consistent — class, error class and quote agree', async () => {
-    const proposals = await rules().evaluate(mixed('two_faults3'), WINDOW);
-    const cfg: any = payloads(proposals).find(
-      (p: any) => p.toolName === 'two_faults3' && p.failureType === 'config',
-    );
-
-    expect(cfg.topErrorClass).toBe('auth');
-    expect(cfg.directive).toContain('token expired');
-    expect(cfg.directive).not.toContain('TypeError');
-    expect(cfg.directive).not.toMatch(/investigate the handler/i);
-  });
-
-  it('gives the two classes distinct proposal ids so they are separate fixes', async () => {
-    const proposals = await rules().evaluate(mixed('two_faults4'), WINDOW);
-    const ids = proposals
-      .filter((p: any) => p.payload?.toolName === 'two_faults4')
-      .map((p: any) => p.proposalId);
-
-    expect(new Set(ids).size).toBe(2);
-  });
-
-  it('applies the thresholds per class — a 2-failure cohort does not ride in', async () => {
-    const events = [
-      ...toolEvents('one_real', 30, 10, 'config', 'auth', 'token expired'),
-      ...toolEvents('one_real', 0, 2, 'bug', 'TypeErrorClass', 'TypeError'),
-    ];
-
-    const proposals = await rules().evaluate(events, WINDOW);
-    const mine = payloads(proposals).filter((p: any) => p.toolName === 'one_real');
+    const mine = proposals.filter((p: any) => p.payload?.toolName === 'two_faults');
 
     expect(mine).toHaveLength(1);
-    expect(mine[0].failureType).toBe('config');
+    // Tool-level identity — the cooldown key must keep matching history.
+    expect((mine[0] as any).sourceRuleId).toBe('tool-failure:two_faults');
+  });
+
+  it('names the minority cohort instead of hiding it inside another class', async () => {
+    const proposals = await rules().evaluate(mixed('two_faults2'), WINDOW);
+    const prop: any = proposals.find((p: any) => p.payload?.toolName === 'two_faults2');
+
+    expect(prop.payload.failureType).toBe('config');
+    expect(prop.hypothesis).toContain('8 bug');
+    expect(prop.payload.otherActionableClasses).toContain('8 bug');
+  });
+
+  it('keeps the remedy internally consistent with the class it names', async () => {
+    const proposals = await rules().evaluate(mixed('two_faults3'), WINDOW);
+    const found: any = proposals.find((x: any) => x.payload?.toolName === 'two_faults3');
+    expect(found).toBeDefined();
+    const p: any = found.payload;
+
+    expect(p.topErrorClass).toBe('auth');
+    expect(p.directive).toContain('token expired');
+    expect(p.directive).not.toContain('TypeError');
+  });
+
+  it('sizes the config remedy on the config cohort, not the combined total', async () => {
+    // The round-5 defect: 10 config + 8 bug rendered as an 18-failure config
+    // fix. The directive must quantify the cohort it is advising on.
+    const proposals = await rules().evaluate(mixed('two_faults4'), WINDOW);
+    const found: any = proposals.find((x: any) => x.payload?.toolName === 'two_faults4');
+    expect(found).toBeDefined();
+    const p: any = found.payload;
+
+    expect(p.directive).toContain('10/30');
+    expect(p.directive).not.toContain('18/30');
   });
 });
