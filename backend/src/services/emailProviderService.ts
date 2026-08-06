@@ -11,7 +11,19 @@ export interface EmailSummary {
   threadId: string;
   subject: string;
   from: string;
+  /**
+   * The sender's own Date header. Display-grade only: it is set by whoever sent
+   * the message, so a wrong or deliberately-skewed clock lands here verbatim.
+   * Never order or trust a freshness decision on it — use `receivedAt`.
+   */
   date: string;
+  /**
+   * When the PROVIDER received the message (Gmail internalDate, Outlook
+   * receivedDateTime), ISO 8601. Server-stamped, so a sender cannot move it.
+   * Optional because a provider may not supply one; fall back to `date` only
+   * where being wrong is harmless.
+   */
+  receivedAt?: string;
   snippet: string;
 }
 
