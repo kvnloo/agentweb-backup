@@ -3029,29 +3029,41 @@ export class AgentModeService {
   /**
    * ENG-803: does this scheduled run's schedule allow it to publish externally?
    *
-   * Returns TRUE for anything that is not an explicit owner opt-out — including a
-   * non-scheduled session, an unparseable pageIdentifier, a missing schedule, and a
-   * failed DynamoDB read. That is deliberate and is the safe direction here:
-   * publishing is the pre-existing behaviour of every scheduled run, so a transient
-   * read failure must degrade to the status quo rather than silently converting a
-   * working schedule into a drafting-only one. A prompt-enrichment lookup must never
-   * change what the run is allowed to do.
+   * The default lives in the FIELD, not in this lookup. A schedule we read that has
+   * no `requirePublishApproval` is authorized (every existing row, so nothing
+   * changes behaviour) — but a schedule we could not read AT ALL is not, because an
+   * owner who did set it would otherwise be overridden by a transient DynamoDB blip
+   * and a public post cannot be taken back (Greptile review #16). Withholding is the
+   * recoverable error: the run still does the work, saves the drafts, and tells the
+   * owner what is waiting.
    *
-   * The value is only ever CONSUMED by getScheduledSessionOverride, which self-guards
-   * on sessionType, so a `true` returned for a non-scheduled session emits nothing.
+   * Every scheduled session is stamped `"<title>|scheduleId:<id>"` by
+   * runScheduledChat — which is also the path a "Test run" takes — so a scheduled
+   * session with no parseable id is an unverifiable state, and is withheld for the
+   * same reason.
+   *
+   * Non-scheduled sessions short-circuit to true and never reach a lookup; the value
+   * is only ever consumed by getScheduledSessionOverride, which self-guards on
+   * sessionType and emits nothing for them.
    */
   private async resolveScheduledPublishAuthorized(currentSession: any): Promise<boolean> {
     if (currentSession?.sessionType !== 'scheduled') return true;
     const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
-    if (!scheduleId) return true;
+    if (!scheduleId) {
+      console.warn(
+        `AgentMode: scheduled session ${currentSession?.sessionId} has no parseable scheduleId; withholding publish authorization rather than assuming it.`
+      );
+      return false;
+    }
     try {
+      // resolvePublishAuthorized returns false for a null/deleted schedule too.
       return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId));
     } catch (error) {
       console.error(
-        `AgentMode: failed to resolve publish approval for scheduled session ${currentSession?.sessionId}; keeping the existing publish behaviour:`,
+        `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding publish authorization for this turn rather than publishing unverified:`,
         error
       );
-      return true;
+      return false;
     }
   }
 

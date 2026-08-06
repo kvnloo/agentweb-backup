@@ -1466,6 +1466,23 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 // write-back now"). Budget truncation comes next (also a hard state signal); a
 // confirmation halt takes precedence over a plain unfinished-work admission so
 // the continuation message can be tailored to "proceed best-effort".
+// ENG-803: the terminal marker a publish-withheld run is instructed to end on (see
+// the approval-required branch of getScheduledSessionOverride).
+//
+// Without this the fix would loop the very runs it protects. A withheld run
+// correctly ends by saying its drafts are saved and nothing was posted — wording
+// that the confirmation detector reads as "awaiting … approval", i.e. a run halting
+// for a human answer. It would then be nudged to continue, on a schedule whose owner
+// asked it NOT to publish, which is the ~21-turn nudge loop this whole area exists to
+// avoid. The marker is emitted only on the withheld branch, so it distinguishes a
+// deliberate, complete withhold from a genuine mid-run halt.
+const PUBLISH_WITHHELD_MARKER = /PUBLISH WITHHELD:\s*this schedule requires approval before publishing/i;
+
+export function scheduledRunWithheldPublish(content?: string): boolean {
+  if (!content || typeof content !== 'string') return false;
+  return PUBLISH_WITHHELD_MARKER.test(content);
+}
+
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
@@ -1474,7 +1491,10 @@ export function classifyScheduledContinuation(response: {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
-  if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
+  // ENG-803: a deliberate publish-withhold is a COMPLETE terminal state, not a halt
+  // awaiting an answer. Suppress only 'confirmation' — a withheld run can still be
+  // genuinely truncated or leave other work unfinished, and those must still continue.
+  if (!scheduledRunWithheldPublish(content) && scheduledRunAwaitsConfirmation(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
@@ -1552,7 +1572,10 @@ export async function classifyScheduledContinuationAsync(response: {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
-  if (await scheduledTurnDefersToUser(content)) return 'confirmation';
+  // ENG-803: same withhold exemption as the sync classifier above — and it must be
+  // checked BEFORE the LLM judge, which would otherwise be asked to rule on text
+  // that is deliberately shaped like a deferral.
+  if (!scheduledRunWithheldPublish(content) && await scheduledTurnDefersToUser(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }

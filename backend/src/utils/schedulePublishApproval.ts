@@ -30,8 +30,11 @@
  * behaviour when this ships.
  *
  * This is not fail-open in the dangerous direction: it preserves an existing
- * capability rather than granting a new one. A read failure resolves to the status
- * quo, not to a new grant.
+ * capability rather than granting a new one, and the model still cannot talk its way
+ * into publishing — the value is read off the record, never off the prompt. Note the
+ * default applies to a MISSING FIELD, not to a missing answer: when the schedule
+ * cannot be read at all we withhold instead, because that is the recoverable error
+ * (see resolvePublishAuthorized).
  *
  * SIGNALS DELIBERATELY NOT HONOURED — do not reinstate any of these:
  *
@@ -76,14 +79,32 @@ export interface SchedulePublishApprovalInput {
 /**
  * Whether an unattended run on this schedule may publish externally.
  *
- * Strict `!== true` so that false, undefined, null, a missing attribute, or a
- * legacy row all resolve to authorized — the pre-existing behaviour. Only an
- * explicit boolean true withholds.
+ * TWO DIFFERENT ABSENCES, TWO DIFFERENT ANSWERS — this distinction is the whole
+ * correctness argument, and conflating them was a real bug (Greptile review #16):
+ *
+ *   - The FIELD is absent on a schedule we successfully read -> AUTHORIZED. That is
+ *     every one of the 897 existing rows, none of which has the attribute; treating
+ *     it as a withhold would convert 25 active publishing schedules into
+ *     drafting-only runs. Absence of the field is not a signal, it is the default.
+ *
+ *   - The RECORD itself is absent (deleted schedule, or a read that failed and was
+ *     caught upstream) -> NOT AUTHORIZED. Here we genuinely do not know what the
+ *     owner chose, and an owner who set `requirePublishApproval` would be
+ *     overridden by a transient DynamoDB blip. The two errors are not symmetric:
+ *     publishing is IRREVERSIBLE and public, while withholding saves the drafts and
+ *     tells the owner what is waiting. When we cannot verify, take the recoverable
+ *     one.
+ *
+ * Strict `!== true` on the field so a truthy string or number from a loosely-typed
+ * caller cannot silence a schedule's publishing by accident.
  */
 export function resolvePublishAuthorized(
   schedule?: SchedulePublishApprovalInput | null
 ): boolean {
-  return schedule?.requirePublishApproval !== true;
+  // No record => we cannot confirm the owner's choice => do not take the
+  // irreversible action. See the two-absences note above.
+  if (!schedule) return false;
+  return schedule.requirePublishApproval !== true;
 }
 
 /**
