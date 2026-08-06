@@ -539,28 +539,37 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Brand guidelines not found" });
     }
 
-    // Determine S3 key for deletion. For legacy assets without a key field,
-    // extract the S3 key from the asset URL as a fallback.
+    // Resolve the request against the caller's OWN attachments before deleting
+    // anything. `key` and `?url=` come straight from the request, so using them
+    // as the S3 key directly let any authenticated user with brand guidelines
+    // delete any object in the bucket.
+    // For keyless legacy assets, match by URL instead of key.
     const isValidKey = key && key !== "undefined";
-    let s3Key: string | undefined = isValidKey ? key : undefined;
-    if (!s3Key && urlFallback) {
+    const attachments: any[] = brandGuidelines.attachments || [];
+    const target = attachments.find((attachment: any) =>
+      isValidKey
+        ? attachment.key === key
+        : !!urlFallback && attachment.url === urlFallback
+    );
+    if (!target) {
+      return res.status(404).json({ error: "Asset not found" });
+    }
+
+    // Determine S3 key for deletion from the matched attachment. Legacy assets
+    // have no key field, so fall back to extracting it from the asset URL.
+    let s3Key: string | undefined =
+      typeof target.key === "string" && target.key !== "undefined" ? target.key : undefined;
+    if (!s3Key && typeof target.url === "string") {
       const bucketPrefix = `https://${process.env.AWS_S3_BUCKET || "agentweb-user-files"}.s3.us-west-2.amazonaws.com/`;
-      if (urlFallback.startsWith(bucketPrefix)) {
-        s3Key = urlFallback.slice(bucketPrefix.length);
+      if (target.url.startsWith(bucketPrefix)) {
+        s3Key = target.url.slice(bucketPrefix.length);
       }
     }
 
-    // Remove the asset from attachments.
-    // For keyless legacy assets, match by URL instead of key.
-    const updatedAttachments = (brandGuidelines.attachments || []).filter(
-      (attachment: any) => {
-        if (isValidKey) {
-          return attachment.key !== key;
-        } else if (urlFallback) {
-          return attachment.url !== urlFallback;
-        }
-        return true; // Can't identify, keep all
-      }
+    // A match is guaranteed here, so this drops the target (and any duplicate
+    // entries pointing at the same object, as before).
+    const updatedAttachments = attachments.filter((attachment: any) =>
+      isValidKey ? attachment.key !== key : attachment.url !== urlFallback
     );
 
     console.log(
