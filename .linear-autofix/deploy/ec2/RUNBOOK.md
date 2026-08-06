@@ -242,12 +242,34 @@ ssh -i <key> -L 8790:localhost:8790 ec2-user@<public-ip>
   5 compressed generations, run daily by `logrotate.timer`. This is an independent backstop to `run.sh`'s
   per-cycle rotation (which stops if the poll cron stops). Inspect: `sudo logrotate --debug /etc/logrotate.d/autofix`.
 - **SSM Agent:** `bootstrap.sh` installs + enables `amazon-ssm-agent` (Session Manager / Run Command).
-  It runs, but the box only becomes a **managed instance** once the IAM role grants
-  `AmazonSSMManagedInstanceCore` — that IAM change is deferred to Harsha / **ENG-562**, not applied here.
-- **CloudWatch alarms:** `deploy/ec2/cloudwatch-alarms.draft.json` is a **DRAFT** (not applied) — four
-  alarms: no-successful-poll-in-15 min (off the poll heartbeat / metrics `lastPollAt`), disk %, mem %, and
-  IAM AccessDenied count. Each entry is a `put-metric-alarm --cli-input-json` payload; the header lists the
-  metric-publishing prerequisites. Apply via Harsha / **ENG-562** after filling `<INSTANCE_ID>`/`<SNS_TOPIC_ARN>`.
+  The box becomes a **managed instance** once its IAM role grants `AmazonSSMManagedInstanceCore` — now
+  live on `autofix-runner-least-priv`, so `i-0cb38aac2332941dc` is registered (verify off-box with
+  `aws ssm describe-instance-information`; the runner role itself is intentionally denied that read).
+  **Gotcha:** if the instance profile is swapped on a *running* box, restart the agent so it picks up the
+  new IMDS credentials — `sudo systemctl restart amazon-ssm-agent` — otherwise registration silently
+  never completes (the agent log's `[EC2Identity] Registration info found` + MGS control-channel lines
+  are the proof it registered).
+- **Poll heartbeat:** `run.sh` emits `PutMetricData` `PollSuccess=1` (namespace `AgentWeb/Autofix`,
+  dimension `InstanceId=i-0cb38aac2332941dc`) as its **last** step, so it fires only on a fully successful
+  cycle — a wedged/crashed poller stops the heartbeat, which is what the `no-successful-poll-15m` alarm
+  keys off (that alarm needs `TreatMissingData=breaching`). The runner role allows `PutMetricData` on this
+  namespace but **denies `ListMetrics`**, so confirm the metric off-box:
+  `aws cloudwatch list-metrics --namespace AgentWeb/Autofix`.
+- **CloudWatch agent (disk/mem):** `bootstrap.sh` installs `amazon-cloudwatch-agent` and applies
+  `deploy/ec2/cloudwatch-agent-config.json` — `mem_used_percent` + `disk_used_percent` (root fs) to the
+  **`CWAgent`** namespace every 60s. `InstanceId` is resolved from IMDS (no `ec2:DescribeTags` → does not
+  trip the AccessDenied canary), and `aggregation_dimensions [[InstanceId]]` also publishes an
+  InstanceId-only rollup. **Exact published dimensions** (bind the disk/mem alarms to these — the earlier
+  draft's guess was unverified):
+  - `mem_used_percent`: `{InstanceId=i-0cb38aac2332941dc}`
+  - `disk_used_percent`: `{InstanceId=i-0cb38aac2332941dc, path=/, fstype=xfs}` (device dropped via
+    `drop_device`), plus the InstanceId-only rollup `{InstanceId=i-0cb38aac2332941dc}` — **binding the
+    alarm on `InstanceId` alone is the robust choice** (survives a filesystem/mount change).
+- **CloudWatch alarms:** `deploy/ec2/cloudwatch-alarms.draft.json` — the `AccessDenied` alarm is live
+  (CloudTrail-backed, via Harsha). The remaining three (`no-successful-poll-15m`, `disk>85%`, `mem>90%`)
+  are a short `put-metric-alarm` apply from Harsha's session now that all three metric **sources** above
+  are emitting; bind disk/mem to the exact dimensions listed above, and the poll alarm with
+  `TreatMissingData=breaching`.
 
 ## 9. Granting access to other users
 
