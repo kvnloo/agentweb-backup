@@ -346,3 +346,67 @@ describe('ENG-820 — the cited error class matches the chosen failure class', (
     expect(p.topErrorClass).toBe('LegacyClass');
   });
 });
+
+/**
+ * Greptile round 4, and the most serious of the four: my triage made the policy
+ * HIDE real bugs. Dropping a tool because its dominant class is non-dispatchable
+ * discards a recurring `bug` cohort sitting behind a larger `by_design` one —
+ * the exact opposite of this issue's intent, which is to remove noise without
+ * losing signal.
+ *
+ * The unit of exclusion is a FAILURE, not a tool.
+ */
+describe('ENG-820 — a non-actionable majority never hides an actionable minority', () => {
+  const rules = () => new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2 });
+
+  it('still dispatches the bug cohort hiding behind a larger by_design one', async () => {
+    const events = [
+      ...toolEvents('shadowed_tool', 40, 20, 'by_design', 'policy_blocked'),
+      ...toolEvents('shadowed_tool', 0, 10, 'bug', 'TypeErrorClass', 'TypeError: boom'),
+    ];
+
+    const proposals = await rules().evaluate(events, WINDOW);
+    const p: any = payloads(proposals).find((x: any) => x.toolName === 'shadowed_tool');
+
+    expect(p).toBeDefined();
+    expect(p.failureType).toBe('bug');
+    // Counts and rate describe the ACTIONABLE cohort, not the raw total.
+    expect(p.failures).toBe(10);
+    expect(p.directive).toMatch(/investigate/i);
+  });
+
+  it('says how many failures it set aside, so the number is not silently smaller', async () => {
+    const events = [
+      ...toolEvents('shadowed_tool2', 40, 20, 'by_design', 'policy_blocked'),
+      ...toolEvents('shadowed_tool2', 0, 10, 'bug', 'TypeErrorClass', 'TypeError: boom'),
+    ];
+
+    const proposals = await rules().evaluate(events, WINDOW);
+    const prop: any = proposals.find((x: any) => x.payload?.toolName === 'shadowed_tool2');
+
+    expect(prop.hypothesis).toContain('10/40');
+    expect(prop.hypothesis).toContain('20 non-actionable excluded');
+  });
+
+  it('still drops a tool whose failures are ENTIRELY non-actionable', async () => {
+    const events = toolEvents('pure_by_design', 30, 20, 'by_design', 'policy_blocked');
+
+    const proposals = await rules().evaluate(events, WINDOW);
+
+    expect(payloads(proposals).map((p: any) => p.toolName)).not.toContain('pure_by_design');
+  });
+
+  it('does not admit a tool whose actionable cohort is below the threshold', async () => {
+    // 2 real bugs behind 20 by_design is still below minFailures=3. The gate
+    // applies to the actionable cohort, not to the raw total, which would
+    // otherwise let a single bug ride in on by_design volume.
+    const events = [
+      ...toolEvents('mostly_fine', 40, 20, 'by_design', 'policy_blocked'),
+      ...toolEvents('mostly_fine', 0, 2, 'bug', 'TypeErrorClass', 'TypeError'),
+    ];
+
+    const proposals = await rules().evaluate(events, WINDOW);
+
+    expect(payloads(proposals).map((p: any) => p.toolName)).not.toContain('mostly_fine');
+  });
+});

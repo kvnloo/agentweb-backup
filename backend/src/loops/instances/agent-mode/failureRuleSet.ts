@@ -233,20 +233,37 @@ export class AgentFailureRuleSet
       });
     }
     for (const stats of byTool.values()) {
-      // Denominator is invocations; when only failures were recorded (no
-      // matching invoked events in window), treat failures as the denominator
-      // so a fully-broken tool still trips the rate gate.
-      const denom = stats.invocations > 0 ? stats.invocations : stats.failures;
-      const failureRate = denom > 0 ? stats.failures / denom : 0;
+      // ENG-820: exclude non-actionable FAILURES, not the tools that have them.
+      //
+      // Dropping a tool because its dominant class is non-dispatchable would
+      // hide a recurring `bug` cohort behind a larger `by_design` one — the
+      // exact opposite of this issue's intent, which is to remove noise without
+      // losing signal. So the tool is judged on its actionable failures alone.
+      const actionableTypes = new Map<string, number>();
+      let excludedNonActionable = 0;
+      for (const [ft, n] of stats.failureTypes) {
+        if (NON_DISPATCHABLE_FAILURE_TYPES.has(ft)) excludedNonActionable += n;
+        else actionableTypes.set(ft, n);
+      }
+      // Failures with no recorded class (pre-backfill) are actionable: failing
+      // the other way would hide real bugs.
+      const classified = Array.from(stats.failureTypes.values()).reduce((a, b) => a + b, 0);
+      const unclassified = Math.max(0, stats.failures - classified);
+      const actionableFailures =
+        Array.from(actionableTypes.values()).reduce((a, b) => a + b, 0) + unclassified;
 
-      if (stats.failures < this.minFailures) continue;
+      if (actionableFailures === 0) continue;
+
+      // Denominator is invocations; when only failures were recorded (no
+      // matching invoked events in window), treat the actionable failures as
+      // the denominator so a fully-broken tool still trips the rate gate.
+      const denom = stats.invocations > 0 ? stats.invocations : actionableFailures;
+      const failureRate = denom > 0 ? actionableFailures / denom : 0;
+
+      if (actionableFailures < this.minFailures) continue;
       if (failureRate < this.minFailureRate) continue;
 
-      // ENG-820: triage on the failureType the event already carries. An
-      // unclassified failure (pre-backfill events) still dispatches — failing
-      // the other way would hide real bugs.
-      const failureType = stats.failureTypes.size > 0 ? dominantKey(stats.failureTypes) : '';
-      if (NON_DISPATCHABLE_FAILURE_TYPES.has(failureType)) continue;
+      const failureType = actionableTypes.size > 0 ? dominantKey(actionableTypes) : '';
       const handlerBug = failureType !== 'config' && failureType !== 'schema_reject';
       // Cite an error class from the SAME cohort as the chosen failure class.
       // Falls back to the global aggregate only when the class has none of its
@@ -259,9 +276,10 @@ export class AgentFailureRuleSet
         proposalId: asMutationId(`agent-mode:tool-failure:${stats.toolName}`),
         sourceRuleId: `tool-failure:${stats.toolName}`,
         hypothesis:
-          `Tool \`${stats.toolName}\` failed ${stats.failures}/${denom} times ` +
+          `Tool \`${stats.toolName}\` failed ${actionableFailures}/${denom} times ` +
           `(${(failureRate * 100).toFixed(0)}%) this window, dominated by ${topErrorClass}` +
-          `${failureType ? ` [${failureType}]` : ''}. ` +
+          `${failureType ? ` [${failureType}]` : ''}` +
+          `${excludedNonActionable > 0 ? ` (+${excludedNonActionable} non-actionable excluded)` : ''}. ` +
           (handlerBug
             ? `Investigate the handler + propose a robustness fix.`
             : failureType === 'config'
@@ -270,7 +288,7 @@ export class AgentFailureRuleSet
         kind: 'code_change',
         payload: {
           toolName: stats.toolName,
-          failures: stats.failures,
+          failures: actionableFailures,
           invocations: stats.invocations,
           failureRate,
           topErrorClass,
@@ -279,7 +297,7 @@ export class AgentFailureRuleSet
             failureType,
             stats.toolName,
             topErrorClass,
-            stats.failures,
+            actionableFailures,
             denom,
             stats.messagesByType.get(failureType) ?? '',
             this.minFailureRate,
@@ -287,7 +305,8 @@ export class AgentFailureRuleSet
         },
         triggeringStats: {
           toolName: stats.toolName,
-          failures: stats.failures,
+          failures: actionableFailures,
+          excludedNonActionable,
           invocations: stats.invocations,
           failureRatePct: Math.round(failureRate * 100),
           topErrorClass,
