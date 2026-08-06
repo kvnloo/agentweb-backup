@@ -233,91 +233,97 @@ export class AgentFailureRuleSet
       });
     }
     for (const stats of byTool.values()) {
-      // ENG-820: exclude non-actionable FAILURES, not the tools that have them.
+      // ENG-820: one proposal per ACTIONABLE FAILURE CLASS, not per tool.
       //
-      // Dropping a tool because its dominant class is non-dispatchable would
-      // hide a recurring `bug` cohort behind a larger `by_design` one — the
-      // exact opposite of this issue's intent, which is to remove noise without
-      // losing signal. So the tool is judged on its actionable failures alone.
-      const actionableTypes = new Map<string, number>();
+      // Three review rounds all reduced to the same mistake — collapsing a
+      // tool's failures to a single "dominant" class and then describing the
+      // whole cohort with that one class's remedy. 10 config + 8 bug became an
+      // 18-failure config proposal telling the operator this is not a handler
+      // bug, which overstates the config impact AND leaves the 8 real bugs with
+      // no remediation at all.
+      //
+      // Splitting per class removes the entire failure mode rather than
+      // patching its latest symptom: every proposal's count, rate, error class,
+      // quoted message and directive now describe exactly one cohort.
+      const perClass = new Map<string, number>();
       let excludedNonActionable = 0;
       for (const [ft, n] of stats.failureTypes) {
         if (NON_DISPATCHABLE_FAILURE_TYPES.has(ft)) excludedNonActionable += n;
-        else actionableTypes.set(ft, n);
+        else perClass.set(ft, n);
       }
-      // Failures with no recorded class (pre-backfill) are actionable: failing
-      // the other way would hide real bugs.
+      // Failures with no recorded class (pre-backfill) are actionable and form
+      // their own cohort: failing the other way would hide real bugs.
       const classified = Array.from(stats.failureTypes.values()).reduce((a, b) => a + b, 0);
       const unclassified = Math.max(0, stats.failures - classified);
-      const actionableFailures =
-        Array.from(actionableTypes.values()).reduce((a, b) => a + b, 0) + unclassified;
+      if (unclassified > 0) perClass.set('', (perClass.get('') ?? 0) + unclassified);
 
-      if (actionableFailures === 0) continue;
+      for (const [failureType, classFailures] of perClass) {
+        // Denominator stays the tool's invocations — a class's rate is its share
+        // of all calls, which is what "how broken is this tool, in this way"
+        // means. When only failures were recorded, fall back to this class's own
+        // count so a fully-broken tool still trips the rate gate.
+        const denom = stats.invocations > 0 ? stats.invocations : classFailures;
+        const failureRate = denom > 0 ? classFailures / denom : 0;
 
-      // Denominator is invocations; when only failures were recorded (no
-      // matching invoked events in window), treat the actionable failures as
-      // the denominator so a fully-broken tool still trips the rate gate.
-      const denom = stats.invocations > 0 ? stats.invocations : actionableFailures;
-      const failureRate = denom > 0 ? actionableFailures / denom : 0;
+        // Both gates apply PER CLASS, so a small cohort cannot ride in on
+        // another class's volume.
+        if (classFailures < this.minFailures) continue;
+        if (failureRate < this.minFailureRate) continue;
 
-      if (actionableFailures < this.minFailures) continue;
-      if (failureRate < this.minFailureRate) continue;
-
-      const failureType = actionableTypes.size > 0 ? dominantKey(actionableTypes) : '';
-      const handlerBug = failureType !== 'config' && failureType !== 'schema_reject';
-      // Cite an error class from the SAME cohort as the chosen failure class.
-      // Falls back to the global aggregate only when the class has none of its
-      // own (i.e. unclassified failures), where global IS the right cohort.
-      const cohort = stats.errorClassesByType.get(failureType);
-      const topErrorClass = cohort && cohort.size > 0
-        ? dominantKey(cohort)
-        : dominantKey(stats.errorClasses);
-      proposals.push({
-        proposalId: asMutationId(`agent-mode:tool-failure:${stats.toolName}`),
-        sourceRuleId: `tool-failure:${stats.toolName}`,
-        hypothesis:
-          `Tool \`${stats.toolName}\` failed ${actionableFailures}/${denom} times ` +
-          `(${(failureRate * 100).toFixed(0)}%) this window, dominated by ${topErrorClass}` +
-          `${failureType ? ` [${failureType}]` : ''}` +
-          `${excludedNonActionable > 0 ? ` (+${excludedNonActionable} non-actionable excluded)` : ''}. ` +
-          (handlerBug
-            ? `Investigate the handler + propose a robustness fix.`
-            : failureType === 'config'
-              ? `Configuration/credential issue — resolve the account, not the code.`
-              : `Declared schema and handler disagree — fix the contract.`),
-        kind: 'code_change',
-        payload: {
-          toolName: stats.toolName,
-          failures: actionableFailures,
-          invocations: stats.invocations,
-          failureRate,
-          topErrorClass,
-          failureType,
-          directive: directiveFor(
-            failureType,
-            stats.toolName,
-            topErrorClass,
-            actionableFailures,
-            denom,
-            stats.messagesByType.get(failureType) ?? '',
-            this.minFailureRate,
+        const handlerBug = failureType !== 'config' && failureType !== 'schema_reject';
+        // Cite an error class from this cohort. Falls back to the global
+        // aggregate only for unclassified failures, where global IS the cohort.
+        const cohort = stats.errorClassesByType.get(failureType);
+        const topErrorClass = cohort && cohort.size > 0
+          ? dominantKey(cohort)
+          : dominantKey(stats.errorClasses);
+        proposals.push({
+          // Keyed by tool AND class: two classes on one tool are two distinct
+          // fixes, and the cooldown wrapper must be able to tell them apart.
+          proposalId: asMutationId(
+            `agent-mode:tool-failure:${stats.toolName}${failureType ? `:${failureType}` : ''}`,
           ),
-        },
-        triggeringStats: {
-          toolName: stats.toolName,
-          failures: actionableFailures,
-          excludedNonActionable,
-          invocations: stats.invocations,
-          failureRatePct: Math.round(failureRate * 100),
-          topErrorClass,
-        },
-      });
+          sourceRuleId: `tool-failure:${stats.toolName}${failureType ? `:${failureType}` : ''}`,
+          hypothesis:
+            `Tool \`${stats.toolName}\` failed ${classFailures}/${denom} times ` +
+            `(${(failureRate * 100).toFixed(0)}%) this window, dominated by ${topErrorClass}` +
+            `${failureType ? ` [${failureType}]` : ''}` +
+            `${excludedNonActionable > 0 ? ` (+${excludedNonActionable} non-actionable excluded)` : ''}. ` +
+            (handlerBug
+              ? `Investigate the handler + propose a robustness fix.`
+              : failureType === 'config'
+                ? `Configuration/credential issue — resolve the account, not the code.`
+                : `Declared schema and handler disagree — fix the contract.`),
+          kind: 'code_change',
+          payload: {
+            toolName: stats.toolName,
+            failures: classFailures,
+            invocations: stats.invocations,
+            failureRate,
+            topErrorClass,
+            failureType,
+            directive: directiveFor(
+              failureType,
+              stats.toolName,
+              topErrorClass,
+              classFailures,
+              denom,
+              stats.messagesByType.get(failureType) ?? '',
+              this.minFailureRate,
+            ),
+          },
+          triggeringStats: {
+            toolName: stats.toolName,
+            failures: classFailures,
+            excludedNonActionable,
+            invocations: stats.invocations,
+            failureRatePct: Math.round(failureRate * 100),
+            topErrorClass,
+          },
+        });
+      }
     }
 
-    // Worst failure rate first (tool proposals only — the claim-mismatch
-    // proposal has no failure rate and sorts first as the highest-signal
-    // truthfulness pattern) — the orchestrator caps proposals per cycle, so
-    // the highest-signal fixes survive the cap.
     // ENG-820: rank by failure COUNT, not rate. Impact is volume x rate, and
     // ranking by rate alone hid the single largest source of failures in the
     // window (save_memory, 33 failures at 33%) behind a tool with 6 failures at
