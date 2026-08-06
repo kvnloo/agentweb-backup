@@ -21,6 +21,7 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
+import { resolvePublishAuthorized } from '../utils/schedulePublishApproval';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -1478,23 +1479,47 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 // deliberate, complete withhold from a genuine mid-run halt.
 const PUBLISH_WITHHELD_MARKER = /PUBLISH WITHHELD:\s*this schedule requires approval before publishing/i;
 
+// NOTE: this matches MODEL-AUTHORED text, so on its own it proves nothing. Callers
+// must confirm the run was actually withheld before honouring it — see the
+// publishAuthorized parameter on the classifiers below (Greptile review #20).
 export function scheduledRunWithheldPublish(content?: string): boolean {
   if (!content || typeof content !== 'string') return false;
   return PUBLISH_WITHHELD_MARKER.test(content);
+}
+
+/**
+ * ENG-803: may this run's publish-withheld marker be honoured?
+ *
+ * The marker is text the MODEL wrote, so trusting it alone re-opens the exact hole
+ * this ticket is about (Greptile review #20): an AUTHORIZED run that simply does not
+ * want to post can emit the sentence, suppress its own corrective continuation, and
+ * finish "successfully" having published nothing. That is the fabricated publishing
+ * constraint again, except this time the platform hands it a machine-readable way to
+ * escape the nudge.
+ *
+ * So the marker is only honoured when the schedule ACTUALLY withheld authorization —
+ * an explicit `false` resolved from the record. `undefined` (a caller with no
+ * schedule to read) deliberately does NOT exempt: the two failure modes are not
+ * symmetric. Refusing the exemption costs a genuinely-withheld run one extra
+ * continuation, bounded by completionGateMaxContinuations; granting it on an unknown
+ * lets any run talk its way out of a mandated publish.
+ */
+function withholdIsGenuine(content: string, publishAuthorized?: boolean): boolean {
+  return publishAuthorized === false && scheduledRunWithheldPublish(content);
 }
 
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}): ScheduledContinuationReason | null {
+}, publishAuthorized?: boolean): ScheduledContinuationReason | null {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   // ENG-803: a deliberate publish-withhold is a COMPLETE terminal state, not a halt
   // awaiting an answer. Suppress only 'confirmation' — a withheld run can still be
   // genuinely truncated or leave other work unfinished, and those must still continue.
-  if (!scheduledRunWithheldPublish(content) && scheduledRunAwaitsConfirmation(content)) return 'confirmation';
+  if (!withholdIsGenuine(content, publishAuthorized) && scheduledRunAwaitsConfirmation(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
@@ -1568,14 +1593,14 @@ export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}): Promise<ScheduledContinuationReason | null> {
+}, publishAuthorized?: boolean): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
   // ENG-803: same withhold exemption as the sync classifier above — and it must be
   // checked BEFORE the LLM judge, which would otherwise be asked to rule on text
   // that is deliberately shaped like a deferral.
-  if (!scheduledRunWithheldPublish(content) && await scheduledTurnDefersToUser(content)) return 'confirmation';
+  if (!withholdIsGenuine(content, publishAuthorized) && await scheduledTurnDefersToUser(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
@@ -1653,6 +1678,11 @@ export async function runVerifiedChat(
     // rather than dropped into a void no one will ever action. Fail-safe default
     // means a NEW headless caller is covered automatically (no drift).
     parkNotifiable?: boolean;
+    // ENG-803: this run's resolved publish authorization, read from the schedule
+    // record by the caller. Used ONLY to decide whether the model's
+    // publish-withheld marker may be believed — see withholdIsGenuine. Undefined
+    // for callers with no schedule, which never honour the marker.
+    publishAuthorized?: boolean;
     // ENG-657: tool calls already made in a PRIOR (abandoned) portion of this
     // session that this run is RESUMING. Seeded into the run's accumulated tool
     // calls so keyword/required-function verification counts the whole task, not
@@ -1684,7 +1714,8 @@ export async function runVerifiedChat(
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
-    parkNotifiable = false
+    parkNotifiable = false,
+    publishAuthorized
   } = params;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
@@ -2014,7 +2045,7 @@ export async function runVerifiedChat(
         const continuationReason = await classifyScheduledContinuationAsync({
           ...continuationResponse,
           toolCalls: allToolCalls,
-        });
+        }, publishAuthorized);
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -2269,7 +2300,7 @@ export async function runVerifiedChat(
             // (name + arguments + result), not just this turn's — an earlier attempt
             // may hold the unmatched, still-uncommitted preview.
             toolCalls: allToolCalls,
-          })
+          }, publishAuthorized)
         : null;
       if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
@@ -3066,6 +3097,9 @@ export async function runScheduledChat(
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
       fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-803: the same decision the system prompt was built from, so the
+      // publish-withheld marker is believed ONLY on a run that genuinely withheld.
+      publishAuthorized: resolvePublishAuthorized(schedule as any),
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,

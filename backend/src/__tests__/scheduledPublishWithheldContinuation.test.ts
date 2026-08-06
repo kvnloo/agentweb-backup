@@ -14,6 +14,14 @@
  * the classifier treats that marker as "complete", suppressing ONLY the
  * confirmation reason — a withheld run can still be genuinely truncated or leave
  * other work unfinished, and those must still continue.
+ *
+ * AND THE MARKER IS ONLY BELIEVED ON A RUN THAT ACTUALLY WITHHELD (review #20).
+ * The marker is text the MODEL wrote. Honouring it unconditionally would let an
+ * AUTHORIZED run that simply does not want to post emit the sentence, suppress its
+ * own corrective continuation, and finish "successfully" having published nothing —
+ * ENG-803's fabricated publishing constraint, handed a machine-readable escape
+ * hatch by the very fix meant to close it. The exemption therefore requires an
+ * explicit `publishAuthorized === false` resolved from the schedule record.
  */
 
 import {
@@ -54,10 +62,26 @@ describe('classifyScheduledContinuation — publish-withheld exemption (ENG-803)
     expect(classifyScheduledContinuation({ content: withheldReport })).toBe('confirmation');
   });
 
-  it('returns null once the run emits the withheld marker — the run is complete', () => {
+  it('returns null once a genuinely WITHHELD run emits the marker — the run is complete', () => {
+    expect(
+      classifyScheduledContinuation({ content: `${withheldReport}\n\n${MARKER}` }, false)
+    ).toBeNull();
+  });
+
+  // Greptile review #20: the marker is model-authored, so it must not be a way for a
+  // run that WAS allowed to publish to excuse itself from publishing.
+  it('IGNORES the marker on an AUTHORIZED run, so it cannot fake its way out of publishing', () => {
+    expect(
+      classifyScheduledContinuation({ content: `${withheldReport}\n\n${MARKER}` }, true)
+    ).toBe('confirmation');
+  });
+
+  it('IGNORES the marker when authorization is unknown — exemption needs an explicit false', () => {
+    // Not symmetric: refusing the exemption costs a withheld run one bounded extra
+    // continuation, while granting it on an unknown lets any run skip a mandated post.
     expect(
       classifyScheduledContinuation({ content: `${withheldReport}\n\n${MARKER}` })
-    ).toBeNull();
+    ).toBe('confirmation');
   });
 
   it('suppresses ONLY confirmation — a truncated withheld run still continues', () => {
@@ -65,7 +89,7 @@ describe('classifyScheduledContinuation — publish-withheld exemption (ENG-803)
       classifyScheduledContinuation({
         content: `${withheldReport}\n\n${MARKER}`,
         truncatedByStepBudget: true,
-      })
+      }, false)
     ).toBe('budget');
   });
 
@@ -73,7 +97,7 @@ describe('classifyScheduledContinuation — publish-withheld exemption (ENG-803)
     expect(
       classifyScheduledContinuation({
         content: `${MARKER}\n\nI did not finish the research for the remaining 2 accounts.`,
-      })
+      }, false)
     ).toBe('unfinished');
   });
 
