@@ -127,6 +127,18 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
       expect(scheduled).toContain('Reason (1) above does NOT apply to this run');
     });
 
+    it('APPROVAL-REQUIRED branch ends on the marker that stops the nudge loop', () => {
+      // Without a terminal marker the withheld run's own honest wording reads as a
+      // confirmation halt to the continuation classifier, which would nudge it to
+      // keep going on a schedule whose owner asked it not to publish. The exact
+      // string is load-bearing — scheduledRunWithheldPublish matches it.
+      expect(approvalRequired).toContain('PUBLISH WITHHELD: this schedule requires approval before publishing.');
+      expect(approvalRequired).toContain('Do NOT ask the owner a question');
+      expect(approvalRequired).toContain('do NOT phrase the ending as waiting on their confirmation');
+      // and the authorized branch must NOT carry it — it would end healthy runs early
+      expect(scheduled).not.toContain('PUBLISH WITHHELD');
+    });
+
     it('APPROVAL-REQUIRED branch is the reachable escape hatch (review #11)', () => {
       expect(approvalRequired).toContain('THIS BLOCK IS reason (1) above');
       expect(approvalRequired).toContain('Do NOT call any tool that publishes externally');

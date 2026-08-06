@@ -26,11 +26,22 @@ describe('resolvePublishAuthorized (ENG-803)', () => {
       expect(resolvePublishAuthorized({ requirePublishApproval: false })).toBe(true);
     });
 
-    it('authorizes when the schedule could not be read at all', () => {
-      // A prompt-enrichment lookup that fails must degrade to the status quo, not
-      // silently halt publishing for a schedule that works today.
-      expect(resolvePublishAuthorized(null)).toBe(true);
-      expect(resolvePublishAuthorized(undefined)).toBe(true);
+  });
+
+  describe('a missing RECORD is a different absence from a missing FIELD', () => {
+    // Greptile review #16: conflating the two let a failed schedule read publish
+    // straight past an owner who had explicitly opted out. The errors are not
+    // symmetric — a public post cannot be withdrawn, while a withhold saves the
+    // drafts and tells the owner — so an unverifiable state takes the recoverable
+    // side. This does NOT re-introduce the opt-in regression: the 897 existing rows
+    // are all "record present, field absent", which stays authorized above.
+    it('withholds when there is no schedule record at all', () => {
+      expect(resolvePublishAuthorized(null)).toBe(false);
+      expect(resolvePublishAuthorized(undefined)).toBe(false);
+    });
+
+    it('still authorizes the read-but-unset case, so no existing schedule regresses', () => {
+      expect(resolvePublishAuthorized({})).toBe(true);
     });
   });
 
@@ -94,7 +105,8 @@ describe('extractScheduleId (ENG-803)', () => {
   });
 
   it('returns null for anything that is not a scheduled identifier', () => {
-    // Every null case resolves to authorized upstream, so these are status-quo paths.
+    // A scheduled session with no parseable id is unverifiable, so the caller
+    // withholds rather than assuming — see resolveScheduledPublishAuthorized.
     expect(extractScheduleId(undefined)).toBeNull();
     expect(extractScheduleId(null)).toBeNull();
     expect(extractScheduleId('')).toBeNull();
