@@ -24,6 +24,22 @@ describe("adImageStatusService", () => {
     expect(patch.adImageResult).toBeUndefined();
   });
 
+  it("startPatch mints a per-run nonce, and a fresh one on every call (ENG-792)", () => {
+    // Ownership of the ad-image axis is decided on this nonce, so two runs
+    // must never share one — including two started inside the same
+    // millisecond, where adImageStartedAt is byte-identical.
+    const first = adImageStartPatch(now);
+    const second = adImageStartPatch(now);
+    expect(first.adImageStartedAt).toBe(second.adImageStartedAt);
+    expect(first.adImageRunId).toMatch(/^adimg_/);
+    expect(second.adImageRunId).toEqual(expect.any(String));
+    expect(first.adImageRunId).not.toBe(second.adImageRunId);
+  });
+
+  it("startPatch takes an injectable mint for deterministic tests", () => {
+    expect(adImageStartPatch(now, () => "adimg_fixed").adImageRunId).toBe("adimg_fixed");
+  });
+
   it("readyPatch returns null when not running (FAIL #1)", () => {
     const r = { variants: [variant(1)] };
     expect(adImageReadyPatch({ adImageStatus: "ready" }, r, now)).toBeNull();

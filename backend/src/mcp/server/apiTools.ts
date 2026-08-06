@@ -2026,6 +2026,224 @@ const normalizeWorkPlanSteps = (steps: any): any => {
   });
 };
 
+/**
+ * Work plan steps are stored as a whole array, so PUT /api/admin/work-plans/:id
+ * replaces every step with the payload. Callers amending a single step used to
+ * silently delete the rest (ENG-890); the helpers below add merge semantics and
+ * a fail-closed guard around destructive replacements. They all run on steps
+ * that normalizeWorkPlanSteps has already put in canonical camelCase.
+ */
+
+function normalizeStepTitle(value: unknown): string {
+  return String(value ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * The step fields worth guarding. The admin route rebuilds every step from a
+ * fixed field list and defaults these to empty (services/workPlanSteps.ts), so
+ * re-sending a step without them blanks whatever was stored — at an unchanged
+ * step count, which no length check can see.
+ */
+const STEP_CONTENT_FIELDS = [
+  'description',
+  'requiredFunctionCalls',
+  'skillIds',
+  'userInstructions',
+  'expectedAssetCount',
+] as const;
+
+function isEmptyStepValue(value: unknown): boolean {
+  return value === undefined || value === null || value === ''
+    || (Array.isArray(value) && value.length === 0);
+}
+
+/**
+ * Locate `probe`'s counterpart in `steps`. Title first, then position: a caller
+ * reordering a plan renumbers the steps but keeps their titles, so matching on
+ * stepCount first would pair up the wrong two.
+ */
+function findStepIndex(steps: any[], probe: any): number {
+  if (probe.title !== undefined) {
+    const title = normalizeStepTitle(probe.title);
+    const matches = steps.filter((s: any) => normalizeStepTitle(s.title) === title);
+    // A title shared by two steps identifies neither — fall through to position
+    // rather than pairing everything against the first one.
+    if (matches.length === 1) return steps.indexOf(matches[0]);
+  }
+  if (probe.stepCount === undefined || probe.stepCount === null) return -1;
+  return steps.findIndex((s: any) => Number(s.stepCount) === Number(probe.stepCount));
+}
+
+/**
+ * Titles in `from` with no counterpart left in `to`. Counts occurrences instead
+ * of testing set membership, so dropping one of two steps that share a title is
+ * still reported as a drop.
+ */
+function diffStepTitles(from: any[], to: any[]): any[] {
+  const available = new Map<string, number>();
+  for (const step of to) {
+    const title = normalizeStepTitle(step.title);
+    available.set(title, (available.get(title) || 0) + 1);
+  }
+  const unmatched: any[] = [];
+  for (const step of from) {
+    const title = normalizeStepTitle(step.title);
+    const remaining = available.get(title) || 0;
+    if (remaining > 0) available.set(title, remaining - 1);
+    else unmatched.push(step.title);
+  }
+  return unmatched;
+}
+
+/**
+ * Incoming merge steps that name no stepCount and whose title matches more than
+ * one existing step. Amending "whichever came first" is a silent wrong-step
+ * edit, so the caller is asked to disambiguate instead.
+ */
+function findAmbiguousMergeTargets(existingSteps: any[], incomingSteps: any[]) {
+  const ambiguous: { title: any; matchingStepCounts: any[] }[] = [];
+  for (const incoming of incomingSteps) {
+    // A stepCount only settles the target if it names a step that exists.
+    // mergeWorkPlanSteps falls back to the title otherwise, so a stale or
+    // invented count must not buy a pass through this check.
+    const named = incoming.stepCount !== undefined && incoming.stepCount !== null
+      && existingSteps.some((s: any) => Number(s.stepCount) === Number(incoming.stepCount));
+    if (named) continue;
+    if (incoming.title === undefined) continue;
+    const title = normalizeStepTitle(incoming.title);
+    const matches = existingSteps.filter((s: any) => normalizeStepTitle(s.title) === title);
+    if (matches.length > 1) {
+      ambiguous.push({ title: incoming.title, matchingStepCounts: matches.map((s: any) => s.stepCount) });
+    }
+  }
+  return ambiguous;
+}
+
+/**
+ * Two incoming entries that resolve to the same existing step. One request
+ * saying both "rename step 1" and "amend the step titled <its old name>" is a
+ * contradiction; applying them in array order silently lets the later one undo
+ * the earlier, which is the kind of quiet resolution this tool no longer does.
+ */
+function findConflictingMergeTargets(existingSteps: any[], incomingSteps: any[]) {
+  const byIndex = new Map<number, any[]>();
+  for (const { index, incoming } of resolveMergeTargets(existingSteps, incomingSteps)) {
+    if (index === -1) continue;
+    byIndex.set(index, [...(byIndex.get(index) || []), incoming]);
+  }
+  return [...byIndex.entries()]
+    .filter(([, entries]) => entries.length > 1)
+    .map(([index, entries]) => ({
+      stepCount: existingSteps[index]?.stepCount,
+      title: existingSteps[index]?.title,
+      entries: entries.length,
+    }));
+}
+
+/**
+ * Fields a replace would blank on steps the caller plainly meant to keep. A
+ * step with no counterpart at all is skipped: that is a removal or a rewrite,
+ * which the count guard and the dropped-titles diff already report.
+ */
+function findStepContentLoss(before: any[], after: any[]) {
+  const losses: { stepCount: any; title: any; fields: string[] }[] = [];
+  for (const existing of before) {
+    const index = findStepIndex(after, existing);
+    if (index === -1) continue;
+    const fields = STEP_CONTENT_FIELDS.filter(
+      (field) => !isEmptyStepValue(existing[field]) && isEmptyStepValue(after[index][field]),
+    );
+    if (fields.length > 0) {
+      losses.push({ stepCount: existing.stepCount, title: existing.title, fields: [...fields] });
+    }
+  }
+  return losses;
+}
+
+/** Apply the caller-supplied fields of `incoming` on top of an existing step. */
+function mergeWorkPlanStep(existing: any, incoming: any): any {
+  const merged = { ...existing };
+  for (const [key, value] of Object.entries(incoming)) {
+    // stepCount only selects which step to amend. Copying it through would
+    // renumber — and could duplicate — positions whenever the match came from
+    // the title instead.
+    if (key === 'stepCount') continue;
+    // A model emits null for a field it is not setting (ENG-889), so treating
+    // null as a value would blank an existing field in what is meant to be the
+    // non-destructive mode.
+    if (value === undefined || value === null) continue;
+    merged[key] = value;
+  }
+  return merged;
+}
+
+/**
+ * Resolve each incoming step to the index it amends, or -1 to append.
+ *
+ * Deliberately stepCount-before-title, the opposite of findStepIndex: here the
+ * caller has explicitly named the step to amend, and the schema says so.
+ * findStepIndex infers identity across two full arrays with no such selector.
+ *
+ * A shared title resolves to nothing rather than to the first match — the same
+ * rule findAmbiguousMergeTargets pre-checks, kept here so the two cannot drift.
+ */
+function resolveMergeTargets(existingSteps: any[], incomingSteps: any[]) {
+  return incomingSteps.map((incoming: any) => {
+    const targetCount = incoming.stepCount;
+    if (targetCount !== undefined && targetCount !== null) {
+      const byCount = existingSteps.findIndex((s: any) => Number(s.stepCount) === Number(targetCount));
+      if (byCount !== -1) return { index: byCount, incoming };
+    }
+    if (incoming.title !== undefined) {
+      const title = normalizeStepTitle(incoming.title);
+      const matches = existingSteps
+        .map((s: any, i: number) => ({ s, i }))
+        .filter(({ s }: any) => normalizeStepTitle(s.title) === title);
+      if (matches.length === 1) return { index: matches[0].i, incoming };
+    }
+    return { index: -1, incoming };
+  });
+}
+
+/**
+ * Merge partial steps into the plan's current steps. Never removes a step.
+ *
+ * Targets are resolved for ALL entries first, against the plan as it was read.
+ * Resolving during application would read a half-mutated array, so one request
+ * could rename a step and then fail to find it for a later, already-validated
+ * entry — turning an amendment into an append, and making the result depend on
+ * the order the entries happened to arrive in. Resolution and the ambiguity
+ * pre-check now share one frame of reference.
+ */
+function mergeWorkPlanSteps(existingSteps: any[], incomingSteps: any[]): any[] {
+  const merged = existingSteps.map((s: any) => ({ ...s }));
+
+  for (const { index, incoming } of resolveMergeTargets(existingSteps, incomingSteps)) {
+    if (index === -1) {
+      merged.push(mergeWorkPlanStep({ stepCount: merged.length + 1 }, incoming));
+    } else {
+      merged[index] = mergeWorkPlanStep(merged[index], incoming);
+    }
+  }
+
+  return merged;
+}
+
+/** Diff summary returned to the caller so step removals can never go unnoticed. */
+function summarizeStepChange(before: any[], after: any[], mode: 'merge' | 'replace') {
+  const contentLoss = findStepContentLoss(before, after);
+  return {
+    mode,
+    stepsBefore: before.length,
+    stepsAfter: after.length,
+    stepsRemoved: Math.max(0, before.length - after.length),
+    droppedStepTitles: diffStepTitles(before, after),
+    addedStepTitles: diffStepTitles(after, before),
+    // Omitted rather than empty so a clean update's summary stays quiet.
+    ...(contentLoss.length > 0 && { stepContentLoss: contentLoss }),
+  };
+}
+
 mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
@@ -2056,7 +2274,7 @@ mcpToolRegistry.register({
   name: 'manage_predefined_work_plan',
   definition: {
     name: 'manage_predefined_work_plan',
-    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes.',
+    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes. STEPS ARE DESTRUCTIVE ON UPDATE: sending "steps" with action=update replaces the entire steps array, it does not patch individual steps. To amend one step without touching the others, pass steps_mode="merge" with just the step(s) you are changing. To intentionally rewrite the plan with fewer steps, send the complete new array plus confirm_step_removal=true. A replace stores exactly what you send, so a field you omit on a step is erased too — an update that would drop steps, or blank fields on the steps it keeps, is rejected unless confirmed. Every step change comes back as a stepsChange diff summary.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2085,12 +2303,21 @@ mcpToolRegistry.register({
               requiredFunctionCalls: { type: 'array', items: { type: 'string' }, description: 'Tool names the step must call before it can complete. Note the camelCase name; the snake_case alias required_function_calls is also accepted.' },
               skillIds: { type: 'array', items: { type: 'string' }, description: 'Skill IDs attached to this step (from list_skills / resolve_skill). Alias: skill_ids.' },
               userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
-              stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. Alias: step_count.' },
+              stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. In steps_mode="merge" this is what selects the existing step to amend. Alias: step_count.' },
               expectedAssetCount: { type: 'number', description: 'For a step that must produce a fixed number of media assets (e.g. "generate 18 images"), the required count. The step cannot be marked completed until that many images/videos have been generated in the run, which stops it being closed with only some produced. Note the count is per run, not per step: assets generated by earlier steps of the same run also count towards it. Omit for steps with no fixed asset count. Alias: expected_asset_count.' }
             },
             required: ['title']
           },
-          description: 'Work plan steps (create/update). Step fields are camelCase (unlike the snake_case top-level parameters); snake_case aliases are accepted too. Any field outside this list is not stored — the response lists such fields under "warnings".'
+          description: 'Work plan steps. On create this is the full plan. On update this REPLACES the entire steps array unless steps_mode="merge". Step fields are camelCase (unlike the snake_case top-level parameters); snake_case aliases are accepted too. Any field outside this list is not stored — the response lists such fields under "warnings".'
+        },
+        steps_mode: {
+          type: 'string',
+          enum: ['replace', 'merge'],
+          description: 'How to apply "steps" on update. "replace" (default) overwrites the whole array. "merge" patches the supplied steps into the existing plan by stepCount (or title) and appends unmatched ones, leaving every other step intact. In "merge", send ONLY the fields you are actually changing on each step, plus stepCount to say which step you mean: every field you include is applied, so passing a title you did not mean to change RENAMES that step. Do not fill in placeholder values for fields you are leaving alone.'
+        },
+        confirm_step_removal: {
+          type: 'boolean',
+          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
         }
       },
       required: ['action']
@@ -2113,7 +2340,9 @@ mcpToolRegistry.register({
         return jsonResult(data);
       }
       case 'update': {
-        const body: any = { title: args.title, steps: normalizeWorkPlanSteps(args.steps) };
+        // `steps` is deliberately not set here — it is only ever assigned below,
+        // after the current plan has been read (ENG-890).
+        const body: any = { title: args.title };
         if (args.description !== undefined) body.description = args.description;
         if (args.welcome_message !== undefined) body.welcomeMessage = args.welcome_message;
         if (args.autocomplete !== undefined) body.autocomplete = args.autocomplete;
@@ -2122,7 +2351,113 @@ mcpToolRegistry.register({
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
         if (args.category !== undefined) body.category = args.category;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+
+        // Steps replace the whole array server-side, so read the current plan
+        // first and either merge into it or refuse an unconfirmed shrink.
+        let stepsChange: ReturnType<typeof summarizeStepChange> | undefined;
+        if (args.steps !== undefined) {
+          if (!Array.isArray(args.steps)) {
+            return jsonResult({ error: 'steps must be an array of step objects' });
+          }
+          const mode: 'merge' | 'replace' = args.steps_mode === 'merge' ? 'merge' : 'replace';
+          // Canonicalize the casing once, up front, so the merge matcher and the
+          // replace payload both see the same camelCase fields the route reads
+          // (ENG-889). Merging raw aliases would drop them on the stored step.
+          const incomingSteps: any[] = normalizeWorkPlanSteps(args.steps);
+
+          let existingSteps: any[] | undefined;
+          try {
+            const current = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
+            existingSteps = Array.isArray(current?.steps) ? current.steps : [];
+            // Stake the read: everything below is judged against these steps, so
+            // a write that lands in between has to fail rather than quietly make
+            // that judgement wrong (ENG-890).
+            body.expectedStepsRev = current?.steps_rev ?? null;
+          } catch (error: any) {
+            // Fail closed in both modes: without the current steps we can
+            // neither merge nor tell whether a replace would delete steps, and
+            // writing blind is exactly the silent deletion this guards against.
+            return jsonResult({ error: `Cannot safely update work plan ${args.plan_id}: failed to read its current steps (${error?.message || error}). Retry, or re-send with the full steps array once the plan is readable.` });
+          }
+
+          if (mode === 'merge') {
+            const ambiguous = findAmbiguousMergeTargets(existingSteps || [], incomingSteps);
+            if (ambiguous.length > 0) {
+              return jsonResult({
+                error: `Refusing to merge into work plan ${args.plan_id}: ${ambiguous.length === 1 ? 'a step title matches' : 'some step titles match'} more than one step, so there is no way to tell which one to amend.`,
+                ambiguousSteps: ambiguous,
+                howToProceed: [
+                  'Retry with stepCount on each ambiguous step to name the one you mean (call action="get" to see the current numbering).',
+                ],
+              });
+            }
+            const conflicting = findConflictingMergeTargets(existingSteps || [], incomingSteps);
+            if (conflicting.length > 0) {
+              return jsonResult({
+                error: `Refusing to merge into work plan ${args.plan_id}: more than one supplied step resolves to the same existing step, so they would silently overwrite each other.`,
+                conflictingSteps: conflicting,
+                howToProceed: [
+                  'Combine the changes for each step into a single entry, then retry.',
+                ],
+              });
+            }
+            body.steps = mergeWorkPlanSteps(existingSteps || [], incomingSteps);
+          } else {
+            body.steps = incomingSteps;
+            if (existingSteps && body.steps.length < existingSteps.length && args.confirm_step_removal !== true) {
+              const preview = summarizeStepChange(existingSteps, body.steps, 'replace');
+              return jsonResult({
+                error: `Refusing to update work plan ${args.plan_id}: action=update replaces the entire steps array, and this payload would take the plan from ${preview.stepsBefore} steps to ${preview.stepsAfter}, removing ${preview.stepsRemoved}.`,
+                stepsWouldBeRemoved: preview.stepsRemoved,
+                removedStepTitles: preview.droppedStepTitles,
+                howToProceed: [
+                  'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+                  'To intentionally rewrite the plan with fewer steps, retry with confirm_step_removal=true (send the complete new steps array).',
+                ],
+              });
+            }
+
+            // Same failure, one level down: the step count is untouched but the
+            // steps come back gutted, which is what happens when a caller
+            // re-types the array from memory as title+description.
+            const contentLoss = findStepContentLoss(existingSteps || [], body.steps);
+            if (contentLoss.length > 0 && args.confirm_step_removal !== true) {
+              return jsonResult({
+                error: `Refusing to update work plan ${args.plan_id}: this payload keeps the steps but would blank fields that are currently set on ${contentLoss.length} of them. A replace stores exactly what you send, so any field you omit is erased.`,
+                stepsWouldBeRemoved: 0,
+                stepContentLoss: contentLoss,
+                howToProceed: [
+                  'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+                  'To keep these steps as they are, re-send each one with its current fields (call action="get" first if you no longer have them).',
+                  'To intentionally clear them, retry with confirm_step_removal=true.',
+                ],
+              });
+            }
+          }
+          if (existingSteps) {
+            stepsChange = summarizeStepChange(existingSteps, body.steps, mode);
+          }
+        }
+
+        let data: any;
+        try {
+          data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+        } catch (error: any) {
+          // The stake above was rejected. Nothing was written, and a blind retry
+          // would re-send a payload built from steps that no longer exist.
+          if (String(error?.message || '').includes('409')) {
+            return jsonResult({
+              error: `Work plan ${args.plan_id} changed while this update was being prepared, so nothing was saved.`,
+              howToProceed: [
+                'Re-read the plan with action="get" and retry the change against its current steps.',
+              ],
+            });
+          }
+          throw error;
+        }
+        if (stepsChange && data && typeof data === 'object' && !Array.isArray(data)) {
+          return jsonResult({ ...data, stepsChange });
+        }
         return jsonResult(data);
       }
       case 'delete': {

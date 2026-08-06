@@ -18,6 +18,7 @@ import {
   videoGenerationCostUsd,
   __resetUnknownModelWarnsForTests,
 } from '../utils/llmPricing';
+import { BEDROCK_EXTENDED_CACHE_TTL_MODELS } from '../utils/bedrockInferenceProfiles';
 
 function parseLlmModelsRegistryKeys(): string[] {
   const srcPath = path.join(__dirname, '..', 'services', 'agentModeService.ts');
@@ -188,6 +189,18 @@ describe('llmPricing', () => {
         expect(price.cacheReadPerM).toBeCloseTo(price.inPerM * 0.1, 10);
         expect(price.cacheWritePerM).toBeCloseTo(price.inPerM * 1.25, 10);
         expect(model).toBeTruthy();
+      }
+    });
+
+    it('keeps extended-TTL models on the declared 1.25x rate (ENG-893)', () => {
+      // The 1-hour (2x) rate is applied from the response's TTL breakdown, not
+      // from the price book — see cacheWriteCost. Declaring 2x here would
+      // over-bill every non-agent-mode caller of the same model id.
+      expect(BEDROCK_EXTENDED_CACHE_TTL_MODELS.size).toBeGreaterThan(0);
+      for (const model of BEDROCK_EXTENDED_CACHE_TTL_MODELS) {
+        const price = getModelPrice(model);
+        expect(price).not.toBeNull();
+        expect(price!.cacheWritePerM).toBeCloseTo(price!.inPerM * 1.25, 10);
       }
     });
 

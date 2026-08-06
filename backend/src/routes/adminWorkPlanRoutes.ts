@@ -108,6 +108,12 @@ router.put("/:planId", async (req, res) => {
     if (steps !== undefined && !Array.isArray(steps)) {
       return res.status(400).json({ message: "steps must be an array" });
     }
+    // A caller that decided this write was safe by reading the plan first can
+    // stake the revision it saw. `null` is a real value here ("the plan had no
+    // revision"), so presence of the key is what counts (ENG-890).
+    const stake = "expectedStepsRev" in req.body
+      ? { expectedStepsRev: req.body.expectedStepsRev }
+      : {};
     const normalized = steps !== undefined ? normalizeWorkPlanSteps(steps) : undefined;
     const normalizedSteps = normalized?.steps;
     const warnings = normalized?.warnings ?? [];
@@ -125,9 +131,18 @@ router.put("/:planId", async (req, res) => {
       ...(category !== undefined && { category }),
       ...(visibility !== undefined && { visibility }),
     };
-    await workPlanService.updateWorkPlan(updated);
-    res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
+    // `updated` was built by spreading the plan we read, so it carries the
+    // pre-write revision. Answer with the one the write produced.
+    const steps_rev = await workPlanService.updateWorkPlan(updated, stake);
+    const saved = { ...updated, steps_rev };
+    res.json(warnings.length > 0 ? { ...saved, warnings } : saved);
   } catch (error: any) {
+    // A competing write landed between the caller's read and this one, so the
+    // payload was judged against steps that no longer exist. Retryable, unlike
+    // the 404 below — hence a distinct status (ENG-890).
+    if (error?.message === "Work plan steps changed") {
+      return res.status(409).json({ message: "Work plan changed since it was read — re-read it and retry" });
+    }
     // The plan was deleted between the read above and the write.
     if (error?.message === "Work plan not found") {
       return res.status(404).json({ message: "Work plan not found" });
@@ -157,6 +172,9 @@ router.post("/:planId/approve", async (req, res) => {
     const plan = await workPlanService.approveWorkPlan(req.params.planId);
     res.json(plan);
   } catch (error: any) {
+    if (error.message === 'Work plan steps changed') {
+      return res.status(409).json({ message: "Work plan changed since it was read — re-read it and retry" });
+    }
     if (error.message === 'Work plan not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Plan is not pending review') return res.status(400).json({ message: error.message });
     console.error("Error approving work plan:", error);
@@ -173,6 +191,9 @@ router.post("/:planId/reject", async (req, res) => {
     const plan = await workPlanService.rejectWorkPlan(req.params.planId, feedback);
     res.json(plan);
   } catch (error: any) {
+    if (error.message === 'Work plan steps changed') {
+      return res.status(409).json({ message: "Work plan changed since it was read — re-read it and retry" });
+    }
     if (error.message === 'Work plan not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Plan is not pending review') return res.status(400).json({ message: error.message });
     console.error("Error rejecting work plan:", error);

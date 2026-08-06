@@ -11,7 +11,7 @@
  *    tokens are still counted.
  */
 
-import { getModelPrice } from "../utils/llmPricing";
+import { getModelPrice, cacheWriteCost, CacheWriteByTtl } from "../utils/llmPricing";
 import { usageRecordDb, CostSource } from "./usageRecordDb";
 // tokenUsageService is lazy-required inside meterUserUsage (not statically imported):
 // it pulls in db.ts -> config/aws.ts, and usageRecorderService is imported very widely
@@ -30,6 +30,8 @@ export interface RecordUsageContext {
   outputTokens: number;
   cacheReadTokens?: number;
   cacheWriteTokens?: number;
+  /** ENG-893: cache-write tokens split by the TTL Bedrock applied, when reported. */
+  cacheWriteByTtl?: CacheWriteByTtl;
   sessionId?: string;
   taskId?: string;
   /**
@@ -92,17 +94,18 @@ export function computeCostMicroUsd(
   inputTokens: number,
   outputTokens: number,
   cacheReadTokens: number = 0,
-  cacheWriteTokens: number = 0
+  cacheWriteTokens: number = 0,
+  /** ENG-893: per-TTL cache-write split from Bedrock's `usage.cacheDetails`. */
+  cacheWriteByTtl?: CacheWriteByTtl
 ): number {
   const price = getModelPrice(model);
   if (!price) return 0;
   const cacheReadPerM = price.cacheReadPerM ?? price.inPerM * 0.1;
-  const cacheWritePerM = price.cacheWritePerM ?? price.inPerM * 1.25;
   return Math.round(
     inputTokens * price.inPerM +
       outputTokens * price.outPerM +
       cacheReadTokens * cacheReadPerM +
-      cacheWriteTokens * cacheWritePerM
+      cacheWriteCost(price, cacheWriteTokens, cacheWriteByTtl)
   );
 }
 
@@ -130,7 +133,8 @@ export async function recordUsage(ctx: RecordUsageContext): Promise<void> {
             inputTokens,
             outputTokens,
             cacheReadTokens,
-            cacheWriteTokens
+            cacheWriteTokens,
+            ctx.cacheWriteByTtl
           );
 
     await usageRecordDb.incrementUsage({
@@ -229,8 +233,14 @@ export function meterUserUsage(ctx: RecordUsageContext): void {
   const costUsd =
     ctx.costUsdOverride != null
       ? Math.max(0, ctx.costUsdOverride)
-      : computeCostMicroUsd(ctx.model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens) /
-        1e6;
+      : computeCostMicroUsd(
+          ctx.model,
+          inputTokens,
+          outputTokens,
+          cacheReadTokens,
+          cacheWriteTokens,
+          ctx.cacheWriteByTtl
+        ) / 1e6;
 
   if (totalTokens <= 0 && costUsd <= 0) return;
 

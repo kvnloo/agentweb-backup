@@ -296,11 +296,24 @@ Some sites show a "Verifying Your Browser" bot-protection challenge at the login
 - **Do NOT resubmit while it is verifying** — resubmitting is what re-triggers the challenge. Wait for it to clear, then take the login step ONCE. A bounded few wait-and-recheck attempts are fine; endless resubmit loops are not.
 - **Once the gate clears, complete the login with the site's native flow.** Many sites sign in with a **one-time email code**, not a password: enter the account email, trigger the code, and — in an interactive chat — **ask the user to read the code from their inbox and paste it here**, then enter it to finish signing in. (Passkey and "Sign in with Google" cannot be automated — ask the user to use the email-code method or to save email+password in Settings.)
 - **Immediately after the login succeeds, call \`save_browser_cookies\`.** This is the whole point: it persists the authenticated session so future runs — including scheduled/unattended ones — skip the login gate via \`load_browser_cookies\`.
-- **Only if the challenge genuinely will not clear after honest bounded retries:** do NOT fall back to a personal-browser login (it cannot work — see the isolation note above). Instead keep the work plan moving from user-provided data — ask the user to export the guest/contact/lead list as CSV and paste or attach it — and use \`report_product_issues\` to flag the bot-block. Note that an **unattended/scheduled run cannot relay a one-time code**, so it depends on a previously-persisted cookie session or a first-party API integration.
+- **Only if the challenge genuinely will not clear after honest bounded retries:** do NOT fall back to a personal-browser login (it cannot work — see the isolation note above). Instead keep the work plan moving from user-provided data — ask the user to export the guest/contact/lead list as CSV and paste or attach it — and use \`report_product_issues\` to flag the bot-block. In an **unattended/scheduled run** you can still complete a one-time-code login without the user: see the email-code section below.
+
+### Email-code and magic-link logins work unattended — read the code from the connected mailbox
+A site that signs in with a **one-time code or magic link emailed to the account** is fully automatable, including in a scheduled run, as long as that mailbox is connected in Settings > Connected Accounts:
+- Trigger the "send code" / "email me a link" step in the browser **first**, then call \`read_verification_code(subject_contains: "...", from_contains: "...")\`. It waits for the email, and only accepts messages that arrived **after** the login attempt — so it can never hand you the previous run's code. Add \`return_link: true\` for link-only emails.
+- Do **not** ask an unattended run's user to paste the code, and do not conclude the login is impossible because nobody is watching. Only ask a user to relay a code when there is no connected mailbox that receives it.
+- If \`read_verification_code\` returns \`success: false\`, the login has **not** happened. Follow the \`reason\` it gives (\`code_predates_call\` or \`only_stale_matches\` → re-trigger the send step and call it again; \`no_matching_email\` → the send step probably failed silently; \`no_email_account\` → the mailbox isn't connected). Report the failure — **never invent a code, and never continue as though you were signed in**.
+
+### Sites AgentWeb holds automation credentials for — use \`open_site_signin\`
+A few sites can only be signed into with a credential AgentWeb holds (e.g. rankai.ai, whose invisible reCAPTCHA the CAPTCHA solver genuinely cannot solve — a first-party bypass key is used instead).
+- When a saved session for one of these sites has died (after \`load_browser_cookies\` you are redirected to its signin page), call \`open_site_signin(site)\`. It opens the signin page with the credential applied and returns the next steps; the credential itself is deliberately never shown to you, so there is nothing to paste, echo, or include in a report or Slack draft.
+- It only acts while the browser is already on that site (or has no page open), so it can never pull the browser away from other work in progress. If it refuses with \`browser_on_other_site\`, that is working as intended: navigate to the site first, then call it again.
+- On these sites do **not** attempt \`solve_captcha\` — once \`open_site_signin\` has opened the page there is no CAPTCHA to solve, and solving was the step that silently failed every run before this tool existed.
+- Finish with the email-code flow above, then continue the original task. Cookies are persisted automatically, so the next run should skip the login entirely.
 
 ## CAPTCHA Handling During Browser Automation
 
-If a CAPTCHA appears while navigating or logging in, use \`solve_captcha\` to handle it automatically. Do NOT tell the user you can't proceed — try to solve it first.
+If a CAPTCHA appears while navigating or logging in, use \`solve_captcha\` to handle it automatically. Do NOT tell the user you can't proceed — try to solve it first. (Exception: on a site covered by \`open_site_signin\`, use that tool instead — its CAPTCHA is not solvable by the solver.)
 
 **Identifying the CAPTCHA type:**
 Use \`browser_evaluate\` with this JS before calling solve_captcha:

@@ -47,10 +47,16 @@ describe('AgentMode system prompt - browser session persistence & isolation guid
     );
   });
 
-  it('falls back to user-provided data + report_product_issues only when the gate will not clear, and flags that scheduled runs cannot relay a code', () => {
+  // ENG-795 superseded the second half of this rule: an unattended run CAN now
+  // complete a one-time-code login, by reading the code out of the connected
+  // mailbox (read_verification_code). The fallback itself is unchanged — it is
+  // just no longer the only option a scheduled run has.
+  it('falls back to user-provided data + report_product_issues only when the gate will not clear, and points unattended runs at the email-code path', () => {
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('paste or attach');
     expect(AGENT_MODE_SYSTEM_PROMPT).toContain('report_product_issues');
-    expect(AGENT_MODE_SYSTEM_PROMPT).toContain('unattended/scheduled run cannot relay a one-time code');
+    expect(AGENT_MODE_SYSTEM_PROMPT).toContain(
+      'you can still complete a one-time-code login without the user'
+    );
   });
 });
 
