@@ -76,7 +76,13 @@ interface ToolStats {
   failures: number;
   errorClasses: Map<string, number>;
   failureTypes: Map<string, number>;
-  sampleMessage: string;
+  /**
+   * A representative error message PER failure class. Keyed by class on purpose
+   * (ENG-820 review): a tool with mixed classes would otherwise quote whichever
+   * message arrived first, so a `config` directive could cite a `bug` message
+   * and send the operator to reconnect an account over a TypeError.
+   */
+  messagesByType: Map<string, string>;
 }
 
 /**
@@ -169,7 +175,7 @@ export class AgentFailureRuleSet
         failures: 0,
         errorClasses: new Map<string, number>(),
         failureTypes: new Map<string, number>(),
-        sampleMessage: '',
+        messagesByType: new Map<string, string>(),
       };
       if (e.eventType === EVT_TOOL_INVOKED) {
         stats.invocations++;
@@ -180,7 +186,9 @@ export class AgentFailureRuleSet
         const ft = strDim(e.dimensions?.failureType) || '';
         if (ft) stats.failureTypes.set(ft, (stats.failureTypes.get(ft) ?? 0) + 1);
         const em = strDim(e.dimensions?.errorMessage) || '';
-        if (em && !stats.sampleMessage) stats.sampleMessage = em;
+        // Store under this event's OWN class, so the directive can quote a
+        // message that actually belongs to the class it is advising on.
+        if (em && !stats.messagesByType.has(ft)) stats.messagesByType.set(ft, em);
       }
       byTool.set(toolName, stats);
     }
@@ -255,7 +263,7 @@ export class AgentFailureRuleSet
             topErrorClass,
             stats.failures,
             denom,
-            stats.sampleMessage,
+            stats.messagesByType.get(failureType) ?? '',
             this.minFailureRate,
           ),
         },

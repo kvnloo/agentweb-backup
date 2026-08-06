@@ -165,7 +165,14 @@ const agentModeDigestTemplate: LoopDigestTemplate<number> = {
   counts: (result) => {
     // ENG-820: never render a capped slice as if it were the whole set.
     const truncated = (result as { proposalsTruncated?: number }).proposalsTruncated ?? 0;
-    const shown = result.proposals.length;
+    // Count TOOL proposals only. The claim-mismatch proposal is a whole-run
+    // verdict, not a failing tool, and counting it made both numbers wrong
+    // (ENG-820 review). It also always survives the cap — it carries no
+    // `failures` and so sorts first — which is why every truncated proposal is
+    // a tool proposal and this arithmetic holds.
+    const shown = result.proposals.filter(
+      (p) => typeof (p.payload as { toolName?: unknown })?.toolName === 'string',
+    ).length;
     const failing = truncated > 0
       ? `Failing tools: showing ${shown} of ${shown + truncated}`
       : `Failing tools: ${shown}`;

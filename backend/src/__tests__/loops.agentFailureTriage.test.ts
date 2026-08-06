@@ -186,7 +186,12 @@ describe('ENG-820 — the digest states truncation', () => {
     const { _internal } = require('../loops/instances/agent-mode/index');
     return _internal.digestTemplate().counts({
       eventsScanned: 100,
-      proposals: new Array(shown).fill({}),
+      // Real tool-proposal shape. The earlier fixture used bare `{}`, which is
+      // not what the policy emits — and once the digest started counting tool
+      // proposals specifically, that placeholder silently counted as zero.
+      proposals: Array.from({ length: shown }, (_, i) => ({
+        payload: { toolName: `tool_${i}`, failures: shown - i },
+      })),
       proposalsTruncated: truncated,
     });
   };
@@ -205,8 +210,82 @@ describe('ENG-820 — the digest states truncation', () => {
     const { _internal } = require('../loops/instances/agent-mode/index');
     const line = _internal.digestTemplate().counts({
       eventsScanned: 5,
-      proposals: [{}],
+      proposals: [{ payload: { toolName: 'only_tool', failures: 4 } }],
     });
     expect(line).toContain('Failing tools: 1');
+  });
+});
+
+/**
+ * Greptile review findings on the first cut of this change. Both were real, and
+ * both are the kind that make a digest actively misleading rather than merely
+ * noisy — which is worse than the problem being fixed.
+ */
+describe('ENG-820 — mixed classes and non-tool proposals', () => {
+  const rules = () => new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2 });
+
+  it('quotes a message from the SAME class the directive advises on', async () => {
+    // Mixed classes, minority class first. Before the fix the representative
+    // message stayed pinned to whichever failure arrived first, so a `config`
+    // directive could quote a TypeError and send someone to reconnect an
+    // account over a code bug.
+    const events = [
+      ...toolEvents('mixed_tool', 30, 2, 'bug', 'Error', 'TypeError: cannot read property'),
+      ...toolEvents('mixed_tool', 0, 12, 'config', 'auth', 'credits depleted — top up required'),
+    ];
+
+    const proposals = await rules().evaluate(events, WINDOW);
+    const p: any = payloads(proposals).find((x: any) => x.toolName === 'mixed_tool');
+
+    expect(p.failureType).toBe('config');
+    expect(p.directive).toContain('credits depleted');
+    expect(p.directive).not.toContain('TypeError');
+  });
+
+  it('omits the quote entirely rather than borrowing one from another class', async () => {
+    // If the dominant class has no message of its own, quoting a different
+    // class's message would be worse than saying nothing.
+    const events = [
+      ...toolEvents('quiet_tool', 30, 2, 'bug', 'Error', 'TypeError: boom'),
+      ...toolEvents('quiet_tool', 0, 12, 'config', 'auth', ''),
+    ];
+
+    const proposals = await rules().evaluate(events, WINDOW);
+    const p: any = payloads(proposals).find((x: any) => x.toolName === 'quiet_tool');
+
+    expect(p.failureType).toBe('config');
+    expect(p.directive).not.toContain('TypeError');
+  });
+
+  it('the digest counts failing TOOLS, not every proposal', async () => {
+    // A claim-mismatch proposal is a whole-run verdict, not a failing tool.
+    // Counting it reported "showing 8 of 9" when only 8 tools existed.
+    const { _internal } = require('../loops/instances/agent-mode/index');
+    const line = _internal.digestTemplate().counts({
+      eventsScanned: 100,
+      proposals: [
+        { payload: { occurrences: 4, sessionIds: [], directive: 'x' } }, // claim mismatch
+        { payload: { toolName: 'a', failures: 9 } },
+        { payload: { toolName: 'b', failures: 4 } },
+      ],
+      proposalsTruncated: 0,
+    });
+
+    expect(line).toContain('Failing tools: 2');
+  });
+
+  it('states the tool total correctly when the cap truncated', () => {
+    const { _internal } = require('../loops/instances/agent-mode/index');
+    const line = _internal.digestTemplate().counts({
+      eventsScanned: 100,
+      proposals: [
+        { payload: { occurrences: 4, sessionIds: [], directive: 'x' } },
+        ...Array.from({ length: 8 }, (_, i) => ({ payload: { toolName: `t${i}`, failures: 9 - i } })),
+      ],
+      proposalsTruncated: 5,
+    });
+
+    // 8 tools shown, 5 dropped — 13 tools, not 14.
+    expect(line).toContain('showing 8 of 13');
   });
 });
