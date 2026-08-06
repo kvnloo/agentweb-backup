@@ -153,9 +153,19 @@ router.put("/:planId", async (req, res) => {
       ...(showLoginSignup !== undefined && { showLoginSignup }),
       ...(defaultModel !== undefined && { defaultModel }),
     };
-    await workPlanService.updateWorkPlan(updated);
-    res.json(warnings.length > 0 ? { ...updated, warnings } : updated);
+    // Same stake as the admin PUT: `null` means "the plan I read had no
+    // revision", so presence of the key is what counts (ENG-890).
+    const stake = "expectedStepsRev" in req.body
+      ? { expectedStepsRev: req.body.expectedStepsRev }
+      : {};
+    const steps_rev = await workPlanService.updateWorkPlan(updated, stake);
+    const saved = { ...updated, steps_rev };
+    res.json(warnings.length > 0 ? { ...saved, warnings } : saved);
   } catch (error: any) {
+    // A competing write landed between the caller's read and this one.
+    if (error?.message === "Work plan steps changed") {
+      return res.status(409).json({ message: "Work plan changed since it was read — re-read it and retry" });
+    }
     // The plan was deleted between the read above and the write.
     if (error?.message === "Work plan not found") {
       return res.status(404).json({ message: "Work plan not found" });
@@ -207,6 +217,9 @@ router.post("/:planId/submit-for-review", async (req, res) => {
 
     res.json(plan);
   } catch (error: any) {
+    if (error.message === 'Work plan steps changed') {
+      return res.status(409).json({ message: "Work plan changed since it was read — re-read it and retry" });
+    }
     if (error.message === 'Work plan not found') return res.status(404).json({ message: error.message });
     if (error.message === 'Not authorized') return res.status(403).json({ message: error.message });
     if (error.message === 'Only private plans can be submitted for review') return res.status(400).json({ message: error.message });

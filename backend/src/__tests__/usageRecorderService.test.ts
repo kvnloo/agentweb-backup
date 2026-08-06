@@ -258,6 +258,22 @@ describe('usageRecorderService', () => {
       ).toBe(Math.round(1000 * 0.5 + 1000 * 6.25));
     });
 
+    it('prices cache writes from the TTL Bedrock applied, not the model default (ENG-893)', () => {
+      // Opus 5 declares the DEFAULT 5-minute rate ($6.25/M). The 1-hour rate
+      // ($10/M) is earned only by a response that says `ttl: '1h'`, so cost
+      // tracks what Bedrock actually served rather than what we asked for.
+      expect(
+        computeCostMicroUsd('anthropic.claude-opus-5', 0, 0, 0, 1000, { '1h': 1000 })
+      ).toBe(Math.round(1000 * 10));
+      expect(
+        computeCostMicroUsd('anthropic.claude-opus-5', 0, 0, 0, 1000, { '5m': 1000 })
+      ).toBe(Math.round(1000 * 6.25));
+      // No breakdown → the declared DEFAULT-TTL rate, i.e. today's behaviour.
+      expect(computeCostMicroUsd('anthropic.claude-opus-5', 0, 0, 0, 1000)).toBe(
+        Math.round(1000 * 6.25)
+      );
+    });
+
     it('prices the deep-research agents (so their per-run cost is counted, not 0)', () => {
       // ENG-207: verified — Deep Research runs on Gemini 3.1 Pro rates: in $2/M, out $12/M.
       expect(computeCostMicroUsd('deep-research-preview-04-2026', 1_000_000, 100_000)).toBe(
