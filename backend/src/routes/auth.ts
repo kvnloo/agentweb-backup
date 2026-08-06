@@ -11,6 +11,7 @@ import { ChatbotDB } from '../services/chatbotService';
 import * as authController from '../controllers/auth';
 import rateLimit from 'express-rate-limit';
 import { resolveAnalyticsConfig, resolveConfigTarget } from '../services/analyticsConfigResolver';
+import { resolveOrgProfileField } from '../services/orgProfileResolver';
 
 const router = express.Router();
 
@@ -168,7 +169,11 @@ router.get('/me', authenticateToken, async (req, res) => {
       response.orgId = org.orgId;
       response.orgName = org.name;
       response.orgRole = user.orgRole;
-      response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
+      // Org-level brand, falling back to the owner's record when the org was
+      // created without copying the profile over — otherwise the owner is
+      // pushed back into brand onboarding the moment they create an org (ENG-927).
+      const orgBrand = await resolveOrgProfileField(user, org, 'brandGuidelines');
+      response.hasBrandGuidelines = !!(orgBrand?.brandData?.brandName);
       // Merge org-level and user-level Drive folders so legacy user-record folders
       // (added before the org feature) continue to appear in the UI without migration.
       const orgFolders: Array<{ folderId: string; name: string }> =

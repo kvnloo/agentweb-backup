@@ -2241,7 +2241,10 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
       let marketStrategy: any = user?.marketStrategy;
       if (user?.orgId) {
         const org: any = await orgDb.getOrgById(user.orgId);
-        if (org) marketStrategy = org.marketStrategy;
+        if (org) {
+          const { resolveOrgProfileField } = await import('../services/orgProfileResolver');
+          marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
+        }
       }
       const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
       if (marketIcp.length > 0) {

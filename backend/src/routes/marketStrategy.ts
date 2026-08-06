@@ -3,6 +3,7 @@ import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { DynamoDB } from "aws-sdk";
 import { userDb, orgDb } from "../services/db";
 import { canEditItem } from "../services/orgShareService";
+import { resolveOrgProfileField } from "../services/orgProfileResolver";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -53,13 +54,15 @@ router.get("/", authenticateToken, async (req, res) => {
     const user = users[0];
     console.log(`[MARKET STRATEGY DEBUG] Found user: ${user.email}`);
 
-    // If user is in an org, always read market strategy from the org (not the user)
+    // If user is in an org, read market strategy from the org — falling back to
+    // the org owner's user record when the org was created without copying the
+    // owner's profile over, so the page does not silently go blank (ENG-927).
     let marketStrategy = user.marketStrategy;
     let isOrgLevel = false;
     if (user.orgId) {
       const org = await orgDb.getOrgById(user.orgId);
       if (org) {
-        marketStrategy = org.marketStrategy;
+        marketStrategy = await resolveOrgProfileField(user, org, "marketStrategy");
         isOrgLevel = true;
       }
     }
@@ -155,7 +158,11 @@ router.post("/", authenticateToken, async (req, res) => {
       }
 
       if (org) {
-        existingSource = org.marketStrategy || null;
+        // Merge onto the org's strategy, or the owner's when the org record was
+        // never populated — otherwise a partial save wipes the fields the caller
+        // did not touch (ENG-927).
+        existingSource =
+          (await resolveOrgProfileField(user, org, "marketStrategy")) || null;
       }
 
       const existingMarketStrategyMerged = existingSource || {

@@ -12,6 +12,7 @@ import {
   logCompletionMetric,
 } from "../services/brandBuildStatusService";
 import { canEditItem } from "../services/orgShareService";
+import { resolveOrgProfileField } from "../services/orgProfileResolver";
 
 const router = Router();
 const dynamodb = new DynamoDB.DocumentClient();
@@ -87,13 +88,15 @@ router.get("/guidelines", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "User not found" });
     }
 
-    // If user is in an org, always read brand guidelines from the org (not the user)
+    // If user is in an org, read brand guidelines from the org — falling back to
+    // the org owner's user record when the org was created without copying the
+    // owner's profile over, so the pillar does not silently go blank (ENG-927).
     let brandGuidelines = user.brandGuidelines;
     let isOrgLevel = false;
     if (user.orgId) {
       const org = await orgDb.getOrgById(user.orgId);
       if (org) {
-        brandGuidelines = org.brandGuidelines;
+        brandGuidelines = await resolveOrgProfileField(user, org, "brandGuidelines");
         isOrgLevel = true;
       }
     }
@@ -278,8 +281,12 @@ router.post(
       let postOrg: Awaited<ReturnType<typeof orgDb.getOrgById>> | undefined;
       if (user.orgId) {
         postOrg = await orgDb.getOrgById(user.orgId);
-        if (postOrg?.brandGuidelines) {
-          existingBrandGuidelines = postOrg.brandGuidelines;
+        if (postOrg) {
+          existingBrandGuidelines = await resolveOrgProfileField(
+            user,
+            postOrg,
+            "brandGuidelines"
+          );
         }
       }
 
@@ -517,8 +524,11 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       if (!allowed) {
         return res.status(403).json({ message: "Not authorized to edit brand guidelines" });
       }
-      if (org?.brandGuidelines) {
-        brandGuidelines = org.brandGuidelines;
+      if (org) {
+        // Same owner-record fallback the GET uses, so an asset the settings page
+        // shows for an un-copied org can actually be deleted (ENG-927). The write
+        // still targets the org record, which is authoritative from here on.
+        brandGuidelines = await resolveOrgProfileField(user, org, "brandGuidelines");
         isOrgLevel = true;
       }
     } else {

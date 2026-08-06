@@ -8843,7 +8843,10 @@ export class AgentModeService {
             error: 'Permission denied'
           };
         }
-        existingMarketStrategy = org?.marketStrategy;
+        // Same owner-record fallback as the brand path — merging onto an
+        // unpopulated org record would drop the owner's competitors/ICPs.
+        const { resolveOrgProfileField } = await import('./orgProfileResolver');
+        existingMarketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
       } else {
         existingMarketStrategy = user.marketStrategy;
       }
@@ -12583,7 +12586,11 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
             error: 'Permission denied'
           };
         }
-        existingBrand = org?.brandGuidelines;
+        // Fall back to the org owner's record when the org record was never
+        // populated, so a tweak merges onto the existing brand instead of
+        // building a fresh empty structure over it (ENG-927).
+        const { resolveOrgProfileField } = await import('./orgProfileResolver');
+        existingBrand = await resolveOrgProfileField(user, org, 'brandGuidelines');
       } else {
         existingBrand = user.brandGuidelines;
       }
