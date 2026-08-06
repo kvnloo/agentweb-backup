@@ -601,16 +601,34 @@ When you confirm a filed item, share the tracking link from the tool result so t
 // The truthful-reporting rules stay UNCONDITIONAL: inventing a gate is a reporting
 // violation whichever way authorization resolved, and that includes misdescribing
 // this very block as a platform gate.
-export function getScheduledSessionOverride(sessionType?: string, publishAuthorized: boolean = true): string {
+//
+// `publishAuthorized` is TRI-STATE, and the undefined case is load-bearing
+// (Greptile review #18, security). `sessionType === 'scheduled'` describes how the
+// session was CREATED, not whether a human is present now: a user can open a
+// schedule-created session in the customer-portal Emma sidebar and chat in it, and
+// that ATTENDED turn rebuilds this prompt via getEmmaSystemContext. Defaulting such
+// a turn to the authorized branch would order a tool-capable model to publish
+// externally, straight past an owner's opt-out — and would be wrong even without
+// one, since the mandate's whole premise ("there is no human to ask") is false when
+// a human is right there.
+//
+//   undefined -> ATTENDED turn. Emit the base override and the truthful-reporting
+//                rules only. No mandate, no publish block: an attended user can be
+//                asked, so the ordinary approval flow applies.
+//   true/false -> UNATTENDED run, decision already resolved from the schedule
+//                record by the caller. Emit the mandate plus the matching branch.
+export function getScheduledSessionOverride(sessionType?: string, publishAuthorized?: boolean): string {
   if (sessionType !== 'scheduled') return '';
+  // Only an unattended run carries a resolved decision; see the tri-state note above.
+  const unattended = publishAuthorized !== undefined;
   return `\n\n⚠️ CRITICAL OVERRIDE: This IS a scheduled automated session. The user has ALREADY set up a schedule. NEVER suggest creating a schedule, setting up automated runs, or saying "want this to run automatically" — doing so would be incorrect and confusing. Just deliver the results.
 
 NO FABRICATED PLATFORM OR PUBLISH GATE (CRITICAL — Truthful Reporting):
 - Never assert a platform, publishing, permission, or "unattended publish" gate as a fact unless an actual tool call in THIS session returned that gate/permission error. If no tool call returned a gate or permission error, you may NOT claim a gate exists — inventing one to justify skipping a required action is a fabrication and a reporting violation.
 - If, and only if, a tool call genuinely returns a gate/permission/credential error, name the SPECIFIC tool and the verbatim error you received — never a gate you have not actually hit. Then persist the drafts to the knowledge base, save memory, and file a product issue via report_product_issues so the real blocker is surfaced.
-- The PUBLISH AUTHORIZATION block below reflects an account-level setting the owner chose on this schedule. Describe it accurately as that, and never as a platform, X/Twitter, API, or credential gate. Restating it as a platform gate is the same fabrication.
-- Derive your title and summary from actual tool-call outcomes. A run that posted nothing must NOT claim replies/posts were "queued", "posted", or "sent" — if nothing was posted, say so plainly and state the reason.
-
+${unattended ? `- The PUBLISH AUTHORIZATION block below reflects an account-level setting the owner chose on this schedule. Describe it accurately as that, and never as a platform, X/Twitter, API, or credential gate. Restating it as a platform gate is the same fabrication.
+` : ''}- Derive your title and summary from actual tool-call outcomes. A run that posted nothing must NOT claim replies/posts were "queued", "posted", or "sent" — if nothing was posted, say so plainly and state the reason.
+${!unattended ? '' : `
 NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION (CRITICAL):
 - When the schedule's instructions direct you to perform an action (post, reply, send, publish, update) and the tool that performs it is available to you, you MUST actually call that tool. Drafting the content and reporting it as "queued", "ready", or "pending approval" is NOT completion — e.g. twitter_manage_post (action "reply") to reply on X, post_on_connected_account to post a new tweet.
 - There are exactly TWO acceptable reasons not to perform a mandated action, and you must cite which one applies: (1) the PUBLISH AUTHORIZATION block below states this run is not authorized to publish — quote that block; or (2) a tool call you ACTUALLY made returned an error — quote the tool name and its error. Nothing else qualifies.
@@ -629,7 +647,7 @@ PUBLISH AUTHORIZATION — this schedule requires approval before publishing (CRI
 - THIS BLOCK IS reason (1) above. Do NOT call any tool that publishes externally (e.g. twitter_manage_post, post_on_connected_account, publish_blog_article). Instead do all the work up to the publish step, persist the drafts to the knowledge base, and state plainly in your final report that nothing was posted because this schedule requires approval before publishing.
 - Quote THIS block as the reason, and describe it accurately: it is an account-level setting the owner chose, NOT a platform, X/Twitter, API, or credential gate. Calling it a platform gate is exactly the fabrication banned above. Give the owner the concrete unblocking action, naming the setting exactly: turn OFF "Require approval before publishing" in this schedule's settings, and the next run will post. Do NOT point them at "Full autonomy" — that setting governs whether Emma decides unaided mid-run and does NOT affect publishing, so following it would leave the next run blocked in exactly the same place.
 - Drafted-and-awaiting-approval is the correct, COMPLETE terminal state for this run. It is not unfinished work. State it ONCE and stop — do not re-attempt or re-explain the withheld publish across turns.
-- End your final report with EXACTLY this sentence on its own line, so the run is recorded as deliberately withheld rather than as a halt waiting for an answer: "PUBLISH WITHHELD: this schedule requires approval before publishing." Do NOT ask the owner a question, and do NOT phrase the ending as waiting on their confirmation — there is no one to answer, and the drafts are already saved for them.`}`;
+- End your final report with EXACTLY this sentence on its own line, so the run is recorded as deliberately withheld rather than as a halt waiting for an answer: "PUBLISH WITHHELD: this schedule requires approval before publishing." Do NOT ask the owner a question, and do NOT phrase the ending as waiting on their confirmation — there is no one to answer, and the drafts are already saved for them.`}`}`;
 }
 
 // Directive injected for scheduled / automated unattended runs.

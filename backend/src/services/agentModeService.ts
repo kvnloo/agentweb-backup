@@ -3209,9 +3209,11 @@ export class AgentModeService {
       // ENG-803: resolve this scheduled run's publish authorization from the schedule
       // record so the directive states a DECISION rather than leaving one for the
       // model to guess — guessing is what produced the fabricated "X publishing gate".
-      // Resolved here, at the only getScheduledSessionOverride call site, rather than
-      // in the controller: this keeps ENG-803 clear of the regions ENG-827 (PR #2263)
-      // rewrites. Never derived from the schedule's prompt text.
+      // Resolved here rather than in the controller so ENG-803 stays clear of the
+      // regions ENG-827 (PR #2263) rewrites. Never derived from the schedule's prompt
+      // text. This is the UNATTENDED run path, so it always passes a resolved
+      // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
+      // deliberately passes nothing (see the tri-state note on the override).
       const publishAuthorized = await this.resolveScheduledPublishAuthorized(currentSession);
       const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
       const messages: any[] = [

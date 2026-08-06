@@ -14,19 +14,24 @@
  *    "you are not authorized" escape hatch could never occur (Greptile review #11),
  *    then a carve-out that deferred to a block which did not exist, leaving the
  *    skipped-tool failure reachable (review #15). Both are one bug — a decision
- *    nobody makes. So every scheduled run now carries exactly one of the two
- *    branches, and the tests assert that both exist and that they are mutually
+ *    nobody makes. So every unattended scheduled run now carries exactly one of the
+ *    two branches, and the tests assert that both exist and that they are mutually
  *    exclusive.
+ *
+ * A third state matters too: an ATTENDED turn on a schedule-created session (the
+ * customer-portal sidebar) must carry NEITHER branch — see review #18 below.
  */
 
 import { getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
 
 describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)', () => {
-  // Default (no argument) is the AUTHORIZED branch — publishing is the pre-existing
-  // behaviour of every scheduled run, so an omitted argument must not silently halt
-  // publishing on the ~25 active publishing-shaped schedules.
-  const scheduled = getScheduledSessionOverride('scheduled');
+  // The publish argument is TRI-STATE: true/false is an UNATTENDED run whose
+  // decision the caller resolved from the schedule record, and omitting it is an
+  // ATTENDED turn (the sidebar) that must carry no publish rules at all.
+  const scheduled = getScheduledSessionOverride('scheduled', true);
   const approvalRequired = getScheduledSessionOverride('scheduled', false);
+  // Attended sidebar turn on a schedule-created session — no resolved decision.
+  const attended = getScheduledSessionOverride('scheduled');
 
   it('emits nothing at all for non-scheduled sessions, on either branch', () => {
     // The rules are unattended-run rules; an interactive session has a human who
@@ -164,12 +169,49 @@ describe('getScheduledSessionOverride — truthful execution reporting (ENG-803)
       expect(approvalRequired).toContain('does NOT affect publishing');
     });
 
-    it('defaults to AUTHORIZED so no existing schedule silently stops publishing', () => {
+    it('AUTHORIZED is what an unresolved-but-readable schedule gets, so none stops publishing', () => {
       // The population fact behind this: 25 of 96 active schedules are
       // publishing-shaped. A default-deny would convert all of them to drafting-only,
-      // trading a 1-in-62-session fabrication for 25 broken schedules.
-      expect(getScheduledSessionOverride('scheduled')).toContain('publishes without approval');
-      expect(getScheduledSessionOverride('scheduled', undefined as any)).toContain('publishes without approval');
+      // trading a 1-in-62-session fabrication for 25 broken schedules. The resolver
+      // (not this function) supplies `true` for every schedule without the opt-out.
+      expect(getScheduledSessionOverride('scheduled', true)).toContain('publishes without approval');
+    });
+
+    // Greptile review #18 (security). `sessionType === 'scheduled'` says how the
+    // session was CREATED, not that it is running unattended now: a user can open a
+    // schedule-created session in the customer-portal sidebar and chat, and that
+    // ATTENDED turn rebuilds this prompt through getEmmaSystemContext with no
+    // resolved decision. Emitting the authorized branch there would order a live
+    // publish past the owner's opt-out; emitting the withheld branch would assert a
+    // gate the session may not be under. It must emit NEITHER.
+    describe('attended turn (no resolved decision) carries no publish rules', () => {
+      it('emits no PUBLISH AUTHORIZATION block of either polarity', () => {
+        expect(attended).not.toContain('PUBLISH AUTHORIZATION');
+        expect(attended).not.toContain('publishes without approval');
+        expect(attended).not.toContain('requires approval before publishing');
+        expect(attended).not.toContain('PUBLISH WITHHELD');
+      });
+
+      it('emits no unattended publish mandate — a human is present to ask', () => {
+        expect(attended).not.toContain('NEVER SUBSTITUTE A DRAFT FOR A MANDATED ACTION');
+        expect(attended).not.toContain('CALL THE TOOL');
+        expect(attended).not.toContain('exactly TWO acceptable reasons');
+      });
+
+      it('still keeps the base override and the truthful-reporting rules', () => {
+        // Inventing a gate is a lie in an attended session too, and the pre-existing
+        // "do not suggest creating a schedule" override must survive untouched.
+        expect(attended).toContain('This IS a scheduled automated session');
+        expect(attended).toContain('NEVER suggest creating a schedule');
+        expect(attended).toContain('NO FABRICATED PLATFORM OR PUBLISH GATE');
+        expect(attended).toContain('you may NOT claim a gate exists');
+        expect(attended).toContain('Derive your title and summary from actual tool-call outcomes');
+      });
+
+      it('drops the bullet that points at a block it does not emit', () => {
+        // A dangling reference to a non-existent block is itself a small fabrication.
+        expect(attended).not.toContain('The PUBLISH AUTHORIZATION block below');
+      });
     });
 
     it('closes the three excuses the reported run actually used', () => {

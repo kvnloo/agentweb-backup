@@ -3830,6 +3830,15 @@ If a user asks about making someone a co-owner, giving ownership to another pers
 // To update: edit that file and open a PR.
 export function getEmmaSystemContext(sessionType?: string, orgRole?: string): string {
   const memberAddendum = orgRole === "member" ? ORG_MEMBER_ADDENDUM : "";
+  // ENG-803: `sessionType` can be 'scheduled' here — a user may open a
+  // schedule-created session in the sidebar and keep chatting in it — but this turn
+  // is ATTENDED. getScheduledSessionOverride's publish argument is therefore left
+  // undefined ON PURPOSE, which emits the base override and the truthful-reporting
+  // rules WITHOUT the unattended publish mandate or the PUBLISH AUTHORIZATION block.
+  // Passing a resolved decision here would be wrong in both directions: `true` would
+  // order a live publish past the owner's opt-out (Greptile review #18), and `false`
+  // would assert an approval gate this session may not actually be under. A human is
+  // present, so the ordinary approval flow applies.
   return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${getScheduledSessionOverride(sessionType)}${memberAddendum}`;
 }
 
