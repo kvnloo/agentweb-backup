@@ -1677,6 +1677,26 @@ export async function runVerifiedChat(
   let requiredFunctions = params.requiredFunctions ?? [];
   /** Set when consent narrows mid-run; prepended to every subsequent turn message. */
   let publishRevocationNotice: string | null = null;
+  /**
+   * ENG-827: the system prompt — and with it the PUBLISH AUTHORIZATION directive — is
+   * assembled and persisted ONCE, on the session's first message. Narrowing
+   * `livePublishAuthorization` therefore reaches the required-function checker but NOT
+   * the model, which would keep reading its admission-time "you are authorized to
+   * publish" instruction for the rest of the run: revocation would stop the nudging
+   * without stopping the publishing. Carry the withdrawal in the turn message instead,
+   * where it lands in context immediately and persists in the transcript for every
+   * later turn. The prohibition wording is single-sourced from the same directive
+   * builder the system prompt uses.
+   *
+   * This helper is the ONLY way a turn message reaches the model in this loop — both
+   * `generateSessionResponse` call sites below go through it. That is deliberate: the
+   * completion-gate CONTINUATION turn built its own message and called the model
+   * directly, so a revocation that landed while a run was mid-continuation narrowed
+   * the checker but left the model still reading "you are authorized to publish" —
+   * i.e. it could publish after the owner had already said stop.
+   */
+  const withPublishRevocationNotice = (message: string): string =>
+    publishRevocationNotice ? `${publishRevocationNotice}\n\n${message}` : message;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
   // question, so a model that keeps re-asking cannot loop until maxAttempts. Once
@@ -2023,7 +2043,7 @@ export async function runVerifiedChat(
         completionGateReason = 'unfinished';
         const continuationResponse = await generateSessionResponse(
           sessionId,
-          userMessage,
+          withPublishRevocationNotice(userMessage),
           userId,
           defaultModel,
           [],
@@ -2149,22 +2169,10 @@ export async function runVerifiedChat(
       // Generate response
       // Only pass attachments on the first attempt to avoid duplicating them
       const attachmentsForThisAttempt = attempt === 1 ? attachmentsArray : [];
-      // ENG-827: the system prompt — and with it the PUBLISH AUTHORIZATION directive —
-      // is assembled and persisted ONCE, on the session's first message. Narrowing
-      // `livePublishAuthorization` therefore reaches the required-function checker but
-      // NOT the model, which would keep reading its admission-time "you are authorized
-      // to publish" instruction for the rest of the run. Revocation would stop the
-      // nudging without stopping the publishing. Carry the withdrawal in the turn
-      // message instead, where it lands in context immediately and persists in the
-      // transcript for every later turn. The prohibition wording is single-sourced
-      // from the same directive builder the system prompt uses.
-      if (publishRevocationNotice) {
-        userMessage = `${publishRevocationNotice}\n\n${userMessage}`;
-      }
       console.log(`AgentMode runVerifiedChat: Attempt ${attempt}, passing ${attachmentsForThisAttempt.length} attachments to generateSessionResponse`);
       const response = await generateSessionResponse(
         sessionId,
-        userMessage,
+        withPublishRevocationNotice(userMessage),
         userId,
         defaultModel,
         attachmentsForThisAttempt,
