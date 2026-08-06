@@ -453,6 +453,50 @@ describe('ENG-820 — mixed actionable cohorts stay visible under one tool ident
     expect((mine[0] as any).sourceRuleId).toBe('tool-failure:two_faults');
   });
 
+  it('gives the minority cohort its own ACTION, not just a mention', async () => {
+    // Round 7: naming a cohort is not dispatching it. Resolving the account for
+    // the 10 config failures must not close out 8 recurring handler bugs that
+    // were never assigned an action.
+    const proposals = await rules().evaluate(mixed('two_faults_act'), WINDOW);
+    const found: any = proposals.find((x: any) => x.payload?.toolName === 'two_faults_act');
+    expect(found).toBeDefined();
+    const p: any = found.payload;
+
+    expect(p.failureType).toBe('config');
+    expect(p.directive).toMatch(/8 bug failure\(s\)/);
+    expect(p.directive).toMatch(/investigate the "two_faults_act" handler/i);
+    expect(p.directive).toMatch(/do not close this out after the first remedy/i);
+  });
+
+  it('gives a secondary CONFIG cohort the account action, not a handler one', async () => {
+    // Mirror case: bug dominant, config minority. The secondary instruction has
+    // to match its own class or it misdirects exactly like the primary once did.
+    const events = [
+      ...toolEvents('bug_major', 30, 12, 'bug', 'TypeErrorClass', 'TypeError: boom'),
+      ...toolEvents('bug_major', 0, 7, 'config', 'auth', 'token expired'),
+    ];
+
+    const proposals = await rules().evaluate(events, WINDOW);
+    const found: any = proposals.find((x: any) => x.payload?.toolName === 'bug_major');
+    expect(found).toBeDefined();
+    const p: any = found.payload;
+
+    expect(p.failureType).toBe('bug');
+    expect(p.directive).toMatch(/7 configuration\/credential failure\(s\)/);
+    expect(p.directive).toMatch(/reconnect or re-authorise/i);
+  });
+
+  it('adds no secondary section when there is only one cohort', async () => {
+    const events = toolEvents('single_class', 30, 10, 'bug', 'TypeErrorClass', 'TypeError');
+
+    const proposals = await rules().evaluate(events, WINDOW);
+    const found: any = proposals.find((x: any) => x.payload?.toolName === 'single_class');
+    expect(found).toBeDefined();
+    const p: any = found.payload;
+
+    expect(p.directive).not.toMatch(/ALSO has other failure classes/i);
+  });
+
   it('names the minority cohort instead of hiding it inside another class', async () => {
     const proposals = await rules().evaluate(mixed('two_faults2'), WINDOW);
     const prop: any = proposals.find((p: any) => p.payload?.toolName === 'two_faults2');

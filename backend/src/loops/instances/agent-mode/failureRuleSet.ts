@@ -109,6 +109,26 @@ interface ToolStats {
 const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_uninstalled_tool']);
 
 /**
+ * A one-line action for a secondary cohort (ENG-820 review round 7).
+ *
+ * A tool with 10 config + 8 bug failures gets ONE proposal, because
+ * `sourceRuleId` is the cooldown key and splitting it orphans history
+ * (see ENG-937). But the minority cohort must still receive an ACTION, not just
+ * a mention — otherwise resolving the account closes the dispatch and the 8
+ * recurring handler bugs are never worked.
+ */
+function secondaryAction(failureType: string, toolName: string, count: number): string {
+  if (failureType === 'config') {
+    return `${count} configuration/credential failure(s) — reconnect or re-authorise the account for "${toolName}", or top up its balance.`;
+  }
+  if (failureType === 'schema_reject') {
+    return `${count} schema rejection(s) — reconcile "${toolName}"'s declared JSON schema with what the handler accepts.`;
+  }
+  const label = failureType || 'unclassified';
+  return `${count} ${label} failure(s) — investigate the "${toolName}" handler and add a regression test.`;
+}
+
+/**
  * Directive per failure class. The whole defect was appending one sentence —
  * "Investigate the handler + propose a robustness fix" — to every cluster
  * regardless of what the system already knew about it.
@@ -285,11 +305,17 @@ export class AgentFailureRuleSet
       const topErrorClass = cohort && cohort.size > 0
         ? dominantKey(cohort)
         : dominantKey(stats.errorClasses);
-      const otherClasses = Array.from(actionableTypes.entries())
+      const otherEntries = Array.from(actionableTypes.entries())
         .filter(([ft]) => ft !== failureType)
-        .sort((a, b) => b[1] - a[1])
-        .map(([ft, n]) => `${n} ${ft || 'unclassified'}`);
-      const alsoNote = otherClasses.length > 0 ? ` Also present: ${otherClasses.join(', ')}.` : '';
+        .sort((a, b) => b[1] - a[1]);
+      const otherClasses = otherEntries.map(([ft, n]) => `${n} ${ft || 'unclassified'}`);
+      // Every remaining cohort gets its OWN instruction, so completing the
+      // primary remedy cannot close out work that was never dispatched.
+      const alsoNote = otherEntries.length > 0
+        ? ` This tool ALSO has other failure classes needing separate action: `
+          + otherEntries.map(([ft, n]) => secondaryAction(ft, stats.toolName, n)).join(' ')
+          + ` Do not close this out after the first remedy alone.`
+        : '';
 
       proposals.push({
         proposalId: asMutationId(`agent-mode:tool-failure:${stats.toolName}`),
