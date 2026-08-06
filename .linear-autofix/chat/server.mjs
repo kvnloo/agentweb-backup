@@ -13,7 +13,7 @@ import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {
-  readFileSync, writeFileSync, existsSync, mkdirSync, statSync, unlinkSync, rmSync, createWriteStream, readdirSync,
+  readFileSync, writeFileSync, renameSync, existsSync, mkdirSync, statSync, unlinkSync, rmSync, createWriteStream, readdirSync,
 } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -71,7 +71,22 @@ const turnTokens = (u) => {
 
 const fixEnabled = () => process.env.AUTOFIX_RUN_ENABLED === '1';
 const loadState = () => { try { return JSON.parse(readFileSync(statePath, 'utf8')); } catch { return {}; } };
-const loadChatState = () => { try { return JSON.parse(readFileSync(chatStatePath, 'utf8')); } catch { return {}; } };
+// chat-state.json grows to tens of MB (every issue's full transcript). JSON.parsing it on EVERY
+// request — the detail GET, each 30s poll, several times per turn — stalled the event loop ~0.5s a
+// call and made big issues feel unresponsive. Cache the parsed object keyed on the file's mtime: a
+// cheap statSync replaces the multi-MB parse on the hot path. Any write invalidates it — in-process
+// (writeChatState refreshes the cache below) or cross-process (autofix.mjs, caught by the mtime
+// change) — so callers still observe fresh state. Preserves the original {} fallback on a bad read.
+let chatStateCache = { mtimeMs: -1, data: null };
+const loadChatState = () => {
+  try {
+    const mtimeMs = statSync(chatStatePath).mtimeMs;
+    if (chatStateCache.data && chatStateCache.mtimeMs === mtimeMs) return chatStateCache.data;
+    const data = JSON.parse(readFileSync(chatStatePath, 'utf8'));
+    chatStateCache = { mtimeMs, data };
+    return data;
+  } catch { return {}; }
+};
 // Read-modify-write against a fresh read (same discipline as autofix's updateState).
 // Give every message a stable, monotonic `mid`. Edit/delete address a message by mid, NOT by array
 // position, because the .slice(-500) cap drops messages off the FRONT and would shift every index —
@@ -94,10 +109,26 @@ function resolveMsgIndex(msgs, body) {
   return Number.isInteger(idx) && idx >= 0 && idx < msgs.length ? idx : -1;
 }
 
+// Persist chat-state compactly + atomically. Compact (no pretty-print) keeps the file ~40% smaller,
+// so the synchronous parse-on-read / stringify-on-write no longer stalls the event loop on every
+// message. Temp-file + rename makes the multi-MB write crash-safe — a mid-write crash can no longer
+// truncate the live file. Stays fully synchronous, so the cross-process fresh-read-modify-write
+// discipline (see updateIssueEntry) is unchanged.
+function writeChatState(obj) {
+  const tmp = `${chatStatePath}.tmp.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(obj));
+  renameSync(tmp, chatStatePath);
+  // Refresh the read cache to the object we just wrote so the very next loadChatState() is instant
+  // AND consistent with disk (never relies on mtime resolution for in-process writes). If the post-
+  // write stat fails, invalidate so the next read re-parses fresh rather than serving a wrong mtime.
+  try { chatStateCache = { mtimeMs: statSync(chatStatePath).mtimeMs, data: obj }; }
+  catch { chatStateCache = { mtimeMs: -1, data: null }; }
+}
+
 function updateChatState(identifier, fn) {
   const s = loadChatState();
   s[identifier] = ensureMids(fn(s[identifier] || { identifier, cwd: null, sessions: {}, messages: [] }));
-  writeFileSync(chatStatePath, JSON.stringify(s, null, 2));
+  writeChatState(s);
   return s[identifier];
 }
 
@@ -275,7 +306,7 @@ function closeChat(identifier) {
     const s = loadState();
     for (const [uuid, e] of Object.entries(s)) if ((e.identifier || '').toUpperCase() === identifier.toUpperCase()) delete s[uuid];
     writeFileSync(statePath, JSON.stringify(s, null, 2));
-    const cs = loadChatState(); delete cs[identifier]; writeFileSync(chatStatePath, JSON.stringify(cs, null, 2));
+    const cs = loadChatState(); delete cs[identifier]; writeChatState(cs);
     log(`closed standalone chat ${identifier} (removed worktree + branch ${branch})`);
     return { code: 200, body: { closed: true } };
   } finally { releaseLock(lockPath); }
@@ -335,14 +366,20 @@ async function freshTurnPrompt(cap, identifier, entry, cwd, message, history = '
 }
 
 // Live Linear data is decoration, never a dependency: 8s cap, null on any failure (including
-// no LINEAR_API_KEY at all).
-async function fetchLinear(identifier) {
+// no LINEAR_API_KEY at all). Cached per-issue with stale-while-revalidate (same shape as usageCache):
+// a live API round-trip on EVERY detail GET / poll / turn-prompt was the other half of the multi-
+// second detail latency. Within TTL we serve the cached value; when stale we serve the last good
+// value immediately and refresh in the background, so repeated opens are instant and freshness (loose
+// for issue metadata/comments) still catches up within a poll cycle. First-ever fetch blocks inline.
+const LINEAR_TTL_MS = 30000;
+const linearCache = new Map(); // identifier -> { at, data }
+async function refreshLinear(identifier) {
   try {
     const issue = await Promise.race([
       resolveIssue(identifier),
       new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 8000)),
     ]);
-    return {
+    const data = {
       title: issue.title,
       description: issue.description || '',
       url: issue.url,
@@ -350,7 +387,15 @@ async function fetchLinear(identifier) {
       stateType: issue.state?.type || null,
       comments: (issue.comments?.nodes || []).map((c) => ({ author: c.user?.name || 'someone', body: c.body, at: c.createdAt })),
     };
-  } catch { return null; }
+    linearCache.set(identifier, { at: Date.now(), data });
+    return data;
+  } catch { return linearCache.get(identifier)?.data ?? null; } // keep the last good value on a blip
+}
+async function fetchLinear(identifier) {
+  const hit = linearCache.get(identifier);
+  if (hit && Date.now() - hit.at < LINEAR_TTL_MS) return hit.data; // fresh
+  if (hit) { refreshLinear(identifier).catch(() => {}); return hit.data; } // stale: serve now, warm in bg
+  return refreshLinear(identifier); // cold: block once
 }
 
 // Attribution for a full-mode turn's commits/PRs/merges. Prefer the CURRENT Linear assignee, so a
