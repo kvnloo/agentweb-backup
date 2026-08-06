@@ -132,3 +132,30 @@ export function extractScheduleId(pageIdentifier?: string | null): string | null
   const match = pageIdentifier.match(/\|scheduleId:([a-f0-9-]+)\s*$/);
   return match ? match[1] : null;
 }
+
+/**
+ * How a session resolves for the dispatch-time publish gate.
+ *
+ *   'allow'        -> not a scheduled run; no owner schedule setting applies. The
+ *                     attended paths that share the tool dispatcher (Emma sidebar,
+ *                     live voice) land here, and a human is present for them.
+ *   'scheduled'    -> a scheduled run; read the schedule and apply its setting.
+ *   'unverifiable' -> we cannot tell. Block, because publishing is irreversible.
+ *
+ * A NULL SESSION IS 'unverifiable', NOT 'allow' (Greptile review #23). Deleting a
+ * scheduled session does not cancel its in-flight worker, so the worker keeps
+ * running and its session lookup starts returning null. Treating that as "not
+ * scheduled" let the run publish externally past an owner who had required
+ * approval — the fail-open hole again, this time through a null rather than a
+ * throw. `session?.sessionType !== 'scheduled'` reads naturally and is exactly
+ * wrong here, because it collapses "definitely attended" and "no idea" into one
+ * answer.
+ */
+export type PublishGateSessionClass = 'allow' | 'scheduled' | 'unverifiable';
+
+export function classifySessionForPublishGate(
+  session?: { sessionType?: string } | null
+): PublishGateSessionClass {
+  if (!session) return 'unverifiable';
+  return session.sessionType === 'scheduled' ? 'scheduled' : 'allow';
+}

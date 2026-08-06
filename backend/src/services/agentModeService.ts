@@ -28,7 +28,7 @@ import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type Judge
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
-import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
+import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate } from '../utils/schedulePublishApproval';
 import { isPublishName } from '../utils/hardeningGaps';
 import {
   applyAnswer,
@@ -7219,8 +7219,18 @@ export class AgentModeService {
       }
     }
 
+    // A NULL session is unverifiable, not attended: deleting a scheduled session
+    // does not cancel its in-flight worker, so the worker runs on and its lookup
+    // starts returning null (Greptile review #23).
+    const sessionClass = classifySessionForPublishGate(session);
+    if (sessionClass === 'unverifiable') {
+      console.warn(
+        `AgentMode ENG-803: session ${sessionId} not found while verifying publish approval for ${toolName}; blocking rather than assuming it was attended.`
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
     // Attended / non-scheduled sessions have no owner schedule setting to enforce.
-    if (session?.sessionType !== 'scheduled') return null;
+    if (sessionClass === 'allow') return null;
 
     const scheduleId = extractScheduleId(session?.pageIdentifier);
     if (!scheduleId) {

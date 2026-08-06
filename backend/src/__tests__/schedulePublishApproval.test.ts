@@ -14,7 +14,11 @@
  * must therefore mean AUTHORIZED, which is also why no backfill is needed.
  */
 
-import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
+import {
+  resolvePublishAuthorized,
+  extractScheduleId,
+  classifySessionForPublishGate,
+} from '../utils/schedulePublishApproval';
 
 describe('resolvePublishAuthorized (ENG-803)', () => {
   describe('absence means authorized — no existing schedule changes behaviour', () => {
@@ -146,5 +150,37 @@ describe('extractScheduleId (ENG-803)', () => {
     expect(extractScheduleId('/dashboard')).toBeNull();
     expect(extractScheduleId('scheduleId:')).toBeNull();
     expect(extractScheduleId(12345 as any)).toBeNull();
+  });
+});
+
+describe('classifySessionForPublishGate (ENG-803)', () => {
+  // Greptile review #23: `session?.sessionType !== 'scheduled'` reads naturally and
+  // is exactly wrong — it collapses "definitely attended" and "no idea" into one
+  // answer. Deleting a scheduled session does NOT cancel its in-flight worker, so
+  // the worker runs on and its session lookup starts returning null; treating that
+  // as attended let the run publish past an owner who required approval.
+  it('treats a MISSING session as unverifiable, not attended', () => {
+    expect(classifySessionForPublishGate(null)).toBe('unverifiable');
+    expect(classifySessionForPublishGate(undefined)).toBe('unverifiable');
+  });
+
+  it('routes a scheduled session to the schedule check', () => {
+    expect(classifySessionForPublishGate({ sessionType: 'scheduled' })).toBe('scheduled');
+  });
+
+  it('allows genuinely attended sessions, which share the tool dispatcher', () => {
+    // The Emma sidebar (chatbotService) and liveVoiceService both reach executeTool.
+    // They have no owner schedule setting to apply and a human is present, so they
+    // must not be caught by the gate.
+    for (const sessionType of ['regular', 'emma-sidebar', 'slack', undefined]) {
+      expect(classifySessionForPublishGate({ sessionType } as any)).toBe('allow');
+    }
+  });
+
+  it('never returns allow for anything it cannot positively identify', () => {
+    // The property that matters: unknown -> not allow. Only a session object we
+    // actually read can produce 'allow'.
+    expect(classifySessionForPublishGate(null)).not.toBe('allow');
+    expect(classifySessionForPublishGate(undefined)).not.toBe('allow');
   });
 });
