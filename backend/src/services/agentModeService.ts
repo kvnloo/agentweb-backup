@@ -27,7 +27,8 @@ import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
-import { taskDb, taskTemplateDb, accountMemoryDb, userDb } from './db';
+import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -3025,6 +3026,35 @@ export class AgentModeService {
     );
   }
 
+  /**
+   * ENG-803: does this scheduled run's schedule allow it to publish externally?
+   *
+   * Returns TRUE for anything that is not an explicit owner opt-out — including a
+   * non-scheduled session, an unparseable pageIdentifier, a missing schedule, and a
+   * failed DynamoDB read. That is deliberate and is the safe direction here:
+   * publishing is the pre-existing behaviour of every scheduled run, so a transient
+   * read failure must degrade to the status quo rather than silently converting a
+   * working schedule into a drafting-only one. A prompt-enrichment lookup must never
+   * change what the run is allowed to do.
+   *
+   * The value is only ever CONSUMED by getScheduledSessionOverride, which self-guards
+   * on sessionType, so a `true` returned for a non-scheduled session emits nothing.
+   */
+  private async resolveScheduledPublishAuthorized(currentSession: any): Promise<boolean> {
+    if (currentSession?.sessionType !== 'scheduled') return true;
+    const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
+    if (!scheduleId) return true;
+    try {
+      return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId));
+    } catch (error) {
+      console.error(
+        `AgentMode: failed to resolve publish approval for scheduled session ${currentSession?.sessionId}; keeping the existing publish behaviour:`,
+        error
+      );
+      return true;
+    }
+  }
+
   private getVisionFallbackModel(primaryModel: string): string | undefined {
     const fallbackOrder = ['anthropic.claude-opus-4-8', 'gemini-3-flash-preview', 'gpt-5.4-nano'];
     return fallbackOrder.find((model) => model !== primaryModel && this.llmModels[model]?.supportsVision === true);
@@ -3164,7 +3194,14 @@ export class AgentModeService {
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
-      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType);
+      // ENG-803: resolve this scheduled run's publish authorization from the schedule
+      // record so the directive states a DECISION rather than leaving one for the
+      // model to guess — guessing is what produced the fabricated "X publishing gate".
+      // Resolved here, at the only getScheduledSessionOverride call site, rather than
+      // in the controller: this keeps ENG-803 clear of the regions ENG-827 (PR #2263)
+      // rewrites. Never derived from the schedule's prompt text.
+      const publishAuthorized = await this.resolveScheduledPublishAuthorized(currentSession);
+      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];
