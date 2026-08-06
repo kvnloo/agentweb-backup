@@ -29,6 +29,7 @@ import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWor
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
+import { isPublishName } from '../utils/hardeningGaps';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -7114,6 +7115,85 @@ export class AgentModeService {
     );
   }
 
+  /**
+   * ENG-803: does this call publish CONTENT to an external account?
+   *
+   * Scoped deliberately. `twitter_manage_post` is a dispatcher whose actions are
+   * mostly reads (get_tweet_metrics, list_replies, get_retweeters, ...) alongside a
+   * few that publish; blocking the whole tool would break a reply run's ability to
+   * even FIND the mentions it is supposed to answer. Only the actions that put new
+   * content in front of an audience count — which is exactly what an owner means by
+   * "review before publishing".
+   *
+   * Engagement actions (like, retweet) and delete_tweet are deliberately NOT treated
+   * as publishing: they surface no authored content, and delete is governed by its
+   * own confirmation rules.
+   */
+  private static readonly X_PUBLISHING_ACTIONS = new Set(['reply', 'post_thread', 'quote_tweet']);
+
+  private static isExternalContentPublish(toolName: string, args: any): boolean {
+    // publish_* / post_on_* — whole-tool publishers.
+    if (isPublishName(toolName)) return true;
+    if (/_manage_post$/.test(toolName)) {
+      const action = typeof args?.action === 'string' ? args.action : '';
+      return AgentModeService.X_PUBLISHING_ACTIONS.has(action);
+    }
+    return false;
+  }
+
+  /**
+   * ENG-803: ENFORCE the owner's publish-approval setting at dispatch, not just in
+   * the prompt (Greptile review #21).
+   *
+   * A directive is guidance; this ticket is literally a report of a model reasoning
+   * its way around instructions. So the setting an owner ticks has to be a real
+   * boundary: if the schedule requires approval, the publishing call does not
+   * execute, whatever the model decided.
+   *
+   * The refusal is returned as a normal tool error on purpose. It gives the model a
+   * REAL, quotable failure — satisfying the directive's "reason (2): a tool call you
+   * ACTUALLY made returned an error" — so the run reports an accurate blocker
+   * instead of inventing one. That is the same ticket's other half.
+   *
+   * FAILS OPEN, deliberately. This is defence in depth behind the prompt, which
+   * already withholds when the schedule cannot be read. Making the enforcement layer
+   * fail closed would let one throttled DynamoDB read stop publishing across the ~25
+   * active publishing-shaped schedules — trading a rare, prompt-covered miss for a
+   * broad outage. Only a schedule we positively READ as approval-required blocks.
+   */
+  private async blockedByScheduledPublishApproval(
+    toolName: string,
+    args: any,
+    sessionId: string
+  ): Promise<{ success: false; error: string; publishApprovalRequired: true } | null> {
+    if (!sessionId || !AgentModeService.isExternalContentPublish(toolName, args)) return null;
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      if (session?.sessionType !== 'scheduled') return null;
+      const scheduleId = extractScheduleId((session as any)?.pageIdentifier);
+      if (!scheduleId) return null;
+      if (resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId))) return null;
+      console.warn(
+        `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} requires approval before publishing.`
+      );
+      return {
+        success: false,
+        error:
+          `Blocked: this schedule has "Require approval before publishing" turned ON, so ${toolName} cannot publish on the owner's behalf in an unattended run. ` +
+          `This is an account-level setting the owner chose for this schedule — it is NOT a platform, X/Twitter, API, or credential limit. ` +
+          `Save the drafts, report plainly that nothing was published, and tell the owner they can turn that setting OFF for this schedule to let the next run post.`,
+        publishApprovalRequired: true,
+      };
+    } catch (error) {
+      // See the fail-open note above: the prompt layer already covers this case.
+      console.error(
+        `AgentMode ENG-803: could not verify publish approval for session ${sessionId}; allowing ${toolName} rather than halting publishing:`,
+        error
+      );
+      return null;
+    }
+  }
+
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
@@ -7157,6 +7237,12 @@ export class AgentModeService {
         policy: policyDecision,
       };
     }
+
+    // ENG-803: the owner's publish-approval setting is enforced HERE, so it holds
+    // even if the model ignores the directive. Checked after arg repair so the
+    // action is read from the same args the tool would have run with.
+    const publishApprovalBlock = await this.blockedByScheduledPublishApproval(toolName, preparedArgs, sessionId);
+    if (publishApprovalBlock) return publishApprovalBlock;
 
     // In mock mode, only session-state tools (install_skills) execute for real
     // because they modify DynamoDB session state with no external side effects
