@@ -32,10 +32,26 @@ jobs:
       partner: ${{ steps.filter.outputs.partner }}
       workflows: ${{ steps.filter.outputs.workflows }}
     steps:
+      # ENG-729: shallow. This workflow only ever runs on `pull_request`, and on
+      # that event dorny/paths-filter reads the changed-file list from the
+      # GitHub REST API — "Uses GitHub REST API to fetch a list of modified
+      # files", needing only the `pull-requests: read` granted above. It runs
+      # git commands only for the push / merge_group / `base: HEAD` modes, none
+      # of which this workflow uses. So the full-history clone was never read by
+      # anything: the `Paths filter` step below measures 0s.
+      #
+      # It is not free, though. This job runs on every push to every PR, and
+      # `fetch-depth: 0` on a repo this size made its checkout the most
+      # expensive step in the run — 14s at best but 159s, 188s and 247s on
+      # sampled runs, against a steady 7-9s for the depth-1 checkouts elsewhere
+      # in this same file (`Require Greptile Review`).
+      #
+      # The checkout could be dropped outright per those docs; a shallow one is
+      # kept so the workspace is still populated for anything added here later.
       - name: Checkout
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Paths filter
         id: filter
@@ -123,10 +139,14 @@ jobs:
       group: ${{ github.workflow }}-backend-tests-a-${{ github.ref }}
       cancel-in-progress: true
     steps:
+      # ENG-729: shallow. This job installs, type-checks and runs Jest against
+      # the working tree; nothing in it reads git history (no `git` invocation
+      # in backend/src/__tests__, and jest resolves from `src/`). One sampled
+      # run spent 209s here.
       - name: Checkout PR head
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -138,9 +158,20 @@ jobs:
         working-directory: backend
         run: npm ci
 
-      - name: Build
+      # ENG-729: type-check instead of build. Jest runs through ts-jest against
+      # `src/`, so `dist/` is written by this step and then read by nothing —
+      # the emit was the waste, NOT the type-check.
+      #
+      # The type-check itself has to stay, and that is the part worth being
+      # explicit about. `tsconfig.jest.json` sets `isolatedModules: true`, so
+      # ts-jest is transpile-only and reports no type errors at all. This step
+      # is therefore the ONLY thing type-checking the backend on a PR; deleting
+      # it (rather than narrowing it) would have silently removed that gate.
+      # `npm run typecheck` is `tsc --noEmit` over the same tsconfig.json as
+      # `npm run build`, so the diagnostics are identical — only the emit goes.
+      - name: Type-check
         working-directory: backend
-        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
+        run: NODE_OPTIONS="--max-old-space-size=4096" npm run typecheck --if-present
 
       - name: Run tests (agentMode files)
         working-directory: backend
@@ -169,10 +200,12 @@ jobs:
       group: ${{ github.workflow }}-backend-tests-b-${{ github.ref }}
       cancel-in-progress: true
     steps:
+      # ENG-729: shallow, for the same reason as backend-tests-a. The coverage
+      # comment step below talks to the GitHub API, not to git.
       - name: Checkout PR head
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
@@ -184,9 +217,12 @@ jobs:
         working-directory: backend
         run: npm ci
 
-      - name: Build
+      # ENG-729: type-check instead of build, for the same reason as
+      # backend-tests-a above — `dist/` is never read by Jest, the type-check is
+      # load-bearing and stays.
+      - name: Type-check
         working-directory: backend
-        run: NODE_OPTIONS="--max-old-space-size=4096" npm run build --if-present
+        run: NODE_OPTIONS="--max-old-space-size=4096" npm run typecheck --if-present
 
       - name: Run tests with coverage (non-agentMode files)
         working-directory: backend
@@ -529,10 +565,14 @@ jobs:
       group: ${{ github.workflow }}-partner-tests-${{ github.ref }}
       cancel-in-progress: true
     steps:
+      # ENG-729: shallow — this job builds and tests the working tree only.
+      # Its `npm run build` below is deliberately KEPT: partner-portal's build
+      # is `tsc -b && vite build`, so unlike the backend jobs the build is the
+      # type-check here, not a discarded emit.
       - name: Checkout PR head
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Setup Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
