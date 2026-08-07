@@ -439,6 +439,68 @@ describe('sanitizeGeminiSchema', () => {
     });
   });
 
+  it('normalizes a union `type` array to a single Gemini type + nullable (ENG-826)', () => {
+    // Real prod shape from emma/tools.ts (get_meta_ads_metrics.campaign_ids,
+    // gmail send to/cc/bcc): a JSON-Schema union `type: ['array', 'string']`.
+    // Gemini's function-declaration Schema.type is a SINGLE OpenAPI type — a
+    // union array 400s the ENTIRE request the moment the tool is attached, so
+    // every gemini-3.5-flash agent turn carrying such a tool failed with zero
+    // assistant output (the ENG-826 silent-failure signature). 'array' is kept
+    // when `items` is present so the element schema stays meaningful.
+    const input = {
+      type: 'object',
+      properties: {
+        campaign_ids: { type: ['array', 'string'], items: { type: 'string' }, minItems: 1 },
+        note: { type: ['string', 'null'] },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        campaign_ids: { type: 'array', items: { type: 'string' }, minItems: 1 },
+        note: { type: 'string', nullable: true },
+      },
+    });
+  });
+
+  it('drops array-only keywords when a union `type` resolves to a non-array type', () => {
+    // A union with no `array` member resolves to a scalar and must not keep
+    // array-only constraints (items/minItems/maxItems) — Gemini rejects those
+    // on a non-array type.
+    const input = { type: ['string', 'number'], items: { type: 'string' }, maxItems: 5 };
+    expect(sanitizeGeminiSchema(input)).toEqual({ type: 'string' });
+  });
+
+  it('falls back to a scalar `string` for a degenerate union with no non-null member', () => {
+    // The `nonNull[0] || 'string'` fallback (geminiNativeClient.ts): a `type: []`
+    // (empty union) or `type: ['null']` (only null) has no resolvable member, so
+    // it must default to a concrete Gemini type rather than leaving `type`
+    // undefined/array — both of which Gemini rejects.
+    expect(sanitizeGeminiSchema({ type: [] })).toEqual({ type: 'string' });
+    expect(sanitizeGeminiSchema({ type: ['null'] })).toEqual({ type: 'string', nullable: true });
+  });
+
+  it('resolves an `object`/scalar union to `object` when the node carries `properties` (ENG-826)', () => {
+    // A union that pairs `object` with a scalar and actually defines `properties`
+    // (some MCP tools describe a payload this way) should collapse to `object` so
+    // the nested shape stays meaningful — not to the scalar member. Array-only
+    // keywords are irrelevant here and must not appear.
+    const input = {
+      type: ['object', 'string'],
+      properties: { id: { type: 'string' } },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: { id: { type: 'string' } },
+    });
+  });
+
+  it('does NOT force `object` for an object-union that lacks `properties`', () => {
+    // Without sibling `properties`, `object` is not more faithful than the scalar,
+    // so we fall to the first non-null member rather than inventing an empty object.
+    expect(sanitizeGeminiSchema({ type: ['string', 'object'] })).toEqual({ type: 'string' });
+  });
+
   it('drops oneOf/allOf/const (absent from the genai Schema type, e.g. dynamic MCP tool schemas)', () => {
     const input = {
       type: 'object',
@@ -452,6 +514,272 @@ describe('sanitizeGeminiSchema', () => {
       properties: {
         mode: {},
         combined: {},
+      },
+    });
+  });
+
+  it('drops `propertyNames` — the live @playwright/mcp browser_drop shape (ENG-845)', () => {
+    // Verbatim `data` property of browser_drop from `@playwright/mcp` 0.0.78. The
+    // playwright MCP server is registered in the prod `mcp_servers` setting; prod
+    // currently resolves the pinned 0.0.70, which predates this tool, so this guards
+    // the next version bump rather than a live break. Confirmed against the real API:
+    // unsanitized, this schema 400s the ENTIRE request with
+    //   Unknown name "propertyNames" at '...parameters.properties[1].value'
+    // which is exactly the ENG-845 zero-assistant-output / null-token signature.
+    const input = {
+      type: 'object',
+      properties: {
+        data: {
+          description: 'Data to drop, as a map of MIME type to string value.',
+          type: 'object',
+          propertyNames: { type: 'string' },
+          additionalProperties: { type: 'string' },
+        },
+      },
+      required: ['target'],
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        data: { description: 'Data to drop, as a map of MIME type to string value.', type: 'object' },
+      },
+      required: ['target'],
+    });
+  });
+
+  it('drops every keyword outside the genai Schema field set, not just known-bad ones (ENG-845)', () => {
+    // The sanitizer is an ALLOWLIST because Gemini rejects any unknown field
+    // outright. Each keyword below was confirmed against the real API to 400 the
+    // whole request; none of them was on the previous denylist. Third-party MCP tool
+    // schemas are arbitrary input, so enumerating bad keywords can never be complete.
+    const input = {
+      type: 'object',
+      properties: {
+        a: { type: 'string', examples: ['x'], contentEncoding: 'base64', readOnly: true },
+        b: { type: 'number', exclusiveMinimum: 0, exclusiveMaximum: 10, multipleOf: 2 },
+        c: { type: 'array', items: { type: 'string' }, uniqueItems: true, contains: { type: 'string' } },
+        d: { type: 'string', deprecated: true, not: { const: 'x' }, $comment: 'note' },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        a: { type: 'string' },
+        b: { type: 'number' },
+        c: { type: 'array', items: { type: 'string' } },
+        d: { type: 'string' },
+      },
+    });
+  });
+
+  it('never filters property NAMES that collide with schema keywords (ENG-845)', () => {
+    // `properties` maps NAMES to schemas, so the keyword filter must not be applied
+    // to its keys. A tool with a parameter literally called `const`, `not` or
+    // `additionalProperties` (legal, and present in real third-party MCP schemas)
+    // would otherwise have that parameter silently deleted from its declaration —
+    // the model then can never supply it.
+    const input = {
+      type: 'object',
+      properties: {
+        const: { type: 'string' },
+        not: { type: 'string' },
+        additionalProperties: { type: 'boolean' },
+        'x-request-id': { type: 'string' },
+      },
+      required: ['const'],
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        const: { type: 'string' },
+        not: { type: 'string' },
+        additionalProperties: { type: 'boolean' },
+        'x-request-id': { type: 'string' },
+      },
+      required: ['const'],
+    });
+  });
+
+  it('collapses a draft-07 tuple `items` array to its first schema (ENG-845)', () => {
+    // Gemini's `items` is a SINGLE Schema; a tuple array 400s with
+    // `Unknown name "0" at '...value.items'`. Keep the first element so the
+    // parameter stays usable rather than dropping `items` entirely.
+    const input = { type: 'object', properties: { pair: { type: 'array', items: [{ type: 'string' }, { type: 'number' }] } } };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: { pair: { type: 'array', items: { type: 'string' } } },
+    });
+  });
+
+  it('recurses into `anyOf` members so a nested bad keyword is stripped too (ENG-845)', () => {
+    // `anyOf` is the one composition keyword Gemini's `Schema` DOES model, so it
+    // survives the allowlist — which means its MEMBERS are still model-facing and
+    // must themselves be sanitized. A member carrying an unknown keyword would
+    // otherwise 400 the whole request exactly as a top-level one does.
+    const input = {
+      type: 'object',
+      properties: {
+        payload: {
+          anyOf: [
+            { type: 'string', pattern: '^v\\d+$', contentEncoding: 'base64' },
+            { type: 'object', properties: { id: { type: 'string', readOnly: true } }, additionalProperties: false },
+          ],
+        },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        payload: {
+          anyOf: [
+            { type: 'string', pattern: '^v\\d+$' },
+            { type: 'object', properties: { id: { type: 'string' } } },
+          ],
+        },
+      },
+    });
+  });
+
+  it('always emits `items` for an array — Gemini 400s without it (ENG-845)', () => {
+    // Confirmed against the real API: `{ type: 'array' }` alone fails the whole request
+    // with `properties[a].items: missing field`. Three paths can strip it — a degenerate
+    // tuple, a schema that never declared `items`, and depth/cycle truncation — so the
+    // fallback is applied last, after the union collapse has settled the final type.
+    expect(sanitizeGeminiSchema({ type: 'object', properties: { a: { type: 'array', items: [] } } }))
+      .toEqual({ type: 'object', properties: { a: { type: 'array', items: { type: 'string' } } } });
+    expect(sanitizeGeminiSchema({ type: 'object', properties: { a: { type: 'array', minItems: 1 } } }))
+      .toEqual({ type: 'object', properties: { a: { type: 'array', minItems: 1, items: { type: 'string' } } } });
+    // A union collapsing to `array` must get the fallback too.
+    expect(sanitizeGeminiSchema({ type: 'object', properties: { a: { type: ['array', 'string'] } } }))
+      .toEqual({ type: 'object', properties: { a: { type: 'array', items: { type: 'string' } } } });
+    // A real `items` is never overwritten.
+    expect(sanitizeGeminiSchema({ type: 'array', items: { type: 'number' } }))
+      .toEqual({ type: 'array', items: { type: 'number' } });
+  });
+
+  it('salvages a real element type from prefixItems/contains before guessing (ENG-845)', () => {
+    // An invented element type is a lie the model acts on — told an array-of-objects is
+    // an array-of-strings it sends strings, execute() rejects them against the ORIGINAL
+    // schema, and the user sees a tool error. `prefixItems` (the draft-2020 tuple form,
+    // used by @playwright/mcp and friends) and `contains` both describe the element and
+    // are dropped by the allowlist, so we read them off the input before falling back.
+    expect(sanitizeGeminiSchema({
+      type: 'array',
+      prefixItems: [{ type: 'object', properties: { id: { type: 'string' } } }],
+    })).toEqual({ type: 'array', items: { type: 'object', properties: { id: { type: 'string' } } } });
+
+    expect(sanitizeGeminiSchema({ type: 'array', contains: { type: 'number' } }))
+      .toEqual({ type: 'array', items: { type: 'number' } });
+
+    // A donor that sanitizes to something Gemini still can't use falls through to the guess.
+    expect(sanitizeGeminiSchema({ type: 'array', contains: { readOnly: true } }))
+      .toEqual({ type: 'array', items: { type: 'string' } });
+  });
+
+  it('reports a degraded schema once, and stays silent on a clean one (ENG-845)', () => {
+    // Silence is what made the original ENG-845 failure expensive to find, so every
+    // degradation is surfaced — but aggregated, or a pathological schema would emit a
+    // line per node.
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      sanitizeGeminiSchema({ type: 'object', properties: { a: { type: 'array', items: { type: 'number' } } } });
+      expect(warn).not.toHaveBeenCalled();
+
+      sanitizeGeminiSchema({
+        type: 'object',
+        properties: { a: { type: 'array' }, b: { type: 'array' }, c: { type: 'array', contains: { type: 'number' } } },
+      });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        'Gemini schema sanitizer degraded a tool schema:',
+        expect.objectContaining({ guessedArrayItems: 2, salvagedArrayItems: 1, truncatedNodes: 0 }),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('truncates a self-referencing schema instead of overflowing the stack (ENG-845)', () => {
+    // A dereferenced $ref or a hand-built circular object would recurse forever and take
+    // the worker down mid-turn — the very zero-assistant-output signature this fixes.
+    const cyclic: any = { type: 'object', properties: { name: { type: 'string' } } };
+    cyclic.properties.self = cyclic;
+    expect(sanitizeGeminiSchema(cyclic)).toEqual({
+      type: 'object',
+      properties: { name: { type: 'string' }, self: { type: 'object' } },
+    });
+
+    // Mutual recursion (A -> B -> A) must terminate too.
+    const a: any = { type: 'object', properties: {} };
+    const b: any = { type: 'object', properties: { back: a } };
+    a.properties.fwd = b;
+    expect(sanitizeGeminiSchema(a)).toEqual({
+      type: 'object',
+      properties: { fwd: { type: 'object', properties: { back: { type: 'object' } } } },
+    });
+  });
+
+  it('truncates a cycle reached through `items` or `anyOf`, not just `properties` (ENG-845)', () => {
+    // Each schema-bearing key has its own truncation branch, so each needs its own
+    // cycle. An array whose element type is itself, and a union with itself as a member,
+    // are both reachable from a dereferenced $ref in a generated schema.
+    const cyclicArray: any = { type: 'array' };
+    cyclicArray.items = cyclicArray;
+    // The truncated leaf is an array, so the items fallback applies — never a bare
+    // `{ type: 'array' }`, which Gemini rejects outright.
+    expect(sanitizeGeminiSchema(cyclicArray)).toEqual({
+      type: 'array',
+      items: { type: 'array', items: { type: 'string' } },
+    });
+
+    const cyclicUnion: any = { type: 'object', properties: { v: { type: 'string' } } };
+    cyclicUnion.anyOf = [cyclicUnion];
+    expect(sanitizeGeminiSchema(cyclicUnion)).toEqual({
+      type: 'object',
+      properties: { v: { type: 'string' } },
+      anyOf: [{ type: 'object' }],
+    });
+  });
+
+  it('expands a schema object SHARED between siblings in both branches (ENG-845)', () => {
+    // Cycle detection tracks ANCESTRY, not every object ever seen — otherwise a shared
+    // sub-schema (common in generated schemas) would be truncated in whichever branch
+    // happened to be visited second.
+    const shared = { type: 'string', description: 'shared' };
+    expect(sanitizeGeminiSchema({ type: 'object', properties: { x: shared, y: shared } })).toEqual({
+      type: 'object',
+      properties: { x: { type: 'string', description: 'shared' }, y: { type: 'string', description: 'shared' } },
+    });
+  });
+
+  it('caps nesting depth below the limit Gemini itself enforces (ENG-845)', () => {
+    // Gemini rejects beyond `Message recursion depth exceeds maximum of 64`, counted in
+    // protobuf messages — an object level costs two. Measured live: 30-deep objects fail,
+    // 25 passes. We cap at 20 so a pathological schema truncates instead of 400ing.
+    let deep: any = { type: 'string' };
+    for (let i = 0; i < 300; i++) deep = { type: 'object', properties: { n: deep } };
+    let node = sanitizeGeminiSchema(deep);
+    let levels = 0;
+    while (node?.properties?.n) { node = node.properties.n; levels++; }
+    expect(levels).toBe(20);
+    expect(node).toEqual({ type: 'object' });
+  });
+
+  it('passes `default`/`example` instance values through untouched', () => {
+    // These hold literal INSTANCE data, not sub-schemas, so the keyword filter must
+    // not be applied to their contents — Gemini accepts an arbitrary object there.
+    const input = {
+      type: 'object',
+      properties: {
+        cfg: { type: 'object', properties: { mode: { type: 'string' } }, default: { mode: 'fast', const: 1 } },
+        tag: { type: 'string', example: 'beta' },
+      },
+    };
+    expect(sanitizeGeminiSchema(input)).toEqual({
+      type: 'object',
+      properties: {
+        cfg: { type: 'object', properties: { mode: { type: 'string' } }, default: { mode: 'fast', const: 1 } },
+        tag: { type: 'string', example: 'beta' },
       },
     });
   });

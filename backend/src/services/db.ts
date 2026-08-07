@@ -93,6 +93,13 @@ const dedupeLinkedInMessageEvents = <T extends { eventId?: string; eventType?: s
 
 const ENGAGED_EVENT_KEYWORDS = ["clicked", "replied", "received"];
 
+/**
+ * Engagement count at which a lead is logged as approaching the 400 KB DynamoDB
+ * item ceiling. The array is unbounded by design; this makes the growth visible
+ * before writes start failing.
+ */
+const ENGAGEMENT_COUNT_WARN_THRESHOLD = 500;
+
 const engagementMatchesKeyword = (engagement: any): boolean => {
   const eventType = String(engagement?.eventType || "").toLowerCase();
   const eventData = String(JSON.stringify(engagement?.eventData || {})).toLowerCase();
@@ -307,6 +314,8 @@ export interface User {
   // ── Ad image axis ──
   adImageStatus?: "idle" | "running" | "ready" | "failed";
   adImageStartedAt?: string;
+  /** Per-run nonce identifying the run that owns the axis — see AdImageStatusFields. */
+  adImageRunId?: string;
   adImageCompletedAt?: string;
   adImageDurationMs?: number;
   adImageError?: string;
@@ -1435,7 +1444,27 @@ export class UserDB {
     }
   }
 
-  async updateUser(userId: string, updates: Partial<User>) {
+  /**
+   * @param options.condition Optional DynamoDB ConditionExpression applied to
+   *   the write. Callers that decide *whether* to write from a prior read
+   *   (e.g. the onboarding ad-image axis, which only lets the owning run
+   *   publish a terminal state) must restate that decision here: without it
+   *   the read and the write are two separate operations and a concurrent
+   *   writer can slip between them (ENG-792). A failed condition surfaces as
+   *   a `ConditionalCheckFailedException` — an expected outcome for those
+   *   callers, so it is re-thrown untouched rather than logged as an error.
+   */
+  async updateUser(
+    userId: string,
+    updates: Partial<User>,
+    options?: {
+      condition?: {
+        expression: string;
+        names?: { [key: string]: string };
+        values?: { [key: string]: any };
+      };
+    }
+  ) {
     // First, get the user by userId to ensure they exist and to get their email
     const user = await this.getUserById(userId);
     if (!user || !user.email) {
@@ -1490,6 +1519,11 @@ export class UserDB {
       ExpressionAttributeNames: expressionAttributeNames,
       ReturnValues: "ALL_NEW",
     };
+    if (options?.condition) {
+      params.ConditionExpression = options.condition.expression;
+      Object.assign(expressionAttributeNames, options.condition.names || {});
+      Object.assign(expressionAttributeValues, options.condition.values || {});
+    }
     // DynamoDB rejects an empty ExpressionAttributeValues map (e.g. when every
     // update is a REMOVE-on-null with no SET clauses at all).
     if (Object.keys(expressionAttributeValues).length > 0) {
@@ -1499,7 +1533,12 @@ export class UserDB {
     try {
       const result = await this.docClient.update(params).promise();
       return result.Attributes as User;
-    } catch (error) {
+    } catch (error: any) {
+      // An unmet condition is the caller's own guard firing, not a fault —
+      // hand it back verbatim instead of logging it as a DynamoDB error.
+      if (options?.condition && error?.code === "ConditionalCheckFailedException") {
+        throw error;
+      }
       handleDynamoDbError(error, "updateUser");
       throw error; // Re-throw after logging
     }
@@ -5304,9 +5343,16 @@ export const crmDb = {
     // metadata. Lookup GSIs partition on email/linkedin/nameCompanyKey, not
     // userId, so userId is not load-bearing for retrieval — only audit.
     userId?: string;
+    // ENG-787: caller-supplied deterministic leadId + fail-if-exists conditional
+    // create. Lets a caller that keys a lead on a stable identity (the invite
+    // mirror keys on the normalized LinkedIn URL) dedup two concurrent creates:
+    // both target the SAME (listId, leadId) item, so the second's conditional put
+    // fails with `leadAlreadyExists` instead of spawning a duplicate lead.
+    leadId?: string;
+    failIfExists?: boolean;
   }) {
     try {
-      const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const leadId = leadData.leadId?.trim() || `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
       // Check for duplicate email if email is provided
       if (leadData.email && leadData.email.trim()) {
@@ -5317,7 +5363,20 @@ export const crmDb = {
       }
 
       const emailValue = leadData.email?.trim().toLowerCase();
-      const linkedinValue = leadData.linkedin?.trim();
+      // Store LinkedIn URL in canonical form (matching batchCreateLeads) so the
+      // LinkedinLookupIndex GSI stays canonical and future dedup reads match
+      // regardless of the source's formatting (ENG-787).
+      //
+      // normalizeLinkedInUrl returns '' for anything that is not a personal /in/
+      // profile (company page, school, free text). Falling back to the trimmed raw
+      // value keeps that content — canonicalization must never silently discard
+      // what the caller supplied, which is what dropping to '' would do.
+      // Only an actual personal /in/ profile is canonicalized. normalizeLinkedInUrl
+      // returns '' for company/school URLs and lowercases free text, so guarding on
+      // '/in/' keeps everything else byte-identical to what the caller sent.
+      const rawLinkedin = leadData.linkedin?.trim();
+      const canonicalLinkedin = normalizeLinkedInUrl(leadData.linkedin);
+      const linkedinValue = canonicalLinkedin.includes('/in/') ? canonicalLinkedin : rawLinkedin;
       const item: any = {
         listId,
         leadId,
@@ -5429,10 +5488,16 @@ export const crmDb = {
       });
       Object.assign(item, attributionFields);
 
-      const params = {
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Item: item,
       };
+      // ENG-787: when the caller keys the lead on a deterministic id, create it
+      // only if that (listId, leadId) item does not already exist, so two
+      // concurrent creates of the same identity resolve to one lead.
+      if (leadData.failIfExists) {
+        params.ConditionExpression = 'attribute_not_exists(leadId)';
+      }
 
       await dynamodb.put(params).promise();
 
@@ -5496,7 +5561,15 @@ export const crmDb = {
       }
 
       return params.Item;
-    } catch (error) {
+    } catch (error: any) {
+      // ENG-787: a fail-if-exists create that loses the race is not an error the
+      // caller should treat as a DB fault — surface it as a tagged signal so the
+      // invite mirror can adopt the winning lead instead of duplicating it.
+      if (leadData.failIfExists && error?.code === 'ConditionalCheckFailedException') {
+        const raceError: any = new Error('Lead already exists for this deterministic key');
+        raceError.leadAlreadyExists = true;
+        throw raceError;
+      }
       handleDynamoDbError(error, "createLead");
       throw error;
     }
@@ -5701,6 +5774,52 @@ export const crmDb = {
       return result.Items || [];
     } catch (error) {
       handleDynamoDbError(error, 'findLeadsByLinkedin');
+      throw error;
+    }
+  },
+
+  /**
+   * Find the lead in ONE list whose linkedin matches, via LinkedinLookupIndex.
+   *
+   * findLeadsByLinkedin caps at 10 items across ALL tenants, so a profile that
+   * exists as a lead in more than 10 lists can page past the caller's list and be
+   * reported absent — which makes a caller create a duplicate lead in a list that
+   * already has that person (ENG-787). Filtering server-side on listId and paging
+   * until the match is found removes that ceiling.
+   *
+   * Returns the freshest matching lead, or null.
+   */
+  async findLeadByLinkedinInList(listId: string, linkedin: string) {
+    const value = (linkedin ?? '').trim();
+    if (!value || !listId) return null;
+    // Bounded so a pathological fan-out can never spin: 20 pages of a
+    // single-partition GSI query is far beyond any real profile's reuse.
+    const MAX_PAGES = 20;
+    try {
+      let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+      let pages = 0;
+      do {
+        const result = await dynamodb.query({
+          TableName: `${TABLE_PREFIX}AW-Leads`,
+          IndexName: 'LinkedinLookupIndex',
+          KeyConditionExpression: 'linkedin = :linkedin',
+          FilterExpression: 'listId = :listId',
+          ExpressionAttributeValues: { ':linkedin': value, ':listId': listId },
+          ScanIndexForward: false,
+          // Bound the read units consumed per request. The filter is applied AFTER
+          // Limit, so this caps work per call without capping the search — the
+          // pagination below still walks the whole partition when it has to.
+          Limit: 100,
+          ExclusiveStartKey: lastEvaluatedKey,
+        }).promise();
+        const hit = (result.Items || [])[0];
+        if (hit) return hit;
+        lastEvaluatedKey = result.LastEvaluatedKey;
+        pages++;
+      } while (lastEvaluatedKey && pages < MAX_PAGES);
+      return null;
+    } catch (error) {
+      handleDynamoDbError(error, 'findLeadByLinkedinInList');
       throw error;
     }
   },
@@ -5974,10 +6093,20 @@ export const crmDb = {
       }
 
       if (updates.linkedin !== undefined) {
+        // Canonicalize (matching batchCreateLeads / createLead) so the
+        // LinkedinLookupIndex GSI stays canonical and dedup reads match
+        // regardless of the source's formatting (ENG-787).
+        //
+        // A non-personal URL normalizes to '' — fall back to the trimmed raw value
+        // so the field is only REMOVED when the caller actually sent an empty
+        // value. Without this, updating a lead whose linkedin holds a company page
+        // would silently delete it.
         const trimmedLinkedin = (updates.linkedin ?? '').trim();
-        if (trimmedLinkedin) {
+        const canonicalLinkedin = normalizeLinkedInUrl(updates.linkedin);
+        const normalizedLinkedin = canonicalLinkedin.includes('/in/') ? canonicalLinkedin : trimmedLinkedin;
+        if (normalizedLinkedin) {
           setExpressions.push('linkedin = :linkedin');
-          expressionAttributeValues[':linkedin'] = trimmedLinkedin;
+          expressionAttributeValues[':linkedin'] = normalizedLinkedin;
         } else {
           // Keep LinkedinLookupIndex sparse — empty/null values must not appear.
           removeExpressions.push('linkedin');
@@ -6989,14 +7118,21 @@ export const crmDb = {
     eventType: string;
     eventData: any;
     createdAt: string;
-  }) {
+  }, opts: {
+    /**
+     * Compare-and-swap guard. When supplied, the append only lands if the lead's
+     * `updatedAt` still equals this value — i.e. nothing has written to the lead
+     * since the caller read it. Callers that decide whether to append by INSPECTING
+     * the current engagements need this: the read and the append are otherwise two
+     * separate operations, so two of them can both observe "not present" and both
+     * append. On a lost race the thrown error carries `preconditionFailed` so the
+     * caller can re-read and re-decide.
+     *
+     * Omit it for unconditional appends (the common case) — behaviour is unchanged.
+     */
+    expectedUpdatedAt?: string;
+  } = {}) {
     try {
-      // Get the lead first to ensure it exists
-      const lead = await this.getLeadById(listId, leadId);
-      if (!lead) {
-        throw new Error('Lead not found');
-      }
-
       // Generate a unique eventId for this engagement
       const eventId = `custom_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
@@ -7006,30 +7142,90 @@ export const crmDb = {
         eventId,
       };
 
-      // Get existing engagements or initialize empty array
-      const existingEngagements = (lead.engagements as Array<{ eventId?: string; eventType: string; eventData: any; createdAt: string }>) || [];
+      // Append atomically. This used to read the lead, concatenate in memory and
+      // write the whole array back — two engagements landing concurrently (e.g. an
+      // outreach run and the invite reconciliation touching the same lead) would
+      // both read the same base array and the second write would silently drop the
+      // first. list_append lets DynamoDB do the concatenation server-side, and
+      // attribute_exists replaces the pre-read that enforced "lead must exist".
+      //
+      // isEngaged is only ever raised, never recomputed: it is monotonic (an
+      // engagement is never removed by this path), so a matching new event sets it
+      // and a non-matching one leaves whatever earlier events established.
+      const raisesEngaged = engagementMatchesKeyword(engagementWithId);
+      // The CAS token IS updatedAt. new Date() is millisecond-resolution, so an
+      // append landing in the same millisecond as the updatedAt it guards against
+      // could rewrite the identical value — leaving the token unchanged and
+      // letting a second concurrent CAS append satisfy the first writer's
+      // precondition too, double-recording the engagement. Force the replacement
+      // strictly past the precondition so any successful append MOVES the token,
+      // which makes a losing racer's condition fail and re-decide (ENG-787).
+      let stampedUpdatedAt = new Date().toISOString();
+      if (opts.expectedUpdatedAt !== undefined && stampedUpdatedAt <= opts.expectedUpdatedAt) {
+        const bumped = new Date(new Date(opts.expectedUpdatedAt).getTime() + 1);
+        if (!Number.isNaN(bumped.getTime())) stampedUpdatedAt = bumped.toISOString();
+      }
+      const setClauses = [
+        'engagements = list_append(if_not_exists(engagements, :empty), :new)',
+        'updatedAt = :updatedAt',
+      ];
+      const expressionAttributeValues: Record<string, any> = {
+        ':empty': [],
+        ':new': [engagementWithId],
+        ':updatedAt': stampedUpdatedAt,
+      };
+      if (raisesEngaged) {
+        setClauses.push('isEngaged = :isEngaged');
+        expressionAttributeValues[':isEngaged'] = 1;
+      }
 
-      // Add the new engagement
-      const updatedEngagements = [...existingEngagements, engagementWithId];
-      const isEngaged = updatedEngagements.some(engagementMatchesKeyword) ? 1 : 0;
+      const conditions = ['attribute_exists(leadId)'];
+      if (opts.expectedUpdatedAt !== undefined) {
+        conditions.push('updatedAt = :expectedUpdatedAt');
+        expressionAttributeValues[':expectedUpdatedAt'] = opts.expectedUpdatedAt;
+      }
 
-      // Update the lead with the new engagements array
       const params = {
         TableName: `${TABLE_PREFIX}AW-Leads`,
         Key: {
           listId,
           leadId,
         },
-        UpdateExpression: 'SET engagements = :engagements, isEngaged = :isEngaged, updatedAt = :updatedAt',
-        ExpressionAttributeValues: {
-          ':engagements': updatedEngagements,
-          ':isEngaged': isEngaged,
-          ':updatedAt': new Date().toISOString(),
-        },
+        UpdateExpression: `SET ${setClauses.join(', ')}`,
+        ConditionExpression: conditions.join(' AND '),
+        ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: 'ALL_NEW',
       };
 
-      const result = await dynamodb.update(params).promise();
+      let result;
+      try {
+        result = await dynamodb.update(params).promise();
+      } catch (updateError: any) {
+        if (updateError?.code === 'ConditionalCheckFailedException') {
+          // With a CAS guard the failure is ambiguous — the lead may be gone OR it
+          // may have changed under the caller. Flag it so the caller can re-read
+          // and re-decide instead of treating a lost race as a missing lead.
+          if (opts.expectedUpdatedAt !== undefined) {
+            const raceError: any = new Error('Lead engagement precondition failed');
+            raceError.preconditionFailed = true;
+            throw raceError;
+          }
+          // Preserve the pre-existing contract for a missing lead.
+          throw new Error('Lead not found');
+        }
+        throw updateError;
+      }
+
+      // A DynamoDB item is capped at 400 KB and engagements are unbounded, so a
+      // very long-lived lead can eventually fail to accept writes. Surface that
+      // before it becomes a hard failure rather than discovering it in an outage.
+      const engagementCount = (result.Attributes?.engagements as any[] | undefined)?.length ?? 0;
+      if (engagementCount >= ENGAGEMENT_COUNT_WARN_THRESHOLD) {
+        console.warn(
+          `[crmDb.addLeadEngagement] lead ${listId}/${leadId} now holds ${engagementCount} engagements — approaching the DynamoDB item-size ceiling`,
+        );
+      }
+
       return result.Attributes;
     } catch (error) {
       handleDynamoDbError(error, "addLeadEngagement");
@@ -8139,7 +8335,18 @@ export const accountMemoryDb = {
     if (!content || content.trim().length === 0) {
       throw new Error('Content is required');
     }
-    if (content.length > 2000) {
+    // Counted in Unicode characters (code points), matching the `maxLength: 2000`
+    // the memory tools advertise in JSON Schema and that the tool gateway
+    // enforces. `content.length` counts UTF-16 code units, so it rejected 1,001
+    // emoji — 1,001 characters, well inside the declared limit — turning a
+    // schema-valid call into a runtime throw (ENG-821). Declared and enforced
+    // have to use the same unit or the contract is a lie for astral input.
+    //
+    // Only ever accepts MORE than before, never less, so nothing previously
+    // valid becomes invalid. Worst-case stored size roughly doubles (2,000
+    // astral chars ≈ 8 KB UTF-8) — negligible against DynamoDB's 400 KB limit.
+    // The other three memory guards below/above match this unit deliberately.
+    if (Array.from(content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 
@@ -8240,7 +8447,9 @@ export const accountMemoryDb = {
     if (updates.content !== undefined && updates.content.trim().length === 0) {
       throw new Error('Content cannot be empty');
     }
-    if (updates.content !== undefined && updates.content.length > 2000) {
+    // Code points, not UTF-16 code units — same unit as the declared
+    // `maxLength: 2000` and the addMemory guard (ENG-821).
+    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 
@@ -8304,7 +8513,9 @@ export const orgMemoryDb = {
     if (!content || content.trim().length === 0) {
       throw new Error('Content is required');
     }
-    if (content.length > 2000) {
+    // Code points, not UTF-16 code units — same unit as the declared
+    // `maxLength: 2000` and the addMemory guard (ENG-821).
+    if (Array.from(content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 
@@ -8404,7 +8615,9 @@ export const orgMemoryDb = {
     if (updates.content !== undefined && updates.content.trim().length === 0) {
       throw new Error('Content cannot be empty');
     }
-    if (updates.content !== undefined && updates.content.length > 2000) {
+    // Code points, not UTF-16 code units — same unit as the declared
+    // `maxLength: 2000` and the addMemory guard (ENG-821).
+    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 

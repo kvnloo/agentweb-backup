@@ -32,6 +32,7 @@ import boto3  # Add at the top with other imports
 from urllib.parse import quote
 from task_utils import get_downloads_path, upload_task_result_files, get_llm, validate_content_format, extract_json_from_content, generate_content_hash, get_agent_code_base_path, call_github_api, run_python_code_in_sandbox, fetch_api_credentials, decrypt_password, get_all_configs, parse_json, convert_svg_to_png
 from knowledge_base_utils import get_knowledge_base_manager
+from partial_extraction import collect_partial_extraction, build_incomplete_run_message
 from datetime import datetime, timezone
 import PyPDF2
 import docx
@@ -416,8 +417,23 @@ class WebAgent:
                 task_is_done = True
                 agent_message = result.history[-1].result[-1].extracted_content
 
+            # ENG-859: a run that reached its step/time limit before the agent
+            # signalled `done` used to discard everything already scraped and
+            # return a bare "please restart" error — e.g. a long LinkedIn activity
+            # extraction zeroed out at the step limit. Salvage the partial content
+            # so the user gets what was gathered (and can ask to continue) instead
+            # of starting over from scratch.
+            partial_extraction = None
+            if not task_is_done:
+                partial_extraction = collect_partial_extraction(result)
+                if partial_extraction:
+                    logger.info(
+                        f"Run did not signal done; salvaged {len(partial_extraction)} chars of partial extraction"
+                    )
+
             if agent_message is None:
-                agent_message = 'Oops! Something went wrong while running AgentWeb.'
+                agent_message = build_incomplete_run_message(partial_extraction) or \
+                    'Oops! Something went wrong while running AgentWeb.'
             
             # If json output is required, validate the response is proper JSON
             if output_as_json and task_is_done:
@@ -449,8 +465,11 @@ class WebAgent:
             result_files = []
             downloads_path = self._get_downloads_path()
             
-            # Extract JSON content if enabled
-            if extract_page_content:
+            # Extract JSON content if enabled — also run it when a run ended
+            # incomplete but left partial content behind (ENG-859), so any
+            # structured data scraped before the step/time limit is persisted to
+            # files rather than lost with the aborted run.
+            if extract_page_content or partial_extraction:
                 logger.info("Extract page content flag is enabled, extracting JSON objects...")
                 # Use history.extracted_content() to get all extracted content
                 all_content = result.extracted_content()
@@ -491,6 +510,7 @@ class WebAgent:
             return {
                 "success": task_is_done,
                 "summary" if task_is_done else "error": agent_message,
+                "partial": bool(partial_extraction) and not task_is_done,
                 "llmName": self.llm_name,
                 "result_files": result_files if result_files else None
             }

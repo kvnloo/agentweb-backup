@@ -133,6 +133,64 @@ describe('AgentModeService - Meta Ads Complete CRUD', () => {
         expect(result.message).toBe('Ad set "New Ad Set" created successfully');
         expect(result.adSet).toEqual(mockAdSetData);
       });
+
+      // ENG-600 regression lock: targeting.custom_audiences/excluded_custom_audiences
+      // must pass through to metaService.createAdSet verbatim (no whitelist/strip),
+      // since the new audience-sourced campaign-launch workflows rely on this being
+      // a true passthrough with zero service-layer changes.
+      it('passes targeting.custom_audiences through to metaService.createAdSet verbatim', async () => {
+        const mockAdSetData = { id: 'adset_456', name: 'Targeted Ad Set' };
+        const params = {
+          name: 'Targeted Ad Set',
+          campaign_id: 'camp_123',
+          billing_event: 'IMPRESSIONS',
+          optimization_goal: 'REACH',
+          targeting: {
+            geo_locations: { countries: ['US'] },
+            custom_audiences: [{ id: 'aud_seed_1' }],
+          },
+          daily_budget: 1000,
+          bid_strategy: 'LOWEST_COST_WITH_BID_CAP',
+          bid_amount: 2.00,
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_AWARENESS' });
+        (metaService.createAdSet as jest.Mock).mockResolvedValue(mockAdSetData);
+
+        await agentModeService.createMetaAdsAdSet('user123', params);
+
+        const [, , calledParams] = (metaService.createAdSet as jest.Mock).mock.calls[0];
+        expect(calledParams.targeting.custom_audiences).toEqual([{ id: 'aud_seed_1' }]);
+      });
+
+      it('passes targeting.excluded_custom_audiences through to metaService.createAdSet verbatim', async () => {
+        const mockAdSetData = { id: 'adset_789', name: 'Retargeting Ad Set' };
+        const params = {
+          name: 'Retargeting Ad Set',
+          campaign_id: 'camp_123',
+          billing_event: 'IMPRESSIONS',
+          optimization_goal: 'REACH',
+          targeting: {
+            geo_locations: { countries: ['US'] },
+            custom_audiences: [{ id: 'aud_seed_2' }],
+            excluded_custom_audiences: [{ id: 'aud_broad_control' }],
+          },
+          daily_budget: 1000,
+          bid_strategy: 'LOWEST_COST_WITH_BID_CAP',
+          bid_amount: 2.00,
+        };
+
+        (userDb.getUserById as jest.Mock).mockResolvedValue(mockUser);
+        (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_123', objective: 'OUTCOME_AWARENESS' });
+        (metaService.createAdSet as jest.Mock).mockResolvedValue(mockAdSetData);
+
+        await agentModeService.createMetaAdsAdSet('user123', params);
+
+        const [, , calledParams] = (metaService.createAdSet as jest.Mock).mock.calls[0];
+        expect(calledParams.targeting.excluded_custom_audiences).toEqual([{ id: 'aud_broad_control' }]);
+        expect(calledParams.targeting.custom_audiences).toEqual([{ id: 'aud_seed_2' }]);
+      });
     });
 
     describe('updateMetaAdsAdSet', () => {

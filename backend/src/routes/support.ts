@@ -6,6 +6,16 @@ import { settingsService } from "../services/settingsService";
 import { uploadScreenshotToS3, presignS3Url } from "../utils/s3Utils";
 import { RESEND_SYSTEM_EMAIL, RESEND_SYSTEM_NAME } from "../config";
 import { getUserFunnelStatusIssueTags, getUserFunnelStatusLabel } from "../utils/userFunnelStatus";
+import {
+  buildReportTitle,
+  toSingleLine,
+  reportFingerprint,
+  fileReportOnce,
+  REPORT_CAPACITY_WAIT_MS,
+  ReportReplayCapacityError,
+} from "../utils/reportIntake";
+import { reportUIError } from "../utils/errorReporter";
+import type { FiledUserResult } from "../services/intakeService";
 
 const router = express.Router();
 
@@ -250,12 +260,130 @@ const REPORT_TYPES: Record<string, ReportTypeConfig> = {
   },
 };
 
+/**
+ * Everything the best-effort product-team notification needs for a report that is ALREADY filed.
+ */
+interface ProductReportNotification {
+  config: ReportTypeConfig;
+  /** The shared, already-normalized single-line report title. */
+  title: string;
+  /** The reporter's original text, line breaks intact (the email body renders them). */
+  description: string;
+  userEmail: string;
+  userDisplayName: string;
+  pageUrl?: string;
+  screenshotUrl: string | null;
+  filed: FiledUserResult;
+  issueId?: string;
+  funnelStatusLabel: string | null;
+  /** Admin email when the report came in through a delegated session. */
+  adminEmail?: string;
+}
+
+/**
+ * Notify the product team about an ALREADY-FILED report.
+ *
+ * Every step that can fail — presigning the screenshot, reading the recipient setting, the send
+ * itself — lives behind this one boundary, so a notification problem can never turn a successful
+ * filing into a failed request (ENG-529). The caller records a throw for operators.
+ */
+async function sendProductReportNotification(n: ProductReportNotification): Promise<void> {
+  // Presign the screenshot so the email can render an inline preview that the
+  // recipient can actually load (the bucket is private).
+  const previewUrl = n.screenshotUrl ? presignS3Url(n.screenshotUrl) : null;
+
+  const delegationNote = n.adminEmail
+    ? `<div style="background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 10px; margin-bottom: 15px;">
+           <strong>⚠️ Note:</strong> Submitted via admin delegation by ${n.adminEmail}
+         </div>`
+    : "";
+
+  const emailHtml = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; line-height: 1.6; color: #333;">
+  <div style="max-width: 640px; margin: 0 auto; padding: 20px;">
+    <div style="background-color: ${n.config.accent.bg}; padding: 16px 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid ${n.config.accent.border};">
+      <h2 style="margin: 0; color: ${n.config.accent.heading}; font-size: 18px;">${n.config.headerLabel}</h2>
+    </div>
+
+    ${delegationNote}
+
+    <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+      <tr><td style="padding: 6px 0; color: #666; width: 140px; vertical-align: top;"><strong>Reported by</strong></td><td style="padding: 6px 0;"><a href="mailto:${n.userEmail}" style="color: #4F46E5;">${n.userDisplayName}</a> (${n.userEmail})</td></tr>
+      ${n.funnelStatusLabel ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>User status</strong></td><td style="padding: 6px 0;">${n.funnelStatusLabel}</td></tr>` : ""}
+      ${n.issueId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">${n.issueId}</td></tr>` : ""}
+      ${n.filed.trackerUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${n.filed.tracker}</strong></td><td style="padding: 6px 0;"><a href="${n.filed.trackerUrl}" style="color: #4F46E5; font-weight: 600;">→ Open in ${n.filed.tracker}</a></td></tr>` : ""}
+      ${n.filed.canonicalUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Linear canonical</strong></td><td style="padding: 6px 0;"><a href="${n.filed.canonicalUrl}" style="color: #4F46E5; font-weight: 600;">→ Open canonical in Linear</a></td></tr>` : ""}
+      ${n.pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${n.pageUrl}" style="color: #4F46E5;">${n.pageUrl}</a></td></tr>` : ""}
+    </table>
+
+    <div style="background-color: #fff; border-left: 4px solid ${n.config.accent.border}; padding: 15px; border-radius: 0 4px 4px 0;">
+      <div style="font-weight: 600; margin-bottom: 8px; color: #333;">What the user reported</div>
+      <div style="color: #444; line-height: 1.6;">${n.description.replace(/\n/g, "<br>")}</div>
+    </div>
+
+    ${previewUrl ? `<div style="margin-top: 20px;"><div style="font-weight: 600; margin-bottom: 8px; color: #333;">Screenshot</div><a href="${previewUrl}"><img src="${previewUrl}" alt="Screenshot" style="max-width: 100%; border: 1px solid #e5e7eb; border-radius: 6px;"></a><div style="font-size: 12px; color: #9ca3af; margin-top: 4px;">This preview link expires in ~1 hour.</div></div>` : ""}
+
+    <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #9ca3af;">
+      Reply to this email to respond directly to the customer.
+    </div>
+  </div>
+</body>
+</html>
+    `;
+
+  const productIssueEmails = await settingsService.getJsonArraySetting("product_issue_emails", ["founders@agentweb.pro"]);
+  const recipients = n.adminEmail ? [...productIssueEmails, n.adminEmail] : productIssueEmails;
+
+  await resendService.sendEmail({
+    from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
+    to: recipients,
+    // Single-lined at the boundary too: an email subject must never carry a line break
+    // (Resend answers `422 validation_error` and the whole send is rejected — ENG-529).
+    subject: toSingleLine(`[${n.config.subjectLabel}] ${n.title} — reported by ${n.userEmail}`),
+    html: emailHtml,
+    replyTo: n.userEmail,
+  });
+}
+
+/**
+ * Record a notification that never went out. The report IS filed and the user was told so, but
+ * the product team never heard about it — that must be loud for operators, never swallowed.
+ */
+async function recordNotificationFailure(error: unknown, context: Record<string, any>, userId: string): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error("[support] product report filed but the team notification failed:", { ...context, error: message });
+  try {
+    await reportUIError({
+      operation: "support:report-ui-bug:notification",
+      errorMessage: message,
+      userId,
+      context,
+    });
+  } catch (reportingError) {
+    // The structured reporter is itself best-effort; the console.error above is the floor.
+    console.error("[support] failed to record the notification failure:", reportingError);
+  }
+}
+
 // Report a product issue from the in-app feedback button. Supports bugs,
 // feature requests, improvement suggestions, and general feedback. The client
 // auto-captures a screenshot; here we upload it, create a tracked item on the
 // engineering sprint board, and notify the product team — the same pipeline
 // used by Emma's report_product_issues tool.
+//
+// The filing is the durable outcome; the notification is best-effort (ENG-529). They have
+// separate failure boundaries: filing failure -> 500 and nothing is claimed as tracked;
+// notification failure -> the user still gets the success + tracking link, and the failure is
+// recorded for operators.
 router.post("/report-ui-bug", async (req, res) => {
+  let notify: ProductReportNotification;
+  let filed: FiledUserResult;
+  let replayed: boolean;
+  let issueId: string | undefined;
+
   try {
     const authenticatedReq = req as any;
     const userId = authenticatedReq.user.userId;
@@ -289,7 +417,9 @@ router.post("/report-ui-bug", async (req, res) => {
     const isDelegated = authenticatedReq.delegateInfo?.isDelegated === true;
     const adminEmail: string | undefined = authenticatedReq.delegateInfo?.adminEmail;
 
-    const title = `${config.titlePrefix}: ${description.trim().slice(0, 80)}`;
+    // The ONE normalization of the shared report title: the tracked item and the notification
+    // subject are both derived from this single-line string (ENG-529).
+    const title = buildReportTitle(config.titlePrefix, description);
 
     const issueContext: Record<string, any> = {
       "User Name": user.displayName || user.email,
@@ -310,100 +440,107 @@ router.post("/report-ui-bug", async (req, res) => {
     // File the user-reported issue. Behind FEATUREBASE_INTAKE this dedups and creates a
     // public, votable canonical in Linear (Featurebase-mirrored); flag off -> Notion. Same
     // shared path as Emma's report_product_issues tool.
+    //
+    // Wrapped in the replay guard so a retried or timed-out submission of the SAME report
+    // returns the first filing instead of opening another reporter ticket (ENG-529: one report
+    // became tickets #169/#170/#171 when the client retried three 500s).
     const reportItemType: 'feature_request' | 'bug' = typeKey === 'bug' ? 'bug' : 'feature_request';
     const { fileUserIssue } = await import('../services/intakeService');
-    const filed = await fileUserIssue({
-      type: reportItemType,
+    // ONE fingerprint, used twice on purpose (ENG-529 AC5 / ENG-598 option A):
+    //   - `fileReportOnce` coalesces concurrent and in-window retries IN THIS PROCESS, and
+    //   - `fileUserIssue` stamps it on the Featurebase ticket and looks it up before creating,
+    //     which is the DURABLE half — it is what still holds after the bounded replay map evicts
+    //     this entry, after a restart, or when a second instance serves the retry.
+    // Computing it inline for the guard alone would leave the destination check dead code, so the
+    // two must share this value rather than each deriving their own.
+    const fingerprint = reportFingerprint({ userId, reportType: typeKey, description, pageUrl });
+    const outcome = await fileReportOnce(
+      fingerprint,
+      () => fileUserIssue({
+        type: reportItemType,
+        title,
+        description: description.trim(),
+        userEmail: user.email,
+        userName: user.displayName || user.email,
+        reportedByAdmin: isDelegated && adminEmail ? adminEmail : undefined,
+        sessionId: typeof sessionId === "string" ? sessionId : undefined,
+        reportFingerprint: fingerprint,
+        // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
+        funnelStatus: user.funnelStatus,
+        notionTags: ["Customer Reported", config.tag, ...funnelStatusTags],
+        notionContext: issueContext,
+      }),
+      Date.now(),
+      REPORT_CAPACITY_WAIT_MS,
+      userId,
+    );
+    filed = outcome.result;
+    replayed = outcome.replayed;
+    issueId = filed.pageId ? `AGW-${filed.pageId}` : undefined;
+
+    notify = {
+      config,
       title,
       description: description.trim(),
       userEmail: user.email,
-      userName: user.displayName || user.email,
-      reportedByAdmin: isDelegated && adminEmail ? adminEmail : undefined,
-      sessionId: typeof sessionId === "string" ? sessionId : undefined,
-      // Linear-side triage enrichment (ENG-187): stage labels + priority/state/assignee defaults.
-      funnelStatus: user.funnelStatus,
-      notionTags: ["Customer Reported", config.tag, ...funnelStatusTags],
-      notionContext: issueContext,
-    });
-    const issueId = filed.pageId ? `AGW-${filed.pageId}` : undefined;
-
-    // Presign the screenshot so the email can render an inline preview that the
-    // recipient can actually load (the bucket is private).
-    const previewUrl = screenshotUrl ? presignS3Url(screenshotUrl) : null;
-
-    const delegationNote = isDelegated && adminEmail
-      ? `<div style="background-color: #fff3cd; border-left: 4px solid #ffc107; padding: 10px; margin-bottom: 15px;">
-           <strong>⚠️ Note:</strong> Submitted via admin delegation by ${adminEmail}
-         </div>`
-      : "";
-
-    const emailHtml = `
-<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; line-height: 1.6; color: #333;">
-  <div style="max-width: 640px; margin: 0 auto; padding: 20px;">
-    <div style="background-color: ${config.accent.bg}; padding: 16px 20px; border-radius: 8px; margin-bottom: 20px; border-left: 4px solid ${config.accent.border};">
-      <h2 style="margin: 0; color: ${config.accent.heading}; font-size: 18px;">${config.headerLabel}</h2>
-    </div>
-
-    ${delegationNote}
-
-    <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
-      <tr><td style="padding: 6px 0; color: #666; width: 140px; vertical-align: top;"><strong>Reported by</strong></td><td style="padding: 6px 0;"><a href="mailto:${user.email}" style="color: #4F46E5;">${user.displayName || user.email}</a> (${user.email})</td></tr>
-      ${funnelStatusLabel ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>User status</strong></td><td style="padding: 6px 0;">${funnelStatusLabel}</td></tr>` : ""}
-      ${issueId ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Issue ID</strong></td><td style="padding: 6px 0; font-family: monospace;">${issueId}</td></tr>` : ""}
-      ${filed.trackerUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>${filed.tracker}</strong></td><td style="padding: 6px 0;"><a href="${filed.trackerUrl}" style="color: #4F46E5; font-weight: 600;">→ Open in ${filed.tracker}</a></td></tr>` : ""}
-      ${filed.canonicalUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Linear canonical</strong></td><td style="padding: 6px 0;"><a href="${filed.canonicalUrl}" style="color: #4F46E5; font-weight: 600;">→ Open canonical in Linear</a></td></tr>` : ""}
-      ${pageUrl ? `<tr><td style="padding: 6px 0; color: #666; vertical-align: top;"><strong>Page URL</strong></td><td style="padding: 6px 0;"><a href="${pageUrl}" style="color: #4F46E5;">${pageUrl}</a></td></tr>` : ""}
-    </table>
-
-    <div style="background-color: #fff; border-left: 4px solid ${config.accent.border}; padding: 15px; border-radius: 0 4px 4px 0;">
-      <div style="font-weight: 600; margin-bottom: 8px; color: #333;">What the user reported</div>
-      <div style="color: #444; line-height: 1.6;">${description.trim().replace(/\n/g, "<br>")}</div>
-    </div>
-
-    ${previewUrl ? `<div style="margin-top: 20px;"><div style="font-weight: 600; margin-bottom: 8px; color: #333;">Screenshot</div><a href="${previewUrl}"><img src="${previewUrl}" alt="Screenshot" style="max-width: 100%; border: 1px solid #e5e7eb; border-radius: 6px;"></a><div style="font-size: 12px; color: #9ca3af; margin-top: 4px;">This preview link expires in ~1 hour.</div></div>` : ""}
-
-    <div style="margin-top: 20px; padding-top: 16px; border-top: 1px solid #e5e7eb; font-size: 12px; color: #9ca3af;">
-      Reply to this email to respond directly to the customer.
-    </div>
-  </div>
-</body>
-</html>
-    `;
-
-    const productIssueEmails = await settingsService.getJsonArraySetting("product_issue_emails", ["founders@agentweb.pro"]);
-    const recipients = isDelegated && adminEmail
-      ? [...productIssueEmails, adminEmail]
-      : productIssueEmails;
-
-    await resendService.sendEmail({
-      from: `${RESEND_SYSTEM_NAME} Support <${RESEND_SYSTEM_EMAIL}>`,
-      to: recipients,
-      subject: `[${config.subjectLabel}] ${title} — reported by ${user.email}`,
-      html: emailHtml,
-      replyTo: user.email,
-    });
-
-    res.json({
-      success: true,
-      // When deduped, tell the user it's a known request (and that they'll be notified) so the
-      // client can show the right copy + a link to track it.
-      message: filed.deduped
-        ? "Thanks — this is already a known request. We've added your report and you'll be notified when it's resolved."
-        : "Report submitted successfully",
+      userDisplayName: user.displayName || user.email,
+      pageUrl,
+      screenshotUrl,
+      filed,
       issueId,
-      trackingUrl: filed.userUrl, // public link to the user's request on the feedback board
-      // The canonical Linear link is deliberately NOT returned here — surfacing it to admins is
-      // Emma-chat-only (ENG-289). The in-app bug report only exposes the Featurebase tracking link;
-      // the internal Linear canonical still lands in the team notification email above.
-      deduped: filed.deduped,
-    });
+      funnelStatusLabel,
+      adminEmail: isDelegated && adminEmail ? adminEmail : undefined,
+    };
   } catch (error) {
+    if (error instanceof ReportReplayCapacityError) {
+      // The bounded replay guard is fully occupied by authoritative filings. Ask the client to
+      // retry instead of misreporting this temporary admission condition as a filing failure.
+      return res
+        .status(503)
+        .set("Retry-After", "5")
+        .json({ message: "Report intake is busy; please retry shortly" });
+    }
+    // Nothing durable happened — say so plainly and claim nothing was tracked.
     console.error("Error submitting product report:", error);
-    res.status(500).json({ message: "Failed to submit report" });
+    return res.status(500).json({ message: "Failed to submit report" });
   }
+
+  // ---------------------------------------------------------------------------------------
+  // The report is FILED from here on. Nothing below may change the caller's outcome.
+  // ---------------------------------------------------------------------------------------
+  if (replayed) {
+    console.log(`[support] replayed an existing product report filing (${issueId ?? filed.trackerUrl}) — skipping a duplicate team notification`);
+  } else {
+    try {
+      await sendProductReportNotification(notify);
+    } catch (error) {
+      await recordNotificationFailure(
+        error,
+        {
+          "Issue ID": issueId ?? "unknown",
+          "Tracker URL": filed.trackerUrl,
+          "Report Type": notify.config.subjectLabel,
+          "Reporter": notify.userEmail,
+        },
+        (req as any).user.userId,
+      );
+    }
+  }
+
+  return res.json({
+    success: true,
+    // When deduped, tell the user it's a known request (and that they'll be notified) so the
+    // client can show the right copy + a link to track it.
+    message: filed.deduped
+      ? "Thanks — this is already a known request. We've added your report and you'll be notified when it's resolved."
+      : "Report submitted successfully",
+    issueId,
+    trackingUrl: filed.userUrl, // public link to the user's request on the feedback board
+    // The canonical Linear link is deliberately NOT returned here — surfacing it to admins is
+    // Emma-chat-only (ENG-289). The in-app bug report only exposes the Featurebase tracking link;
+    // the internal Linear canonical still lands in the team notification email above.
+    deduped: filed.deduped,
+  });
 });
 
 export default router;

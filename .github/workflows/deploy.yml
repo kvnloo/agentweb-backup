@@ -32,14 +32,14 @@ jobs:
       partner: ${{ steps.filter.outputs.partner || steps.manual.outputs.partner }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
       - name: Check changes (push)
         if: github.event_name == 'push'
         id: filter
-        uses: dorny/paths-filter@v4
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         with:
           filters: |
             backend:
@@ -62,12 +62,12 @@ jobs:
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           cache: 'npm'
           cache-dependency-path: backend/package-lock.json
@@ -119,7 +119,7 @@ jobs:
           zip -r "builds/${VERSION_LABEL}.zip" dist docs package.json package-lock.json .env.example .platform .ebextensions || zip -r "builds/${VERSION_LABEL}.zip" dist docs package.json package-lock.json
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -166,12 +166,12 @@ jobs:
     environment: prod
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           cache: 'npm'
           cache-dependency-path: partner-portal/package-lock.json
@@ -223,7 +223,7 @@ jobs:
           zip -r "builds/${VERSION_LABEL}.zip" dist package.json package-lock.json
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -261,3 +261,107 @@ jobs:
 
       # Artifact upload removed to save GitHub storage quota
       # Build artifacts are already uploaded to S3 for deployment
+
+  # A failed production deploy used to be silent. eb-deploy.sh (ENG-734/837)
+  # made the run go red honestly, but a red check in the Actions tab is not a
+  # notification: on 2026-08-01 nobody saw it and production stayed undeployable
+  # for ~17 hours. This job is the alarm (ENG-865).
+  #
+  # A separate job rather than an `if: failure()` step, for three reasons:
+  #   * one implementation covers both deploy jobs;
+  #   * it still runs when a deploy job is killed by its own `timeout-minutes`
+  #     or cancelled, which a step-level `if: failure()` does not reliably catch;
+  #   * if the alert itself breaks, it is a distinct red job in the run rather
+  #     than a second red step inside an already-red job that nobody reads.
+  #
+  # The condition fires ONLY on a job that actually ran and concluded badly.
+  # `skipped` — the path filter not selecting that project, which is the common
+  # case on any merge touching neither backend/** nor partner-portal/** —
+  # matches neither 'failure' nor 'cancelled', so an ordinary docs-only merge
+  # posts nothing. A fully successful deploy leaves this job skipped. That noise
+  # budget is the whole game: an alert that cries wolf gets muted.
+  notify-deploy-failure:
+    name: Alert on production deploy failure
+    needs: [detect-changes, backend-deploy, partner-deploy]
+    # Fires ONLY when a deploy that was actually attempted did not succeed.
+    #
+    # Deliberately NOT included, because each would cry wolf and a muted alert
+    # is worth the same as no alert:
+    #
+    #   - `detect-changes` failing or being cancelled. That job only computes
+    #     path filters; it deploys nothing. Firing "Production deploy FAILED —
+    #     do not assume this commit is live" for it states something false.
+    #     Its failure means the run could not decide what to deploy, which is a
+    #     CI problem, not a production one.
+    #   - `cancelled()` on the run as a whole. `always()` still runs a job after
+    #     someone presses Cancel, so including cancellation pages a human for
+    #     something a human just did on purpose.
+    #   - `skipped`. A path-filtered skip is the normal state for any PR that
+    #     touches no deployable code — including this one. Verified against real
+    #     run 30823838490 (#2254), where both deploy jobs were `skipped` and the
+    #     run still concluded success.
+    #
+    # `cancelled` IS included, but only inside the `!cancelled()` guard, and the
+    # distinction is the whole point:
+    #   - a human cancels the RUN      -> !cancelled() is false -> silent. Right:
+    #     they know, and paging them for their own action is how alerts get muted.
+    #   - a deploy JOB is cancelled on its own (runner death, job-level timeout,
+    #     an admin cancelling one job) while the run lives -> !cancelled() is
+    #     true -> ALERT. That is a real deploy that did not happen, and dropping
+    #     it was a silent hole.
+    if: >-
+      ${{ !cancelled() && (
+      needs.backend-deploy.result == 'failure' ||
+      needs.backend-deploy.result == 'cancelled' ||
+      needs.partner-deploy.result == 'failure' ||
+      needs.partner-deploy.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # REQUIRED, not decoration: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY exist
+    # only as `prod` ENVIRONMENT secrets — this repo has no repository-level
+    # secrets at all. Without this line they resolve to empty strings and the
+    # Secrets Manager read fails. `prod` carries no protection rules today; if a
+    # required reviewer is ever added to it, this alert would sit pending
+    # forever instead of firing, so that rule change has to come with a
+    # different credential source for this job.
+    environment: prod
+    permissions:
+      contents: read
+      # The classified reason is recovered from the failing job's `::error::`
+      # annotation: `actions: read` lists the run's jobs, `checks: read` reads
+      # their annotations. See .github/scripts/deploy-failure-alert.sh for why
+      # the annotation is the only durable carrier of that reason.
+      actions: read
+      checks: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # No `continue-on-error`. A missing/malformed/revoked secret, or a Slack
+      # `ok:false`, fails this step loudly — an alerting path that quietly stops
+      # working is worse than none, because it is trusted.
+      - name: Post the deploy-failure alert to Slack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLACK_SECRET_ID: prod/AgentWeb/Slack
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
+          COMMIT_SHA: ${{ github.sha }}
+          # Null on a workflow_dispatch run; the script tolerates an empty value.
+          # Passed through `env:` rather than interpolated into `run:` so a
+          # commit subject can never become shell.
+          COMMIT_SUBJECT: ${{ github.event.head_commit.message }}
+          DEPLOY_ACTOR: ${{ github.triggering_actor }}
+          DETECT_RESULT: ${{ needs.detect-changes.result }}
+          BACKEND_RESULT: ${{ needs.backend-deploy.result }}
+          PARTNER_RESULT: ${{ needs.partner-deploy.result }}
+        run: bash .github/scripts/deploy-failure-alert.sh

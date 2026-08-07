@@ -90,6 +90,50 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
     expect(metaService.createAd).toHaveBeenCalledTimes(1);
   });
 
+  // ENG-600
+  it('launch_targeted_audience_campaign: wires userId + full args into agentModeService.launchTargetedAudienceCampaign', async () => {
+    const spy = jest
+      .spyOn(agentModeService, 'launchTargetedAudienceCampaign')
+      .mockResolvedValue({ success: true, awaitingUserConfirmation: true } as any);
+
+    const args = {
+      account_id: '123456789',
+      campaign_id: 'camp_1',
+      audience_name: 'Warm List',
+      audience_source: { csv_url: 'https://s3.example.com/a.csv' },
+      ad_set_params: { name: 'Ad Set', targeting: { geo_locations: { countries: ['US'] } } }
+    };
+
+    const result: any = await emmaToolRegistry.execute('launch_targeted_audience_campaign', args, ctx);
+
+    expect(spy).toHaveBeenCalledWith('user123', args);
+    expect(result.awaitingUserConfirmation).toBe(true);
+    spy.mockRestore();
+  });
+
+  // ENG-600
+  it('launch_retargeting_campaign: wires userId + full args into agentModeService.launchRetargetingCampaign', async () => {
+    const spy = jest
+      .spyOn(agentModeService, 'launchRetargetingCampaign')
+      .mockResolvedValue({ success: true, workflow: 'retargeting' } as any);
+
+    const args = {
+      account_id: '123456789',
+      campaign_id: 'camp_1',
+      audience_name: 'Warm List',
+      audience_source: { hubspot_list_id: 'list-1' },
+      exclude_audience_id: 'aud_broad',
+      ad_set_params: { name: 'Ad Set', targeting: { geo_locations: { countries: ['US'] } } },
+      confirm: true
+    };
+
+    const result: any = await emmaToolRegistry.execute('launch_retargeting_campaign', args, ctx);
+
+    expect(spy).toHaveBeenCalledWith('user123', args);
+    expect(result.workflow).toBe('retargeting');
+    spy.mockRestore();
+  });
+
   it('generate_image: image EDIT (inputImages set) without confirm returns awaitingUserConfirmation', async () => {
     const result: any = await emmaToolRegistry.execute('generate_image', {
       prompt: 'sharpen it',

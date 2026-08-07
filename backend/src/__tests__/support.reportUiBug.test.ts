@@ -89,15 +89,21 @@ describe('POST /api/support/report-ui-bug', () => {
     expect(res.body.message).toMatch(/description is required/i);
   });
 
-  it('does not expose internal server errors to caller when email sending fails', async () => {
+  // ENG-529: this used to assert a 500 — it pinned the bug. The report was ALREADY filed by the
+  // time the notification email ran, so failing the request was wrong: it hid a tracked report
+  // behind a generic error and invited duplicate retries. The team-notification failure path is
+  // covered in full in support.reportUiBug.notificationDecoupling.test.ts.
+  it('still reports filing success to the caller when the notification email fails', async () => {
     resendService.sendEmail.mockRejectedValueOnce(new Error('SMTP connection failed'));
     const app = buildApp();
     const res = await request(app)
       .post('/api/support/report-ui-bug')
       .send({ description: 'The button overlaps the header' });
 
-    expect(res.status).toBe(500);
-    expect(res.body.message).toBe('Failed to submit report');
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
+    expect(res.body.issueId).toBe('AGW-page-abc');
+    expect(createOncallItem).toHaveBeenCalledTimes(1);
   });
 
   // SUCCESS tests — happy path

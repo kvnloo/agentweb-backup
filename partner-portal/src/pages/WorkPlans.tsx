@@ -58,6 +58,9 @@ interface WorkPlanStep {
    *  raw system prompt and must NEVER be rendered to end users. */
   userInstructions?: string;
   requiredFunctionCalls?: string[];
+  /** Media assets this step must actually produce before it can be marked
+   *  completed. Enforced at run time by the session work plan's asset gate. */
+  expectedAssetCount?: number;
 }
 
 const PLAN_CATEGORIES = ["Paid Ads", "Strategy", "Content", "Other"];
@@ -83,6 +86,10 @@ interface WorkPlan {
   thumbnail_url?: string;
   thumbnail_source?: 'ai' | 'upload' | 'none';
   thumbnail_alt_text?: string;
+  /** Bumped by every write. The editor sends back the one it loaded so a save
+   *  built from a stale plan is refused rather than overwriting whatever
+   *  changed in between — Emma edits these same plans (ENG-890). */
+  steps_rev?: string;
 }
 
 const visibilityColor = (v: string) => {
@@ -317,9 +324,14 @@ export default function WorkPlans() {
         ...(category && { category }),
       };
       if (editingPlan) {
-        await axios.put(buildApiUrl(`/api/admin/work-plans/${editingPlan.planId}`), body, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        // This save replaces the whole steps array with what the dialog loaded,
+        // so stake the revision it loaded: if anything changed the plan since,
+        // the server refuses rather than silently discarding it (ENG-890).
+        await axios.put(
+          buildApiUrl(`/api/admin/work-plans/${editingPlan.planId}`),
+          { ...body, expectedStepsRev: editingPlan.steps_rev ?? null },
+          { headers: { Authorization: `Bearer ${token}` } },
+        );
         setSuccess("Work plan updated");
       } else {
         await axios.post(buildApiUrl("/api/admin/work-plans"), body, {
@@ -330,6 +342,14 @@ export default function WorkPlans() {
       setDialogOpen(false);
       fetchPlans();
     } catch (err: any) {
+      if (err.response?.status === 409) {
+        // Keep the dialog open — their edits are still in it, and closing would
+        // throw away the work while the plan on screen is the outdated one.
+        setError(
+          "This plan changed while you were editing it — nothing was saved. Copy any changes you want to keep, then close and reopen the plan to start from the current version.",
+        );
+        return;
+      }
       setError(err.response?.data?.message || "Failed to save work plan");
     } finally {
       setSaving(false);
@@ -387,7 +407,7 @@ export default function WorkPlans() {
     setSteps(steps.filter((_, i) => i !== index).map((s, i) => ({ ...s, stepCount: i + 1 })));
   };
 
-  const updateStep = (index: number, field: string, value: string | string[]) => {
+  const updateStep = (index: number, field: string, value: string | string[] | number | undefined) => {
     const updated = [...steps];
     updated[index] = { ...updated[index], [field]: value };
     setSteps(updated);
@@ -395,11 +415,21 @@ export default function WorkPlans() {
 
   const toggleVisibility = async (plan: WorkPlan) => {
     try {
+      // Sends one boolean, but the route rewrites the whole plan from the copy
+      // it reads — so a toggle against a row this page loaded minutes ago can
+      // still put back the steps as they were then. Stake the same revision the
+      // row carries (ENG-890).
       await axios.put(buildApiUrl(`/api/admin/work-plans/${plan.planId}`), {
         showInAgentMode: !plan.showInAgentMode,
+        expectedStepsRev: plan.steps_rev ?? null,
       }, { headers: { Authorization: `Bearer ${token}` } });
       fetchPlans();
-    } catch (err) {
+    } catch (err: any) {
+      if (err.response?.status === 409) {
+        setError("This plan changed since the list was loaded — nothing was saved. Refreshing so you can try again.");
+        fetchPlans();
+        return;
+      }
       setError("Failed to update visibility");
     }
   };
@@ -493,11 +523,22 @@ export default function WorkPlans() {
                           {step.stepCount}. <strong>{step.title}</strong>
                           {step.description && <span> — {step.description}</span>}
                         </Typography>
-                        {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
+                        {((step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) || step.expectedAssetCount) && (
                           <Box sx={{ ml: 2 }}>
-                            {step.requiredFunctionCalls.map((fc, j) => (
+                            {step.requiredFunctionCalls?.map((fc, j) => (
                               <Chip key={j} label={fc} size="small" variant="outlined" sx={{ mr: 0.5, mb: 0.5, fontFamily: "monospace", fontSize: "0.7rem" }} />
                             ))}
+                            {/* Without this the asset gate is invisible here: the step
+                                simply refuses to complete with no on-screen reason. */}
+                            {step.expectedAssetCount ? (
+                              <Chip
+                                label={`${step.expectedAssetCount} assets required`}
+                                size="small"
+                                color="warning"
+                                variant="outlined"
+                                sx={{ mr: 0.5, mb: 0.5, fontSize: "0.7rem" }}
+                              />
+                            ) : null}
                           </Box>
                         )}
                       </Box>
@@ -636,11 +677,20 @@ export default function WorkPlans() {
                                 {step.stepCount}. <strong>{step.title}</strong>
                                 {step.description && <span> — {step.description}</span>}
                               </Typography>
-                              {step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0 && (
+                              {((step.requiredFunctionCalls && step.requiredFunctionCalls.length > 0) || step.expectedAssetCount) && (
                                 <Box sx={{ ml: 2 }}>
-                                  {step.requiredFunctionCalls.map((fc, j) => (
+                                  {step.requiredFunctionCalls?.map((fc, j) => (
                                     <Chip key={j} label={fc} size="small" variant="outlined" sx={{ mr: 0.5, mb: 0.5, fontFamily: "monospace", fontSize: "0.7rem" }} />
                                   ))}
+                                  {step.expectedAssetCount ? (
+                                    <Chip
+                                      label={`${step.expectedAssetCount} assets required`}
+                                      size="small"
+                                      color="warning"
+                                      variant="outlined"
+                                      sx={{ mr: 0.5, mb: 0.5, fontSize: "0.7rem" }}
+                                    />
+                                  ) : null}
                                 </Box>
                               )}
                             </Box>
@@ -779,6 +829,24 @@ export default function WorkPlans() {
                           helperText="Functions that must be called to complete this step"
                         />
                       )}
+                    />
+                    <TextField
+                      size="small"
+                      type="number"
+                      label="Required assets"
+                      value={step.expectedAssetCount ?? ""}
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        const parsed = parseInt(raw, 10);
+                        updateStep(
+                          i,
+                          "expectedAssetCount",
+                          raw === "" || Number.isNaN(parsed) ? undefined : parsed,
+                        );
+                      }}
+                      inputProps={{ min: 0 }}
+                      sx={{ mt: 1, maxWidth: 220 }}
+                      helperText="This step cannot be completed until the run has generated this many images/videos. Counted across the whole run, not just this step. Leave blank for no requirement."
                     />
                   </Box>
                   {steps.length > 1 && (

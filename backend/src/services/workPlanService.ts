@@ -66,7 +66,38 @@ export interface WorkPlan {
   thumbnail_url?: string;
   thumbnail_source?: 'ai' | 'upload' | 'none';
   thumbnail_alt_text?: string;
+  /** Bumped by every thumbnail write and by nothing else. Thumbnail generations
+   *  condition on it, so a concurrent title/step/owner edit cannot discard a
+   *  generated thumbnail while a concurrent thumbnail action still does. */
+  thumbnail_rev?: string;
+
+  /** Bumped by every updateWorkPlan write. A caller that decided a write was
+   *  safe by reading the plan first can pass the revision it saw, so a
+   *  competing write in between fails it instead of silently invalidating the
+   *  decision — the read-then-write gap under the MCP tool's destructive-step
+   *  guard (ENG-890). Scoped to plan writes, exactly as thumbnail_rev is scoped
+   *  to thumbnail writes, so the two never invalidate each other. */
+  steps_rev?: string;
 }
+
+/** Owned exclusively by updateThumbnail. updateWorkPlan must never write these,
+ *  or an ordinary plan save would clobber a newer thumbnail — the same
+ *  lost-update class this pipeline already had (ENG-889). */
+const THUMBNAIL_FIELDS = ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_text', 'thumbnail_rev'] as const;
+
+/** Optional plan fields: set when present, REMOVEd when the caller cleared them
+ *  (a whole-item put used to give us that for free). */
+const OPTIONAL_PLAN_FIELDS = [
+  'description', 'welcomeMessage', 'autocomplete', 'requireLogin', 'showLoginSignup',
+  'showInAgentMode', 'defaultModel', 'category', 'ownerId', 'orgId', 'reviewFeedback',
+] as const;
+
+/** Always written. */
+const REQUIRED_PLAN_FIELDS = ['title', 'steps', 'visibility', 'isBuiltIn', 'createdAt'] as const;
+
+/** Minted by updateWorkPlan itself, never supplied by a caller. Kept out of the
+ *  lists above so an ordinary save cannot REMOVE it as a "cleared" field. */
+const SELF_MINTED_FIELDS = ['steps_rev'] as const;
 
 export class WorkPlanService {
   private tableName: string;
@@ -113,20 +144,189 @@ export class WorkPlanService {
     return workPlan;
   }
 
-  async getWorkPlan(planId: string): Promise<WorkPlan | null> {
+  /** @param opts.consistentRead for reads that must not see a stale replica —
+   *  i.e. when the answer decides what a caller is told about a write that has
+   *  already happened. Ordinary reads stay eventually consistent. */
+  async getWorkPlan(planId: string, opts: { consistentRead?: boolean } = {}): Promise<WorkPlan | null> {
     const result = await dynamodb.get({
       TableName: this.tableName,
       Key: { planId },
+      ...(opts.consistentRead && { ConsistentRead: true }),
     }).promise();
     return (result.Item as WorkPlan) || null;
   }
 
-  async updateWorkPlan(plan: WorkPlan): Promise<void> {
+  /**
+   * Update a plan without touching its thumbnail.
+   *
+   * This was a whole-item put, which meant an ordinary save wrote back whatever
+   * thumbnail the caller happened to be holding — clobbering a newer one, and
+   * making any thumbnail-scoped version attribute impossible to keep. It is now
+   * attribute-scoped: every non-thumbnail field is written, fields the caller
+   * cleared are REMOVEd (which the put gave us for free), and the thumbnail
+   * attributes are left entirely alone (ENG-889).
+   *
+   * @param opts.expectedStepsRev the `steps_rev` observed when the caller
+   *   decided this write was safe; `null` for "the plan had no revision yet".
+   *   Omit for writes that inspected nothing, which stay unconditional.
+   * @throws 'Work plan steps changed' when a competing write landed first, and
+   *   'Work plan not found' when the plan was deleted. Callers must tell these
+   *   apart: the first is retryable against a fresh read, the second is not.
+   * @returns the revision this write produced. Callers assembling a response
+   *   must surface it: the plan they read carries the superseded one, and
+   *   echoing that back guarantees a spurious conflict on the next staked write.
+   */
+  async updateWorkPlan(
+    plan: WorkPlan,
+    opts: { expectedStepsRev?: string | null } = {},
+  ): Promise<string> {
     this.validateSteps(plan.steps);
-    await dynamodb.put({
-      TableName: this.tableName,
-      Item: { ...plan, updatedAt: new Date().toISOString() },
-    }).promise();
+
+    // Every write rewrites steps (they are a REQUIRED field), so every write
+    // invalidates any decision made against the previous ones.
+    const sets = ['#updatedAt = :updatedAt', '#steps_rev = :steps_rev'];
+    const removes: string[] = [];
+    const names: Record<string, string> = { '#updatedAt': 'updatedAt', '#steps_rev': 'steps_rev' };
+    const stepsRev = uuidv4();
+    const values: Record<string, any> = {
+      ':updatedAt': new Date().toISOString(),
+      ':steps_rev': stepsRev,
+    };
+
+    for (const key of REQUIRED_PLAN_FIELDS) {
+      names[`#${key}`] = key;
+      values[`:${key}`] = (plan as any)[key];
+      sets.push(`#${key} = :${key}`);
+    }
+    for (const key of OPTIONAL_PLAN_FIELDS) {
+      names[`#${key}`] = key;
+      const value = (plan as any)[key];
+      if (value === undefined) {
+        removes.push(`#${key}`);
+      } else {
+        values[`:${key}`] = value;
+        sets.push(`#${key} = :${key}`);
+      }
+    }
+
+    // update is an upsert. Callers read the plan first, so a failure here
+    // means it was deleted in between — the old whole-item put silently
+    // resurrected it, which is worse than failing.
+    let condition = 'attribute_exists(planId)';
+    const staked = 'expectedStepsRev' in opts;
+    if (staked) {
+      if (opts.expectedStepsRev === null || opts.expectedStepsRev === undefined) {
+        condition += ' AND attribute_not_exists(#steps_rev)';
+      } else {
+        values[':expectedStepsRev'] = opts.expectedStepsRev;
+        condition += ' AND #steps_rev = :expectedStepsRev';
+      }
+    }
+
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { planId: plan.planId },
+        UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        ConditionExpression: condition,
+      }).promise();
+    } catch (err: any) {
+      if (err?.code === 'ConditionalCheckFailedException') {
+        // Without a stake the only condition is existence, so the plan is gone.
+        // With one, the failure is ambiguous and the difference matters to the
+        // caller — a conflict is retryable against a fresh read, a deletion is
+        // not — so pay for one read to say which.
+        // Consistent, because a stale replica here would report a plan we just
+        // failed to write as deleted — a 404 for a retryable conflict.
+        if (staked && await this.getWorkPlan(plan.planId, { consistentRead: true })) {
+          throw new Error('Work plan steps changed');
+        }
+        // Same message approveWorkPlan/rejectWorkPlan already throw, which the
+        // routes map to 404 — a deleted plan is not an internal error.
+        throw new Error('Work plan not found');
+      }
+      throw err;
+    }
+
+    return stepsRev;
+  }
+
+  /**
+   * Write only the thumbnail attributes of a plan, and only if no other
+   * thumbnail action has happened since the caller observed it.
+   *
+   * Ordering is one conditional write on `thumbnail_rev`, an attribute only
+   * this method writes. Not a claim-then-write token — a claim is a second
+   * unconditioned write that races the actions it exists to order. Not the
+   * plan-wide `updatedAt` either: that made an unrelated title or step edit
+   * discard a perfectly good generated thumbnail. Scoping the version to the
+   * thumbnail means only a competing thumbnail action invalidates a generation.
+   *
+   * Safe because updateWorkPlan is attribute-scoped and never writes these
+   * fields, so an ordinary plan save cannot roll the revision back.
+   *
+   * @param opts.expectedRev the revision observed when the work began; `null`
+   *   for "the plan had no thumbnail revision yet". Omit for user-initiated
+   *   writes, which are unconditional and always win.
+   * @returns the new revision when the write landed, or null when a newer
+   *   thumbnail action won, or the plan is gone. Callers must not report null
+   *   as success.
+   */
+  async updateThumbnail(
+    planId: string,
+    fields: Partial<Pick<WorkPlan, 'thumbnail_url' | 'thumbnail_source' | 'thumbnail_alt_text'>>,
+    opts: { expectedRev?: string | null } = {},
+  ): Promise<string | null> {
+    const rev = uuidv4();
+    const sets = ['#updatedAt = :updatedAt', '#thumbnail_rev = :thumbnail_rev'];
+    const removes: string[] = [];
+    const names: Record<string, string> = { '#updatedAt': 'updatedAt', '#thumbnail_rev': 'thumbnail_rev' };
+    const values: Record<string, any> = { ':updatedAt': new Date().toISOString(), ':thumbnail_rev': rev };
+
+    for (const key of ['thumbnail_url', 'thumbnail_source', 'thumbnail_alt_text'] as const) {
+      if (!(key in fields)) continue;
+      names[`#${key}`] = key;
+      const value = fields[key];
+      if (value === undefined) {
+        removes.push(`#${key}`);
+      } else {
+        sets.push(`#${key} = :${key}`);
+        values[`:${key}`] = value;
+      }
+    }
+
+    // update is an upsert, so without attribute_exists a plan deleted while a
+    // generation was running would come back as a stub holding only planId and
+    // the thumbnail fields — no title, no steps — which breaks every consumer
+    // that maps over plan.steps.
+    let condition = 'attribute_exists(planId)';
+    if ('expectedRev' in opts) {
+      if (opts.expectedRev === null || opts.expectedRev === undefined) {
+        condition += ' AND attribute_not_exists(#thumbnail_rev)';
+      } else {
+        values[':expectedRev'] = opts.expectedRev;
+        condition += ' AND #thumbnail_rev = :expectedRev';
+      }
+    }
+
+    try {
+      await dynamodb.update({
+        TableName: this.tableName,
+        Key: { planId },
+        UpdateExpression: `SET ${sets.join(', ')}${removes.length ? ` REMOVE ${removes.join(', ')}` : ''}`,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        ConditionExpression: condition,
+      }).promise();
+      return rev;
+    } catch (err: any) {
+      // Either the plan is gone, or a newer thumbnail action won. Both mean
+      // "this write does not apply", not "this write failed".
+      if (err?.code === 'ConditionalCheckFailedException') return null;
+      throw err;
+    }
   }
 
   async deleteWorkPlan(planId: string): Promise<void> {
@@ -207,7 +407,12 @@ export class WorkPlanService {
 
     plan.visibility = 'pending_review';
     plan.reviewFeedback = undefined;
-    await this.updateWorkPlan(plan);
+    // Stake the read: this writes the whole plan back, steps included, so
+    // without it a concurrent step edit is silently reverted (ENG-890).
+    // Carry the minted revision onto what we hand back: the object we read
+    // still holds the superseded one, and echoing that guarantees a false
+    // conflict on the caller's next staked write (ENG-890).
+    plan.steps_rev = await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
     return plan;
   }
 
@@ -218,7 +423,10 @@ export class WorkPlanService {
 
     plan.visibility = 'public';
     plan.showInAgentMode = true;
-    await this.updateWorkPlan(plan);
+    // Carry the minted revision onto what we hand back: the object we read
+    // still holds the superseded one, and echoing that guarantees a false
+    // conflict on the caller's next staked write (ENG-890).
+    plan.steps_rev = await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
     return plan;
   }
 
@@ -229,7 +437,10 @@ export class WorkPlanService {
 
     plan.visibility = 'private';
     plan.reviewFeedback = feedback;
-    await this.updateWorkPlan(plan);
+    // Carry the minted revision onto what we hand back: the object we read
+    // still holds the superseded one, and echoing that guarantees a false
+    // conflict on the caller's next staked write (ENG-890).
+    plan.steps_rev = await this.updateWorkPlan(plan, { expectedStepsRev: plan.steps_rev ?? null });
     return plan;
   }
 
@@ -244,12 +455,21 @@ export class WorkPlanService {
 
     if (!result.Item) return null;
 
+    // A whole-item put that replaces the target's steps while bypassing
+    // updateWorkPlan entirely. Carrying the source's steps_rev across would let
+    // a staked write pass its precondition against steps this sync had already
+    // replaced — and the two tables' revisions genuinely can match, since dev is
+    // populated from prod. Mint a new one: the target's steps just changed.
+    // getSyncStatus compares an explicit field list, so this does not make every
+    // plan read as out-of-sync (ENG-890).
+    const synced = { ...result.Item, steps_rev: uuidv4() } as WorkPlan;
+
     await dynamodb.put({
       TableName: targetTable,
-      Item: result.Item,
+      Item: synced,
     }).promise();
 
-    return result.Item as WorkPlan;
+    return synced;
   }
 
   async getSyncStatus(): Promise<Record<string, { inSync: boolean; existsInProd: boolean; existsInDev: boolean; changedFields: string[] }>> {
