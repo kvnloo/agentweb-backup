@@ -93,6 +93,30 @@ function canManageOrgAccounts(user: any, org: Organization): boolean {
   return can({ userId: user.userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:accounts:manage");
 }
 
+/**
+ * The last-one-out invariant: an org must always retain at least one owner.
+ *
+ * Enforced on every verb that can take an owner away — remove, leave, and
+ * demote. Better Auth shipped the first two and not the third, and a demote
+ * orphaned an org (better-auth#3651); the demote path is the one that gets
+ * missed, so it is guarded here explicitly.
+ *
+ * Counted from the live GSI-backed member list rather than a denormalized
+ * counter. Org membership is capped by nothing now, but orgs are small and this
+ * runs only on the three membership-mutating verbs, so a Query is the right
+ * trade against maintaining another counter — that is exactly the apparatus the
+ * seat cap left behind.
+ *
+ * `losingUserId` is the member about to stop being an owner. Returns true when
+ * at least one OTHER owner would remain.
+ */
+async function anotherOwnerRemains(org: Organization, losingUserId: string): Promise<boolean> {
+  const members = await orgDb.getOrgMembers(org.orgId);
+  return members.some(
+    (m) => m.userId !== losingUserId && roleOf({ userId: m.userId, orgId: m.orgId, orgRole: m.orgRole }, org) === "owner"
+  );
+}
+
 // Domain always derived server-side from the acting user's own email — never
 // client-supplied — so nobody can claim a domain they don't belong to.
 function deriveDomainFromEmail(email: string): string | undefined {
@@ -542,6 +566,67 @@ router.delete("/:orgId/invite/:email", async (req: Request, res: Response) => {
   }
 });
 
+// Change a member's role. This is the whole of succession: there is no
+// transfer-ownership primitive, because no system surveyed has one — you promote
+// someone, then leave. Guarded by the last-one-out invariant so a demote can
+// never orphan the org.
+router.patch("/:orgId/members/:memberId/role", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const { orgId, memberId } = req.params;
+    const { role } = req.body ?? {};
+
+    if (role !== "owner" && role !== "admin" && role !== "member") {
+      return res.status(400).json({ error: "role must be one of: owner, admin, member" });
+    }
+
+    const org = await orgDb.getOrgById(orgId);
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can change member roles" });
+    }
+
+    const member = await userDb.getUserById(memberId);
+    if (!member || member.orgId !== orgId) {
+      return res.status(404).json({ error: "Member not found in this organization" });
+    }
+
+    const caller = await userDb.getUserById(userId);
+    const callerRole = roleOf({ userId, orgId, orgRole: caller?.orgRole }, org);
+    const currentRole = roleOf({ userId: memberId, orgId, orgRole: member.orgRole }, org);
+
+    // Only an owner may mint or remove another owner. An admin promoting someone
+    // to owner would be a self-service privilege escalation: admins cannot delete
+    // the org, owners can, so admin->owner->delete would route around the one
+    // authority admins are deliberately denied.
+    if ((role === "owner" || currentRole === "owner") && callerRole !== "owner") {
+      return res.status(403).json({ error: "Only an owner can grant or revoke owner" });
+    }
+
+    if (currentRole === role) {
+      return res.json({ success: true, message: `Member is already ${role}`, role });
+    }
+
+    // Demoting the last owner orphans the org. This is the path Better Auth
+    // missed (better-auth#3651) — remove and leave were guarded, changeRole was
+    // not.
+    if (currentRole === "owner" && !(await anotherOwnerRemains(org, memberId))) {
+      return res.status(409).json({
+        error: "Cannot demote the only owner. Promote another member to owner first.",
+      });
+    }
+
+    await userDb.updateUser(memberId, { orgRole: role });
+    return res.json({ success: true, message: `Member role set to ${role}`, role });
+  } catch (error) {
+    console.error("Error changing member role:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // Remove member (owner only)
 router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) => {
   try {
@@ -566,6 +651,13 @@ router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) =
       return res.status(404).json({ error: "Member not found in this organization" });
     }
 
+    if (roleOf({ userId: memberId, orgId, orgRole: member.orgRole }, org) === "owner"
+        && !(await anotherOwnerRemains(org, memberId))) {
+      return res.status(409).json({
+        error: "Cannot remove the only owner. Promote another member to owner first.",
+      });
+    }
+
     await userDb.clearOrgMembership(memberId);
     return res.json({ success: true, message: "Member removed" });
   } catch (error) {
@@ -585,13 +677,19 @@ router.post("/:orgId/leave", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId === userId) {
-      return res.status(400).json({ error: "The owner cannot leave the organization. Transfer ownership or delete the org." });
-    }
-
     const user = await userDb.getUserById(userId);
     if (!user || user.orgId !== orgId) {
       return res.status(400).json({ error: "You are not a member of this organization" });
+    }
+
+    // Owners may leave — as long as they are not the last one. This used to
+    // block on `ownerUserId === userId` and point at a transfer-ownership route
+    // that was never built, which made the primary owner permanently unable to
+    // leave their own org.
+    if (roleOf({ userId, orgId, orgRole: user.orgRole }, org) === "owner" && !(await anotherOwnerRemains(org, userId))) {
+      return res.status(409).json({
+        error: "You are the only owner. Promote another member to owner before leaving.",
+      });
     }
 
     await userDb.clearOrgMembership(userId);

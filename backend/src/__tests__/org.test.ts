@@ -550,10 +550,23 @@ describe('Organization routes', () => {
       mockUsers['user-2'].orgRole = 'member';
     });
 
-    it('should fail if owner tries to leave', async () => {
+    // Behavior change (ENG-954): what blocks the owner is being the LAST owner,
+    // not being the owner. The old 400 fired unconditionally and told them to
+    // "transfer ownership" via a route that was never built, which made the
+    // primary owner permanently unable to leave their own org. Now it is a 409
+    // naming the actual remedy, and it lifts as soon as a second owner exists.
+    it('should fail if the only owner tries to leave, naming the remedy', async () => {
       const res = await request(app).post('/api/org/org-1/leave');
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/owner cannot leave/i);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/only owner/i);
+      expect(res.body.error).toMatch(/promote another member/i);
+    });
+
+    it('should succeed for an owner once a second owner exists', async () => {
+      mockUsers['user-2'].orgRole = 'owner';
+      const res = await request(app).post('/api/org/org-1/leave');
+      expect(res.status).toBe(200);
+      expect(mockUsers['user-1'].orgId).toBeUndefined();
     });
 
     it('should succeed for a member', async () => {
