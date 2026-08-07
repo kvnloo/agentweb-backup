@@ -1403,7 +1403,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1617,7 +1617,7 @@ router.put('/lists/:listId/enrichment-config', async (req: Request, res: Respons
     const { listId } = req.params;
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -1689,7 +1689,7 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     const { listId } = req.params;
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2030,7 +2030,7 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2081,7 +2081,7 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
 
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
+    if (!(await canDestructiveCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
 
     // Normalize Unipile search result shape → CRM lead shape
     const normalizedLeads = leads.map((lead: any) => {
@@ -2445,7 +2445,7 @@ router.put('/lists/:listId/leads/bulk-contact-status', async (req: Request, res:
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2565,7 +2565,7 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2913,7 +2913,7 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3036,7 +3036,7 @@ router.post('/lists/:listId/leads/export', async (req: Request, res: Response) =
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3184,7 +3184,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3593,7 +3593,7 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -3857,7 +3857,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -4059,7 +4059,7 @@ router.post('/lists/:listId/leads/enrich-tech-stack', async (req: Request, res: 
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -4168,7 +4168,7 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list as any))) {
+    if (!(await canDestructiveCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -4252,7 +4252,7 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-connection', async (req:
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || !(await canAccessCrmList(userId, list as any))) {
+    if (!list || !(await canDestructiveCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4406,7 +4406,7 @@ router.post('/lists/:listId/sync-linkedin-connections', async (req: Request, res
     if (!userId) return res.status(401).json({ message: 'Unauthorized' });
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || !(await canAccessCrmList(userId, list as any))) {
+    if (!list || !(await canDestructiveCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4449,7 +4449,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-message', async (req: Re
     }
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || !(await canAccessCrmList(userId, list as any))) {
+    if (!list || !(await canDestructiveCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4517,7 +4517,7 @@ router.post('/lists/:listId/leads/:leadId/send-linkedin-invite', async (req: Req
     }
 
     const list = await crmDb.getLeadListById(listId);
-    if (!list || !(await canAccessCrmList(userId, list as any))) {
+    if (!list || !(await canDestructiveCrmList(userId, list as any))) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
@@ -4813,7 +4813,7 @@ router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -4873,7 +4873,7 @@ router.put('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: Requ
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -4912,7 +4912,7 @@ router.delete('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: R
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -5323,7 +5323,7 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
 
     // Verify the lead belongs to the user's list
     const list = await crmDb.getLeadListById(listId);
-    if (!list || !(await canAccessCrmList(userId, list))) {
+    if (!list || !(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -5399,7 +5399,7 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
 
     // Verify the lead belongs to the user's list
     const list = await crmDb.getLeadListById(listId);
-    if (!list || !(await canAccessCrmList(userId, list))) {
+    if (!list || !(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -5463,7 +5463,7 @@ router.put('/lists/:listId/public-access', async (req: Request, res: Response) =
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -5524,7 +5524,7 @@ router.put('/lists/:listId/auto-draft', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -5766,7 +5766,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -5865,7 +5865,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -6020,7 +6020,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -6114,7 +6114,7 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -6571,7 +6571,7 @@ router.post('/lists/:listId/enrichment-jobs/:jobId/revert', async (req: Request,
   try {
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
+    if (!(await canDestructiveCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -6612,7 +6612,7 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/verify', async (req: Req
   try {
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
+    if (!(await canDestructiveCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
     const lead: any = await crmDb.getLeadById(listId, leadId);
@@ -6657,7 +6657,7 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/reject', async (req: Req
   try {
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
+    if (!(await canDestructiveCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
     const lead: any = await crmDb.getLeadById(listId, leadId);
@@ -6704,7 +6704,7 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/refresh', async (req: Re
   try {
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
+    if (!(await canDestructiveCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
     const lead: any = await crmDb.getLeadById(listId, leadId);
