@@ -13,7 +13,18 @@ VM is ever rebuilt.
 1. Create the OS user: `sudo useradd -r -m -d /opt/agent-engine -s /bin/bash agentengine`
    (temporary login shell for setup; can be switched to `/usr/sbin/nologin`
    once systemd is the only thing invoking it, since systemd's `ExecStart`
-   doesn't need a login shell).
+   doesn't need a login shell). **`agentengine` must NOT be a member of the
+   `google-sudoers` group** (ENG-914) — `useradd -r` does not add it there by
+   default, so this only happens if someone adds it by hand during setup.
+   `agentengine` runs browser automation against arbitrary web content, so it
+   should be treated as potentially compromised; passwordless root would let
+   it read the alerter's key file (defeating the isolation in step 8 below)
+   or mask/rewrite `agent-engine-alert@.service` outright, regardless of the
+   file-permission isolation. Verify after provisioning:
+   `sudo -l -U agentengine` should report no sudo entitlement at all. Neither
+   `task_monitor.py` nor anything else in the codebase shells out to `sudo`,
+   so this costs the daemon nothing; operators use their own sudo (see
+   "Deploy / update code" and "Monitoring / status" below).
 2. Clone the repo as `agentengine`: `git clone https://github.com/AgentWebPro/agentweb.git /opt/agent-engine/agentweb`
    — requires a GitHub credential; see "Secrets" below for
    `agentengine-prod-github-deploy-token`. Never leave the token embedded in
@@ -159,6 +170,7 @@ USERNAME=$(echo "$DEPLOY_JSON" | python3 -c 'import json,sys; print(json.load(sy
 git remote set-url origin "https://${USERNAME}:${TOKEN}@github.com/AgentWebPro/agentweb.git"
 git pull origin main
 git remote set-url origin https://github.com/AgentWebPro/agentweb.git   # strip token back out
+exit   # back to your own shell — agentengine has no sudo (ENG-914), restart with your own
 sudo systemctl restart agent-engine
 ```
 

@@ -569,6 +569,7 @@ Quick reference:
 sudo -u agentengine -i
 cd /opt/agent-engine/agentweb
 git pull origin main   # see RUNBOOK.md for the deploy-token auth step
+exit   # agentengine has no sudo (ENG-914) — restart with your own
 sudo systemctl restart agent-engine
 ```
 
