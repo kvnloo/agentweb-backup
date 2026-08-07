@@ -28,6 +28,7 @@ import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type Judge
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb } from './db';
+import { resolveOrgProfileField } from './orgProfileResolver';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -8845,7 +8846,6 @@ export class AgentModeService {
         }
         // Same owner-record fallback as the brand path — merging onto an
         // unpopulated org record would drop the owner's competitors/ICPs.
-        const { resolveOrgProfileField } = await import('./orgProfileResolver');
         existingMarketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
       } else {
         existingMarketStrategy = user.marketStrategy;
@@ -12589,7 +12589,6 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // Fall back to the org owner's record when the org record was never
         // populated, so a tweak merges onto the existing brand instead of
         // building a fresh empty structure over it (ENG-927).
-        const { resolveOrgProfileField } = await import('./orgProfileResolver');
         existingBrand = await resolveOrgProfileField(user, org, 'brandGuidelines');
       } else {
         existingBrand = user.brandGuidelines;

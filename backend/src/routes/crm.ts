@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
+import { resolveOrgProfileField } from '../services/orgProfileResolver';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
@@ -2242,7 +2243,6 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
       if (user?.orgId) {
         const org: any = await orgDb.getOrgById(user.orgId);
         if (org) {
-          const { resolveOrgProfileField } = await import('../services/orgProfileResolver');
           marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
         }
       }
