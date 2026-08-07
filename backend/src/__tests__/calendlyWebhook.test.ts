@@ -496,6 +496,42 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockGetUserById).not.toHaveBeenCalled();
       expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
     });
+
+    // ENG-924 groundwork: the real event_memberships shape for 2+ hosts has never been
+    // observed live (only assumed to be "more entries, same per-entry shape" as the
+    // verified single-host payload). Logging it the first time it actually happens in
+    // production is cheap insurance against that assumption being wrong, without needing
+    // a live multi-host test setup that isn't available right now.
+    it('logs the raw payload when a delivery has more than one event_membership', async () => {
+      const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+      const body = multiHostPayload();
+      body.payload.scheduled_event.event_memberships = [
+        { user: HOST_A_URI, user_email: 'host-a@example.com', user_name: 'Host A' },
+        { user: HOST_B_URI, user_email: 'host-b@example.com', user_name: 'Host B' },
+      ];
+      const res = await postSigned(body, HOST_A_KEY);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Multi-host event detected (2 members)'),
+        expect.stringContaining(HOST_A_URI),
+      );
+      logSpy.mockRestore();
+    });
+
+    it('does not log a multi-host notice for an ordinary single-host delivery', async () => {
+      const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(logSpy).not.toHaveBeenCalledWith(expect.stringContaining('Multi-host event detected'), expect.anything());
+      logSpy.mockRestore();
+    });
   });
 
   describe('Lead-added/updated alert (gap 4)', () => {
