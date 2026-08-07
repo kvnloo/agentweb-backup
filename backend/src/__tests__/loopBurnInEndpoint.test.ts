@@ -86,7 +86,7 @@ describe('GET /api/admin/loops/burn-in (ENG-746 AC4)', () => {
   it('fails closed with an explicit verdict when NO burn-in data exists', async () => {
     const res = await request(makeApp())
       .get('/api/admin/loops/burn-in')
-      .query({ releaseAt: RELEASE_AT });
+      .query({ releaseAt: RELEASE_AT, releaseIssueId: 'ENG-746' });
 
     expect(res.status).toBe(200);
     expect(res.body.verdict).toBe('insufficient_data');
@@ -127,7 +127,7 @@ describe('GET /api/admin/loops/burn-in (ENG-746 AC4)', () => {
 
     const res = await request(makeApp())
       .get('/api/admin/loops/burn-in')
-      .query({ releaseAt: RELEASE_AT });
+      .query({ releaseAt: RELEASE_AT, releaseIssueId: 'ENG-746' });
 
     expect(res.status).toBe(200);
     expect(res.body.verdict).toBe('clean');
@@ -158,7 +158,7 @@ describe('GET /api/admin/loops/burn-in (ENG-746 AC4)', () => {
 
     const res = await request(makeApp())
       .get('/api/admin/loops/burn-in')
-      .query({ releaseAt: RELEASE_AT, minRuns: 0 });
+      .query({ releaseAt: RELEASE_AT, releaseIssueId: 'ENG-746', minRuns: 0 });
 
     expect(res.body.verdict).toBe('insufficient_data');
     expect(res.body.passesClosureCheck4).toBe(false);
@@ -189,7 +189,7 @@ describe('GET /api/admin/loops/burn-in (ENG-746 AC4)', () => {
 
     const res = await request(makeApp())
       .get('/api/admin/loops/burn-in')
-      .query({ releaseAt: RELEASE_AT, tolerance: 1 });
+      .query({ releaseAt: RELEASE_AT, releaseIssueId: 'ENG-746', tolerance: 1 });
 
     expect(res.body.verdict).toBe('regressed');
     expect(res.body.passesClosureCheck4).toBe(false);
@@ -216,7 +216,12 @@ describe('GET /api/admin/loops/burn-in (ENG-746 AC4)', () => {
     // minRuns above the default is honoured...
     const strict = await request(makeApp())
       .get('/api/admin/loops/burn-in')
-      .query({ releaseAt: RELEASE_AT, minRuns: 5000, tolerance: 0.001 });
+      .query({
+        releaseAt: RELEASE_AT,
+        releaseIssueId: 'ENG-746',
+        minRuns: 5000,
+        tolerance: 0.001,
+      });
 
     expect(strict.body.minRunCount).toBe(5000);
     expect(strict.body.tolerance).toBe(0.001);
@@ -239,6 +244,36 @@ describe('GET /api/admin/loops/burn-in (ENG-746 AC4)', () => {
     expect(res.status).toBe(400);
     expect(res.body.passesClosureCheck4).toBe(false);
   });
+
+  it('requires release attribution rather than evaluating an anonymous release', async () => {
+    const res = await request(makeApp())
+      .get('/api/admin/loops/burn-in')
+      .query({ releaseAt: RELEASE_AT });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('releaseIssueId_required');
+    expect(res.body.passesClosureCheck4).toBe(false);
+  });
+
+  it('rejects requester-selected 7d policy instead of blending window lines', async () => {
+    const res = await request(makeApp())
+      .get('/api/admin/loops/burn-in')
+      .query({ releaseAt: RELEASE_AT, releaseIssueId: 'ENG-746', window: '7d' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('window_fixed');
+    expect(res.body.passesClosureCheck4).toBe(false);
+  });
+
+  it('rejects malformed incident attribution', async () => {
+    const res = await request(makeApp())
+      .get('/api/admin/loops/burn-in')
+      .query({ releaseAt: RELEASE_AT, releaseIssueId: 'ENG-746', incident: 'last-week:ENG-1' });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('incident_invalid');
+    expect(res.body.passesClosureCheck4).toBe(false);
+  });
 });
 
 describe('fail-closed on infrastructure failure', () => {
@@ -253,7 +288,7 @@ describe('fail-closed on infrastructure failure', () => {
 
     const res = await request(makeApp())
       .get('/api/admin/loops/burn-in')
-      .query({ releaseAt: RELEASE_AT });
+      .query({ releaseAt: RELEASE_AT, releaseIssueId: 'ENG-746' });
 
     expect(res.status).toBe(500);
     // An error must never be mistaken for approval.

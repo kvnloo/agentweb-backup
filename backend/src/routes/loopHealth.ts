@@ -19,8 +19,10 @@ import { awsDynamoAdapter } from '../loops/adapters/awsAdapters';
 import { readReliabilityTrend } from '../cron/agentReliabilitySnapshotCron';
 import {
   evaluateBurnIn,
+  BURN_IN_AUTHORITATIVE_WINDOW_LABEL,
   BURN_IN_DEFAULT_MIN_RUN_COUNT,
   BURN_IN_DEFAULT_TOLERANCE,
+  type BurnInIncidentAttribution,
 } from '../cron/burnInEvaluation';
 
 const router = express.Router();
@@ -86,7 +88,8 @@ router.get('/reliability-trend', async (req: Request, res: Response) => {
  * false-green this endpoint exists to prevent.
  *
  *   ?releaseAt=<ISO>  — required; when the change reached production
- *   ?window=7d        — '24h' (default) or '7d'
+ *   ?releaseIssueId=ENG-759 — required; release attribution boundary
+ *   ?incident=2026-08-06:ENG-836 — repeatable unrelated incident attribution
  *   ?days=30          — how much trend history to consider (default 30)
  *   ?minRuns=10       — raise the minimum runs a window needs (stricter only)
  *   ?tolerance=0.005  — lower the allowed rate increase (stricter only)
@@ -114,7 +117,57 @@ router.get('/burn-in', async (req: Request, res: Response) => {
       });
     }
 
-    const windowLabel = req.query.window === '7d' ? '7d' : '24h';
+    const releaseIssueId =
+      typeof req.query.releaseIssueId === 'string' ? req.query.releaseIssueId.trim() : '';
+    if (!releaseIssueId) {
+      return res.status(400).json({
+        error: 'releaseIssueId_required',
+        passesClosureCheck4: false,
+        verdict: 'insufficient_data',
+        reason:
+          'releaseIssueId is required so incident windows can be attributed to this release or excluded as unrelated.',
+      });
+    }
+
+    if (
+      typeof req.query.window === 'string' &&
+      req.query.window !== BURN_IN_AUTHORITATIVE_WINDOW_LABEL
+    ) {
+      return res.status(400).json({
+        error: 'window_fixed',
+        passesClosureCheck4: false,
+        verdict: 'insufficient_data',
+        reason: `Closure check 4 uses the fixed '${BURN_IN_AUTHORITATIVE_WINDOW_LABEL}' window.`,
+      });
+    }
+
+    const incidentValues = Array.isArray(req.query.incident)
+      ? req.query.incident
+      : req.query.incident === undefined
+        ? []
+        : [req.query.incident];
+    const incidentAttributions: BurnInIncidentAttribution[] = [];
+    for (const raw of incidentValues) {
+      if (typeof raw !== 'string') {
+        return res.status(400).json({
+          error: 'incident_invalid',
+          passesClosureCheck4: false,
+          verdict: 'insufficient_data',
+          reason: 'Each incident must use YYYY-MM-DD:ENG-NNN format.',
+        });
+      }
+      const match = /^(\d{4}-\d{2}-\d{2}):(ENG-\d+)$/.exec(raw.trim());
+      if (!match) {
+        return res.status(400).json({
+          error: 'incident_invalid',
+          passesClosureCheck4: false,
+          verdict: 'insufficient_data',
+          reason: `Incident '${raw}' must use YYYY-MM-DD:ENG-NNN format.`,
+        });
+      }
+      incidentAttributions.push({ date: match[1], issueId: match[2] });
+    }
+
     const days = Math.max(1, Math.min(365, Number(req.query.days) || 30));
 
     // Stricter-only clamps. A request can demand more evidence or less slack;
@@ -132,12 +185,19 @@ router.get('/burn-in', async (req: Request, res: Response) => {
         : undefined;
 
     const dynamo = awsDynamoAdapter();
-    const snapshots = await readReliabilityTrend(dynamo, { limit: days, windowLabel });
+    const [dailySnapshots, weeklySnapshots] = await Promise.all([
+      readReliabilityTrend(dynamo, {
+        limit: days,
+        windowLabel: BURN_IN_AUTHORITATIVE_WINDOW_LABEL,
+      }),
+      readReliabilityTrend(dynamo, { limit: days, windowLabel: '7d' }),
+    ]);
 
     const assessment = evaluateBurnIn({
-      snapshots,
+      snapshots: [...dailySnapshots, ...weeklySnapshots],
       releaseAt,
-      windowLabel,
+      releaseIssueId,
+      incidentAttributions,
       ...(minRunCount !== undefined ? { minRunCount } : {}),
       ...(tolerance !== undefined ? { tolerance } : {}),
     });

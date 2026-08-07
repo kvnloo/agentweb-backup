@@ -59,6 +59,9 @@ export const BURN_IN_DEFAULT_MIN_RUN_COUNT = 5;
  */
 export const BURN_IN_DEFAULT_TOLERANCE = 0.02;
 
+/** Closure check 4 has one authoritative line; callers cannot choose it. */
+export const BURN_IN_AUTHORITATIVE_WINDOW_LABEL = '24h' as const;
+
 /** The subset of a snapshot the verdict is actually computed from. */
 export interface BurnInRates {
   date: string;
@@ -87,6 +90,14 @@ export interface BurnInAssessment {
   windowLabel: string;
   minRunCount: number;
   tolerance: number;
+  /** Explicitly attributed, unrelated incident windows omitted from the verdict. */
+  excludedIncidents?: readonly BurnInIncidentAttribution[];
+}
+
+export interface BurnInIncidentAttribution {
+  date: string;
+  issueId: string;
+  reason?: string;
 }
 
 export interface EvaluateBurnInInput {
@@ -96,6 +107,10 @@ export interface EvaluateBurnInInput {
   windowLabel?: string;
   minRunCount?: number;
   tolerance?: number;
+  /** Release whose burn-in is being evaluated (enables attributed replay policy). */
+  releaseIssueId?: string;
+  /** Explicit incident ownership by snapshot date. */
+  incidentAttributions?: readonly BurnInIncidentAttribution[];
 }
 
 function toRates(s: ReliabilitySnapshot): BurnInRates {
@@ -118,6 +133,31 @@ function boundaryMs(iso: string | undefined): number {
 
 function fmtPct(rate: number): string {
   return `${(rate * 100).toFixed(2)}%`;
+}
+
+function regressionDescriptions(
+  baseline: BurnInRates,
+  candidate: BurnInRates,
+  tolerance: number,
+): string[] {
+  const failedDelta = candidate.failedRunRate - baseline.failedRunRate;
+  const degradedDelta = candidate.degradedRunRate - baseline.degradedRunRate;
+  const regressions: string[] = [];
+
+  if (failedDelta > tolerance) {
+    regressions.push(
+      `failedRunRate rose ${fmtPct(baseline.failedRunRate)} → ${fmtPct(candidate.failedRunRate)} ` +
+        `(+${fmtPct(failedDelta)}, tolerance ${fmtPct(tolerance)})`,
+    );
+  }
+  if (degradedDelta > tolerance) {
+    regressions.push(
+      `degradedRunRate rose ${fmtPct(baseline.degradedRunRate)} → ${fmtPct(candidate.degradedRunRate)} ` +
+        `(+${fmtPct(degradedDelta)}, tolerance ${fmtPct(tolerance)})`,
+    );
+  }
+
+  return regressions;
 }
 
 /** Build a failing assessment. Every early exit funnels through here so no path
@@ -160,7 +200,10 @@ function insufficient(
  * the comparison against how the system actually behaved just before shipping.
  */
 export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
-  const windowLabel = input.windowLabel ?? '24h';
+  const attributableReplay = Boolean(input.releaseIssueId);
+  const windowLabel = attributableReplay
+    ? BURN_IN_AUTHORITATIVE_WINDOW_LABEL
+    : input.windowLabel ?? BURN_IN_AUTHORITATIVE_WINDOW_LABEL;
   const minRunCount = input.minRunCount ?? BURN_IN_DEFAULT_MIN_RUN_COUNT;
   const tolerance = input.tolerance ?? BURN_IN_DEFAULT_TOLERANCE;
 
@@ -173,6 +216,39 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
   }
   const releaseAtIso = input.releaseAt.toISOString();
   const ctx = { releaseAt: releaseAtIso, windowLabel, minRunCount, tolerance };
+
+  if (
+    attributableReplay &&
+    input.windowLabel !== undefined &&
+    input.windowLabel !== BURN_IN_AUTHORITATIVE_WINDOW_LABEL
+  ) {
+    return insufficient(
+      `Cannot evaluate burn-in: closure check 4 uses the fixed '${BURN_IN_AUTHORITATIVE_WINDOW_LABEL}' ` +
+        `window, not requester-selected '${input.windowLabel}'.`,
+      ctx,
+    );
+  }
+
+  if (attributableReplay) {
+    const labelsByDate = new Map<string, Set<string>>();
+    for (const snapshot of input.snapshots) {
+      if (snapshot.windowLabel !== '24h' && snapshot.windowLabel !== '7d') continue;
+      const labels = labelsByDate.get(snapshot.date) ?? new Set<string>();
+      labels.add(snapshot.windowLabel);
+      labelsByDate.set(snapshot.date, labels);
+    }
+    const unpairedDates = [...labelsByDate.entries()]
+      .filter(([, labels]) => !labels.has('24h') || !labels.has('7d'))
+      .map(([date]) => date)
+      .sort();
+    if (unpairedDates.length > 0) {
+      return insufficient(
+        `Cannot evaluate burn-in: every replay date must contain separate 24h and 7d rows; ` +
+          `missing a pair for ${unpairedDates.join(', ')}. The evaluator never blends window lines.`,
+        ctx,
+      );
+    }
+  }
 
   const relevant = input.snapshots
     .filter((s) => s.windowLabel === windowLabel)
@@ -242,22 +318,74 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
   const baseline = toRates(baselineSnap);
   const postRelease = toRates(postSnap);
 
-  const failedDelta = postRelease.failedRunRate - baseline.failedRunRate;
-  const degradedDelta = postRelease.degradedRunRate - baseline.degradedRunRate;
+  if (attributableReplay) {
+    const excludedIncidents: BurnInIncidentAttribution[] = [];
+    let latestClean: BurnInRates | null = null;
 
-  const regressions: string[] = [];
-  if (failedDelta > tolerance) {
-    regressions.push(
-      `failedRunRate rose ${fmtPct(baseline.failedRunRate)} → ${fmtPct(postRelease.failedRunRate)} ` +
-        `(+${fmtPct(failedDelta)}, tolerance ${fmtPct(tolerance)})`,
-    );
+    for (const candidateSnap of afterAll.filter((snapshot) => snapshot.runCount >= minRunCount)) {
+      const candidate = toRates(candidateSnap);
+      const regressions = regressionDescriptions(baseline, candidate, tolerance);
+      if (regressions.length === 0) {
+        latestClean = candidate;
+        continue;
+      }
+
+      const unrelatedIncident = input.incidentAttributions?.find(
+        (incident) =>
+          incident.date === candidate.date && incident.issueId !== input.releaseIssueId,
+      );
+      if (unrelatedIncident) {
+        excludedIncidents.push(unrelatedIncident);
+        continue;
+      }
+
+      return {
+        verdict: 'regressed',
+        passesClosureCheck4: false,
+        reason:
+          `Burn-in for ${input.releaseIssueId} regressed on ${candidate.date} against the ` +
+          `${baseline.date} baseline: ${regressions.join('; ')}.`,
+        baseline,
+        postRelease: candidate,
+        releaseAt: releaseAtIso,
+        windowLabel,
+        minRunCount,
+        tolerance,
+        excludedIncidents,
+      };
+    }
+
+    if (!latestClean) {
+      return {
+        ...insufficient(
+          `Cannot evaluate burn-in for ${input.releaseIssueId}: every qualifying post-release ` +
+            'regression belongs to an explicitly unrelated incident, leaving no clean release window.',
+          { ...ctx, baseline },
+        ),
+        excludedIncidents,
+      };
+    }
+
+    return {
+      verdict: 'clean',
+      passesClosureCheck4: true,
+      reason:
+        `Burn-in clean for ${input.releaseIssueId}: ${latestClean.date} is no worse than the ` +
+        `${baseline.date} baseline within a ${fmtPct(tolerance)} tolerance` +
+        (excludedIncidents.length > 0
+          ? `; excluded ${excludedIncidents.length} explicitly attributed unrelated incident window(s).`
+          : '.'),
+      baseline,
+      postRelease: latestClean,
+      releaseAt: releaseAtIso,
+      windowLabel,
+      minRunCount,
+      tolerance,
+      excludedIncidents,
+    };
   }
-  if (degradedDelta > tolerance) {
-    regressions.push(
-      `degradedRunRate rose ${fmtPct(baseline.degradedRunRate)} → ${fmtPct(postRelease.degradedRunRate)} ` +
-        `(+${fmtPct(degradedDelta)}, tolerance ${fmtPct(tolerance)})`,
-    );
-  }
+
+  const regressions = regressionDescriptions(baseline, postRelease, tolerance);
 
   if (regressions.length > 0) {
     return {

@@ -45,6 +45,118 @@ function snap(
 
 const RELEASE_AT = new Date('2026-07-20T12:00:00.000Z');
 
+function pairedSnap(
+  date: string,
+  over24h: Partial<ReliabilitySnapshot> = {},
+): ReliabilitySnapshot[] {
+  return [
+    snap(date, over24h),
+    snap(date, {
+      ...over24h,
+      windowLabel: '7d',
+      windowStart: `${date}T00:00:00.000Z`,
+      windowEnd: `${date}T23:59:59.999Z`,
+    }),
+  ];
+}
+
+const REPLAY_RELEASE_AT = new Date('2026-07-30T12:00:00.000Z');
+const REPLAY_DATES = [
+  '2026-07-28',
+  '2026-07-29',
+  '2026-07-30',
+  '2026-07-31',
+  '2026-08-01',
+  '2026-08-02',
+  '2026-08-03',
+  '2026-08-04',
+  '2026-08-05',
+  '2026-08-06',
+];
+
+function replaySnapshots(
+  overrides: Record<string, Partial<ReliabilitySnapshot>> = {},
+): ReliabilitySnapshot[] {
+  return REPLAY_DATES.flatMap((date) => pairedSnap(date, overrides[date]));
+}
+
+describe('evaluateBurnIn — attributed replay policy (ENG-938)', () => {
+  it('fixture guard: every replay date carries separate 24h and 7d rows', () => {
+    const snapshots = replaySnapshots();
+
+    for (const date of REPLAY_DATES) {
+      expect(
+        snapshots.filter((snapshot) => snapshot.date === date).map((snapshot) => snapshot.windowLabel),
+      ).toEqual(['24h', '7d']);
+    }
+  });
+
+  it('replays ENG-759 clean when the latest spike belongs to unrelated ENG-836', () => {
+    const snapshots = replaySnapshots({
+      '2026-08-06': { failedRunRate: 0.8 },
+    });
+
+    const assessment = evaluateBurnIn({
+      snapshots,
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-759',
+      incidentAttributions: [
+        { date: '2026-08-06', issueId: 'ENG-836', reason: 'unrelated production incident' },
+      ],
+    });
+
+    expect(assessment.verdict).toBe('clean');
+    expect(assessment.passesClosureCheck4).toBe(true);
+    expect(assessment.excludedIncidents).toEqual([
+      { date: '2026-08-06', issueId: 'ENG-836', reason: 'unrelated production incident' },
+    ]);
+  });
+
+  it('replays ENG-745 clean against the same unrelated incident', () => {
+    const assessment = evaluateBurnIn({
+      snapshots: replaySnapshots({
+        '2026-08-06': { degradedRunRate: 0.75 },
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-745',
+      incidentAttributions: [{ date: '2026-08-06', issueId: 'ENG-836' }],
+    });
+
+    expect(assessment.verdict).toBe('clean');
+    expect(assessment.passesClosureCheck4).toBe(true);
+  });
+
+  it('fails a genuine release regression even when a later window recovers', () => {
+    const assessment = evaluateBurnIn({
+      snapshots: replaySnapshots({
+        '2026-08-03': { failedRunRate: 0.9 },
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.verdict).toBe('regressed');
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.postRelease?.date).toBe('2026-08-03');
+  });
+
+  it('fails closed when a replay date lacks either authoritative window row', () => {
+    const snapshots = replaySnapshots().filter(
+      (snapshot) => !(snapshot.date === '2026-08-02' && snapshot.windowLabel === '7d'),
+    );
+
+    const assessment = evaluateBurnIn({
+      snapshots,
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-759',
+    });
+
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.reason).toMatch(/24h.*7d|7d.*24h/i);
+  });
+});
+
 describe('evaluateBurnIn — empty is never a pass (ENG-746 AC3)', () => {
   it('returns insufficient_data, not clean, when there are no snapshots at all', () => {
     const a = evaluateBurnIn({ snapshots: [], releaseAt: RELEASE_AT });
