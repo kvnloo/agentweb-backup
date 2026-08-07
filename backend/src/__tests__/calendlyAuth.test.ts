@@ -330,8 +330,12 @@ describe('POST /connect', () => {
     const duplicateError = {
       response: { status: 409, data: { title: 'Already Exists', message: 'Hook with this url already exists' } },
     };
+    const ourCallbackUrl = `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/webhooks/calendly`;
     const staleListResponse = (over: any = {}) => ({
-      data: { collection: [{ uri: 'https://api.calendly.com/webhook_subscriptions/STALE111111111' }], ...over },
+      data: {
+        collection: [{ uri: 'https://api.calendly.com/webhook_subscriptions/STALE111111111', callback_url: ourCallbackUrl }],
+        ...over,
+      },
     });
 
     it('deletes the stale subscription and retries, succeeding with the new one', async () => {
@@ -353,6 +357,62 @@ describe('POST /connect', () => {
         'https://api.calendly.com/webhook_subscriptions/STALE111111111',
         expect.objectContaining({ headers: expect.objectContaining({ Authorization: expect.stringContaining('Bearer') }) }),
       );
+    });
+
+    // Greptile P1 (agentweb#2291): the list query is scoped to this user + scope:'user', but
+    // Calendly doesn't further scope it to OUR app specifically — another third-party
+    // integration's scope:'user' webhook for the same Calendly user can legitimately appear
+    // in the same collection. Blindly deleting collection[0] risks deleting an unrelated
+    // app's webhook and leaving our own real stale one (with the actual URL conflict) intact.
+    it('deletes only the subscription matching our own callback URL, not an unrelated one listed first', async () => {
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce(duplicateError);
+      axios.get.mockResolvedValueOnce({
+        data: {
+          collection: [
+            { uri: 'https://api.calendly.com/webhook_subscriptions/UNRELATED_APP', callback_url: 'https://some-other-app.example.com/webhooks/calendly' },
+            { uri: 'https://api.calendly.com/webhook_subscriptions/STALE111111111', callback_url: ourCallbackUrl },
+          ],
+        },
+      });
+      axios.delete = jest.fn().mockResolvedValueOnce({ data: {} });
+      axios.post.mockResolvedValueOnce(webhookCreatedResponse({ uri: 'https://api.calendly.com/webhook_subscriptions/FRESH2222222222' }));
+
+      const res = await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.account.config.booking_tracking_active).toBe(true);
+      expect(axios.delete).toHaveBeenCalledWith(
+        'https://api.calendly.com/webhook_subscriptions/STALE111111111',
+        expect.objectContaining({ headers: expect.objectContaining({ Authorization: expect.stringContaining('Bearer') }) }),
+      );
+      expect(axios.delete).not.toHaveBeenCalledWith(
+        'https://api.calendly.com/webhook_subscriptions/UNRELATED_APP',
+        expect.anything(),
+      );
+    });
+
+    it('falls back to the upgrade-required message when the only listed subscription belongs to a different app', async () => {
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce(duplicateError);
+      axios.get.mockResolvedValueOnce({
+        data: {
+          collection: [
+            { uri: 'https://api.calendly.com/webhook_subscriptions/UNRELATED_APP', callback_url: 'https://some-other-app.example.com/webhooks/calendly' },
+          ],
+        },
+      });
+
+      const res = await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.upgradeRequired).toBe(true);
+      expect(res.body.account.config.booking_tracking_active).toBe(false);
+      expect(axios.delete).not.toHaveBeenCalled();
     });
 
     it('falls back to the upgrade-required message when no stale subscription can be found', async () => {
