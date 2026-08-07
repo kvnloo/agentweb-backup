@@ -62,6 +62,19 @@ export const BURN_IN_DEFAULT_TOLERANCE = 0.02;
 /** Closure check 4 has one authoritative line; callers cannot choose it. */
 export const BURN_IN_AUTHORITATIVE_WINDOW_LABEL = '24h' as const;
 
+/**
+ * How many qualifying post-release 24h windows the attributed replay inspects.
+ *
+ * The burn-in period has to be a fixed, named length, because the scan decides
+ * how long a release can be failed by a later day. Bounding it by the caller's
+ * history horizon instead (`?days=30`) means a regression three weeks after the
+ * release still fails that release — a 30-day freeze, which is a worse version
+ * of the exact 7-day freeze ENG-938 was filed about. Seven windows matches the
+ * burn-in period named in the issue and is independent of how much trend
+ * history is read.
+ */
+export const BURN_IN_POST_RELEASE_WINDOW_LIMIT = 7;
+
 /** The subset of a snapshot the verdict is actually computed from. */
 export interface BurnInRates {
   date: string;
@@ -123,6 +136,43 @@ function toRates(s: ReliabilitySnapshot): BurnInRates {
     degradedRunRate: s.degradedRunRate,
     runCount: s.runCount,
   };
+}
+
+/**
+ * Canonical form of an ENG issue id for comparison.
+ *
+ * Incident exclusion turns on `incident.issueId !== releaseIssueId`, so a bare
+ * string comparison makes `eng-836` and `ENG-836` two different issues: a
+ * release could exclude its OWN incident window purely on a case mismatch, and
+ * the endpoint would report `clean` for a release that regressed. That is the
+ * contamination this evaluator exists to prevent, inverted.
+ */
+function normalizeIssueId(id: string | undefined): string {
+  return typeof id === 'string' ? id.trim().toUpperCase() : '';
+}
+
+/**
+ * Dates (of those the verdict actually reads) that lack either authoritative
+ * window row. AC3 forbids blending the 24h and 7d lines, so a date the verdict
+ * consumes must carry both.
+ */
+function unpairedWindowDates(
+  snapshots: readonly ReliabilitySnapshot[],
+  consumedDates: readonly string[],
+): string[] {
+  const labelsByDate = new Map<string, Set<string>>();
+  for (const snapshot of snapshots) {
+    if (snapshot.windowLabel !== '24h' && snapshot.windowLabel !== '7d') continue;
+    const labels = labelsByDate.get(snapshot.date) ?? new Set<string>();
+    labels.add(snapshot.windowLabel);
+    labelsByDate.set(snapshot.date, labels);
+  }
+  return [...new Set(consumedDates)]
+    .filter((date) => {
+      const labels = labelsByDate.get(date);
+      return !labels || !labels.has('24h') || !labels.has('7d');
+    })
+    .sort();
 }
 
 /** Epoch ms of a snapshot boundary, or NaN if the row is malformed. */
@@ -201,6 +251,7 @@ function insufficient(
  */
 export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
   const attributableReplay = Boolean(input.releaseIssueId);
+  const releaseIssueKey = normalizeIssueId(input.releaseIssueId);
   const windowLabel = attributableReplay
     ? BURN_IN_AUTHORITATIVE_WINDOW_LABEL
     : input.windowLabel ?? BURN_IN_AUTHORITATIVE_WINDOW_LABEL;
@@ -227,27 +278,6 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
         `window, not requester-selected '${input.windowLabel}'.`,
       ctx,
     );
-  }
-
-  if (attributableReplay) {
-    const labelsByDate = new Map<string, Set<string>>();
-    for (const snapshot of input.snapshots) {
-      if (snapshot.windowLabel !== '24h' && snapshot.windowLabel !== '7d') continue;
-      const labels = labelsByDate.get(snapshot.date) ?? new Set<string>();
-      labels.add(snapshot.windowLabel);
-      labelsByDate.set(snapshot.date, labels);
-    }
-    const unpairedDates = [...labelsByDate.entries()]
-      .filter(([, labels]) => !labels.has('24h') || !labels.has('7d'))
-      .map(([date]) => date)
-      .sort();
-    if (unpairedDates.length > 0) {
-      return insufficient(
-        `Cannot evaluate burn-in: every replay date must contain separate 24h and 7d rows; ` +
-          `missing a pair for ${unpairedDates.join(', ')}. The evaluator never blends window lines.`,
-        ctx,
-      );
-    }
   }
 
   const relevant = input.snapshots
@@ -319,10 +349,35 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
   const postRelease = toRates(postSnap);
 
   if (attributableReplay) {
+    // The burn-in period is a fixed number of post-release windows, NOT however
+    // much history the caller happened to read. See
+    // BURN_IN_POST_RELEASE_WINDOW_LIMIT.
+    const scanned = afterAll
+      .filter((snapshot) => snapshot.runCount >= minRunCount)
+      .slice(0, BURN_IN_POST_RELEASE_WINDOW_LIMIT);
+
+    // AC3's no-blending rule applies to the rows this verdict READS: the
+    // baseline and the scanned burn-in windows. Demanding a 24h/7d pair across
+    // the whole horizon instead bricks the gate on a single missing 7d row for
+    // a pre-release date the verdict never looks at — and it cannot self-heal,
+    // because the snapshot catch-up horizon (14 days) is shorter than the read
+    // horizon the endpoint asks for (30).
+    const unpairedDates = unpairedWindowDates(input.snapshots, [
+      baseline.date,
+      ...scanned.map((snapshot) => snapshot.date),
+    ]);
+    if (unpairedDates.length > 0) {
+      return insufficient(
+        `Cannot evaluate burn-in: every date this verdict reads must contain separate 24h and 7d ` +
+          `rows; missing a pair for ${unpairedDates.join(', ')}. The evaluator never blends window lines.`,
+        { ...ctx, baseline },
+      );
+    }
+
     const excludedIncidents: BurnInIncidentAttribution[] = [];
     let latestClean: BurnInRates | null = null;
 
-    for (const candidateSnap of afterAll.filter((snapshot) => snapshot.runCount >= minRunCount)) {
+    for (const candidateSnap of scanned) {
       const candidate = toRates(candidateSnap);
       const regressions = regressionDescriptions(baseline, candidate, tolerance);
       if (regressions.length === 0) {
@@ -332,7 +387,8 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
 
       const unrelatedIncident = input.incidentAttributions?.find(
         (incident) =>
-          incident.date === candidate.date && incident.issueId !== input.releaseIssueId,
+          incident.date === candidate.date &&
+          normalizeIssueId(incident.issueId) !== releaseIssueKey,
       );
       if (unrelatedIncident) {
         excludedIncidents.push(unrelatedIncident);

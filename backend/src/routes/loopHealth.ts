@@ -88,9 +88,12 @@ router.get('/reliability-trend', async (req: Request, res: Response) => {
  * false-green this endpoint exists to prevent.
  *
  *   ?releaseAt=<ISO>  — required; when the change reached production
- *   ?releaseIssueId=ENG-759 — required; release attribution boundary
+ *   ?releaseIssueId=ENG-759 — required; ENG-NNN release attribution boundary
  *   ?incident=2026-08-06:ENG-836 — repeatable unrelated incident attribution
- *   ?days=30          — how much trend history to consider (default 30)
+ *   ?days=30          — how much trend history to READ (default 30). This does
+ *                       not set the burn-in period: the verdict inspects a fixed
+ *                       BURN_IN_POST_RELEASE_WINDOW_LIMIT of post-release
+ *                       windows however much history is read.
  *   ?minRuns=10       — raise the minimum runs a window needs (stricter only)
  *   ?tolerance=0.005  — lower the allowed rate increase (stricter only)
  */
@@ -126,6 +129,21 @@ router.get('/burn-in', async (req: Request, res: Response) => {
         verdict: 'insufficient_data',
         reason:
           'releaseIssueId is required so incident windows can be attributed to this release or excluded as unrelated.',
+      });
+    }
+
+    // Same shape the incident attributions are parsed with. Incident exclusion
+    // is an equality test against this value, so a free-form or differently
+    // cased id ('eng-836', 'ENG 836', a PR number) would fail to match its own
+    // incident and let the release exclude the very window that indicts it.
+    if (!/^ENG-\d+$/.test(releaseIssueId)) {
+      return res.status(400).json({
+        error: 'releaseIssueId_invalid',
+        passesClosureCheck4: false,
+        verdict: 'insufficient_data',
+        reason:
+          `releaseIssueId '${releaseIssueId}' must use ENG-NNN form — incident attribution is ` +
+          "matched against it exactly, so any other form would silently exclude this release's own incident window.",
       });
     }
 

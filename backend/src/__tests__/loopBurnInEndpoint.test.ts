@@ -255,6 +255,22 @@ describe('GET /api/admin/loops/burn-in (ENG-746 AC4)', () => {
     expect(res.body.passesClosureCheck4).toBe(false);
   });
 
+  // Incident exclusion is an exact match against releaseIssueId, so a
+  // free-form or differently-cased id would fail to match its own incident and
+  // exclude the very window that indicts the release.
+  it.each(['eng-759', 'ENG 759', '759', 'PR-2293'])(
+    'rejects releaseIssueId %p rather than evaluating an unmatchable attribution',
+    async (releaseIssueId) => {
+      const res = await request(makeApp())
+        .get('/api/admin/loops/burn-in')
+        .query({ releaseAt: RELEASE_AT, releaseIssueId });
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe('releaseIssueId_invalid');
+      expect(res.body.passesClosureCheck4).toBe(false);
+    },
+  );
+
   it('rejects requester-selected 7d policy instead of blending window lines', async () => {
     const res = await request(makeApp())
       .get('/api/admin/loops/burn-in')
