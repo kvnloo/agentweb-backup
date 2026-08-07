@@ -2,6 +2,7 @@ import {
   collectMediaGeneratedSince,
   buildTimeoutContinuationMessage,
   buildEmptyMediaTimeoutMessage,
+  buildMediaBudgetDeferralMessage,
 } from '../utils/timeoutContinuation';
 
 describe('collectMediaGeneratedSince', () => {
@@ -117,5 +118,67 @@ describe('buildEmptyMediaTimeoutMessage (ENG-922)', () => {
   it('does not mislabel a non-media timeout as an image-generation failure', () => {
     expect(buildEmptyMediaTimeoutMessage(['search_web', 'create_blog_article'])).toBeNull();
     expect(buildEmptyMediaTimeoutMessage(undefined)).toBeNull();
+  });
+
+  it('covers video and voiceover timeouts, and falls back to neutral wording when mixed', () => {
+    expect(buildEmptyMediaTimeoutMessage(['generate_video'])).toContain('1 video still remains');
+    expect(buildEmptyMediaTimeoutMessage(['generate_voiceover', 'generate_voiceover']))
+      .toContain('2 voiceovers still remain');
+    expect(buildEmptyMediaTimeoutMessage(['generate_image', 'generate_video']))
+      .toContain('2 assets still remain');
+  });
+});
+
+describe('buildMediaBudgetDeferralMessage (ENG-922)', () => {
+  const deferred = (name: string) => ({
+    name,
+    result: { deferred: true, reason: 'media_generation_time_budget' },
+  });
+  const doneImage = (filename: string) => ({
+    name: 'generate_image',
+    result: { imageUrl: `https://s3/${filename}`, filename },
+  });
+
+  it('delivers completed images inline and states the exact remaining count', () => {
+    const msg = buildMediaBudgetDeferralMessage([
+      doneImage('v1.png'),
+      doneImage('v2.png'),
+      doneImage('v3.png'),
+      deferred('generate_image'),
+    ]);
+
+    expect(msg).toContain('I generated and saved 3 images so far');
+    expect(msg).toContain('![v1.png](https://s3/v1.png)');
+    expect(msg).toContain('1 image still remains');
+  });
+
+  it('still delivers completed images when the deferred call is a video, not an image', () => {
+    // Regression: counting only generate_image returned null here, dropping the caller
+    // into a canned string that lost the finished images entirely.
+    const msg = buildMediaBudgetDeferralMessage([
+      doneImage('v1.png'),
+      deferred('generate_video'),
+    ]);
+
+    expect(msg).not.toBeNull();
+    expect(msg).toContain('![v1.png](https://s3/v1.png)');
+    expect(msg).toContain('1 video still remains');
+  });
+
+  it('does not claim the whole turn published nothing — only that it paused here', () => {
+    // The loop can only guarantee that NOTHING FURTHER ran after this pause; an earlier
+    // iteration in the same turn may already have published. The copy must not overclaim.
+    const msg = buildMediaBudgetDeferralMessage([doneImage('v1.png'), deferred('generate_image')])!;
+
+    expect(msg).toContain('I paused here rather than taking the incomplete set on to any further publishing step');
+    expect(msg).not.toContain('was not published');
+  });
+
+  it('returns null when no media call was deferred for the time budget', () => {
+    expect(buildMediaBudgetDeferralMessage([doneImage('v1.png')])).toBeNull();
+    expect(buildMediaBudgetDeferralMessage([
+      { name: 'call_meta_marketing_api', result: { deferred: true, reason: 'media_generation_time_budget' } },
+    ])).toBeNull();
+    expect(buildMediaBudgetDeferralMessage(undefined)).toBeNull();
   });
 });

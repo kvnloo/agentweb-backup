@@ -686,6 +686,15 @@ export async function executePreparedTools(
     mediaBudgetDeferred = true;
     return { status: 'deferred', toolCall, functionArgs, duration: 0, policyDecision };
   };
+  // ENG-922: which NON-media calls must wait when a media batch defers mid-turn. A
+  // deferral leaves the media set INCOMPLETE, so anything that could act on that set —
+  // publish it, send it, write it to an external account, or advance session/work-plan
+  // state — must not run against a half-finished batch; it waits for the next turn.
+  // Read-only lookups have no such side effect (they cannot publish or orphan Graph
+  // state), so they still run and their results stay available to the terminal message
+  // and the next turn. Anything the gateway cannot classify fails CLOSED and defers.
+  const isDeferrableDependent = (policyDecision: AgentToolPolicyDecision | undefined): boolean =>
+    (policyDecision?.effect ?? 'unknown') !== 'read';
   // A genuine media asset: a gateway success that isn't an encoded {success:false}
   // AND actually produced an asset (not a confirmation-gate pause — see
   // mediaGenProducedAsset). Keeps the deferral budget's notion of "an asset exists
@@ -708,8 +717,20 @@ export async function executePreparedTools(
     // Strict sequential: wait_seconds must take effect in emission order, so nothing
     // batched with it may overlap it.
     toolResults = [];
+    // ENG-922: this path was previously unhardened — a batch like
+    // [wait_seconds, generate_image, call_meta_marketing_api] deferred the image and
+    // then still performed the Graph write against the incomplete set. Once a media
+    // call defers here the batch is in exactly the same position as the concurrent
+    // path below, so every LATER media call and every later state-changing dependent
+    // defers with it. Calls that already ran before the deferral are untouched.
+    let mediaDeferredThisBatch = false;
     for (const { toolCall, functionArgs, policyDecision } of preparedCalls) {
-      if (shouldDeferMedia(toolCall)) {
+      if (isMediaGenTool(toolCall) && (mediaDeferredThisBatch || shouldDeferMedia(toolCall))) {
+        mediaDeferredThisBatch = true;
+        toolResults.push(makeDeferred(toolCall, functionArgs, policyDecision));
+        continue;
+      }
+      if (mediaDeferredThisBatch && isDeferrableDependent(policyDecision)) {
         toolResults.push(makeDeferred(toolCall, functionArgs, policyDecision));
         continue;
       }
@@ -723,9 +744,10 @@ export async function executePreparedTools(
     // ENG-510: run batched media-gen with BOUNDED concurrency (MEDIA_GEN_MAX_CONCURRENCY
     // at a time) instead of strictly serial, so N independent variants finish in ~one
     // image's wall-clock and fit under the whole-turn cap — while staying under provider
-    // rate limits. Non-media calls wait until every media batch succeeds: otherwise a
-    // same-iteration Graph write can race a deferred final image and publish an incomplete
-    // creative set (ENG-922). Budget/duration state settles BETWEEN media batches, so the
+    // rate limits. Non-media calls run after the media batches: otherwise a same-iteration
+    // Graph write can race a deferred final image and publish an incomplete creative set
+    // (ENG-922). On a deferral only the STATE-CHANGING dependents are held back; read-only
+    // calls still execute. Budget/duration state settles BETWEEN media batches, so the
     // deferral decision (and the >=1-asset forward-progress gate) is race-free. Results are
     // written by original index so the model-visible emission order is preserved.
     toolResults = new Array(preparedCalls.length);
@@ -762,26 +784,32 @@ export async function executePreparedTools(
       });
     }
 
-    if (stopAfterMediaDeferral) {
-      // The loop terminates after processing these results, but every emitted tool call
-      // still gets a ledger/message entry. Mark dependent non-media work deferred rather
-      // than executing it against an incomplete batch.
-      indexedNonMediaCalls.forEach(({ preparedCall, index }) => {
+    // The loop terminates after processing these results, but every emitted tool call
+    // still gets a ledger/message entry. On a deferral, mark the STATE-CHANGING
+    // dependents deferred rather than executing them against an incomplete batch —
+    // read-only calls have no publish side effect and still run (isDeferrableDependent).
+    const dependentsToDefer = stopAfterMediaDeferral
+      ? indexedNonMediaCalls.filter(({ preparedCall }) => isDeferrableDependent(preparedCall.policyDecision))
+      : [];
+    const dependentsToRun = stopAfterMediaDeferral
+      ? indexedNonMediaCalls.filter(({ preparedCall }) => !isDeferrableDependent(preparedCall.policyDecision))
+      : indexedNonMediaCalls;
+
+    dependentsToDefer.forEach(({ preparedCall, index }) => {
+      const { toolCall, functionArgs, policyDecision } = preparedCall;
+      toolResults[index] = makeDeferred(toolCall, functionArgs, policyDecision);
+    });
+
+    const nonMediaResults = await Promise.all(
+      dependentsToRun.map(async ({ preparedCall }) => {
         const { toolCall, functionArgs, policyDecision } = preparedCall;
-        toolResults[index] = makeDeferred(toolCall, functionArgs, policyDecision);
-      });
-    } else {
-      const nonMediaResults = await Promise.all(
-        indexedNonMediaCalls.map(async ({ preparedCall }) => {
-          const { toolCall, functionArgs, policyDecision } = preparedCall;
-          const outcome = await runOne(toolCall, functionArgs, policyDecision);
-          return toDispatchResult(outcome, toolCall, functionArgs);
-        }),
-      );
-      nonMediaResults.forEach((dr, i) => {
-        toolResults[indexedNonMediaCalls[i].index] = dr;
-      });
-    }
+        const outcome = await runOne(toolCall, functionArgs, policyDecision);
+        return toDispatchResult(outcome, toolCall, functionArgs);
+      }),
+    );
+    nonMediaResults.forEach((dr, i) => {
+      toolResults[dependentsToRun[i].index] = dr;
+    });
   } else {
     // Parallel path carries at most one media-gen call (a solo call; any media call
     // batched with other tools forces the sequential path above), so a single

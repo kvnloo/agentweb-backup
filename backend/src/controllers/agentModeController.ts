@@ -5728,14 +5728,17 @@ export const agentModeController = {
 
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const shareId = req.params?.shareId;
-      // Snapshot BEFORE markProgressComplete deletes the progress entry.
-      const sharedTimedOutProgress = shareId ? getLatestProgress(shareId) : undefined;
+      let sharedTimedOutProgress: ReturnType<typeof getLatestProgress> | undefined;
       if (shareId) {
         // Wall-clock timeout: cancel the orphaned worker run (same as manual stop) so it
         // stops burning compute and stops emitting orphan progress that would re-open the
         // "Generating image..." panel. Mirrors the regular /generate timeout handling.
         if ((error as any)?.isGenerationTimeout) {
           console.log(`AgentMode: shared generation timed out for session ${shareId} — cancelling orphaned worker run`);
+          // Snapshot BEFORE cancellation/markProgressComplete clears the store. Read it
+          // only on the timeout path — the same guard the /generate path above uses — so
+          // an ordinary error never depends on the progress store at all.
+          sharedTimedOutProgress = getLatestProgress(shareId);
           requestCancel(shareId);
           generateMarketingResponseWorkerService.cancelSession(shareId);
         }

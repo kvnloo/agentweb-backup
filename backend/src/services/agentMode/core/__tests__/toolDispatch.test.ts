@@ -487,6 +487,72 @@ describe('executePreparedTools', () => {
       expect(executed).toEqual(['read_brand_guidelines']);
     });
 
+    /**
+     * ENG-922: a media deferral leaves the batch INCOMPLETE, so a dependent that could
+     * publish/mutate against it must not run in the same iteration — but a read-only
+     * call has no such side effect and must keep running (the assertion directly above).
+     * The gateway's own effect classification is the discriminator; anything it cannot
+     * classify fails closed.
+     */
+    const effectAwarePorts = (base: ToolDispatchPorts): ToolDispatchPorts => ({
+      ...base,
+      evaluateAgentToolPolicy: ({ toolName }: any) => ({
+        allowed: true,
+        effect: String(toolName).startsWith('read_') ? 'read' : 'unknown',
+        flags: [],
+      }) as any,
+    });
+
+    it('defers a state-changing dependent batched with a deferred image, but still runs read-only calls', async () => {
+      const { ports, executed } = mediaPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'generate_image', '{"prompt":"1"}'),
+          toolCall('b', 'call_meta_marketing_api', '{"action":"UPLOAD_IMAGE"}'),
+          toolCall('c', 'read_brand_guidelines', '{}'),
+        ],
+        effectAwarePorts(ports),
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 1 },
+      );
+      const result = await executePreparedTools(input);
+
+      // The Graph write never executes against the incomplete image set; the read does.
+      expect(executed).toEqual(['read_brand_guidelines']);
+      expect(result.mediaBudgetDeferred).toBe(true);
+      expect(input.toolCallsLedger.map((t: any) => [t.name, t.result?.deferred === true])).toEqual([
+        ['generate_image', true],
+        ['call_meta_marketing_api', true],
+        ['read_brand_guidelines', false],
+      ]);
+    });
+
+    it('applies the same defer-dependents rule on the sequential wait_seconds path', async () => {
+      // Audit repro: ["wait_seconds", "generate_image", "call_meta_marketing_api"] used
+      // to defer the image and then STILL perform the Meta Graph write in the same batch.
+      const { ports, executed } = mediaPorts();
+      const input = makeInput(
+        [
+          toolCall('a', 'wait_seconds', '{"seconds":1}'),
+          toolCall('b', 'generate_image', '{"prompt":"1"}'),
+          toolCall('c', 'call_meta_marketing_api', '{"action":"UPLOAD_IMAGE"}'),
+          toolCall('d', 'read_brand_guidelines', '{}'),
+        ],
+        effectAwarePorts(ports),
+        { mediaGenerationDeadlineMs: Date.now() - 1, mediaAssetsProducedThisRun: 1 },
+      );
+      const result = await executePreparedTools(input);
+
+      expect(executed).toEqual(['wait_seconds', 'read_brand_guidelines']);
+      expect(executed).not.toContain('call_meta_marketing_api');
+      expect(result.mediaBudgetDeferred).toBe(true);
+      expect(input.toolCallsLedger.map((t: any) => [t.name, t.result?.deferred === true])).toEqual([
+        ['wait_seconds', false],
+        ['generate_image', true],
+        ['call_meta_marketing_api', true],
+        ['read_brand_guidelines', false],
+      ]);
+    });
+
     it('forwards a deferred call to telemetry as a deferred result (ENG-103)', async () => {
       const { ports } = mediaPorts();
       const recordToolTelemetry = jest.fn();

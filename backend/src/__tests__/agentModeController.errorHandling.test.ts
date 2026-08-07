@@ -66,6 +66,11 @@ jest.mock('../utils/sseProgress', () => ({
   },
   emitProgress: jest.fn(),
   hasActiveProgress: jest.fn().mockReturnValue(false),
+  // ENG-922: the timeout paths snapshot the last progress frame before clearing it.
+  // Mock the whole module surface the controller imports, so a missing export can
+  // never surface as a TypeError inside an unrelated error branch.
+  getLatestProgress: jest.fn().mockReturnValue(null),
+  registerProgressCallback: jest.fn(),
   requestCancel: jest.fn(),
   clearCancel: jest.fn(),
   isCancelled: jest.fn().mockReturnValue(false),

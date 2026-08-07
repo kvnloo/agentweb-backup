@@ -35,6 +35,32 @@ export interface MediaBudgetToolCall {
 }
 
 /**
+ * User-facing nouns for the media-gen tools subject to the per-run time budget. Kept
+ * local (rather than imported from core/toolDispatch) so these copy helpers stay a
+ * dependency-free leaf util — importing the dispatcher here would pull the gateway and
+ * the whole tool-execution graph into the controller's error path.
+ *
+ * Mirrors MEDIA_GEN_TOOLS in services/agentMode/core/toolDispatch.ts. Adding a media-gen
+ * tool there without adding it here degrades to the generic "asset" wording; it never
+ * silently drops the deferral message (unknown names simply aren't counted).
+ */
+const MEDIA_TOOL_NOUNS: Record<string, { singular: string; plural: string }> = {
+  generate_image: { singular: 'image', plural: 'images' },
+  generate_video: { singular: 'video', plural: 'videos' },
+  generate_voiceover: { singular: 'voiceover', plural: 'voiceovers' },
+};
+
+/** Singular/plural noun for a set of media tool names — kind-specific, or "asset" when mixed. */
+function mediaNounFor(toolNames: string[]): { singular: string; plural: string } {
+  const kinds = new Set(toolNames);
+  if (kinds.size === 1) {
+    const only = MEDIA_TOOL_NOUNS[toolNames[0]];
+    if (only) return only;
+  }
+  return { singular: 'asset', plural: 'assets' };
+}
+
+/**
  * Collect image-generated markers (carrying a saved URL) persisted at or after `sinceMs`,
  * URL-deduped. Mirrors scanMessagesForAssets' marker shape and timestamp precedence
  * (`message.timestamp || metadata.timestamp`) so the set matches exactly what the asset
@@ -90,16 +116,18 @@ export function buildTimeoutContinuationMessage(images: GeneratedImageRef[] | un
 export function buildEmptyMediaTimeoutMessage(
   pendingTools: string[] | undefined | null,
 ): string | null {
-  const remaining = Array.isArray(pendingTools)
-    ? pendingTools.filter((name) => name === 'generate_image').length
-    : 0;
+  const pending = Array.isArray(pendingTools)
+    ? pendingTools.filter((name): name is string => typeof name === 'string' && name in MEDIA_TOOL_NOUNS)
+    : [];
+  const remaining = pending.length;
   if (remaining < 1) return null;
-  const noun = remaining === 1 ? 'image' : 'images';
+  const label = mediaNounFor(pending);
+  const noun = remaining === 1 ? label.singular : label.plural;
   return (
-    `⚠️ This image request hit the time limit before any images finished. ` +
-    `No image from this batch finished, so there was nothing from it to upload or use in a creative or ad. ` +
+    `⚠️ This ${label.singular} request hit the time limit before any ${label.plural} finished. ` +
+    `No ${label.singular} from this batch finished, so there was nothing from it to upload or use in a creative or ad. ` +
     `${remaining} ${noun} still ${remaining === 1 ? 'remains' : 'remain'}. ` +
-    `Please retry the request; it will start from the first missing image.`
+    `Please retry the request; it will start from the first missing ${label.singular}.`
   );
 }
 
@@ -113,32 +141,42 @@ export function buildMediaBudgetDeferralMessage(
   toolCalls: MediaBudgetToolCall[] | undefined | null,
 ): string | null {
   if (!Array.isArray(toolCalls)) return null;
+  // Only generate_image results carry a renderable URL, so the inline gallery stays
+  // image-only — but the REMAINING count spans every budgeted media tool. Counting only
+  // generate_image made a deferred video/voiceover return null, which dropped the caller
+  // into a canned string that lost the completed images entirely.
   const images = toolCalls
     .filter((call) => call?.name === 'generate_image' && typeof call.result?.imageUrl === 'string')
     .map((call) => ({
       imageUrl: call.result!.imageUrl!,
       filename: call.result?.filename || 'generated-image.png',
     }));
-  const remaining = toolCalls.filter(
-    (call) => call?.name === 'generate_image'
+  const deferredNames = toolCalls
+    .filter((call) => typeof call?.name === 'string'
+      && call.name in MEDIA_TOOL_NOUNS
       && call.result?.deferred === true
-      && call.result?.reason === 'media_generation_time_budget',
-  ).length;
+      && call.result?.reason === 'media_generation_time_budget')
+    .map((call) => call.name as string);
+  const remaining = deferredNames.length;
   if (remaining < 1) return null;
 
   const completed = images.length;
   const completedNoun = completed === 1 ? 'image' : 'images';
-  const remainingNoun = remaining === 1 ? 'image' : 'images';
+  const remainingLabel = mediaNounFor(deferredNames);
+  const remainingNoun = remaining === 1 ? remainingLabel.singular : remainingLabel.plural;
   const gallery = images.map((image) => `![${image.filename}](${image.imageUrl})`).join('\n\n');
   const delivered = completed > 0
     ? `I generated and saved ${completed} ${completedNoun} so far${gallery ? `:\n\n${gallery}` : '.'}`
-    : 'No images finished before the budget boundary.';
+    : 'Nothing from this batch finished before the budget boundary.';
 
   return (
     `⚠️ This request reached the per-response media time budget before the full batch finished. ` +
     `${delivered}\n\n` +
     `${remaining} ${remainingNoun} still ${remaining === 1 ? 'remains' : 'remain'}. ` +
-    `I stopped before starting any follow-on publishing steps, so the incomplete batch was not published. ` +
+    // Scoped deliberately to what the code actually guarantees: from this pause onward
+    // nothing further in this response was published. It does NOT claim that no publishing
+    // happened earlier in the turn — an earlier iteration may already have published.
+    `I paused here rather than taking the incomplete set on to any further publishing step. ` +
     `Reply "continue" and I'll create only what is still missing.`
   );
 }
