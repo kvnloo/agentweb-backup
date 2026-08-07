@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, orgDb, Organization } from "../services/db";
 import { defaultShareSettings } from "../services/orgShareService";
+import { callerCan, can, roleOf } from "../services/orgAuthz";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
@@ -80,8 +81,16 @@ function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
 // All org routes require authentication
 router.use(authenticateToken);
 
-function isOrgOwner(user: any, org: Organization): boolean {
-  return org.ownerUserId === user.userId || user.orgRole === "owner";
+// Read and write authority over org connected accounts are separate questions, so
+// they get separate predicates rather than one shared `isOrgOwner`. They resolve
+// the same way today (both owner+admin) but splitting them is what makes a
+// read-only oversight role expressible later without decomposing either route.
+function canSeeAllOrgAccounts(user: any, org: Organization): boolean {
+  return can({ userId: user.userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:accounts:read");
+}
+
+function canManageOrgAccounts(user: any, org: Organization): boolean {
+  return can({ userId: user.userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:accounts:manage");
 }
 
 // Domain always derived server-side from the acting user's own email — never
@@ -211,8 +220,8 @@ router.put("/:orgId", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can update the organization" });
+    if (!(await callerCan(userId, org, "org:configure"))) {
+      return res.status(403).json({ error: "Only org owners and admins can update the organization" });
     }
 
     // Allow updating org-level profile fields
@@ -275,8 +284,8 @@ router.post("/:orgId/invite", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can invite members" });
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can invite members" });
     }
 
     // Check member count
@@ -439,8 +448,8 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can approve domain-join requests" });
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can approve domain-join requests" });
     }
 
     const pendingRequests = org.pendingDomainJoinRequests || [];
@@ -504,8 +513,8 @@ router.post("/:orgId/domain-requests/:requestToken/reject", async (req: Request,
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can reject domain-join requests" });
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can reject domain-join requests" });
     }
 
     const removed = await orgDb.removeDomainJoinRequest(orgId, requestToken);
@@ -531,8 +540,8 @@ router.delete("/:orgId/invite/:email", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can cancel invites" });
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can cancel invites" });
     }
 
     const pendingInvites = org.pendingInvites || [];
@@ -569,8 +578,8 @@ router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) =
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can remove members" });
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can remove members" });
     }
 
     if (memberId === userId) {
@@ -629,8 +638,8 @@ router.delete("/:orgId", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can delete the organization" });
+    if (!(await callerCan(userId, org, "org:delete"))) {
+      return res.status(403).json({ error: "Only org owners can delete the organization" });
     }
 
     // Remove all members from the org
@@ -681,7 +690,7 @@ router.get("/:orgId/connected-accounts", async (req: Request, res: Response) => 
       }
     }
 
-    const ownerCanManageOrgAccounts = isOrgOwner(user, org);
+    const ownerCanManageOrgAccounts = canSeeAllOrgAccounts(user, org);
 
     // Member personal accounts. Members only see accounts explicitly shared with the org.
     // Org owners see all member-connected accounts so they can decide what becomes an
@@ -731,7 +740,7 @@ router.patch("/connected-accounts/:platform/:accountId/share", async (req: Reque
       return res.status(404).json({ error: "Organization not found" });
     }
 
-    const requesterIsOwner = isOrgOwner(user, org);
+    const requesterIsOwner = canManageOrgAccounts(user, org);
     let accountOwner = user;
     let accounts = user.connected_accounts || [];
     let idx = accounts.findIndex(
@@ -793,8 +802,8 @@ router.post("/:orgId/copy-profile", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can copy profile data" });
+    if (!(await callerCan(userId, org, "org:configure"))) {
+      return res.status(403).json({ error: "Only org owners and admins can copy profile data" });
     }
 
     const user = await userDb.getUserById(userId);
