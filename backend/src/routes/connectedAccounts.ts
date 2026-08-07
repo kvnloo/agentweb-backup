@@ -6,6 +6,7 @@ import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
 import { getAllowedConnectedAccounts } from '../services/subscriptionService';
 import { userDb, orgDb } from '../services/db';
+import { can } from "../services/orgAuthz";
 
 const router = express.Router();
 
@@ -26,7 +27,7 @@ async function canCallerDisconnectAccount(userId: string, platform: string, acco
   }
 
   const org = await orgDb.getOrgById(user.orgId);
-  const isOrgOwner = org?.ownerUserId === userId || user.orgRole === 'owner';
+  const isOrgOwner = can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, 'org:accounts:read');
   if (isOrgOwner) {
     return { allowed: true };
   }

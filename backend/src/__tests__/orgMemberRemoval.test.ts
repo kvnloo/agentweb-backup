@@ -37,6 +37,8 @@ const mockWorkPlanTransferOwner = jest.fn();
 const mockGetSkillsByOwner = jest.fn();
 const mockDeleteSkill = jest.fn();
 const mockSkillTransferOwner = jest.fn();
+const mockGetOrgById = jest.fn();
+const mockGetOrgMembers = jest.fn();
 const mockDynamoGet = jest.fn();
 const mockDynamoPut = jest.fn();
 
@@ -48,6 +50,8 @@ jest.mock("../services/db", () => ({
   },
   orgDb: {
     pruneEditorListsForUser: mockPruneEditorListsForUser,
+    getOrgById: mockGetOrgById,
+    getOrgMembers: mockGetOrgMembers,
   },
   taskDb: {
     getTasksByUserId: mockGetTasksByUserId,
@@ -206,6 +210,11 @@ function setupNormalUsers() {
 describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // ENG-954: the routes now resolve org authority through orgAuthz.can(),
+    // which needs the org record. callerOwner is the org's owner, so every
+    // previously-passing authorization outcome is unchanged.
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: callerUserId, name: "Test Org" });
+    mockGetOrgMembers.mockResolvedValue([callerOwner, targetMember]);
   });
 
   it("returns correct itemCounts for a member with mixed items", async () => {
@@ -303,6 +312,10 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
   });
 
   it("returns 403 if caller is not org owner", async () => {
+    // ownerUserId must point elsewhere: orgAuthz unions ownerUserId with
+    // orgRole, so a caller who is the org's ownerUserId is an owner even with a
+    // drifted role. That union is the stale-role-lockout fix, not an accident.
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "someone-else", name: "Test Org" });
     mockGetUserById.mockImplementation((uid: string) => {
       if (uid === callerUserId)
         return Promise.resolve({ userId: callerUserId, orgId, orgRole: "member" });
@@ -314,7 +327,7 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
     );
 
     expect(res.status).toBe(403);
-    expect(res.body.message).toBe("Org owner only");
+    expect(res.body.message).toBe("Org owners and admins only");
   });
 
   it("returns 403 if caller is not in any org", async () => {
@@ -330,7 +343,7 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
     );
 
     expect(res.status).toBe(403);
-    expect(res.body.message).toBe("Org owner only");
+    expect(res.body.message).toBe("Org owners and admins only");
   });
 
   it("handles getTasksByUserId returning undefined gracefully", async () => {
@@ -364,6 +377,7 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
 
   // 1. 403 when caller is not orgRole=owner
   it("returns 403 when caller is not org owner", async () => {
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "someone-else", name: "Test Org" });
     mockGetUserById.mockImplementation((uid: string) => {
       if (uid === callerUserId)
         return Promise.resolve({ userId: callerUserId, orgId, orgRole: "member" });
@@ -375,7 +389,7 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
       .send({ confirm: true, decisions: allDelete });
 
     expect(res.status).toBe(403);
-    expect(res.body.message).toBe("Org owner only");
+    expect(res.body.message).toBe("Org owners and admins only");
   });
 
   // 2. 400 when confirm:true is missing
@@ -669,5 +683,48 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
     expect(res.body.summary.knowledgeBase.errors[0]).toMatch(/conditional check failed/);
     // Other features still processed and cleanup called
     expect(mockClearOrgMembership).toHaveBeenCalledWith(targetUserId);
+  });
+});
+
+// ENG-954 — the two guards this route was missing entirely, unlike its sibling
+// in routes/org.ts. Without them an owner could remove themselves, leaving
+// org.ownerUserId pointing at a non-member with no transfer route to recover.
+describe("orgMemberRemoval guards", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: callerUserId, name: "Test Org" });
+    mockGetOrgMembers.mockResolvedValue([callerOwner, targetMember]);
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(callerOwner);
+      if (uid === targetUserId) return Promise.resolve(targetMember);
+      return Promise.resolve(null);
+    });
+  });
+
+  it("refuses self-removal — this is what bricked orgs", async () => {
+    const res = await request(app)
+      .post(`/api/orgs/me/members/${callerUserId}/remove`)
+      .send({ confirm: true, decisions: {} });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/cannot remove yourself/i);
+    expect(mockClearOrgMembership).not.toHaveBeenCalled();
+  });
+
+  it("refuses to remove the only owner", async () => {
+    const secondOwner = { userId: "u-second", orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve({ userId: callerUserId, orgId, orgRole: "admin" });
+      if (uid === "u-second") return Promise.resolve(secondOwner);
+      return Promise.resolve(null);
+    });
+    mockGetOrgMembers.mockResolvedValue([{ userId: callerUserId, orgId, orgRole: "admin" }, secondOwner]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-second", name: "Test Org" });
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-second/remove`)
+      .send({ confirm: true, decisions: {} });
+    expect(res.status).toBe(409);
+    expect(res.body.message).toMatch(/only owner/i);
+    expect(mockClearOrgMembership).not.toHaveBeenCalled();
   });
 });

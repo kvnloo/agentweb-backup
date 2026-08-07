@@ -10,6 +10,7 @@ import {
   transferLandingPageOwner,
 } from "../services/v0Service";
 import { OWNED_FEATURES, OwnedFeature } from "../services/orgShareService";
+import { can, roleOf } from "../services/orgAuthz";
 
 const router = express.Router();
 
@@ -54,8 +55,9 @@ router.get("/:userId/removal-preview", async (req, res) => {
   try {
     const callerId = (req as any).user.userId;
     const caller = await userDb.getUserById(callerId);
-    if (!caller?.orgId || caller.orgRole !== "owner") {
-      return res.status(403).json({ message: "Org owner only" });
+    const callerOrg = caller?.orgId ? await orgDb.getOrgById(caller.orgId) : null;
+    if (!caller?.orgId || !can({ userId: callerId, orgId: caller.orgId, orgRole: caller.orgRole }, callerOrg, "org:members:manage")) {
+      return res.status(403).json({ message: "Org owners and admins only" });
     }
 
     const target = await userDb.getUserById(req.params.userId);
@@ -104,8 +106,9 @@ router.post("/:userId/remove", async (req, res) => {
     const callerId = (req as any).user.userId;
     const callerEmail = (req as any).user.email as string;
     const caller = await userDb.getUserById(callerId);
-    if (!caller?.orgId || caller.orgRole !== "owner") {
-      return res.status(403).json({ message: "Org owner only" });
+    const callerOrg = caller?.orgId ? await orgDb.getOrgById(caller.orgId) : null;
+    if (!caller?.orgId || !can({ userId: callerId, orgId: caller.orgId, orgRole: caller.orgRole }, callerOrg, "org:members:manage")) {
+      return res.status(403).json({ message: "Org owners and admins only" });
     }
 
     if (req.body?.confirm !== true) {
@@ -115,6 +118,22 @@ router.post("/:userId/remove", async (req, res) => {
     const target = await userDb.getUserById(req.params.userId);
     if (!target || target.orgId !== caller.orgId) {
       return res.status(404).json({ message: "Member not found in your org" });
+    }
+
+    // Both guards were missing here, unlike the sibling route in routes/org.ts.
+    // Without them an owner could remove themselves, leaving org.ownerUserId
+    // pointing at a non-member and the org permanently unadministrable.
+    if (target.userId === callerId) {
+      return res.status(400).json({ message: "Cannot remove yourself. Use the leave endpoint or delete the org." });
+    }
+    if (roleOf({ userId: target.userId, orgId: target.orgId, orgRole: target.orgRole }, callerOrg) === "owner") {
+      const members = await orgDb.getOrgMembers(caller.orgId);
+      const anotherOwner = members.some(
+        (m: any) => m.userId !== target.userId &&
+          roleOf({ userId: m.userId, orgId: m.orgId, orgRole: m.orgRole }, callerOrg) === "owner");
+      if (!anotherOwner) {
+        return res.status(409).json({ message: "Cannot remove the only owner. Promote another member to owner first." });
+      }
     }
 
     const decisions: Partial<Record<OwnedFeature, Decision>> = req.body?.decisions || {};

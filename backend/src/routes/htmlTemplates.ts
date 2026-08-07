@@ -20,6 +20,7 @@ import {
   listOrgVisibleItems,
 } from "../services/orgShareService";
 import { extractVariables } from "../utils/templateParser";
+import { can } from "../services/orgAuthz";
 
 const router = express.Router();
 
@@ -340,12 +341,11 @@ router.delete("/:templateId", async (req, res) => {
       ]);
       const callerOrgId = callerUser?.orgId;
       let allowed = false;
-      if (
-        callerUser?.orgRole === "owner" &&
-        callerOrgId &&
-        ownerUser?.orgId === callerOrgId
-      ) {
-        allowed = true;
+      if (callerOrgId && ownerUser?.orgId === callerOrgId) {
+        const callerOrg = await orgDb.getOrgById(callerOrgId);
+        if (can({ userId, orgId: callerOrgId, orgRole: callerUser?.orgRole }, callerOrg, "org:content:manage")) {
+          allowed = true;
+        }
       }
       if (!allowed) {
         return res.status(403).json({ error: "Not authorized" });
