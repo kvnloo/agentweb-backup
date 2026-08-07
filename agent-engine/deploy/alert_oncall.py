@@ -63,6 +63,8 @@ def main():
     timestamp = datetime.now(timezone.utc).isoformat()
 
     creds = get_smtp_credentials()
+    smtp_host = creds.get("host", SMTP_HOST)
+    smtp_port = int(creds.get("port", SMTP_PORT))
 
     msg = MIMEText(
         f"agent-engine ({failed_unit}) failed and exhausted its systemd "
@@ -70,10 +72,10 @@ def main():
         f"until this is manually restarted (systemctl restart agent-engine)."
     )
     msg["Subject"] = "[URGENT] agent-engine process failure - auto-restart exhausted"
-    msg["From"] = creds["user"]
+    msg["From"] = creds.get("from", creds["user"])   # "resend" isn't a valid From
     msg["To"] = ALERT_RECIPIENT
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.starttls()
         server.login(creds["user"], creds["pass"])
         server.send_message(msg)
