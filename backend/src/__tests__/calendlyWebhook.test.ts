@@ -364,6 +364,55 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', existingLead, 'attio', 'updated');
     });
 
+    // Greptile P1 (agentweb#2291): CAPI already dedupes redeliveries via Meta's own event_id
+    // collapsing (see file header comment), but nothing protected the CRM-forward leg — a
+    // redelivery of the same invitee.created event (e.g. our 200 response didn't reach
+    // Calendly) would re-run updateLead, re-sync to HubSpot/Attio, and re-fire a customer
+    // alert for a booking already fully processed.
+    it('skips CRM-forward re-processing for a redelivery of an already-processed booking (matches lastBookingUri)', async () => {
+      const existingLead = {
+        leadId: 'lead-existing',
+        email: 'lead@example.com',
+        customFields: { lastBookingUri: 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1' },
+      };
+      mockGetLeadByEmail.mockResolvedValue(existingLead);
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      // Default makePayload() uri is exactly 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1'.
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockCreateLead).not.toHaveBeenCalled();
+      expect(mockUpdateLead).not.toHaveBeenCalled();
+      expect(mockAutoSyncLead).not.toHaveBeenCalled();
+      expect(mockNotifyLeadListOwnerIfConfigured).not.toHaveBeenCalled();
+    });
+
+    it('skips CRM-forward re-processing for a redelivery of the very first booking (matches bookingUri, pre-update)', async () => {
+      const existingLead = {
+        leadId: 'lead-existing',
+        email: 'lead@example.com',
+        customFields: { bookingUri: 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1' },
+      };
+      mockGetLeadByEmail.mockResolvedValue(existingLead);
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockCreateLead).not.toHaveBeenCalled();
+      expect(mockUpdateLead).not.toHaveBeenCalled();
+      expect(mockAutoSyncLead).not.toHaveBeenCalled();
+    });
+
     it('still sends the CAPI event when the CRM-forward leg throws', async () => {
       mockGetLeadListById.mockRejectedValue(new Error('crm down'));
       mockCreateLeadList.mockRejectedValue(new Error('crm down'));
