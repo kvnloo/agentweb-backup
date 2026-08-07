@@ -1,4 +1,6 @@
 import type { Organization } from "./db";
+import type { OrgRole } from "./orgAuthz";
+import { roleOf } from "./orgAuthz";
 
 export type ToggleableFeature =
   | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills" | "analytics";
@@ -82,7 +84,11 @@ export function defaultShareSettings(): {
 }
 
 export interface ItemLike { userId?: string }
-export interface UserLike { userId: string; orgId?: string; orgRole?: "owner" | "member" }
+// orgRole is widened to the full OrgRole union (owner | admin | member). The 36
+// `as "owner" | "member"` casts scattered across the call sites existed only to
+// satisfy the old narrow type here; they are now redundant and can be deleted
+// opportunistically rather than in one sweep.
+export interface UserLike { userId: string; orgId?: string; orgRole?: OrgRole }
 export type OrgLike = Pick<Organization, "orgId" | "ownerUserId" | "shareSettings">;
 
 function configFor(org: OrgLike | null, f: Feature) {

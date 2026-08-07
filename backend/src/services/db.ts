@@ -8,6 +8,7 @@ import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey }
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
+import type { OrgRole } from "./orgAuthz";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
@@ -581,7 +582,20 @@ export interface User {
   allowedPages?: string[];
   allowedSkills?: string[];
   orgId?: string;
-  orgRole?: "owner" | "member";
+  /**
+   * Authority within `orgId`. Every role is plural — an org may have N owners and
+   * N admins — so that no single departure can strand an org. Authorization
+   * decisions go through `services/orgAuthz.ts`, never through a direct comparison
+   * here.
+   *
+   * This is NOT the billing signal. Which member the subscription and pooled quota
+   * resolve to is `Organization.ownerUserId` (the primary owner); use
+   * `orgAuthz.isBillingRoot` / `inheritsOrgBilling`. Testing this field for
+   * "member" as a stand-in for "not the owner" breaks silently as soon as a third
+   * role exists — an admin is neither, and would fall through to their own empty
+   * subscription.
+   */
+  orgRole?: OrgRole;
   // Set when an org owner invites this email; cleared when invite is accepted or cancelled.
   // Used to redirect users straight to accept-invite instead of onboarding.
   // null is used by updateUser to explicitly remove the field from DynamoDB.
@@ -1568,7 +1582,7 @@ export class UserDB {
   async joinOrgWithCapacityCheck(
     userId: string,
     orgId: string,
-    orgRole: "member" | "owner",
+    orgRole: OrgRole,
     maxMembers: number
   ): Promise<"joined" | "org_full" | "already_in_org" | "not_migrated"> {
     const user = await this.getUserById(userId);
