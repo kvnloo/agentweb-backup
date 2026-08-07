@@ -430,7 +430,7 @@ describe('ENG-820 — a non-actionable majority never hides an actionable minori
  * `CooldownRuleSet` matches it exactly against persisted learning records — so
  * class-qualifying it orphans every historical record and re-dispatches tools
  * that are deliberately on cooldown. That is a persistence-semantics change,
- * not a digest change, and it is tracked as its own issue.
+ * not a digest change, and it is tracked as ENG-937.
  *
  * What is kept here: the dominant actionable class drives the remedy, and every
  * other actionable cohort is NAMED, so nothing is silently folded into another
@@ -527,5 +527,77 @@ describe('ENG-820 — mixed actionable cohorts stay visible under one tool ident
 
     expect(p.directive).toContain('10/30');
     expect(p.directive).not.toContain('18/30');
+  });
+});
+
+/**
+ * Ties must resolve on the data, not on arrival order.
+ *
+ * Both the dominant-class pick and the proposal ranking read counts out of a
+ * Map whose insertion order is the order DynamoDB happened to return the
+ * events. On an exact tie that made the output non-reproducible: the same
+ * window could tell an operator to reconnect an account on one run and to
+ * investigate a handler on the next, and could swap which tools survived the
+ * orchestrator's cap. The chosen keys (lexical class, then tool name) are
+ * arbitrary; being STABLE is the whole point.
+ */
+describe('ENG-820 — ties resolve deterministically, not on event arrival order', () => {
+  const rules = () => new AgentFailureRuleSet({ minFailures: 3, minFailureRate: 0.2 });
+
+  /** 9 config + 9 bug on one tool — an exact dominant-class tie. */
+  const tiedCohorts = (tool: string, configFirst: boolean) => {
+    const config = toolEvents(tool, 20, 9, 'config', 'auth', 'token expired — reconnect');
+    const bug = toolEvents(tool, 0, 9, 'bug', 'TypeErrorClass', 'TypeError: boom');
+    return configFirst ? [...config, ...bug] : [...bug, ...config];
+  };
+
+  it('picks the same dominant class whichever order the events arrive in', async () => {
+    const first: any = (await rules().evaluate(tiedCohorts('tied_tool', true), WINDOW))
+      .find((p: any) => p.payload?.toolName === 'tied_tool');
+    const second: any = (await rules().evaluate(tiedCohorts('tied_tool', false), WINDOW))
+      .find((p: any) => p.payload?.toolName === 'tied_tool');
+
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    expect(first.payload.failureType).toBe(second.payload.failureType);
+    // Pinned, so a future refactor cannot reintroduce the flip silently.
+    expect(first.payload.failureType).toBe('bug');
+  });
+
+  it('does not flip the operator instruction between runs on identical data', async () => {
+    const first: any = (await rules().evaluate(tiedCohorts('tied_msg', true), WINDOW))
+      .find((p: any) => p.payload?.toolName === 'tied_msg');
+    const second: any = (await rules().evaluate(tiedCohorts('tied_msg', false), WINDOW))
+      .find((p: any) => p.payload?.toolName === 'tied_msg');
+
+    expect(first.payload.directive).toBe(second.payload.directive);
+    expect(first.hypothesis).toBe(second.hypothesis);
+  });
+
+  /** Two tools at an identical count AND rate — a ranking tie. */
+  const tiedTools = (order: string[]) =>
+    order.flatMap((t) => toolEvents(t, 10, 5, 'bug', 'TypeErrorClass', 'TypeError'));
+
+  it('ranks equal-count, equal-rate tools by name rather than arrival order', async () => {
+    const forward = payloads(await rules().evaluate(tiedTools(['zeta_tool', 'alpha_tool']), WINDOW))
+      .map((p: any) => p.toolName);
+    const reverse = payloads(await rules().evaluate(tiedTools(['alpha_tool', 'zeta_tool']), WINDOW))
+      .map((p: any) => p.toolName);
+
+    expect(forward).toEqual(reverse);
+    expect(forward).toEqual(['alpha_tool', 'zeta_tool']);
+  });
+
+  it('breaks a count+rate tie on failure class before tool name', async () => {
+    // `a_config_tool` sorts first by name, but `bug` sorts before `config`, so
+    // the class key has to win or the tertiary key is doing the work.
+    const events = [
+      ...toolEvents('a_config_tool', 10, 5, 'config', 'auth', 'token expired'),
+      ...toolEvents('b_bug_tool', 10, 5, 'bug', 'TypeErrorClass', 'TypeError'),
+    ];
+
+    const order = payloads(await rules().evaluate(events, WINDOW)).map((p: any) => p.toolName);
+
+    expect(order).toEqual(['b_bug_tool', 'a_config_tool']);
   });
 });

@@ -285,7 +285,7 @@ export class AgentFailureRuleSet
       // records), so class-qualifying it orphans every historical record and
       // re-dispatches tools that are deliberately on cooldown. That is a
       // persistence-semantics change, not a digest change, and it belongs in
-      // its own issue with a migration. Tracked separately; see the PR.
+      // its own issue with a migration. Tracked as ENG-937.
       //
       // The dominant actionable class drives the remedy, and every OTHER
       // actionable class is named in the hypothesis so no cohort is silently
@@ -365,13 +365,25 @@ export class AgentFailureRuleSet
     // ranking by rate alone hid the single largest source of failures in the
     // window (save_memory, 33 failures at 33%) behind a tool with 6 failures at
     // 100%. Rate remains the admission gate above; it is no longer the order.
+    //
+    // Count and rate can both tie, and when they do the order decided which
+    // tools survived the orchestrator's cap — on arrival order, i.e. nothing.
+    // The remaining keys (failure class, then tool name) are arbitrary but
+    // stable, so the same window always ranks the same way.
     proposals.sort((a, b) => {
       const countA = 'failures' in a.payload ? a.payload.failures : Infinity;
       const countB = 'failures' in b.payload ? b.payload.failures : Infinity;
       if (countA !== countB) return countB - countA;
       const rateA = 'failureRate' in a.payload ? a.payload.failureRate : Infinity;
       const rateB = 'failureRate' in b.payload ? b.payload.failureRate : Infinity;
-      return rateB - rateA;
+      if (rateA !== rateB) return rateB - rateA;
+      const typeA = 'failureType' in a.payload ? String(a.payload.failureType ?? '') : '';
+      const typeB = 'failureType' in b.payload ? String(b.payload.failureType ?? '') : '';
+      if (typeA !== typeB) return typeA < typeB ? -1 : 1;
+      const toolA = 'toolName' in a.payload ? String(a.payload.toolName ?? '') : '';
+      const toolB = 'toolName' in b.payload ? String(b.payload.toolName ?? '') : '';
+      if (toolA !== toolB) return toolA < toolB ? -1 : 1;
+      return 0;
     });
     return proposals;
   }
@@ -381,11 +393,22 @@ function strDim(v: string | number | boolean | null | undefined): string | undef
   return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
 
+/**
+ * The highest-count key, with a deterministic tie-break.
+ *
+ * Without the tie-break, a 9-config vs 9-bug tool resolves to whichever class
+ * this Map happened to see first — i.e. DynamoDB event arrival order — and the
+ * operator instruction flips between "reconnect the account" and "investigate
+ * the handler" across runs on identical data. Lexical order is arbitrary but
+ * stable, which is the property that matters: the same window must always
+ * produce the same directive. Neither cohort is lost either way — the loser is
+ * named and given its own secondary action.
+ */
 function dominantKey(counts: Map<string, number>): string {
   let best = 'UnknownError';
   let bestN = -1;
   for (const [k, n] of counts) {
-    if (n > bestN) {
+    if (n > bestN || (n === bestN && k < best)) {
       bestN = n;
       best = k;
     }
