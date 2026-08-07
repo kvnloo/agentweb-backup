@@ -75,11 +75,13 @@ jest.mock('../services/leadListAlertService', () => ({
 const mockEnqueueJob = jest.fn();
 const mockMarkJobComplete = jest.fn();
 const mockMarkJobFailed = jest.fn();
+const mockMarkJobProcessing = jest.fn();
 const mockRegisterProcessor = jest.fn();
 jest.mock('../services/asyncJobQueue', () => ({
   enqueueJob: (...a: any[]) => mockEnqueueJob(...a),
   markJobComplete: (...a: any[]) => mockMarkJobComplete(...a),
   markJobFailed: (...a: any[]) => mockMarkJobFailed(...a),
+  markJobProcessing: (...a: any[]) => mockMarkJobProcessing(...a),
   registerProcessor: (...a: any[]) => mockRegisterProcessor(...a),
 }));
 
@@ -174,6 +176,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     mockEnqueueJob.mockResolvedValue('enqueued');
     mockMarkJobComplete.mockResolvedValue(undefined);
     mockMarkJobFailed.mockResolvedValue(undefined);
+    mockMarkJobProcessing.mockResolvedValue(undefined);
     // getLeadListById serves two callers: resolveOrCreateBookingList's deterministic-ID
     // lookup (should see "not found" by default, so the fallback-create path exercises
     // naturally) and the CRM-forward leg's "fetch full list for the alert" lookup on an
