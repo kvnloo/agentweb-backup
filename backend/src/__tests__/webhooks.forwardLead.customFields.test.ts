@@ -155,6 +155,59 @@ describe('forward-lead — unknown top-level fields reach customFields', () => {
     }
   });
 
+  // ---- negative paths: malformed input and dependency failure ----
+
+  it('survives malformed passthrough values without crashing or corrupting the lead', async () => {
+    const res = await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_123',
+      email: 'malformed@example.com',
+      nullish: null,
+      numeric: 0,
+      falsey: false,
+      emptyStr: '',
+      nested: { deep: { deeper: ['a', 'b'] } },
+      arr: [1, 2, 3],
+    });
+    await flush();
+
+    expect(res.status).toBe(201);
+    const cf = storedCustomFields();
+    // Values are preserved as-sent. Truncation applies to strings only, so a non-string
+    // must pass through untouched rather than being stringified or dropped.
+    expect(cf.nullish).toBeNull();
+    expect(cf.numeric).toBe(0);
+    expect(cf.falsey).toBe(false);
+    expect(cf.emptyStr).toBe('');
+    expect(cf.nested).toEqual({ deep: { deeper: ['a', 'b'] } });
+    expect(cf.arr).toEqual([1, 2, 3]);
+    // The lead itself is unharmed.
+    expect((crmDb.createLead as jest.Mock).mock.calls[0][1].email).toBe('malformed@example.com');
+  });
+
+  it('does not 201 when the persistence dependency fails', async () => {
+    (crmDb.createLead as jest.Mock).mockRejectedValueOnce(new Error('dynamo unavailable'));
+
+    const res = await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_123', email: 'dbfail@example.com', qualified: true,
+    });
+    await flush();
+
+    // A storage failure must surface. Reporting success on a lead that was never saved is
+    // the same silent-success failure this whole change exists to remove.
+    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.body.success).not.toBe(true);
+  });
+
+  it('rejects a body with no email even when passthrough fields are present', async () => {
+    const res = await request(app).post('/api/webhooks/forward-lead').send({
+      listId: 'list_123', qualified: true, annual_revenue: 5000000,
+    });
+    await flush();
+
+    expect(res.status).toBe(400);
+    expect(crmDb.createLead).not.toHaveBeenCalled();
+  });
+
   // ---- control cases: these already pass, and must keep passing ----
 
   it('still accepts the nested customFields shape (backward compatible)', async () => {
