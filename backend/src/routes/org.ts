@@ -219,11 +219,59 @@ router.get("/me", async (req: Request, res: Response) => {
       orgRole: m.orgRole,
     }));
 
+    // ENG-953: this used to spread the whole Organization record, which carries
+    // org-level `connected_accounts` (with unredacted config) and the encrypted
+    // per-org `secrets` map — handed to every member, not just owners. The
+    // sanitizer two hundred lines below was already applied to the sibling
+    // connected-accounts routes and simply never to this one.
+    //
+    // An explicit allowlist rather than a denylist, so a future Organization
+    // field is absent here until someone deliberately adds it.
+    const callerRole = roleOf({ userId, orgId: user.orgId, orgRole: user.orgRole }, org);
     return res.json({
       success: true,
       data: {
-        ...org,
+        orgId: org.orgId,
+        name: org.name,
+        ownerUserId: org.ownerUserId,
+        brandGuidelines: org.brandGuidelines,
+        marketStrategy: org.marketStrategy,
+        startupProfiles: org.startupProfiles,
+        connected_accounts: (org.connected_accounts || []).map(sanitizeConnectedAccountForOrgResponse),
+        seoDomains: org.seoDomains,
+        cmsType: org.cmsType,
+        emailDomain: org.emailDomain,
+        fromName: org.fromName,
+        slackChannel: org.slackChannel,
+        googleAnalyticsProperties: org.googleAnalyticsProperties,
+        primaryAnalyticsPropertyId: org.primaryAnalyticsPropertyId,
+        gaFilteredDomains: org.gaFilteredDomains,
+        clarityProjects: org.clarityProjects,
+        productDomain: org.productDomain,
+        googleDriveFolders: org.googleDriveFolders,
+        pendingInvites: org.pendingInvites,
+        autoJoinEnabled: org.autoJoinEnabled,
+        autoJoinDomain: org.autoJoinDomain,
+        pendingDomainJoinRequests: org.pendingDomainJoinRequests,
+        shareSettings: org.shareSettings,
+        shareAnalyticsWithOrg: org.shareAnalyticsWithOrg,
+        orgMemoryEnabled: org.orgMemoryEnabled,
+        analyticsConfigSource: org.analyticsConfigSource,
+        createdAt: org.createdAt,
+        updatedAt: org.updatedAt,
         members: safeMembers,
+        // Server-computed capabilities. Clients must gate on these rather than
+        // comparing orgRole themselves — that comparison is exactly what has to
+        // be updated in every UI each time a role is added, and it is why the
+        // portal would silently render an admin as a plain member.
+        callerRole,
+        capabilities: {
+          canManageOrg: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:configure"),
+          canManageMembers: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:members:manage"),
+          canManageContent: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:content:manage"),
+          canSeeAllAccounts: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:accounts:read"),
+          canDeleteOrg: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:delete"),
+        },
       },
     });
   } catch (error) {
