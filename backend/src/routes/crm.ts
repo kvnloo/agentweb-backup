@@ -1,6 +1,12 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
+import {
+  isFeatureEffectivelyEnabled,
+  canEditItem,
+  type UserLike,
+  type OrgLike,
+} from '../services/orgShareService';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
@@ -519,17 +525,35 @@ const fetchAllLeadsByStatusIndex = async (
   }
 };
 
-// ─── Org-aware access control ────────────────────────────────────────────────
-// Returns true if userId owns the list OR is a member of the same org as the owner.
+// ─── Org-aware access control ─────────────────────────────────────────────────
+
+// Read access: honours shareSettings.crm.enabled. When disabled, only the list
+// owner, the org owner, and listed crm.editors retain cross-member read access.
 async function canAccessCrmList(userId: string, list: { userId: string } | Record<string, any>): Promise<boolean> {
   if (list.userId === userId) return true;
   const [user, owner] = await Promise.all([
     userDb.getUserById(userId),
     userDb.getUserById(list.userId),
   ]);
-  return !!(user?.orgId && owner?.orgId && user.orgId === owner.orgId);
+  if (!user?.orgId || !owner?.orgId || user.orgId !== owner.orgId) return false;
+  const org = await orgDb.getOrgById(user.orgId);
+  return isFeatureEffectivelyEnabled(user as UserLike, org as OrgLike | null, "crm");
 }
-// ─────────────────────────────────────────────────────────────────────────────
+
+// Destructive write access: requires being the list owner, the org owner, or a
+// listed crm.editor — regardless of the crm.enabled toggle. Mirrors landingPages.
+async function canDestructiveCrmList(userId: string, list: { userId: string } | Record<string, any>): Promise<boolean> {
+  if (list.userId === userId) return true;
+  const [user, owner] = await Promise.all([
+    userDb.getUserById(userId),
+    userDb.getUserById(list.userId),
+  ]);
+  if (!user?.orgId || !owner?.orgId || user.orgId !== owner.orgId) return false;
+  const org = await orgDb.getOrgById(user.orgId);
+  return canEditItem({ userId: list.userId }, user as UserLike, org as OrgLike | null, owner?.orgId, "crm");
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 
 // Lead List Routes
 
@@ -1736,7 +1760,7 @@ router.delete('/lists/:listId', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2495,7 +2519,7 @@ router.delete('/lists/:listId/leads/bulk-delete', async (req: Request, res: Resp
     if (!list) {
       return res.status(404).json({ message: 'Lead list not found' });
     }
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 
@@ -2630,7 +2654,7 @@ router.delete('/lists/:listId/leads/:leadId', async (req: Request, res: Response
       return res.status(404).json({ message: 'Lead list not found' });
     }
 
-    if (!(await canAccessCrmList(userId, list))) {
+    if (!(await canDestructiveCrmList(userId, list))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 

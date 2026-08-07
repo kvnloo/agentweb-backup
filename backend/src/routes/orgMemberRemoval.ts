@@ -1,6 +1,6 @@
 import express from "express";
 import AWS from "aws-sdk";
-import { userDb, orgDb, taskDb } from "../services/db";
+import { userDb, orgDb, taskDb, crmDb } from "../services/db";
 import { workPlanService } from "../services/workPlanService";
 import { skillService } from "../services/skillService";
 import { htmlTemplateService } from "../services/htmlTemplateService";
@@ -66,13 +66,14 @@ router.get("/:userId/removal-preview", async (req, res) => {
       return res.status(404).json({ message: "Member not found in your org" });
     }
 
-    const [taskList, templates, landingPages, workPlans, skills, funnelsCount] = await Promise.all([
+    const [taskList, templates, landingPages, workPlans, skills, funnelsCount, crmLists] = await Promise.all([
       taskDb.getTasksByUserId(target.userId).then((a) => (a ?? []).length),
       htmlTemplateService.getTemplatesByOwner(target.userId).then((a) => a.length),
       getLandingPagesByOwner(target.userId).then((a) => a.length),
       workPlanService.getWorkPlansByOwner(target.userId).then((a) => a.length),
       skillService.getSkillsByOwner(target.userId).then((a) => a.length),
       getUserFunnelCount(target.userId),
+      crmDb.getLeadListsByUserId(target.userId).then((a) => (a ?? []).length),
     ]);
 
     res.json({
@@ -84,6 +85,7 @@ router.get("/:userId/removal-preview", async (req, res) => {
         workPlans,
         skills,
         funnels: funnelsCount,
+        crm: crmLists,
       },
     });
   } catch (e) {
@@ -214,6 +216,7 @@ async function fetchItemsForFeature(userId: string, f: OwnedFeature): Promise<an
     case "skills":         return skillService.getSkillsByOwner(userId);
     case "funnels":        return Object.values(await getUserFunnelsMap(userId));
     case "analytics":      return [];
+    case "crm":            return (await crmDb.getLeadListsByUserId(userId)) ?? [];
   }
 }
 
@@ -226,6 +229,7 @@ function getItemId(item: any, f: OwnedFeature): string {
     case "skills":         return item.skillId;
     case "funnels":        return item.id;
     case "analytics":      return item.id ?? "";
+    case "crm":            return item.listId;
   }
 }
 
@@ -267,6 +271,9 @@ async function transferItemOwner(
     case "analytics":
       // analytics has no per-user items to transfer
       return;
+    case "crm":
+      await crmDb.transferLeadListOwner(item.listId, newOwnerId);
+      return;
   }
 }
 
@@ -296,6 +303,9 @@ async function deleteItem(item: any, f: OwnedFeature, ownerId: string): Promise<
     }
     case "analytics":
       // analytics has no per-user items to delete
+      return;
+    case "crm":
+      await crmDb.deleteLeadList(item.listId);
       return;
   }
 }

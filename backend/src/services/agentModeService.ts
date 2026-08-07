@@ -10456,21 +10456,25 @@ export class AgentModeService {
       }
 
       // Resolve and access-check each list. In single-list mode an inaccessible
-      // list_id is a hard error; in multi-list mode we silently skip so the
-      // caller still gets results from the lists they CAN see.
+      // list_id is a hard error; in multi-list mode we skip and record the list ID
+      // in skipped_list_ids so callers can distinguish a permission skip from an
+      // empty result.
       type ListEntry = { listId: string; list: any } | null;
       const lists: ListEntry[] = [];
+      const skippedListIds: string[] = [];
       for (let i = 0; i < cursorListIds.length; i++) {
         const id = cursorListIds[i];
         const list = await crmDb.getLeadListById(id);
         if (!list) {
           if (!isMultiList) return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+          skippedListIds.push(id);
           lists.push(null);
           continue;
         }
         const access = await crmDb.canOrgMemberAccessList(userId, list);
         if (!access) {
           if (!isMultiList) return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+          skippedListIds.push(id);
           lists.push(null);
           continue;
         }
@@ -10574,6 +10578,7 @@ export class AgentModeService {
         ...(isMultiList ? {
           listsScanned: lists.filter((e: ListEntry): e is { listId: string; list: any } => !!e)
             .map((e) => ({ listId: e.listId, listName: e.list.name })),
+          skipped_list_ids: skippedListIds,
         } : {}),
         has_more: !!cursorOut,
         ...(nextCursor && { next_cursor: nextCursor }),

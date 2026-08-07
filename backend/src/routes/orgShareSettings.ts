@@ -43,11 +43,16 @@ router.patch("/", async (req, res) => {
 
     const org = await orgDb.getOrgById(user.orgId);
 
-    // Back-fill `analytics` from the org's existing settings when an older client
-    // omits it, so the not-yet-deployed customer portal keeps working.
+    // Back-fill newer features from the org's existing settings when an older client
+    // omits them, so pre-deploy portals keep working.
     const incoming = req.body?.shareSettings;
-    if (incoming && typeof incoming === "object" && incoming.analytics === undefined) {
-      incoming.analytics = org?.shareSettings?.analytics ?? { enabled: false, editors: [] };
+    if (incoming && typeof incoming === "object") {
+      if (incoming.analytics === undefined) {
+        incoming.analytics = org?.shareSettings?.analytics ?? { enabled: false, editors: [] };
+      }
+      if (incoming.crm === undefined) {
+        incoming.crm = org?.shareSettings?.crm ?? { enabled: true, editors: [] };
+      }
     }
     const validated = validateSettings(incoming);
     if ("error" in validated) return res.status(400).json({ message: validated.error });

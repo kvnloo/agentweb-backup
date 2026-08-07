@@ -737,6 +737,7 @@ export interface OrgShareSettings {
   workPlans: { enabled: boolean; editors: string[] };
   skills: { enabled: boolean; editors: string[] };
   analytics: { enabled: boolean; editors: string[] };
+  crm?: { enabled: boolean; editors: string[] };
   // Always shared with org—only editors are configurable, enabled is implicit
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
@@ -4676,21 +4677,37 @@ export const crmDb = {
     return items;
   },
 
-  // Returns true if userId owns the list OR is an org member of the same org as the list owner.
+  // Returns true if userId owns the list OR has CRM read access to the owner's org lists.
+  // Respects shareSettings.crm.enabled: when false, only the list owner, the org owner,
+  // and listed crm.editors retain cross-member read access.
   async canOrgMemberAccessList(userId: string, list: { userId?: string } | Record<string, any>): Promise<boolean> {
     if (list.userId === userId) return true;
     const [user, owner] = await Promise.all([
       userDb.getUserById(userId),
       userDb.getUserById(list.userId),
     ]);
-    return !!(user?.orgId && owner?.orgId && user.orgId === owner.orgId);
+    if (!user?.orgId || !owner?.orgId || user.orgId !== owner.orgId) return false;
+    const org = await orgDb.getOrgById(user.orgId);
+    const crmCfg = org?.shareSettings?.crm;
+    const crmEnabled = typeof crmCfg?.enabled === "boolean" ? crmCfg.enabled : true;
+    if (crmEnabled) return true;
+    if (org?.ownerUserId === userId) return true;
+    return !!(crmCfg?.editors && crmCfg.editors.includes(userId));
   },
 
   // Org-aware version: returns the user's own lists plus all org members' lists.
+  // When shareSettings.crm.enabled is false the fan-out is suppressed for plain
+  // members; org owners and crm.editors still receive the full org list.
   async getLeadListsForUser(userId: string) {
     const ownLists = await this.getLeadListsByUserId(userId);
     const user = await userDb.getUserById(userId);
     if (!user?.orgId) return ownLists;
+    const org = await orgDb.getOrgById(user.orgId);
+    const crmCfg = org?.shareSettings?.crm;
+    const crmEnabled = typeof crmCfg?.enabled === "boolean" ? crmCfg.enabled : true;
+    const isPrivileged =
+      org?.ownerUserId === userId || !!(crmCfg?.editors && crmCfg.editors.includes(userId));
+    if (!crmEnabled && !isPrivileged) return ownLists;
     const members = await orgDb.getOrgMembers(user.orgId);
     const memberListArrays = await Promise.all(
       members
@@ -5103,6 +5120,19 @@ export const crmDb = {
       handleDynamoDbError(error, 'setLeadListSearchCursor');
       throw error;
     }
+  },
+
+  async transferLeadListOwner(listId: string, newUserId: string): Promise<void> {
+    const TABLE_PREFIX = process.env.NODE_ENV === "production" ? "" : "Dev-";
+    await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-LeadLists`,
+      Key: { listId },
+      UpdateExpression: "SET userId = :uid, updatedAt = :ts",
+      ExpressionAttributeValues: {
+        ":uid": newUserId,
+        ":ts": new Date().toISOString(),
+      },
+    }).promise();
   },
 
   async deleteLeadList(listId: string) {
@@ -9220,6 +9250,7 @@ export const orgDb = {
       workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
       skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
       analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
+      crm:               { ...(ss.crm ?? { enabled: true, editors: [] }), editors: strip((ss.crm?.editors) ?? []) },
       brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
       marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
     };
