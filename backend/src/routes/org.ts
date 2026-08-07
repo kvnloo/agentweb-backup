@@ -145,11 +145,9 @@ router.post("/", async (req: Request, res: Response) => {
       orgId: uuidv4(),
       name: name.trim(),
       ownerUserId: userId,
-      maxMembers: orgDb.ORG_MAX_MEMBERS,
       // The owner is the org's first member. Seeded directly (no transaction
       // needed — this org doesn't exist in the table until this exact call,
       // so there's no concurrent joiner to race against).
-      memberCount: 1,
       pendingInvites: [],
       // Seed sharing defaults at creation so the toggle UI and member-fanout
       // gating agree from day one (skills + work plans shared org-wide by
@@ -288,13 +286,6 @@ router.post("/:orgId/invite", async (req: Request, res: Response) => {
       return res.status(403).json({ error: "Only org owners and admins can invite members" });
     }
 
-    // Check member count
-    const memberCount = await orgDb.getOrgMemberCount(orgId);
-    const pendingCount = (org.pendingInvites || []).length;
-    if (memberCount + pendingCount >= org.maxMembers) {
-      return res.status(400).json({ error: `Organization has reached the maximum of ${org.maxMembers} members (including pending invites)` });
-    }
-
     // Check if user already in this org
     const targetUser = await userDb.getUserByEmail(email.toLowerCase());
     if (targetUser?.orgId === orgId) {
@@ -403,29 +394,23 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Invalid or expired invitation" });
     }
 
-    // Add user to org first — atomic (memberCount increment + orgId write in
-    // one transaction, see joinOrgWithCapacityCheck) so two concurrent
-    // accepts/approvals can never both squeeze into the last slot. We
+    // Add user to org first — the conditional write in joinOrg rejects a user
+    // who already belongs to an org, so two concurrent accepts/approvals for the
+    // same person resolve to exactly one membership. We
     // intentionally do NOT snapshot the owner's subscription tier onto the
     // member here — the org's effective tier is resolved dynamically from
     // the owner at read time (getUserSubscriptionType), which keeps members
     // in sync with owner up/downgrades and auto-revokes entitlements when
     // they leave. See ENG-288.
-    const joinResult = await userDb.joinOrgWithCapacityCheck(userId, orgId, "member", org.maxMembers);
-    if (joinResult === "org_full") {
-      return res.status(400).json({ error: "Organization is full" });
-    }
+    const joinResult = await userDb.joinOrg(userId, orgId, "member");
     if (joinResult === "already_in_org") {
       return res.status(400).json({ error: "You are already in an organization. Leave your current org first." });
-    }
-    if (joinResult === "not_migrated") {
-      return res.status(409).json({ error: "This organization is not yet ready to accept members. Please try again shortly." });
     }
 
     // Only remove the invite once the join actually succeeded — removing it
     // first would silently drop the invite if the atomic join lost the race.
-    // (joinOrgWithCapacityCheck's transaction already cleared pendingOrgInvite
-    // on the user as part of the atomic write.)
+    // (joinOrg's conditional write already cleared pendingOrgInvite on the user
+    // as part of the same update.)
     const updatedInvites = [...pendingInvites];
     updatedInvites.splice(inviteIndex, 1);
     await orgDb.updateOrg(orgId, { pendingInvites: updatedInvites });
@@ -458,13 +443,11 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
       return res.status(400).json({ error: "Invalid or unknown domain-join request" });
     }
 
-    // Cheap early exit — the authoritative check is the atomic transaction
-    // below (joinOrgWithCapacityCheck), which closes both: (1) the same user
-    // joining twice if the domain matched multiple orgs and another owner
-    // approved first, and (2) two different users both squeezing into the
-    // last slot when the org is nearly full. Neither race is closeable by a
-    // separate read-then-write, however early — see the function's doc
-    // comment.
+    // Cheap early exit — the authoritative check is the conditional write in
+    // joinOrg below, which closes the real race: the same user joining twice if
+    // the domain matched multiple orgs and another owner approved first. That
+    // race is not closeable by a separate read-then-write, however early — see
+    // the function's doc comment.
     const targetUser = await userDb.getUserById(requestEntry.userId);
     if (!targetUser) {
       return res.status(404).json({ error: "The requesting user no longer exists" });
@@ -476,17 +459,9 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
     // Only remove the request from this org's pending list once the join
     // actually succeeds — removing it first would silently drop the request
     // if the atomic join loses the race, with no way to retry.
-    const joinResult = await userDb.joinOrgWithCapacityCheck(requestEntry.userId, orgId, "member", org.maxMembers);
-    if (joinResult === "org_full") {
-      return res.status(400).json({
-        error: `Organization has reached the maximum of ${org.maxMembers} members. Upgrade to add more.`,
-      });
-    }
+    const joinResult = await userDb.joinOrg(requestEntry.userId, orgId, "member");
     if (joinResult === "already_in_org") {
       return res.status(400).json({ error: "This user is already in an organization" });
-    }
-    if (joinResult === "not_migrated") {
-      return res.status(409).json({ error: "This organization is not yet ready to accept members. Please try again shortly." });
     }
 
     // Same non-snapshotting join mechanics as accept-invite (see ENG-288) —
