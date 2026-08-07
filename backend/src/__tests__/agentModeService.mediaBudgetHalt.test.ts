@@ -58,20 +58,19 @@ describe('AgentModeService - media budget halts before Meta writes', () => {
           imageCall('img-2', 'variant 2'),
           imageCall('img-3', 'variant 3'),
           imageCall('img-4', 'variant 4'),
+          // A model may optimistically emit the dependent Graph write in the
+          // SAME tool batch. It must not race the incomplete image set.
+          {
+            id: 'graph-write-same-iteration',
+            name: 'call_meta_marketing_api',
+            arguments: JSON.stringify({
+              entity_type: 'AD_CREATIVE',
+              action: 'UPLOAD_IMAGE',
+              account_id: 'act_123',
+              params: { image_url: 'https://s3/variant-1.png' },
+            }),
+          },
         ],
-      }))
-      // This turn is intentionally reachable only before the fix.
-      .mockResolvedValue(buildLLMResponse({
-        tool_calls: [{
-          id: 'graph-write',
-          name: 'call_meta_marketing_api',
-          arguments: JSON.stringify({
-            entity_type: 'AD_CREATIVE',
-            action: 'UPLOAD_IMAGE',
-            account_id: 'act_123',
-            params: { image_url: 'https://s3/variant-1.png' },
-          }),
-        }],
       }));
 
     const graphCalls: string[] = [];

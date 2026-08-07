@@ -723,17 +723,34 @@ export async function executePreparedTools(
     // ENG-510: run batched media-gen with BOUNDED concurrency (MEDIA_GEN_MAX_CONCURRENCY
     // at a time) instead of strictly serial, so N independent variants finish in ~one
     // image's wall-clock and fit under the whole-turn cap — while staying under provider
-    // rate limits. Budget/duration state settles BETWEEN batches, so the deferral decision
-    // (and the >=1-asset forward-progress gate) is made per batch, race-free. Results are
-    // written by index so emission order is preserved regardless of completion order.
+    // rate limits. Non-media calls wait until every media batch succeeds: otherwise a
+    // same-iteration Graph write can race a deferred final image and publish an incomplete
+    // creative set (ENG-922). Budget/duration state settles BETWEEN media batches, so the
+    // deferral decision (and the >=1-asset forward-progress gate) is race-free. Results are
+    // written by original index so the model-visible emission order is preserved.
     toolResults = new Array(preparedCalls.length);
-    for (let start = 0; start < preparedCalls.length; start += MEDIA_GEN_MAX_CONCURRENCY) {
-      const batch = preparedCalls.slice(start, start + MEDIA_GEN_MAX_CONCURRENCY);
+    const indexedMediaCalls = preparedCalls
+      .map((preparedCall, index) => ({ preparedCall, index }))
+      .filter(({ preparedCall }) => isMediaGenTool(preparedCall.toolCall));
+    const indexedNonMediaCalls = preparedCalls
+      .map((preparedCall, index) => ({ preparedCall, index }))
+      .filter(({ preparedCall }) => !isMediaGenTool(preparedCall.toolCall));
+    let stopAfterMediaDeferral = false;
+
+    for (let start = 0; start < indexedMediaCalls.length; start += MEDIA_GEN_MAX_CONCURRENCY) {
+      const batch = indexedMediaCalls.slice(start, start + MEDIA_GEN_MAX_CONCURRENCY);
+      if (stopAfterMediaDeferral || batch.some(({ preparedCall }) => shouldDeferMedia(preparedCall.toolCall))) {
+        batch.forEach(({ preparedCall, index }) => {
+          const { toolCall, functionArgs, policyDecision } = preparedCall;
+          toolResults[index] = makeDeferred(toolCall, functionArgs, policyDecision);
+        });
+        stopAfterMediaDeferral = true;
+        continue;
+      }
+
       const batchResults = await Promise.all(
-        batch.map(async ({ toolCall, functionArgs, policyDecision }) => {
-          if (shouldDeferMedia(toolCall)) {
-            return makeDeferred(toolCall, functionArgs, policyDecision);
-          }
+        batch.map(async ({ preparedCall }) => {
+          const { toolCall, functionArgs, policyDecision } = preparedCall;
           const outcome = await runOne(toolCall, functionArgs, policyDecision);
           return toDispatchResult(outcome, toolCall, functionArgs);
         }),
@@ -741,7 +758,28 @@ export async function executePreparedTools(
       batchResults.forEach((dr, i) => {
         if (countsAsAsset(dr)) assetsThisBatch++;
         recordMediaDuration(dr);
-        toolResults[start + i] = dr;
+        toolResults[batch[i].index] = dr;
+      });
+    }
+
+    if (stopAfterMediaDeferral) {
+      // The loop terminates after processing these results, but every emitted tool call
+      // still gets a ledger/message entry. Mark dependent non-media work deferred rather
+      // than executing it against an incomplete batch.
+      indexedNonMediaCalls.forEach(({ preparedCall, index }) => {
+        const { toolCall, functionArgs, policyDecision } = preparedCall;
+        toolResults[index] = makeDeferred(toolCall, functionArgs, policyDecision);
+      });
+    } else {
+      const nonMediaResults = await Promise.all(
+        indexedNonMediaCalls.map(async ({ preparedCall }) => {
+          const { toolCall, functionArgs, policyDecision } = preparedCall;
+          const outcome = await runOne(toolCall, functionArgs, policyDecision);
+          return toDispatchResult(outcome, toolCall, functionArgs);
+        }),
+      );
+      nonMediaResults.forEach((dr, i) => {
+        toolResults[indexedNonMediaCalls[i].index] = dr;
       });
     }
   } else {
