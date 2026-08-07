@@ -81,6 +81,7 @@ import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
 import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
+import { buildMediaBudgetDeferralMessage } from '../utils/timeoutContinuation';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -4075,6 +4076,31 @@ export class AgentModeService {
             console.error('AgentMode: Failed to batch update function call counters:', counterError);
             // Don't fail the whole iteration if counter update fails
           }
+        }
+
+        // ENG-922: a media-budget deferral is terminal for THIS turn. Previously
+        // the loop asked the model for another iteration after exposing the
+        // deferral as a tool result. On an ad-creative request that next iteration
+        // could start uploading the incomplete image set to Meta, leaving staged
+        // images/creatives behind when the remaining variant had not finished.
+        // Deliver the completed images deterministically and stop before any later
+        // Graph write. The next user turn resumes only the missing variants.
+        if (dispatchResult.mediaBudgetDeferred) {
+          const deferralMessage = buildMediaBudgetDeferralMessage(
+            toolCalls.slice(toolCallsLengthBeforeIteration),
+          );
+          content = deferralMessage
+            || 'Media generation paused at the per-response time limit. Reply "continue" to create only the remaining assets.';
+          (messages as any[]).push({
+            role: 'assistant',
+            content,
+            llm: llmModel,
+            metadata: { timestamp: new Date().toISOString(), mediaBudgetDeferred: true },
+          });
+          if (onProgress) {
+            onProgress({ iteration, status: 'complete', toolCalls: toolCalls.slice() });
+          }
+          break;
         }
 
         // Human-in-the-loop confirmation gate: if a tool in this iteration requested

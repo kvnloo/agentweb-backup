@@ -24,6 +24,16 @@ export interface GeneratedImageRef {
   filename: string;
 }
 
+export interface MediaBudgetToolCall {
+  name?: string;
+  result?: {
+    imageUrl?: string;
+    filename?: string;
+    deferred?: boolean;
+    reason?: string;
+  } | null;
+}
+
 /**
  * Collect image-generated markers (carrying a saved URL) persisted at or after `sinceMs`,
  * URL-deduped. Mirrors scanMessagesForAssets' marker shape and timestamp precedence
@@ -69,5 +79,66 @@ export function buildTimeoutContinuationMessage(images: GeneratedImageRef[] | un
     `${gallery}\n\n` +
     `Reply "continue" and I'll pick up where I left off and create anything still missing — ` +
     `I won't redo what's already done.`
+  );
+}
+
+/**
+ * Explain a whole-turn timeout that occurred while media tools were actively in
+ * flight but before any asset finished. `pendingTools` comes from the final SSE
+ * progress snapshot, so non-media timeouts keep their existing generic handling.
+ */
+export function buildEmptyMediaTimeoutMessage(
+  pendingTools: string[] | undefined | null,
+): string | null {
+  const remaining = Array.isArray(pendingTools)
+    ? pendingTools.filter((name) => name === 'generate_image').length
+    : 0;
+  if (remaining < 1) return null;
+  const noun = remaining === 1 ? 'image' : 'images';
+  return (
+    `⚠️ This image request hit the time limit before any images finished. ` +
+    `No image from this batch finished, so there was nothing from it to upload or use in a creative or ad. ` +
+    `${remaining} ${noun} still ${remaining === 1 ? 'remains' : 'remain'}. ` +
+    `Please retry the request; it will start from the first missing image.`
+  );
+}
+
+/**
+ * Deterministic terminal response for a soft media-budget deferral. Stopping the
+ * agent loop at this boundary prevents a later iteration from uploading a partial
+ * image set to Meta. Successful generated images are delivered inline; deferred
+ * calls become the exact remaining count.
+ */
+export function buildMediaBudgetDeferralMessage(
+  toolCalls: MediaBudgetToolCall[] | undefined | null,
+): string | null {
+  if (!Array.isArray(toolCalls)) return null;
+  const images = toolCalls
+    .filter((call) => call?.name === 'generate_image' && typeof call.result?.imageUrl === 'string')
+    .map((call) => ({
+      imageUrl: call.result!.imageUrl!,
+      filename: call.result?.filename || 'generated-image.png',
+    }));
+  const remaining = toolCalls.filter(
+    (call) => call?.name === 'generate_image'
+      && call.result?.deferred === true
+      && call.result?.reason === 'media_generation_time_budget',
+  ).length;
+  if (remaining < 1) return null;
+
+  const completed = images.length;
+  const completedNoun = completed === 1 ? 'image' : 'images';
+  const remainingNoun = remaining === 1 ? 'image' : 'images';
+  const gallery = images.map((image) => `![${image.filename}](${image.imageUrl})`).join('\n\n');
+  const delivered = completed > 0
+    ? `I generated and saved ${completed} ${completedNoun} so far${gallery ? `:\n\n${gallery}` : '.'}`
+    : 'No images finished before the budget boundary.';
+
+  return (
+    `⚠️ This request reached the per-response media time budget before the full batch finished. ` +
+    `${delivered}\n\n` +
+    `${remaining} ${remainingNoun} still ${remaining === 1 ? 'remains' : 'remain'}. ` +
+    `I stopped before starting any follow-on publishing steps, so the incomplete batch was not published. ` +
+    `Reply "continue" and I'll create only what is still missing.`
   );
 }

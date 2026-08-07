@@ -39,7 +39,11 @@ import { stripImageDataForPersistence } from '../services/agentMode/incrementalP
 import { MarketingActionCarrier, normalizeMarketingActions } from '../services/marketingActionEnvelope';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
-import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
+import {
+  collectMediaGeneratedSince,
+  buildTimeoutContinuationMessage,
+  buildEmptyMediaTimeoutMessage,
+} from '../utils/timeoutContinuation';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
@@ -4834,6 +4838,10 @@ export const agentModeController = {
         // worker break out of its loop and discard the response (response.cancelled).
         if (genErr?.isGenerationTimeout) {
           console.log(`AgentMode: generation timed out for session ${sessionId} — cancelling orphaned worker run`);
+          // Snapshot BEFORE cancellation/markProgressComplete clears the store.
+          // With zero completed assets, the in-flight pendingTools list is the
+          // only reliable signal that this was specifically a media timeout.
+          const timedOutProgress = getLatestProgress(sessionId);
           requestCancel(sessionId);
           generateMarketingResponseWorkerService.cancelSession(sessionId);
 
@@ -4865,6 +4873,34 @@ export const agentModeController = {
                 void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_media' });
               }
               res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+              return;
+            }
+
+            // ENG-922: zero completed images used to fall through to the generic
+            // 504, silently losing both the failure cause and the remaining-work
+            // count. Handle only a progress-proven image timeout; non-media
+            // timeouts preserve the existing generic path.
+            const emptyMediaTimeoutMsg = buildEmptyMediaTimeoutMessage(timedOutProgress?.pendingTools);
+            if (emptyMediaTimeoutMsg) {
+              markProgressComplete(sessionId);
+              await chatbotDb.addMessageToSession(sessionId, {
+                role: 'assistant',
+                content: emptyMediaTimeoutMsg,
+                timestamp: new Date().toISOString(),
+                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-zero-media' },
+              }).catch((persistErr) =>
+                console.error('AgentMode: failed to persist zero-media timeout message:', persistErr),
+              );
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'failed', { finishReason: 'timeout_zero_media' });
+              }
+              res.status(504).json({
+                error: 'GENERATION_TIMEOUT',
+                message: emptyMediaTimeoutMsg,
+                content: emptyMediaTimeoutMsg,
+                images: [],
+                partialMediaDelivery: false,
+              });
               return;
             }
           } catch (continuationErr) {
@@ -5692,6 +5728,8 @@ export const agentModeController = {
 
       // Clean up progress store on error so session doesn't appear stuck in generating state
       const shareId = req.params?.shareId;
+      // Snapshot BEFORE markProgressComplete deletes the progress entry.
+      const sharedTimedOutProgress = shareId ? getLatestProgress(shareId) : undefined;
       if (shareId) {
         // Wall-clock timeout: cancel the orphaned worker run (same as manual stop) so it
         // stops burning compute and stops emitting orphan progress that would re-open the
@@ -5731,6 +5769,24 @@ export const agentModeController = {
             // Progress was already completed above; the session lock is released in the
             // inner finally, so this early return is safe.
             res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+            return;
+          }
+
+          const emptyMediaTimeoutMsg = buildEmptyMediaTimeoutMessage(sharedTimedOutProgress?.pendingTools);
+          if (emptyMediaTimeoutMsg) {
+            await chatbotDb.addMessageToSession(shareId, {
+              role: 'assistant',
+              content: emptyMediaTimeoutMsg,
+              timestamp: new Date().toISOString(),
+              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-zero-media' },
+            });
+            res.status(504).json({
+              error: 'GENERATION_TIMEOUT',
+              message: emptyMediaTimeoutMsg,
+              content: emptyMediaTimeoutMsg,
+              images: [],
+              partialMediaDelivery: false,
+            });
             return;
           }
         } catch (persistErr) {

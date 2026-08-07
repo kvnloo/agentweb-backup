@@ -17,7 +17,7 @@ import { Request, Response } from 'express';
 import { agentModeController, activeSessionGenerations } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { requestCancel } from '../utils/sseProgress';
+import { getLatestProgress, requestCancel } from '../utils/sseProgress';
 
 jest.mock('../services/durableLandingService', () => ({
   findInFlightJobForSession: jest.fn().mockResolvedValue(null),
@@ -102,6 +102,7 @@ jest.mock('../utils/agentModeErrors', () => ({
 const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
 const mockWorkerService = generateMarketingResponseWorkerService as jest.Mocked<typeof generateMarketingResponseWorkerService>;
 const mockRequestCancel = requestCancel as jest.Mock;
+const mockGetLatestProgress = getLatestProgress as jest.Mock;
 
 describe('AgentModeController - timeout cancels the orphaned generation', () => {
   const mockUserId = 'user-timeout';
@@ -143,6 +144,7 @@ describe('AgentModeController - timeout cancels the orphaned generation', () => 
     mockChatbotDb.addMessageToSession.mockResolvedValue(mockSession as any);
     mockChatbotDb.addMessagesToSession.mockResolvedValue(undefined as any);
     mockChatbotDb.updateSessionTitle.mockResolvedValue(undefined as any);
+    mockGetLatestProgress.mockReturnValue(null);
   });
 
   it('signals cancellation to the worker when generation hits the wall-clock timeout', async () => {
@@ -180,5 +182,35 @@ describe('AgentModeController - timeout cancels the orphaned generation', () => 
     expect(mockRequestCancel).not.toHaveBeenCalled();
     expect(mockWorkerService.cancelSession).not.toHaveBeenCalled();
     expect(activeSessionGenerations.has(mockSessionId)).toBe(false);
+  });
+
+  it('persists an actionable same-turn message when four pending images time out with zero assets', async () => {
+    const timeoutErr: any = new Error('image batch timed out');
+    timeoutErr.isGenerationTimeout = true;
+    mockWorkerService.runInWorker.mockRejectedValueOnce(timeoutErr);
+    mockGetLatestProgress.mockReturnValue({
+      iteration: 1,
+      status: 'executing_tools',
+      pendingTools: ['generate_image', 'generate_image', 'generate_image', 'generate_image'],
+      toolCalls: [],
+    });
+
+    const res = makeRes();
+    await agentModeController.generateResponse(makeReq(mockSessionId), res);
+
+    expect(mockChatbotDb.addMessageToSession).toHaveBeenCalledWith(
+      mockSessionId,
+      expect.objectContaining({
+        role: 'assistant',
+        content: expect.stringContaining('4 images still remain'),
+        metadata: expect.objectContaining({ kind: 'generation-timeout-zero-media' }),
+      }),
+    );
+    expect(res.status).toHaveBeenCalledWith(504);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      error: 'GENERATION_TIMEOUT',
+      message: expect.stringContaining('before any images finished'),
+      partialMediaDelivery: false,
+    }));
   });
 });

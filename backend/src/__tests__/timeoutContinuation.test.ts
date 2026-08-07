@@ -1,6 +1,7 @@
 import {
   collectMediaGeneratedSince,
   buildTimeoutContinuationMessage,
+  buildEmptyMediaTimeoutMessage,
 } from '../utils/timeoutContinuation';
 
 describe('collectMediaGeneratedSince', () => {
@@ -90,5 +91,31 @@ describe('buildTimeoutContinuationMessage', () => {
     expect(msg).toContain('here they are');
     expect(msg).toContain('![v1.png](https://s3/v1.png)');
     expect(msg).toContain('![v2.png](https://s3/v2.png)');
+  });
+});
+
+describe('buildEmptyMediaTimeoutMessage (ENG-922)', () => {
+  it('reports a four-image batch that timed out before any asset finished', () => {
+    const msg = buildEmptyMediaTimeoutMessage([
+      'generate_image',
+      'generate_image',
+      'generate_image',
+      'generate_image',
+    ]);
+
+    expect(msg).toContain('before any images finished');
+    expect(msg).toContain('4 images still remain');
+    expect(msg).toContain('nothing from it to upload or use in a creative or ad');
+  });
+
+  it('uses singular remaining-work copy for one pending image', () => {
+    const msg = buildEmptyMediaTimeoutMessage(['generate_image']);
+    expect(msg).toContain('1 image still remains');
+    expect(msg).not.toContain('1 images');
+  });
+
+  it('does not mislabel a non-media timeout as an image-generation failure', () => {
+    expect(buildEmptyMediaTimeoutMessage(['search_web', 'create_blog_article'])).toBeNull();
+    expect(buildEmptyMediaTimeoutMessage(undefined)).toBeNull();
   });
 });
