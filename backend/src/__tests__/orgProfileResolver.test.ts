@@ -120,6 +120,17 @@ describe("resolveOrgProfileField — boundary / error paths", () => {
     ).resolves.toEqual(ownerBrand);
   });
 
+  test("nothing to recover (brand-new org, no brand anywhere) → no warning", async () => {
+    // This is the ordinary empty state, and the resolver runs on every `/me`.
+    // Warning here would bury the real signal — an org shadowing intact data.
+    const owner = { userId: OWNER_ID, orgId: "org-1" };
+
+    await expect(
+      resolveOrgProfileField(owner, unpopulatedOrg, "brandGuidelines")
+    ).resolves.toBeUndefined();
+    expect(console.warn).not.toHaveBeenCalled();
+  });
+
   test("org without an ownerUserId → caller's own record", async () => {
     const owner = { userId: OWNER_ID, orgId: "org-1", marketStrategy: ownerStrategy };
 
