@@ -193,6 +193,19 @@ router.post('/', (req: express.Request, res: express.Response) => {
       const memberships = parsed.payload?.scheduled_event?.event_memberships ?? [];
       const signatureHeader = req.headers['calendly-webhook-signature'] as string | undefined;
 
+      // The real event_memberships shape for 2+ hosts has never been observed live — the
+      // resolution logic below only assumes "more entries, same per-entry shape" as the
+      // single-host payload this receiver was originally verified against. Log the raw
+      // shape the first time this actually happens in production, cheap insurance against
+      // that assumption being wrong (ENG-524 multi-host fix, no live multi-host account
+      // available to verify against directly).
+      if (memberships.length > 1) {
+        console.log(
+          `[Calendly Webhook] Multi-host event detected (${memberships.length} members) — logging payload shape for verification:`,
+          JSON.stringify(memberships),
+        );
+      }
+
       // Each customer's webhook subscription is scope:'user' (calendlyAuth.ts), so an event
       // with 2+ independently-connected hosts produces a SEPARATE delivery per subscription —
       // identical payload, but each signed with that host's own webhook_signing_key. We can't
