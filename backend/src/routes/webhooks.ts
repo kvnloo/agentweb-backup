@@ -22,7 +22,7 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
 import { isSmokeTestEmail } from '../utils/smokeTestLead';
-import { enqueueJob, markJobComplete, markJobFailed, registerProcessor } from '../services/asyncJobQueue';
+import { enqueueJob, markJobComplete, markJobFailed, markJobProcessing, registerProcessor } from '../services/asyncJobQueue';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -1258,6 +1258,12 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       if (enqueueResult === 'duplicate') {
         console.log(`[HubSpot Webhook] Duplicate delivery (${dedupeKey.slice(0, 12)}...) — already queued, skipping`);
         return;
+      }
+      if (enqueueResult === 'enqueued') {
+        // Claim it before doing real work — otherwise this row stays 'pending' for
+        // the whole inline call and the poller's next tick can pick up and re-run
+        // it concurrently (duplicate contact/deal syncs).
+        await markJobProcessing('hubspot_webhook', dedupeKey);
       }
 
       try {

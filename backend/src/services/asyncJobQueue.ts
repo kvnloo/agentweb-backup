@@ -101,6 +101,33 @@ export async function markJobComplete(source: string, dedupeKey: string): Promis
   }
 }
 
+/** Claim a just-enqueued job for immediate inline processing (same request that
+ *  enqueued it). Without this, the row sits at status='pending' for the entire
+ *  duration of inline processing, and the poller's next tick can claim and
+ *  re-run the SAME job concurrently — duplicate CRM writes, duplicate CAPI
+ *  sends. Callers should call this right after a successful enqueueJob and
+ *  before starting real work, narrowing the race to the gap between two
+ *  sequential DynamoDB calls instead of up to a full poll interval.
+ *  Best-effort like markJobComplete/markJobFailed: if this write fails, the
+ *  row is simply left 'pending' a little longer — no worse than before this
+ *  function existed, never a reason to abort inline processing. */
+export async function markJobProcessing(source: string, dedupeKey: string): Promise<void> {
+  const id = jobId(source, dedupeKey);
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: 'SET #status = :processing, updatedAt = :now',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':processing': 'processing', ':now': new Date().toISOString() },
+      })
+      .promise();
+  } catch (error: any) {
+    console.warn(`[AsyncJobQueue] markJobProcessing failed for ${id} (best-effort):`, error?.message ?? error);
+  }
+}
+
 export async function markJobFailed(source: string, dedupeKey: string, error: unknown): Promise<void> {
   const id = jobId(source, dedupeKey);
   const message = error instanceof Error ? error.message : String(error);
