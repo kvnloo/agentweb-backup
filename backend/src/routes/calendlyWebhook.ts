@@ -8,18 +8,21 @@
  * already built for AgentWeb's own funnel.
  *
  * Structure mirrors the HubSpot receiver in routes/webhooks.ts: respond 200
- * immediately, then verify + process in a fire-and-forget async block,
- * silently dropping (console.warn, no throw) on any verification/resolution
- * failure — Calendly retries on non-2xx, and a per-customer OAuth webhook is
- * closer to HubSpot's model than Fathom's shared-secret one, so a hard
- * failure risks a retry storm against a broken/misconfigured connection
- * rather than protecting anything.
+ * immediately, verify synchronously first (fast — DB lookups + HMAC, no
+ * external API calls), then enqueue + process fire-and-forget. Signature
+ * verification and multi-host resolution stay here, before enqueueing, so
+ * the queue never has to re-touch signing keys — only already-verified work
+ * gets a durable row (ENG-524 fast-follow, Greptile P1: an unenqueued
+ * fire-and-forget silently loses a booking's attribution/CRM-forward if the
+ * process crashes between the 200 response and finishing the work, since
+ * Calendly saw success and never retries).
  *
- * No new persistent dedup store: `eventId` (the invitee URI, stable per
- * booking) is passed straight through to metaService.sendCapiLeadEvent,
- * which already documents that Meta collapses matching event_ids into one
- * conversion on its own side — that's the correctness mechanism for
- * Calendly's webhook retries, not anything built here.
+ * No new persistent dedup store for CAPI specifically: `eventId` (the
+ * invitee URI, stable per booking) is passed straight through to
+ * metaService.sendCapiLeadEvent, which already documents that Meta collapses
+ * matching event_ids into one conversion on its own side. CRM-forward has
+ * its own idempotency check (see processCalendlyWebhookJob) since it has no
+ * equivalent built-in dedup.
  *
  * Field paths below were confirmed against a real invitee.created delivery
  * captured during a live test booking, not assumed from Calendly's docs
@@ -35,8 +38,11 @@ import { userDb, crmDb } from '../services/db';
 import { metaService } from '../services/metaService';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { leadListAlertService } from '../services/leadListAlertService';
+import { enqueueJob, markJobComplete, markJobFailed, registerProcessor } from '../services/asyncJobQueue';
 
 const router = express.Router();
+
+const QUEUE_SOURCE = 'calendly_webhook';
 
 // ── CRM-forward: target-list resolution ─────────────────────────────────
 //
@@ -134,6 +140,19 @@ interface CalendlyInviteePayload {
   };
 }
 
+/** What actually gets enqueued/processed — already-resolved and verified, so the
+ *  queue (and any retry by the poller) never needs to re-touch signing keys. */
+interface CalendlyJobPayload {
+  userId: string;
+  accountId: string;
+  bookingLeadListId?: string;
+  email?: string;
+  firstName?: string;
+  lastName?: string;
+  uri: string;
+  eventTimeSeconds?: number;
+}
+
 /**
  * Calendly signs as header `t=<unix-ts>,v1=<hex-hmac-sha256>` over the string
  * `${t}.${rawBody}`, HMAC'd with the per-connection webhook_signing_key we
@@ -173,6 +192,152 @@ function splitName(payload: CalendlyInviteePayload['payload']): { firstName?: st
   if (spaceIndex === -1) return { firstName: name };
   return { firstName: name.slice(0, spaceIndex), lastName: name.slice(spaceIndex + 1) };
 }
+
+/** CAPI attribution + CRM-forward, run either inline (same request, the common case)
+ *  or later by the async job queue's poller if the process crashed before finishing.
+ *  Re-fetches the owner and treats bookingLeadListId as a snapshot to verify, not
+ *  trust — both cheap, and avoids ever acting on stale data on a delayed retry. */
+export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Promise<void> {
+  const owner = await userDb.getUserById(payload.userId);
+  if (!owner) {
+    console.warn(`[Calendly Webhook] Resolved user ${payload.userId} not found — dropping`);
+    return;
+  }
+
+  // Two independent legs — CAPI attribution and CRM-forward. Each gets its own
+  // try/catch so a failure in one (e.g. no Meta ad account connected, or a CRM
+  // write error) never prevents the other from running.
+
+  try {
+    const pixelResolution = await metaService.resolveMetaPixelForUser(owner, payload.userId);
+    if ('unresolved' in pixelResolution) {
+      console.log(`[Calendly Webhook] Meta pixel unresolved for user ${payload.userId}: ${pixelResolution.reason} — booking saved, CAPI skipped`);
+    } else {
+      const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
+      const { accessToken } = await getMetaAccountCredentials(owner, payload.userId, pixelResolution.accountId);
+
+      const result = await metaService.sendCapiLeadEvent(pixelResolution.pixelId, accessToken, {
+        eventId: payload.uri,
+        email: payload.email,
+        firstName: payload.firstName,
+        lastName: payload.lastName,
+        eventTimeSeconds: payload.eventTimeSeconds,
+        // A booking is Meta's 'Schedule' standard event, not 'Lead' (this function's
+        // default) — PRD §6 step 3, matches ENG-522's sendScheduleEvent.
+        eventName: 'Schedule',
+      });
+
+      if (result.success) {
+        console.log(`[Calendly Webhook] CAPI Schedule event sent for user ${payload.userId} (fbtrace_id=${result.fbtraceId ?? 'n/a'})`);
+      } else {
+        console.error(`[Calendly Webhook] CAPI send failed for user ${payload.userId}: ${result.error}`);
+      }
+    }
+  } catch (capiError: any) {
+    console.error('[Calendly Webhook] CAPI leg failed:', capiError?.message ?? capiError);
+  }
+
+  try {
+    const email = payload.email;
+    if (!email) {
+      console.warn('[Calendly Webhook] No invitee email — skipping CRM-forward');
+    } else {
+      let listId = payload.bookingLeadListId;
+      if (listId) {
+        const configuredList = await crmDb.getLeadListById(listId);
+        // Ownership check, not a truthiness check: createLead's list-metadata update
+        // has no attribute_exists guard, so writing a lead against a deleted listId
+        // partially RESURRECTS a ghost record there (fieldNames/leadCount/listId/
+        // updatedAt only — no userId, no name). A plain "does a row exist" check gets
+        // fooled by that ghost and never falls back (confirmed live). Checking userId
+        // ownership is what actually distinguishes a real list from a ghost.
+        if (!configuredList || configuredList.userId !== payload.userId) {
+          console.warn(`[Calendly Webhook] Configured booking list ${listId} no longer exists — falling back`);
+          listId = undefined;
+        }
+      }
+      if (!listId) {
+        listId = await resolveOrCreateBookingList(payload.userId);
+        await updateAccountConfig(payload.userId, 'calendly', payload.accountId, {
+          booking_lead_list_id: listId,
+        });
+      }
+
+      const existingLead = await crmDb.getLeadByEmail(listId, email.trim().toLowerCase());
+
+      // Idempotency: CAPI already dedupes a Calendly redelivery via Meta's own
+      // event_id collapsing (see file header comment) — but nothing protects THIS
+      // leg, so a redelivery of the same invitee.created event (e.g. our 200 response
+      // didn't reach Calendly) would otherwise repeat the HubSpot/Attio sync and fire
+      // a duplicate customer-facing alert for a booking already fully processed.
+      // bookingUri covers a redelivery of the very first booking (create path, before
+      // any update happened); lastBookingUri covers every booking after that.
+      const alreadyProcessed =
+        existingLead?.customFields?.lastBookingUri === payload.uri ||
+        existingLead?.customFields?.bookingUri === payload.uri;
+
+      if (alreadyProcessed) {
+        console.log(`[Calendly Webhook] Duplicate delivery for already-processed booking ${payload.uri} — skipping CRM-forward re-processing`);
+      } else {
+        let lead: any;
+        let eventType: 'created' | 'updated';
+        if (existingLead) {
+          await crmDb.updateLead(listId, existingLead.leadId, {
+            customFields: {
+              ...(existingLead.customFields || {}),
+              lastBookedAt: new Date().toISOString(),
+              lastBookingUri: payload.uri,
+            },
+          });
+          lead = existingLead;
+          eventType = 'updated';
+        } else {
+          lead = await crmDb.createLead(listId, {
+            email: email.trim(),
+            firstName: payload.firstName,
+            lastName: payload.lastName,
+            customFields: {
+              source: 'calendly_booking',
+              bookedAt: new Date().toISOString(),
+              bookingUri: payload.uri,
+            },
+          });
+          eventType = 'created';
+        }
+
+        void externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'hubspot', eventType)
+          .catch((err: any) => console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err));
+        void externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'attio', eventType)
+          .catch((err: any) => console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err));
+
+        // Same alert mechanism /forward-lead already uses — per-list opt-in via
+        // list.alertEvents, so this only notifies the customer if they've already
+        // configured this specific list to alert on lead-added/updated.
+        try {
+          const list = await crmDb.getLeadListById(listId);
+          if (list) {
+            const alertEventType = eventType === 'created' ? 'api.lead_added' : 'api.lead_updated';
+            await leadListAlertService.notifyLeadListOwnerIfConfigured(
+              list,
+              lead,
+              alertEventType,
+              { source: 'calendly_booking', bookingUri: payload.uri },
+              new Date().toISOString(),
+            );
+          }
+        } catch (alertError: any) {
+          console.error('[Calendly Webhook] Lead alert failed:', alertError?.message ?? alertError);
+        }
+
+        console.log(`[Calendly Webhook] CRM-forward: lead ${eventType} in list ${listId} for user ${payload.userId}`);
+      }
+    }
+  } catch (crmError: any) {
+    console.error('[Calendly Webhook] CRM-forward leg failed:', crmError?.message ?? crmError);
+  }
+}
+
+registerProcessor(QUEUE_SOURCE, processCalendlyWebhookJob);
 
 router.post('/', (req: express.Request, res: express.Response) => {
   // Respond immediately — all processing below is fire-and-forget, same
@@ -230,146 +395,41 @@ router.post('/', (req: express.Request, res: express.Response) => {
         return;
       }
 
-      const owner = await userDb.getUserById(resolved.userId);
-      if (!owner) {
-        console.warn(`[Calendly Webhook] Resolved user ${resolved.userId} not found — dropping`);
-        return;
-      }
-
       const { firstName, lastName } = splitName(parsed.payload);
       const createdAtMs = parsed.payload.created_at ? Date.parse(parsed.payload.created_at) : NaN;
       const eventTimeSeconds = Number.isFinite(createdAtMs) ? Math.floor(createdAtMs / 1000) : undefined;
 
-      // Two independent legs from here — CAPI attribution and CRM-forward. Each gets
-      // its own try/catch so a failure in one (e.g. no Meta ad account connected, or a
-      // CRM write error) never prevents the other from running.
+      const jobPayload: CalendlyJobPayload = {
+        userId: resolved.userId,
+        accountId: resolved.account.account_id,
+        bookingLeadListId: resolved.account.config?.booking_lead_list_id,
+        email: parsed.payload.email,
+        firstName,
+        lastName,
+        uri: parsed.payload.uri,
+        eventTimeSeconds,
+      };
 
-      try {
-        const pixelResolution = await metaService.resolveMetaPixelForUser(owner, resolved.userId);
-        if ('unresolved' in pixelResolution) {
-          console.log(`[Calendly Webhook] Meta pixel unresolved for user ${resolved.userId}: ${pixelResolution.reason} — booking saved, CAPI skipped`);
-        } else {
-          const { getMetaAccountCredentials } = await import('../services/metaAccountCredentials');
-          const { accessToken } = await getMetaAccountCredentials(owner, resolved.userId, pixelResolution.accountId);
-
-          const result = await metaService.sendCapiLeadEvent(pixelResolution.pixelId, accessToken, {
-            eventId: parsed.payload.uri,
-            email: parsed.payload.email,
-            firstName,
-            lastName,
-            eventTimeSeconds,
-            // A booking is Meta's 'Schedule' standard event, not 'Lead' (this function's
-            // default) — PRD §6 step 3, matches ENG-522's sendScheduleEvent.
-            eventName: 'Schedule',
-          });
-
-          if (result.success) {
-            console.log(`[Calendly Webhook] CAPI Schedule event sent for user ${resolved.userId} (fbtrace_id=${result.fbtraceId ?? 'n/a'})`);
-          } else {
-            console.error(`[Calendly Webhook] CAPI send failed for user ${resolved.userId}: ${result.error}`);
-          }
-        }
-      } catch (capiError: any) {
-        console.error('[Calendly Webhook] CAPI leg failed:', capiError?.message ?? capiError);
+      const enqueueResult = await enqueueJob(QUEUE_SOURCE, parsed.payload.uri, jobPayload);
+      if (enqueueResult === 'duplicate') {
+        console.log(`[Calendly Webhook] Duplicate delivery for ${parsed.payload.uri} — already queued, skipping`);
+        return;
       }
 
       try {
-        const email = parsed.payload.email;
-        if (!email) {
-          console.warn('[Calendly Webhook] No invitee email — skipping CRM-forward');
-        } else {
-          let listId = resolved.account.config?.booking_lead_list_id as string | undefined;
-          if (listId) {
-            const configuredList = await crmDb.getLeadListById(listId);
-            // Ownership check, not a truthiness check: createLead's list-metadata update
-            // has no attribute_exists guard, so writing a lead against a deleted listId
-            // partially RESURRECTS a ghost record there (fieldNames/leadCount/listId/
-            // updatedAt only — no userId, no name). A plain "does a row exist" check gets
-            // fooled by that ghost and never falls back (confirmed live). Checking userId
-            // ownership is what actually distinguishes a real list from a ghost.
-            if (!configuredList || configuredList.userId !== resolved.userId) {
-              console.warn(`[Calendly Webhook] Configured booking list ${listId} no longer exists — falling back`);
-              listId = undefined;
-            }
-          }
-          if (!listId) {
-            listId = await resolveOrCreateBookingList(resolved.userId);
-            await updateAccountConfig(resolved.userId, 'calendly', resolved.account.account_id, {
-              booking_lead_list_id: listId,
-            });
-          }
-
-          const existingLead = await crmDb.getLeadByEmail(listId, email.trim().toLowerCase());
-
-          // Idempotency: CAPI already dedupes a Calendly redelivery via Meta's own
-          // event_id collapsing (see file header comment) — but nothing protects THIS
-          // leg, so a redelivery of the same invitee.created event (e.g. our 200 response
-          // didn't reach Calendly) would otherwise repeat the HubSpot/Attio sync and fire
-          // a duplicate customer-facing alert for a booking already fully processed.
-          // bookingUri covers a redelivery of the very first booking (create path, before
-          // any update happened); lastBookingUri covers every booking after that.
-          const alreadyProcessed =
-            existingLead?.customFields?.lastBookingUri === parsed.payload.uri ||
-            existingLead?.customFields?.bookingUri === parsed.payload.uri;
-
-          if (alreadyProcessed) {
-            console.log(`[Calendly Webhook] Duplicate delivery for already-processed booking ${parsed.payload.uri} — skipping CRM-forward re-processing`);
-          } else {
-            let lead: any;
-            let eventType: 'created' | 'updated';
-            if (existingLead) {
-              await crmDb.updateLead(listId, existingLead.leadId, {
-                customFields: {
-                  ...(existingLead.customFields || {}),
-                  lastBookedAt: new Date().toISOString(),
-                  lastBookingUri: parsed.payload.uri,
-                },
-              });
-              lead = existingLead;
-              eventType = 'updated';
-            } else {
-              lead = await crmDb.createLead(listId, {
-                email: email.trim(),
-                firstName,
-                lastName,
-                customFields: {
-                  source: 'calendly_booking',
-                  bookedAt: new Date().toISOString(),
-                  bookingUri: parsed.payload.uri,
-                },
-              });
-              eventType = 'created';
-            }
-
-            void externalCrmSyncService.autoSyncLead(resolved.userId, listId, lead, 'hubspot', eventType)
-              .catch((err: any) => console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err));
-            void externalCrmSyncService.autoSyncLead(resolved.userId, listId, lead, 'attio', eventType)
-              .catch((err: any) => console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err));
-
-            // Same alert mechanism /forward-lead already uses — per-list opt-in via
-            // list.alertEvents, so this only notifies the customer if they've already
-            // configured this specific list to alert on lead-added/updated.
-            try {
-              const list = await crmDb.getLeadListById(listId);
-              if (list) {
-                const alertEventType = eventType === 'created' ? 'api.lead_added' : 'api.lead_updated';
-                await leadListAlertService.notifyLeadListOwnerIfConfigured(
-                  list,
-                  lead,
-                  alertEventType,
-                  { source: 'calendly_booking', bookingUri: parsed.payload.uri },
-                  new Date().toISOString(),
-                );
-              }
-            } catch (alertError: any) {
-              console.error('[Calendly Webhook] Lead alert failed:', alertError?.message ?? alertError);
-            }
-
-            console.log(`[Calendly Webhook] CRM-forward: lead ${eventType} in list ${listId} for user ${resolved.userId}`);
-          }
+        await processCalendlyWebhookJob(jobPayload);
+        if (enqueueResult === 'enqueued') {
+          await markJobComplete(QUEUE_SOURCE, parsed.payload.uri);
         }
-      } catch (crmError: any) {
-        console.error('[Calendly Webhook] CRM-forward leg failed:', crmError?.message ?? crmError);
+      } catch (processingError: any) {
+        if (enqueueResult === 'enqueued') {
+          // Durable record exists — the poller will retry, so don't lose this silently.
+          await markJobFailed(QUEUE_SOURCE, parsed.payload.uri, processingError);
+        } else {
+          // Queue unavailable (e.g. table not provisioned yet) — no durable record to
+          // retry from, so this is exactly today's fire-and-forget failure behavior.
+          console.error('[Calendly Webhook] Processing failed with no durable record (queue unavailable):', processingError?.message ?? processingError);
+        }
       }
     } catch (error: any) {
       console.error('[Calendly Webhook] Unexpected error:', error?.message ?? error);
