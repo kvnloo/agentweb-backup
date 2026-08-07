@@ -2607,6 +2607,14 @@ const createDealsTable = async () => {
   }
 };
 
+// Shared store for pending OAuth flows, one random-keyed row per in-flight popup, so
+// /finalize and /connect can land on different Elastic Beanstalk instances (ENG-162).
+// TTL: rows carry a `ttl` attribute (epoch seconds). Enable DynamoDB native TTL on the
+// `ttl` attribute manually — same manual TTL-enable step as the MCP session/OAuth tables —
+// so an abandoned popup's row (which holds live token material) self-prunes. The app does
+// not depend on that sweep for correctness: `oauthSessionDb.consumePending` conditions the
+// consuming delete on `#ttl > :now`, so an expired row is unreadable the moment it lapses,
+// whether or not DynamoDB has physically removed it yet.
 const createOAuthSessionsTable = async () => {
   const params: AWS.DynamoDB.CreateTableInput = {
     TableName: `${TABLE_PREFIX}AW-OAuthSessions`,

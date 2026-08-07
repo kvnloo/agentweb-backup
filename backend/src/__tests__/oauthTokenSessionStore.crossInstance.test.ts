@@ -175,4 +175,22 @@ describe('oauthTokenSessionStore — cross-instance handoff (ENG-162)', () => {
     );
     expect(stolen).toBeNull();
   });
+
+  // The /connect routes only reject a FALSY id (`if (!tokenSessionId)`), so a malformed body
+  // like `{"tokenSessionId": {}}` is truthy and reaches the store. Without the typeof guard it
+  // becomes a DynamoDB partition key of the wrong type: a ValidationException surfacing as a
+  // 500, where every other unusable session yields 401. An unusable id is an invalid session.
+  it.each([
+    ['an object', { evil: true }],
+    ['an array', ['a']],
+    ['a number', 12345],
+  ])('returns null without querying Dynamo when the session id is %s', async (_label, badId) => {
+    const { oauthSessionDb } = require('../services/db');
+
+    await expect(onFreshInstance((store) =>
+      store.retrieveOAuthSession(badId as any, 'user-E', 'hubspot'),
+    )).resolves.toBeNull();
+
+    expect(oauthSessionDb.consumePending).not.toHaveBeenCalled();
+  });
 });

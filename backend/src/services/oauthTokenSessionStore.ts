@@ -67,8 +67,15 @@ const readRow = async (userId: string, provider: OAuthProvider): Promise<Session
 
 const writeRow = async (row: SessionRow): Promise<void> => {
   if (row.sessions.length === 0) {
-    // One-time use is only proven after the shared row is deleted. Returning token material
-    // after a failed delete would silently leave a replayable session behind.
+    // Fail closed: one-time use is only proven once the shared row is gone, so a failed
+    // delete must not hand back a credential we could not burn.
+    //
+    // Scope note (ENG-162): this throw does NOT make the session unreplayable. The row is
+    // still in AW-Settings and stays consumable until its TTL lapses or the user's next
+    // attempt overwrites it — exactly as it was before. All this changes is that THIS
+    // response no longer carries token material, at the cost of failing the legitimate
+    // user's connect. Both callers (gmailAuth/outlookAuth `/connect`) invoke this outside
+    // their try/catch, so the rejection escapes the route's error boundary.
     await settingsService.deleteSetting(settingName(row.userId, row.provider));
     return;
   }
@@ -157,6 +164,11 @@ export async function retrieveOAuthSession<T>(
   userId: string,
   provider: DurableOAuthProvider,
 ): Promise<T | null> {
-  if (!sessionId) return null;
+  // `typeof` and not just falsiness: the session id is read straight off the request body and
+  // then used as the DynamoDB partition key. A non-string (`{"tokenSessionId": {}}` or an
+  // array) is truthy, so it would reach `consumePending` and fail the key's `S` type with a
+  // ValidationException — a 500 on a malformed request. An unusable id is an invalid session,
+  // so return null and let the route answer 401.
+  if (!sessionId || typeof sessionId !== 'string') return null;
   return oauthSessionDb.consumePending<T>(sessionId, userId, provider);
 }

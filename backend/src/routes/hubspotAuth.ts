@@ -37,7 +37,7 @@ const verifyState = (state: string, userId: string): StatePayload | null => {
 };
 
 // The pending session held between /finalize and /connect. It lives in the shared,
-// DynamoDB-backed store (AW-Settings via oauthTokenSessionStore) — NOT a process-local Map —
+// DynamoDB-backed store (AW-OAuthSessions via oauthTokenSessionStore) — NOT a process-local Map —
 // so /connect can land on a different Elastic Beanstalk instance than /finalize without the
 // user seeing "Please reconnect" (the cross-instance bug ALB stickiness was masking). ENG-162.
 interface HubSpotSessionData {
