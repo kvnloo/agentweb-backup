@@ -221,8 +221,17 @@ export function snapshot(
  */
 export function logCompletionMetric(
   userId: string,
-  status: "ready" | "failed",
-  durationMs: number
+  // "timeout" was previously unreachable here: only persistFailure's own direct
+  // write could set it, and that write is gone (ENG-848). Widening keeps the
+  // timeout class distinct from a generic failure — collapsing the two would
+  // have quietly destroyed the distinction the heartbeat reports on.
+  status: "ready" | "failed" | "timeout",
+  durationMs: number,
+  // ENG-848: carried through so this can be the SINGLE durable writer for a
+  // brand-build outcome. persistFailure used to call this AND write its own
+  // OnboardingMetrics row just to attach the message, so every failure landed
+  // twice — inflating n from 39 attempts to 74 rows in the heartbeat.
+  errorMessage?: string
 ): void {
   const userPrefix = (userId || "anon").slice(0, 8);
   // Structured for the log-scraper pipeline that feeds swarm metrics.
@@ -244,5 +253,6 @@ export function logCompletionMetric(
     completedAt: completedAt.toISOString(),
     durationMs: durationMs || 0,
     status,
+    ...(errorMessage ? { errorMessage } : {}),
   });
 }

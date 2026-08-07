@@ -40,6 +40,14 @@
 #      be parsed, or the payload is not JSON      -> exit 1 immediately, with
 #      the raw response surfaced. Never fall back to "the score I found".
 #
+# Exit codes (ENG-915 added the third; all non-zero, none is a pass)
+#   0   PASS         a verdict for this head scored at or above MIN
+#   1   REFUSED      a verdict for this head exists and does not clear the bar,
+#                    or the evidence is unparseable
+#   75  UNAVAILABLE  the deadline passed with no verdict for this head at all.
+#                    Distinct from REFUSED so a caller can tell "Greptile said
+#                    no" from "Greptile never answered". See unavailable().
+#
 # Environment:
 #   REPO                             owner/repo (e.g. AgentWebPro/agentweb)
 #   PR_NUMBER                        pull request number
@@ -73,6 +81,35 @@ fail() {
   exit 1
 }
 
+# ENG-915: a THIRD outcome, distinct from pass and from refused.
+#
+# `unavailable` means the deadline passed without Greptile ever returning a
+# verdict for this head. The caller may use it to let the test suite run
+# anyway, so that a Greptile outage costs test *feedback* rather than blocking
+# every PR in both repos.
+#
+# Why this cannot misfire, which is the only reason it is safe to act on:
+# every path that OBSERVES a verdict for this head exits before the deadline is
+# ever consulted — at or above the bar exits 0, below the bar exits 1, and an
+# unparseable verdict exits 1. So reaching the deadline is already proof that
+# no verdict for this head was seen. `unavailable` therefore cannot be returned
+# for a review Greptile actually scored; it is structurally impossible for a
+# 3/5 to present as an outage.
+#
+# The weaker case it DOES cover is "Greptile is alive but never got to this PR
+# within 20 minutes". Treating that as unavailable is deliberate: after a
+# 20-minute wait the information value of continuing to block is nil, and the
+# cost of being wrong is bounded to CI minutes, never to correctness — this
+# still exits non-zero, so the job still fails, the merge gate is unchanged,
+# and nothing becomes mergeable that was not mergeable before.
+EXIT_UNAVAILABLE=75
+
+unavailable() {
+  printf '::error::greptile-gate: %s\n' "$1" >&2
+  printf 'greptile-gate: verdict=unavailable\n'
+  exit "${EXIT_UNAVAILABLE}"
+}
+
 if ! printf '%s' "${MIN_SCORE}" | grep -qE '^[0-9]+$'; then
   fail "GREPTILE_GATE_MIN_SCORE must be an integer, got '${MIN_SCORE}'"
 fi
@@ -96,6 +133,22 @@ deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
 last_state="no Greptile review comment found on the pull request yet"
 last_body=''
 
+# ENG-915: proof that Greptile is FUNCTIONING, kept separate from whether it
+# has answered for our head. Set only by observing a landed verdict — a
+# `Last reviewed commit` footer carrying a real 40-hex pointer — for some
+# commit on this PR. That is the strongest available sign of life and the
+# hardest to fake: a placeholder comment, an impostor comment, or a failing
+# API prove nothing.
+#
+# It exists so the deadline can tell two states apart that otherwise look
+# identical from here: Greptile is down (no verdict ever seen -> UNAVAILABLE,
+# and the caller may run the suite anyway) versus Greptile is alive and simply
+# has not reached our head yet (-> a plain refusal, and the suite stays held,
+# because a verdict really is imminent). Without this, a re-review still in
+# flight would be reported as an outage.
+greptile_alive=''
+alive_sha=''
+
 while :; do
   comments_json="$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" 2>"${stderr_file}")"
   gh_exit=$?
@@ -106,13 +159,29 @@ while :; do
     last_state="GitHub API call failed (exit ${gh_exit}): $(tr '\n' ' ' <"${stderr_file}")"
     last_body="$(cat "${stderr_file}")"
   else
+    # Prefer the newest Greptile comment that actually carries a verdict footer,
+    # falling back to the newest Greptile comment of any kind so the "exists but
+    # no verdict yet" pending message still works.
+    #
+    # The header above assumed Greptile only ever edits one comment in place, so
+    # `last` was safe. That is not true: replying to a Greptile finding makes it
+    # post a threaded REPLY, which is newer than the edited-in-place summary and
+    # carries no footer. `last` then locked onto the reply and the gate polled
+    # for the full 20 minutes and timed out — on a PR Greptile had already
+    # scored 5/5. Any PR whose author converses with Greptile hit this.
+    #
+    # No loss of strictness: the selected body is still required to carry a
+    # footer pointing at THIS head, exactly one Confidence Score, denominator 5,
+    # and a score at or above the minimum.
     body="$(printf '%s' "${comments_json}" | jq -r '
         [ .[]
           | select((.user.type // "") == "Bot")
           | select(((.user.login // "") | ascii_downcase | startswith("greptile")))
-        ]
-        | last
-        | if . == null then "" else (.body // "") end
+          | (.body // "")
+        ] as $bodies
+        | ( [ $bodies[] | select(test("last reviewed commit"; "i")) ] | last )
+          // ( $bodies | last )
+          // ""
       ' 2>/dev/null)"
     jq_exit=$?
 
@@ -154,6 +223,12 @@ while :; do
         if [ "${reviewed_sha}" != "${head_sha}" ]; then
           # Criterion 2. Greptile re-reviews by editing this same comment, so
           # the next poll re-reads it and sees the pointer move to our head.
+          #
+          # This is also the sign of life described at greptile_alive: a landed
+          # verdict for another commit proves the service is working, so if we
+          # go on to time out it is a slow review and not an outage.
+          greptile_alive='yes'
+          alive_sha="${reviewed_sha}"
           last_state="Greptile's latest review is for ${reviewed_sha}, not the current head ${head_sha} — superseded, treating as pending"
         else
           # A verdict exists for OUR head. Decide now; never pend again.
@@ -196,7 +271,16 @@ while :; do
 
   if [ "$(date +%s)" -ge "${deadline}" ]; then
     [ -n "${last_body}" ] && surface 'Last observed response (raw)' "${last_body}"
-    fail "timed out after ${TIMEOUT_SECONDS}s without a Greptile ${MIN_SCORE}/5 verdict for head ${head_sha}. Last observed state: ${last_state}"
+
+    # Greptile demonstrably works — it returned a landed verdict for another
+    # commit on this PR — so the timeout is a slow re-review, not an outage.
+    # Refusing to call this UNAVAILABLE is the whole anti-misfire guarantee:
+    # the bypass is reserved for a service that never answered at all.
+    if [ -n "${greptile_alive}" ]; then
+      fail "timed out after ${TIMEOUT_SECONDS}s without a Greptile ${MIN_SCORE}/5 verdict for head ${head_sha}. Last observed state: ${last_state}. NOT reporting this as UNAVAILABLE: Greptile returned a landed verdict for ${alive_sha} on this PR, so it is responding and a re-review of this head is outstanding."
+    fi
+
+    unavailable "timed out after ${TIMEOUT_SECONDS}s without a Greptile ${MIN_SCORE}/5 verdict for head ${head_sha}. Last observed state: ${last_state}. Reporting this as UNAVAILABLE rather than a refusal: no landed Greptile verdict was observed for ANY commit on this PR, so this is Greptile not answering, not Greptile saying no."
   fi
 
   log "pending — ${last_state}; retrying in ${POLL_SECONDS}s"

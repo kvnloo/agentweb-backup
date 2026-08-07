@@ -15,6 +15,7 @@ import { agentModeService } from './agentModeService';
 import { getGitHubOrgToken, getSecret } from '../utils/secretsManager';
 import { BEDROCK_BEARER_TOKEN_MODELS, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import { recordUsage, computeCostMicroUsd } from './usageRecorderService';
+import { normalizeAnthropicCacheCreation } from '../utils/llmClients';
 import { getLandingPageById, getLandingPagesByOwner, canUserEditLandingPage, GeneratedLandingPage } from './v0Service';
 import { AcceptanceCheck, AcceptanceStatus, AcceptanceVerificationResult, verifyAcceptanceChecks } from './codingAgentAcceptance';
 import {
@@ -114,6 +115,8 @@ interface CodingAgentUsageAccumulator {
   outputTokens: number;
   cacheReadTokens: number;
   cacheWriteTokens: number;
+  /** ENG-893: cache-write tokens by the TTL the response reported, for pricing. */
+  cacheWriteByTtl: Record<string, number>;
 }
 
 interface SearchReplaceEdit {
@@ -2167,6 +2170,15 @@ async function runCodingAgentInternal(
           usageAcc.outputTokens += u.output_tokens || 0;
           usageAcc.cacheReadTokens += u.cache_read_input_tokens || 0;
           usageAcc.cacheWriteTokens += u.cache_creation_input_tokens || 0;
+          // ENG-893: this loop never requests a 1-hour TTL, so its writes are
+          // 5-minute writes even on a model agent-mode asks 1h for. Carry the
+          // response's own breakdown so cost follows the TTL actually applied.
+          const turnCacheByTtl = normalizeAnthropicCacheCreation(u.cache_creation);
+          if (turnCacheByTtl) {
+            for (const [ttl, tokens] of Object.entries(turnCacheByTtl)) {
+              usageAcc.cacheWriteByTtl[ttl] = (usageAcc.cacheWriteByTtl[ttl] || 0) + tokens;
+            }
+          }
           void recordUsage({
             userId: context.userId,
             sessionId: context.sessionId,
@@ -2177,6 +2189,7 @@ async function runCodingAgentInternal(
             outputTokens: u.output_tokens || 0,
             cacheReadTokens: u.cache_read_input_tokens || 0,
             cacheWriteTokens: u.cache_creation_input_tokens || 0,
+            cacheWriteByTtl: turnCacheByTtl,
           });
         }
       } catch {
@@ -2342,6 +2355,7 @@ export async function runCodingAgent(
     outputTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
+    cacheWriteByTtl: {} as Record<string, number>,
   };
 
   const withRun = (result: CodingAgentResult, state?: CodingAgentRunState): CodingAgentResult => {
@@ -2365,7 +2379,10 @@ export async function runCodingAgent(
                 usageAcc.inputTokens,
                 usageAcc.outputTokens,
                 usageAcc.cacheReadTokens,
-                usageAcc.cacheWriteTokens
+                usageAcc.cacheWriteTokens,
+                Object.keys(usageAcc.cacheWriteByTtl).length > 0
+                  ? usageAcc.cacheWriteByTtl
+                  : undefined
               ) / 1e6,
           }
         : undefined;

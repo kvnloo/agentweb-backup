@@ -45,7 +45,8 @@ export async function getLinearCredentials(): Promise<LinearCredentials> {
   return getLinearCredentialsForEnv(environment === 'production' ? 'production' : 'development');
 }
 
-async function linearGraphQL(query: string, variables?: Record<string, any>): Promise<any> {
+/** Shared authenticated Linear GraphQL boundary for production adapters. */
+export async function linearGraphQL(query: string, variables?: Record<string, any>): Promise<any> {
   const { apiKey } = await getLinearCredentials();
   const MAX_RETRIES = 3;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {

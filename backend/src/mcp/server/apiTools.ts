@@ -1968,6 +1968,262 @@ mcpToolRegistry.register({
 
 // ─── Predefined Work Plans (admin-only) ─────────────────────────────────────
 
+// This tool's own parameters are snake_case, but /api/admin/work-plans reads the
+// step fields in camelCase, so a snake_case step field used to be silently
+// dropped (the plan saved with requiredFunctionCalls: [] and no error). Accept
+// either casing and hand the route the camelCase names it reads (ENG-889).
+const WORK_PLAN_STEP_ALIASES: Record<string, string> = {
+  required_function_calls: 'requiredFunctionCalls',
+  skill_ids: 'skillIds',
+  user_instructions: 'userInstructions',
+  step_count: 'stepCount',
+  expected_asset_count: 'expectedAssetCount',
+};
+
+const normalizeWorkPlanSteps = (steps: any): any => {
+  if (!Array.isArray(steps)) return steps;
+  return steps.map((step: any) => {
+    if (!step || typeof step !== 'object' || Array.isArray(step)) return step;
+    const normalized: any = {};
+    // Copy everything that is already canonical first, then fill the gaps from
+    // snake_case aliases. Two passes rather than one because a single pass is
+    // key-order dependent: with `{required_function_calls, requiredFunctionCalls}`
+    // the later key would overwrite whatever the earlier one resolved to.
+    for (const [key, value] of Object.entries(step)) {
+      if (!WORK_PLAN_STEP_ALIASES[key]) normalized[key] = value;
+    }
+    for (const [key, value] of Object.entries(step)) {
+      const alias = WORK_PLAN_STEP_ALIASES[key];
+      if (!alias) continue;
+      // A camelCase value supplied alongside its snake_case twin wins — but
+      // JSON has no undefined, so a model emitting an unset field emits null.
+      // Treating that null as "present" would shadow a good snake_case value.
+      if (normalized[alias] === undefined || normalized[alias] === null) {
+        normalized[alias] = value;
+      }
+    }
+    return normalized;
+  });
+};
+
+/**
+ * Work plan steps are stored as a whole array, so PUT /api/admin/work-plans/:id
+ * replaces every step with the payload. Callers amending a single step used to
+ * silently delete the rest (ENG-890); the helpers below add merge semantics and
+ * a fail-closed guard around destructive replacements. They all run on steps
+ * that normalizeWorkPlanSteps has already put in canonical camelCase.
+ */
+
+function normalizeStepTitle(value: unknown): string {
+  return String(value ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * The step fields worth guarding. The admin route rebuilds every step from a
+ * fixed field list and defaults these to empty (services/workPlanSteps.ts), so
+ * re-sending a step without them blanks whatever was stored — at an unchanged
+ * step count, which no length check can see.
+ */
+const STEP_CONTENT_FIELDS = [
+  'description',
+  'requiredFunctionCalls',
+  'skillIds',
+  'userInstructions',
+  'expectedAssetCount',
+] as const;
+
+function isEmptyStepValue(value: unknown): boolean {
+  return value === undefined || value === null || value === ''
+    || (Array.isArray(value) && value.length === 0);
+}
+
+/**
+ * Locate `probe`'s counterpart in `steps`. Title first, then position: a caller
+ * reordering a plan renumbers the steps but keeps their titles, so matching on
+ * stepCount first would pair up the wrong two.
+ */
+function findStepIndex(steps: any[], probe: any): number {
+  if (probe.title !== undefined) {
+    const title = normalizeStepTitle(probe.title);
+    const matches = steps.filter((s: any) => normalizeStepTitle(s.title) === title);
+    // A title shared by two steps identifies neither — fall through to position
+    // rather than pairing everything against the first one.
+    if (matches.length === 1) return steps.indexOf(matches[0]);
+  }
+  if (probe.stepCount === undefined || probe.stepCount === null) return -1;
+  return steps.findIndex((s: any) => Number(s.stepCount) === Number(probe.stepCount));
+}
+
+/**
+ * Titles in `from` with no counterpart left in `to`. Counts occurrences instead
+ * of testing set membership, so dropping one of two steps that share a title is
+ * still reported as a drop.
+ */
+function diffStepTitles(from: any[], to: any[]): any[] {
+  const available = new Map<string, number>();
+  for (const step of to) {
+    const title = normalizeStepTitle(step.title);
+    available.set(title, (available.get(title) || 0) + 1);
+  }
+  const unmatched: any[] = [];
+  for (const step of from) {
+    const title = normalizeStepTitle(step.title);
+    const remaining = available.get(title) || 0;
+    if (remaining > 0) available.set(title, remaining - 1);
+    else unmatched.push(step.title);
+  }
+  return unmatched;
+}
+
+/**
+ * Incoming merge steps that name no stepCount and whose title matches more than
+ * one existing step. Amending "whichever came first" is a silent wrong-step
+ * edit, so the caller is asked to disambiguate instead.
+ */
+function findAmbiguousMergeTargets(existingSteps: any[], incomingSteps: any[]) {
+  const ambiguous: { title: any; matchingStepCounts: any[] }[] = [];
+  for (const incoming of incomingSteps) {
+    // A stepCount only settles the target if it names a step that exists.
+    // mergeWorkPlanSteps falls back to the title otherwise, so a stale or
+    // invented count must not buy a pass through this check.
+    const named = incoming.stepCount !== undefined && incoming.stepCount !== null
+      && existingSteps.some((s: any) => Number(s.stepCount) === Number(incoming.stepCount));
+    if (named) continue;
+    if (incoming.title === undefined) continue;
+    const title = normalizeStepTitle(incoming.title);
+    const matches = existingSteps.filter((s: any) => normalizeStepTitle(s.title) === title);
+    if (matches.length > 1) {
+      ambiguous.push({ title: incoming.title, matchingStepCounts: matches.map((s: any) => s.stepCount) });
+    }
+  }
+  return ambiguous;
+}
+
+/**
+ * Two incoming entries that resolve to the same existing step. One request
+ * saying both "rename step 1" and "amend the step titled <its old name>" is a
+ * contradiction; applying them in array order silently lets the later one undo
+ * the earlier, which is the kind of quiet resolution this tool no longer does.
+ */
+function findConflictingMergeTargets(existingSteps: any[], incomingSteps: any[]) {
+  const byIndex = new Map<number, any[]>();
+  for (const { index, incoming } of resolveMergeTargets(existingSteps, incomingSteps)) {
+    if (index === -1) continue;
+    byIndex.set(index, [...(byIndex.get(index) || []), incoming]);
+  }
+  return [...byIndex.entries()]
+    .filter(([, entries]) => entries.length > 1)
+    .map(([index, entries]) => ({
+      stepCount: existingSteps[index]?.stepCount,
+      title: existingSteps[index]?.title,
+      entries: entries.length,
+    }));
+}
+
+/**
+ * Fields a replace would blank on steps the caller plainly meant to keep. A
+ * step with no counterpart at all is skipped: that is a removal or a rewrite,
+ * which the count guard and the dropped-titles diff already report.
+ */
+function findStepContentLoss(before: any[], after: any[]) {
+  const losses: { stepCount: any; title: any; fields: string[] }[] = [];
+  for (const existing of before) {
+    const index = findStepIndex(after, existing);
+    if (index === -1) continue;
+    const fields = STEP_CONTENT_FIELDS.filter(
+      (field) => !isEmptyStepValue(existing[field]) && isEmptyStepValue(after[index][field]),
+    );
+    if (fields.length > 0) {
+      losses.push({ stepCount: existing.stepCount, title: existing.title, fields: [...fields] });
+    }
+  }
+  return losses;
+}
+
+/** Apply the caller-supplied fields of `incoming` on top of an existing step. */
+function mergeWorkPlanStep(existing: any, incoming: any): any {
+  const merged = { ...existing };
+  for (const [key, value] of Object.entries(incoming)) {
+    // stepCount only selects which step to amend. Copying it through would
+    // renumber — and could duplicate — positions whenever the match came from
+    // the title instead.
+    if (key === 'stepCount') continue;
+    // A model emits null for a field it is not setting (ENG-889), so treating
+    // null as a value would blank an existing field in what is meant to be the
+    // non-destructive mode.
+    if (value === undefined || value === null) continue;
+    merged[key] = value;
+  }
+  return merged;
+}
+
+/**
+ * Resolve each incoming step to the index it amends, or -1 to append.
+ *
+ * Deliberately stepCount-before-title, the opposite of findStepIndex: here the
+ * caller has explicitly named the step to amend, and the schema says so.
+ * findStepIndex infers identity across two full arrays with no such selector.
+ *
+ * A shared title resolves to nothing rather than to the first match — the same
+ * rule findAmbiguousMergeTargets pre-checks, kept here so the two cannot drift.
+ */
+function resolveMergeTargets(existingSteps: any[], incomingSteps: any[]) {
+  return incomingSteps.map((incoming: any) => {
+    const targetCount = incoming.stepCount;
+    if (targetCount !== undefined && targetCount !== null) {
+      const byCount = existingSteps.findIndex((s: any) => Number(s.stepCount) === Number(targetCount));
+      if (byCount !== -1) return { index: byCount, incoming };
+    }
+    if (incoming.title !== undefined) {
+      const title = normalizeStepTitle(incoming.title);
+      const matches = existingSteps
+        .map((s: any, i: number) => ({ s, i }))
+        .filter(({ s }: any) => normalizeStepTitle(s.title) === title);
+      if (matches.length === 1) return { index: matches[0].i, incoming };
+    }
+    return { index: -1, incoming };
+  });
+}
+
+/**
+ * Merge partial steps into the plan's current steps. Never removes a step.
+ *
+ * Targets are resolved for ALL entries first, against the plan as it was read.
+ * Resolving during application would read a half-mutated array, so one request
+ * could rename a step and then fail to find it for a later, already-validated
+ * entry — turning an amendment into an append, and making the result depend on
+ * the order the entries happened to arrive in. Resolution and the ambiguity
+ * pre-check now share one frame of reference.
+ */
+function mergeWorkPlanSteps(existingSteps: any[], incomingSteps: any[]): any[] {
+  const merged = existingSteps.map((s: any) => ({ ...s }));
+
+  for (const { index, incoming } of resolveMergeTargets(existingSteps, incomingSteps)) {
+    if (index === -1) {
+      merged.push(mergeWorkPlanStep({ stepCount: merged.length + 1 }, incoming));
+    } else {
+      merged[index] = mergeWorkPlanStep(merged[index], incoming);
+    }
+  }
+
+  return merged;
+}
+
+/** Diff summary returned to the caller so step removals can never go unnoticed. */
+function summarizeStepChange(before: any[], after: any[], mode: 'merge' | 'replace') {
+  const contentLoss = findStepContentLoss(before, after);
+  return {
+    mode,
+    stepsBefore: before.length,
+    stepsAfter: after.length,
+    stepsRemoved: Math.max(0, before.length - after.length),
+    droppedStepTitles: diffStepTitles(before, after),
+    addedStepTitles: diffStepTitles(after, before),
+    // Omitted rather than empty so a clean update's summary stays quiet.
+    ...(contentLoss.length > 0 && { stepContentLoss: contentLoss }),
+  };
+}
+
 mcpToolRegistry.register({
   name: 'list_predefined_work_plans',
   definition: {
@@ -1998,7 +2254,7 @@ mcpToolRegistry.register({
   name: 'manage_predefined_work_plan',
   definition: {
     name: 'manage_predefined_work_plan',
-    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes.',
+    description: 'Create, update, delete, or get a predefined work plan. Admin only. CAUTION: These operations modify production configuration — incorrect changes can cause outages. Always confirm with the user before making changes. STEPS ARE DESTRUCTIVE ON UPDATE: sending "steps" with action=update replaces the entire steps array, it does not patch individual steps. To amend one step without touching the others, pass steps_mode="merge" with just the step(s) you are changing. To intentionally rewrite the plan with fewer steps, send the complete new array plus confirm_step_removal=true. A replace stores exactly what you send, so a field you omit on a step is erased too — an update that would drop steps, or blank fields on the steps it keeps, is rejected unless confirmed. Every step change comes back as a stepsChange diff summary.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -2012,6 +2268,11 @@ mcpToolRegistry.register({
         show_in_agent_mode: { type: 'boolean', description: 'Whether to show in agent mode (create/update)' },
         show_login_signup: { type: 'string', enum: ['after_plan_completed', 'always'], description: 'When to show login/signup (create/update)' },
         default_model: { type: 'string', description: 'Default LLM model (create/update)' },
+        category: { type: 'string', description: 'Plan category shown in the admin list, e.g. Paid Ads, Strategy, Content (create/update)' },
+        // Deliberately no `visibility` parameter. The route accepts it, but
+        // exposing it here would let a model publish a draft plan to every user
+        // — or unpublish a live one — off a single misread instruction. Leave
+        // that transition to a human in the portal (ENG-889).
         steps: {
           type: 'array',
           items: {
@@ -2019,11 +2280,24 @@ mcpToolRegistry.register({
             properties: {
               title: { type: 'string' },
               description: { type: 'string' },
-              required_function_calls: { type: 'array', items: { type: 'string' } }
+              requiredFunctionCalls: { type: 'array', items: { type: 'string' }, description: 'Tool names the step must call before it can complete. Note the camelCase name; the snake_case alias required_function_calls is also accepted.' },
+              skillIds: { type: 'array', items: { type: 'string' }, description: 'Skill IDs attached to this step (from list_skills / resolve_skill). Alias: skill_ids.' },
+              userInstructions: { type: 'string', description: 'Instructions shown to the user for this step. Alias: user_instructions.' },
+              stepCount: { type: 'number', description: 'Step order, 1-based. Defaults to the array position. In steps_mode="merge" this is what selects the existing step to amend. Alias: step_count.' },
+              expectedAssetCount: { type: 'number', description: 'For a step that must produce a fixed number of media assets (e.g. "generate 18 images"), the required count. The step cannot be marked completed until that many images/videos have been generated in the run, which stops it being closed with only some produced. Note the count is per run, not per step: assets generated by earlier steps of the same run also count towards it. Omit for steps with no fixed asset count. Alias: expected_asset_count.' }
             },
             required: ['title']
           },
-          description: 'Work plan steps (create/update)'
+          description: 'Work plan steps. On create this is the full plan. On update this REPLACES the entire steps array unless steps_mode="merge". Step fields are camelCase (unlike the snake_case top-level parameters); snake_case aliases are accepted too. Any field outside this list is not stored — the response lists such fields under "warnings".'
+        },
+        steps_mode: {
+          type: 'string',
+          enum: ['replace', 'merge'],
+          description: 'How to apply "steps" on update. "replace" (default) overwrites the whole array. "merge" patches the supplied steps into the existing plan by stepCount (or title) and appends unmatched ones, leaving every other step intact. In "merge", send ONLY the fields you are actually changing on each step, plus stepCount to say which step you mean: every field you include is applied, so passing a title you did not mean to change RENAMES that step. Do not fill in placeholder values for fields you are leaving alone.'
+        },
+        confirm_step_removal: {
+          type: 'boolean',
+          description: 'Required (true) when a steps_mode="replace" update would leave the plan with fewer steps than it has now, or would blank fields (description, requiredFunctionCalls, skillIds, userInstructions, expectedAssetCount) that are currently set on the steps it keeps. Without it the update is rejected instead of silently destroying that content.'
         }
       },
       required: ['action']
@@ -2033,7 +2307,7 @@ mcpToolRegistry.register({
     const c = ctx(context);
     switch (args.action) {
       case 'create': {
-        const body: any = { title: args.title, steps: args.steps };
+        const body: any = { title: args.title, steps: normalizeWorkPlanSteps(args.steps) };
         if (args.description !== undefined) body.description = args.description;
         if (args.welcome_message !== undefined) body.welcomeMessage = args.welcome_message;
         if (args.autocomplete !== undefined) body.autocomplete = args.autocomplete;
@@ -2041,11 +2315,14 @@ mcpToolRegistry.register({
         if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
+        if (args.category !== undefined) body.category = args.category;
         const data = await mcpFetch({ method: 'POST', path: '/api/admin/work-plans', context: c, body });
         return jsonResult(data);
       }
       case 'update': {
-        const body: any = { title: args.title, steps: args.steps };
+        // `steps` is deliberately not set here — it is only ever assigned below,
+        // after the current plan has been read (ENG-890).
+        const body: any = { title: args.title };
         if (args.description !== undefined) body.description = args.description;
         if (args.welcome_message !== undefined) body.welcomeMessage = args.welcome_message;
         if (args.autocomplete !== undefined) body.autocomplete = args.autocomplete;
@@ -2053,7 +2330,114 @@ mcpToolRegistry.register({
         if (args.show_in_agent_mode !== undefined) body.showInAgentMode = args.show_in_agent_mode;
         if (args.show_login_signup !== undefined) body.showLoginSignup = args.show_login_signup;
         if (args.default_model !== undefined) body.defaultModel = args.default_model;
-        const data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+        if (args.category !== undefined) body.category = args.category;
+
+        // Steps replace the whole array server-side, so read the current plan
+        // first and either merge into it or refuse an unconfirmed shrink.
+        let stepsChange: ReturnType<typeof summarizeStepChange> | undefined;
+        if (args.steps !== undefined) {
+          if (!Array.isArray(args.steps)) {
+            return jsonResult({ error: 'steps must be an array of step objects' });
+          }
+          const mode: 'merge' | 'replace' = args.steps_mode === 'merge' ? 'merge' : 'replace';
+          // Canonicalize the casing once, up front, so the merge matcher and the
+          // replace payload both see the same camelCase fields the route reads
+          // (ENG-889). Merging raw aliases would drop them on the stored step.
+          const incomingSteps: any[] = normalizeWorkPlanSteps(args.steps);
+
+          let existingSteps: any[] | undefined;
+          try {
+            const current = await mcpFetch({ method: 'GET', path: `/api/admin/work-plans/${args.plan_id}`, context: c });
+            existingSteps = Array.isArray(current?.steps) ? current.steps : [];
+            // Stake the read: everything below is judged against these steps, so
+            // a write that lands in between has to fail rather than quietly make
+            // that judgement wrong (ENG-890).
+            body.expectedStepsRev = current?.steps_rev ?? null;
+          } catch (error: any) {
+            // Fail closed in both modes: without the current steps we can
+            // neither merge nor tell whether a replace would delete steps, and
+            // writing blind is exactly the silent deletion this guards against.
+            return jsonResult({ error: `Cannot safely update work plan ${args.plan_id}: failed to read its current steps (${error?.message || error}). Retry, or re-send with the full steps array once the plan is readable.` });
+          }
+
+          if (mode === 'merge') {
+            const ambiguous = findAmbiguousMergeTargets(existingSteps || [], incomingSteps);
+            if (ambiguous.length > 0) {
+              return jsonResult({
+                error: `Refusing to merge into work plan ${args.plan_id}: ${ambiguous.length === 1 ? 'a step title matches' : 'some step titles match'} more than one step, so there is no way to tell which one to amend.`,
+                ambiguousSteps: ambiguous,
+                howToProceed: [
+                  'Retry with stepCount on each ambiguous step to name the one you mean (call action="get" to see the current numbering).',
+                ],
+              });
+            }
+            const conflicting = findConflictingMergeTargets(existingSteps || [], incomingSteps);
+            if (conflicting.length > 0) {
+              return jsonResult({
+                error: `Refusing to merge into work plan ${args.plan_id}: more than one supplied step resolves to the same existing step, so they would silently overwrite each other.`,
+                conflictingSteps: conflicting,
+                howToProceed: [
+                  'Combine the changes for each step into a single entry, then retry.',
+                ],
+              });
+            }
+            body.steps = mergeWorkPlanSteps(existingSteps || [], incomingSteps);
+          } else {
+            body.steps = incomingSteps;
+            if (existingSteps && body.steps.length < existingSteps.length && args.confirm_step_removal !== true) {
+              const preview = summarizeStepChange(existingSteps, body.steps, 'replace');
+              return jsonResult({
+                error: `Refusing to update work plan ${args.plan_id}: action=update replaces the entire steps array, and this payload would take the plan from ${preview.stepsBefore} steps to ${preview.stepsAfter}, removing ${preview.stepsRemoved}.`,
+                stepsWouldBeRemoved: preview.stepsRemoved,
+                removedStepTitles: preview.droppedStepTitles,
+                howToProceed: [
+                  'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+                  'To intentionally rewrite the plan with fewer steps, retry with confirm_step_removal=true (send the complete new steps array).',
+                ],
+              });
+            }
+
+            // Same failure, one level down: the step count is untouched but the
+            // steps come back gutted, which is what happens when a caller
+            // re-types the array from memory as title+description.
+            const contentLoss = findStepContentLoss(existingSteps || [], body.steps);
+            if (contentLoss.length > 0 && args.confirm_step_removal !== true) {
+              return jsonResult({
+                error: `Refusing to update work plan ${args.plan_id}: this payload keeps the steps but would blank fields that are currently set on ${contentLoss.length} of them. A replace stores exactly what you send, so any field you omit is erased.`,
+                stepsWouldBeRemoved: 0,
+                stepContentLoss: contentLoss,
+                howToProceed: [
+                  'To amend specific steps without touching the others, retry with steps_mode="merge" and only the steps you are changing.',
+                  'To keep these steps as they are, re-send each one with its current fields (call action="get" first if you no longer have them).',
+                  'To intentionally clear them, retry with confirm_step_removal=true.',
+                ],
+              });
+            }
+          }
+          if (existingSteps) {
+            stepsChange = summarizeStepChange(existingSteps, body.steps, mode);
+          }
+        }
+
+        let data: any;
+        try {
+          data = await mcpFetch({ method: 'PUT', path: `/api/admin/work-plans/${args.plan_id}`, context: c, body });
+        } catch (error: any) {
+          // The stake above was rejected. Nothing was written, and a blind retry
+          // would re-send a payload built from steps that no longer exist.
+          if (String(error?.message || '').includes('409')) {
+            return jsonResult({
+              error: `Work plan ${args.plan_id} changed while this update was being prepared, so nothing was saved.`,
+              howToProceed: [
+                'Re-read the plan with action="get" and retry the change against its current steps.',
+              ],
+            });
+          }
+          throw error;
+        }
+        if (stepsChange && data && typeof data === 'object' && !Array.isArray(data)) {
+          return jsonResult({ ...data, stepsChange });
+        }
         return jsonResult(data);
       }
       case 'delete': {
@@ -2191,7 +2575,21 @@ mcpToolRegistry.register({
   name: 'get_chat_history',
   definition: {
     name: 'get_chat_history',
-    description: 'Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don\'t have them (slower but ensures all scores are present).',
+    description: `Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don't have them (slower but ensures all scores are present).
+
+MODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.
+- attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.
+- attributionBasis: 'transcript' when EVERY assistant turn recorded a model (trustworthy provenance); 'partial-transcript' when only some did — the model list is real but incomplete, so do not present it as the session's full attribution; 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
+
+The two underlying fields are also returned, and they are NOT interchangeable:
+- llmModel: the model *selected* in the picker. A client-side selection only — the session may never have run on it (it can name a model outside the registry, or a live voice model that cannot generate text at all).
+- generationModels: the models that actually generated the assistant turns, derived from the transcript. Null when no message recorded one.
+
+TOKEN vs COST — they are not on the same basis. totalTokens EXCLUDES prompt-cache tokens, but totalCost/estimated_cost BILLS them. cacheTokens ({creation, read}, null when none) reports what was cached. A cache-heavy scheduled run can show 371 totalTokens against $2.94 of real spend, so a cost-per-token or "cheap because few tokens" claim computed from totalTokens alone is wrong by orders of magnitude. When reporting spend, use totalCost directly; when reporting volume, add cacheTokens to totalTokens and say you did.
+
+PER-MODEL COST — use costByModel, never attributedModels. attributedModels says WHICH models ran; it does not say how the money split. costByModel ({model: usd}, null when no turn recorded cost) is the actual per-turn allocation, so a session that ran two models contributes correctly to each rather than being double-counted or dropped. unattributedCost is the residual, on the same micro-USD basis as costByModel and totalCost: sum(costByModel) + unattributedCost reconciles to totalCost, exactly whenever there is spend left to attribute. It is null when the residual is not positive — in that case the per-model buckets already account for the whole session and may exceed totalCost by a few micro-dollars of per-turn rounding, which is noise, not missing money. Never treat a null as licence to rescale the buckets. It covers both spend on turns that recorded no model AND cost that never lands on a turn at all (tool/image spend counts toward totalCost but belongs to no model). When it is non-null the per-model split does NOT account for all of this session's cost — report it as its own line rather than folding it into a model, or your model percentages will not sum to the total.
+
+Whenever you name a model — reports, cost/usage breakdowns, per-model groupings, routing recommendations, filed tickets — use attributedModels. Never group or attribute cost by llmModel: it is a selection, so it books spend to models that never ran. This supersedes any earlier note, prior report, or saved memory that tells you to group cost by llmModel. If llmModel and generationModels disagree, that mismatch is itself worth reporting.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -2245,8 +2643,43 @@ mcpToolRegistry.register({
       let dislikes = 0;
       let longestWaitMs = 0;
       let maxHeapMB = 0;
+      // ENG-892: session.llmModel is only what the model picker last stored — a
+      // selection, not provenance. Each assistant message carries the model that
+      // actually produced it (written after model resolution and any backup-model
+      // switch), so derive real attribution from the transcript.
+      const generationModels = new Set<string>();
+      // ENG-892 follow-on: estimated_cost bills cache tokens, but total_tokens
+      // excludes them, so cost/token on a cache-heavy scheduled run reads ~100x
+      // the real rate (a live session: 371 total_tokens vs 156,013 cache-creation
+      // tokens for $2.94). Surface them so cost and tokens can be reconciled.
+      let cacheCreationTokens = 0;
+      let cacheReadTokens = 0;
+      // Per-model cost split. totalCost is one session-wide number, so a multi-model
+      // session gave a per-model breakdown nothing to divide by — the per-turn cost
+      // and model are both already here, so allocate rather than make callers guess.
+      // Accumulated in whole micro-USD, the unit costs are already computed in
+      // (usageRecorderService.computeCostMicroUsd). Rounding each bucket to 6dp on
+      // the way out while deriving the residual from unrounded floats put the three
+      // reported numbers on different bases, so they could fail to sum to totalCost —
+      // the exact reconciliation the tool description tells consumers to rely on.
+      const costMicroByModel: Record<string, number> = {};
+      // Assistant turns carrying no model, counted regardless of cost: a turn with
+      // no recorded spend still means the transcript is only partially labelled, and
+      // keying that off cost alone let a partial set read as authoritative.
+      let unlabelledAssistantTurns = 0;
       for (const msg of messages) {
         if (msg?.role !== 'assistant') continue;
+        const turnCost = msg?.usage?.estimated_cost || 0;
+        if (typeof msg?.llm === 'string' && msg.llm) {
+          generationModels.add(msg.llm);
+          if (turnCost) {
+            costMicroByModel[msg.llm] = (costMicroByModel[msg.llm] || 0) + Math.round(turnCost * 1e6);
+          }
+        } else {
+          unlabelledAssistantTurns++;
+        }
+        cacheCreationTokens += msg?.usage?.cache_creation_input_tokens || 0;
+        cacheReadTokens += msg?.usage?.cache_read_input_tokens || 0;
         if (msg?.metadata?.feedback?.type === 'like') likes++;
         if (msg?.metadata?.feedback?.type === 'dislike') dislikes++;
         if (Array.isArray(msg?.metadata?.iterationTimings)) {
@@ -2283,9 +2716,45 @@ mcpToolRegistry.register({
         portalType: session.portalType || null,
         sessionType: session.sessionType || null,
         llmModel: session.llmModel || null,
+        generationModels: generationModels.size > 0 ? [...generationModels] : null,
+        // ENG-892: pre-resolve the attribution so the agent never has to choose
+        // between two model-shaped fields. The original mis-report happened
+        // because a field named `llmModel` sat in the payload and got named on
+        // sight; a stored account memory still instructs grouping cost by it.
+        // Emitting the answer (plus how trustworthy it is) removes that judgement
+        // call rather than relying on the agent to make it correctly.
+        attributedModels: generationModels.size > 0
+          ? [...generationModels]
+          : (session.llmModel ? [session.llmModel] : null),
+        attributionBasis: generationModels.size > 0
+          ? (unlabelledAssistantTurns > 0 ? 'partial-transcript' : 'transcript')
+          : (session.llmModel ? 'selection-only' : null),
         messageCount: messages.length,
         totalTokens: session.totalTokens || null,
-        totalCost: session.totalCost != null ? Number(session.totalCost.toFixed(6)) : null,
+        cacheTokens: (cacheCreationTokens > 0 || cacheReadTokens > 0)
+          ? { creation: cacheCreationTokens, read: cacheReadTokens }
+          : null,
+        costByModel: Object.keys(costMicroByModel).length > 0
+          ? Object.fromEntries(
+              Object.entries(costMicroByModel).map(([m, micro]) => [m, micro / 1e6])
+            )
+          : null,
+        // The residual, on the SAME micro-USD basis as the buckets and as the
+        // totalCost reported above, so the three always reconcile exactly. Captures
+        // both spend on unlabelled turns and cost that never lands on an assistant
+        // turn at all (tool/image spend is in totalCost but in no turn's usage —
+        // measured at $1.92 on a real $100 session), which a turn-only sum would
+        // silently drop from a per-model breakdown.
+        unattributedCost: (() => {
+          if (session.totalCost == null) return null;
+          const totalMicro = Math.round(Number(session.totalCost) * 1e6);
+          const attributedMicro = Object.values(costMicroByModel).reduce((a, b) => a + b, 0);
+          const residualMicro = totalMicro - attributedMicro;
+          return residualMicro > 0 ? residualMicro / 1e6 : null;
+        })(),
+        // Same micro-USD basis as costByModel/unattributedCost below, so the three
+        // reconcile exactly rather than each being rounded independently.
+        totalCost: session.totalCost != null ? Math.round(Number(session.totalCost) * 1e6) / 1e6 : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,
         feedback: (likes > 0 || dislikes > 0) ? { likes, dislikes } : null,

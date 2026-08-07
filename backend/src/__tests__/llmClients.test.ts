@@ -64,6 +64,8 @@ import {
   normalizeUsageFromResponse,
   meterUsageFromResponse,
   bedrockModelIdFromArn,
+  normalizeCacheDetails,
+  normalizeAnthropicCacheCreation,
 } from '../utils/llmClients';
 
 const mockRecordUsage = recordUsage as jest.Mock;
@@ -1386,3 +1388,109 @@ async function wrapAndCall(client: any, sdkResponse: any): Promise<any> {
   setUnderlyingResolution(client, sdkResponse);
   return client.chat.completions.create({ model: sdkResponse.model });
 }
+
+
+/**
+ * ENG-893 — cache-write cost is billed at the TTL the provider APPLIED, so these
+ * two normalizers decide real money. Requesting `ttl: '1h'` is not a guarantee of
+ * getting it, and the same model id is used by paths with different TTLs, so a
+ * dropped or mis-parsed breakdown silently mis-bills by 60% in one direction or
+ * the other.
+ */
+describe('normalizeCacheDetails (Bedrock Converse usage.cacheDetails)', () => {
+  it('sums tokens per TTL bucket', () => {
+    expect(
+      normalizeCacheDetails([
+        { ttl: '1h', inputTokens: 84210 },
+        { ttl: '5m', inputTokens: 1200 },
+      ])
+    ).toEqual({ '1h': 84210, '5m': 1200 });
+  });
+
+  it('merges repeated buckets rather than letting the last one win', () => {
+    expect(
+      normalizeCacheDetails([
+        { ttl: '1h', inputTokens: 100 },
+        { ttl: '1h', inputTokens: 50 },
+      ])
+    ).toEqual({ '1h': 150 });
+  });
+
+  it('returns undefined for a missing, empty, or non-array value', () => {
+    // undefined means "no breakdown" — the caller then falls back to the
+    // model's declared rate rather than billing zero.
+    expect(normalizeCacheDetails(undefined)).toBeUndefined();
+    expect(normalizeCacheDetails(null)).toBeUndefined();
+    expect(normalizeCacheDetails([])).toBeUndefined();
+    expect(normalizeCacheDetails({ ttl: '1h' })).toBeUndefined();
+  });
+
+  it('skips entries with a non-string ttl or a non-positive token count', () => {
+    expect(
+      normalizeCacheDetails([
+        { ttl: 3600, inputTokens: 500 },
+        { ttl: '5m', inputTokens: 0 },
+        { ttl: '1h', inputTokens: 'not-a-number' },
+        { ttl: '1h', inputTokens: 700 },
+      ])
+    ).toEqual({ '1h': 700 });
+  });
+
+  it('returns undefined when nothing survives filtering', () => {
+    expect(normalizeCacheDetails([{ ttl: '1h', inputTokens: 0 }])).toBeUndefined();
+  });
+
+  it('reaches the ledger through normalizeBedrockUsage', () => {
+    expect(
+      normalizeBedrockUsage({
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheWriteInputTokens: 84210,
+        cacheDetails: [{ ttl: '1h', inputTokens: 84210 }],
+      }).cacheWriteByTtl
+    ).toEqual({ '1h': 84210 });
+  });
+});
+
+describe('normalizeAnthropicCacheCreation (Messages API usage.cache_creation)', () => {
+  it('maps the ephemeral_* fields onto TTL buckets', () => {
+    expect(
+      normalizeAnthropicCacheCreation({
+        ephemeral_5m_input_tokens: 1200,
+        ephemeral_1h_input_tokens: 84210,
+      })
+    ).toEqual({ '5m': 1200, '1h': 84210 });
+  });
+
+  it('omits zero buckets so a 5m-only write is not reported as mixed', () => {
+    expect(
+      normalizeAnthropicCacheCreation({
+        ephemeral_5m_input_tokens: 1200,
+        ephemeral_1h_input_tokens: 0,
+      })
+    ).toEqual({ '5m': 1200 });
+  });
+
+  it('returns undefined for missing, non-object, or all-zero input', () => {
+    expect(normalizeAnthropicCacheCreation(undefined)).toBeUndefined();
+    expect(normalizeAnthropicCacheCreation(null)).toBeUndefined();
+    expect(normalizeAnthropicCacheCreation('nope')).toBeUndefined();
+    expect(
+      normalizeAnthropicCacheCreation({
+        ephemeral_5m_input_tokens: 0,
+        ephemeral_1h_input_tokens: 0,
+      })
+    ).toBeUndefined();
+  });
+
+  it('reaches the ledger through normalizeAnthropicUsage', () => {
+    expect(
+      normalizeAnthropicUsage({
+        input_tokens: 10,
+        output_tokens: 5,
+        cache_creation_input_tokens: 1200,
+        cache_creation: { ephemeral_5m_input_tokens: 1200 },
+      }).cacheWriteByTtl
+    ).toEqual({ '5m': 1200 });
+  });
+});

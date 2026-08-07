@@ -142,6 +142,23 @@ greptile_comments() {
     "$(greptile_body "$(score_line "$1")" "$(footer "$2")")"
 }
 
+# greptile_comments_with_reply <score> <sha> -> the verdict comment PLUS a later,
+# footerless Greptile reply. Replying to a Greptile finding makes it answer in
+# thread, so the newest Greptile comment is not the verdict — the shape that
+# stalled agentweb#2266 until the 20-minute timeout despite a landed 5/5.
+greptile_comments_with_reply() {
+  jq -n --arg body "$(greptile_body "$(score_line "$1")" "$(footer "$2")")" '
+    [
+      {id: 1, created_at: "2026-07-29T15:00:00Z", updated_at: "2026-07-29T15:00:00Z",
+       user: {login: "harshmoney123", type: "User"}, body: "looks good to me"},
+      {id: 3, created_at: "2026-07-29T15:39:33Z", updated_at: "2026-07-29T15:47:46Z",
+       user: {login: "greptile-apps[bot]", type: "Bot"}, body: $body},
+      {id: 4, created_at: "2026-07-29T16:10:00Z", updated_at: "2026-07-29T16:10:00Z",
+       user: {login: "greptile-apps[bot]", type: "Bot"},
+       body: "That is a good, well-reasoned explanation. I am satisfied — no further action needed on that thread."}
+    ]'
+}
+
 # ---------------------------------------------------------------------------
 # Runner + assertions
 # ---------------------------------------------------------------------------
@@ -210,6 +227,22 @@ set_comments "$M" 1 "$(greptile_comments '4/5' "${HEAD}")"
 run_gate "$M"
 check 'AC1: 4/5 on the current head fails the gate' 1 'Greptile scored 4/5'
 
+# Regression (agentweb#2266): a landed 5/5 must still be found when Greptile has
+# posted a later, footerless reply in thread. Selecting the newest Greptile
+# comment locked onto the reply, reported "no verdict footer yet", and polled to
+# the 20-minute timeout on a PR Greptile had already passed.
+M=$(new_mock_dir)
+set_comments "$M" 1 "$(greptile_comments_with_reply '5/5' "${HEAD}")"
+run_gate "$M"
+check 'reply-after-verdict: a 5/5 behind a threaded reply still passes' 0 'Greptile 5/5'
+
+# The same shape must not become a way to sneak a bad score through: the verdict
+# comment is still the one that decides.
+M=$(new_mock_dir)
+set_comments "$M" 1 "$(greptile_comments_with_reply '3/5' "${HEAD}")"
+run_gate "$M"
+check 'reply-after-verdict: a 3/5 behind a threaded reply still fails' 1 'Greptile scored 3/5'
+
 # AC1 — a true 5/5 on the current head passes.
 M=$(new_mock_dir)
 set_comments "$M" 1 "$(greptile_comments '5/5' "${HEAD}")"
@@ -224,6 +257,45 @@ set_comments "$M" 1 "$(greptile_comments '5/5' "${STALE}")"
 run_gate "$M"
 check 'AC2: 5/5 on a superseded SHA does not pass' 1 'superseded'
 check 'AC2: the failure names both SHAs' 1 "${STALE}"
+# ENG-915 anti-misfire: a landed verdict for ANOTHER commit proves Greptile is
+# working, so timing out here is a slow re-review and must NOT be reported as
+# an outage. If this ever returns 75 the caller would run the suite on a PR
+# whose review is seconds away — the exact case the gate exists to skip.
+check 'ENG-915: a superseded verdict proves Greptile is alive, so never UNAVAILABLE' 1 \
+  'NOT reporting this as UNAVAILABLE'
+
+# ---------------------------------------------------------------------------
+# ENG-915 — REFUSED and UNAVAILABLE must never be confusable
+# ---------------------------------------------------------------------------
+#
+# The whole outage bypass rests on one property: a review Greptile actually
+# scored can never present as an outage. These pin it from both directions.
+#
+# Every scored verdict for our head decides immediately and exits before the
+# deadline is consulted, so no score can reach the UNAVAILABLE path.
+for bad_score in '0/5' '1/5' '2/5' '3/5' '4/5'; do
+  M=$(new_mock_dir)
+  set_comments "$M" 1 "$(greptile_comments "${bad_score}" "${HEAD}")"
+  run_gate "$M"
+  check "ENG-915: ${bad_score} on our head is REFUSED (1), never UNAVAILABLE (75)" 1 \
+    "Greptile scored ${bad_score%%/*}/5"
+done
+
+# An unparseable verdict is a refusal too: it is evidence we cannot read, not
+# evidence that never arrived. Letting it bypass would turn a malformed comment
+# into a way of skipping review.
+M=$(new_mock_dir)
+set_comments "$M" 1 "$(greptile_comments 'not-a-score' "${HEAD}")"
+run_gate "$M"
+check 'ENG-915: an unparseable verdict for our head is REFUSED, never UNAVAILABLE' 1 ''
+
+# And the genuine outage: nothing from Greptile at all, for any commit.
+M=$(new_mock_dir)
+set_comments "$M" 1 '[]'
+run_gate "$M"
+check 'ENG-915: a total absence of Greptile is UNAVAILABLE' 75 'verdict=unavailable'
+check 'ENG-915: the outage verdict says no verdict was seen for ANY commit' 75 \
+  'for ANY commit on this PR'
 
 # AC2 — the in-place edit. Greptile never posts a second comment; it rewrites
 # the same one, advancing `Reviews (N)` and `Last reviewed commit`. Poll 1 sees
@@ -246,14 +318,14 @@ check 'AC2: an in-place re-review that drops to 3/5 fails' 1 'Greptile scored 3/
 M=$(new_mock_dir)
 set_comments "$M" 1 '[]'
 run_gate "$M"
-check 'AC3: no Greptile review yet never passes' 1 'no Greptile review comment'
+check 'AC3: no Greptile review yet never passes (UNAVAILABLE, not a pass)' 75 'no Greptile review comment'
 
 # AC3 — a comment exists but carries no verdict footer yet (Greptile posts a
 # placeholder while reviewing). Pending, never a pass.
 M=$(new_mock_dir)
 set_comments "$M" 1 "$(comments_json 'greptile-apps[bot]' 'Bot' 'Greptile is reviewing this pull request...')"
 run_gate "$M"
-check 'AC3: a placeholder comment with no verdict footer never passes' 1 \
+check 'AC3: a placeholder comment with no verdict footer never passes' 75 \
   'no '"'"'Last reviewed commit'"'"' verdict footer yet'
 
 # AC3 — an impostor: a non-bot account posting a perfect-looking Greptile body
@@ -262,7 +334,7 @@ M=$(new_mock_dir)
 set_comments "$M" 1 "$(comments_json 'greptile-fan' 'User' \
   "$(greptile_body "$(score_line '5/5')" "$(footer "${HEAD}")")")"
 run_gate "$M"
-check 'AC3: a non-bot impostor comment does not satisfy the gate' 1 \
+check 'AC3: a non-bot impostor comment does not satisfy the gate' 75 \
   'no Greptile review comment'
 
 # AC4 — a verdict footer for OUR head whose score is missing: fail closed
@@ -321,8 +393,8 @@ check 'AC4: the raw non-JSON response is surfaced' 1 'this is not json'
 M=$(new_mock_dir)
 printf '1\n' >"${M}/comments_exit"
 run_gate "$M"
-check 'AC4: a failing GitHub API call never passes' 1 'timed out'
-check 'AC4: the API error text is surfaced, not swallowed' 1 'simulated API failure'
+check 'AC4: a failing GitHub API call never passes' 75 'timed out'
+check 'AC4: the API error text is surfaced, not swallowed' 75 'simulated API failure'
 
 # A successful `gh` call that also writes to stderr (warnings, deprecation
 # notices) must not be misread as an unparseable response. Folding stderr into

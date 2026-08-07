@@ -1,4 +1,5 @@
 import { agentModeService } from '../services/agentModeService';
+import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
@@ -492,11 +493,11 @@ emmaToolRegistry.register({
 
 Actions:
 - search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person.
-- get-profile: Get detailed profile info (headline, location, network_distance, is_open_profile, etc.) for a LinkedIn user by provider_id.
+- get-profile: Get detailed profile info (headline, About, location, network_distance, is_open_profile, etc.) for a LinkedIn user by profile_url or provider_id. This reads the LIVE profile from the connected/platform-wide Unipile account — it is the ONLY authoritative source for a person's current headline/About. NEVER take a headline, About, or other profile-identity field from a you_search_web snippet or a page-source scrape: search caches lag LinkedIn edits by many months and will report a stale headline as if current. When you specifically need the CURRENT profile — a founder/profile readiness audit, or a "what is my headline right now?" question — pass force_refresh=true to bypass the profile cache and read live. If no LinkedIn account can be resolved, get-profile fails with an explicit connect-LinkedIn error; surface that and prompt the user to connect LinkedIn rather than substituting search-snippet text.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
 - list-received-invitations: (exact action string: "list-received-invitations") List pending connection requests received from others. Returns paginated results with sender info.
-- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Aim for 200 characters or fewer (target ~195) so the whole message — including your call-to-action — fits and reads well. The backend auto-trims an over-limit note to the account's limit on a word boundary before sending, so a send never fails on length; but a note you keep within the limit yourself stays complete and coherent. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure. NOTE-QUOTA GATE: if send-invite returns requiresDecision/noteQuotaExceeded, the account's monthly personalized-note quota is spent and the note was NOT sent — do NOT retry automatically; ask the user whether to send WITHOUT the note or skip, and only re-call with on_note_quota="send_without_note" if they agree.
+- send-invite: Send a connection request. Requires profile_url or provider_id. message optional but recommended. IMPORTANT: the invite note limit is 200 characters on free LinkedIn accounts and 300 on Premium. Aim for 200 characters or fewer (target ~195) so the whole message — including your call-to-action — fits and reads well. The backend auto-trims an over-limit note to the account's limit on a word boundary before sending, so a send never fails on length; but a note you keep within the limit yourself stays complete and coherent. Also: do not send-invite to someone you are already connected with (network_distance FIRST_DEGREE) — use send-message instead; check with get-profile or list-connections if unsure. NOTE-QUOTA GATE: if send-invite returns requiresDecision/noteQuotaExceeded, the account's monthly personalized-note quota is spent and the note was NOT sent — do NOT retry automatically; ask the user whether to send WITHOUT the note or skip, and only re-call with on_note_quota="send_without_note" if they agree. CRM ATTRIBUTION: when you are running outreach for a CRM lead list, ALWAYS pass list_id with send-invite, plus the invitee's own first_name/last_name/company/title when you actually know them for THAT person (from search-people or get-profile) — never reuse the filters you searched with, or the lead is stamped with the wrong employer/title. The invite is then mirrored into that list — the person is created as a lead if absent, marked contacted, and logged with a linkedin.invite.sent engagement — so contact volume is attributed and follow-up cadence can fire. Also pass lead_id when you already know the CRM lead.
 - send-message: Send a direct message. Requires profile_url or provider_id. message required. Only works for 1st-degree connections or open profiles. When sending to a CRM lead, always provide list_id and lead_id — the system enforces that update-conversation-history was called within the last 24 hours before allowing a send.
 - send-inmail: Send a LinkedIn InMail to any profile regardless of connection degree (2nd/3rd-degree connections). Requires profile_url or provider_id, message (body), and subject. Requires a LinkedIn Premium account with available InMail credits. Use this when send-message is not possible due to connection degree restrictions. list_id and lead_id are optional but recommended for CRM persistence.
 - get-company: Get a LinkedIn company profile by company_id (the company's LinkedIn identifier/slug).
@@ -543,11 +544,19 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         list_id: {
           type: 'string',
-          description: 'CRM lead list ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate.'
+          description: 'CRM lead list ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. For send-invite: pass the list you are running outreach for so the invite is mirrored back into that CRM list (ENG-787 attribution).'
         },
         lead_id: {
           type: 'string',
-          description: 'CRM lead ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate.'
+          description: 'CRM lead ID. Required for update-conversation-history. Also required for send-message when enforcing the 24-hour sync gate. Optional for send-invite — pass it when you already know the CRM lead so the invite is attributed to it directly.'
+        },
+        first_name: {
+          type: 'string',
+          description: 'The target person\'s first name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name.'
+        },
+        last_name: {
+          type: 'string',
+          description: 'The target person\'s last name. Pass with send-invite (alongside list_id) so a lead created for CRM attribution carries their name.'
         },
         keywords: {
           type: 'string',
@@ -559,11 +568,11 @@ For target person identification (send-invite, send-message, get-profile, update
         },
         title: {
           type: 'string',
-          description: 'Job title filter for search-people (e.g. "CTO").'
+          description: 'For search-people: job title FILTER (e.g. "CTO"). For send-invite: the invitee\'s ACTUAL job title, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real title.'
         },
         company: {
           type: 'string',
-          description: 'Company name filter for search-people — free text, auto-resolved to a LinkedIn company id if no company_id is provided.'
+          description: 'For search-people: company name FILTER — free text, auto-resolved to a LinkedIn company id if no company_id is provided. For send-invite: the invitee\'s ACTUAL employer, as returned by search-people/get-profile for that specific person — it is written to the CRM lead. Never carry a search filter over into send-invite; omit it if you do not know the person\'s real employer.'
         },
         company_id: {
           type: 'string',
@@ -613,6 +622,10 @@ For target person identification (send-invite, send-message, get-profile, update
         cursor: {
           type: 'string',
           description: 'Pagination cursor for search-people, list-connections, list-sent-invitations, list-received-invitations.'
+        },
+        force_refresh: {
+          type: 'boolean',
+          description: 'For get-profile ONLY. Set true to bypass the 30-day profile cache and read the CURRENT profile live from the connected Unipile account — use it for a founder/profile readiness audit or any "what is my headline/About right now?" read so a months-stale cached value is never returned as current. Omit (cache-first) for high-volume outreach where an occasionally-cached profile is acceptable and dedup/rate-limit matter.'
         }
       },
       required: ['action']
@@ -894,12 +907,17 @@ emmaToolRegistry.register({
 ACTION MATRIX (entity_type → supported actions):
   CAMPAIGN      → LIST, CREATE, UPDATE, DELETE
   AD_SET        → LIST, CREATE, UPDATE, DELETE
-  AD_CREATIVE   → LIST, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
+  AD_CREATIVE   → LIST, GET, CREATE, UPLOAD_IMAGE, UPLOAD_VIDEO
   AD            → LIST, CREATE, UPDATE, DELETE, COPY_AD, RETAG_UTM
   CUSTOM_AUDIENCE → LIST, CREATE, UPLOAD_USERS
   TARGETING     → SEARCH
   PAGE          → LIST
   DATASET       → LIST, GET_MATCH_QUALITY
+
+AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including asset_feed_spec.
+  LIST is account-wide, capped, and omits asset_feed_spec, so it cannot tell you what a specific
+  creative actually contains. Use GET to verify a creative you just built or swapped onto an ad, and
+  to read a placement-customized creative (1:1 Feed + 9:16 Story/Reels) faithfully before cloning it.
 
 READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimize for (use to verify after a CREATE/UPDATE):
   AD_SET LIST returns optimization_goal, billing_event, destination_type, promoted_object (pixel_id + custom_event_type), bid_strategy, and budgets per ad set. Pass ad_set_id to read a single ad set; pass campaign_id to scope to one campaign's ad sets.
@@ -933,6 +951,10 @@ AD RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad that's missing them
 REQUIRED PARAMS PER ENTITY + ACTION:
   CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
   AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
+                        Optional but WRITABLE on create: bid_strategy (LOWEST_COST_WITHOUT_CAP | LOWEST_COST_WITH_BID_CAP | COST_CAP) and bid_amount.
+                        Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
+                        bid_amount is REQUIRED for LOWEST_COST_WITH_BID_CAP and COST_CAP, and must be OMITTED for LOWEST_COST_WITHOUT_CAP.
+                        NOT SUPPORTED: dayparting / ad scheduling (adset_schedule, pacing_type). A request for scheduled delivery is REJECTED, not silently ignored — tell the user it must be set in Ads Manager after creation. start_time/end_time are the flight window, not dayparting.
   AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
   AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.
@@ -1032,7 +1054,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
         },
         action: {
           type: "string",
-          enum: ["LIST", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
+          enum: ["LIST", "GET", "CREATE", "UPDATE", "DELETE", "COPY_AD", "RETAG_UTM", "UPLOAD_IMAGE", "UPLOAD_VIDEO", "UPLOAD_USERS", "SEARCH", "GET_MATCH_QUALITY"],
           description: "The operation to perform. Must be valid for the chosen entity_type."
         },
         account_id: {
@@ -1391,13 +1413,10 @@ emmaToolRegistry.register({
   },
   execute: async (args, context) => {
     // Backward-compatible normalization: accept legacy campaign_id or string campaign_ids.
-    const normalizedCampaignIds = Array.isArray(args.campaign_ids)
-      ? args.campaign_ids
-      : (typeof args.campaign_ids === 'string' && args.campaign_ids.trim())
-        ? [args.campaign_ids.trim()]
-        : (typeof args.campaign_id === 'string' && args.campaign_id.trim())
-          ? [args.campaign_id.trim()]
-          : [];
+    const normalizedCampaignIds = normalizeMetaCampaignIds(
+      args.campaign_ids,
+      args.campaign_id,
+    );
 
     return await agentModeService.getMetaAdsMetrics(
       args.timeframe || '7d',
@@ -1827,6 +1846,8 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'read_brand_guidelines',
+  // ENG-822: reads/writes account-scoped data; refused in anonymous sessions.
+  requiresUserAccount: true,
   definition: {
     name: 'read_brand_guidelines',
     description: 'Read the current user\'s brand guidelines (brand data and attachments). Returns exists=false if not set.',
@@ -1844,6 +1865,8 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'update_brand_guidelines',
+  // ENG-822: reads/writes account-scoped data; refused in anonymous sessions.
+  requiresUserAccount: true,
   definition: {
     name: 'update_brand_guidelines',
     description: 'Update the user\'s brand guidelines. IMPORTANT: Use read_brand_guidelines first to fetch the latest data, then only update the fields that need to be changed. Can update both brand data and brand assets (logos, brand guides, etc.). NOTE: SVG files are NOT allowed for logo or secondaryLogo uploads. If the user provides an SVG file, ask them to convert it to PNG or another raster format first. RE-SETUP SCOPE: when the user asks for a broad brand re-setup or refresh (NOT a single-field edit like changing just the tagline or one color), pass refreshMarketStrategy=true so the same operation also refreshes market strategy positioning by regenerating ICPs and competitors from the updated brand. This REPLACES current ICPs and competitors while preserving the business overview. For a small single-field edit, leave refreshMarketStrategy false/omitted.',
@@ -1921,6 +1944,8 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'read_market_strategy',
+  // ENG-822: reads/writes account-scoped data; refused in anonymous sessions.
+  requiresUserAccount: true,
   definition: {
     name: 'read_market_strategy',
     description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set.',
@@ -1938,6 +1963,8 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'update_market_strategy',
+  // ENG-822: reads/writes account-scoped data; refused in anonymous sessions.
+  requiresUserAccount: true,
   definition: {
     name: 'update_market_strategy',
     description: 'Update the user\'s market strategy. IMPORTANT: Use read_market_strategy first to fetch the latest data, then only update the fields that need to be changed. Can update business overview, competitors, and ideal customer profiles.',
@@ -1985,6 +2012,8 @@ emmaToolRegistry.register({
 
 emmaToolRegistry.register({
   name: 'regenerate_market_strategy',
+  // ENG-822: reads/writes account-scoped data; refused in anonymous sessions.
+  requiresUserAccount: true,
   definition: {
     name: 'regenerate_market_strategy',
     description: 'Regenerate the user\'s market strategy (ideal customer profiles and competitors) from their CURRENT brand guidelines, so the strategy matches the latest brand. DESTRUCTIVE: this REPLACES the existing competitors and ICPs (the business overview is preserved). Only call this AFTER the user has explicitly confirmed they want to regenerate — if they already have competitors/ICPs, first tell them how many will be replaced and get a clear yes. Takes ~30-60s. Typically used as part of a brand re-setup when the user chose to also refresh their positioning/market strategy (option 2 of the brand re-setup scope question).',
@@ -6363,6 +6392,7 @@ emmaToolRegistry.register({
       properties: {
         content: {
           type: 'string',
+          maxLength: 2000,
           description: 'The fact to remember (max 2000 chars). Be specific and actionable.'
         },
         category: {
@@ -6587,7 +6617,7 @@ emmaToolRegistry.register({
   name: 'get_website_analytics',
   definition: {
     name: 'get_website_analytics',
-    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), key-event/conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement, and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
+    description: 'Get Google Analytics (GA4) website analytics data. Returns sessions, users, page views, bounce rate, average session duration, traffic sources (with conversion counts per source/medium), a conversion breakdown by traffic source and event name (conversionsBySource), top pages by engagement, and daily trends. Use conversionsBySource for UTM-source-level attribution of form fills and other conversion events. Its conversion counts are historical — they show which events were counted as conversions when they were collected, not which events are currently marked as key events (GA4 key-event changes are not retroactive); this tool cannot read key-event configuration, so never infer it from this data. If the user has multiple GA4 properties configured, returns analytics for all properties unless a specific property is requested.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -7299,6 +7329,10 @@ emmaToolRegistry.register({
                 items: { type: 'string' },
                 description: 'Skill IDs to auto-install when this step becomes active'
               },
+              expectedAssetCount: {
+                type: 'number',
+                description: 'Number of media assets that must have been generated in the run before this step can be completed (e.g. 18 for "generate 3 images per hook, 18 total"). Counted per run, not per step. Carried over from the session work plan when omitted.'
+              },
             },
             required: ['stepCount', 'title']
           },
@@ -7364,6 +7398,15 @@ emmaToolRegistry.register({
           skillIds: Array.isArray(s.skillIds) && s.skillIds.length > 0
             ? s.skillIds
             : (sessionStep?.skillIds || []),
+          // Same reason as the two above: the LLM usually omits the asset gate
+          // when saving, and losing it here would silently strip the session
+          // plan's "must actually produce N assets" guarantee (ENG-889).
+          ...(() => {
+            const count = s.expectedAssetCount !== undefined
+              ? s.expectedAssetCount
+              : sessionStep?.expectedAssetCount;
+            return count !== undefined ? { expectedAssetCount: count } : {};
+          })(),
         };
       }),
       ownerId: userId,
