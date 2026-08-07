@@ -1,3 +1,5 @@
+import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
+
 export interface ToolContext {
   userId: string;
   sessionId: string;
@@ -14,6 +16,13 @@ export interface AgentTool {
   name: string;
   definition: any;
   execute(args: any, context: ToolContext): Promise<any>;
+  /**
+   * Mirrors McpToolHandler.requiresUserAccount (ENG-822). This registry is what
+   * a live Emma session dispatches through, so the flag has to survive the copy
+   * in agentModeService.registerTools() — otherwise the guard below never fires
+   * for the path real users take.
+   */
+  requiresUserAccount?: boolean;
 }
 
 export class ToolRegistry {
@@ -36,6 +45,14 @@ export class ToolRegistry {
     if (!tool) {
       throw new Error(`Unknown tool: ${toolName}`);
     }
+
+    // ENG-822: this is the live Emma dispatch path. Refuse account-scoped tools
+    // for anonymous sessions before the handler runs, so the visitor gets an
+    // actionable sign-in message rather than a raw `User not found`.
+    if (tool.requiresUserAccount && isAnonymousUserId(context?.userId)) {
+      return buildAnonymousToolRefusal(toolName);
+    }
+
     return await tool.execute(args, context);
   }
 

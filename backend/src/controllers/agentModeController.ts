@@ -112,6 +112,22 @@ const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
   "It has been recorded and will be retried automatically, and a transient issue like this usually " +
   "clears on its own. If it keeps happening, please contact support.";
 
+// ENG-764: a run ABANDONED because its owning process died (prod-verified: an EB
+// immutable deploy terminated the instance mid-run) is not a budget overrun either.
+// The reconciler used to persist the budget copy here, telling the user their job was
+// too large and to split it into smaller batches — a misdiagnosis of the user's own
+// workload for an outage on our side, and a direct contradiction of the accurate
+// "the owning process terminated mid-run" that the same recovery writes to
+// session.error. Splitting the request genuinely cannot help: the next deploy would
+// interrupt a smaller run just the same. Be honest about the cause, and reassure —
+// the requeue (and, on a safe boundary, the ENG-657 resume) recovers it unattended.
+const SCHEDULED_RUN_ABANDONED_MESSAGE =
+  "This scheduled run was interrupted before it could finish — the server process running it stopped " +
+  "mid-run, which normally happens during a routine deployment or restart on our side. " +
+  "Nothing is wrong with your request, and splitting it into smaller batches would not have helped. " +
+  "The run has been recorded as failed and will be retried automatically. " +
+  "If it keeps happening, please contact support.";
+
 // ENG-826: classify a zero-output scheduled-run failure so the persisted message and
 // the `failureClass` metadata match the ACTUAL cause. Precedence:
 //  1) 'budget' — context-limit, generation timeout, worker OOM/replacement, or a run
@@ -135,8 +151,9 @@ export function classifyZeroAssistantFailure(error: unknown): ScheduledRunFailur
   return 'system';
 }
 
-// The reconciler path (a dead process, with no error object to classify) deliberately
-// keeps SCHEDULED_JOB_INCOMPLETE_MESSAGE.
+// The reconciler path has no error object to classify, but it does not need one: a
+// stale lease means the owning process died, so it uses SCHEDULED_RUN_ABANDONED_MESSAGE
+// directly rather than falling back to the budget copy (ENG-764).
 export function zeroAssistantIncompleteMessage(error: unknown): string {
   switch (classifyZeroAssistantFailure(error)) {
     case 'budget':
@@ -2937,9 +2954,42 @@ export async function runScheduledChat(
     // Set the session title to the schedule name
     await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
 
-    // Update the session with the selected model from the schedule
+    // Update the session with the selected model from the schedule.
+    // ENG-892: schedule.llmModel is written straight from an admin request body
+    // with no allow-list check, and this is an internal db call, so it bypasses
+    // the validation on the picker endpoints. Stamping it raw recorded a model
+    // that never ran whenever generation fell back — on exactly the scheduled
+    // sessions the daily reports analyse. Resolve first so the stored value is
+    // what generation will resolve to.
     const defaultModel = await agentModeService.getScheduledChatsDefaultModel();
-    const modelToUse = schedule.llmModel || defaultModel;
+    const requestedModel = schedule.llmModel || defaultModel;
+    const scheduleModelResolution = agentModeService.resolveGenerationModel(requestedModel);
+    const modelToUse = scheduleModelResolution.model;
+    if (scheduleModelResolution.fellBack) {
+      // Fail loud, not partial. The run still completes on the fallback, but the
+      // admin's pin is dead and the UI keeps showing the model they chose — the
+      // ENG-806 failure mode, where an alias-valued setting sat inert for two
+      // months. resolveConfiguredModel alerts for AW-Settings; schedules only
+      // console.warn'd. Fire-and-forget so the run never blocks on it.
+      void sendAgentModeOncallAlert({
+        subject: 'AgentMode: unsupported model pinned on a scheduled chat',
+        message:
+          `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${requestedModel}", which is ` +
+          `not a served model even after legacy-alias resolution. The run fell back to "${modelToUse}", so the ` +
+          `pin is inert and every run of this schedule is using a model nobody chose.`,
+        context: {
+          Schedule: schedule.scheduleId,
+          'Pinned Model': requestedModel,
+          'Actually Used': modelToUse,
+        },
+        // One alert per (schedule, bad value) per hour: a daily schedule with a
+        // permanently bad pin must not flood oncall.
+        dedupeKey: `schedule_model_invalid:${schedule.scheduleId}:${requestedModel}`,
+        dedupeWindowMs: 60 * 60 * 1000,
+      }).catch((alertError) => {
+        console.error('AgentMode: Failed to send unsupported schedule-model alert:', alertError);
+      });
+    }
     await chatbotDb.updateSessionLlmModel(sessionId, modelToUse);
 
     // Convert schedule format to runVerifiedChat format
@@ -3547,7 +3597,10 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
       } else {
         await chatbotDb.addMessageToSession(lease.sessionId, {
           role: 'assistant',
-          content: SCHEDULED_JOB_INCOMPLETE_MESSAGE,
+          // ENG-764: honest cause — the process died, this was not a budget overrun.
+          // The jobIncomplete/isErrorMessage markers are unchanged: sessionScoringService
+          // and resumePlan both detect this placeholder by metadata, never by its text.
+          content: SCHEDULED_RUN_ABANDONED_MESSAGE,
           timestamp: nowIso,
           metadata: { timestamp: nowIso, isErrorMessage: true, jobIncomplete: true },
         });
@@ -8811,8 +8864,22 @@ export const agentModeController = {
         return res.status(400).json({ error: 'llmModel is required' });
       }
 
+      // ENG-892: the picker used to persist whatever string arrived, so ids that
+      // are not served at all (e.g. 'claude-sonnet-4-5') were stored and later
+      // reported as the model a session ran on. Accept only what generation would
+      // accept — `fellBack` is true exactly when the id is not in the allow-list
+      // after legacy-alias resolution — and store the canonical id so the field
+      // stays comparable to the per-message `llm` provenance.
+      const resolution = agentModeService.resolveGenerationModel(llmModel);
+      if (resolution.fellBack) {
+        return res.status(400).json({
+          error: `Unsupported model '${llmModel}'. Choose a model returned by the supported-models endpoint.`,
+        });
+      }
+      const canonicalModel = resolution.model;
+
       // Block non-admins from using opus models
-      if (llmModel.includes('opus') && !user.isAdmin) {
+      if (canonicalModel.includes('opus') && !user.isAdmin) {
         return res.status(403).json({ error: 'Opus models are not available for your account' });
       }
 
@@ -8828,7 +8895,7 @@ export const agentModeController = {
       }
 
       // Update the session's llmModel
-      const updatedSession = await chatbotDb.updateSessionLlmModel(sessionId, llmModel);
+      const updatedSession = await chatbotDb.updateSessionLlmModel(sessionId, canonicalModel);
 
       res.json({ llmModel: updatedSession.llmModel });
     } catch (error) {
@@ -8848,8 +8915,20 @@ export const agentModeController = {
         return res.status(400).json({ error: 'llmModel is required' });
       }
 
+      // ENG-892: same allow-list guard as the authenticated picker. This path
+      // matters more, not less — an interactive-share viewer writes to the
+      // owner's real session, so an unserved id here mislabels someone else's
+      // session.
+      const resolution = agentModeService.resolveGenerationModel(llmModel);
+      if (resolution.fellBack) {
+        return res.status(400).json({
+          error: `Unsupported model '${llmModel}'. Choose a model returned by the supported-models endpoint.`,
+        });
+      }
+      const canonicalModel = resolution.model;
+
       // Shared sessions are non-admin; block opus models
-      if (llmModel.includes('opus')) {
+      if (canonicalModel.includes('opus')) {
         return res.status(403).json({ error: 'Opus models are not available for shared sessions' });
       }
 
@@ -8876,7 +8955,7 @@ export const agentModeController = {
       }
 
       // Update the session's llmModel
-      const updatedSession = await chatbotDb.updateSessionLlmModel(shareId, llmModel);
+      const updatedSession = await chatbotDb.updateSessionLlmModel(shareId, canonicalModel);
 
       res.json({ llmModel: updatedSession.llmModel });
     } catch (error) {

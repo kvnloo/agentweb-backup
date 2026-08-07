@@ -820,6 +820,47 @@ export async function get2CaptchaApiKey(): Promise<string> {
 }
 
 
+export interface RankAICredentials {
+  /** First-party key that suppresses RankAI's invisible reCAPTCHA on their signin page. */
+  captchaBypassKey: string;
+  /** Base signin URL, e.g. https://rankai.ai/signin */
+  signinUrl: string;
+  /** Account the scheduled report signs in as. */
+  reportAccountEmail?: string;
+  /** Dashboard the report reads. */
+  dashboardId?: string;
+}
+
+/**
+ * Get RankAI automation credentials from AWS Secrets Manager (ENG-795).
+ *
+ * Secret format: JSON at dev/AgentWeb/RankAI or prod/AgentWeb/RankAI. The
+ * captcha bypass key is RankAI's own credential for their own bot protection —
+ * it is sensitive, must never be committed or written into a chat prompt, and is
+ * therefore always read at runtime from here.
+ */
+export async function getRankAICredentials(): Promise<RankAICredentials> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/RankAI'
+    : 'dev/AgentWeb/RankAI';
+
+  const raw = await getSecret(secretName);
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`Secret ${secretName} is not valid JSON. Expected keys: captchaBypassKey, signinUrl.`);
+  }
+
+  return {
+    captchaBypassKey: parsed.captchaBypassKey,
+    signinUrl: parsed.signinUrl,
+    reportAccountEmail: parsed.reportAccountEmail,
+    dashboardId: parsed.dashboardId,
+  };
+}
+
 /**
  * Get the email-verification provider API key from AWS Secrets Manager.
  * Stored as a plain string at dev/AgentWeb/EnrichSo or prod/AgentWeb/EnrichSo.

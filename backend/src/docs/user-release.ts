@@ -9,6 +9,42 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-08-05',
+    changes: [
+      'New: Emma Can Finish an Email-Code Login on Her Own, Including in Scheduled Runs',
+      '- Sites that sign you in with a one-time code emailed to you used to stop an unattended run dead: nobody was there to read the code out of the inbox and hand it over, so the run ended with nothing',
+      '- Emma now reads the code straight from your connected Gmail or Outlook and finishes the login herself — and she only accepts a code that arrived after she asked for one, so a leftover code from last week is never retyped',
+      '- If no code arrives, she says exactly what happened and stops. She will never invent a code, and never carry on as though she had signed in',
+      'Fixed: The Weekly RankAI SEO & GEO Report Was Producing Nothing Every Week',
+      '- Once the saved rankai.ai session expired, every run hit the sign-in page, could not get past its bot check, and finished with an empty report',
+      '- Emma can now re-open that sign-in page with the access RankAI granted us and complete the login by email code, so the report picks itself back up without anyone logging in by hand',
+      'Fixed: Amending One Step of a Work Plan No Longer Deletes the Others',
+      '- Updating a work plan through the Claude connector replaced the entire list of steps with whatever was sent, so editing a single step could silently drop every other one — a seven-step plan could become a one-step plan with no warning, and no way back unless you still had the original to hand',
+      '- You can now amend individual steps and leave the rest untouched, and an update that would remove steps — or blank out settings on the steps it keeps — is refused until you confirm you meant it',
+      '- Any update that changes steps now comes back with a summary of what changed, so a removal cannot pass unnoticed',
+      'Fixed: Two People Editing the Same Work Plan No Longer Overwrite Each Other',
+      '- Saving in the Work Plans editor wrote back the version loaded when you opened it, so a save could quietly undo a change someone made in the meantime — including one Emma made',
+      '- A save built on an out-of-date copy is now refused, and your edits stay in the dialog so you can carry them across to the current version',
+    ],
+  },
+  {
+    date: '2026-08-04',
+    changes: [
+      'Fixed: A Scheduled Run Interrupted by a Deployment Now Says So',
+      '- If we shipped an update while one of your scheduled runs was working, the run could stop partway through — and the note left in the chat told you the job was too large and to split it into smaller batches',
+      '- That advice was wrong: nothing was wrong with your request, and a smaller batch would have been interrupted in exactly the same way',
+      '- The note now states the real cause — the run was interrupted on our side — and confirms it is retried automatically, so you are not sent off rewriting a schedule that was never the problem',
+      '- Interrupted runs are also no longer counted as poor-quality results in our internal quality reporting, so genuine issues stand out instead of being buried',
+      'Fixed: Work Plan Steps Built Over the API No Longer Lose Their Settings',
+      '- When you created a work plan through the Claude connector, the tool bindings on each step could come back empty even though the request succeeded — the field name shown in the tool description was not the one the system read, and nothing warned you',
+      '- Both spellings are now accepted, and the tool description lists the settings a step really supports, including the skills you can attach to it',
+      '- If a step does include something we cannot store, the response now names that field instead of quietly discarding it, so a plan that saved differently from what you asked for tells you why',
+      'New: Require a Step to Actually Produce Its Images Before It Can Be Completed',
+      '- A step can now state how many images or videos it must produce — say 18 for "three images per hook across six hooks" — and it will not be marked complete until that many have genuinely been generated in the run',
+      '- Set it per step in the work plan editor, where saved plans also show the requirement at a glance; leave it blank for steps with no fixed count',
+    ],
+  },
+  {
     date: '2026-08-03',
     changes: [
       'Fixed: Scheduled Chats on Gemini 3.5 Flash No Longer Fail Silently',

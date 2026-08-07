@@ -25,8 +25,38 @@
 #   git diff --name-only "$BASE...$HEAD" | bash .github/scripts/eb-config-conflict.sh
 #   bash .github/scripts/eb-config-conflict.sh file1 file2 ...
 #
-# Exit status: 0 when the change is safe to deploy in one operation, 1 when it
-# must be split into two sequential deploys.
+# Exit status: 1 when this file combination is CERTAIN to be rejected. 0 means
+# only "not that known-bad combination" — it does NOT mean the deploy will
+# succeed. Read the limitation below before trusting a pass.
+#
+# ============================ WHAT THIS CANNOT SEE ===========================
+# EB rejects an update carrying a resource-config DELTA against the
+# environment's LIVE option settings at the same time as a bundle change. Every
+# application deploy uploads a bundle. So an `.ebextensions` resource change
+# cannot ride a normal deploy AT ALL — not even alone in its own PR.
+#
+# This script classifies FILE PATHS. It cannot observe a delta-against-live-
+# state, so it cannot decide deployability, and adding namespaces will not fix
+# that.
+#
+# Proven on 2026-08-04 at the cost of ~50 minutes of undeployable `main`
+# (ENG-818 #2277): a resource-only PR passed this gate, and its production
+# deploy was rejected with the exact error this gate exists to prevent. The
+# author merged partly BECAUSE this gate passed. Then the revert (#2279)
+# touched the same file with the same bundle shape and was accepted, because it
+# set the value back to what the ALB already had — no delta.
+#
+#   .ebextensions resource edit alone   -> this gate PASSES, prod REJECTS
+#   .ebextensions touched, value live   -> this gate PASSES, prod accepts
+#   .ebextensions + .platform           -> this gate BLOCKS, prod rejects
+#
+# It is right about the third case and blind to the first two. Treat a pass as
+# "no known-bad file pair", never as "safe to deploy".
+#
+# The real check belongs in eb-deploy.sh, which already reads the live
+# environment and can compare declared option_settings against actual values
+# before calling update-environment. Tracked on ENG-836.
+# =============================================================================
 #
 # Optional environment:
 #   EB_CONFLICT_REPO_ROOT   Root to resolve changed paths against (default: cwd)
@@ -103,6 +133,21 @@ content_of() {
   fi
 }
 
+# Echoes every needle from the named array that appears in $1, one per line.
+# The warning below names the namespaces a PR actually touches, rather than
+# assuming the load-balancer one: a PR changing `aws:autoscaling:asg` that was
+# told to inspect `aws:elbv2:loadbalancer` would find nothing and conclude it
+# was safe — the exact misleading-guidance failure this file exists to remove.
+matched_needles() {
+  local content="$1" needle
+  shift
+  for needle in "$@"; do
+    if printf '%s' "${content}" | grep -qF "${needle}"; then
+      printf '%s\n' "${needle}"
+    fi
+  done
+}
+
 # Does $1 (a blob of content) contain any needle from the named array?
 contains_any() {
   local content="$1" needle
@@ -131,6 +176,7 @@ main() {
   fi
 
   local resource_hits='' instance_hits='' unclassified='' f content
+  local touched_namespaces=''
 
   for f in "${changed[@]}"; do
     case "${f}" in
@@ -164,6 +210,7 @@ main() {
 
     if contains_any "${content}" "${RESOURCE_NAMESPACES[@]}"; then
       resource_hits="${resource_hits}  ${f} (resource namespace)${origin}"$'\n'
+      touched_namespaces="${touched_namespaces}$(matched_needles "${content}" "${RESOURCE_NAMESPACES[@]}")"$'\n'
     fi
 
     if contains_any "${content}" "${INSTANCE_NAMESPACES[@]}" || \
@@ -175,14 +222,49 @@ main() {
   # An unrecoverable config counts as BOTH sides, so it conflicts with any
   # other config change — including another unrecoverable one.
   if [ -z "${resource_hits}" ] && [ -z "${unclassified}" ]; then
-    log "No Elastic Beanstalk resource-config change in this diff; safe to deploy in one operation."
+    log "No Elastic Beanstalk resource-config file changed in this diff."
+    log "PASS means: not the known-bad file combination. It does NOT verify deployability."
     return 0
   fi
 
   if [ -z "${instance_hits}" ] && [ -z "${unclassified}" ]; then
     log "Resource-config change detected, with no instance-config change alongside it:"
     printf '%s' "${resource_hits}${unclassified}"
-    log "Safe: an immutable deploy accepts a resource-only update."
+    log ""
+    log "NOT PASSING THIS AS SAFE. A resource-config change cannot ride a normal"
+    log "application deploy even on its own: every deploy uploads a bundle, and"
+    log "immutable rejects a live-value delta plus a bundle together. A PR shaped"
+    log "exactly like this one (#2277) was rejected in production and left main"
+    log "undeployable for ~50 minutes."
+    log ""
+    # Filter to the namespaces THIS diff touches. A generic example naming only
+    # the load-balancer namespace would send an autoscaling or RDS change
+    # looking in the wrong place and finding nothing.
+    local ns filter=''
+    while IFS= read -r ns; do
+      [ -z "${ns}" ] && continue
+      case "${filter}" in
+        *"'${ns}'"*) continue ;;
+      esac
+      [ -n "${filter}" ] && filter="${filter} || "
+      filter="${filter}starts_with(Namespace, '${ns}')"
+    done <<<"${touched_namespaces}"
+    [ -z "${filter}" ] && filter="starts_with(Namespace, 'aws:')"
+
+    log "This gate cannot tell whether your value differs from the environment's"
+    log "LIVE setting, which is what actually decides. Before merging, check the"
+    log "namespaces this diff touches:"
+    log "  aws elasticbeanstalk describe-configuration-settings \\"
+    log "    --application-name agentweb-backend \\"
+    log "    --environment-name Agentweb-backend-env-prod-3 \\"
+    log "    --query \"ConfigurationSettings[0].OptionSettings[?${filter}]\""
+    log ""
+    log "If the live value already matches, there is no delta and the deploy is"
+    log "fine. If it differs, apply it with 'update-environment --option-settings'"
+    log "and NO version change first. See ENG-818 / ENG-836."
+    log ""
+    log "Exiting 0 because this is not the known-bad file pair, but this is a"
+    log "warning, not a clearance."
     return 0
   fi
 

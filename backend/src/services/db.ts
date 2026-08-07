@@ -314,6 +314,8 @@ export interface User {
   // ── Ad image axis ──
   adImageStatus?: "idle" | "running" | "ready" | "failed";
   adImageStartedAt?: string;
+  /** Per-run nonce identifying the run that owns the axis — see AdImageStatusFields. */
+  adImageRunId?: string;
   adImageCompletedAt?: string;
   adImageDurationMs?: number;
   adImageError?: string;
@@ -1442,7 +1444,27 @@ export class UserDB {
     }
   }
 
-  async updateUser(userId: string, updates: Partial<User>) {
+  /**
+   * @param options.condition Optional DynamoDB ConditionExpression applied to
+   *   the write. Callers that decide *whether* to write from a prior read
+   *   (e.g. the onboarding ad-image axis, which only lets the owning run
+   *   publish a terminal state) must restate that decision here: without it
+   *   the read and the write are two separate operations and a concurrent
+   *   writer can slip between them (ENG-792). A failed condition surfaces as
+   *   a `ConditionalCheckFailedException` — an expected outcome for those
+   *   callers, so it is re-thrown untouched rather than logged as an error.
+   */
+  async updateUser(
+    userId: string,
+    updates: Partial<User>,
+    options?: {
+      condition?: {
+        expression: string;
+        names?: { [key: string]: string };
+        values?: { [key: string]: any };
+      };
+    }
+  ) {
     // First, get the user by userId to ensure they exist and to get their email
     const user = await this.getUserById(userId);
     if (!user || !user.email) {
@@ -1497,6 +1519,11 @@ export class UserDB {
       ExpressionAttributeNames: expressionAttributeNames,
       ReturnValues: "ALL_NEW",
     };
+    if (options?.condition) {
+      params.ConditionExpression = options.condition.expression;
+      Object.assign(expressionAttributeNames, options.condition.names || {});
+      Object.assign(expressionAttributeValues, options.condition.values || {});
+    }
     // DynamoDB rejects an empty ExpressionAttributeValues map (e.g. when every
     // update is a REMOVE-on-null with no SET clauses at all).
     if (Object.keys(expressionAttributeValues).length > 0) {
@@ -1506,7 +1533,12 @@ export class UserDB {
     try {
       const result = await this.docClient.update(params).promise();
       return result.Attributes as User;
-    } catch (error) {
+    } catch (error: any) {
+      // An unmet condition is the caller's own guard firing, not a fault —
+      // hand it back verbatim instead of logging it as a DynamoDB error.
+      if (options?.condition && error?.code === "ConditionalCheckFailedException") {
+        throw error;
+      }
       handleDynamoDbError(error, "updateUser");
       throw error; // Re-throw after logging
     }
@@ -8312,7 +8344,18 @@ export const accountMemoryDb = {
     if (!content || content.trim().length === 0) {
       throw new Error('Content is required');
     }
-    if (content.length > 2000) {
+    // Counted in Unicode characters (code points), matching the `maxLength: 2000`
+    // the memory tools advertise in JSON Schema and that the tool gateway
+    // enforces. `content.length` counts UTF-16 code units, so it rejected 1,001
+    // emoji — 1,001 characters, well inside the declared limit — turning a
+    // schema-valid call into a runtime throw (ENG-821). Declared and enforced
+    // have to use the same unit or the contract is a lie for astral input.
+    //
+    // Only ever accepts MORE than before, never less, so nothing previously
+    // valid becomes invalid. Worst-case stored size roughly doubles (2,000
+    // astral chars ≈ 8 KB UTF-8) — negligible against DynamoDB's 400 KB limit.
+    // The other three memory guards below/above match this unit deliberately.
+    if (Array.from(content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 
@@ -8413,7 +8456,9 @@ export const accountMemoryDb = {
     if (updates.content !== undefined && updates.content.trim().length === 0) {
       throw new Error('Content cannot be empty');
     }
-    if (updates.content !== undefined && updates.content.length > 2000) {
+    // Code points, not UTF-16 code units — same unit as the declared
+    // `maxLength: 2000` and the addMemory guard (ENG-821).
+    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 
@@ -8477,7 +8522,9 @@ export const orgMemoryDb = {
     if (!content || content.trim().length === 0) {
       throw new Error('Content is required');
     }
-    if (content.length > 2000) {
+    // Code points, not UTF-16 code units — same unit as the declared
+    // `maxLength: 2000` and the addMemory guard (ENG-821).
+    if (Array.from(content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 
@@ -8577,7 +8624,9 @@ export const orgMemoryDb = {
     if (updates.content !== undefined && updates.content.trim().length === 0) {
       throw new Error('Content cannot be empty');
     }
-    if (updates.content !== undefined && updates.content.length > 2000) {
+    // Code points, not UTF-16 code units — same unit as the declared
+    // `maxLength: 2000` and the addMemory guard (ENG-821).
+    if (updates.content !== undefined && Array.from(updates.content).length > 2000) {
       throw new Error('Content must be 2000 characters or less');
     }
 

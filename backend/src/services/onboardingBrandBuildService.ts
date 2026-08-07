@@ -128,6 +128,8 @@ function buildBrandPrompt(input: {
     `- Do NOT call update_market_strategy or regenerate_market_strategy in this session, and do NOT offer to regenerate the market strategy. ICPs and competitor research are handled by separate steps after the user reviews the brand.`,
     `- Do NOT ask the user to verify anything mid-flight.`,
     `- Do NOT call any work-plan tools, do NOT create GTM plans, email campaigns, or landing pages.`,
+    `- logoUrl must be a direct link to an image the SITE ITSELF serves — the <img> in its header, an og:image, or its own /favicon.ico. NEVER substitute a third-party favicon proxy such as https://www.google.com/s2/favicons?domain=<domain>. That service returns 404 for any domain it has not crawled, and the dead URL then breaks every ad-image generation for this account.`,
+    `- If the site's logo is an inline SVG or otherwise has no linkable image URL, OMIT logoUrl entirely rather than approximating it. A deterministic step after this session discovers and pins a logo whenever you leave one unset — an omitted logoUrl self-heals, a wrong one does not.`,
     `- After update_brand_guidelines succeeds, reply with a single line "DONE" and stop.`,
     `- If a step is impossible (e.g. site is unreachable), reply "FAILED: <reason>" and stop. Do NOT loop indefinitely.`,
   ].join("\n");
@@ -501,20 +503,24 @@ async function persistFailure(
 ): Promise<void> {
   const patch = buildFailedPatch(current || {}, message, now);
   await userDb.updateUser(userId, patch as any);
-  logCompletionMetric(userId, "failed", patch.brandBuildDurationMs ?? 0);
-  // Durable metric — logCompletionMetric only writes a structured log line
-  // that rotates with the container. The OnboardingMetrics row survives.
-  const startedAt = (current?.brandBuildStartedAt as string | undefined) ??
-    new Date(now.getTime() - (patch.brandBuildDurationMs ?? 0)).toISOString();
-  void logStepMetric({
+  // ENG-848: ONE durable row per outcome.
+  //
+  // This used to call logCompletionMetric AND write its own OnboardingMetrics
+  // row, on the stated premise that "logCompletionMetric only writes a
+  // structured log line that rotates". That premise was false — it writes a
+  // durable row too (brandBuildStatusService), so every failure landed twice.
+  //
+  // The heartbeat reads row counts, so the duplication doubled the denominator:
+  // 74 rows for 39 real attempts. It did not distort the failure RATE, because
+  // both copies carried the same status, but it made the sample look twice as
+  // large as it was — and at ~5 attempts in the last active week, that
+  // difference decides whether a "below 10%" claim means anything.
+  logCompletionMetric(
     userId,
-    step: "brand-build",
-    startedAt,
-    completedAt: now.toISOString(),
-    durationMs: patch.brandBuildDurationMs ?? 0,
-    status: message.includes("timed out") ? "timeout" : "failed",
-    errorMessage: message,
-  });
+    message.includes("timed out") ? "timeout" : "failed",
+    patch.brandBuildDurationMs ?? 0,
+    message,
+  );
   // eslint-disable-next-line no-console
   console.warn("[onboardingBrandBuildService] failed", {
     userId,

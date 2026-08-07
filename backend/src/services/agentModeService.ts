@@ -54,9 +54,11 @@ import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, fil
 import type { LLMUsageData, LLMUsageContext } from '../utils/llmService';
 import { meterUserUsage } from './usageRecorderService';
 import { meterUsageFromResponse } from '../utils/llmClients';
-import { BEDROCK_BEARER_TOKEN_MODELS, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
+import { BEDROCK_BEARER_TOKEN_MODELS, bedrockCacheTtl, resolveBedrockModelId } from '../utils/bedrockInferenceProfiles';
 import {
   getModelPrice,
+  cacheWriteCost,
+  CacheWriteByTtl,
   imageGenerationCostUsd,
   videoGenerationCostUsd,
 } from '../utils/llmPricing';
@@ -78,6 +80,7 @@ import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
+import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -139,6 +142,13 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 
   return undefined;
 }
+
+// Moved to utils/metaCampaignIds.ts (ENG-821) — it is pure, and emma/tools.ts
+// needs it at dispatch time while 140 test files jest.mock this module.
+// Imported (not just re-exported) because this module calls it internally too;
+// re-exported so any importer of the old path keeps working.
+export { normalizeMetaCampaignIds };
+
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 
 // Max output tokens for agent-mode LLM turns. Must be large enough to hold a
@@ -160,6 +170,48 @@ export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
 // Already-complete HTML drafts bypass the render entirely (see
 // isCompleteHtmlDocument) and are NOT subject to this cap.
 export const CREATE_HTML_RENDER_MAX_DRAFT_CHARS = 60000;
+
+// Above this draft size, a render TIMEOUT is deterministic rather than transient,
+// so ENG-203's retry only spends another full 5-minute window arriving at the
+// identical failure. Backstop for the streaming render (see the createLLMService
+// call in createHTMLFile): streaming is what actually stops the 5-minute
+// socket-inactivity timer from firing mid-generation, but if a render still times
+// out on a draft this large, the size — not a blip — is why.
+//
+// The threshold is empirical, from the create_html_file calls in prod:
+//   timed out: 45,000 / 42,232 / 37,604 / 31,213 / 25,580-char drafts
+//   succeeded: 23,010 / 22,456 / 11,975 / 11,825-char drafts
+// so the cliff sat between ~23K and ~25.5K. 20K keeps a margin under the smallest
+// observed success, and well below CREATE_HTML_RENDER_MAX_DRAFT_CHARS so ordinary
+// drafts — where a timeout really is a one-off blip — keep the retry.
+export const CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS = 20000;
+
+// Largest draft still rendered by ONE monolithic LLM call. Above it the render
+// is all-or-nothing at a size where prod says it does not reliably fit the
+// per-call budget (see the observed cliff above), so the draft is rendered
+// section by section instead and the fragments are assembled locally. That
+// keeps the styled design for exactly the large reports that used to strand —
+// degrading to plain built-in styling stays the last resort, not the plan.
+export const CREATE_HTML_RENDER_SINGLE_PASS_MAX_DRAFT_CHARS = 24000;
+
+// Target size of one section render. Comfortably inside the smallest draft size
+// observed to render successfully in prod (23,010 chars), so no single section
+// is anywhere near the per-call budget, and small enough that the 60K ceiling
+// splits into a handful of parallel calls rather than dozens.
+export const CREATE_HTML_RENDER_CHUNK_MAX_CHARS = 12000;
+
+// Is this render error a per-call TIMEOUT (as opposed to a throttle, 5xx or
+// terminal error)? Bedrock surfaces these as TimeoutError/ModelTimeoutException,
+// or — for the streaming render — as "Stream timed out because of no activity
+// for 300000 ms", which carries no distinguishing name or code.
+export function isRenderTimeoutError(error: unknown): boolean {
+  if (!error) return false;
+  const e = error as any;
+  if (e.name === 'TimeoutError' || e.name === 'ModelTimeoutException') return true;
+  if (e.code === 'ETIMEDOUT' || e.code === 'ECONNABORTED') return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /timed?\s?out|timeout/i.test(message);
+}
 
 // A create_html_file content_draft that is already a complete HTML document does
 // not need the internal HTML-generation LLM call — re-rendering HTML->HTML is
@@ -345,7 +397,9 @@ function recordAgentModeToolTelemetry(
         // as a failure (it carries no error signal).
         void recorder.toolDeferred(runId, {
           toolName,
-          reason: 'media_generation_time_budget',
+          // A handler-supplied deferral names its own reason (ENG-822); the
+          // media-budget path keeps the original default.
+          reason: (r.result as any)?.reason || 'media_generation_time_budget',
           iteration,
           sessionId,
           ...(budgetContext?.mediaAssetsProducedThisRun != null
@@ -713,6 +767,12 @@ interface LLMModelConfig {
 }
 
 // Type for LLM call options
+/**
+ * Bedrock's default prompt-cache TTL. A prefix re-read inside this window is a
+ * free refresh; only a gap longer than it can justify the 1-hour rate (ENG-893).
+ */
+const PROMPT_CACHE_DEFAULT_TTL_MS = 5 * 60 * 1000;
+
 interface LLMCallOptions {
   tools?: any[] | null;
   tool_choice?: 'auto' | 'none' | any | null;
@@ -725,6 +785,20 @@ interface LLMCallOptions {
    * When omitted, usage is recorded under userId "system".
    */
   usageContext?: LLMUsageContext | null;
+  /**
+   * ENG-893: opt IN to the 1-hour prompt-cache TTL, for conversations with human
+   * thinking time between turns.
+   *
+   * The default is deliberately OFF. A 1-hour cache write costs 2x input where a
+   * 5-minute write costs 1.25x, and a cache HIT refreshes the TTL for free — so
+   * the extended TTL only pays for itself when turns are far enough apart to have
+   * expired the 5-minute window. Machine-paced callers (scheduled runs, loops,
+   * one-shot judges and utility calls) fire back-to-back or never re-read the
+   * prefix at all, so for them it is a pure surcharge. Opting in rather than out
+   * means a new call site that has not thought about pacing keeps today's
+   * behaviour instead of silently buying the 2x rate.
+   */
+  humanPaced?: boolean;
 }
 
 // Diagnosis agent configuration
@@ -1130,6 +1204,8 @@ export class AgentModeService {
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
         await import('../emma/solveRecaptchaTool');
+        await import('../emma/siteSigninTools');
+        await import('../emma/verificationCodeTool');
         await import('../emma/calendarTools');
         await import('../emma/localAgentTools');
 
@@ -1161,7 +1237,10 @@ export class AgentModeService {
           this.toolRegistry.register({
             name: toolHandler.name,
             definition: openAiDef,
-            execute: toolHandler.execute
+            execute: toolHandler.execute,
+            // ENG-822: carry the account-scope flag across the copy. Dropping it
+            // here is what made the registry guard inert for live sessions.
+            requiresUserAccount: toolHandler.requiresUserAccount
           });
         }
       }
@@ -1907,6 +1986,32 @@ export class AgentModeService {
     return this.getGeminiClient();
   }
 
+  /**
+   * ENG-893: models that have already reported a TTL other than the one we
+   * asked for. Log-once, so a persistent downgrade does not spam every turn.
+   */
+  private static readonly cacheTtlDowngradeWarned = new Set<string>();
+
+  /** Test seam — reset the log-once guard. */
+  public static __resetCacheTtlDowngradeWarnsForTests(): void {
+    AgentModeService.cacheTtlDowngradeWarned.clear();
+  }
+
+  private static warnCacheTtlDowngradeOnce(
+    modelId: string,
+    requestedTtl: string,
+    appliedTtls: string[]
+  ): void {
+    if (AgentModeService.cacheTtlDowngradeWarned.has(modelId)) return;
+    AgentModeService.cacheTtlDowngradeWarned.add(modelId);
+    console.warn(
+      `AgentMode: Bedrock did NOT honour the requested prompt-cache TTL for "${modelId}" ` +
+        `— asked for '${requestedTtl}', got '${appliedTtls.join(',') || 'none'}'. ` +
+        `Cost is still billed at the applied rate, but the extended-TTL saving is not being realised: ` +
+        `remove this model from BEDROCK_EXTENDED_CACHE_TTL_MODELS (ENG-893).`
+    );
+  }
+
   public async getBedrockClient(modelId: string): Promise<any> {
     // Use the Bedrock Converse API directly (instead of LangChain) to support
     // Anthropic prompt caching via cachePoint markers. This saves 30-50% on
@@ -1960,6 +2065,17 @@ export class AgentModeService {
     // Note: Newer Claude models require using inference profiles for cross-region access
     const actualModelId = resolveBedrockModelId(modelId);
 
+    // ENG-893: human-paced conversations idle past the default 5-minute
+    // prompt-cache TTL between turns, re-writing the whole prefix at 1.25x
+    // input instead of reading it back at 0.1x. Ask for the 1-hour TTL on the
+    // models we have verified honour it. Bedrock does NOT reject an unsupported
+    // `ttl`, so the allowlist guards against silent mispricing, not a crash.
+    //
+    // Resolved PER CALL, never captured here: this client is memoised on the
+    // model registry and shared by every session in the process, so a TTL baked
+    // into the closure would leak one session's pacing to all the others.
+    const modelSupportsExtendedTtl = bedrockCacheTtl(modelId);
+
     // Create OpenAI-compatible wrapper using direct Converse API
     return {
       chat: {
@@ -1968,17 +2084,35 @@ export class AgentModeService {
             // Convert OpenAI messages to Bedrock Converse format
             const { system, messages } = AgentModeService.convertToBedrockConverse(params.messages);
 
+            // ENG-893: a 1-hour write costs 2x input where a 5-minute write
+            // costs 1.25x, and a cache HIT refreshes the TTL for free. So the
+            // extended TTL only pays for itself when turns are far enough apart
+            // to have expired the 5-minute window. Machine-paced runs (scheduled
+            // reports, loops) fire their turns back-to-back and never expire it,
+            // so asking for 1h there is a pure 60% surcharge on every write —
+            // measured at +43% of cache-write spend across the ten costliest
+            // scheduled sessions. This mirrors AWS's own guidance: keep the
+            // 5-minute cache for prompts reused more often than every 5 minutes.
+            const cacheTtl = params.humanPaced ? modelSupportsExtendedTtl : undefined;
+            // A fresh object per call site: the two checkpoints must not alias.
+            const cachePointBlock = () => ({
+              cachePoint: cacheTtl ? { type: 'default', ttl: cacheTtl } : { type: 'default' },
+            });
+
             // --- Prompt caching ---
             // Add cache point after system prompt (~3.5K tokens cached on every call)
             if (system.length > 0) {
-              system.push({ cachePoint: { type: 'default' } });
+              system.push(cachePointBlock());
             }
             // Add cache point before the last message to cache the conversation prefix.
             // Within the tool-call iteration loop, each subsequent call only pays full
             // price for the newest exchange; all prior turns hit the cache.
+            // Both checkpoints carry the SAME ttl: Bedrock requires longer-TTL
+            // checkpoints to precede shorter ones, and mixing them here would
+            // leave the (much larger) history on the 5-minute expiry anyway.
             if (messages.length > 2) {
               const pivotMsg = messages[messages.length - 2];
-              pivotMsg.content = [...pivotMsg.content, { cachePoint: { type: 'default' } }];
+              pivotMsg.content = [...pivotMsg.content, cachePointBlock()];
             }
 
             // Convert tools to Bedrock toolConfig format
@@ -2045,8 +2179,40 @@ export class AgentModeService {
             const cacheReadTokens = usage.cacheReadInputTokens || 0;
             const cacheWriteTokens = usage.cacheWriteInputTokens || 0;
 
+            // ENG-893: cacheDetails breaks the write down by the TTL Bedrock
+            // actually applied. It is both the prod-log proof that the 1-hour
+            // checkpoint was honoured rather than silently ignored, AND what the
+            // ledger bills against — asking for `ttl: '1h'` does not guarantee
+            // getting it, so we price what came back.
+            const cacheWriteByTtl: Record<string, number> | undefined =
+              Array.isArray(usage.cacheDetails) && usage.cacheDetails.length > 0
+                ? usage.cacheDetails.reduce((acc: Record<string, number>, d: any) => {
+                    const ttl = typeof d?.ttl === 'string' ? d.ttl : undefined;
+                    const tokens = Number(d?.inputTokens) || 0;
+                    if (ttl && tokens > 0) acc[ttl] = (acc[ttl] || 0) + tokens;
+                    return acc;
+                  }, {})
+                : undefined;
+
+            // ENG-893: we allowlist the 1-hour TTL per model from live probes,
+            // and for Sonnet 4.6 / Opus 4.6 those probes contradict AWS's
+            // published "5 minutes only" table. Billing is already safe either
+            // way (we charge the TTL that came back), but a silent downgrade
+            // would quietly cost us the savings — so say so, once per model,
+            // rather than assuming the measurement holds forever.
+            if (cacheTtl && cacheWriteByTtl && !cacheWriteByTtl[cacheTtl]) {
+              AgentModeService.warnCacheTtlDowngradeOnce(
+                modelId,
+                cacheTtl,
+                Object.keys(cacheWriteByTtl)
+              );
+            }
+
             if (cacheReadTokens > 0 || cacheWriteTokens > 0) {
-              console.log(`AgentMode: Bedrock cache — read: ${cacheReadTokens}, write: ${cacheWriteTokens}, uncached input: ${inputTokens}, output: ${outputTokens}`);
+              const ttlBreakdown = Object.entries(cacheWriteByTtl || {})
+                .map(([ttl, tokens]) => `${ttl}:${tokens}`)
+                .join(',');
+              console.log(`AgentMode: Bedrock cache — read: ${cacheReadTokens}, write: ${cacheWriteTokens}${ttlBreakdown ? ` (${ttlBreakdown})` : ''}, uncached input: ${inputTokens}, output: ${outputTokens}`);
             }
 
             const stopReason: string = response.stopReason || '';
@@ -2082,6 +2248,10 @@ export class AgentModeService {
                 total_tokens: inputTokens + outputTokens,
                 cache_read_input_tokens: cacheReadTokens,
                 cache_creation_input_tokens: cacheWriteTokens,
+                // ENG-893: the TTL Bedrock actually applied per write bucket, so
+                // cost is billed at the honoured rate rather than the one we asked
+                // for. Undefined when the response carried no breakdown.
+                cache_creation_by_ttl: cacheWriteByTtl,
               },
             };
           },
@@ -2622,7 +2792,8 @@ export class AgentModeService {
       max_completion_tokens = null,
       temperature = null,
       response_format = { type: "text" },
-      usageContext = null
+      usageContext = null,
+      humanPaced = false
     } = options || {};
 
     const params: any = {
@@ -2630,6 +2801,16 @@ export class AgentModeService {
       messages: messages,
       response_format: response_format || { type: "text" },
     };
+
+    // ENG-893: cache-TTL hint for the Bedrock Converse wrapper, which reads it
+    // off `params` and never forwards it to ConverseCommand. Set ONLY for
+    // Bedrock models: `params` is handed verbatim to
+    // `client.chat.completions.create()` for every provider, and the OpenAI SDK
+    // forwards unknown body fields to the API — Azure OpenAI rejects an
+    // unrecognised argument with a 400, which would break every GPT turn.
+    if (model.startsWith('anthropic.')) {
+      params.humanPaced = humanPaced;
+    }
 
     // Only add tools and tool_choice if tools are provided
     if (tools && tools.length > 0) {
@@ -2713,6 +2894,8 @@ export class AgentModeService {
               outputTokens: usage.completion_tokens || 0,
               cacheReadTokens: usage.cache_read_input_tokens || usage.prompt_tokens_details?.cached_tokens || 0,
               cacheWriteTokens: usage.cache_creation_input_tokens || 0,
+              // ENG-893: bill writes at the TTL Bedrock applied, not the one asked for.
+              cacheWriteByTtl: usage.cache_creation_by_ttl,
             });
           }
         } catch {
@@ -2765,17 +2948,28 @@ export class AgentModeService {
    * Estimate cost in USD for an LLM call based on model pricing.
    * Prices are per 1M tokens (input/output).
    */
-  private estimateCost(model: string, inputTokens: number, outputTokens: number, cacheReadTokens: number = 0, cacheWriteTokens: number = 0): number {
+  private estimateCost(
+    model: string,
+    inputTokens: number,
+    outputTokens: number,
+    cacheReadTokens: number = 0,
+    cacheWriteTokens: number = 0,
+    /** ENG-893: per-TTL cache-write split from Bedrock's `usage.cacheDetails`. */
+    cacheWriteByTtl?: CacheWriteByTtl
+  ): number {
     // Single source of truth for rates: llmPricing.MODEL_PRICING (via getModelPrice).
     // Unknown models fall back to Sonnet pricing here, preserving long-standing behavior.
     const price = getModelPrice(model);
     const inputPrice = price?.inPerM ?? 3;
     const outputPrice = price?.outPerM ?? 15;
-    // Cache reads are 10% of input price; cache writes are 125% of input price.
+    // Cache reads are 10% of input price. Cache WRITES depend on the TTL that was
+    // applied (1.25x at 5m, 2x at 1h), so they bill off the response's breakdown
+    // when Bedrock reported one — see cacheWriteCost (ENG-893).
     const cacheReadPrice = price?.cacheReadPerM ?? inputPrice * 0.1;
-    const cacheWritePrice = price?.cacheWritePerM ?? inputPrice * 1.25;
+    const effectivePrice = price ?? { inPerM: inputPrice, outPerM: outputPrice };
     return (inputTokens * inputPrice + outputTokens * outputPrice
-      + cacheReadTokens * cacheReadPrice + cacheWriteTokens * cacheWritePrice) / 1_000_000;
+      + cacheReadTokens * cacheReadPrice
+      + cacheWriteCost(effectivePrice, cacheWriteTokens, cacheWriteByTtl)) / 1_000_000;
   }
 
   /** Cost per image generation in USD (fixed per-generation pricing, sourced from llmPricing). */
@@ -3137,6 +3331,32 @@ export class AgentModeService {
       ).length;
 
       const isScheduledSession = currentSession?.sessionType === 'scheduled';
+
+      // ENG-893: does THIS turn justify buying the 1-hour prompt-cache TTL?
+      //
+      // A 1h cache write costs 2x input where a 5m write costs 1.25x, and a
+      // cache HIT refreshes the TTL for free — so the extra 0.75x only pays for
+      // itself if the prefix is re-read after the 5-minute window would have
+      // lapsed. Session TYPE is a poor proxy: it correctly excludes scheduled
+      // runs, but still charges the surcharge to a fast back-and-forth chat and
+      // to a one-turn session that writes the cache and ends, neither of which
+      // ever collects the benefit.
+      //
+      // The signal is how long the user actually took to send THIS message,
+      // measured from the message history. Do NOT use `session.updatedAt`: the
+      // controller persists the incoming user message (bumping updatedAt) and
+      // reloads the session BEFORE handing it to this loop, so that gap is
+      // always ~0 and the extended TTL would never be requested at all.
+      // STICKY on purpose: any pause in this session, not just the latest one.
+      // Checking only the newest gap leaves the fast->slow transition uncovered
+      // — a turn that followed a quick reply writes a 5-minute cache, and the
+      // user's next pause then expires it. Modelled on the ticket's own session
+      // that costs 7 extra full re-caches and roughly half the saving ($19.25 vs
+      // $12.44). A user who has paused once has shown they are human-paced, and
+      // the measured sessions keep pausing (20 of 33 turns there exceeded 5 min).
+      const longestPauseMs = AgentModeService.longestUserPauseMs(sessionHistory);
+      const humanPacedTurn =
+        !isScheduledSession && longestPauseMs > PROMPT_CACHE_DEFAULT_TTL_MS;
       // ENG-844: a verification tool-call retry press ("Make sure to <tool> (1 more
       // time needed)") is the scheduled VERIFIER re-sending the same prompt, not a
       // human withholding information. The anti-loop remedy cannot satisfy a tool call
@@ -3335,6 +3555,31 @@ export class AgentModeService {
 
             // Re-build context using helper
             const skillContext = this.buildSkillContext(associatedSkills, userAllowedSkillIds, publishedSkills, updatedAssociatedSkillIds, hasAdminAccess);
+            // ENG-893: a skill install that ADDS tools changes `toolConfig`, and
+            // Bedrock chains its cache checkpoints tools -> system -> messages —
+            // so the whole cached prefix dies and the next call re-writes it in
+            // full. In the session that surfaced ENG-893 that was 5 installs and
+            // ~646k re-written tokens, the largest remaining cost after the
+            // 1-hour TTL fix.
+            //
+            // It is logged rather than "fixed" on purpose. The two candidate
+            // fixes both turned out to be unsupported by that session's data:
+            // batching installs (they were 85+ minutes apart, each answering a
+            // new user request) and moving the skill-context message out of
+            // index 1 (every install changed the tool set anyway, so the message
+            // splice was never the binding constraint). Whether either becomes
+            // worthwhile depends on how often a real install adds NO new tools —
+            // which nothing measured until now. Hence toolSetChanged.
+            const toolSetDiff = AgentModeService.diffToolSets(
+              allowedToolNames,
+              skillContext.allowedToolNames
+            );
+            console.log(
+              `AgentMode: skill refresh — toolSetChanged: ${toolSetDiff.changed}, added: ${toolSetDiff.added}, removed: ${toolSetDiff.removed}, installedSkills: ${updatedAssociatedSkillIds.length}` +
+                (toolSetDiff.changed
+                  ? ' — prompt-cache prefix invalidated for the next call (ENG-893)'
+                  : ' — cached prefix survives the tool list')
+            );
             allowedToolNames = skillContext.allowedToolNames;
             installedSkillContextMsg = skillContext.installedSkillContextMsg;
 
@@ -3352,7 +3597,34 @@ export class AgentModeService {
               _initialMessageCount = initialMessageCount;
             }
 
-            // Invalidate tools cache
+            // Invalidate tools cache.
+            //
+            // ENG-893 — this is the one remaining prompt-cache cost, and it is
+            // deliberate. Installing a skill changes `allowedToolNames`, which
+            // changes the Converse `toolConfig`; Bedrock chains its checkpoints
+            // tools -> system -> messages, so a tool change invalidates system
+            // AND the whole message history. One skill install therefore costs a
+            // full-prefix re-cache (80k-185k tokens in the session that filed
+            // this ticket). Moving the skill-context message out of index 1 does
+            // NOT avoid it — the tool change alone is sufficient.
+            //
+            // Sizing it, measured against prod on 2026-08-05 across the eight
+            // costliest sessions: 31 installs, 3.28M re-cached tokens, ~$32.78
+            // — about 5% of those sessions' $653 of spend (1.8%-18% each).
+            //
+            // Do NOT "fix" this by pre-declaring every tool up front. 191
+            // distinct tools across 74 skills at ~941 tokens per definition is
+            // ~180k tokens of schema carried on EVERY turn, ~$0.09/turn at Opus
+            // 5 cache-read rates. Installs are only 31 of ~1,186 assistant calls
+            // (2.6%), so that trades a per-call tax for a per-install saving and
+            // loses on every session measured — worse on the long ones, which
+            // are the expensive ones: -$18.59 over 315 calls, -$16.61 over 224,
+            // -$2.80 over 103. Before counting the context it consumes and the
+            // loss of hard tool gating (ENG-260 / ENG-280).
+            //
+            // Batching installs does not help either: that session's five
+            // installs landed in five different user turns as the user changed
+            // topic, so there was nothing to batch.
             filteredToolsCache = null;
             skillsUpdated = false;
           } catch (error) {
@@ -3443,7 +3715,9 @@ export class AgentModeService {
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
-            usageContext: { userId, sessionId, feature: 'agent_task' }
+            usageContext: { userId, sessionId, feature: 'agent_task' },
+            // ENG-893: only the interactive conversation loop waits on a human.
+            humanPaced: humanPacedTurn
           });
         } catch (callError) {
           if (isTransientLLMError(callError) && !backupModelUsed) {
@@ -3465,7 +3739,9 @@ export class AgentModeService {
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
-                usageContext: { userId, sessionId, feature: 'agent_task' }
+                usageContext: { userId, sessionId, feature: 'agent_task' },
+                // ENG-893: same pacing as the primary call it is retrying.
+                humanPaced: humanPacedTurn
               });
             } else {
               recordSpanError(chatSpan, callError);
@@ -3546,6 +3822,7 @@ export class AgentModeService {
               responseUsage.completion_tokens || 0,
               responseUsage.cache_read_input_tokens || 0,
               responseUsage.cache_creation_input_tokens || 0,
+              responseUsage.cache_creation_by_ttl,
             ),
           };
         }
@@ -4842,6 +5119,15 @@ export class AgentModeService {
     // Timing
     'wait_seconds',
 
+    // Magic-link / email-code login recovery (ENG-795). Foundation rather than
+    // skill-scoped because the tool lists of the DB-defined skills (e.g. "Browser
+    // automation") are data, not code: a tool added here would otherwise be
+    // invisible to every existing session and every scheduled run until someone
+    // edited each skill row by hand. loadFoundationTools unions
+    // DEFAULT_FOUNDATION_TOOLS, so a stale prod override cannot strip them.
+    'read_verification_code',
+    'open_site_signin',
+
     // Session Notifications (no email integration required)
     'notify_session',
 
@@ -5312,6 +5598,60 @@ export class AgentModeService {
 
   // Get filtered tools based on user's subscription type AND session state
   // optimized to accept precomputedAllowedNames to avoid redundant DB lookups when possible
+  /**
+   * Compare the tool set before and after a skill refresh.
+   *
+   * ENG-893: `toolConfig` is the FIRST link in Bedrock's cache chain
+   * (tools -> system -> messages), so a change here invalidates the entire
+   * cached prompt prefix, not just the tools. Only a refresh that actually
+   * moves the tool set costs a full re-cache — one that installs a skill whose
+   * tools are already allowed is free. Callers log the difference so we can
+   * find out how often each case really happens.
+   */
+  /**
+   * How long the user took before sending the newest message, in ms, derived
+   * from the message history (ENG-893).
+   *
+   * Measured from history rather than `session.updatedAt` on purpose: the
+   * controller saves the incoming user message and reloads the session before
+   * the loop runs, so updatedAt reflects the message that just arrived, not the
+   * one before it. Returns 0 when there is no earlier timestamped message —
+   * a first turn has no pause to reward.
+   */
+  public static longestUserPauseMs(history: ReadonlyArray<any> | undefined): number {
+    if (!Array.isArray(history) || history.length < 2) return 0;
+    const stamp = (m: any): number => {
+      const raw = m?.timestamp || m?.metadata?.timestamp;
+      const t = raw ? Date.parse(raw) : NaN;
+      return Number.isFinite(t) ? t : NaN;
+    };
+    let longest = 0;
+    for (let i = 1; i < history.length; i++) {
+      if (history[i]?.role !== 'user') continue;
+      const at = stamp(history[i]);
+      if (!Number.isFinite(at)) continue;
+      for (let j = i - 1; j >= 0; j--) {
+        const prev = stamp(history[j]);
+        if (Number.isFinite(prev)) {
+          longest = Math.max(longest, at - prev);
+          break;
+        }
+      }
+    }
+    return Math.max(0, longest);
+  }
+
+  public static diffToolSets(
+    previous: ReadonlySet<string>,
+    next: ReadonlySet<string>
+  ): { added: number; removed: number; changed: boolean } {
+    let added = 0;
+    for (const name of next) if (!previous.has(name)) added++;
+    let removed = 0;
+    for (const name of previous) if (!next.has(name)) removed++;
+    return { added, removed, changed: added > 0 || removed > 0 };
+  }
+
   public async getFilteredTools(
     userId: string,
     precomputedAllowedSkillToolNames?: Set<string>,
@@ -5850,13 +6190,10 @@ export class AgentModeService {
         };
 
       case 'get_meta_ads_metrics':
-        const normalizedCampaignIds = Array.isArray(args.campaign_ids)
-          ? args.campaign_ids
-          : (typeof args.campaign_ids === 'string' && args.campaign_ids.trim())
-            ? [args.campaign_ids.trim()]
-            : (typeof args.campaign_id === 'string' && args.campaign_id.trim())
-              ? [args.campaign_id.trim()]
-              : [];
+        const normalizedCampaignIds = normalizeMetaCampaignIds(
+          args.campaign_ids,
+          args.campaign_id,
+        );
 
         if (normalizedCampaignIds.length === 0) {
           return {
@@ -10126,7 +10463,7 @@ export class AgentModeService {
       const { sanitizeEnrichmentMetadataForResponse } = await import('../utils/enrichmentMetadataPresentation');
       const effectiveLimit = Math.min(Math.max(limit || 20, 1), 100);
 
-      if (!filters || filters.length === 0) {
+      if ((!filters || filters.length === 0) && !options?.search?.trim()) {
         return { success: false, message: 'At least one filter is required', error: 'Provide at least one filter criterion' };
       }
 
@@ -14743,10 +15080,65 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
-  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<MetaApiResult> {
+  public async manageMetaAdsAdCreatives(userId: string, action: 'LIST' | 'GET' | 'CREATE' | 'UPLOAD_IMAGE' | 'UPLOAD_VIDEO', account_id: string, params: any = {}): Promise<MetaApiResult> {
     switch (action) {
       case 'LIST':
         return this.listMetaAdsAdCreatives(userId, account_id);
+      case 'GET': {
+        // Read ONE creative back by id (ENG-471). The service method has existed
+        // and is already used by COPY_AD/RETAG_UTM — only the model-facing
+        // contract was missing, so Emma could build a placement-customized
+        // creative and had no way to verify what she had just made.
+        //
+        // Not a thin alias for LIST: LIST is account-wide, capped, and omits
+        // asset_feed_spec, which is exactly the field a faithful clone needs.
+        if (!params.creative_id) {
+          throw new Error('AD_CREATIVE GET requires "params.creative_id" (the creative to read).');
+        }
+        const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
+        const creative: any = await metaService.getAdCreative(accessToken, params.creative_id);
+
+        // Bind the node to the SELECTED account. A creative id addresses a node
+        // globally, and one Meta OAuth token can reach several ad accounts, so
+        // without this a caller could select account A, pass a creative id from
+        // account B, and receive B's object_story_spec / url_tags /
+        // asset_feed_spec. The token being valid is not the same as the creative
+        // being in scope.
+        //
+        // Fails closed: an unverifiable node is refused rather than returned. We
+        // request account_id explicitly, so its absence on an otherwise valid
+        // node means the assumption behind this check no longer holds.
+        if (creative && creative.id) {
+          const norm = (id: unknown) => String(id ?? '').replace(/^act_/, '').trim();
+          const owner = norm(creative.account_id);
+          const selected = norm(accountId);
+          if (!owner) {
+            throw new Error(
+              `Could not verify which ad account creative ${params.creative_id} belongs to; refusing to return it.`,
+            );
+          }
+          // Both sides must be known. An empty resolved account cannot be
+          // compared against anything, so treating it as "no mismatch" would
+          // reopen the exact bypass this check exists to close — the guard
+          // would silently pass every creative the token can reach.
+          if (!selected) {
+            throw new Error(
+              `Could not determine which ad account was selected; refusing to return creative ${params.creative_id}.`,
+            );
+          }
+          if (owner !== selected) {
+            throw new Error(
+              `Ad creative ${params.creative_id} belongs to ad account ${owner}, not the selected account ${selected}.`,
+            );
+          }
+        }
+
+        return {
+          success: true,
+          message: `Fetched ad creative ${params.creative_id}`,
+          creative,
+        };
+      }
       case 'CREATE':
         return this.createMetaAdsAdCreative(userId, { ...params, account_id });
       case 'UPLOAD_IMAGE':
@@ -16240,12 +16632,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     requestedAccountId?: string,
   ): Promise<any> {
     try {
-      const rawCampaignIds = Array.isArray(campaign_ids)
-        ? campaign_ids
-        : (typeof campaign_ids === 'string' ? [campaign_ids] : []);
-      const campaignFilterIds = [
-        ...new Set(rawCampaignIds.map((id) => String(id).trim()).filter(Boolean))
-      ];
+      const campaignFilterIds = normalizeMetaCampaignIds(campaign_ids);
       console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
       if (campaignFilterIds.length === 0) {
         return {
@@ -16513,6 +16900,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       case 'AD_CREATIVE':
         if (action === 'CREATE') {
           MetaService.validateCreativeParams('CREATE', params);
+        } else if (action === 'GET' && !params.creative_id) {
+          // Caught here as well as in the dispatch so the model gets the same
+          // message whichever layer sees it first. A GET with no id must never
+          // fall through to something account-wide.
+          throw new Error('AD_CREATIVE GET requires "params.creative_id".');
         }
         break;
 
@@ -26075,12 +26467,16 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       // immediately instead. (Complete-HTML drafts already returned above and are
       // not size-limited.)
       if (contentDraft.length > CREATE_HTML_RENDER_MAX_DRAFT_CHARS) {
-        console.warn(`AgentMode: create_html_file — draft too large to render in one file (${contentDraft.length} chars > ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS})`);
-        return {
-          success: false,
-          message: 'Draft too large to render into a single HTML file',
-          error: `content_draft is too large to render into one HTML file in a single pass (${contentDraft.length} characters, limit ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}). Either provide the draft as a complete, self-contained HTML document (which is saved directly without limit), or split it into smaller sections and create multiple files.`
-        };
+        console.warn(`AgentMode: create_html_file — draft too large for an LLM render (${contentDraft.length} chars > ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}); delivering it deterministically instead`);
+        // ENG-873: keep ENG-472's "spend nothing on a render that cannot finish"
+        // rule, but not its "return nothing" outcome — that is the same way the
+        // 40-competitor report was stranded, only at a larger size. The
+        // deterministic renderer has no size ceiling and costs no LLM call, so
+        // the completed work is still delivered as the requested HTML file.
+        return await this.deliverDeterministicHtmlFallback(
+          title, contentDraft, userId, documentType,
+          new Error(`content_draft is too large for the styled render (${contentDraft.length} characters, limit ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}) — split it into smaller sections, or send a complete self-contained HTML document, which is saved verbatim with no size limit`),
+        );
       }
 
       // Use Claude model by default (check for Claude in model name)
@@ -26088,8 +26484,13 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       // Import LLMService
       const { createLLMService } = await import('../utils/llmService');
-      // Use high token limit for HTML generation — reports like GTM audits can be large
-      const llmService = createLLMService(defaultClaudeModel, 0.8, 64000);
+      // Use high token limit for HTML generation — reports like GTM audits can be large.
+      // ENG-873: stream the render. A 64K-token document routinely takes longer than
+      // the Bedrock client's 5-minute socket-inactivity timeout to generate, and a
+      // NON-streaming call puts nothing on the socket until it is completely done —
+      // so every large report timed out deterministically. Streaming keeps bytes
+      // flowing, so the inactivity timer never fires mid-generation.
+      const llmService = createLLMService(defaultClaudeModel, 0.8, 64000, { streaming: true });
 
       // Email mode produces a one-off newsletter/marketing email rendered in
       // HTML that is safe across email clients (Gmail, Outlook, Apple Mail).
@@ -26203,13 +26604,44 @@ Please generate a complete, professional HTML document that properly formats and
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
       const maxRenderAttempts = 3;
       let htmlContent = '';
-      for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
+      let renderFailure: unknown = null;
+      // ENG-873: above this draft size a render TIMEOUT is a property of the
+      // payload, not a blip — the same monolithic render cannot fit in the same
+      // per-call budget on a second attempt, so a retry just spends another five
+      // minutes reaching the identical failure. Below it, ENG-203's retry still
+      // applies: a small draft that times out really did hit a one-off blip.
+      const timeoutIsDeterministic = contentDraft.length > CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS;
+
+      // ENG-873: a draft too big for one render is not rendered in one call at
+      // all. Emails are excluded — an email is a single assembled table layout
+      // that cannot be stitched together from independently designed pieces.
+      const renderInSections =
+        !isEmail && contentDraft.length > CREATE_HTML_RENDER_SINGLE_PASS_MAX_DRAFT_CHARS;
+      if (renderInSections) {
+        try {
+          htmlContent = await this.renderHtmlDraftInSections(
+            title, contentDraft, formatRequirements, userId, sessionId, llmService,
+          );
+        } catch (sectionError) {
+          console.error(`AgentMode: sectioned HTML render failed on a ${contentDraft.length}-char draft (session ${sessionId}):`, sectionError instanceof Error ? sectionError.message : sectionError);
+          renderFailure = sectionError;
+        }
+      }
+      // Sectioned drafts have already been rendered (or failed) above.
+      const singlePassAttempts = renderInSections ? 0 : maxRenderAttempts;
+      for (let attempt = 1; attempt <= singlePassAttempts; attempt++) {
         try {
           htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
           break;
         } catch (renderError) {
           const isLastAttempt = attempt === maxRenderAttempts;
           const isTransient = isTransientLLMError(renderError);
+          const renderErrorText = renderError instanceof Error ? renderError.message : renderError;
+          if (timeoutIsDeterministic && isRenderTimeoutError(renderError)) {
+            console.error(`AgentMode: HTML render timed out on a ${contentDraft.length}-char draft (session ${sessionId}) — too large to re-render inside the per-call budget, degrading instead of retrying:`, renderErrorText);
+            renderFailure = renderError;
+            break;
+          }
           if (isLastAttempt || !isTransient) {
             // Distinguish exhaustion from a terminal error. If every attempt hit a
             // transient timeout, the render likely can't finish inside the per-call
@@ -26218,18 +26650,30 @@ Please generate a complete, professional HTML document that properly formats and
             // chunking the render (ENG-203 follow-up). Log it distinctly so these are
             // greppable and separable from one-off blips and terminal errors.
             if (isLastAttempt && isTransient) {
-              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderError instanceof Error ? renderError.message : renderError);
+              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderErrorText);
             }
-            throw renderError;
+            renderFailure = renderError;
+            break;
           }
           const backoffMs = 1000 * Math.pow(2, attempt - 1);
-          console.warn(`AgentMode: HTML render attempt ${attempt}/${maxRenderAttempts} failed with a transient error, retrying in ${backoffMs}ms:`, renderError instanceof Error ? renderError.message : renderError);
+          console.warn(`AgentMode: HTML render attempt ${attempt}/${maxRenderAttempts} failed with a transient error, retrying in ${backoffMs}ms:`, renderErrorText);
           await this.sleep(backoffMs);
         }
       }
 
-      if (!htmlContent || htmlContent.trim().length === 0) {
-        throw new Error('LLM did not generate HTML content');
+      if (!renderFailure && (!htmlContent || htmlContent.trim().length === 0)) {
+        renderFailure = new Error('LLM did not generate HTML content');
+      }
+
+      // ENG-873: the styled render is a FORMATTING step at the very end of a run
+      // that may have cost an hour of research. Losing it must never lose the
+      // work: render the draft deterministically and deliver that instead of
+      // returning nothing (which is what stranded a completed 40-competitor
+      // report — two monolithic renders, two timeouts, no deliverable at all).
+      if (renderFailure) {
+        return await this.deliverDeterministicHtmlFallback(
+          title, contentDraft, userId, documentType, renderFailure,
+        );
       }
 
       // Upload to S3
@@ -26259,6 +26703,149 @@ Please generate a complete, professional HTML document that properly formats and
         message: 'Failed to create HTML file',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
+    }
+  }
+
+  /**
+   * ENG-873 — render a draft that is too large for one call as N section
+   * renders, then assemble the fragments into a single document under one
+   * stylesheet (supplied by chunkedHtmlRender, not by the model, so sections
+   * cannot drift apart visually).
+   *
+   * Sections render concurrently: each is well inside the per-call budget, so
+   * the wall-clock cost is roughly one render rather than N. A section that
+   * fails transiently is retried once — losing an hour of research to one blip
+   * on one section of the report is exactly the failure being fixed here. If a
+   * section still cannot render, this throws and the caller degrades to the
+   * deterministic document, which never loses content.
+   */
+  private async renderHtmlDraftInSections(
+    title: string,
+    contentDraft: string,
+    formatRequirements: string,
+    userId: string,
+    sessionId: string,
+    llmService: {
+      generateHTML: (
+        systemPrompt: string,
+        userPrompt: string,
+        onUsage: any,
+        context: any,
+      ) => Promise<string>;
+    },
+  ): Promise<string> {
+    const { splitDraftIntoRenderChunks, extractHtmlFragment, assembleChunkedHtmlDocument } =
+      await import('../utils/chunkedHtmlRender');
+
+    const chunks = splitDraftIntoRenderChunks(contentDraft, CREATE_HTML_RENDER_CHUNK_MAX_CHARS);
+    if (chunks.length === 0) {
+      throw new Error('content_draft contains no renderable content');
+    }
+    console.log(`AgentMode: create_html_file — rendering a ${contentDraft.length}-char draft as ${chunks.length} sections (session ${sessionId})`);
+
+    const systemPrompt = `You are an expert web developer rendering ONE SECTION of a larger HTML report. Convert the section of the content draft you are given into clean, professional HTML.
+
+Return ONLY the HTML body fragment for this section:
+- No document-level markup at all — no doctype, no html/head/body tags, no stylesheet block and no scripts. The surrounding document and its stylesheet already exist.
+- Use semantic tags (h2, h3, p, ul, ol, table/thead/tbody/tr/th/td, blockquote). They are already styled by the document's stylesheet, so do NOT add CSS, class names or style attributes.
+- Present the section's content faithfully and completely — every entity, row and figure in it must appear in your output.
+- Do not add an introduction, conclusion, or navigation for the report as a whole: other sections are rendered separately and assembled around yours.
+
+DATA ACCURACY RULES (CRITICAL):
+- NEVER invent, estimate, approximate, or round numeric values
+- Use ONLY the exact numbers, names, dates and links provided — copy them verbatim
+- NEVER use placeholder labels like "Competitor A" or "Label 1" — use the actual names
+- If a value is not present in the section, omit it rather than guessing
+
+CHARTS (if the section's data calls for one):
+- Use a QuickChart image only: https://quickchart.io/chart?v=2.9.4&c=<URL-encoded Chart.js v2 JSON config> as the src of an <img>
+- Every string in the chart config JSON must have BOTH an opening and a closing quote, and the whole config must be URL-encoded
+- Do not use inline Chart.js or any other script: sections are assembled into one page, so scripts and canvas ids would collide${formatRequirements ? `\n\nAdditional Format Requirements:\n${formatRequirements}` : ''}`;
+
+    const renderSection = async (chunk: string, index: number): Promise<string> => {
+      const userPrompt = `Report title: ${title}
+
+This is section ${index + 1} of ${chunks.length} of the report.${index === 0 ? ' Open it with the report title in an <h1>, then use <h2> for the sections below it.' : ' Do not repeat the report title — the first section already carries it in an <h1>. Start at <h2>.'}
+
+Section content:
+${chunk}
+
+Return the HTML body fragment for this section only.`;
+      const maxSectionAttempts = 2;
+      for (let attempt = 1; attempt <= maxSectionAttempts; attempt++) {
+        try {
+          const rendered = await llmService.generateHTML(
+            systemPrompt,
+            userPrompt,
+            this.makeToolUsageCallback(sessionId, 'createHTMLFile'),
+            { userId, sessionId, feature: 'content_gen' },
+          );
+          const fragment = extractHtmlFragment(rendered);
+          if (!fragment) {
+            throw new Error(`section ${index + 1} of ${chunks.length} rendered empty`);
+          }
+          return fragment;
+        } catch (sectionError) {
+          // A streamed render timeout arrives as a bare "Stream timed out
+          // because of no activity for 300000 ms" with no name or code, so
+          // isTransientLLMError alone does not recognise it — but on a section
+          // this small a timeout really is a blip, so it is worth one retry.
+          const isTransient = isTransientLLMError(sectionError) || isRenderTimeoutError(sectionError);
+          if (attempt === maxSectionAttempts || !isTransient) throw sectionError;
+          console.warn(`AgentMode: section ${index + 1}/${chunks.length} render failed transiently, retrying once:`, sectionError instanceof Error ? sectionError.message : sectionError);
+          await this.sleep(1000);
+        }
+      }
+      // Unreachable: the loop either returns a fragment or throws.
+      throw new Error(`section ${index + 1} of ${chunks.length} could not be rendered`);
+    };
+
+    const fragments = await Promise.all(chunks.map(renderSection));
+    return assembleChunkedHtmlDocument(title, fragments);
+  }
+
+  /**
+   * ENG-873 — graceful degradation for create_html_file. When the styled render
+   * cannot run, convert the draft to HTML deterministically (no LLM, no network,
+   * no size ceiling) and deliver THAT, so a downstream formatting failure can
+   * never discard the upstream work that produced the draft.
+   *
+   * Throws the original render failure if the fallback itself cannot be
+   * delivered — the caller's catch then reports the real error, as before.
+   */
+  private async deliverDeterministicHtmlFallback(
+    title: string,
+    contentDraft: string,
+    userId: string,
+    documentType: 'document' | 'email',
+    renderFailure: unknown,
+  ): Promise<any> {
+    const reason = renderFailure instanceof Error ? renderFailure.message : String(renderFailure);
+    let uploadResult: { success: boolean; url?: string; error?: string };
+    try {
+      const { renderMarkdownReportDocumentAsync } = await import('../utils/markdownHtmlReport');
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
+      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      uploadResult = await uploadFileToS3(fallbackHtml, filename, userId, 'text/html');
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+      }
+      console.warn(`AgentMode: create_html_file — styled render failed (${reason}); delivered a deterministically rendered fallback document instead:`, uploadResult.url);
+      return {
+        success: true,
+        s3_url: uploadResult.url,
+        filename,
+        title,
+        document_type: documentType,
+        rendered: false,
+        degraded: true,
+        degraded_reason: reason,
+        message: `HTML file created, but with basic built-in styling: the styled render step failed (${reason}), so the draft was converted to HTML directly. The full content is intact — nothing was lost. Do NOT call create_html_file again with the same draft; it will fail the same way. Give the user this file and mention the simpler styling. If they want the richer design, send a complete self-contained HTML document as content_draft (that is saved verbatim, with no size limit) or split the report into smaller sections.`,
+      };
+    } catch (fallbackError) {
+      console.error('AgentMode: create_html_file — deterministic fallback also failed:', fallbackError);
+      throw renderFailure;
     }
   }
 
@@ -26344,8 +26931,11 @@ Please generate a complete, professional HTML document that properly formats and
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
       const { createLLMService } = await import('../utils/llmService');
-      // Use 16K tokens for HTML template generation to avoid truncation
-      const llmService = createLLMService(defaultClaudeModel, 0.8, 16384);
+      // Use 16K tokens for HTML template generation to avoid truncation.
+      // Streamed for the same reason as the create_html_file render above
+      // (ENG-873) — a 16K-token template can also outrun the 5-minute
+      // socket-inactivity timeout when the call returns nothing until it ends.
+      const llmService = createLLMService(defaultClaudeModel, 0.8, 16384, { streaming: true });
 
       // Build system prompt for HTML template creation
       const systemPrompt = `You are an expert web developer and HTML email template designer. Your task is to create or enhance an HTML email template based on the provided HTML content and instructions.

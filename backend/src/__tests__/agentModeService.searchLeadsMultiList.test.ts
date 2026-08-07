@@ -181,4 +181,41 @@ describe('AgentModeService.searchLeads — multi-list (list_ids)', () => {
     expect(result.leads).toHaveLength(1);
     expect(result.listName).toBe('List A');
   });
+
+  it('accepts a non-empty keyword search without structured filters', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue(listA as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [buildLead('list-A', 'a-1', 'founder@openrouter.ai')],
+      lastEvaluatedKey: null,
+    } as any);
+
+    const result = await service.searchLeads(
+      'list-A',
+      [],
+      userId,
+      10,
+      { search: 'openrouter.ai' },
+    );
+
+    expect(result.success).toBe(true);
+    expect(result.leads).toHaveLength(1);
+    expect(result.leads[0].email).toBe('founder@openrouter.ai');
+  });
+
+  it('keeps filter-free bulk deletion blocked', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue(listA as any);
+
+    const result = await service.deleteLeadsByFilter('list-A', [], userId);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/filter criterion/i);
+  });
+
+  it('still rejects search_leads with neither filters nor a search term', async () => {
+    const result = await service.searchLeads('list-A', [], userId);
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/filter criterion/i);
+    expect(mockCrmDb.getLeadListById).not.toHaveBeenCalled();
+  });
 });

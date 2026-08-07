@@ -1634,7 +1634,11 @@ export class MetaService {
         'child_attachments{link,image_hash,picture,name,description,video_id,call_to_action}},' +
         'video_data{video_id,image_hash,image_url,title,message,call_to_action}}';
       const fields = [
-        'id', 'name', 'body', 'title', 'image_url', 'thumbnail_url',
+        // account_id is requested so callers can bind the returned node to the ad
+        // account they intended to read (ENG-471). A Meta OAuth token can span
+        // several ad accounts, so a creative id alone does not identify a tenant.
+        // Additive for existing callers, which simply ignore the extra field.
+        'id', 'account_id', 'name', 'body', 'title', 'image_url', 'thumbnail_url',
         'object_type', 'link_url', objectStorySpecField, 'asset_feed_spec', 'url_tags'
       ];
       this.log(`Fetching ad creative: ${creativeId}`);
