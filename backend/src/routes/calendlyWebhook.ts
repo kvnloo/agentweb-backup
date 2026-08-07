@@ -300,57 +300,73 @@ router.post('/', (req: express.Request, res: express.Response) => {
           }
 
           const existingLead = await crmDb.getLeadByEmail(listId, email.trim().toLowerCase());
-          let lead: any;
-          let eventType: 'created' | 'updated';
-          if (existingLead) {
-            await crmDb.updateLead(listId, existingLead.leadId, {
-              customFields: {
-                ...(existingLead.customFields || {}),
-                lastBookedAt: new Date().toISOString(),
-                lastBookingUri: parsed.payload.uri,
-              },
-            });
-            lead = existingLead;
-            eventType = 'updated';
+
+          // Idempotency: CAPI already dedupes a Calendly redelivery via Meta's own
+          // event_id collapsing (see file header comment) — but nothing protects THIS
+          // leg, so a redelivery of the same invitee.created event (e.g. our 200 response
+          // didn't reach Calendly) would otherwise repeat the HubSpot/Attio sync and fire
+          // a duplicate customer-facing alert for a booking already fully processed.
+          // bookingUri covers a redelivery of the very first booking (create path, before
+          // any update happened); lastBookingUri covers every booking after that.
+          const alreadyProcessed =
+            existingLead?.customFields?.lastBookingUri === parsed.payload.uri ||
+            existingLead?.customFields?.bookingUri === parsed.payload.uri;
+
+          if (alreadyProcessed) {
+            console.log(`[Calendly Webhook] Duplicate delivery for already-processed booking ${parsed.payload.uri} — skipping CRM-forward re-processing`);
           } else {
-            lead = await crmDb.createLead(listId, {
-              email: email.trim(),
-              firstName,
-              lastName,
-              customFields: {
-                source: 'calendly_booking',
-                bookedAt: new Date().toISOString(),
-                bookingUri: parsed.payload.uri,
-              },
-            });
-            eventType = 'created';
-          }
-
-          void externalCrmSyncService.autoSyncLead(resolved.userId, listId, lead, 'hubspot', eventType)
-            .catch((err: any) => console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err));
-          void externalCrmSyncService.autoSyncLead(resolved.userId, listId, lead, 'attio', eventType)
-            .catch((err: any) => console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err));
-
-          // Same alert mechanism /forward-lead already uses — per-list opt-in via
-          // list.alertEvents, so this only notifies the customer if they've already
-          // configured this specific list to alert on lead-added/updated.
-          try {
-            const list = await crmDb.getLeadListById(listId);
-            if (list) {
-              const alertEventType = eventType === 'created' ? 'api.lead_added' : 'api.lead_updated';
-              await leadListAlertService.notifyLeadListOwnerIfConfigured(
-                list,
-                lead,
-                alertEventType,
-                { source: 'calendly_booking', bookingUri: parsed.payload.uri },
-                new Date().toISOString(),
-              );
+            let lead: any;
+            let eventType: 'created' | 'updated';
+            if (existingLead) {
+              await crmDb.updateLead(listId, existingLead.leadId, {
+                customFields: {
+                  ...(existingLead.customFields || {}),
+                  lastBookedAt: new Date().toISOString(),
+                  lastBookingUri: parsed.payload.uri,
+                },
+              });
+              lead = existingLead;
+              eventType = 'updated';
+            } else {
+              lead = await crmDb.createLead(listId, {
+                email: email.trim(),
+                firstName,
+                lastName,
+                customFields: {
+                  source: 'calendly_booking',
+                  bookedAt: new Date().toISOString(),
+                  bookingUri: parsed.payload.uri,
+                },
+              });
+              eventType = 'created';
             }
-          } catch (alertError: any) {
-            console.error('[Calendly Webhook] Lead alert failed:', alertError?.message ?? alertError);
-          }
 
-          console.log(`[Calendly Webhook] CRM-forward: lead ${eventType} in list ${listId} for user ${resolved.userId}`);
+            void externalCrmSyncService.autoSyncLead(resolved.userId, listId, lead, 'hubspot', eventType)
+              .catch((err: any) => console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err));
+            void externalCrmSyncService.autoSyncLead(resolved.userId, listId, lead, 'attio', eventType)
+              .catch((err: any) => console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err));
+
+            // Same alert mechanism /forward-lead already uses — per-list opt-in via
+            // list.alertEvents, so this only notifies the customer if they've already
+            // configured this specific list to alert on lead-added/updated.
+            try {
+              const list = await crmDb.getLeadListById(listId);
+              if (list) {
+                const alertEventType = eventType === 'created' ? 'api.lead_added' : 'api.lead_updated';
+                await leadListAlertService.notifyLeadListOwnerIfConfigured(
+                  list,
+                  lead,
+                  alertEventType,
+                  { source: 'calendly_booking', bookingUri: parsed.payload.uri },
+                  new Date().toISOString(),
+                );
+              }
+            } catch (alertError: any) {
+              console.error('[Calendly Webhook] Lead alert failed:', alertError?.message ?? alertError);
+            }
+
+            console.log(`[Calendly Webhook] CRM-forward: lead ${eventType} in list ${listId} for user ${resolved.userId}`);
+          }
         }
       } catch (crmError: any) {
         console.error('[Calendly Webhook] CRM-forward leg failed:', crmError?.message ?? crmError);
