@@ -68,6 +68,21 @@ jest.mock('../services/leadListAlertService', () => ({
   },
 }));
 
+// asyncJobQueue (ENG-524 fast-follow): defaults to 'enqueued' so every existing test
+// below exercises the same inline-processing path it always did — the queue is a
+// crash-safety net, not a behavior change to the common case. Queue-specific behavior
+// (duplicate/unavailable) gets its own describe block further down.
+const mockEnqueueJob = jest.fn();
+const mockMarkJobComplete = jest.fn();
+const mockMarkJobFailed = jest.fn();
+const mockRegisterProcessor = jest.fn();
+jest.mock('../services/asyncJobQueue', () => ({
+  enqueueJob: (...a: any[]) => mockEnqueueJob(...a),
+  markJobComplete: (...a: any[]) => mockMarkJobComplete(...a),
+  markJobFailed: (...a: any[]) => mockMarkJobFailed(...a),
+  registerProcessor: (...a: any[]) => mockRegisterProcessor(...a),
+}));
+
 // ─── App setup ───────────────────────────────────────────────────────────────
 
 import calendlyWebhookRouter from '../routes/calendlyWebhook';
@@ -156,6 +171,9 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     mockAutoSyncLead.mockResolvedValue(undefined);
     mockCreateLeadList.mockResolvedValue({ listId: 'list-auto-created' });
     mockUpdateAccountConfig.mockResolvedValue(undefined);
+    mockEnqueueJob.mockResolvedValue('enqueued');
+    mockMarkJobComplete.mockResolvedValue(undefined);
+    mockMarkJobFailed.mockResolvedValue(undefined);
     // getLeadListById serves two callers: resolveOrCreateBookingList's deterministic-ID
     // lookup (should see "not found" by default, so the fallback-create path exercises
     // naturally) and the CRM-forward leg's "fetch full list for the alert" lookup on an
@@ -221,6 +239,83 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     expect(accessToken).toBe('meta-token');
     expect(event.eventId).toBe('https://api.calendly.com/scheduled_events/evt-2/invitees/inv-2');
     expect(event.email).toBe('lead@example.com');
+  });
+
+  describe('async job queue integration (ENG-524 fast-follow, Greptile P1)', () => {
+    it('enqueues before processing, with the resolved userId/accountId and the invitee URI as the dedupe key', async () => {
+      const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-9/invitees/inv-9' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockEnqueueJob).toHaveBeenCalledWith(
+        'calendly_webhook',
+        'https://api.calendly.com/scheduled_events/evt-9/invitees/inv-9',
+        expect.objectContaining({ userId: USER_ID, accountId: mockAccount.account_id, email: 'lead@example.com' }),
+      );
+    });
+
+    it('marks the job complete after successful processing when it was actually enqueued', async () => {
+      const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-10/invitees/inv-10' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockMarkJobComplete).toHaveBeenCalledWith('calendly_webhook', 'https://api.calendly.com/scheduled_events/evt-10/invitees/inv-10');
+    });
+
+    it('skips processing entirely when enqueueJob reports a duplicate', async () => {
+      mockEnqueueJob.mockResolvedValue('duplicate');
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
+      expect(mockCreateLead).not.toHaveBeenCalled();
+      expect(mockMarkJobComplete).not.toHaveBeenCalled();
+    });
+
+    it('still processes inline when enqueueJob reports "unavailable" (queue/table not provisioned yet)', async () => {
+      mockEnqueueJob.mockResolvedValue('unavailable');
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockSendCapiLeadEvent).toHaveBeenCalledTimes(1);
+      // No durable record was ever created for this delivery, so there's nothing to
+      // mark complete — matches the exact fire-and-forget behavior from before the
+      // queue existed.
+      expect(mockMarkJobComplete).not.toHaveBeenCalled();
+    });
+
+    it('marks the job failed (for the poller to retry) when processing throws and the job was enqueued', async () => {
+      mockResolveMetaPixelForUser.mockRejectedValue(new Error('meta down'));
+      mockGetLeadByEmail.mockRejectedValue(new Error('crm down'));
+      const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-11/invitees/inv-11' });
+
+      // Both legs of processCalendlyWebhookJob already catch their own errors internally
+      // and never throw out of the function — so to exercise the outer processing-failed
+      // path here, make userDb.getUserById itself throw, which IS outside any inner
+      // try/catch in processCalendlyWebhookJob.
+      mockGetUserById.mockRejectedValue(new Error('dynamo down'));
+
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockMarkJobFailed).toHaveBeenCalledWith(
+        'calendly_webhook',
+        'https://api.calendly.com/scheduled_events/evt-11/invitees/inv-11',
+        expect.any(Error),
+      );
+    });
   });
 
   it('sends "Schedule" as the CAPI event name, not the default "Lead" (PRD §6 step 3, matches ENG-522)', async () => {
