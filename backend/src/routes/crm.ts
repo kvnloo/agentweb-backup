@@ -2184,7 +2184,7 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
 
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
+    if (!(await canDestructiveCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
 
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.importLeadsFromSearch(userId, {
