@@ -67,6 +67,8 @@
  * fight. See the ENG-803 notes in agentModeSystemPrompt.ts.
  */
 
+import { isPublishName } from './hardeningGaps';
+
 /** The shape this resolver reads. Deliberately minimal — only the owner's opt-out. */
 export interface SchedulePublishApprovalInput {
   /**
@@ -158,4 +160,65 @@ export function classifySessionForPublishGate(
 ): PublishGateSessionClass {
   if (!session) return 'unverifiable';
   return session.sessionType === 'scheduled' ? 'scheduled' : 'allow';
+}
+
+/**
+ * ENG-803: does this call publish CONTENT to an external account?
+ *
+ * Scoped per dispatcher, because tools like twitter_manage_post and
+ * linkedin_manage_post mix publishing actions with pure reads. Blocking a whole
+ * dispatcher would stop an approval-required reply run from even FINDING the
+ * mentions it is supposed to draft answers to — it would produce nothing at all,
+ * not even the drafts the owner is waiting for.
+ *
+ * "Publishing" here means the action puts something on the owner's public presence
+ * under their name. That includes reshares (retweet / repost), not just authored
+ * text: an owner who asked to approve before publishing did not agree to have
+ * their feed posted to on their behalf either. Pure engagement signals that create
+ * no post (like, react, unlike, unretweet) and reads are excluded, as is
+ * delete_tweet — removal is governed by its own confirmation rules.
+ *
+ * Lives here rather than as a private in agentModeService so the enforcement tests
+ * exercise the REAL predicate. They previously re-declared a copy of this map and
+ * asserted against the copy, which passes no matter what the guard actually does.
+ */
+const DISPATCHER_PUBLISHING_ACTIONS: Record<string, ReadonlySet<string>> = {
+  twitter_manage_post: new Set(['reply', 'post_thread', 'quote_tweet', 'retweet']),
+  linkedin_manage_post: new Set(['comment', 'repost']),
+};
+
+/**
+ * Fold a dispatcher action to the one spelling this map is keyed on.
+ *
+ * MUST mirror the dispatcher (Greptile review #24, security). `_twitterManagePostImpl`
+ * opens with `args.action.replace(/_/g, '-')` and switches on the HYPHENATED form, so
+ * `post-thread` and `quote-tweet` are fully valid ways to publish. Comparing the raw
+ * value against underscore-only entries therefore let those two spellings sail past the
+ * guard and post on a schedule whose owner had required approval — the setting held
+ * only for models that happened to pick the other spelling.
+ *
+ * Folding hyphens to underscores covers both spellings with one entry. Lowercasing is
+ * belt-and-braces: the dispatcher's switch is case-sensitive, so a differently-cased
+ * action would be rejected downstream anyway — but a guard that is stricter than the
+ * dispatcher can only ever block a call that was going to fail, never allow one.
+ */
+function normalizePublishAction(action: unknown): string {
+  return typeof action === 'string' ? action.trim().toLowerCase().replace(/-/g, '_') : '';
+}
+
+export function isExternalContentPublish(toolName: string, args: any): boolean {
+  // publish_* / post_on_* — whole-tool publishers.
+  if (isPublishName(toolName)) return true;
+  if (!/_manage_post$/.test(toolName)) return false;
+
+  const known = DISPATCHER_PUBLISHING_ACTIONS[toolName];
+  // An UNKNOWN *_manage_post dispatcher is treated as publishing (Greptile review
+  // #22 flagged exactly this gap for linkedin_manage_post). A tool named
+  // "manage post" is a posting surface by definition, so a new one must not get a
+  // free pass simply because nobody added it here. The cost of the conservative
+  // default is that a read action on a future dispatcher is blocked on the
+  // minority of schedules that require approval; the cost of the permissive
+  // default is publishing without the consent the owner explicitly withheld.
+  if (!known) return true;
+  return known.has(normalizePublishAction(args?.action));
 }

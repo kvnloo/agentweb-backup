@@ -10,23 +10,14 @@
  * direction: too narrow and LinkedIn publishing slips through (review #22), too
  * broad and the reported X reply run can no longer even read the mentions it is
  * supposed to draft answers to.
+ *
+ * They import the REAL predicate. An earlier revision re-declared a copy of the
+ * action map here and asserted against the copy, which passes regardless of what the
+ * guard does — and duly kept passing while the guard was letting `post-thread`
+ * through (review #24).
  */
 
-import { isPublishName } from '../utils/hardeningGaps';
-
-// Mirrors AgentModeService.isExternalContentPublish.
-const DISPATCHER_PUBLISHING_ACTIONS: Record<string, Set<string>> = {
-  twitter_manage_post: new Set(['reply', 'post_thread', 'quote_tweet', 'retweet']),
-  linkedin_manage_post: new Set(['comment', 'repost']),
-};
-const isExternalContentPublish = (toolName: string, args: any): boolean => {
-  if (isPublishName(toolName)) return true;
-  if (!/_manage_post$/.test(toolName)) return false;
-  const known = DISPATCHER_PUBLISHING_ACTIONS[toolName];
-  const action = typeof args?.action === 'string' ? args.action : '';
-  if (!known) return true;
-  return known.has(action);
-};
+import { isExternalContentPublish } from '../utils/schedulePublishApproval';
 
 describe('ENG-803 publish enforcement — what counts as external content publishing', () => {
   it('covers the whole-tool publishers', () => {
@@ -47,6 +38,31 @@ describe('ENG-803 publish enforcement — what counts as external content publis
   it('covers the LinkedIn authored-publishing actions', () => {
     expect(isExternalContentPublish('linkedin_manage_post', { action: 'comment' })).toBe(true);
     expect(isExternalContentPublish('linkedin_manage_post', { action: 'repost' })).toBe(true);
+  });
+
+  // Greptile review #24 (security): `_twitterManagePostImpl` starts with
+  // `args.action.replace(/_/g, '-')` and switches on the HYPHENATED spelling, so
+  // `post-thread` and `quote-tweet` publish just as surely as their underscore
+  // twins. The guard compared the raw string against underscore-only entries, so an
+  // approval-required schedule was protected only against the spellings the model
+  // happened not to pick.
+  it('covers the hyphenated spelling the X dispatcher also accepts', () => {
+    for (const action of ['post-thread', 'quote-tweet']) {
+      expect(isExternalContentPublish('twitter_manage_post', { action })).toBe(true);
+    }
+    // …and the folding must not drag a read action in with it.
+    for (const action of ['list-replies', 'get-tweet-metrics', 'get-quote-tweets']) {
+      expect(isExternalContentPublish('twitter_manage_post', { action })).toBe(false);
+    }
+  });
+
+  it('is not defeated by casing or surrounding whitespace', () => {
+    // Stricter than the dispatcher on purpose: its switch is case-sensitive, so
+    // these would fail downstream anyway. A guard that over-blocks a call that was
+    // going to error is harmless; one that under-blocks publishes irreversibly.
+    expect(isExternalContentPublish('twitter_manage_post', { action: 'Post-Thread' })).toBe(true);
+    expect(isExternalContentPublish('twitter_manage_post', { action: ' reply ' })).toBe(true);
+    expect(isExternalContentPublish('linkedin_manage_post', { action: 'REPOST' })).toBe(true);
   });
 
   it('does NOT block the read actions the reported run depends on', () => {

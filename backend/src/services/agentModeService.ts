@@ -28,8 +28,7 @@ import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type Judge
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
-import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate } from '../utils/schedulePublishApproval';
-import { isPublishName } from '../utils/hardeningGaps';
+import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -7158,45 +7157,6 @@ export class AgentModeService {
   }
 
   /**
-   * ENG-803: does this call publish CONTENT to an external account?
-   *
-   * Scoped per dispatcher, because tools like twitter_manage_post and
-   * linkedin_manage_post mix publishing actions with pure reads. Blocking a whole
-   * dispatcher would stop an approval-required reply run from even FINDING the
-   * mentions it is supposed to draft answers to — it would produce nothing at all,
-   * not even the drafts the owner is waiting for.
-   *
-   * "Publishing" here means the action puts something on the owner's public presence
-   * under their name. That includes reshares (retweet / repost), not just authored
-   * text: an owner who asked to approve before publishing did not agree to have
-   * their feed posted to on their behalf either. Pure engagement signals that create
-   * no post (like, react, unlike, unretweet) and reads are excluded, as is
-   * delete_tweet — removal is governed by its own confirmation rules.
-   */
-  private static readonly DISPATCHER_PUBLISHING_ACTIONS: Record<string, Set<string>> = {
-    twitter_manage_post: new Set(['reply', 'post_thread', 'quote_tweet', 'retweet']),
-    linkedin_manage_post: new Set(['comment', 'repost']),
-  };
-
-  private static isExternalContentPublish(toolName: string, args: any): boolean {
-    // publish_* / post_on_* — whole-tool publishers.
-    if (isPublishName(toolName)) return true;
-    if (!/_manage_post$/.test(toolName)) return false;
-
-    const known = AgentModeService.DISPATCHER_PUBLISHING_ACTIONS[toolName];
-    const action = typeof args?.action === 'string' ? args.action : '';
-    // An UNKNOWN *_manage_post dispatcher is treated as publishing (Greptile review
-    // #22 flagged exactly this gap for linkedin_manage_post). A tool named
-    // "manage post" is a posting surface by definition, so a new one must not get a
-    // free pass simply because nobody added it here. The cost of the conservative
-    // default is that a read action on a future dispatcher is blocked on the
-    // minority of schedules that require approval; the cost of the permissive
-    // default is publishing without the consent the owner explicitly withheld.
-    if (!known) return true;
-    return known.has(action);
-  }
-
-  /**
    * ENG-803: ENFORCE the owner's publish-approval setting at dispatch, not just in
    * the prompt (Greptile review #21).
    *
@@ -7243,7 +7203,7 @@ export class AgentModeService {
     args: any,
     sessionId: string
   ): Promise<{ success: false; error: string; publishApprovalRequired: true } | null> {
-    if (!sessionId || !AgentModeService.isExternalContentPublish(toolName, args)) return null;
+    if (!sessionId || !isExternalContentPublish(toolName, args)) return null;
 
     let session: any;
     try {
