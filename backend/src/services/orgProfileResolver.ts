@@ -34,21 +34,32 @@ export async function resolveOrgProfileField(
   if (!org) return user?.[field];
   if (org[field]) return org[field];
 
-  console.warn(
-    `[orgProfileResolver] org ${org.orgId} has no ${field} — falling back to the owner's user record`
-  );
-
   const ownerUserId = org.ownerUserId;
-  if (!ownerUserId || ownerUserId === user?.userId) return user?.[field];
+  let fallback: any;
 
-  try {
-    const owner: any = await userDb.getUserById(ownerUserId);
-    return owner?.[field];
-  } catch (error: any) {
-    console.error(
-      `[orgProfileResolver] failed to load owner ${ownerUserId} for org ${org.orgId}:`,
-      error?.message
-    );
-    return user?.[field];
+  if (!ownerUserId || ownerUserId === user?.userId) {
+    fallback = user?.[field];
+  } else {
+    try {
+      const owner: any = await userDb.getUserById(ownerUserId);
+      fallback = owner?.[field];
+    } catch (error: any) {
+      console.error(
+        `[orgProfileResolver] failed to load owner ${ownerUserId} for org ${org.orgId}:`,
+        error?.message
+      );
+      fallback = user?.[field];
+    }
   }
+
+  // Warn only when the fallback actually recovered something. An org that has
+  // simply never had a brand/strategy anywhere is the normal empty state, and
+  // this resolver runs on every `/me` — warning there would be pure noise.
+  if (fallback) {
+    console.warn(
+      `[orgProfileResolver] org ${org.orgId} has no ${field} — serving the owner's user record instead`
+    );
+  }
+
+  return fallback;
 }
