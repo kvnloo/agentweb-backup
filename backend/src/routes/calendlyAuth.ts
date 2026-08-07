@@ -233,9 +233,16 @@ async function provisionCalendlyWebhook(
         params: { organization: profile.organization_uri, user: profile.user_uri, scope: 'user' },
         headers: { Authorization: `Bearer ${accessToken}` },
       });
-      const staleUri = (existing.data as any)?.collection?.[0]?.uri;
+      // Scoped to this user + scope:'user', but NOT to our app specifically — another
+      // third-party integration's scope:'user' webhook for the same Calendly user can
+      // legitimately appear in the same collection. Match on our own callback URL so a
+      // reconnect only ever deletes our own stale subscription, never someone else's.
+      const ourCallbackUrl = `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/webhooks/calendly`;
+      const staleUri = ((existing.data as any)?.collection ?? []).find(
+        (sub: any) => sub?.callback_url === ourCallbackUrl,
+      )?.uri;
       if (!staleUri) {
-        console.warn('[Calendly OAuth /connect] could not locate the stale webhook subscription to delete');
+        console.warn('[Calendly OAuth /connect] could not locate our own stale webhook subscription to delete');
         return { active: false };
       }
 
