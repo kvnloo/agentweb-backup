@@ -52,8 +52,12 @@ jest.mock('axios');
 const axios = require('axios');
 
 const queueCalendlyWebhookCleanup = jest.fn();
+const getOrphanedCalendlyWebhook = jest.fn((..._a: any[]): Promise<{ webhookId: string; refreshToken?: string } | null> => Promise.resolve(null));
+const clearOrphanedCalendlyWebhook = jest.fn((..._a: any[]) => Promise.resolve(undefined));
 jest.mock('../services/calendlyWebhookCleanupQueue', () => ({
   queueCalendlyWebhookCleanup: (...a: any[]) => queueCalendlyWebhookCleanup(...a),
+  getOrphanedCalendlyWebhook: (...a: any[]) => getOrphanedCalendlyWebhook(...a),
+  clearOrphanedCalendlyWebhook: (...a: any[]) => clearOrphanedCalendlyWebhook(...a),
 }));
 
 process.env.JWT_SECRET = 'test-jwt-secret';
@@ -123,6 +127,8 @@ beforeEach(() => {
   }));
   getAccountsByUserId.mockResolvedValue([]);
   queueCalendlyWebhookCleanup.mockResolvedValue(undefined);
+  getOrphanedCalendlyWebhook.mockResolvedValue(null);
+  clearOrphanedCalendlyWebhook.mockResolvedValue(undefined);
 });
 
 describe('GET /init', () => {
@@ -386,6 +392,7 @@ describe('POST /connect', () => {
 
     expect(res.status).toBe(500);
     expect(queueCalendlyWebhookCleanup).toHaveBeenCalledWith(
+      'user-123',
       expect.objectContaining({
         webhook_id: 'https://api.calendly.com/webhook_subscriptions/CCCCCCCCCCCCCCCC',
         refresh_token: 'refresh-1',
@@ -489,6 +496,61 @@ describe('POST /connect', () => {
         expect.stringContaining('webhook_subscriptions'),
         expect.objectContaining({ params: expect.anything() }),
       );
+    });
+
+    // Greptile P1 on #2291 (round 16): the local account record isn't the only place a
+    // prior webhook_id can live — if a previous disconnect/rollback's durable-queue
+    // enqueue was ALSO unavailable at that moment, the identifier was recorded in the
+    // orphan-webhook fallback table instead (calendlyWebhookCleanupQueue.ts). Reconnect
+    // must be able to self-heal from THAT too, not just a local record, while still
+    // never listing Calendly's shared webhook_subscriptions.
+    it('falls back to the orphan-webhook table to identify and delete a stale subscription when there is no local record for this identity', async () => {
+      getAccountsByUserId.mockResolvedValueOnce([]); // no local record — e.g. the account row was already deleted
+      getOrphanedCalendlyWebhook.mockResolvedValueOnce({ webhookId: 'https://api.calendly.com/webhook_subscriptions/ORPHAN9999999999' });
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce(duplicateError);
+      axios.delete = jest.fn().mockResolvedValueOnce({ data: {} });
+      axios.post.mockResolvedValueOnce(webhookCreatedResponse({ uri: 'https://api.calendly.com/webhook_subscriptions/FRESH3333333333' }));
+
+      const res = await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.account.config.booking_tracking_active).toBe(true);
+      expect(res.body.account.config.webhook_id).toBe('https://api.calendly.com/webhook_subscriptions/FRESH3333333333');
+      expect(getOrphanedCalendlyWebhook).toHaveBeenCalledWith('user-123', SAME_USER_URI);
+      expect(axios.delete).toHaveBeenCalledWith(
+        'https://api.calendly.com/webhook_subscriptions/ORPHAN9999999999',
+        expect.objectContaining({ headers: expect.objectContaining({ Authorization: expect.stringContaining('Bearer') }) }),
+      );
+      // Consumed — cleared so a future connect doesn't try to re-identify an already
+      // resolved orphan.
+      expect(clearOrphanedCalendlyWebhook).toHaveBeenCalledWith('user-123', SAME_USER_URI);
+    });
+
+    it('prefers the local account record over the orphan-webhook table when both exist', async () => {
+      // Deliberately does NOT seed getOrphanedCalendlyWebhook with a distinct value —
+      // the `??` in provisionCalendlyWebhook's caller short-circuits on the local
+      // record, so the orphan lookup must never even run (asserted below). If it
+      // incorrectly did run, its default (null) return would surface as a DIFFERENT
+      // bug (falling through with no webhookId at all), not a false pass here.
+      getAccountsByUserId.mockResolvedValueOnce([existingAccountFor('https://api.calendly.com/webhook_subscriptions/LOCAL4444444444')]);
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce(duplicateError);
+      axios.delete = jest.fn().mockResolvedValueOnce({ data: {} });
+      axios.post.mockResolvedValueOnce(webhookCreatedResponse());
+
+      await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(axios.delete).toHaveBeenCalledWith(
+        'https://api.calendly.com/webhook_subscriptions/LOCAL4444444444',
+        expect.anything(),
+      );
+      // Short-circuits on the local record — the orphan-table lookup is never even made.
+      expect(getOrphanedCalendlyWebhook).not.toHaveBeenCalled();
     });
 
     // The core tenant-isolation guarantee: a webhook_id recorded for a DIFFERENT Calendly

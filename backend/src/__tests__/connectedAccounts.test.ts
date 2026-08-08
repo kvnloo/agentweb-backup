@@ -1,3 +1,21 @@
+// calendlyWebhookCleanupQueue.ts (transitively imported by connectedAccounts.ts below)
+// creates its own AWS.DynamoDB.DocumentClient at MODULE LOAD time for the orphan-webhook
+// fallback table (round 16) — this mock must be declared and initialized BEFORE any
+// import that would trigger that module chain, since jest.mock('aws-sdk', ...) is
+// hoisted above imports but a plain const is not; declaring it after the imports left
+// a TDZ window where the hoisted mock factory ran before this const was initialized.
+const mockOrphanTableMethods = {
+    put: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    get: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+    delete: jest.fn().mockReturnValue({ promise: jest.fn().mockResolvedValue({}) }),
+};
+jest.mock('aws-sdk', () => ({
+    config: { update: jest.fn() },
+    DynamoDB: {
+        DocumentClient: jest.fn(() => mockOrphanTableMethods),
+    },
+}));
+
 import request from 'supertest';
 import express from 'express';
 import axios from 'axios';
@@ -632,6 +650,7 @@ describe('Connected Accounts Routes', () => {
                     access_token: 'access-token-1',
                     refresh_token: 'refresh-token-1',
                     webhook_id: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                    user_uri: 'https://api.calendly.com/users/AAAAAAAAAAAAAAAA',
                 },
             };
 
@@ -693,7 +712,7 @@ describe('Connected Accounts Routes', () => {
             // where "this subscription is now permanently unrecoverable" is observable at
             // all — it must escalate loudly (console.error) rather than warn, so it's
             // actionable/alertable in production monitoring instead of silently lost.
-            it('logs an actionable error (not just a warning) when the durable enqueue is still unavailable after the retry, right before the local account is deleted anyway', async () => {
+            it('falls back to the orphan-webhook table (and logs an actionable error, not just a warning) when the durable enqueue is still unavailable after the retry', async () => {
                 (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
                 (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
                 (axios.delete as jest.Mock).mockRejectedValue(new Error('token expired'));
@@ -704,8 +723,36 @@ describe('Connected Accounts Routes', () => {
 
                 expect(response.status).toBe(200);
                 expect(mockEnqueueJob).toHaveBeenCalledTimes(2);
-                expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('LOST webhook cleanup record'));
-                // Disconnect still succeeds locally even though the identifier is now lost.
+                // Greptile P1 on #2291 (round 16): the async job queue is itself the thing
+                // failing to accept writes here, so a durable fallback that ALSO writes to
+                // that same table would have no value — the orphan-webhook table is a
+                // genuinely separate table with a real chance of succeeding.
+                expect(mockOrphanTableMethods.put).toHaveBeenCalledWith(expect.objectContaining({
+                    Item: expect.objectContaining({
+                        id: 'test_user_id_https://api.calendly.com/users/AAAAAAAAAAAAAAAA',
+                        webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                    }),
+                }));
+                expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Recorded orphaned webhook'));
+                // Disconnect still succeeds locally even though the identifier is only
+                // recoverable via the fallback table now, not the local account record.
+                expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
+
+                errorSpy.mockRestore();
+            });
+
+            it('logs "LOST webhook cleanup record" when BOTH the durable enqueue and the orphan-webhook fallback table are unavailable', async () => {
+                (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
+                (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+                (axios.delete as jest.Mock).mockRejectedValue(new Error('token expired'));
+                mockEnqueueJob.mockResolvedValue('unavailable');
+                mockOrphanTableMethods.put.mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('dynamo down too')) });
+                const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+                const response = await request(app).delete('/api/oauth/connected-accounts/calendly/jane%40customer.com');
+
+                expect(response.status).toBe(200);
+                expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('LOST webhook cleanup record'), expect.anything());
                 expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
 
                 errorSpy.mockRestore();
