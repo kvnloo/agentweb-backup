@@ -212,11 +212,24 @@ router.get("/me", async (req: Request, res: Response) => {
 
     // Get members (without sensitive data)
     const members = await orgDb.getOrgMembers(user.orgId);
+    // EFFECTIVE role, not the stored column. `roleOf` unions `ownerUserId`, so
+    // the billing root holds owner authority whatever their stored `orgRole`
+    // says — and that divergence is reachable: another owner can demote them,
+    // which changes the column and nothing else.
+    //
+    // Reporting the raw column then makes the roster contradict the authority
+    // on the same screen: the row renders "Member" while `capabilities` for
+    // that same user returns `canDeleteOrg`. Worse, a client gating a control
+    // on `orgRole !== "owner"` offers an admin a remove button the server then
+    // 403s, because `roleOf` disagrees with what the client was told.
+    //
+    // Found by a live run against real DynamoDB (ENG-954); every mocked test
+    // seeded the two fields in agreement, so none of them could see it.
     const safeMembers = members.map((m) => ({
       userId: m.userId,
       email: m.email,
       displayName: m.displayName,
-      orgRole: m.orgRole,
+      orgRole: roleOf({ userId: m.userId, orgId: m.orgId, orgRole: m.orgRole }, org),
     }));
 
     // ENG-953: this used to spread the whole Organization record, which carries

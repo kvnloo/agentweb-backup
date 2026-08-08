@@ -370,6 +370,48 @@ describe('adding people', () => {
   });
 });
 
+describe('the roster reports EFFECTIVE authority, not the stored column', () => {
+  const roster = () => request(app).get('/api/org/me');
+  const roleInRoster = async (userId: string) => {
+    const res = await roster();
+    return (res.body?.data?.members ?? []).find((m: any) => m.userId === userId)?.orgRole;
+  };
+
+  it('a demoted billing root still reports as owner, because they still ARE one', async () => {
+    // Reachable in production: promote a second owner, have them demote the
+    // billing root, and the stored column says member while `roleOf` — which
+    // unions ownerUserId — still grants owner authority. Live run, ENG-954.
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    await setRole('u-filipe', 'member');
+    expect(mockUsers['u-filipe'].orgRole).toBe('member'); // the column did change
+
+    // ...but the roster must not claim they are a plain member while the same
+    // response hands them canDeleteOrg.
+    expect(await roleInRoster('u-filipe')).toBe('owner');
+  });
+
+  it('the roster agrees with the capabilities in the same response', async () => {
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    await setRole('u-filipe', 'member');
+
+    actingUserId = 'u-filipe';
+    const res = await roster();
+    expect(res.body.data.capabilities.canDeleteOrg).toBe(true);
+    expect(res.body.data.callerRole).toBe('owner');
+    // The row for this very user, in this very payload.
+    expect(await roleInRoster('u-filipe')).toBe('owner');
+  });
+
+  it('ordinary members and admins are unaffected', async () => {
+    await setRole('u-eric', 'admin');
+    expect(await roleInRoster('u-eric')).toBe('admin');
+    expect(await roleInRoster('u-georgia')).toBe('member');
+    expect(await roleInRoster('u-filipe')).toBe('owner');
+  });
+});
+
 describe('invite -> accept: the whole admission round trip', () => {
   const invite = (email: string) => request(app).post(`/api/org/${ORG}/invite`).send({ email });
   const tokenFor = (email: string) =>
