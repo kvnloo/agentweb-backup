@@ -31,12 +31,14 @@ const mockUpdateLead = jest.fn();
 const mockSetLeadFields = jest.fn();
 const mockClaimLeadStepOnce = jest.fn();
 const mockGetLeadListById = jest.fn();
+const mockGetLeadById = jest.fn();
 jest.mock('../services/db', () => ({
   userDb: { getUserById: (...a: any[]) => mockGetUserById(...a) },
   crmDb: {
     createLeadList: (...a: any[]) => mockCreateLeadList(...a),
     getLeadByEmail: (...a: any[]) => mockGetLeadByEmail(...a),
     createLead: (...a: any[]) => mockCreateLead(...a),
+    getLeadById: (...a: any[]) => mockGetLeadById(...a),
     updateLead: (...a: any[]) => mockUpdateLead(...a),
     setLeadFields: (...a: any[]) => mockSetLeadFields(...a),
     claimLeadStepOnce: (...a: any[]) => mockClaimLeadStepOnce(...a),
@@ -190,6 +192,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       Promise.resolve(id === 'list-1' ? { listId: 'list-1', userId: USER_ID, name: 'Test List', alertEvents: ['api.lead_added', 'api.lead_updated'] } : null),
     );
     mockNotifyLeadListOwnerIfConfigured.mockResolvedValue(undefined);
+    mockGetLeadById.mockResolvedValue(null);
   });
 
   it('returns 200 immediately without a signature header, and does not call CAPI', async () => {
@@ -634,6 +637,85 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-new', {
         system: { [`alertSynced::${body.payload.uri}`]: { status: 'done' } },
       });
+    });
+
+    it('creates a brand-new lead with a deterministic leadId + failIfExists, not an auto-generated one', async () => {
+      mockGetLeadByEmail.mockResolvedValue(null);
+      mockCreateLead.mockResolvedValue({ leadId: 'lead-new', email: 'lead@example.com' });
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      await postSigned(body);
+      await flushPromises();
+
+      // Greptile P1 on #2291 (round 19): getLeadByEmail-then-createLead is a
+      // read-then-write, not atomic — a heartbeat-failure race letting two
+      // instances process the SAME booking concurrently could otherwise let both
+      // see "no existing lead" and both create one. A deterministic id (not a
+      // random one) is what lets a concurrent loser's create collide with this
+      // one instead of silently succeeding as a duplicate.
+      const call = mockCreateLead.mock.calls[0];
+      expect(call[1].failIfExists).toBe(true);
+      expect(call[1].leadId).toEqual(expect.stringMatching(/^lead_cal_[0-9a-f]{20}$/));
+      // Deterministic on (listId, email) — NOT on the booking URI — so a repeat
+      // booker's second-ever booking still resolves to the SAME lead identity.
+      const bodyB = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-2/invitees/inv-2' });
+      mockCreateLead.mockClear();
+      mockCreateLead.mockRejectedValueOnce(Object.assign(new Error('exists'), { leadAlreadyExists: true }));
+      mockGetLeadById.mockResolvedValueOnce({ leadId: 'lead-new', email: 'lead@example.com', customFields: {} });
+      await postSigned(bodyB);
+      await flushPromises();
+      expect(mockCreateLead.mock.calls[0][1].leadId).toBe(call[1].leadId);
+    });
+
+    // Greptile P1 on #2291 (round 19): if a concurrent instance wins the
+    // deterministic create (this instance's conditional put loses the race), the
+    // loser must adopt the winner's lead — not throw, not silently do nothing —
+    // and still record ITS OWN booking's lastBookedAt/lastBookingUri on it via
+    // the same atomic setLeadFields path already used for a genuinely
+    // pre-existing lead, then proceed through the normal per-step CRM forwarding.
+    it('adopts the winning lead (does not throw or duplicate) when a concurrent instance wins the create race', async () => {
+      mockGetLeadByEmail.mockResolvedValue(null); // this instance's own read saw no lead yet
+      mockCreateLead.mockRejectedValue(Object.assign(new Error('Lead already exists for this deterministic key'), { leadAlreadyExists: true }));
+      mockGetLeadById.mockResolvedValue({ leadId: 'lead-won-the-race', email: 'lead@example.com', customFields: { foo: 'bar' } });
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetLeadById).toHaveBeenCalledWith('list-1', expect.stringMatching(/^lead_cal_/));
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-won-the-race', {
+        customFields: { lastBookedAt: expect.any(String), lastBookingUri: body.payload.uri },
+      });
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(
+        USER_ID,
+        'list-1',
+        expect.objectContaining({ leadId: 'lead-won-the-race' }),
+        'hubspot',
+        'updated',
+      );
+      expect(mockMarkJobFailed).not.toHaveBeenCalled();
+    });
+
+    it('rethrows when createLead fails for a reason OTHER than a lost race (does not misinterpret a real error as adoption)', async () => {
+      mockGetLeadByEmail.mockResolvedValue(null);
+      mockCreateLead.mockRejectedValue(new Error('dynamo down'));
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetLeadById).not.toHaveBeenCalled();
+      expect(mockMarkJobFailed).toHaveBeenCalledWith('calendly_webhook', body.payload.uri, expect.objectContaining({ message: expect.stringContaining('dynamo down') }));
     });
 
     it('updates the existing lead and auto-syncs as "updated" when a lead with that email already exists', async () => {
