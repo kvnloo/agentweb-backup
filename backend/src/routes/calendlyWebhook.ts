@@ -207,6 +207,18 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
   // Two independent legs — CAPI attribution and CRM-forward. Each gets its own
   // try/catch so a failure in one (e.g. no Meta ad account connected, or a CRM
   // write error) never prevents the other from running.
+  //
+  // A genuine failure in either leg (or the HubSpot/Attio syncs or lead alert
+  // nested inside CRM-forward) is recorded here rather than only logged. All
+  // legs still run to completion regardless of an earlier one failing, but if
+  // anything failed we throw once at the end — so the caller's catch (and
+  // therefore markJobFailed) actually fires, letting the queue's poller retry.
+  // Before this, a leg's failure was logged and swallowed, the caller saw a
+  // clean resolve, and the job was marked 'completed' — permanently losing
+  // that attribution/CRM-forward/alert with no retry (Greptile P1 on #2291).
+  // An "expected skip" (no Meta pixel connected, no invitee email, a delivery
+  // already processed) is not a failure and must not be recorded as one.
+  const failures: string[] = [];
 
   try {
     const pixelResolution = await metaService.resolveMetaPixelForUser(owner, payload.userId);
@@ -235,6 +247,7 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
     }
   } catch (capiError: any) {
     console.error('[Calendly Webhook] CAPI leg failed:', capiError?.message ?? capiError);
+    failures.push(`CAPI: ${capiError?.message ?? capiError}`);
   }
 
   try {
@@ -305,10 +318,19 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
           eventType = 'created';
         }
 
-        void externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'hubspot', eventType)
-          .catch((err: any) => console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err));
-        void externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'attio', eventType)
-          .catch((err: any) => console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err));
+        // Awaited (not fire-and-forget) so a genuine sync failure is counted below —
+        // each still independently caught, so one platform's failure never blocks
+        // the other's sync from being attempted.
+        await externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'hubspot', eventType)
+          .catch((err: any) => {
+            console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err);
+            failures.push(`HubSpot sync: ${err?.message ?? err}`);
+          });
+        await externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'attio', eventType)
+          .catch((err: any) => {
+            console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err);
+            failures.push(`Attio sync: ${err?.message ?? err}`);
+          });
 
         // Same alert mechanism /forward-lead already uses — per-list opt-in via
         // list.alertEvents, so this only notifies the customer if they've already
@@ -327,6 +349,7 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
           }
         } catch (alertError: any) {
           console.error('[Calendly Webhook] Lead alert failed:', alertError?.message ?? alertError);
+          failures.push(`Lead alert: ${alertError?.message ?? alertError}`);
         }
 
         console.log(`[Calendly Webhook] CRM-forward: lead ${eventType} in list ${listId} for user ${payload.userId}`);
@@ -334,6 +357,11 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
     }
   } catch (crmError: any) {
     console.error('[Calendly Webhook] CRM-forward leg failed:', crmError?.message ?? crmError);
+    failures.push(`CRM-forward: ${crmError?.message ?? crmError}`);
+  }
+
+  if (failures.length > 0) {
+    throw new Error(`processCalendlyWebhookJob had ${failures.length} failure(s): ${failures.join('; ')}`);
   }
 }
 

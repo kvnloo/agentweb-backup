@@ -2,6 +2,7 @@ import express from 'express';
 import axios from 'axios';
 import { authenticateToken } from '../middleware/auth';
 import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, getAccountById, updateAccountConfig, FathomConfig, CalendlyConfig } from '../services/connectedAccountsDb';
+import { refreshCalendlyAccessToken } from './calendlyAuth';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
@@ -57,11 +58,38 @@ async function cleanupCalendlyWebhook(account: { config: unknown } | null): Prom
   const config = account.config as CalendlyConfig;
   if (!config.webhook_id || !config.access_token) return;
 
+  const attemptDelete = (accessToken: string) =>
+    axios.delete(config.webhook_id!, { headers: { Authorization: `Bearer ${accessToken}` } });
+
   try {
-    await axios.delete(config.webhook_id, { headers: { Authorization: `Bearer ${config.access_token}` } });
+    await attemptDelete(config.access_token);
     console.log(`[Calendly] Deleted webhook ${config.webhook_id} on disconnect`);
+    return;
   } catch (err: any) {
-    console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect:`, err?.response?.data || err?.message);
+    const isAuthError = err?.response?.status === 401 || err?.response?.status === 403;
+    if (!isAuthError || !config.refresh_token) {
+      console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect:`, err?.response?.data || err?.message);
+      return;
+    }
+  }
+
+  // The stored access token is short-lived and this cleanup often runs long after
+  // last activity — an auth failure here is expected, not exceptional. Refresh once
+  // and retry before giving up (Greptile P1 on #2291: silently accepting an expired
+  // token as final loses webhook_id along with the local account, permanently
+  // stranding the subscription since a later reconnect has nothing left to identify
+  // it with).
+  const refreshed = await refreshCalendlyAccessToken(config.refresh_token!);
+  if (!refreshed) {
+    console.warn(`[Calendly] Could not refresh token to clean up webhook ${config.webhook_id} on disconnect — leaving it orphaned`);
+    return;
+  }
+
+  try {
+    await attemptDelete(refreshed.access_token);
+    console.log(`[Calendly] Deleted webhook ${config.webhook_id} on disconnect (after token refresh)`);
+  } catch (retryErr: any) {
+    console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect even after token refresh:`, retryErr?.response?.data || retryErr?.message);
   }
 }
 

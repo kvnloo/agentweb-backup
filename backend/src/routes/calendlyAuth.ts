@@ -171,6 +171,38 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
   }
 });
 
+/**
+ * Refresh a Calendly access token using its refresh_token. Calendly access
+ * tokens are short-lived, so any caller holding a stored token from a prior
+ * session (e.g. disconnect's webhook cleanup, connectedAccounts.ts) should
+ * expect it may already be expired and be ready to refresh once before
+ * giving up. Returns null (never throws) if the refresh itself fails —
+ * e.g. the refresh_token was revoked, which needs a full reconnect anyway.
+ */
+export async function refreshCalendlyAccessToken(
+  refreshToken: string,
+): Promise<{ access_token: string; refresh_token: string } | null> {
+  try {
+    const config = await getCalendlyConfig();
+    const response = await axios.post(
+      config.tokenUrl,
+      new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+      }).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
+    );
+    const { access_token, refresh_token } = response.data as { access_token: string; refresh_token?: string };
+    // Calendly may or may not rotate the refresh token on use; keep the old one if not returned.
+    return { access_token, refresh_token: refresh_token ?? refreshToken };
+  } catch (error: any) {
+    console.warn('[Calendly] Token refresh failed:', error?.response?.data || error?.message);
+    return null;
+  }
+}
+
 // ── Webhook provisioning ─────────────────────────────────────────────────
 //
 // A reconnect (disconnect then re-connect) always attempts to create a fresh
