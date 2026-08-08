@@ -7955,10 +7955,16 @@ export const crmDb = {
         await dynamodb.update({
           TableName: tableName,
           Key: key,
+          // `system` is a DynamoDB reserved keyword — confirmed live against a real
+          // table (round 15/16 smoke test): using it unescaped throws
+          // ValidationException, invisible to unit tests since they mock
+          // dynamodb.update() and never validate expression syntax. #system placeholder
+          // required wherever it appears as a top-level attribute name in an expression.
           UpdateExpression:
             'SET customFields = if_not_exists(customFields, :emptyMap), ' +
             'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap), ' +
-            'system = if_not_exists(system, :emptyMap)',
+            '#system = if_not_exists(#system, :emptyMap)',
+          ExpressionAttributeNames: { '#system': 'system' },
           ExpressionAttributeValues: { ':emptyMap': {} },
           ConditionExpression: 'attribute_exists(leadId)',
         }).promise();
@@ -8033,11 +8039,12 @@ export const crmDb = {
 
     idx = 0;
     for (const [k, v] of Object.entries(options.system ?? {})) {
+      attrNames['#system'] = 'system'; // reserved keyword — must be a placeholder, see bootstrap above
       attrNames[`#sys${idx}`] = k;
       attrValues[`:sys${idx}`] = v;
       setClauses.push(ine
-        ? `system.#sys${idx} = if_not_exists(system.#sys${idx}, :sys${idx})`
-        : `system.#sys${idx} = :sys${idx}`);
+        ? `#system.#sys${idx} = if_not_exists(#system.#sys${idx}, :sys${idx})`
+        : `#system.#sys${idx} = :sys${idx}`);
       idx++;
     }
 
@@ -8057,8 +8064,9 @@ export const crmDb = {
 
     rmIdx = 0;
     for (const k of options.removeSystemKeys ?? []) {
+      attrNames['#system'] = 'system'; // reserved keyword — must be a placeholder, see bootstrap above
       attrNames[`#rmsys${rmIdx}`] = k;
-      removeClauses.push(`system.#rmsys${rmIdx}`);
+      removeClauses.push(`#system.#rmsys${rmIdx}`);
       rmIdx++;
     }
 
@@ -8143,7 +8151,12 @@ export const crmDb = {
       await dynamodb.update({
         TableName: tableName,
         Key: dynKey,
-        UpdateExpression: 'SET system = if_not_exists(system, :emptyMap)',
+        // `system` is a DynamoDB reserved keyword — confirmed live against a real
+        // table (round 15/16 smoke test): unescaped, this throws ValidationException,
+        // invisible to unit tests since they mock dynamodb.update() and never
+        // validate expression syntax against DynamoDB's actual reserved-word list.
+        UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
+        ExpressionAttributeNames: { '#system': 'system' },
         ExpressionAttributeValues: { ':emptyMap': {} },
         ConditionExpression: 'attribute_exists(leadId)',
       }).promise();
@@ -8157,10 +8170,10 @@ export const crmDb = {
       await dynamodb.update({
         TableName: tableName,
         Key: dynKey,
-        UpdateExpression: 'SET system.#k = :v, updatedAt = :ts',
-        ExpressionAttributeNames: { '#k': key },
+        UpdateExpression: 'SET #system.#k = :v, updatedAt = :ts',
+        ExpressionAttributeNames: { '#system': 'system', '#k': key },
         ExpressionAttributeValues: { ':v': 'in_progress', ':ts': new Date().toISOString() },
-        ConditionExpression: 'attribute_not_exists(system.#k)',
+        ConditionExpression: 'attribute_not_exists(#system.#k)',
       }).promise();
       return true;
     } catch (err: any) {
