@@ -132,12 +132,23 @@ describe('asyncJobQueue', () => {
       expect(updateCall.ExpressionAttributeValues[':completed']).toBe('completed');
     });
 
-    it('does not throw when markJobComplete itself fails (best-effort)', async () => {
+    it('retries once and succeeds when the first completion write transiently fails', async () => {
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('throttled')) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
+
+      await expect(markJobComplete('calendly_webhook', 'invitee-123')).resolves.toBeUndefined();
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not throw when markJobComplete fails on both the attempt and the retry (best-effort)', async () => {
       mockDocumentClientMethods.update.mockReturnValue({
         promise: jest.fn().mockRejectedValue(new Error('down')),
       });
 
       await expect(markJobComplete('calendly_webhook', 'invitee-123')).resolves.toBeUndefined();
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
     });
 
     it('re-queues (pending) after a failed attempt below the max attempt count', async () => {
@@ -163,6 +174,35 @@ describe('asyncJobQueue', () => {
       const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
       expect(updateCall.ExpressionAttributeValues[':status']).toBe('failed');
       expect(updateCall.ExpressionAttributeValues[':attempts']).toBe(5);
+    });
+
+    it('retries once and succeeds when the first failed-state write transiently fails', async () => {
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { id: 'calendly_webhook_invitee-123', attempts: 1 } }),
+      });
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('throttled')) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
+
+      await expect(markJobFailed('calendly_webhook', 'invitee-123', new Error('CAPI down'))).resolves.toBeUndefined();
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      // Both attempts read the SAME pre-retry attempts count (the failed first
+      // write never landed), so the retry increments from the same base rather
+      // than double-counting.
+      expect(mockDocumentClientMethods.update.mock.calls[1][0].ExpressionAttributeValues[':attempts']).toBe(2);
+    });
+
+    it('does not throw when markJobFailed fails on both the attempt and the retry (best-effort)', async () => {
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { id: 'calendly_webhook_invitee-123', attempts: 1 } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('down')),
+      });
+
+      await expect(markJobFailed('calendly_webhook', 'invitee-123', new Error('boom'))).resolves.toBeUndefined();
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
     });
   });
 
