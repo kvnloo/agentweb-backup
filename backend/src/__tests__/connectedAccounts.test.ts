@@ -872,6 +872,31 @@ describe('Connected Accounts Routes', () => {
                         expect.anything(),
                     );
                 });
+
+                // Greptile P1 on #2291 (round 20): the same rotation-loss bug as
+                // processCalendlyWebhookCleanupJob, one call site earlier. If Calendly
+                // rotates the refresh token on this refresh and the RETRY delete then
+                // fails too, the durable queue job must be enqueued with the NEW
+                // (rotated) token — not the stale pre-refresh one still on `config` —
+                // or that job's own first refresh attempt is guaranteed to fail too.
+                it('queues the retry with the ROTATED refresh token, not the stale pre-refresh one, when the retried delete still fails', async () => {
+                    (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
+                    (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+                    (axios.delete as jest.Mock).mockRejectedValue({ response: { status: 401 } });
+                    (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                        access_token: 'refreshed-access-token',
+                        refresh_token: 'rotated-refresh-token',
+                    });
+
+                    const response = await request(app).delete('/api/oauth/connected-accounts/calendly/jane%40customer.com');
+
+                    expect(response.status).toBe(200);
+                    expect(mockEnqueueJob).toHaveBeenCalledWith(
+                        'calendly_webhook_cleanup',
+                        'https://api.calendly.com/webhook_subscriptions/AAAA',
+                        expect.objectContaining({ refreshToken: 'rotated-refresh-token' }),
+                    );
+                });
             });
         });
 
