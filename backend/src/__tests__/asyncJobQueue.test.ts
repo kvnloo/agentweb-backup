@@ -309,6 +309,65 @@ describe('asyncJobQueue', () => {
     });
   });
 
+  // Greptile P1 on #2291 (round 9): startHeartbeat existed but was only ever wired
+  // into the inline-processing path (claimImmediately). A job the POLLER itself
+  // claims (pending, or reclaimed-stale) went through processClaimedJob with no
+  // heartbeat at all, so a poller-owned job that ran longer than
+  // STALE_PROCESSING_MS was reclaimed and processed a second time concurrently —
+  // the exact race the inline-path heartbeat was built to close, just reopened on
+  // the other claim path.
+  describe('processClaimedJob heartbeat', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('keeps a poller-claimed job\'s updatedAt fresh via heartbeat while its processor is still running', async () => {
+      let resolveProcessor: () => void = () => {};
+      const handler = jest.fn(() => new Promise<void>((resolve) => { resolveProcessor = resolve; }));
+      registerProcessor('test_source_hb', handler);
+
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ id: 'test_source_hb_abc', source: 'test_source_hb', status: 'pending', payload: '{}', attempts: 0, updatedAt: '2026-01-01T00:00:00.000Z' }],
+          }),
+        })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+
+      const pollPromise = pollAndProcessOnce();
+      // Fake timers also fake setImmediate, so flush the claim's own promise
+      // chain (dynamodb.update().promise()) with plain microtask hops instead.
+      for (let i = 0; i < 5; i++) {
+        await Promise.resolve();
+      }
+
+      await jest.advanceTimersByTimeAsync(60_000);
+
+      const heartbeatCall = mockDocumentClientMethods.update.mock.calls.find(
+        (c: any) => c[0].ConditionExpression === '#status = :processing' && c[0].Key?.id === 'test_source_hb_abc',
+      );
+      expect(heartbeatCall).toBeDefined();
+
+      resolveProcessor();
+      await pollPromise;
+
+      const heartbeatCallsAfterCompletion = mockDocumentClientMethods.update.mock.calls.filter(
+        (c: any) => c[0].ConditionExpression === '#status = :processing',
+      ).length;
+
+      await jest.advanceTimersByTimeAsync(60_000);
+
+      const heartbeatCallsAfterAnotherTick = mockDocumentClientMethods.update.mock.calls.filter(
+        (c: any) => c[0].ConditionExpression === '#status = :processing',
+      ).length;
+      expect(heartbeatCallsAfterAnotherTick).toBe(heartbeatCallsAfterCompletion);
+    });
+  });
+
   // Greptile P1 on #2291: inline processing slower than the poller's stale
   // threshold used to look identical, to the poller's stale-reclamation query,
   // as a claim whose owning instance crashed — the poller would claim and

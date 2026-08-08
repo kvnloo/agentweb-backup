@@ -28,6 +28,7 @@ const mockCreateLeadList = jest.fn();
 const mockGetLeadByEmail = jest.fn();
 const mockCreateLead = jest.fn();
 const mockUpdateLead = jest.fn();
+const mockSetLeadFields = jest.fn();
 const mockGetLeadListById = jest.fn();
 jest.mock('../services/db', () => ({
   userDb: { getUserById: (...a: any[]) => mockGetUserById(...a) },
@@ -36,6 +37,7 @@ jest.mock('../services/db', () => ({
     getLeadByEmail: (...a: any[]) => mockGetLeadByEmail(...a),
     createLead: (...a: any[]) => mockCreateLead(...a),
     updateLead: (...a: any[]) => mockUpdateLead(...a),
+    setLeadFields: (...a: any[]) => mockSetLeadFields(...a),
     getLeadListById: (...a: any[]) => mockGetLeadListById(...a),
   },
 }));
@@ -170,6 +172,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     mockGetLeadByEmail.mockResolvedValue(null);
     mockCreateLead.mockResolvedValue({ leadId: 'lead-1', email: 'lead@example.com' });
     mockUpdateLead.mockResolvedValue(undefined);
+    mockSetLeadFields.mockResolvedValue(undefined);
     mockAutoSyncLead.mockResolvedValue(undefined);
     mockCreateLeadList.mockResolvedValue({ listId: 'list-auto-created' });
     mockUpdateAccountConfig.mockResolvedValue(undefined);
@@ -574,17 +577,18 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockCreateLead).toHaveBeenCalledTimes(1);
       expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', expect.objectContaining({ leadId: 'lead-new' }), 'hubspot', 'created');
       expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', expect.objectContaining({ leadId: 'lead-new' }), 'attio', 'created');
-      // Each downstream step succeeded, so each writes its own completion marker —
-      // this is what lets a later retry recognize exactly which steps are already done.
-      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-new', expect.objectContaining({
-        customFields: expect.objectContaining({ hubspotSyncedUri: body.payload.uri }),
-      }));
-      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-new', expect.objectContaining({
-        customFields: expect.objectContaining({ attioSyncedUri: body.payload.uri }),
-      }));
-      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-new', expect.objectContaining({
-        customFields: expect.objectContaining({ alertSentUri: body.payload.uri }),
-      }));
+      // Each downstream step succeeded, so each writes its own completion marker via
+      // crmDb.setLeadFields's atomic customFields sub-key SET — this is what lets a
+      // later retry recognize exactly which steps are already done.
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-new', {
+        customFields: { hubspotSyncedUri: body.payload.uri },
+      });
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-new', {
+        customFields: { attioSyncedUri: body.payload.uri },
+      });
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-new', {
+        customFields: { alertSentUri: body.payload.uri },
+      });
     });
 
     it('updates the existing lead and auto-syncs as "updated" when a lead with that email already exists', async () => {
@@ -600,14 +604,17 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       await flushPromises();
 
       expect(mockCreateLead).not.toHaveBeenCalled();
-      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
-        customFields: expect.objectContaining({ foo: 'bar' }),
-      }));
-      // Greptile P1 on #2291 (round 6): the lead passed downstream must reflect what
-      // was ACTUALLY just written to the DB (foo preserved, lastBookedAt/lastBookingUri
-      // now present) — not the pre-update snapshot. crmDb.updateLead's customFields is
-      // a full-attribute replace, so a downstream step later re-serializing a stale
-      // snapshot would silently erase these fields from the real record.
+      // Greptile P1 on #2291 (round 9): only lastBookedAt/lastBookingUri are written —
+      // NOT a full customFields snapshot including 'foo' — because crmDb.setLeadFields
+      // SETs individual customFields sub-keys (`customFields.lastBookedAt = :v`) rather
+      // than replacing the whole map, so a concurrent booking's own write to a
+      // different key on this same lead can never be clobbered by this one.
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
+        customFields: { lastBookedAt: expect.any(String), lastBookingUri: expect.any(String) },
+      });
+      // The lead object passed downstream must still reflect what's ACTUALLY in the DB
+      // (foo preserved, lastBookedAt/lastBookingUri now present) — built in-memory from
+      // the pre-update snapshot plus exactly what was just written.
       expect(mockAutoSyncLead).toHaveBeenCalledWith(
         USER_ID,
         'list-1',
@@ -630,7 +637,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       );
     });
 
-    it('does not erase lastBookedAt/lastBookingUri when a downstream step writes its own completion marker for an updated lead', async () => {
+    it('does not clobber concurrent customFields when a downstream step writes its own completion marker for an updated lead', async () => {
       const existingLead = { leadId: 'lead-existing', email: 'lead@example.com', customFields: { foo: 'bar' } };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
@@ -642,17 +649,21 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(res.status).toBe(200);
       await flushPromises();
 
-      // The FIRST downstream marker write (hubspotSyncedUri) is the one that would have
-      // clobbered the DB's customFields down to just { foo, hubspotSyncedUri } if `lead`
-      // still referenced the pre-update snapshot — it must instead carry forward
-      // everything the immediately-preceding updateLead call actually persisted.
-      const markerCall = mockUpdateLead.mock.calls.find(
+      // Greptile P1 on #2291 (round 9): the FIRST downstream marker write
+      // (hubspotSyncedUri) used to re-serialize a full in-memory customFields
+      // snapshot, so a DIFFERENT booking for this same lead completing concurrently
+      // (writing, say, its own step marker between this job's read and this write)
+      // would have its write silently overwritten. Asserting the marker call's
+      // customFields payload contains ONLY the one key being marked — not foo, not
+      // lastBookedAt/lastBookingUri — proves the write is a targeted document-path
+      // SET (customFields.hubspotSyncedUri = :v) that cannot touch any other key,
+      // structurally ruling out that clobber regardless of what else is running
+      // concurrently against the same lead.
+      const markerCall = mockSetLeadFields.mock.calls.find(
         (call) => call[2]?.customFields?.hubspotSyncedUri === body.payload.uri,
       );
       expect(markerCall).toBeDefined();
-      expect(markerCall![2].customFields).toEqual(
-        expect.objectContaining({ foo: 'bar', lastBookedAt: expect.any(String), lastBookingUri: body.payload.uri }),
-      );
+      expect(markerCall![2].customFields).toEqual({ hubspotSyncedUri: body.payload.uri });
     });
 
     // Greptile P1 (agentweb#2291): CAPI already dedupes redeliveries via Meta's own event_id
@@ -685,6 +696,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
 
       expect(mockCreateLead).not.toHaveBeenCalled();
       expect(mockUpdateLead).not.toHaveBeenCalled();
+      expect(mockSetLeadFields).not.toHaveBeenCalled();
       expect(mockAutoSyncLead).not.toHaveBeenCalled();
       expect(mockNotifyLeadListOwnerIfConfigured).not.toHaveBeenCalled();
     });
@@ -713,6 +725,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
 
       expect(mockCreateLead).not.toHaveBeenCalled();
       expect(mockUpdateLead).not.toHaveBeenCalled();
+      expect(mockSetLeadFields).not.toHaveBeenCalled();
       expect(mockAutoSyncLead).not.toHaveBeenCalled();
     });
 
@@ -739,7 +752,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
 
       expect(mockCreateLead).not.toHaveBeenCalled();
       // The lastBookedAt/lastBookingUri write must NOT repeat — the lead is reused as-is.
-      expect(mockUpdateLead).not.toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
+      expect(mockSetLeadFields).not.toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
         customFields: expect.objectContaining({ lastBookedAt: expect.anything() }),
       }));
       // But the downstream steps DO get retried.
@@ -747,15 +760,15 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', existingLead, 'attio', 'updated');
       // And once each succeeds, its own marker gets written so a further retry
       // would correctly skip exactly that step.
-      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
-        customFields: expect.objectContaining({ hubspotSyncedUri: uri }),
-      }));
-      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
-        customFields: expect.objectContaining({ attioSyncedUri: uri }),
-      }));
-      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
-        customFields: expect.objectContaining({ alertSentUri: uri }),
-      }));
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
+        customFields: { hubspotSyncedUri: uri },
+      });
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
+        customFields: { attioSyncedUri: uri },
+      });
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
+        customFields: { alertSentUri: uri },
+      });
     });
 
     it('does not write a step\'s completion marker when that step still fails on retry, but does write the others that succeeded', async () => {
@@ -778,15 +791,15 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(res.status).toBe(200);
       await flushPromises();
 
-      expect(mockUpdateLead).not.toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
+      expect(mockSetLeadFields).not.toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
         customFields: expect.objectContaining({ hubspotSyncedUri: uri }),
       }));
-      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
-        customFields: expect.objectContaining({ attioSyncedUri: uri }),
-      }));
-      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
-        customFields: expect.objectContaining({ alertSentUri: uri }),
-      }));
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
+        customFields: { attioSyncedUri: uri },
+      });
+      expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
+        customFields: { alertSentUri: uri },
+      });
       expect(mockMarkJobFailed).toHaveBeenCalledWith('calendly_webhook', uri, expect.any(Error));
     });
 
@@ -844,6 +857,55 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
 
       expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
       expect(mockCreateLead).toHaveBeenCalledTimes(1);
+    });
+
+    // Greptile P1 on #2291 (round 9): two DIFFERENT bookings for the SAME lead
+    // (matched by email) can be processed by two separate job invocations that
+    // both read the lead before either has written anything back — the classic
+    // concurrent-update race. Every setLeadFields call this file's mocks record
+    // carries exactly the sub-key(s) that ONE booking's own step owns; none ever
+    // repeats another booking's URI, which is only possible because each write
+    // is a targeted customFields.<key> SET rather than a full-map snapshot
+    // replace. That structural property is what prevents booking B's completion
+    // from silently erasing booking A's already-persisted markers, and vice
+    // versa, regardless of which one's write actually lands last.
+    it('two different bookings for the same lead never carry each other\'s customFields keys in their setLeadFields writes', async () => {
+      const uriA = 'https://api.calendly.com/scheduled_events/evt-A/invitees/inv-A';
+      const uriB = 'https://api.calendly.com/scheduled_events/evt-B/invitees/inv-B';
+      // Both bookings' job invocations read this SAME pristine snapshot — never
+      // mutated in place by the code under test — modeling two concurrent reads
+      // that raced ahead of either one's write.
+      const existingLead = { leadId: 'lead-shared', email: 'lead@example.com', customFields: {} };
+      mockGetLeadByEmail.mockResolvedValue(existingLead);
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const resA = await postSigned(makePayload({ email: 'lead@example.com', uri: uriA }));
+      expect(resA.status).toBe(200);
+      await flushPromises();
+
+      const resB = await postSigned(makePayload({ email: 'lead@example.com', uri: uriB }));
+      expect(resB.status).toBe(200);
+      await flushPromises();
+
+      expect(mockSetLeadFields.mock.calls.length).toBeGreaterThan(0);
+      for (const call of mockSetLeadFields.mock.calls) {
+        const keys = Object.keys(call[2].customFields);
+        // The only multi-key write is the sibling lastBookedAt+lastBookingUri
+        // pair for a single booking; every step marker write is exactly one key.
+        expect(keys.length === 1 || (keys.length === 2 && keys.includes('lastBookedAt') && keys.includes('lastBookingUri'))).toBe(true);
+      }
+
+      const bookingACalls = mockSetLeadFields.mock.calls.filter((c) => JSON.stringify(c[2].customFields).includes(uriA));
+      const bookingBCalls = mockSetLeadFields.mock.calls.filter((c) => JSON.stringify(c[2].customFields).includes(uriB));
+      expect(bookingACalls.length).toBeGreaterThan(0);
+      expect(bookingBCalls.length).toBeGreaterThan(0);
+      // No call's payload ever names both bookings' URIs — proof no single write
+      // could have clobbered the other booking's data even if it landed last.
+      for (const call of mockSetLeadFields.mock.calls) {
+        const serialized = JSON.stringify(call[2].customFields);
+        expect(serialized.includes(uriA) && serialized.includes(uriB)).toBe(false);
+      }
     });
   });
 
