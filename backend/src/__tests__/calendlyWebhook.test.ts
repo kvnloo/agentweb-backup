@@ -603,8 +603,56 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
         customFields: expect.objectContaining({ foo: 'bar' }),
       }));
-      expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', existingLead, 'hubspot', 'updated');
-      expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', existingLead, 'attio', 'updated');
+      // Greptile P1 on #2291 (round 6): the lead passed downstream must reflect what
+      // was ACTUALLY just written to the DB (foo preserved, lastBookedAt/lastBookingUri
+      // now present) — not the pre-update snapshot. crmDb.updateLead's customFields is
+      // a full-attribute replace, so a downstream step later re-serializing a stale
+      // snapshot would silently erase these fields from the real record.
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(
+        USER_ID,
+        'list-1',
+        expect.objectContaining({
+          leadId: 'lead-existing',
+          customFields: expect.objectContaining({ foo: 'bar', lastBookedAt: expect.any(String), lastBookingUri: expect.any(String) }),
+        }),
+        'hubspot',
+        'updated',
+      );
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(
+        USER_ID,
+        'list-1',
+        expect.objectContaining({
+          leadId: 'lead-existing',
+          customFields: expect.objectContaining({ foo: 'bar', lastBookedAt: expect.any(String), lastBookingUri: expect.any(String) }),
+        }),
+        'attio',
+        'updated',
+      );
+    });
+
+    it('does not erase lastBookedAt/lastBookingUri when a downstream step writes its own completion marker for an updated lead', async () => {
+      const existingLead = { leadId: 'lead-existing', email: 'lead@example.com', customFields: { foo: 'bar' } };
+      mockGetLeadByEmail.mockResolvedValue(existingLead);
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      // The FIRST downstream marker write (hubspotSyncedUri) is the one that would have
+      // clobbered the DB's customFields down to just { foo, hubspotSyncedUri } if `lead`
+      // still referenced the pre-update snapshot — it must instead carry forward
+      // everything the immediately-preceding updateLead call actually persisted.
+      const markerCall = mockUpdateLead.mock.calls.find(
+        (call) => call[2]?.customFields?.hubspotSyncedUri === body.payload.uri,
+      );
+      expect(markerCall).toBeDefined();
+      expect(markerCall![2].customFields).toEqual(
+        expect.objectContaining({ foo: 'bar', lastBookedAt: expect.any(String), lastBookingUri: body.payload.uri }),
+      );
     });
 
     // Greptile P1 (agentweb#2291): CAPI already dedupes redeliveries via Meta's own event_id
@@ -977,7 +1025,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
 
       expect(mockNotifyLeadListOwnerIfConfigured).toHaveBeenCalledWith(
         expect.objectContaining({ listId: 'list-1' }),
-        existingLead,
+        expect.objectContaining({ leadId: 'lead-existing' }),
         'api.lead_updated',
         expect.any(Object),
         expect.any(String),

@@ -362,5 +362,19 @@ describe('asyncJobQueue', () => {
 
       // No assertion needed beyond "did not throw" — reaching this line is the test.
     });
+
+    it('retries once within the same tick when a beat transiently fails', async () => {
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('throttled')) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
+      const stop = startHeartbeat('calendly_webhook', 'invitee-123');
+
+      jest.advanceTimersByTime(60_000);
+      await Promise.resolve();
+      await Promise.resolve(); // second microtask hop for the nested retry's own .catch chain
+      stop();
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+    });
   });
 });
