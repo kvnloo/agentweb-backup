@@ -837,6 +837,49 @@ describe('CRM Database Service', () => {
       mergeSpy.mockRestore();
     });
 
+    // Greptile P1 on #2291: internal per-booking idempotency markers (e.g. Calendly
+    // webhook completion flags) must never show up in CSV exports or the Configure
+    // Display Fields UI the way customFields does — `system` is the existing sidecar
+    // map for exactly this (see updateLead's `system` param), but setLeadFields only
+    // supported atomic writes to customFields/enrichmentMetadata, not system, forcing
+    // callers needing atomicity to (mis)use customFields instead.
+    it('writes system sub-keys atomically, bootstraps the system map, and never triggers the customFields fieldNames sync', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        system: { 'hubspotSynced::https://api.calendly.com/x/invitees/y': true },
+      });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      const bootstrap = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(bootstrap.UpdateExpression).toContain('system = if_not_exists(system, :emptyMap)');
+      const main = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(main.UpdateExpression).toContain('system.#sys0 = :sys0');
+      expect(main.ExpressionAttributeValues[':sys0']).toBe(true);
+      // system keys are internal bookkeeping, not customer-visible custom fields —
+      // must never register on the list's fieldNames.
+      expect(mergeSpy).not.toHaveBeenCalled();
+
+      mergeSpy.mockRestore();
+    });
+
+    it('removes system sub-keys via removeSystemKeys', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        removeSystemKeys: ['stale_marker'],
+      });
+
+      const main = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(main.UpdateExpression).toContain('REMOVE');
+      expect(main.UpdateExpression).toContain('system.#rmsys0');
+    });
+
     it('uses if_not_exists in all SET clauses when ifNotExists=true', async () => {
       mockDocumentClientMethods.update.mockReturnValue({
         promise: jest.fn().mockResolvedValue({}),
