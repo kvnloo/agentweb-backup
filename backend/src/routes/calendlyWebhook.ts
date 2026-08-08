@@ -38,7 +38,7 @@ import { userDb, crmDb } from '../services/db';
 import { metaService } from '../services/metaService';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { enqueueJob, markJobComplete, markJobFailed, registerProcessor } from '../services/asyncJobQueue';
+import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
 
 const router = express.Router();
 
@@ -480,6 +480,11 @@ router.post('/', (req: express.Request, res: express.Response) => {
         return;
       }
 
+      // Keeps the claim's updatedAt fresh for as long as this inline call actually
+      // runs — without it, processing slower than the poller's stale threshold
+      // looks identical to an abandoned claim, and the poller would claim and
+      // re-run this same booking concurrently (Greptile P1 on #2291).
+      const stopHeartbeat = enqueueResult === 'enqueued' ? startHeartbeat(QUEUE_SOURCE, parsed.payload.uri) : () => {};
       try {
         await processCalendlyWebhookJob(jobPayload);
         if (enqueueResult === 'enqueued') {
@@ -494,6 +499,8 @@ router.post('/', (req: express.Request, res: express.Response) => {
           // retry from, so this is exactly today's fire-and-forget failure behavior.
           console.error('[Calendly Webhook] Processing failed with no durable record (queue unavailable):', processingError?.message ?? processingError);
         }
+      } finally {
+        stopHeartbeat();
       }
     } catch (error: any) {
       console.error('[Calendly Webhook] Unexpected error:', error?.message ?? error);

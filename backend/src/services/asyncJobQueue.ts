@@ -35,6 +35,8 @@ const MAX_ATTEMPTS = 5;
 // A claimed ('processing') job whose updatedAt is older than this is treated as
 // abandoned (the instance that claimed it crashed mid-attempt) and re-claimable.
 const STALE_PROCESSING_MS = 5 * 60 * 1000;
+// Well under STALE_PROCESSING_MS so even one missed beat leaves comfortable margin.
+const HEARTBEAT_INTERVAL_MS = 60 * 1000;
 
 export type EnqueueResult = 'enqueued' | 'duplicate' | 'unavailable';
 
@@ -165,6 +167,43 @@ export async function markJobFailed(source: string, dedupeKey: string, error: un
       console.warn(`[AsyncJobQueue] markJobFailed failed for ${id} after retry (best-effort):`, secondErr?.message ?? secondErr);
     }
   }
+}
+
+/**
+ * Keeps a claimed job's updatedAt fresh while it's genuinely still being
+ * processed inline, so the poller's stale-reclamation query never mistakes
+ * still-active work for an abandoned claim (Greptile P1 on #2291): without
+ * this, inline processing that happens to run longer than
+ * STALE_PROCESSING_MS looked identical — to that query — to a claim whose
+ * owning instance crashed, and the poller would claim and re-run it
+ * concurrently with the still-running original.
+ *
+ * Call right after a successful claimImmediately enqueue; call the returned
+ * stop function in a `finally` block once processing settles (success or
+ * failure), before markJobComplete/markJobFailed. Best-effort and
+ * conditional on the job still being 'processing' — a missed beat just
+ * means the prior (pre-heartbeat) race window reopens for that one tick,
+ * never a new failure mode, and the condition means a tick that fires after
+ * the job already completed is a safe no-op rather than clobbering state.
+ */
+export function startHeartbeat(source: string, dedupeKey: string): () => void {
+  const id = jobId(source, dedupeKey);
+  const interval = setInterval(() => {
+    dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        ConditionExpression: '#status = :processing',
+        UpdateExpression: 'SET updatedAt = :now',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: { ':processing': 'processing', ':now': new Date().toISOString() },
+      })
+      .promise()
+      .catch(() => {
+        // Best-effort — see function comment.
+      });
+  }, HEARTBEAT_INTERVAL_MS);
+  return () => clearInterval(interval);
 }
 
 type JobProcessor = (payload: any) => Promise<void>;

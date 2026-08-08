@@ -129,11 +129,15 @@ async function cleanupCalendlyWebhook(account: { config: unknown } | null): Prom
 }
 
 async function queueCalendlyWebhookCleanup(config: CalendlyConfig): Promise<void> {
-  const result = await enqueueJob(
-    CALENDLY_WEBHOOK_CLEANUP_SOURCE,
-    config.webhook_id!,
-    { webhookId: config.webhook_id, refreshToken: config.refresh_token } as CalendlyWebhookCleanupPayload,
-  );
+  const payload: CalendlyWebhookCleanupPayload = { webhookId: config.webhook_id!, refreshToken: config.refresh_token };
+  let result = await enqueueJob(CALENDLY_WEBHOOK_CLEANUP_SOURCE, config.webhook_id!, payload);
+  if (result === 'unavailable') {
+    // Greptile P1 on #2291: this enqueue is the LAST chance to durably record
+    // webhook_id before the caller deletes the local account — if it's genuinely
+    // gone after this, there is no more durable store to fall back to. One retry
+    // catches a transient write blip distinct from the table not existing yet.
+    result = await enqueueJob(CALENDLY_WEBHOOK_CLEANUP_SOURCE, config.webhook_id!, payload);
+  }
   if (result === 'unavailable') {
     console.warn(`[Calendly] Could not queue a retry for webhook ${config.webhook_id} — queue unavailable, orphaned with no durable record`);
   }
@@ -290,7 +294,13 @@ router.delete('/connected-accounts/:platform', authenticateToken, async (req: an
     }
 
     if (platform === 'calendly') {
-      await cleanupCalendlyWebhook(await getAccountByPlatform(userId, platform));
+      // Greptile P1 on #2291: getAccountByPlatform only returns the FIRST matching
+      // account, but a user can have more than one Calendly connection, and
+      // deleteAccount below removes ALL of them — clean up every one, not just one,
+      // or the rest are orphaned with no local record left to identify them.
+      const allAccounts = await getAccountsByUserId(userId);
+      const calendlyAccounts = allAccounts.filter((acc) => acc.platform === 'calendly');
+      await Promise.all(calendlyAccounts.map((acc) => cleanupCalendlyWebhook(acc)));
     }
 
     await deleteAccount(userId, platform);

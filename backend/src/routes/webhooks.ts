@@ -22,7 +22,7 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
 import { isSmokeTestEmail } from '../utils/smokeTestLead';
-import { enqueueJob, markJobComplete, markJobFailed, registerProcessor } from '../services/asyncJobQueue';
+import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -1263,6 +1263,11 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
         return;
       }
 
+      // Keeps the claim's updatedAt fresh for as long as this inline call actually
+      // runs — without it, processing slower than the poller's stale threshold
+      // looks identical to an abandoned claim, and the poller would claim and
+      // re-run this same delivery concurrently (Greptile P1 on #2291).
+      const stopHeartbeat = enqueueResult === 'enqueued' ? startHeartbeat('hubspot_webhook', dedupeKey) : () => {};
       try {
         await processHubspotWebhookJob(jobPayload);
         if (enqueueResult === 'enqueued') {
@@ -1277,6 +1282,8 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
           // retry from, so this is exactly today's fire-and-forget failure behavior.
           console.error('[HubSpot Webhook] Processing failed with no durable record (queue unavailable):', processingError?.message ?? processingError);
         }
+      } finally {
+        stopHeartbeat();
       }
     } catch (error: any) {
       console.error('[HubSpot Webhook] error:', error);
