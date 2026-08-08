@@ -352,11 +352,35 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       ...(bookingTrackingActive ? { webhook_id: webhookId, webhook_signing_key: webhookSigningKey } : {}),
     };
 
-    const account = await createAccount(userId, 'calendly', {
-      account_id: profile.email,
-      account_name: profile.name,
-      config: config_,
-    });
+    let account;
+    try {
+      account = await createAccount(userId, 'calendly', {
+        account_id: profile.email,
+        account_name: profile.name,
+        config: config_,
+      });
+    } catch (createAccountError: any) {
+      // Greptile P1 on #2291 (round 13): the webhook is already live on Calendly's
+      // side by this point — if persisting the local record fails, nothing anywhere
+      // records this webhook_id, so it can never be identified for cleanup (the
+      // reconnect self-heal above only works from a LOCAL record) and a later
+      // connect attempt just gets Calendly's "Already Exists" forever. Roll it back
+      // immediately, using the fresh access_token already in hand from this exact
+      // request, instead of needing a separate durable-recovery path for a webhook
+      // that never actually finished connecting.
+      if (bookingTrackingActive && webhookId) {
+        try {
+          await axios.delete(webhookId, { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+          console.warn(`[Calendly OAuth /connect] Rolled back webhook ${webhookId} after failing to persist the account`);
+        } catch (rollbackError: any) {
+          console.error(
+            `[Calendly OAuth /connect] Failed to roll back webhook ${webhookId} after failing to persist the account — orphaned:`,
+            rollbackError?.response?.data || rollbackError?.message,
+          );
+        }
+      }
+      throw createAccountError;
+    }
 
     res.json({
       success: true,
