@@ -1,10 +1,12 @@
 import request from 'supertest';
 import express from 'express';
+import axios from 'axios';
 import connectedAccountsRouter from '../routes/connectedAccounts';
 import * as connectedAccountsDb from '../services/connectedAccountsDb';
 import { userDb, orgDb, crmDb } from '../services/db';
 
 // Mock dependencies
+jest.mock('axios');
 jest.mock('../services/connectedAccountsDb');
 jest.mock('../services/db', () => ({
     userDb: {
@@ -566,6 +568,75 @@ describe('Connected Accounts Routes', () => {
 
             const response = await request(app).delete('/api/oauth/connected-accounts/gmail/user@gmail.com');
             expect(response.status).toBe(500);
+        });
+
+        // Greptile P1 on #2291: disconnect used to delete the local account record
+        // (including webhook_id) without ever deleting the actual Calendly-side
+        // subscription, orphaning it. A later reconnect then hit "Already Exists"
+        // with no local record left to identify and clean it up, permanently
+        // stranding the account on "booking tracking disabled". Deleting the
+        // remote subscription here, symmetric with how /connect creates it, is
+        // what makes a normal disconnect-then-reconnect actually recoverable.
+        describe('Calendly webhook cleanup', () => {
+            const calendlyAccount = {
+                platform: 'calendly',
+                account_id: 'jane@customer.com',
+                userId: 'test_user_id',
+                config: {
+                    account_type: 'calendly',
+                    access_token: 'access-token-1',
+                    webhook_id: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                },
+            };
+
+            it('deletes the remote webhook subscription before deleting the local account', async () => {
+                (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
+                (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+                (axios.delete as jest.Mock).mockResolvedValue({ data: {} });
+
+                const response = await request(app).delete('/api/oauth/connected-accounts/calendly/jane%40customer.com');
+
+                expect(response.status).toBe(200);
+                expect(axios.delete).toHaveBeenCalledWith(
+                    'https://api.calendly.com/webhook_subscriptions/AAAA',
+                    expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer access-token-1' }) }),
+                );
+                expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
+            });
+
+            it('still deletes the local account when the remote webhook delete fails (non-fatal)', async () => {
+                (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
+                (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+                (axios.delete as jest.Mock).mockRejectedValue(new Error('token expired'));
+
+                const response = await request(app).delete('/api/oauth/connected-accounts/calendly/jane%40customer.com');
+
+                expect(response.status).toBe(200);
+                expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
+            });
+
+            it('does not attempt a remote delete when there is no webhook_id (booking tracking was already inactive)', async () => {
+                (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue({
+                    ...calendlyAccount,
+                    config: { account_type: 'calendly', access_token: 'access-token-1' },
+                });
+                (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+
+                const response = await request(app).delete('/api/oauth/connected-accounts/calendly/jane%40customer.com');
+
+                expect(response.status).toBe(200);
+                expect(axios.delete).not.toHaveBeenCalled();
+            });
+
+            it('does not attempt webhook cleanup for a non-Calendly platform', async () => {
+                (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+
+                const response = await request(app).delete('/api/oauth/connected-accounts/gmail/user%40gmail.com');
+
+                expect(response.status).toBe(200);
+                expect(connectedAccountsDb.getAccountById).not.toHaveBeenCalled();
+                expect(axios.delete).not.toHaveBeenCalled();
+            });
         });
 
         it('blocks a non-owner org member from disconnecting an org-shared business ad account', async () => {
