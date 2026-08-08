@@ -148,7 +148,16 @@ async function queueCalendlyWebhookCleanup(config: CalendlyConfig): Promise<void
     result = await enqueueJob(CALENDLY_WEBHOOK_CLEANUP_SOURCE, config.webhook_id!, payload);
   }
   if (result === 'unavailable') {
-    console.warn(`[Calendly] Could not queue a retry for webhook ${config.webhook_id} — queue unavailable, orphaned with no durable record`);
+    // Greptile P1 on #2291 (round 10): the caller (disconnect route) proceeds to
+    // delete the local account — the only OTHER copy of this webhook_id —
+    // immediately after this returns, unconditionally, because disconnect must
+    // always succeed locally even when cleanup can't (see cleanupCalendlyWebhook's
+    // header comment; declined to block disconnect on this earlier in the
+    // session). That means this line is the last point where the fact that this
+    // subscription is now permanently unrecoverable is observable anywhere —
+    // console.error (not warn) so it's actionable/alertable in production
+    // monitoring rather than silently lost in an info-level log stream.
+    console.error(`[Calendly] LOST webhook cleanup record for ${config.webhook_id} — queue unavailable after retry and the local account is about to be deleted; this subscription can no longer be identified for cleanup and requires manual intervention`);
   }
 }
 
