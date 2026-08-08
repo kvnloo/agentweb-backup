@@ -1017,6 +1017,52 @@ describe('CRM Database Service', () => {
     });
   });
 
+  // Greptile P1 on #2291 (round 15): a stale-reclamation race in the async job
+  // queue can, in the worst case, let two processor instances both start
+  // processing the SAME booking concurrently. Per-step completion markers alone
+  // stop a THIRD run from repeating a step, but two instances racing to the same
+  // not-yet-done step would both pass that check. claimLeadStepOnce is the actual
+  // mutex — a DynamoDB conditional write, not a probability reduction — so at most
+  // one instance ever wins the claim and performs the real side effect.
+  describe('claimLeadStepOnce', () => {
+    it('returns true and SETs the key when nobody else holds it', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.claimLeadStepOnce('list_123', 'lead_123', 'hubspotSynced::uri-1');
+
+      expect(result).toBe(true);
+      // 1: bootstrap the system map, 2: the conditional claim SET.
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      const claimCall = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(claimCall.UpdateExpression).toContain('system.#k = :v');
+      expect(claimCall.ConditionExpression).toBe('attribute_not_exists(system.#k)');
+      expect(claimCall.ExpressionAttributeValues[':v']).toBe('in_progress');
+    });
+
+    it('returns false without throwing when the key is already claimed (or done)', async () => {
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) }) // bootstrap succeeds
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }) }); // claim loses
+
+      const result = await crmDb.claimLeadStepOnce('list_123', 'lead_123', 'hubspotSynced::uri-1');
+
+      expect(result).toBe(false);
+    });
+
+    it('returns false without throwing when the lead itself does not exist (bootstrap condition fails)', async () => {
+      mockDocumentClientMethods.update.mockReturnValueOnce({
+        promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }),
+      });
+
+      const result = await crmDb.claimLeadStepOnce('list_123', 'missing-lead', 'hubspotSynced::uri-1');
+
+      expect(result).toBe(false);
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('mergeFieldNames', () => {
     it('atomically appends via list_append without a read-modify-write', async () => {
       // The previous implementation read-then-set, which loses concurrent writes.
