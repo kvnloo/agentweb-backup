@@ -3,7 +3,7 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getCalendlyConfig, CalendlyOAuthConfig } from '../config/integrations';
-import { createAccount, CalendlyConfig } from '../services/connectedAccountsDb';
+import { createAccount, getAccountByPlatform, CalendlyConfig } from '../services/connectedAccountsDb';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 import { storeTokenSession, retrieveTokenSession } from '../services/oauthTokenSessionStore';
@@ -182,8 +182,22 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
 //
 // The old subscription's signing key isn't recoverable (Calendly never
 // echoes it back — see the module comment on webhookSigningKey below), so
-// the fix is to find and delete the stale one, then retry with the new key,
-// rather than leaving the account permanently stuck on the wrong message.
+// the fix is to delete the stale one, then retry with the new key, rather
+// than leaving the account permanently stuck on the wrong message.
+//
+// Greptile P1 (agentweb#2291): every AgentWeb tenant shares the exact same
+// callback URL (`${BACKEND_URL}/api/webhooks/calendly`), so an earlier
+// version of this that listed Calendly's webhook_subscriptions and matched
+// by callback_url was tenant-ambiguous — if two different AgentWeb accounts
+// connect the SAME underlying Calendly identity, listing returns both
+// tenants' subscriptions with the identical callback_url, and a match could
+// delete the OTHER tenant's live subscription, silently breaking their
+// booking attribution. Fixed by never reading Calendly's shared list at all:
+// only ever delete a webhook_id THIS AgentWeb account itself previously
+// recorded for THIS EXACT Calendly user_uri (see /connect below). If we have
+// no such record — a genuinely different tenant's conflicting subscription,
+// or this account's own first-ever connect attempt racing itself — we can't
+// safely identify what to delete, so we don't delete anything.
 
 interface WebhookProvisionResult {
   webhookId?: string;
@@ -213,6 +227,9 @@ async function provisionCalendlyWebhook(
   accessToken: string,
   profile: { organization_uri?: string; user_uri?: string },
   webhookSigningKey: string,
+  // Set only when the CURRENT AgentWeb account's own prior connection recorded a
+  // webhook_id for this EXACT Calendly user_uri — see the tenant-safety note above.
+  ownPreviousWebhookId?: string,
 ): Promise<WebhookProvisionResult> {
   try {
     const response = await createWebhookSubscription(config, accessToken, profile, webhookSigningKey);
@@ -227,26 +244,14 @@ async function provisionCalendlyWebhook(
       return { active: false };
     }
 
-    console.warn('[Calendly OAuth /connect] duplicate webhook subscription detected — deleting stale one and retrying');
-    try {
-      const existing = await axios.get(config.webhookSubscriptionsUrl, {
-        params: { organization: profile.organization_uri, user: profile.user_uri, scope: 'user' },
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
-      // Scoped to this user + scope:'user', but NOT to our app specifically — another
-      // third-party integration's scope:'user' webhook for the same Calendly user can
-      // legitimately appear in the same collection. Match on our own callback URL so a
-      // reconnect only ever deletes our own stale subscription, never someone else's.
-      const ourCallbackUrl = `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/webhooks/calendly`;
-      const staleUri = ((existing.data as any)?.collection ?? []).find(
-        (sub: any) => sub?.callback_url === ourCallbackUrl,
-      )?.uri;
-      if (!staleUri) {
-        console.warn('[Calendly OAuth /connect] could not locate our own stale webhook subscription to delete');
-        return { active: false };
-      }
+    if (!ownPreviousWebhookId) {
+      console.warn('[Calendly OAuth /connect] duplicate webhook subscription detected, but no prior webhook_id on record for this account/user_uri — cannot safely identify which subscription is ours, not deleting anything');
+      return { active: false };
+    }
 
-      await axios.delete(staleUri, { headers: { Authorization: `Bearer ${accessToken}` } });
+    console.warn('[Calendly OAuth /connect] duplicate webhook subscription detected — deleting our own previously-recorded subscription and retrying');
+    try {
+      await axios.delete(ownPreviousWebhookId, { headers: { Authorization: `Bearer ${accessToken}` } });
       const retryResponse = await createWebhookSubscription(config, accessToken, profile, webhookSigningKey);
       return { webhookId: (retryResponse.data as any)?.resource?.uri, active: true };
     } catch (retryError: any) {
@@ -281,11 +286,22 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     // per-connection instead of global.
     const webhookSigningKey = crypto.randomBytes(32).toString('hex');
 
+    // This account's own prior connection, if any — read BEFORE createAccount below
+    // overwrites it. Only usable as a delete target if it's for this EXACT Calendly
+    // identity; a stale webhook_id from a previously-connected DIFFERENT Calendly
+    // account under this same AgentWeb login isn't the thing Calendly is now
+    // reporting as a duplicate, so it must not be reused across identities.
+    const existingAccount = await getAccountByPlatform(userId, 'calendly');
+    const existingConfig = existingAccount?.config as CalendlyConfig | undefined;
+    const ownPreviousWebhookId =
+      existingConfig?.user_uri === profile.user_uri ? existingConfig?.webhook_id : undefined;
+
     const { webhookId, active: bookingTrackingActive } = await provisionCalendlyWebhook(
       config,
       tokens.access_token,
       profile,
       webhookSigningKey,
+      ownPreviousWebhookId,
     );
 
     const config_: CalendlyConfig = {

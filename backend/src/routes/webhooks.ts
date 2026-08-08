@@ -22,7 +22,7 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
 import { isSmokeTestEmail } from '../utils/smokeTestLead';
-import { enqueueJob, markJobComplete, markJobFailed, markJobProcessing, registerProcessor } from '../services/asyncJobQueue';
+import { enqueueJob, markJobComplete, markJobFailed, registerProcessor } from '../services/asyncJobQueue';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -1254,16 +1254,13 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
       const dedupeKey = crypto.createHash('sha256').update(rawBody).digest('hex');
       const jobPayload: HubspotJobPayload = { changesByObjectId };
 
-      const enqueueResult = await enqueueJob('hubspot_webhook', dedupeKey, jobPayload);
+      // claimImmediately: this same request processes the job right below, so the
+      // enqueue writes it straight in as 'processing' — no separate claim call, no
+      // window where it sits 'pending' and claimable by the poller.
+      const enqueueResult = await enqueueJob('hubspot_webhook', dedupeKey, jobPayload, { claimImmediately: true });
       if (enqueueResult === 'duplicate') {
         console.log(`[HubSpot Webhook] Duplicate delivery (${dedupeKey.slice(0, 12)}...) — already queued, skipping`);
         return;
-      }
-      if (enqueueResult === 'enqueued') {
-        // Claim it before doing real work — otherwise this row stays 'pending' for
-        // the whole inline call and the poller's next tick can pick up and re-run
-        // it concurrently (duplicate contact/deal syncs).
-        await markJobProcessing('hubspot_webhook', dedupeKey);
       }
 
       try {

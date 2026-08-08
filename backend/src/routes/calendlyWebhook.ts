@@ -38,7 +38,7 @@ import { userDb, crmDb } from '../services/db';
 import { metaService } from '../services/metaService';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { enqueueJob, markJobComplete, markJobFailed, markJobProcessing, registerProcessor } from '../services/asyncJobQueue';
+import { enqueueJob, markJobComplete, markJobFailed, registerProcessor } from '../services/asyncJobQueue';
 
 const router = express.Router();
 
@@ -410,16 +410,13 @@ router.post('/', (req: express.Request, res: express.Response) => {
         eventTimeSeconds,
       };
 
-      const enqueueResult = await enqueueJob(QUEUE_SOURCE, parsed.payload.uri, jobPayload);
+      // claimImmediately: this same request processes the job right below, so the
+      // enqueue writes it straight in as 'processing' — no separate claim call, no
+      // window where it sits 'pending' and claimable by the poller.
+      const enqueueResult = await enqueueJob(QUEUE_SOURCE, parsed.payload.uri, jobPayload, { claimImmediately: true });
       if (enqueueResult === 'duplicate') {
         console.log(`[Calendly Webhook] Duplicate delivery for ${parsed.payload.uri} — already queued, skipping`);
         return;
-      }
-      if (enqueueResult === 'enqueued') {
-        // Claim it before doing real work — otherwise this row stays 'pending' for
-        // the whole inline call and the poller's next tick can pick up and re-run
-        // it concurrently (duplicate CRM writes, duplicate CAPI sends).
-        await markJobProcessing(QUEUE_SOURCE, parsed.payload.uri);
       }
 
       try {
