@@ -7,7 +7,7 @@ import { createAccount, getAccountsByUserId, CalendlyConfig } from '../services/
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 import { storeTokenSession, retrieveTokenSession } from '../services/oauthTokenSessionStore';
-import { queueCalendlyWebhookCleanup } from '../services/calendlyWebhookCleanupQueue';
+import { queueCalendlyWebhookCleanup, getOrphanedCalendlyWebhook, clearOrphanedCalendlyWebhook } from '../services/calendlyWebhookCleanupQueue';
 
 const router = express.Router();
 
@@ -330,7 +330,15 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     const existingAccount = allAccounts.find(
       (acc) => acc.platform === 'calendly' && (acc.config as CalendlyConfig)?.user_uri === profile.user_uri,
     );
-    const ownPreviousWebhookId = (existingAccount?.config as CalendlyConfig | undefined)?.webhook_id;
+    // Greptile P1 on #2291 (round 16): the local account record isn't the ONLY place
+    // this identity's prior webhook_id can live — if a previous disconnect/rollback's
+    // durable-queue enqueue was ALSO unavailable, the identifier was recorded in the
+    // fallback orphan-webhook table instead (see calendlyWebhookCleanupQueue.ts). Check
+    // both — still keyed by (userId, user_uri), never by listing Calendly's shared
+    // webhook_subscriptions, so this preserves the exact same tenant-safety guarantee
+    // the local-record check already had.
+    const ownPreviousWebhookId = (existingAccount?.config as CalendlyConfig | undefined)?.webhook_id
+      ?? (await getOrphanedCalendlyWebhook(userId, profile.user_uri!))?.webhookId;
 
     const { webhookId, active: bookingTrackingActive } = await provisionCalendlyWebhook(
       config,
@@ -385,11 +393,17 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
             `[Calendly OAuth /connect] Failed to roll back webhook ${webhookId} after failing to persist the account — queuing for durable retry:`,
             rollbackError?.response?.data || rollbackError?.message,
           );
-          await queueCalendlyWebhookCleanup(config_);
+          await queueCalendlyWebhookCleanup(userId, config_);
         }
       }
       throw createAccountError;
     }
+
+    // Any orphan-webhook fallback record for this identity is now stale — either it
+    // was the one we just found, deleted, and replaced (ownPreviousWebhookId), or
+    // this connect never needed it. Best-effort: a leftover row is harmless, just a
+    // future lookup returning an id Calendly may already have forgotten about.
+    await clearOrphanedCalendlyWebhook(userId, profile.user_uri!).catch(() => {});
 
     res.json({
       success: true,

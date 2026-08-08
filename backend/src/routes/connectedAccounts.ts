@@ -91,7 +91,7 @@ registerProcessor(CALENDLY_WEBHOOK_CLEANUP_SOURCE, processCalendlyWebhookCleanup
  * or exhausts its attempts, at which point it's durably 'failed' in the queue
  * table rather than silently gone from everywhere.
  */
-async function cleanupCalendlyWebhook(account: { config: unknown } | null): Promise<void> {
+async function cleanupCalendlyWebhook(userId: string, account: { config: unknown } | null): Promise<void> {
   if (!account) return;
   const config = account.config as CalendlyConfig;
   if (!config.webhook_id || !config.access_token) return;
@@ -106,7 +106,7 @@ async function cleanupCalendlyWebhook(account: { config: unknown } | null): Prom
   } catch (err: any) {
     const isAuthError = err?.response?.status === 401 || err?.response?.status === 403;
     if (!isAuthError || !config.refresh_token) {
-      await queueCalendlyWebhookCleanup(config);
+      await queueCalendlyWebhookCleanup(userId, config);
       console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect:`, err?.response?.data || err?.message);
       return;
     }
@@ -117,7 +117,7 @@ async function cleanupCalendlyWebhook(account: { config: unknown } | null): Prom
   // and retry before falling back to the durable queue.
   const refreshed = await refreshCalendlyAccessToken(config.refresh_token!);
   if (!refreshed) {
-    await queueCalendlyWebhookCleanup(config);
+    await queueCalendlyWebhookCleanup(userId, config);
     console.warn(`[Calendly] Could not refresh token to clean up webhook ${config.webhook_id} on disconnect — queued for retry`);
     return;
   }
@@ -126,7 +126,7 @@ async function cleanupCalendlyWebhook(account: { config: unknown } | null): Prom
     await attemptDelete(refreshed.access_token);
     console.log(`[Calendly] Deleted webhook ${config.webhook_id} on disconnect (after token refresh)`);
   } catch (retryErr: any) {
-    await queueCalendlyWebhookCleanup(config);
+    await queueCalendlyWebhookCleanup(userId, config);
     console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect even after token refresh:`, retryErr?.response?.data || retryErr?.message);
   }
 }
@@ -288,7 +288,7 @@ router.delete('/connected-accounts/:platform', authenticateToken, async (req: an
       // or the rest are orphaned with no local record left to identify them.
       const allAccounts = await getAccountsByUserId(userId);
       const calendlyAccounts = allAccounts.filter((acc) => acc.platform === 'calendly');
-      await Promise.all(calendlyAccounts.map((acc) => cleanupCalendlyWebhook(acc)));
+      await Promise.all(calendlyAccounts.map((acc) => cleanupCalendlyWebhook(userId, acc)));
     }
 
     await deleteAccount(userId, platform);
@@ -323,7 +323,7 @@ router.delete('/connected-accounts/:platform/:accountId', authenticateToken, asy
     }
 
     if (platform === 'calendly') {
-      await cleanupCalendlyWebhook(await getAccountById(accountId, userId, 'calendly'));
+      await cleanupCalendlyWebhook(userId, await getAccountById(accountId, userId, 'calendly'));
     }
 
     await deleteAccountById(userId, platform, accountId);
