@@ -13,6 +13,7 @@
 import request from 'supertest';
 import express from 'express';
 import orgRoutes from '../routes/org';
+import { orgDb } from '../services/db';
 
 let actingUserId = 'u-filipe';
 let mockUsers: Record<string, any> = {};
@@ -217,16 +218,46 @@ describe('removing people', () => {
     expect(mockUsers['u-filipe'].orgId).toBe(ORG);
   });
 
-  it('the LAST owner cannot be removed — the org would become unadministrable', async () => {
+  it('an ADMIN may not remove an owner — removal revokes ownership, which is owner-only', async () => {
     await setRole('u-eric', 'admin');
     actingUserId = 'u-eric';
+    const res = await remove('u-filipe');
+    expect(res.status).toBe(403);
+    expect(res.body.error).toMatch(/only an owner/i);
+    expect(mockUsers['u-filipe'].orgId).toBe(ORG);
+    expect(mockUsers['u-filipe'].orgRole).toBe('owner');
+  });
+
+  it('an ADMIN may not remove a SECOND owner either — remove and demote now agree', async () => {
+    // The asymmetry this pins: demote already 403s for an admin, so an admin who
+    // could still *remove* an owner would be doing the same thing by a longer
+    // route — and taking the owner out of the org as well.
+    await setRole('u-tyler', 'owner');
+    await setRole('u-eric', 'admin');
+    actingUserId = 'u-eric';
+    const res = await remove('u-tyler');
+    expect(res.status).toBe(403);
+    expect(mockUsers['u-tyler'].orgId).toBe(ORG);
+    expect(mockUsers['u-tyler'].orgRole).toBe('owner');
+  });
+
+  it('the LAST owner cannot be removed — the org would become unadministrable', async () => {
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    // getOrgMembers reads an eventually-consistent GSI, so a just-promoted owner
+    // can be missing from the listing. When the listing knows of only one owner,
+    // removing them is refused rather than risking an org with no owner at all.
+    (orgDb.getOrgMembers as jest.Mock).mockResolvedValueOnce([
+      mockUsers['u-filipe'],
+      mockUsers['u-georgia'],
+    ]);
     const res = await remove('u-filipe');
     expect(res.status).toBe(409);
     expect(res.body.error).toMatch(/only owner/i);
     expect(mockUsers['u-filipe'].orgId).toBe(ORG);
   });
 
-  it('a second owner CAN be removed while one remains', async () => {
+  it('a second owner CAN be removed by another OWNER while one remains', async () => {
     await setRole('u-eric', 'owner');
     const res = await remove('u-eric');
     expect(res.status).toBe(200);

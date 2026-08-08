@@ -710,14 +710,48 @@ describe("orgMemberRemoval guards", () => {
     expect(mockClearOrgMembership).not.toHaveBeenCalled();
   });
 
-  it("refuses to remove the only owner", async () => {
-    const secondOwner = { userId: "u-second", orgId, orgRole: "owner" };
+  it("refuses to let an ADMIN remove an owner — and so never hands them the owner's content", async () => {
+    // This route does more than evict: `transfer` decisions move the target's
+    // landing pages, skills, work plans and knowledge base to *the caller*. An
+    // admin cannot demote an owner (403 on PATCH .../role), so being able to
+    // remove one would be the same revocation plus an asset transfer.
+    const adminCaller = { userId: callerUserId, orgId, orgRole: "admin" };
+    const targetOwner = { userId: "u-second", orgId, orgRole: "owner" };
+    const thirdOwner = { userId: "u-third", orgId, orgRole: "owner" };
     mockGetUserById.mockImplementation((uid: string) => {
-      if (uid === callerUserId) return Promise.resolve({ userId: callerUserId, orgId, orgRole: "admin" });
-      if (uid === "u-second") return Promise.resolve(secondOwner);
+      if (uid === callerUserId) return Promise.resolve(adminCaller);
+      if (uid === "u-second") return Promise.resolve(targetOwner);
+      if (uid === "u-third") return Promise.resolve(thirdOwner);
       return Promise.resolve(null);
     });
-    mockGetOrgMembers.mockResolvedValue([{ userId: callerUserId, orgId, orgRole: "admin" }, secondOwner]);
+    // Deliberately two other owners, so the last-owner guard cannot be what
+    // refuses this. Only the owner-only guard stands here.
+    mockGetOrgMembers.mockResolvedValue([adminCaller, targetOwner, thirdOwner]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-third", name: "Test Org" });
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-second/remove`)
+      .send({ confirm: true, decisions: allTransfer });
+    expect(res.status).toBe(403);
+    expect(res.body.message).toMatch(/only an owner/i);
+    expect(mockClearOrgMembership).not.toHaveBeenCalled();
+    expect(mockTransferLandingPageOwner).not.toHaveBeenCalled();
+    expect(mockSkillTransferOwner).not.toHaveBeenCalled();
+    expect(mockWorkPlanTransferOwner).not.toHaveBeenCalled();
+    expect(mockUpdateTaskOwner).not.toHaveBeenCalled();
+  });
+
+  it("refuses to remove the only owner the member listing knows about", async () => {
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    const targetOwner = { userId: "u-second", orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === "u-second") return Promise.resolve(targetOwner);
+      return Promise.resolve(null);
+    });
+    // getOrgMembers reads an eventually-consistent GSI: the caller's own
+    // promotion may not have propagated, leaving one owner visible.
+    mockGetOrgMembers.mockResolvedValue([targetOwner]);
     mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-second", name: "Test Org" });
 
     const res = await request(app)
