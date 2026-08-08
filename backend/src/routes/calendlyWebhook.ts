@@ -340,35 +340,41 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
         eventType = 'created';
       }
 
-      // Accumulated locally so the in-process "already done" checks below see
-      // each step immediately, but PERSISTED one customFields sub-key at a time
-      // via crmDb.setLeadFields — Greptile P1 on #2291 (round 9): the previous
-      // version re-serialized this whole local snapshot as a full customFields
-      // SET on every call, so two different bookings for the same lead processed
-      // concurrently would each overwrite the other's step markers (or the
-      // other's lastBookedAt/lastBookingUri) with their own stale snapshot.
-      // setLeadFields's document-path SET touches only the one key being
-      // written, so concurrent step writes for different bookings never race.
-      let leadCustomFields: Record<string, any> = { ...(lead.customFields || {}) };
-      const markStepDone = async (field: string) => {
-        leadCustomFields = { ...leadCustomFields, [field]: payload.uri };
-        await crmDb.setLeadFields(listId!, lead.leadId, { customFields: { [field]: payload.uri } });
+      // Greptile P1 on #2291 (round 12): the previous version tracked each step's
+      // completion under a SCALAR key (hubspotSyncedUri, attioSyncedUri,
+      // alertSentUri) shared by every booking this lead ever gets. Even with
+      // setLeadFields's atomic per-key write (round 9's fix), a scalar key can
+      // only remember ONE booking's URI at a time — if a DIFFERENT booking for
+      // the same lead completes that same step afterward, its write replaces the
+      // marker, so a later retry of the FIRST booking sees a URI that isn't its
+      // own, concludes the step was never done, and repeats it (a duplicate
+      // HubSpot/Attio sync or a duplicate customer alert). The fix is to key each
+      // marker by (step, booking URI) — namespaced into `system` (not
+      // customFields) so these internal flags never surface in CSV exports or
+      // the Configure Display Fields UI. Two different bookings now own two
+      // entirely distinct map entries and can never collide.
+      const stepMarkerKey = (step: 'hubspot' | 'attio' | 'alert') => `${step}Synced::${payload.uri}`;
+      const leadSystemMarkers: Record<string, any> = { ...(lead.system || {}) };
+      const markStepDone = async (step: 'hubspot' | 'attio' | 'alert') => {
+        const key = stepMarkerKey(step);
+        leadSystemMarkers[key] = true;
+        await crmDb.setLeadFields(listId!, lead.leadId, { system: { [key]: true } });
       };
 
-      if (leadCustomFields.hubspotSyncedUri !== payload.uri) {
+      if (!leadSystemMarkers[stepMarkerKey('hubspot')]) {
         try {
           await externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'hubspot', eventType);
-          await markStepDone('hubspotSyncedUri');
+          await markStepDone('hubspot');
         } catch (err: any) {
           console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err);
           failures.push(`HubSpot sync: ${err?.message ?? err}`);
         }
       }
 
-      if (leadCustomFields.attioSyncedUri !== payload.uri) {
+      if (!leadSystemMarkers[stepMarkerKey('attio')]) {
         try {
           await externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'attio', eventType);
-          await markStepDone('attioSyncedUri');
+          await markStepDone('attio');
         } catch (err: any) {
           console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err);
           failures.push(`Attio sync: ${err?.message ?? err}`);
@@ -378,7 +384,7 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
       // Same alert mechanism /forward-lead already uses — per-list opt-in via
       // list.alertEvents, so this only notifies the customer if they've already
       // configured this specific list to alert on lead-added/updated.
-      if (leadCustomFields.alertSentUri !== payload.uri) {
+      if (!leadSystemMarkers[stepMarkerKey('alert')]) {
         try {
           const list = await crmDb.getLeadListById(listId);
           if (list) {
@@ -391,7 +397,7 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
               new Date().toISOString(),
             );
           }
-          await markStepDone('alertSentUri');
+          await markStepDone('alert');
         } catch (alertError: any) {
           console.error('[Calendly Webhook] Lead alert failed:', alertError?.message ?? alertError);
           failures.push(`Lead alert: ${alertError?.message ?? alertError}`);

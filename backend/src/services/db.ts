@@ -7919,8 +7919,14 @@ export const crmDb = {
       topLevel?: Record<string, string>;
       enrichmentMetadata?: Record<string, any>;
       customFields?: Record<string, string>;
+      /** CRM-internal bookkeeping sidecar (see updateLead's `system` param) — same
+       *  atomic per-key document-path SET as customFields/enrichmentMetadata, but
+       *  never triggers the customFields fieldNames sync below, since these keys
+       *  must NOT show up in CSV exports or the Configure Display Fields UI. */
+      system?: Record<string, any>;
       removeEnrichmentMetadataKeys?: string[];
       removeCustomFieldKeys?: string[];
+      removeSystemKeys?: string[];
       /** When true, all SET clauses use if_not_exists() — atomically skips any
        *  field already present in the DB. Use for bulk enrichment paths that
        *  must never overwrite user-entered or concurrently-written data. */
@@ -7934,22 +7940,25 @@ export const crmDb = {
       : sanitizeCustomFields(options.customFields, { source: 'db.setLeadFields', listId, leadId });
     const hasMetaKeys = Object.keys(options.enrichmentMetadata ?? {}).length > 0;
     const hasCustomKeys = Object.keys(safeCustomFields ?? {}).length > 0;
+    const hasSystemKeys = Object.keys(options.system ?? {}).length > 0;
     const hasTopLevel = Object.keys(options.topLevel ?? {}).length > 0;
     const hasRemoveMeta = (options.removeEnrichmentMetadataKeys ?? []).length > 0;
     const hasRemoveCustom = (options.removeCustomFieldKeys ?? []).length > 0;
-    if (!hasTopLevel && !hasMetaKeys && !hasCustomKeys && !hasRemoveMeta && !hasRemoveCustom) return;
+    const hasRemoveSystem = (options.removeSystemKeys ?? []).length > 0;
+    if (!hasTopLevel && !hasMetaKeys && !hasCustomKeys && !hasSystemKeys && !hasRemoveMeta && !hasRemoveCustom && !hasRemoveSystem) return;
 
     // Step 1: ensure parent maps exist so document-path SETs/REMOVEs don't throw.
     // REMOVE on a nested path (e.g. customFields.key) also requires the parent
     // map to exist — bootstrap whenever we touch either map at all.
-    if (hasMetaKeys || hasCustomKeys || hasRemoveMeta || hasRemoveCustom) {
+    if (hasMetaKeys || hasCustomKeys || hasSystemKeys || hasRemoveMeta || hasRemoveCustom || hasRemoveSystem) {
       try {
         await dynamodb.update({
           TableName: tableName,
           Key: key,
           UpdateExpression:
             'SET customFields = if_not_exists(customFields, :emptyMap), ' +
-            'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap)',
+            'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap), ' +
+            'system = if_not_exists(system, :emptyMap)',
           ExpressionAttributeValues: { ':emptyMap': {} },
           ConditionExpression: 'attribute_exists(leadId)',
         }).promise();
@@ -8022,6 +8031,16 @@ export const crmDb = {
       idx++;
     }
 
+    idx = 0;
+    for (const [k, v] of Object.entries(options.system ?? {})) {
+      attrNames[`#sys${idx}`] = k;
+      attrValues[`:sys${idx}`] = v;
+      setClauses.push(ine
+        ? `system.#sys${idx} = if_not_exists(system.#sys${idx}, :sys${idx})`
+        : `system.#sys${idx} = :sys${idx}`);
+      idx++;
+    }
+
     let rmIdx = 0;
     for (const k of options.removeEnrichmentMetadataKeys ?? []) {
       attrNames[`#rmem${rmIdx}`] = k;
@@ -8033,6 +8052,13 @@ export const crmDb = {
     for (const k of options.removeCustomFieldKeys ?? []) {
       attrNames[`#rmcf${rmIdx}`] = k;
       removeClauses.push(`customFields.#rmcf${rmIdx}`);
+      rmIdx++;
+    }
+
+    rmIdx = 0;
+    for (const k of options.removeSystemKeys ?? []) {
+      attrNames[`#rmsys${rmIdx}`] = k;
+      removeClauses.push(`system.#rmsys${rmIdx}`);
       rmIdx++;
     }
 
