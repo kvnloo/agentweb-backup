@@ -98,8 +98,8 @@ export async function enqueueJob(
 
 export async function markJobComplete(source: string, dedupeKey: string): Promise<void> {
   const id = jobId(source, dedupeKey);
-  try {
-    await dynamodb
+  const writeCompleted = () =>
+    dynamodb
       .update({
         TableName: TABLE_NAME,
         Key: { id },
@@ -108,17 +108,31 @@ export async function markJobComplete(source: string, dedupeKey: string): Promis
         ExpressionAttributeValues: { ':completed': 'completed', ':now': new Date().toISOString() },
       })
       .promise();
-  } catch (error: any) {
-    // Best-effort — if this fails, the poller will eventually re-claim and
-    // re-process the job (safe, since processing is idempotent), not silently lose it.
-    console.warn(`[AsyncJobQueue] markJobComplete failed for ${id} (best-effort):`, error?.message ?? error);
+
+  try {
+    await writeCompleted();
+  } catch (firstError: any) {
+    // One immediate retry before falling back to stale-reclamation — a transient
+    // write failure (throttling, a brief network blip) is exactly the case a
+    // single retry resolves, and every extra successful job here is one the
+    // poller never needs to re-claim at all (processing is idempotent per-step
+    // even if it does, but avoiding it outright is strictly better: no wasted
+    // re-run, no ~5 minute delay before that re-run happens).
+    try {
+      await writeCompleted();
+    } catch (secondError: any) {
+      // Still best-effort — if this fails, the poller will eventually re-claim and
+      // re-process the job (safe, since processing is idempotent), not silently lose it.
+      console.warn(`[AsyncJobQueue] markJobComplete failed for ${id} after retry (best-effort):`, secondError?.message ?? secondError);
+    }
   }
 }
 
 export async function markJobFailed(source: string, dedupeKey: string, error: unknown): Promise<void> {
   const id = jobId(source, dedupeKey);
   const message = error instanceof Error ? error.message : String(error);
-  try {
+
+  const writeFailedState = async () => {
     const existing = await dynamodb.get({ TableName: TABLE_NAME, Key: { id } }).promise();
     const attempts = ((existing.Item as any)?.attempts ?? 0) + 1;
     const nextStatus = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
@@ -136,8 +150,20 @@ export async function markJobFailed(source: string, dedupeKey: string, error: un
         },
       })
       .promise();
-  } catch (err: any) {
-    console.warn(`[AsyncJobQueue] markJobFailed failed for ${id} (best-effort):`, err?.message ?? err);
+  };
+
+  try {
+    await writeFailedState();
+  } catch (firstErr: any) {
+    // One immediate retry before falling back to stale-reclamation — same
+    // reasoning as markJobComplete's retry: a transient write failure here would
+    // otherwise leave a genuinely-failed job stuck in 'processing' until the
+    // 5-minute staleness window, delaying its retry for no reason.
+    try {
+      await writeFailedState();
+    } catch (secondErr: any) {
+      console.warn(`[AsyncJobQueue] markJobFailed failed for ${id} after retry (best-effort):`, secondErr?.message ?? secondErr);
+    }
   }
 }
 
