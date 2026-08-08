@@ -323,6 +323,60 @@ describe('POST /connect', () => {
     expect(res.status).toBe(500);
   });
 
+  // Greptile P1 on #2291 (round 13): the webhook is already live on Calendly's side by
+  // the time createAccount runs — if persisting the local record then fails, nothing
+  // anywhere records that webhook_id, so it can never be identified for cleanup and a
+  // later connect attempt just gets Calendly's "Already Exists". Roll it back
+  // immediately (we still have a fresh access_token in hand from this same request)
+  // rather than needing a separate durable-recovery path for a webhook that never
+  // finished connecting in the first place.
+  it('rolls back the newly-created webhook when persisting the account fails, so the subscription isn\'t orphaned', async () => {
+    const fin = await initAndFinalize();
+    axios.post.mockResolvedValueOnce(webhookCreatedResponse());
+    createAccount.mockRejectedValueOnce(new Error('dynamo down'));
+    axios.delete = jest.fn().mockResolvedValueOnce({ data: {} });
+
+    const res = await request(app)
+      .post('/api/oauth/calendly/connect')
+      .send({ tokenSessionId: fin.body.tokenSessionId });
+
+    expect(res.status).toBe(500);
+    expect(axios.delete).toHaveBeenCalledWith(
+      'https://api.calendly.com/webhook_subscriptions/CCCCCCCCCCCCCCCC',
+      expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer access-1' }) }),
+    );
+  });
+
+  it('still 500s (does not throw) when the rollback delete itself fails after persisting the account fails', async () => {
+    const fin = await initAndFinalize();
+    axios.post.mockResolvedValueOnce(webhookCreatedResponse());
+    createAccount.mockRejectedValueOnce(new Error('dynamo down'));
+    axios.delete = jest.fn().mockRejectedValueOnce(new Error('calendly down too'));
+
+    const res = await request(app)
+      .post('/api/oauth/calendly/connect')
+      .send({ tokenSessionId: fin.body.tokenSessionId });
+
+    expect(res.status).toBe(500);
+    expect(axios.delete).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not attempt a rollback delete when createAccount fails but booking tracking was never active (no webhook was ever created)', async () => {
+    const fin = await initAndFinalize();
+    axios.post.mockRejectedValueOnce({
+      response: { status: 403, data: { message: 'You must be on a paid plan to use this feature.' } },
+    });
+    createAccount.mockRejectedValueOnce(new Error('dynamo down'));
+    axios.delete = jest.fn();
+
+    const res = await request(app)
+      .post('/api/oauth/calendly/connect')
+      .send({ tokenSessionId: fin.body.tokenSessionId });
+
+    expect(res.status).toBe(500);
+    expect(axios.delete).not.toHaveBeenCalled();
+  });
+
   // A reconnect (disconnect then re-connect) always attempts to create a fresh webhook
   // subscription. If a previous connect's subscription is still alive at the same
   // callback URL, Calendly rejects the create with { title: 'Already Exists' } — a real
