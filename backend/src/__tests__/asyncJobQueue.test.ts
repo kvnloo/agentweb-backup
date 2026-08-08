@@ -27,6 +27,7 @@ import {
   registerProcessor,
   pollAndProcessOnce,
   startHeartbeat,
+  updateJobPayload,
 } from '../services/asyncJobQueue';
 
 describe('asyncJobQueue', () => {
@@ -204,6 +205,38 @@ describe('asyncJobQueue', () => {
 
       await expect(markJobFailed('calendly_webhook', 'invitee-123', new Error('boom'))).resolves.toBeUndefined();
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // Greptile P1 on #2291 (round 20): a processor may discover, mid-attempt, that
+  // part of its own input has changed in a way future retries need — Calendly's
+  // cleanup-retry job refreshes an OAuth token Calendly may rotate on every use.
+  // If a maxAttempts: Infinity job (calendly_webhook_cleanup) can never persist
+  // that rotation, every future retry keeps refreshing with the same
+  // now-invalid pre-rotation token forever — not just a wasted attempt, an
+  // infinite loop that can never make progress.
+  describe('updateJobPayload', () => {
+    it('overwrites the stored payload for the given job', async () => {
+      await updateJobPayload('calendly_webhook_cleanup', 'https://api.calendly.com/webhook_subscriptions/AAAA', {
+        webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+        refreshToken: 'rotated-refresh-token',
+      });
+
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(updateCall.Key.id).toBe('calendly_webhook_cleanup_https://api.calendly.com/webhook_subscriptions/AAAA');
+      expect(updateCall.UpdateExpression).toContain('SET payload = :payload');
+      expect(JSON.parse(updateCall.ExpressionAttributeValues[':payload'])).toEqual({
+        webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+        refreshToken: 'rotated-refresh-token',
+      });
+    });
+
+    it('does not throw when the write fails (best-effort — a future retry just falls back to the stale payload it already had)', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('down')),
+      });
+
+      await expect(updateJobPayload('calendly_webhook_cleanup', 'id-1', { any: 'payload' })).resolves.toBeUndefined();
     });
   });
 

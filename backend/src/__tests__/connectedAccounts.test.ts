@@ -68,8 +68,10 @@ jest.mock('../routes/calendlyAuth', () => ({
     refreshCalendlyAccessToken: jest.fn(),
 }));
 const mockEnqueueJob = jest.fn();
+const mockUpdateJobPayload = jest.fn();
 jest.mock('../services/asyncJobQueue', () => ({
     enqueueJob: (...a: any[]) => mockEnqueueJob(...a),
+    updateJobPayload: (...a: any[]) => mockUpdateJobPayload(...a),
     registerProcessor: jest.fn(),
 }));
 
@@ -90,6 +92,7 @@ describe('Connected Accounts Routes', () => {
         (userDb.getUserById as jest.Mock).mockResolvedValue(null);
         (orgDb.getOrgById as jest.Mock).mockResolvedValue(null);
         mockEnqueueJob.mockResolvedValue('enqueued');
+        mockUpdateJobPayload.mockResolvedValue(undefined);
     });
 
     describe('GET /connected-accounts', () => {
@@ -928,6 +931,64 @@ describe('Connected Accounts Routes', () => {
             expect(axios.delete).toHaveBeenCalledWith(
                 'https://api.calendly.com/webhook_subscriptions/AAAA',
                 expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer fresh-access-token' }) }),
+            );
+        });
+
+        // Greptile P1 on #2291 (round 20): Calendly may rotate the refresh token on
+        // every use. If this job (registered with maxAttempts: Infinity) never
+        // persists a rotation, a delete failure AFTER a successful refresh leaves
+        // every future retry stuck refreshing with the same now-invalid
+        // pre-rotation token forever — an infinite loop that can never succeed.
+        it('persists a rotated refresh token back to the durable queue row BEFORE attempting the delete', async () => {
+            (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                access_token: 'fresh-access-token',
+                refresh_token: 'rotated-refresh-token',
+            });
+            (axios.delete as jest.Mock).mockResolvedValue({ data: {} });
+
+            await processCalendlyWebhookCleanupJob({
+                webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                refreshToken: 'refresh-token-1',
+            });
+
+            expect(mockUpdateJobPayload).toHaveBeenCalledWith(
+                'calendly_webhook_cleanup',
+                'https://api.calendly.com/webhook_subscriptions/AAAA',
+                { webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA', refreshToken: 'rotated-refresh-token' },
+            );
+        });
+
+        it('does not touch the durable queue row when the refresh token is unchanged', async () => {
+            (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                access_token: 'fresh-access-token',
+                refresh_token: 'refresh-token-1',
+            });
+            (axios.delete as jest.Mock).mockResolvedValue({ data: {} });
+
+            await processCalendlyWebhookCleanupJob({
+                webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                refreshToken: 'refresh-token-1',
+            });
+
+            expect(mockUpdateJobPayload).not.toHaveBeenCalled();
+        });
+
+        it('persists the rotated token even when the delete itself then fails, so the next retry uses it', async () => {
+            (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                access_token: 'fresh-access-token',
+                refresh_token: 'rotated-refresh-token',
+            });
+            (axios.delete as jest.Mock).mockRejectedValue(new Error('calendly down'));
+
+            await expect(processCalendlyWebhookCleanupJob({
+                webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                refreshToken: 'refresh-token-1',
+            })).rejects.toThrow('calendly down');
+
+            expect(mockUpdateJobPayload).toHaveBeenCalledWith(
+                'calendly_webhook_cleanup',
+                'https://api.calendly.com/webhook_subscriptions/AAAA',
+                { webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA', refreshToken: 'rotated-refresh-token' },
             );
         });
 
