@@ -686,6 +686,31 @@ describe('Connected Accounts Routes', () => {
                 expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
             });
 
+            // Greptile P1 on #2291 (round 10): if BOTH the remote delete and the durable
+            // enqueue retry fail, the local account (the only other copy of webhook_id) is
+            // still deleted right after — disconnect intentionally always succeeds locally
+            // rather than blocking the user on cleanup. That makes this the last point
+            // where "this subscription is now permanently unrecoverable" is observable at
+            // all — it must escalate loudly (console.error) rather than warn, so it's
+            // actionable/alertable in production monitoring instead of silently lost.
+            it('logs an actionable error (not just a warning) when the durable enqueue is still unavailable after the retry, right before the local account is deleted anyway', async () => {
+                (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
+                (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+                (axios.delete as jest.Mock).mockRejectedValue(new Error('token expired'));
+                mockEnqueueJob.mockResolvedValue('unavailable');
+                const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+                const response = await request(app).delete('/api/oauth/connected-accounts/calendly/jane%40customer.com');
+
+                expect(response.status).toBe(200);
+                expect(mockEnqueueJob).toHaveBeenCalledTimes(2);
+                expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('LOST webhook cleanup record'));
+                // Disconnect still succeeds locally even though the identifier is now lost.
+                expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
+
+                errorSpy.mockRestore();
+            });
+
             it('does not attempt a remote delete when there is no webhook_id (booking tracking was already inactive)', async () => {
                 (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue({
                     ...calendlyAccount,
