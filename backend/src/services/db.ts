@@ -18,6 +18,11 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
+// An 'in_progress' claimLeadStepOnce claim older than this is treated as
+// abandoned (its release write never landed) and becomes reclaimable — see
+// claimLeadStepOnce for the full reasoning (Greptile P1 on #2291, round 17).
+const CLAIM_STALE_MS = 5 * 60 * 1000;
+
 // For debugging
 
 // Configure AWS SDK
@@ -8166,14 +8171,36 @@ export const crmDb = {
       throw err;
     }
 
+    // Greptile P1 on #2291 (round 17): the release-on-failure write in
+    // calendlyWebhook.ts's runStepOnce is itself best-effort (swallows its own
+    // errors) — if THAT write also fails, a bare-value claim would stay
+    // 'in_progress' forever, and every future retry's claim attempt would keep
+    // losing to it indefinitely: not a probability reduction problem, a
+    // structural one, the same class already fixed twice this session for the
+    // async queue's own staleness model. So the claim carries its own
+    // timestamp and the condition below allows reclaiming an 'in_progress'
+    // claim that's older than CLAIM_STALE_MS — recoverable within a bounded
+    // window even if the release write is never seen again, while still
+    // conservative enough (5 minutes, same order of magnitude as the queue's
+    // own STALE_PROCESSING_MS) that a genuinely still-running external call
+    // is never reclaimed out from under itself.
+    const now = new Date().toISOString();
+    const staleThreshold = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
     try {
       await dynamodb.update({
         TableName: tableName,
         Key: dynKey,
-        UpdateExpression: 'SET #system.#k = :v, updatedAt = :ts',
-        ExpressionAttributeNames: { '#system': 'system', '#k': key },
-        ExpressionAttributeValues: { ':v': 'in_progress', ':ts': new Date().toISOString() },
-        ConditionExpression: 'attribute_not_exists(#system.#k)',
+        UpdateExpression: 'SET #system.#k = :claim, updatedAt = :ts',
+        ExpressionAttributeNames: { '#system': 'system', '#k': key, '#status': 'status', '#claimedAt': 'claimedAt' },
+        ExpressionAttributeValues: {
+          ':claim': { status: 'in_progress', claimedAt: now },
+          ':ts': now,
+          ':inProgress': 'in_progress',
+          ':staleThreshold': staleThreshold,
+        },
+        ConditionExpression:
+          'attribute_not_exists(#system.#k) OR ' +
+          '(#system.#k.#status = :inProgress AND #system.#k.#claimedAt < :staleThreshold)',
       }).promise();
       return true;
     } catch (err: any) {

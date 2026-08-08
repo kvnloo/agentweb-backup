@@ -367,20 +367,32 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
       // two concurrent claimants can ever win, regardless of how the race happened.
       // On failure, the claim is released so a legitimate future retry (this same
       // job re-run by the poller after markJobFailed) can still re-attempt the step.
+      //
+      // Greptile P1 on #2291 (round 17): that release write is itself best-effort —
+      // if it fails too, the previous version just swallowed it, wedging the claim
+      // 'in_progress' forever and silently skipping this step on every future
+      // retry (a real failure disguised as "someone else is handling it"). Retried
+      // once here as the fast path; claimLeadStepOnce's own staleness window
+      // (CLAIM_STALE_MS in db.ts) is the structural backstop if both attempts fail —
+      // a still-wedged claim becomes reclaimable on its own once it's old enough,
+      // rather than staying stuck indefinitely.
       const runStepOnce = async (step: 'hubspot' | 'attio' | 'alert', work: () => Promise<void>): Promise<void> => {
         const key = stepMarkerKey(step);
-        if (leadSystemMarkers[key] === 'done') return;
+        if (leadSystemMarkers[key]?.status === 'done') return;
         const claimed = await crmDb.claimLeadStepOnce(listId!, lead.leadId, key);
         if (!claimed) {
-          console.log(`[Calendly Webhook] ${step} step for ${payload.uri} already claimed by a concurrent run — skipping`);
+          console.log(`[Calendly Webhook] ${step} step for ${payload.uri} already claimed by a concurrent or not-yet-stale run — skipping`);
           return;
         }
         try {
           await work();
-          leadSystemMarkers[key] = 'done';
-          await crmDb.setLeadFields(listId!, lead.leadId, { system: { [key]: 'done' } });
+          leadSystemMarkers[key] = { status: 'done' };
+          await crmDb.setLeadFields(listId!, lead.leadId, { system: { [key]: { status: 'done' } } });
         } catch (err: any) {
-          await crmDb.setLeadFields(listId!, lead.leadId, { removeSystemKeys: [key] }).catch(() => {});
+          const release = () => crmDb.setLeadFields(listId!, lead.leadId, { removeSystemKeys: [key] });
+          await release().catch(() => release().catch((releaseErr: any) => {
+            console.error(`[Calendly Webhook] Failed to release ${step} claim for ${payload.uri} after retry — will self-heal once the claim goes stale:`, releaseErr?.message ?? releaseErr);
+          }));
           throw err;
         }
       };
