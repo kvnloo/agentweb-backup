@@ -51,6 +51,11 @@ jest.mock('../services/settingsService', () => {
 jest.mock('axios');
 const axios = require('axios');
 
+const queueCalendlyWebhookCleanup = jest.fn();
+jest.mock('../services/calendlyWebhookCleanupQueue', () => ({
+  queueCalendlyWebhookCleanup: (...a: any[]) => queueCalendlyWebhookCleanup(...a),
+}));
+
 process.env.JWT_SECRET = 'test-jwt-secret';
 process.env.CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
 
@@ -117,6 +122,7 @@ beforeEach(() => {
     config: input.config,
   }));
   getAccountsByUserId.mockResolvedValue([]);
+  queueCalendlyWebhookCleanup.mockResolvedValue(undefined);
 });
 
 describe('GET /init', () => {
@@ -359,6 +365,46 @@ describe('POST /connect', () => {
 
     expect(res.status).toBe(500);
     expect(axios.delete).toHaveBeenCalledTimes(1);
+  });
+
+  // Greptile P1 on #2291 (round 14): the immediate rollback delete is best-effort —
+  // if IT also fails (Calendly outage, or the very DynamoDB issue that just failed
+  // createAccount also disrupting connectivity generally), the previous version just
+  // logged and gave up, discarding the webhook_id with no durable record anywhere.
+  // Exactly the same shape as the disconnect-side gap fixed in round 9 (issue 3) —
+  // fall back to the same durable, unlimited-retry cleanup queue rather than
+  // inventing a second recovery mechanism.
+  it('falls back to the durable cleanup queue when the rollback delete itself fails', async () => {
+    const fin = await initAndFinalize();
+    axios.post.mockResolvedValueOnce(webhookCreatedResponse());
+    createAccount.mockRejectedValueOnce(new Error('dynamo down'));
+    axios.delete = jest.fn().mockRejectedValueOnce(new Error('calendly down too'));
+
+    const res = await request(app)
+      .post('/api/oauth/calendly/connect')
+      .send({ tokenSessionId: fin.body.tokenSessionId });
+
+    expect(res.status).toBe(500);
+    expect(queueCalendlyWebhookCleanup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        webhook_id: 'https://api.calendly.com/webhook_subscriptions/CCCCCCCCCCCCCCCC',
+        refresh_token: 'refresh-1',
+      }),
+    );
+  });
+
+  it('does not queue a durable cleanup when the immediate rollback delete succeeds', async () => {
+    const fin = await initAndFinalize();
+    axios.post.mockResolvedValueOnce(webhookCreatedResponse());
+    createAccount.mockRejectedValueOnce(new Error('dynamo down'));
+    axios.delete = jest.fn().mockResolvedValueOnce({ data: {} });
+
+    const res = await request(app)
+      .post('/api/oauth/calendly/connect')
+      .send({ tokenSessionId: fin.body.tokenSessionId });
+
+    expect(res.status).toBe(500);
+    expect(queueCalendlyWebhookCleanup).not.toHaveBeenCalled();
   });
 
   it('does not attempt a rollback delete when createAccount fails but booking tracking was never active (no webhook was ever created)', async () => {
