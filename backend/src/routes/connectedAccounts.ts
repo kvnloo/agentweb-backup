@@ -1,6 +1,7 @@
 import express from 'express';
+import axios from 'axios';
 import { authenticateToken } from '../middleware/auth';
-import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, updateAccountConfig, FathomConfig } from '../services/connectedAccountsDb';
+import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, getAccountById, updateAccountConfig, FathomConfig, CalendlyConfig } from '../services/connectedAccountsDb';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
@@ -35,6 +36,33 @@ async function canCallerDisconnectAccount(userId: string, platform: string, acco
     allowed: false,
     error: 'Only the org owner can disconnect an org-shared connected account. Unshare it from the organization first.',
   };
+}
+
+/**
+ * Best-effort cleanup of the remote Calendly webhook subscription on disconnect,
+ * symmetric with how /connect creates it. Non-fatal: disconnect must always
+ * succeed locally even if this fails (expired token, Calendly outage, etc).
+ *
+ * Greptile P1 on #2291: without this, disconnect deleted the local account
+ * record (including webhook_id) but left the actual Calendly-side subscription
+ * alive. A later reconnect of the same identity then hit "Already Exists" with
+ * no local record left to identify and clean it up (reconnect only ever
+ * deletes a webhook_id it can prove belongs to this account — see
+ * calendlyAuth.ts), permanently stranding the account on booking tracking
+ * disabled. Deleting the subscription here removes the need to ever recover
+ * from that state after a normal disconnect.
+ */
+async function cleanupCalendlyWebhook(account: { config: unknown } | null): Promise<void> {
+  if (!account) return;
+  const config = account.config as CalendlyConfig;
+  if (!config.webhook_id || !config.access_token) return;
+
+  try {
+    await axios.delete(config.webhook_id, { headers: { Authorization: `Bearer ${config.access_token}` } });
+    console.log(`[Calendly] Deleted webhook ${config.webhook_id} on disconnect`);
+  } catch (err: any) {
+    console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect:`, err?.response?.data || err?.message);
+  }
 }
 
 // ============================================
@@ -187,6 +215,10 @@ router.delete('/connected-accounts/:platform', authenticateToken, async (req: an
       return res.status(403).json({ error: disconnectGuard.error });
     }
 
+    if (platform === 'calendly') {
+      await cleanupCalendlyWebhook(await getAccountByPlatform(userId, platform));
+    }
+
     await deleteAccount(userId, platform);
     res.json({ success: true, message: `${platform} account(s) disconnected` });
   } catch (error) {
@@ -216,6 +248,10 @@ router.delete('/connected-accounts/:platform/:accountId', authenticateToken, asy
         // Non-fatal: log and continue with DB deletion so the user isn't stuck
         console.warn(`[LinkedIn Outreach] Failed to delete Unipile account ${accountId}:`, unipileErr?.message);
       }
+    }
+
+    if (platform === 'calendly') {
+      await cleanupCalendlyWebhook(await getAccountById(accountId, userId, 'calendly'));
     }
 
     await deleteAccountById(userId, platform, accountId);
