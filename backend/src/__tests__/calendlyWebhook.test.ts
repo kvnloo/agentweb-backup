@@ -310,18 +310,57 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockMarkJobComplete).not.toHaveBeenCalled();
     });
 
-    it('still processes inline when enqueueJob reports "unavailable" (queue/table not provisioned yet)', async () => {
-      mockEnqueueJob.mockResolvedValue('unavailable');
-      const body = makePayload({ email: 'lead@example.com' });
+    it('retries the enqueue once when the first attempt reports unavailable, and processes durably if the retry succeeds', async () => {
+      mockEnqueueJob.mockResolvedValueOnce('unavailable').mockResolvedValueOnce('enqueued');
+      const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-31/invitees/inv-31' });
       const res = await postSigned(body);
 
       expect(res.status).toBe(200);
       await flushPromises();
 
+      expect(mockEnqueueJob).toHaveBeenCalledTimes(2);
+      expect(mockStartHeartbeat).toHaveBeenCalledWith('calendly_webhook', 'https://api.calendly.com/scheduled_events/evt-31/invitees/inv-31');
+      expect(mockMarkJobComplete).toHaveBeenCalledWith('calendly_webhook', 'https://api.calendly.com/scheduled_events/evt-31/invitees/inv-31');
+    });
+
+    // Greptile P1 on #2291 (round 10/11): acking 200 immediately, THEN processing
+    // fire-and-forget, meant a crash in that exact window silently lost the
+    // booking's attribution/CRM-forward with nothing left to recover from once
+    // there's also no durable queue row — the identical gap this entire feature
+    // exists to close, just reopened for the "queue unavailable" branch. When the
+    // queue is genuinely unavailable (even after the retry above), processing now
+    // happens BEFORE the ack, so nothing is ever silently lost regardless of what
+    // happens immediately after the response.
+    it('processes synchronously (before acking) when the queue is unavailable even after retrying, and still returns 200 on success', async () => {
+      mockEnqueueJob.mockResolvedValue('unavailable');
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      // By the time postSigned's promise resolves, processing has ALREADY
+      // happened — no flushPromises needed to observe it, since this path is
+      // synchronous now (unlike the 'enqueued' fire-and-forget path above).
+      expect(res.status).toBe(200);
+      expect(mockEnqueueJob).toHaveBeenCalledTimes(2);
       expect(mockSendCapiLeadEvent).toHaveBeenCalledTimes(1);
-      // No durable record was ever created for this delivery, so there's nothing to
-      // mark complete — matches the exact fire-and-forget behavior from before the
-      // queue existed.
+      // No durable record was ever created for this delivery, so there's nothing
+      // to mark complete or heartbeat — there's no row to keep fresh.
+      expect(mockMarkJobComplete).not.toHaveBeenCalled();
+      expect(mockStartHeartbeat).not.toHaveBeenCalled();
+    });
+
+    it('responds 500 (not a false 200) when the queue is unavailable and synchronous processing also fails, so Calendly can retry the delivery', async () => {
+      mockEnqueueJob.mockResolvedValue('unavailable');
+      // Outside any inner try/catch in processCalendlyWebhookJob (the owner lookup
+      // that gates the whole function), so this always throws.
+      mockGetUserById.mockRejectedValue(new Error('dynamo down'));
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(500);
+      // Still no durable row to update either way — this delivery's only path to
+      // recovery now is Calendly redelivering after the non-200, which our
+      // processing is already safe to run again (idempotent per-step/per-eventId).
+      expect(mockMarkJobFailed).not.toHaveBeenCalled();
       expect(mockMarkJobComplete).not.toHaveBeenCalled();
     });
 
