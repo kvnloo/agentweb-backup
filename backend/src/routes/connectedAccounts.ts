@@ -3,6 +3,7 @@ import axios from 'axios';
 import { authenticateToken } from '../middleware/auth';
 import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, getAccountById, updateAccountConfig, FathomConfig, CalendlyConfig } from '../services/connectedAccountsDb';
 import { refreshCalendlyAccessToken } from './calendlyAuth';
+import { enqueueJob, registerProcessor } from '../services/asyncJobQueue';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
@@ -39,19 +40,53 @@ async function canCallerDisconnectAccount(userId: string, platform: string, acco
   };
 }
 
+const CALENDLY_WEBHOOK_CLEANUP_SOURCE = 'calendly_webhook_cleanup';
+
+interface CalendlyWebhookCleanupPayload {
+  webhookId: string;
+  refreshToken?: string;
+}
+
+/**
+ * Durable retry for a webhook subscription that couldn't be deleted inline during
+ * disconnect (Calendly outage, or a token that a refresh at enqueue-time couldn't
+ * fix but a LATER refresh might). Refreshes on every attempt rather than reusing
+ * a stored access token, since by the time the poller retries this, whatever
+ * token was current at enqueue-time is almost certainly stale again.
+ */
+export async function processCalendlyWebhookCleanupJob(payload: CalendlyWebhookCleanupPayload): Promise<void> {
+  if (!payload.refreshToken) {
+    throw new Error(`No refresh token available to clean up orphaned webhook ${payload.webhookId}`);
+  }
+  const refreshed = await refreshCalendlyAccessToken(payload.refreshToken);
+  if (!refreshed) {
+    throw new Error(`Could not refresh token to clean up orphaned webhook ${payload.webhookId}`);
+  }
+  await axios.delete(payload.webhookId, { headers: { Authorization: `Bearer ${refreshed.access_token}` } });
+  console.log(`[Calendly] Cleaned up orphaned webhook ${payload.webhookId} via queued retry`);
+}
+
+registerProcessor(CALENDLY_WEBHOOK_CLEANUP_SOURCE, processCalendlyWebhookCleanupJob);
+
 /**
  * Best-effort cleanup of the remote Calendly webhook subscription on disconnect,
  * symmetric with how /connect creates it. Non-fatal: disconnect must always
  * succeed locally even if this fails (expired token, Calendly outage, etc).
  *
- * Greptile P1 on #2291: without this, disconnect deleted the local account
- * record (including webhook_id) but left the actual Calendly-side subscription
- * alive. A later reconnect of the same identity then hit "Already Exists" with
- * no local record left to identify and clean it up (reconnect only ever
- * deletes a webhook_id it can prove belongs to this account — see
- * calendlyAuth.ts), permanently stranding the account on booking tracking
- * disabled. Deleting the subscription here removes the need to ever recover
- * from that state after a normal disconnect.
+ * Greptile P1 on #2291 (round 1): without this at all, disconnect deleted the
+ * local account record (including webhook_id) but left the actual Calendly-side
+ * subscription alive, permanently stranding a later reconnect.
+ *
+ * Greptile P1 on #2291 (round 4): the refresh-and-retry added for that fixed the
+ * common "expired token" case, but disconnect still deleted the local account
+ * (and its webhook_id) on ANY remaining failure — a revoked refresh token or a
+ * Calendly outage at that exact moment — losing the only recorded identifier
+ * forever with no way to ever clean it up. Enqueueing a durable retry job here,
+ * BEFORE the account (and its webhook_id) is deleted, means that identifier
+ * survives independently of the account's lifecycle: the queue's own poller
+ * keeps retrying (refreshing the token fresh on each attempt) until it succeeds
+ * or exhausts its attempts, at which point it's durably 'failed' in the queue
+ * table rather than silently gone from everywhere.
  */
 async function cleanupCalendlyWebhook(account: { config: unknown } | null): Promise<void> {
   if (!account) return;
@@ -68,6 +103,7 @@ async function cleanupCalendlyWebhook(account: { config: unknown } | null): Prom
   } catch (err: any) {
     const isAuthError = err?.response?.status === 401 || err?.response?.status === 403;
     if (!isAuthError || !config.refresh_token) {
+      await queueCalendlyWebhookCleanup(config);
       console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect:`, err?.response?.data || err?.message);
       return;
     }
@@ -75,13 +111,11 @@ async function cleanupCalendlyWebhook(account: { config: unknown } | null): Prom
 
   // The stored access token is short-lived and this cleanup often runs long after
   // last activity — an auth failure here is expected, not exceptional. Refresh once
-  // and retry before giving up (Greptile P1 on #2291: silently accepting an expired
-  // token as final loses webhook_id along with the local account, permanently
-  // stranding the subscription since a later reconnect has nothing left to identify
-  // it with).
+  // and retry before falling back to the durable queue.
   const refreshed = await refreshCalendlyAccessToken(config.refresh_token!);
   if (!refreshed) {
-    console.warn(`[Calendly] Could not refresh token to clean up webhook ${config.webhook_id} on disconnect — leaving it orphaned`);
+    await queueCalendlyWebhookCleanup(config);
+    console.warn(`[Calendly] Could not refresh token to clean up webhook ${config.webhook_id} on disconnect — queued for retry`);
     return;
   }
 
@@ -89,7 +123,19 @@ async function cleanupCalendlyWebhook(account: { config: unknown } | null): Prom
     await attemptDelete(refreshed.access_token);
     console.log(`[Calendly] Deleted webhook ${config.webhook_id} on disconnect (after token refresh)`);
   } catch (retryErr: any) {
+    await queueCalendlyWebhookCleanup(config);
     console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect even after token refresh:`, retryErr?.response?.data || retryErr?.message);
+  }
+}
+
+async function queueCalendlyWebhookCleanup(config: CalendlyConfig): Promise<void> {
+  const result = await enqueueJob(
+    CALENDLY_WEBHOOK_CLEANUP_SOURCE,
+    config.webhook_id!,
+    { webhookId: config.webhook_id, refreshToken: config.refresh_token } as CalendlyWebhookCleanupPayload,
+  );
+  if (result === 'unavailable') {
+    console.warn(`[Calendly] Could not queue a retry for webhook ${config.webhook_id} — queue unavailable, orphaned with no durable record`);
   }
 }
 
