@@ -288,6 +288,55 @@ describe('asyncJobQueue', () => {
       expect(failCall![0].ExpressionAttributeValues[':attempts']).toBe(1);
     });
 
+    it('marks a job "failed" once it reaches the default MAX_ATTEMPTS (5)', async () => {
+      const handler = jest.fn().mockRejectedValue(new Error('still down'));
+      registerProcessor('test_source_maxattempts_default', handler);
+
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ id: 'test_source_maxattempts_default_abc', source: 'test_source_maxattempts_default', status: 'pending', payload: '{}', attempts: 4, updatedAt: '2026-01-01T00:00:00.000Z' }],
+          }),
+        })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+
+      await pollAndProcessOnce();
+
+      const failCall = mockDocumentClientMethods.update.mock.calls.find((c: any) => c[0].ExpressionAttributeValues?.[':lastError'] === 'still down');
+      expect(failCall![0].ExpressionAttributeValues[':status']).toBe('failed');
+      expect(failCall![0].ExpressionAttributeValues[':attempts']).toBe(5);
+    });
+
+    // Greptile P1 on #2291 (round 9, issue 3): calendly_webhook_cleanup jobs are
+    // enqueued to durably record a webhook_id BEFORE the local account (the only
+    // other copy of that identifier) is deleted on disconnect. Once the job hits
+    // MAX_ATTEMPTS it goes 'failed' and the poller's claimable query never selects
+    // 'failed' jobs again — permanently stranding a webhook Calendly will never let
+    // a later reconnect re-create ("Already Exists"), since the identifier that
+    // could clean it up now lives nowhere else. A source registered with
+    // maxAttempts: Infinity keeps retrying indefinitely instead of ever going
+    // terminally inert, so a Calendly outage or a token that's refreshable again
+    // later still eventually resolves the orphan.
+    it('never marks a job "failed" when its processor is registered with maxAttempts: Infinity, no matter how many attempts it has', async () => {
+      const handler = jest.fn().mockRejectedValue(new Error('calendly still down'));
+      registerProcessor('calendly_webhook_cleanup_test', handler, { maxAttempts: Infinity });
+
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ id: 'calendly_webhook_cleanup_test_abc', source: 'calendly_webhook_cleanup_test', status: 'pending', payload: '{}', attempts: 999, updatedAt: '2026-01-01T00:00:00.000Z' }],
+          }),
+        })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+
+      await pollAndProcessOnce();
+
+      const failCall = mockDocumentClientMethods.update.mock.calls.find((c: any) => c[0].ExpressionAttributeValues?.[':lastError'] === 'calendly still down');
+      expect(failCall).toBeDefined();
+      expect(failCall![0].ExpressionAttributeValues[':status']).toBe('pending');
+      expect(failCall![0].ExpressionAttributeValues[':attempts']).toBe(1000);
+    });
+
     it('does not throw when no processor is registered for a job\'s source', async () => {
       mockDocumentClientMethods.query
         .mockReturnValueOnce({

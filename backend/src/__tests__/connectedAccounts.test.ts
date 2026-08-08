@@ -5,6 +5,7 @@ import connectedAccountsRouter, { processCalendlyWebhookCleanupJob } from '../ro
 import * as connectedAccountsDb from '../services/connectedAccountsDb';
 import { refreshCalendlyAccessToken } from '../routes/calendlyAuth';
 import { userDb, orgDb, crmDb } from '../services/db';
+import { registerProcessor as mockRegisterProcessor } from '../services/asyncJobQueue';
 
 // Mock dependencies
 jest.mock('axios');
@@ -57,6 +58,13 @@ jest.mock('../services/asyncJobQueue', () => ({
 const app = express();
 app.use(express.json());
 app.use('/api/oauth', connectedAccountsRouter);
+
+// connectedAccounts.ts calls registerProcessor at MODULE LOAD time (once, when this
+// test file's top-level import above executes) — captured here, before any
+// beforeEach's jest.clearAllMocks() has a chance to wipe that one-time call record.
+const registeredCleanupProcessorCall = (mockRegisterProcessor as jest.Mock).mock.calls.find(
+    (call: any[]) => call[0] === 'calendly_webhook_cleanup',
+);
 
 describe('Connected Accounts Routes', () => {
     beforeEach(() => {
@@ -820,6 +828,18 @@ describe('Connected Accounts Routes', () => {
     });
 
     describe('processCalendlyWebhookCleanupJob (queued webhook cleanup retry)', () => {
+        // Greptile P1 on #2291 (round 9, issue 3): this job holds the ONLY
+        // remaining durable copy of a webhook_id once disconnect deletes the local
+        // account record. The default 5-attempt cap let it go permanently 'failed'
+        // and unclaimable, stranding the orphaned subscription forever. Registered
+        // with maxAttempts: Infinity so it keeps retrying instead of ever going
+        // terminally inert.
+        it('is registered with unlimited retry attempts, since it holds the only remaining copy of an orphaned webhook_id once the local account is deleted', () => {
+            expect(registeredCleanupProcessorCall).toBeDefined();
+            expect(registeredCleanupProcessorCall![1]).toBe(processCalendlyWebhookCleanupJob);
+            expect(registeredCleanupProcessorCall![2]).toEqual({ maxAttempts: Infinity });
+        });
+
         it('refreshes the token and deletes the webhook', async () => {
             (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
                 access_token: 'fresh-access-token',
