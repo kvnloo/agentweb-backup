@@ -66,7 +66,16 @@ export async function processCalendlyWebhookCleanupJob(payload: CalendlyWebhookC
   console.log(`[Calendly] Cleaned up orphaned webhook ${payload.webhookId} via queued retry`);
 }
 
-registerProcessor(CALENDLY_WEBHOOK_CLEANUP_SOURCE, processCalendlyWebhookCleanupJob);
+// Greptile P1 on #2291 (round 9, issue 3): this job carries the ONLY remaining
+// durable copy of a webhook_id once the local account record (its other copy)
+// is deleted by disconnect. The default 5-attempt cap let it go terminally
+// 'failed' and never be retried again — permanently stranding the orphaned
+// Calendly-side subscription with no way left to recover its id and clean it
+// up, which then blocks a later reconnect with Calendly's "Already Exists".
+// Unlimited retries mean a Calendly outage or an initially-unrefreshable token
+// still eventually resolves the orphan instead of going silently and
+// permanently inert.
+registerProcessor(CALENDLY_WEBHOOK_CLEANUP_SOURCE, processCalendlyWebhookCleanupJob, { maxAttempts: Infinity });
 
 /**
  * Best-effort cleanup of the remote Calendly webhook subscription on disconnect,

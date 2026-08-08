@@ -214,11 +214,27 @@ export function startHeartbeat(source: string, dedupeKey: string): () => void {
 
 type JobProcessor = (payload: any) => Promise<void>;
 const processors = new Map<string, JobProcessor>();
+const maxAttemptsBySource = new Map<string, number>();
 
 /** Populated once per process at module-load time by each integration — mirrors how
- *  server.ts's cron jobs are each set up once, not a runtime registration API. */
-export function registerProcessor(source: string, handler: JobProcessor): void {
+ *  server.ts's cron jobs are each set up once, not a runtime registration API.
+ *
+ *  `maxAttempts` (default MAX_ATTEMPTS) overrides how many failed attempts this
+ *  source gets before a job goes terminally 'failed' and stops being claimable.
+ *  Greptile P1 on #2291 (round 9, issue 3): calendly_webhook_cleanup enqueues the
+ *  ONLY remaining durable copy of a webhook_id right before the local account
+ *  record holding the other copy gets deleted. Once that job hit the shared
+ *  5-attempt cap it went 'failed' and was never retried again — silently and
+ *  permanently stranding the orphaned subscription, since there is nowhere left
+ *  to recover its id from. Pass `maxAttempts: Infinity` for a source whose
+ *  failure mode is "the outage/expired-token will eventually clear" rather than
+ *  "a human needs to intervene" — it just keeps retrying instead of ever going
+ *  terminally inert. */
+export function registerProcessor(source: string, handler: JobProcessor, options?: { maxAttempts?: number }): void {
   processors.set(source, handler);
+  if (options?.maxAttempts !== undefined) {
+    maxAttemptsBySource.set(source, options.maxAttempts);
+  }
 }
 
 async function claimJob(job: AsyncJobRecord): Promise<boolean> {
@@ -276,7 +292,8 @@ async function processClaimedJob(job: AsyncJobRecord): Promise<void> {
       .promise();
   } catch (error: any) {
     const attempts = (job.attempts ?? 0) + 1;
-    const nextStatus = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
+    const maxAttempts = maxAttemptsBySource.get(job.source) ?? MAX_ATTEMPTS;
+    const nextStatus = attempts >= maxAttempts ? 'failed' : 'pending';
     await dynamodb
       .update({
         TableName: TABLE_NAME,
