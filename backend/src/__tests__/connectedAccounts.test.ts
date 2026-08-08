@@ -1,7 +1,7 @@
 import request from 'supertest';
 import express from 'express';
 import axios from 'axios';
-import connectedAccountsRouter from '../routes/connectedAccounts';
+import connectedAccountsRouter, { processCalendlyWebhookCleanupJob } from '../routes/connectedAccounts';
 import * as connectedAccountsDb from '../services/connectedAccountsDb';
 import { refreshCalendlyAccessToken } from '../routes/calendlyAuth';
 import { userDb, orgDb, crmDb } from '../services/db';
@@ -48,6 +48,11 @@ jest.mock('../services/subscriptionService', () => ({
 jest.mock('../routes/calendlyAuth', () => ({
     refreshCalendlyAccessToken: jest.fn(),
 }));
+const mockEnqueueJob = jest.fn();
+jest.mock('../services/asyncJobQueue', () => ({
+    enqueueJob: (...a: any[]) => mockEnqueueJob(...a),
+    registerProcessor: jest.fn(),
+}));
 
 const app = express();
 app.use(express.json());
@@ -58,6 +63,7 @@ describe('Connected Accounts Routes', () => {
         jest.clearAllMocks();
         (userDb.getUserById as jest.Mock).mockResolvedValue(null);
         (orgDb.getOrgById as jest.Mock).mockResolvedValue(null);
+        mockEnqueueJob.mockResolvedValue('enqueued');
     });
 
     describe('GET /connected-accounts', () => {
@@ -609,7 +615,7 @@ describe('Connected Accounts Routes', () => {
                 expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
             });
 
-            it('still deletes the local account when the remote webhook delete fails (non-fatal)', async () => {
+            it('still deletes the local account when the remote webhook delete fails (non-fatal), and queues a durable retry', async () => {
                 (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
                 (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
                 (axios.delete as jest.Mock).mockRejectedValue(new Error('token expired'));
@@ -618,6 +624,14 @@ describe('Connected Accounts Routes', () => {
 
                 expect(response.status).toBe(200);
                 expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
+                // Greptile P1 on #2291 (round 4): the webhook_id would otherwise be lost the
+                // moment the local account above is deleted — enqueueing BEFORE that happens
+                // is what lets the queue's own poller find and retry the cleanup later.
+                expect(mockEnqueueJob).toHaveBeenCalledWith(
+                    'calendly_webhook_cleanup',
+                    'https://api.calendly.com/webhook_subscriptions/AAAA',
+                    expect.objectContaining({ webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA', refreshToken: 'refresh-token-1' }),
+                );
             });
 
             it('does not attempt a remote delete when there is no webhook_id (booking tracking was already inactive)', async () => {
@@ -676,7 +690,7 @@ describe('Connected Accounts Routes', () => {
                     expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
                 });
 
-                it('still deletes the local account when the token refresh itself fails', async () => {
+                it('still deletes the local account when the token refresh itself fails, and queues a durable retry', async () => {
                     (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
                     (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
                     (axios.delete as jest.Mock).mockRejectedValue({ response: { status: 401 } });
@@ -687,9 +701,14 @@ describe('Connected Accounts Routes', () => {
                     expect(response.status).toBe(200);
                     expect(axios.delete).toHaveBeenCalledTimes(1); // no retry without a successful refresh
                     expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
+                    expect(mockEnqueueJob).toHaveBeenCalledWith(
+                        'calendly_webhook_cleanup',
+                        'https://api.calendly.com/webhook_subscriptions/AAAA',
+                        expect.objectContaining({ webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA', refreshToken: 'refresh-token-1' }),
+                    );
                 });
 
-                it('does not attempt a token refresh for a non-auth error', async () => {
+                it('does not attempt a token refresh for a non-auth error, but still queues a durable retry', async () => {
                     (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
                     (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
                     (axios.delete as jest.Mock).mockRejectedValue({ response: { status: 500 } });
@@ -700,6 +719,31 @@ describe('Connected Accounts Routes', () => {
                     expect(refreshCalendlyAccessToken).not.toHaveBeenCalled();
                     expect(axios.delete).toHaveBeenCalledTimes(1);
                     expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
+                    expect(mockEnqueueJob).toHaveBeenCalledWith(
+                        'calendly_webhook_cleanup',
+                        'https://api.calendly.com/webhook_subscriptions/AAAA',
+                        expect.objectContaining({ webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA', refreshToken: 'refresh-token-1' }),
+                    );
+                });
+
+                it('does not queue a retry when the retried delete (after a successful refresh) still fails', async () => {
+                    (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
+                    (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+                    (axios.delete as jest.Mock).mockRejectedValue({ response: { status: 401 } });
+                    (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                        access_token: 'refreshed-access-token',
+                        refresh_token: 'refresh-token-1',
+                    });
+
+                    const response = await request(app).delete('/api/oauth/connected-accounts/calendly/jane%40customer.com');
+
+                    expect(response.status).toBe(200);
+                    expect(axios.delete).toHaveBeenCalledTimes(2);
+                    expect(mockEnqueueJob).toHaveBeenCalledWith(
+                        'calendly_webhook_cleanup',
+                        'https://api.calendly.com/webhook_subscriptions/AAAA',
+                        expect.anything(),
+                    );
                 });
             });
         });
@@ -728,6 +772,61 @@ describe('Connected Accounts Routes', () => {
             expect(response.status).toBe(403);
             expect(response.body.error).toContain('Only the org owner');
             expect(connectedAccountsDb.deleteAccountById).not.toHaveBeenCalled();
+        });
+    });
+
+    describe('processCalendlyWebhookCleanupJob (queued webhook cleanup retry)', () => {
+        it('refreshes the token and deletes the webhook', async () => {
+            (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                access_token: 'fresh-access-token',
+                refresh_token: 'refresh-token-1',
+            });
+            (axios.delete as jest.Mock).mockResolvedValue({ data: {} });
+
+            await processCalendlyWebhookCleanupJob({
+                webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                refreshToken: 'refresh-token-1',
+            });
+
+            expect(refreshCalendlyAccessToken).toHaveBeenCalledWith('refresh-token-1');
+            expect(axios.delete).toHaveBeenCalledWith(
+                'https://api.calendly.com/webhook_subscriptions/AAAA',
+                expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer fresh-access-token' }) }),
+            );
+        });
+
+        it('throws (so the poller re-queues it) when there is no refresh token to work with', async () => {
+            await expect(
+                processCalendlyWebhookCleanupJob({ webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA' }),
+            ).rejects.toThrow(/no refresh token/i);
+            expect(refreshCalendlyAccessToken).not.toHaveBeenCalled();
+        });
+
+        it('throws (so the poller re-queues it) when the token refresh fails', async () => {
+            (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue(null);
+
+            await expect(
+                processCalendlyWebhookCleanupJob({
+                    webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                    refreshToken: 'refresh-token-1',
+                }),
+            ).rejects.toThrow(/could not refresh/i);
+            expect(axios.delete).not.toHaveBeenCalled();
+        });
+
+        it('throws (so the poller re-queues it) when the delete itself still fails after a successful refresh', async () => {
+            (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                access_token: 'fresh-access-token',
+                refresh_token: 'refresh-token-1',
+            });
+            (axios.delete as jest.Mock).mockRejectedValue({ response: { status: 404 } });
+
+            await expect(
+                processCalendlyWebhookCleanupJob({
+                    webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                    refreshToken: 'refresh-token-1',
+                }),
+            ).rejects.toBeDefined();
         });
     });
 
