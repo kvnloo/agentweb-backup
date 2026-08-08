@@ -376,13 +376,23 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
       // (CLAIM_STALE_MS in db.ts) is the structural backstop if both attempts fail —
       // a still-wedged claim becomes reclaimable on its own once it's old enough,
       // rather than staying stuck indefinitely.
+      // Greptile P1 on #2291 (round 18): losing the claim below used to resolve
+      // runStepOnce NORMALLY — "someone else has it, not my problem" — but that's
+      // only safe if that someone else actually finishes. If the current claim
+      // owner crashes before writing its own done marker, this job would still
+      // complete with zero failures recorded (nothing else was watching this
+      // step), the queue marks it 'completed', and the poller never revisits a
+      // completed job — permanently omitting the sync/alert with no trace. A lost
+      // claim is treated as a failure for THIS attempt too, so the job gets
+      // retried later regardless of which instance actually finishes it: a retry
+      // that finds the step genuinely done skips cleanly (leadSystemMarkers check
+      // above), and a retry that finds it still stuck tries again.
       const runStepOnce = async (step: 'hubspot' | 'attio' | 'alert', work: () => Promise<void>): Promise<void> => {
         const key = stepMarkerKey(step);
         if (leadSystemMarkers[key]?.status === 'done') return;
         const claimed = await crmDb.claimLeadStepOnce(listId!, lead.leadId, key);
         if (!claimed) {
-          console.log(`[Calendly Webhook] ${step} step for ${payload.uri} already claimed by a concurrent or not-yet-stale run — skipping`);
-          return;
+          throw new Error(`${step} step for ${payload.uri} could not be claimed (held by another run) — retrying to confirm completion`);
         }
         try {
           await work();
