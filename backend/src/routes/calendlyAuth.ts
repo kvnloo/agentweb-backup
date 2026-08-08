@@ -3,7 +3,7 @@ import axios from 'axios';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
 import { getCalendlyConfig, CalendlyOAuthConfig } from '../config/integrations';
-import { createAccount, getAccountByPlatform, CalendlyConfig } from '../services/connectedAccountsDb';
+import { createAccount, getAccountsByUserId, CalendlyConfig } from '../services/connectedAccountsDb';
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 import { storeTokenSession, retrieveTokenSession } from '../services/oauthTokenSessionStore';
@@ -318,15 +318,18 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
     // per-connection instead of global.
     const webhookSigningKey = crypto.randomBytes(32).toString('hex');
 
-    // This account's own prior connection, if any — read BEFORE createAccount below
-    // overwrites it. Only usable as a delete target if it's for this EXACT Calendly
-    // identity; a stale webhook_id from a previously-connected DIFFERENT Calendly
-    // account under this same AgentWeb login isn't the thing Calendly is now
-    // reporting as a duplicate, so it must not be reused across identities.
-    const existingAccount = await getAccountByPlatform(userId, 'calendly');
-    const existingConfig = existingAccount?.config as CalendlyConfig | undefined;
-    const ownPreviousWebhookId =
-      existingConfig?.user_uri === profile.user_uri ? existingConfig?.webhook_id : undefined;
+    // This account's own prior connection for this EXACT Calendly identity, if any —
+    // read BEFORE createAccount below overwrites it. Greptile P1 on #2291 (round 7):
+    // getAccountByPlatform only ever returns the FIRST Calendly account for this
+    // AgentWeb user — if they have more than one connected and are reconnecting one
+    // that isn't first in the list, it would never find that identity's own record,
+    // even though one genuinely exists. Search all of this user's Calendly accounts
+    // for the one matching profile.user_uri specifically, not just the first.
+    const allAccounts = await getAccountsByUserId(userId);
+    const existingAccount = allAccounts.find(
+      (acc) => acc.platform === 'calendly' && (acc.config as CalendlyConfig)?.user_uri === profile.user_uri,
+    );
+    const ownPreviousWebhookId = (existingAccount?.config as CalendlyConfig | undefined)?.webhook_id;
 
     const { webhookId, active: bookingTrackingActive } = await provisionCalendlyWebhook(
       config,
