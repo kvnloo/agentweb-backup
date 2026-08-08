@@ -296,14 +296,11 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     });
 
     it('marks the job failed (for the poller to retry) when processing throws and the job was enqueued', async () => {
-      mockResolveMetaPixelForUser.mockRejectedValue(new Error('meta down'));
-      mockGetLeadByEmail.mockRejectedValue(new Error('crm down'));
       const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-11/invitees/inv-11' });
 
-      // Both legs of processCalendlyWebhookJob already catch their own errors internally
-      // and never throw out of the function — so to exercise the outer processing-failed
-      // path here, make userDb.getUserById itself throw, which IS outside any inner
-      // try/catch in processCalendlyWebhookJob.
+      // Outside any inner try/catch in processCalendlyWebhookJob (the owner lookup
+      // that gates the whole function), so this always throws regardless of the
+      // per-leg failure-aggregation covered below.
       mockGetUserById.mockRejectedValue(new Error('dynamo down'));
 
       const res = await postSigned(body);
@@ -316,6 +313,99 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
         'https://api.calendly.com/scheduled_events/evt-11/invitees/inv-11',
         expect.any(Error),
       );
+    });
+
+    // Greptile P1 on #2291: each leg (CAPI, CRM-forward, HubSpot/Attio sync, lead
+    // alert) used to catch its own errors and only log them, so processCalendlyWebhookJob
+    // always resolved cleanly even when a leg genuinely failed — the caller saw success,
+    // called markJobComplete, and the poller (which never retries 'completed' jobs) lost
+    // that attribution/sync/alert forever. These verify a real failure in ANY leg now
+    // surfaces as a thrown error, while an "expected skip" (no Meta pixel connected)
+    // correctly does not.
+    describe('leg-failure aggregation (Greptile P1 on #2291)', () => {
+      it('marks the job failed when the CAPI leg genuinely fails, even though CRM-forward succeeds', async () => {
+        mockSendCapiLeadEvent.mockRejectedValue(new Error('meta API down'));
+        const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-20/invitees/inv-20' });
+
+        const res = await postSigned(body);
+        expect(res.status).toBe(200);
+        await flushPromises();
+
+        expect(mockCreateLead).toHaveBeenCalled(); // CRM-forward still ran and succeeded
+        expect(mockMarkJobFailed).toHaveBeenCalledWith(
+          'calendly_webhook',
+          'https://api.calendly.com/scheduled_events/evt-20/invitees/inv-20',
+          expect.any(Error),
+        );
+        expect(mockMarkJobComplete).not.toHaveBeenCalled();
+      });
+
+      it('marks the job failed when the CRM-forward leg genuinely fails, even though CAPI succeeds', async () => {
+        mockGetLeadByEmail.mockRejectedValue(new Error('dynamo throttled'));
+        const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-21/invitees/inv-21' });
+
+        const res = await postSigned(body);
+        expect(res.status).toBe(200);
+        await flushPromises();
+
+        expect(mockSendCapiLeadEvent).toHaveBeenCalled(); // CAPI leg still ran and succeeded
+        expect(mockMarkJobFailed).toHaveBeenCalledWith(
+          'calendly_webhook',
+          'https://api.calendly.com/scheduled_events/evt-21/invitees/inv-21',
+          expect.any(Error),
+        );
+        expect(mockMarkJobComplete).not.toHaveBeenCalled();
+      });
+
+      it('marks the job failed when the HubSpot sync fails, and still attempts the Attio sync', async () => {
+        mockAutoSyncLead.mockImplementation((_userId, _listId, _lead, platform: string) =>
+          platform === 'hubspot' ? Promise.reject(new Error('hubspot down')) : Promise.resolve(undefined),
+        );
+        const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-22/invitees/inv-22' });
+
+        const res = await postSigned(body);
+        expect(res.status).toBe(200);
+        await flushPromises();
+
+        expect(mockAutoSyncLead).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), 'hubspot', expect.anything());
+        expect(mockAutoSyncLead).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), 'attio', expect.anything());
+        expect(mockMarkJobFailed).toHaveBeenCalledWith(
+          'calendly_webhook',
+          'https://api.calendly.com/scheduled_events/evt-22/invitees/inv-22',
+          expect.any(Error),
+        );
+      });
+
+      it('marks the job failed when the lead alert fails', async () => {
+        // 'list-1' is the id the shared getLeadListById mock resolves as an existing,
+        // alert-configured list (see beforeEach) — needed so the alert branch is reached.
+        const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+        mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+        mockNotifyLeadListOwnerIfConfigured.mockRejectedValue(new Error('email service down'));
+        const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-23/invitees/inv-23' });
+
+        const res = await postSigned(body);
+        expect(res.status).toBe(200);
+        await flushPromises();
+
+        expect(mockMarkJobFailed).toHaveBeenCalledWith(
+          'calendly_webhook',
+          'https://api.calendly.com/scheduled_events/evt-23/invitees/inv-23',
+          expect.any(Error),
+        );
+      });
+
+      it('marks the job complete (not failed) when Meta pixel is unresolved — an expected skip, not a failure', async () => {
+        mockResolveMetaPixelForUser.mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' });
+        const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-24/invitees/inv-24' });
+
+        const res = await postSigned(body);
+        expect(res.status).toBe(200);
+        await flushPromises();
+
+        expect(mockMarkJobComplete).toHaveBeenCalledWith('calendly_webhook', 'https://api.calendly.com/scheduled_events/evt-24/invitees/inv-24');
+        expect(mockMarkJobFailed).not.toHaveBeenCalled();
+      });
     });
   });
 
