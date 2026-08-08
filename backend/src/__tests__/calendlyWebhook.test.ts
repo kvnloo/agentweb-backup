@@ -962,7 +962,13 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     // so without a real mutex both would fire the actual side effect. Simulating
     // "lost the claim" via claimLeadStepOnce returning false proves the guarded
     // work is never even attempted when another run already holds it.
-    it('does not call the external sync/alert when claimLeadStepOnce reports the step is already claimed by a concurrent run', async () => {
+    // Greptile P1 on #2291 (round 18): a lost claim used to resolve normally — "not
+    // my problem, someone else has it" — but if that someone else then crashes
+    // before writing its own done marker, the job would complete with zero
+    // failures recorded and the queue marks it 'completed', permanently omitting
+    // the step with nothing left to ever revisit it. Losing a claim must fail
+    // THIS attempt too, so the job gets retried and re-checked later.
+    it('does not call the external sync/alert when claimLeadStepOnce reports the step is already claimed, but still fails the job so it gets retried', async () => {
       mockClaimLeadStepOnce.mockResolvedValue(false);
 
       const body = makePayload({ email: 'lead@example.com' });
@@ -976,8 +982,10 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockSetLeadFields).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({
         system: expect.anything(),
       }));
-      // Losing a claim to a concurrent run is not a failure — nothing to retry.
-      expect(mockMarkJobFailed).not.toHaveBeenCalled();
+      // A lost claim can't be assumed successful — the job must be retried later
+      // to confirm whether the step actually got done, not marked complete blind.
+      expect(mockMarkJobFailed).toHaveBeenCalledWith('calendly_webhook', body.payload.uri, expect.any(Error));
+      expect(mockMarkJobComplete).not.toHaveBeenCalled();
     });
 
     it('claims each step independently — losing the HubSpot claim does not block the Attio or alert steps from claiming and running', async () => {
@@ -997,6 +1005,10 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockAutoSyncLead).not.toHaveBeenCalledWith(USER_ID, expect.anything(), expect.anything(), 'hubspot', expect.anything());
       expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, expect.anything(), expect.anything(), 'attio', expect.anything());
       expect(mockNotifyLeadListOwnerIfConfigured).toHaveBeenCalled();
+      // The lost HubSpot claim still fails the job overall (Greptile P1 round 18),
+      // even though attio/alert independently succeeded — a retry will re-check
+      // whether HubSpot actually got done by whoever holds that claim.
+      expect(mockMarkJobFailed).toHaveBeenCalledWith('calendly_webhook', uri, expect.any(Error));
     });
 
     it('releases the claim (so a future retry can re-attempt) when the guarded work fails after claiming it', async () => {
