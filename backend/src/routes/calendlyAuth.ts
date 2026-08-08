@@ -7,6 +7,7 @@ import { createAccount, getAccountsByUserId, CalendlyConfig } from '../services/
 import { authenticateToken } from '../middleware/auth';
 import { getJwtSecret } from '../config/jwt';
 import { storeTokenSession, retrieveTokenSession } from '../services/oauthTokenSessionStore';
+import { queueCalendlyWebhookCleanup } from '../services/calendlyWebhookCleanupQueue';
 
 const router = express.Router();
 
@@ -373,10 +374,18 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
           await axios.delete(webhookId, { headers: { Authorization: `Bearer ${tokens.access_token}` } });
           console.warn(`[Calendly OAuth /connect] Rolled back webhook ${webhookId} after failing to persist the account`);
         } catch (rollbackError: any) {
+          // Greptile P1 on #2291 (round 14): the immediate rollback is best-effort —
+          // if it ALSO fails, don't just log and discard the identifier (the exact
+          // same shape as the disconnect-side gap fixed in round 9, issue 3). Fall
+          // back to the same durable, unlimited-retry cleanup queue rather than
+          // inventing a second recovery mechanism for what's structurally the same
+          // problem: a webhook that's live on Calendly's side with nothing local
+          // left to identify it by.
           console.error(
-            `[Calendly OAuth /connect] Failed to roll back webhook ${webhookId} after failing to persist the account — orphaned:`,
+            `[Calendly OAuth /connect] Failed to roll back webhook ${webhookId} after failing to persist the account — queuing for durable retry:`,
             rollbackError?.response?.data || rollbackError?.message,
           );
+          await queueCalendlyWebhookCleanup(config_);
         }
       }
       throw createAccountError;

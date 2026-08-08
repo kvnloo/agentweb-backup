@@ -3,7 +3,8 @@ import axios from 'axios';
 import { authenticateToken } from '../middleware/auth';
 import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, getAccountById, updateAccountConfig, FathomConfig, CalendlyConfig } from '../services/connectedAccountsDb';
 import { refreshCalendlyAccessToken } from './calendlyAuth';
-import { enqueueJob, registerProcessor } from '../services/asyncJobQueue';
+import { registerProcessor } from '../services/asyncJobQueue';
+import { CALENDLY_WEBHOOK_CLEANUP_SOURCE, CalendlyWebhookCleanupPayload, queueCalendlyWebhookCleanup } from '../services/calendlyWebhookCleanupQueue';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
@@ -38,13 +39,6 @@ async function canCallerDisconnectAccount(userId: string, platform: string, acco
     allowed: false,
     error: 'Only the org owner can disconnect an org-shared connected account. Unshare it from the organization first.',
   };
-}
-
-const CALENDLY_WEBHOOK_CLEANUP_SOURCE = 'calendly_webhook_cleanup';
-
-interface CalendlyWebhookCleanupPayload {
-  webhookId: string;
-  refreshToken?: string;
 }
 
 /**
@@ -134,30 +128,6 @@ async function cleanupCalendlyWebhook(account: { config: unknown } | null): Prom
   } catch (retryErr: any) {
     await queueCalendlyWebhookCleanup(config);
     console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect even after token refresh:`, retryErr?.response?.data || retryErr?.message);
-  }
-}
-
-async function queueCalendlyWebhookCleanup(config: CalendlyConfig): Promise<void> {
-  const payload: CalendlyWebhookCleanupPayload = { webhookId: config.webhook_id!, refreshToken: config.refresh_token };
-  let result = await enqueueJob(CALENDLY_WEBHOOK_CLEANUP_SOURCE, config.webhook_id!, payload);
-  if (result === 'unavailable') {
-    // Greptile P1 on #2291: this enqueue is the LAST chance to durably record
-    // webhook_id before the caller deletes the local account — if it's genuinely
-    // gone after this, there is no more durable store to fall back to. One retry
-    // catches a transient write blip distinct from the table not existing yet.
-    result = await enqueueJob(CALENDLY_WEBHOOK_CLEANUP_SOURCE, config.webhook_id!, payload);
-  }
-  if (result === 'unavailable') {
-    // Greptile P1 on #2291 (round 10): the caller (disconnect route) proceeds to
-    // delete the local account — the only OTHER copy of this webhook_id —
-    // immediately after this returns, unconditionally, because disconnect must
-    // always succeed locally even when cleanup can't (see cleanupCalendlyWebhook's
-    // header comment; declined to block disconnect on this earlier in the
-    // session). That means this line is the last point where the fact that this
-    // subscription is now permanently unrecoverable is observable anywhere —
-    // console.error (not warn) so it's actionable/alertable in production
-    // monitoring rather than silently lost in an info-level log stream.
-    console.error(`[Calendly] LOST webhook cleanup record for ${config.webhook_id} — queue unavailable after retry and the local account is about to be deleted; this subscription can no longer be identified for cleanup and requires manual intervention`);
   }
 }
 
