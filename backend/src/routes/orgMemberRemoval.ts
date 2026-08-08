@@ -127,6 +127,14 @@ router.post("/:userId/remove", async (req, res) => {
       return res.status(400).json({ message: "Cannot remove yourself. Use the leave endpoint or delete the org." });
     }
     if (roleOf({ userId: target.userId, orgId: target.orgId, orgRole: target.orgRole }, callerOrg) === "owner") {
+      // Owner-only, for the same reason PATCH /:orgId/members/:memberId/role is:
+      // this revokes ownership. It matters more here than there, because this
+      // route also honours `transfer` decisions — an admin removing an owner
+      // would inherit that owner's landing pages, skills, work plans and
+      // knowledge base in the same request.
+      if (roleOf({ userId: callerId, orgId: caller.orgId, orgRole: caller.orgRole }, callerOrg) !== "owner") {
+        return res.status(403).json({ message: "Only an owner can remove an owner" });
+      }
       const members = await orgDb.getOrgMembers(caller.orgId);
       const anotherOwner = members.some(
         (m: any) => m.userId !== target.userId &&

@@ -699,11 +699,20 @@ router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) =
       return res.status(404).json({ error: "Member not found in this organization" });
     }
 
-    if (roleOf({ userId: memberId, orgId, orgRole: member.orgRole }, org) === "owner"
-        && !(await anotherOwnerRemains(org, memberId))) {
-      return res.status(409).json({
-        error: "Cannot remove the only owner. Promote another member to owner first.",
-      });
+    if (roleOf({ userId: memberId, orgId, orgRole: member.orgRole }, org) === "owner") {
+      // Removing an owner revokes their ownership, so it answers to the same
+      // authority as demoting one. Without this an admin — who is 403'd by the
+      // role route above for exactly this reason — could reach the same end by
+      // deleting the owner outright, which is the strictly larger action.
+      const caller = await userDb.getUserById(userId);
+      if (roleOf({ userId, orgId, orgRole: caller?.orgRole }, org) !== "owner") {
+        return res.status(403).json({ error: "Only an owner can remove an owner" });
+      }
+      if (!(await anotherOwnerRemains(org, memberId))) {
+        return res.status(409).json({
+          error: "Cannot remove the only owner. Promote another member to owner first.",
+        });
+      }
     }
 
     await userDb.clearOrgMembership(memberId);
