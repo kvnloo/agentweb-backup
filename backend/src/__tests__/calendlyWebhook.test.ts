@@ -525,9 +525,13 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       await flushPromises();
 
       expect(mockCreateLead).toHaveBeenCalledTimes(1);
-      expect(mockUpdateLead).not.toHaveBeenCalled();
       expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', expect.objectContaining({ leadId: 'lead-new' }), 'hubspot', 'created');
       expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', expect.objectContaining({ leadId: 'lead-new' }), 'attio', 'created');
+      // Downstream steps all succeeded, so the sync-completed marker is written —
+      // this is what lets a later retry recognize this booking as fully done.
+      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-new', expect.objectContaining({
+        customFields: expect.objectContaining({ syncCompletedUri: body.payload.uri }),
+      }));
     });
 
     it('updates the existing lead and auto-syncs as "updated" when a lead with that email already exists', async () => {
@@ -555,11 +559,14 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     // redelivery of the same invitee.created event (e.g. our 200 response didn't reach
     // Calendly) would re-run updateLead, re-sync to HubSpot/Attio, and re-fire a customer
     // alert for a booking already fully processed.
-    it('skips CRM-forward re-processing for a redelivery of an already-processed booking (matches lastBookingUri)', async () => {
+    it('skips CRM-forward re-processing for a redelivery of an already fully-processed booking (matches lastBookingUri + syncCompletedUri)', async () => {
       const existingLead = {
         leadId: 'lead-existing',
         email: 'lead@example.com',
-        customFields: { lastBookingUri: 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1' },
+        customFields: {
+          lastBookingUri: 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1',
+          syncCompletedUri: 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1',
+        },
       };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
@@ -578,11 +585,14 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockNotifyLeadListOwnerIfConfigured).not.toHaveBeenCalled();
     });
 
-    it('skips CRM-forward re-processing for a redelivery of the very first booking (matches bookingUri, pre-update)', async () => {
+    it('skips CRM-forward re-processing for a redelivery of the very first booking (matches bookingUri + syncCompletedUri, pre-update)', async () => {
       const existingLead = {
         leadId: 'lead-existing',
         email: 'lead@example.com',
-        customFields: { bookingUri: 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1' },
+        customFields: {
+          bookingUri: 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1',
+          syncCompletedUri: 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1',
+        },
       };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
@@ -597,6 +607,68 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockCreateLead).not.toHaveBeenCalled();
       expect(mockUpdateLead).not.toHaveBeenCalled();
       expect(mockAutoSyncLead).not.toHaveBeenCalled();
+    });
+
+    // Greptile P1 on #2291 (round 2): the lead mutation is idempotent (never repeated
+    // once recorded), but the downstream steps are a SEPARATE question — a queue retry
+    // after, say, a HubSpot outage must still re-attempt the sync even though the lead
+    // record itself already reflects this booking from the failed first attempt.
+    it('reuses the existing lead without re-updating it, but still retries the downstream sync/alert, when the lead was recorded but sync did not complete', async () => {
+      const uri = 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1';
+      const existingLead = {
+        leadId: 'lead-existing',
+        email: 'lead@example.com',
+        customFields: { lastBookingUri: uri }, // recorded, but no syncCompletedUri — first attempt's downstream step failed
+      };
+      mockGetLeadByEmail.mockResolvedValue(existingLead);
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+
+      const body = makePayload({ email: 'lead@example.com' });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockCreateLead).not.toHaveBeenCalled();
+      // The lastBookedAt/lastBookingUri write must NOT repeat — the lead is reused as-is.
+      expect(mockUpdateLead).not.toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
+        customFields: expect.objectContaining({ lastBookedAt: expect.anything() }),
+      }));
+      // But the downstream steps DO get retried.
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', existingLead, 'hubspot', 'updated');
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, 'list-1', existingLead, 'attio', 'updated');
+      // And once they succeed, the sync-completed marker gets written so a further
+      // retry (if any) would now correctly skip entirely.
+      expect(mockUpdateLead).toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
+        customFields: expect.objectContaining({ syncCompletedUri: uri }),
+      }));
+    });
+
+    it('does not write the sync-completed marker when a downstream step still fails on retry', async () => {
+      const uri = 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1';
+      const existingLead = {
+        leadId: 'lead-existing',
+        email: 'lead@example.com',
+        customFields: { lastBookingUri: uri },
+      };
+      mockGetLeadByEmail.mockResolvedValue(existingLead);
+      const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
+      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockAutoSyncLead.mockImplementation((_userId, _listId, _lead, platform: string) =>
+        platform === 'hubspot' ? Promise.reject(new Error('still down')) : Promise.resolve(undefined),
+      );
+
+      const body = makePayload({ email: 'lead@example.com', uri });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockUpdateLead).not.toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
+        customFields: expect.objectContaining({ syncCompletedUri: uri }),
+      }));
+      expect(mockMarkJobFailed).toHaveBeenCalledWith('calendly_webhook', uri, expect.any(Error));
     });
 
     it('still sends the CAPI event when the CRM-forward leg throws', async () => {
