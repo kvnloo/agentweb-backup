@@ -355,37 +355,55 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
       // entirely distinct map entries and can never collide.
       const stepMarkerKey = (step: 'hubspot' | 'attio' | 'alert') => `${step}Synced::${payload.uri}`;
       const leadSystemMarkers: Record<string, any> = { ...(lead.system || {}) };
-      const markStepDone = async (step: 'hubspot' | 'attio' | 'alert') => {
+
+      // Greptile P1 on #2291 (round 15): the per-booking marker above (round 12's
+      // fix) stops a THIRD run from repeating a step once one instance finishes it,
+      // but if a stale-reclamation race in the async job queue (asyncJobQueue.ts —
+      // every heartbeat write failing across the whole staleness window) ever lets
+      // TWO instances start processing the SAME booking concurrently, both would
+      // pass the "not yet done" check below and both fire the real side effect
+      // before either gets to write "done". claimLeadStepOnce is an actual mutex —
+      // a DynamoDB conditional write, not a probability reduction — so only ONE of
+      // two concurrent claimants can ever win, regardless of how the race happened.
+      // On failure, the claim is released so a legitimate future retry (this same
+      // job re-run by the poller after markJobFailed) can still re-attempt the step.
+      const runStepOnce = async (step: 'hubspot' | 'attio' | 'alert', work: () => Promise<void>): Promise<void> => {
         const key = stepMarkerKey(step);
-        leadSystemMarkers[key] = true;
-        await crmDb.setLeadFields(listId!, lead.leadId, { system: { [key]: true } });
+        if (leadSystemMarkers[key] === 'done') return;
+        const claimed = await crmDb.claimLeadStepOnce(listId!, lead.leadId, key);
+        if (!claimed) {
+          console.log(`[Calendly Webhook] ${step} step for ${payload.uri} already claimed by a concurrent run — skipping`);
+          return;
+        }
+        try {
+          await work();
+          leadSystemMarkers[key] = 'done';
+          await crmDb.setLeadFields(listId!, lead.leadId, { system: { [key]: 'done' } });
+        } catch (err: any) {
+          await crmDb.setLeadFields(listId!, lead.leadId, { removeSystemKeys: [key] }).catch(() => {});
+          throw err;
+        }
       };
 
-      if (!leadSystemMarkers[stepMarkerKey('hubspot')]) {
-        try {
-          await externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'hubspot', eventType);
-          await markStepDone('hubspot');
-        } catch (err: any) {
-          console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err);
-          failures.push(`HubSpot sync: ${err?.message ?? err}`);
-        }
+      try {
+        await runStepOnce('hubspot', () => externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'hubspot', eventType));
+      } catch (err: any) {
+        console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err);
+        failures.push(`HubSpot sync: ${err?.message ?? err}`);
       }
 
-      if (!leadSystemMarkers[stepMarkerKey('attio')]) {
-        try {
-          await externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'attio', eventType);
-          await markStepDone('attio');
-        } catch (err: any) {
-          console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err);
-          failures.push(`Attio sync: ${err?.message ?? err}`);
-        }
+      try {
+        await runStepOnce('attio', () => externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'attio', eventType));
+      } catch (err: any) {
+        console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err);
+        failures.push(`Attio sync: ${err?.message ?? err}`);
       }
 
       // Same alert mechanism /forward-lead already uses — per-list opt-in via
       // list.alertEvents, so this only notifies the customer if they've already
       // configured this specific list to alert on lead-added/updated.
-      if (!leadSystemMarkers[stepMarkerKey('alert')]) {
-        try {
+      try {
+        await runStepOnce('alert', async () => {
           const list = await crmDb.getLeadListById(listId);
           if (list) {
             const alertEventType = eventType === 'created' ? 'api.lead_added' : 'api.lead_updated';
@@ -397,11 +415,10 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
               new Date().toISOString(),
             );
           }
-          await markStepDone('alert');
-        } catch (alertError: any) {
-          console.error('[Calendly Webhook] Lead alert failed:', alertError?.message ?? alertError);
-          failures.push(`Lead alert: ${alertError?.message ?? alertError}`);
-        }
+        });
+      } catch (alertError: any) {
+        console.error('[Calendly Webhook] Lead alert failed:', alertError?.message ?? alertError);
+        failures.push(`Lead alert: ${alertError?.message ?? alertError}`);
       }
 
       console.log(`[Calendly Webhook] CRM-forward: lead ${eventType} in list ${listId} for user ${payload.userId}`);

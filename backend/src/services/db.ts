@@ -8112,6 +8112,64 @@ export const crmDb = {
     }
   },
 
+  /**
+   * Atomic claim-before-act lock on a single `system` sub-key: SETs it ONLY if it
+   * doesn't already exist, returning whether THIS caller won the claim.
+   *
+   * Greptile P1 on #2291 (round 15): a stale-reclamation race in the async job
+   * queue (asyncJobQueue.ts — if every heartbeat write for a claimed job fails
+   * across the whole staleness window) can, in the worst case, let two instances
+   * both start processing the SAME booking concurrently. Per-step completion
+   * markers (setLeadFields's `system` writes) already stop a THIRD run from
+   * repeating a step once one instance finishes it, but two instances racing
+   * to the SAME not-yet-done step would both pass that check and both fire the
+   * external side effect (a duplicate HubSpot/Attio sync call, a duplicate
+   * customer alert) before either gets to write "done".
+   *
+   * This closes that specific gap: callers claim the step BEFORE doing the
+   * side-effecting work, not after. Only one of two concurrent claimants can
+   * ever win (DynamoDB's conditional write is the actual mutex — not a
+   * probabilistic reduction like more retries would be), so at most one
+   * instance ever performs the real side effect, regardless of how the race
+   * that caused two instances to run in the first place happened.
+   *
+   * Callers MUST release the claim (removeSystemKeys) if the guarded work then
+   * fails, or the step is wedged forever — see calendlyWebhook.ts's runStepOnce.
+   */
+  async claimLeadStepOnce(listId: string, leadId: string, key: string): Promise<boolean> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const dynKey = { listId, leadId };
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        UpdateExpression: 'SET system = if_not_exists(system, :emptyMap)',
+        ExpressionAttributeValues: { ':emptyMap': {} },
+        ConditionExpression: 'attribute_exists(leadId)',
+      }).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'claimLeadStepOnce:bootstrap');
+      throw err;
+    }
+
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        UpdateExpression: 'SET system.#k = :v, updatedAt = :ts',
+        ExpressionAttributeNames: { '#k': key },
+        ExpressionAttributeValues: { ':v': 'in_progress', ':ts': new Date().toISOString() },
+        ConditionExpression: 'attribute_not_exists(system.#k)',
+      }).promise();
+      return true;
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'claimLeadStepOnce');
+      throw err;
+    }
+  },
+
   async deleteEnrichmentCacheByEntityKey(entityKey: string): Promise<void> {
     try {
       const result = await dynamodb.query({
