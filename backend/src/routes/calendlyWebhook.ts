@@ -311,14 +311,21 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
         lead = existingLead;
         eventType = existingLead.customFields?.bookingUri === payload.uri ? 'created' : 'updated';
       } else if (existingLead) {
-        await crmDb.updateLead(listId, existingLead.leadId, {
-          customFields: {
-            ...(existingLead.customFields || {}),
-            lastBookedAt: new Date().toISOString(),
-            lastBookingUri: payload.uri,
-          },
-        });
-        lead = existingLead;
+        // Greptile P1 on #2291: crmDb.updateLead's customFields is a full-attribute
+        // replace, not a merge — the DynamoDB update expression is literally
+        // `customFields = :customFields`. Keeping `lead = existingLead` here (the
+        // PRE-update snapshot) meant the first downstream step's own markStepDone
+        // write later re-serialized that stale snapshot as the WHOLE customFields
+        // map, erasing the lastBookedAt/lastBookingUri just written below. lead
+        // must reflect what's now actually in the DB, not what was there before
+        // this call.
+        const updatedCustomFields = {
+          ...(existingLead.customFields || {}),
+          lastBookedAt: new Date().toISOString(),
+          lastBookingUri: payload.uri,
+        };
+        await crmDb.updateLead(listId, existingLead.leadId, { customFields: updatedCustomFields });
+        lead = { ...existingLead, customFields: updatedCustomFields };
         eventType = 'updated';
       } else {
         lead = await crmDb.createLead(listId, {

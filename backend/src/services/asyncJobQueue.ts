@@ -188,7 +188,7 @@ export async function markJobFailed(source: string, dedupeKey: string, error: un
  */
 export function startHeartbeat(source: string, dedupeKey: string): () => void {
   const id = jobId(source, dedupeKey);
-  const interval = setInterval(() => {
+  const beat = () =>
     dynamodb
       .update({
         TableName: TABLE_NAME,
@@ -198,10 +198,13 @@ export function startHeartbeat(source: string, dedupeKey: string): () => void {
         ExpressionAttributeNames: { '#status': 'status' },
         ExpressionAttributeValues: { ':processing': 'processing', ':now': new Date().toISOString() },
       })
-      .promise()
-      .catch(() => {
-        // Best-effort — see function comment.
-      });
+      .promise();
+
+  const interval = setInterval(() => {
+    // One immediate retry on failure, same reasoning as markJobComplete/markJobFailed
+    // — a transient write blip is exactly what a retry resolves, and each tick that
+    // actually lands is one the next tick doesn't need to compensate for.
+    beat().catch(() => beat().catch(() => {}));
   }, HEARTBEAT_INTERVAL_MS);
   return () => clearInterval(interval);
 }
