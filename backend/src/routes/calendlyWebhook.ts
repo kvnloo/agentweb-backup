@@ -311,21 +311,20 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
         lead = existingLead;
         eventType = existingLead.customFields?.bookingUri === payload.uri ? 'created' : 'updated';
       } else if (existingLead) {
-        // Greptile P1 on #2291: crmDb.updateLead's customFields is a full-attribute
-        // replace, not a merge — the DynamoDB update expression is literally
-        // `customFields = :customFields`. Keeping `lead = existingLead` here (the
-        // PRE-update snapshot) meant the first downstream step's own markStepDone
-        // write later re-serialized that stale snapshot as the WHOLE customFields
-        // map, erasing the lastBookedAt/lastBookingUri just written below. lead
-        // must reflect what's now actually in the DB, not what was there before
-        // this call.
-        const updatedCustomFields = {
-          ...(existingLead.customFields || {}),
-          lastBookedAt: new Date().toISOString(),
-          lastBookingUri: payload.uri,
-        };
-        await crmDb.updateLead(listId, existingLead.leadId, { customFields: updatedCustomFields });
-        lead = { ...existingLead, customFields: updatedCustomFields };
+        // Greptile P1 on #2291 (round 9): two different bookings for the same lead
+        // (email) processed concurrently each read their own pre-update
+        // customFields snapshot, so a plain crmDb.updateLead full-map SET here —
+        // even with `lead` correctly reflecting this write's own result — would
+        // still let the LATER-committing booking's write silently overwrite
+        // whatever the other one had just persisted (its own lastBookedAt/
+        // lastBookingUri, or any step marker written by a job that raced ahead of
+        // this one). crmDb.setLeadFields writes only these two customFields
+        // sub-keys via a DynamoDB document-path SET
+        // (`customFields.lastBookedAt = :v`), so two concurrent bookings' writes
+        // to the SAME lead no longer clobber each other's fields.
+        const bookedFields = { lastBookedAt: new Date().toISOString(), lastBookingUri: payload.uri };
+        await crmDb.setLeadFields(listId, existingLead.leadId, { customFields: bookedFields });
+        lead = { ...existingLead, customFields: { ...(existingLead.customFields || {}), ...bookedFields } };
         eventType = 'updated';
       } else {
         lead = await crmDb.createLead(listId, {
@@ -341,13 +340,19 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
         eventType = 'created';
       }
 
-      // Accumulated locally and persisted after each step succeeds, so a crash
-      // between steps (not just a thrown/caught failure) still leaves whatever
-      // already completed correctly marked for the next attempt.
+      // Accumulated locally so the in-process "already done" checks below see
+      // each step immediately, but PERSISTED one customFields sub-key at a time
+      // via crmDb.setLeadFields — Greptile P1 on #2291 (round 9): the previous
+      // version re-serialized this whole local snapshot as a full customFields
+      // SET on every call, so two different bookings for the same lead processed
+      // concurrently would each overwrite the other's step markers (or the
+      // other's lastBookedAt/lastBookingUri) with their own stale snapshot.
+      // setLeadFields's document-path SET touches only the one key being
+      // written, so concurrent step writes for different bookings never race.
       let leadCustomFields: Record<string, any> = { ...(lead.customFields || {}) };
       const markStepDone = async (field: string) => {
         leadCustomFields = { ...leadCustomFields, [field]: payload.uri };
-        await crmDb.updateLead(listId!, lead.leadId, { customFields: leadCustomFields });
+        await crmDb.setLeadFields(listId!, lead.leadId, { customFields: { [field]: payload.uri } });
       };
 
       if (leadCustomFields.hubspotSyncedUri !== payload.uri) {

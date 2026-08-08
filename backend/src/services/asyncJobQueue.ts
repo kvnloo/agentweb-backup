@@ -186,8 +186,7 @@ export async function markJobFailed(source: string, dedupeKey: string, error: un
  * never a new failure mode, and the condition means a tick that fires after
  * the job already completed is a safe no-op rather than clobbering state.
  */
-export function startHeartbeat(source: string, dedupeKey: string): () => void {
-  const id = jobId(source, dedupeKey);
+function startHeartbeatForId(id: string): () => void {
   const beat = () =>
     dynamodb
       .update({
@@ -207,6 +206,10 @@ export function startHeartbeat(source: string, dedupeKey: string): () => void {
     beat().catch(() => beat().catch(() => {}));
   }, HEARTBEAT_INTERVAL_MS);
   return () => clearInterval(interval);
+}
+
+export function startHeartbeat(source: string, dedupeKey: string): () => void {
+  return startHeartbeatForId(jobId(source, dedupeKey));
 }
 
 type JobProcessor = (payload: any) => Promise<void>;
@@ -252,6 +255,13 @@ async function processClaimedJob(job: AsyncJobRecord): Promise<void> {
     return;
   }
 
+  // Greptile P1 on #2291 (round 9): startHeartbeat was only ever wired into the
+  // claimImmediately/inline path. A job the poller itself claims went through
+  // this function with no heartbeat, so a poller-owned job running longer than
+  // STALE_PROCESSING_MS was indistinguishable from an abandoned claim and got
+  // reclaimed and re-run concurrently — the same race the inline heartbeat
+  // exists to close, just reopened on this path.
+  const stopHeartbeat = startHeartbeatForId(job.id);
   try {
     const payload = JSON.parse(job.payload);
     await processor(payload);
@@ -283,6 +293,8 @@ async function processClaimedJob(job: AsyncJobRecord): Promise<void> {
       .promise()
       .catch(() => {});
     console.error(`[AsyncJobQueue] Processing failed for job ${job.id} (source=${job.source}, attempt ${attempts}):`, error?.message ?? error);
+  } finally {
+    stopHeartbeat();
   }
 }
 
