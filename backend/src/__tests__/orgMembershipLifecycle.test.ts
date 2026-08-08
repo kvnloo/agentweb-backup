@@ -63,6 +63,14 @@ jest.mock('../services/db', () => ({
     }),
     createOrg: jest.fn((org: any) => { mockOrgs[org.orgId] = org; return Promise.resolve(org); }),
     deleteOrg: jest.fn((orgId: string) => { delete mockOrgs[orgId]; return Promise.resolve(); }),
+    removeDomainJoinRequest: jest.fn((orgId: string, requestToken: string) => {
+      const org = mockOrgs[orgId];
+      const before = (org?.pendingDomainJoinRequests || []).length;
+      if (!org) return Promise.resolve(false);
+      org.pendingDomainJoinRequests = (org.pendingDomainJoinRequests || [])
+        .filter((r: any) => r.requestToken !== requestToken);
+      return Promise.resolve(org.pendingDomainJoinRequests.length < before);
+    }),
   },
   Organization: {},
 }));
@@ -79,10 +87,19 @@ function seed() {
     'u-tyler':   { userId: 'u-tyler',   email: 'tyler@xcures.com',   orgId: ORG, orgRole: 'member' },
     'u-georgia': { userId: 'u-georgia', email: 'georgia@xcures.com', orgId: ORG, orgRole: 'member' },
     'u-outsider':{ userId: 'u-outsider',email: 'outsider@other.com' },
+    'u-newgrad': { userId: 'u-newgrad', email: 'newgrad@xcures.com' },
     'u-juan':    { userId: 'u-juan',    email: 'juan@haven.com', orgId: 'org-haven', orgRole: 'owner' },
   };
   mockOrgs = {
-    [ORG]: { orgId: ORG, name: 'xCures', ownerUserId: 'u-filipe', pendingInvites: [] },
+    [ORG]: {
+      orgId: ORG,
+      name: 'xCures',
+      ownerUserId: 'u-filipe',
+      pendingInvites: [],
+      pendingDomainJoinRequests: [
+        { userId: 'u-newgrad', email: 'newgrad@xcures.com', requestedAt: '2026-08-07T00:00:00.000Z', requestToken: 'tok-newgrad' },
+      ],
+    },
     'org-haven': { orgId: 'org-haven', name: 'Haven', ownerUserId: 'u-juan', pendingInvites: [] },
   };
   actingUserId = 'u-filipe';
@@ -176,6 +193,15 @@ describe('demoting people (downgrading)', () => {
     expect(res.status).toBe(409);
     expect(res.body.error).toMatch(/only owner/i);
     expect(mockUsers['u-filipe'].orgRole).toBe('owner');
+  });
+
+  it('an ADMIN demotes another ADMIN back to member', async () => {
+    await setRole('u-eric', 'admin');
+    await setRole('u-tyler', 'admin');
+    actingUserId = 'u-eric';
+    const res = await setRole('u-tyler', 'member');
+    expect(res.status).toBe(200);
+    expect(mockUsers['u-tyler'].orgRole).toBe('member');
   });
 
   it('an ADMIN may not demote an owner', async () => {
@@ -341,6 +367,178 @@ describe('adding people', () => {
     }
     const res = await request(app).post(`/api/org/${ORG}/invite`).send({ email: 'fifteenth@xcures.com' });
     expect(res.status).toBe(200);
+  });
+});
+
+describe('invite -> accept: the whole admission round trip', () => {
+  const invite = (email: string) => request(app).post(`/api/org/${ORG}/invite`).send({ email });
+  const tokenFor = (email: string) =>
+    (mockOrgs[ORG].pendingInvites || []).find((i: any) => i.email === email)?.inviteToken;
+  const accept = (inviteToken: string) =>
+    request(app).post('/api/org/accept-invite').send({ orgId: ORG, inviteToken });
+
+  it('an owner invites an outsider, who accepts and lands as a member', async () => {
+    expect((await invite('outsider@other.com')).status).toBe(200);
+    const token = tokenFor('outsider@other.com');
+    expect(token).toBeTruthy();
+
+    actingUserId = 'u-outsider';
+    const res = await accept(token);
+    expect(res.status).toBe(200);
+    expect(mockUsers['u-outsider'].orgId).toBe(ORG);
+    expect(mockUsers['u-outsider'].orgRole).toBe('member');
+    // The invite is consumed, so the same link cannot admit a second person.
+    expect(mockOrgs[ORG].pendingInvites).toHaveLength(0);
+  });
+
+  it('an ADMIN can admit someone end to end, not just send the invite', async () => {
+    await setRole('u-eric', 'admin');
+    actingUserId = 'u-eric';
+    expect((await invite('outsider@other.com')).status).toBe(200);
+
+    actingUserId = 'u-outsider';
+    expect((await accept(tokenFor('outsider@other.com'))).status).toBe(200);
+    expect(mockUsers['u-outsider'].orgRole).toBe('member');
+  });
+
+  it('a SECOND owner can admit someone end to end', async () => {
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    expect((await invite('outsider@other.com')).status).toBe(200);
+
+    actingUserId = 'u-outsider';
+    expect((await accept(tokenFor('outsider@other.com'))).status).toBe(200);
+    expect(mockUsers['u-outsider'].orgId).toBe(ORG);
+  });
+
+  it('a plain member cannot invite, so there is no token to accept', async () => {
+    actingUserId = 'u-georgia';
+    expect((await invite('outsider@other.com')).status).toBe(403);
+    expect(mockOrgs[ORG].pendingInvites).toHaveLength(0);
+  });
+
+  it('a wrong token is refused and admits nobody', async () => {
+    await invite('outsider@other.com');
+    actingUserId = 'u-outsider';
+    const res = await accept('not-the-token');
+    expect(res.status).toBe(400);
+    expect(mockUsers['u-outsider'].orgId).toBeUndefined();
+  });
+
+  it("someone else's token does not admit you", async () => {
+    await invite('outsider@other.com');
+    const token = tokenFor('outsider@other.com');
+    // u-newgrad is a real user with a different email; the invite is matched on
+    // token AND email, so holding the link is not enough.
+    actingUserId = 'u-newgrad';
+    const res = await accept(token);
+    expect(res.status).toBe(400);
+    expect(mockUsers['u-newgrad'].orgId).toBeUndefined();
+  });
+});
+
+describe('revoking access', () => {
+  const invite = (email: string) => request(app).post(`/api/org/${ORG}/invite`).send({ email });
+  const cancel = (email: string) =>
+    request(app).delete(`/api/org/${ORG}/invite/${encodeURIComponent(email)}`);
+  const tokenFor = (email: string) =>
+    (mockOrgs[ORG].pendingInvites || []).find((i: any) => i.email === email)?.inviteToken;
+
+  it('an owner cancels a pending invite', async () => {
+    await invite('outsider@other.com');
+    const res = await cancel('outsider@other.com');
+    expect(res.status).toBe(200);
+    expect(mockOrgs[ORG].pendingInvites).toHaveLength(0);
+  });
+
+  it('an ADMIN cancels a pending invite', async () => {
+    await invite('outsider@other.com');
+    await setRole('u-eric', 'admin');
+    actingUserId = 'u-eric';
+    const res = await cancel('outsider@other.com');
+    expect(res.status).toBe(200);
+    expect(mockOrgs[ORG].pendingInvites).toHaveLength(0);
+  });
+
+  it('a plain member cannot cancel, and the invite survives', async () => {
+    await invite('outsider@other.com');
+    actingUserId = 'u-georgia';
+    const res = await cancel('outsider@other.com');
+    expect(res.status).toBe(403);
+    expect(mockOrgs[ORG].pendingInvites).toHaveLength(1);
+  });
+
+  it('a cancelled invite can no longer be accepted — revocation actually revokes', async () => {
+    await invite('outsider@other.com');
+    const token = tokenFor('outsider@other.com');
+    await cancel('outsider@other.com');
+
+    actingUserId = 'u-outsider';
+    const res = await request(app).post('/api/org/accept-invite').send({ orgId: ORG, inviteToken: token });
+    expect(res.status).toBe(400);
+    expect(mockUsers['u-outsider'].orgId).toBeUndefined();
+  });
+
+  it("cancelling clears the invitee's pendingOrgInvite stamp, so they are not bounced to accept-invite", async () => {
+    await invite('outsider@other.com');
+    expect(mockUsers['u-outsider'].pendingOrgInvite).toMatchObject({ orgId: ORG });
+    await cancel('outsider@other.com');
+    expect(mockUsers['u-outsider'].pendingOrgInvite).toBeNull();
+  });
+
+  it('cancelling an invite that does not exist is a 404, not a silent success', async () => {
+    const res = await cancel('nobody@nowhere.com');
+    expect(res.status).toBe(404);
+  });
+
+  it('a removed member loses org access and can be re-invited afterwards', async () => {
+    expect((await request(app).delete(`/api/org/${ORG}/members/u-georgia`)).status).toBe(200);
+    expect(mockUsers['u-georgia'].orgId).toBeUndefined();
+    expect(mockUsers['u-georgia'].orgRole).toBeUndefined();
+    expect((await invite('georgia@xcures.com')).status).toBe(200);
+  });
+});
+
+describe('domain-join requests (the other admission path)', () => {
+  const approve = (tok: string) => request(app).post(`/api/org/${ORG}/domain-requests/${tok}/approve`);
+  const reject = (tok: string) => request(app).post(`/api/org/${ORG}/domain-requests/${tok}/reject`);
+
+  it('an owner approves, and the requester joins as a member', async () => {
+    const res = await approve('tok-newgrad');
+    expect(res.status).toBe(200);
+    expect(mockUsers['u-newgrad'].orgId).toBe(ORG);
+    expect(mockUsers['u-newgrad'].orgRole).toBe('member');
+    expect(mockOrgs[ORG].pendingDomainJoinRequests).toHaveLength(0);
+  });
+
+  it('an ADMIN approves too — this is member management, not an owner reserve', async () => {
+    await setRole('u-eric', 'admin');
+    actingUserId = 'u-eric';
+    expect((await approve('tok-newgrad')).status).toBe(200);
+    expect(mockUsers['u-newgrad'].orgId).toBe(ORG);
+  });
+
+  it('a plain member can neither approve nor reject', async () => {
+    actingUserId = 'u-georgia';
+    expect((await approve('tok-newgrad')).status).toBe(403);
+    expect((await reject('tok-newgrad')).status).toBe(403);
+    expect(mockUsers['u-newgrad'].orgId).toBeUndefined();
+    expect(mockOrgs[ORG].pendingDomainJoinRequests).toHaveLength(1);
+  });
+
+  it('an ADMIN rejects, and the requester joins nothing', async () => {
+    await setRole('u-eric', 'admin');
+    actingUserId = 'u-eric';
+    expect((await reject('tok-newgrad')).status).toBe(200);
+    expect(mockUsers['u-newgrad'].orgId).toBeUndefined();
+    expect(mockOrgs[ORG].pendingDomainJoinRequests).toHaveLength(0);
+  });
+
+  it('a rejected request cannot then be approved', async () => {
+    await reject('tok-newgrad');
+    const res = await approve('tok-newgrad');
+    expect(res.status).toBe(400);
+    expect(mockUsers['u-newgrad'].orgId).toBeUndefined();
   });
 });
 
