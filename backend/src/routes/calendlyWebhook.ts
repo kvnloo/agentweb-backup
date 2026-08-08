@@ -38,7 +38,7 @@ import { userDb, crmDb } from '../services/db';
 import { metaService } from '../services/metaService';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
 import { leadListAlertService } from '../services/leadListAlertService';
-import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
+import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat, EnqueueResult } from '../services/asyncJobQueue';
 
 const router = express.Router();
 
@@ -412,112 +412,158 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
 
 registerProcessor(QUEUE_SOURCE, processCalendlyWebhookJob);
 
-router.post('/', (req: express.Request, res: express.Response) => {
-  // Respond immediately — all processing below is fire-and-forget, same
-  // pattern as the HubSpot receiver. Calendly must never see a slow/failed
-  // response as a reason to retry a delivery we're already handling async.
-  res.status(200).json({ received: true });
+type PreparedCalendlyDelivery =
+  | { kind: 'ignored' }
+  | { kind: 'ready'; jobPayload: CalendlyJobPayload; enqueueResult: EnqueueResult };
 
-  void (async () => {
-    try {
-      const rawBody = req.body as Buffer;
-      const parsed = JSON.parse(rawBody.toString('utf8')) as CalendlyInviteePayload;
+/** Verification + resolution + the enqueue attempt — everything that must finish
+ *  BEFORE deciding how (and whether) to ack, since that decision now depends on
+ *  enqueueResult (see the route handler below). All fast: DB lookups + HMAC, no
+ *  external API calls, same as this file always documented for the verification
+ *  step alone — moving the enqueue attempt in here too doesn't change that. */
+async function prepareCalendlyDelivery(req: express.Request): Promise<PreparedCalendlyDelivery> {
+  const rawBody = req.body as Buffer;
+  const parsed = JSON.parse(rawBody.toString('utf8')) as CalendlyInviteePayload;
 
-      if (parsed.event !== 'invitee.created') {
-        console.log(`[Calendly Webhook] Ignored event: ${parsed.event}`);
-        return;
-      }
+  if (parsed.event !== 'invitee.created') {
+    console.log(`[Calendly Webhook] Ignored event: ${parsed.event}`);
+    return { kind: 'ignored' };
+  }
 
-      const memberships = parsed.payload?.scheduled_event?.event_memberships ?? [];
-      const signatureHeader = req.headers['calendly-webhook-signature'] as string | undefined;
+  const memberships = parsed.payload?.scheduled_event?.event_memberships ?? [];
+  const signatureHeader = req.headers['calendly-webhook-signature'] as string | undefined;
 
-      // The real event_memberships shape for 2+ hosts has never been observed live — the
-      // resolution logic below only assumes "more entries, same per-entry shape" as the
-      // single-host payload this receiver was originally verified against. Log the raw
-      // shape the first time this actually happens in production, cheap insurance against
-      // that assumption being wrong (ENG-524 multi-host fix, no live multi-host account
-      // available to verify against directly).
-      if (memberships.length > 1) {
-        console.log(
-          `[Calendly Webhook] Multi-host event detected (${memberships.length} members) — logging payload shape for verification:`,
-          JSON.stringify(memberships),
-        );
-      }
+  // The real event_memberships shape for 2+ hosts has never been observed live — the
+  // resolution logic below only assumes "more entries, same per-entry shape" as the
+  // single-host payload this receiver was originally verified against. Log the raw
+  // shape the first time this actually happens in production, cheap insurance against
+  // that assumption being wrong (ENG-524 multi-host fix, no live multi-host account
+  // available to verify against directly).
+  if (memberships.length > 1) {
+    console.log(
+      `[Calendly Webhook] Multi-host event detected (${memberships.length} members) — logging payload shape for verification:`,
+      JSON.stringify(memberships),
+    );
+  }
 
-      // Each customer's webhook subscription is scope:'user' (calendlyAuth.ts), so an event
-      // with 2+ independently-connected hosts produces a SEPARATE delivery per subscription —
-      // identical payload, but each signed with that host's own webhook_signing_key. We can't
-      // know in advance which membership this particular delivery belongs to, so try every
-      // connected candidate's key rather than committing to the first membership that resolves
-      // to a connected account — otherwise a later host's delivery is silently dropped whenever
-      // an earlier-listed host is also connected (confirmed as a real gap, not just untested).
-      let resolved: { userId: string; account: any } | null = null;
-      for (const membership of memberships) {
-        if (!membership.user) continue;
-        const candidate = await getAccountByCalendlyUserUri(membership.user);
-        if (!candidate) continue;
-        const candidateKey: string | undefined = (candidate.account.config as any)?.webhook_signing_key;
-        if (candidateKey && verifyCalendlySignature(candidateKey, rawBody, signatureHeader)) {
-          resolved = candidate;
-          break;
-        }
-      }
-
-      if (!resolved) {
-        console.warn('[Calendly Webhook] No connected account\'s key verified this delivery — dropping');
-        return;
-      }
-
-      const { firstName, lastName } = splitName(parsed.payload);
-      const createdAtMs = parsed.payload.created_at ? Date.parse(parsed.payload.created_at) : NaN;
-      const eventTimeSeconds = Number.isFinite(createdAtMs) ? Math.floor(createdAtMs / 1000) : undefined;
-
-      const jobPayload: CalendlyJobPayload = {
-        userId: resolved.userId,
-        accountId: resolved.account.account_id,
-        bookingLeadListId: resolved.account.config?.booking_lead_list_id,
-        email: parsed.payload.email,
-        firstName,
-        lastName,
-        uri: parsed.payload.uri,
-        eventTimeSeconds,
-      };
-
-      // claimImmediately: this same request processes the job right below, so the
-      // enqueue writes it straight in as 'processing' — no separate claim call, no
-      // window where it sits 'pending' and claimable by the poller.
-      const enqueueResult = await enqueueJob(QUEUE_SOURCE, parsed.payload.uri, jobPayload, { claimImmediately: true });
-      if (enqueueResult === 'duplicate') {
-        console.log(`[Calendly Webhook] Duplicate delivery for ${parsed.payload.uri} — already queued, skipping`);
-        return;
-      }
-
-      // Keeps the claim's updatedAt fresh for as long as this inline call actually
-      // runs — without it, processing slower than the poller's stale threshold
-      // looks identical to an abandoned claim, and the poller would claim and
-      // re-run this same booking concurrently (Greptile P1 on #2291).
-      const stopHeartbeat = enqueueResult === 'enqueued' ? startHeartbeat(QUEUE_SOURCE, parsed.payload.uri) : () => {};
-      try {
-        await processCalendlyWebhookJob(jobPayload);
-        if (enqueueResult === 'enqueued') {
-          await markJobComplete(QUEUE_SOURCE, parsed.payload.uri);
-        }
-      } catch (processingError: any) {
-        if (enqueueResult === 'enqueued') {
-          // Durable record exists — the poller will retry, so don't lose this silently.
-          await markJobFailed(QUEUE_SOURCE, parsed.payload.uri, processingError);
-        } else {
-          // Queue unavailable (e.g. table not provisioned yet) — no durable record to
-          // retry from, so this is exactly today's fire-and-forget failure behavior.
-          console.error('[Calendly Webhook] Processing failed with no durable record (queue unavailable):', processingError?.message ?? processingError);
-        }
-      } finally {
-        stopHeartbeat();
-      }
-    } catch (error: any) {
-      console.error('[Calendly Webhook] Unexpected error:', error?.message ?? error);
+  // Each customer's webhook subscription is scope:'user' (calendlyAuth.ts), so an event
+  // with 2+ independently-connected hosts produces a SEPARATE delivery per subscription —
+  // identical payload, but each signed with that host's own webhook_signing_key. We can't
+  // know in advance which membership this particular delivery belongs to, so try every
+  // connected candidate's key rather than committing to the first membership that resolves
+  // to a connected account — otherwise a later host's delivery is silently dropped whenever
+  // an earlier-listed host is also connected (confirmed as a real gap, not just untested).
+  let resolved: { userId: string; account: any } | null = null;
+  for (const membership of memberships) {
+    if (!membership.user) continue;
+    const candidate = await getAccountByCalendlyUserUri(membership.user);
+    if (!candidate) continue;
+    const candidateKey: string | undefined = (candidate.account.config as any)?.webhook_signing_key;
+    if (candidateKey && verifyCalendlySignature(candidateKey, rawBody, signatureHeader)) {
+      resolved = candidate;
+      break;
     }
-  })();
+  }
+
+  if (!resolved) {
+    console.warn('[Calendly Webhook] No connected account\'s key verified this delivery — dropping');
+    return { kind: 'ignored' };
+  }
+
+  const { firstName, lastName } = splitName(parsed.payload);
+  const createdAtMs = parsed.payload.created_at ? Date.parse(parsed.payload.created_at) : NaN;
+  const eventTimeSeconds = Number.isFinite(createdAtMs) ? Math.floor(createdAtMs / 1000) : undefined;
+
+  const jobPayload: CalendlyJobPayload = {
+    userId: resolved.userId,
+    accountId: resolved.account.account_id,
+    bookingLeadListId: resolved.account.config?.booking_lead_list_id,
+    email: parsed.payload.email,
+    firstName,
+    lastName,
+    uri: parsed.payload.uri,
+    eventTimeSeconds,
+  };
+
+  // claimImmediately: the common case ('enqueued') processes the job in this same
+  // request, so the enqueue writes it straight in as 'processing' — no separate
+  // claim call, no window where it sits 'pending' and claimable by the poller.
+  let enqueueResult = await enqueueJob(QUEUE_SOURCE, jobPayload.uri, jobPayload, { claimImmediately: true });
+  if (enqueueResult === 'unavailable') {
+    // Greptile P1 on #2291 (round 10/11): this is the LAST chance at a durable
+    // record before falling back to the synchronous path below — one retry
+    // catches a transient write blip distinct from the table genuinely not
+    // existing yet, same reasoning as the webhook-cleanup queue's enqueue retry.
+    enqueueResult = await enqueueJob(QUEUE_SOURCE, jobPayload.uri, jobPayload, { claimImmediately: true });
+  }
+
+  return { kind: 'ready', jobPayload, enqueueResult };
+}
+
+router.post('/', async (req: express.Request, res: express.Response) => {
+  let prepared: PreparedCalendlyDelivery;
+  try {
+    prepared = await prepareCalendlyDelivery(req);
+  } catch (error: any) {
+    console.error('[Calendly Webhook] Unexpected error:', error?.message ?? error);
+    res.status(200).json({ received: true });
+    return;
+  }
+
+  if (prepared.kind === 'ignored') {
+    res.status(200).json({ received: true });
+    return;
+  }
+
+  const { jobPayload, enqueueResult } = prepared;
+
+  if (enqueueResult === 'duplicate') {
+    console.log(`[Calendly Webhook] Duplicate delivery for ${jobPayload.uri} — already queued, skipping`);
+    res.status(200).json({ received: true });
+    return;
+  }
+
+  if (enqueueResult === 'enqueued') {
+    // A durable row exists — ack now and process fire-and-forget, same pattern as
+    // the HubSpot receiver. A crash after this point is recoverable by the poller
+    // from that row, so there's no reason to make Calendly wait on it.
+    res.status(200).json({ received: true });
+    // Keeps the claim's updatedAt fresh for as long as this inline call actually
+    // runs — without it, processing slower than the poller's stale threshold
+    // looks identical to an abandoned claim, and the poller would claim and
+    // re-run this same booking concurrently (Greptile P1 on #2291).
+    const stopHeartbeat = startHeartbeat(QUEUE_SOURCE, jobPayload.uri);
+    try {
+      await processCalendlyWebhookJob(jobPayload);
+      await markJobComplete(QUEUE_SOURCE, jobPayload.uri);
+    } catch (processingError: any) {
+      // Durable record exists — the poller will retry, so don't lose this silently.
+      await markJobFailed(QUEUE_SOURCE, jobPayload.uri, processingError);
+    } finally {
+      stopHeartbeat();
+    }
+    return;
+  }
+
+  // enqueueResult === 'unavailable' (even after the retry in prepareCalendlyDelivery):
+  // no durable record exists anywhere for this delivery. Greptile P1 on #2291
+  // (round 10/11): acking 200 immediately and THEN processing fire-and-forget — the
+  // pattern every other branch above uses — meant a crash in that exact window
+  // silently lost the booking's attribution/CRM-forward with nothing left to
+  // recover from, identical to the pre-ENG-524 gap this entire feature exists to
+  // close. This is the one branch where there is no durable fallback, so it's the
+  // one branch that can't afford to ack before finishing: process fully first, then
+  // ack on success. On failure, respond 500 instead of a false 200 — Calendly's own
+  // delivery-retry becomes the fallback durability mechanism in exactly this
+  // degraded window, since processing here is already safe to re-run (CAPI dedupes
+  // by eventId on Meta's side; CRM-forward dedupes via its own per-step markers).
+  try {
+    await processCalendlyWebhookJob(jobPayload);
+    res.status(200).json({ received: true });
+  } catch (processingError: any) {
+    console.error('[Calendly Webhook] Processing failed with no durable record (queue unavailable):', processingError?.message ?? processingError);
+    res.status(500).json({ error: 'Processing failed; please retry this delivery' });
+  }
 });
 
 export default router;
