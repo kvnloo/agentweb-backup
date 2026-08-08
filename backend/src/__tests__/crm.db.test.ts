@@ -1030,7 +1030,7 @@ describe('CRM Database Service', () => {
   // mutex — a DynamoDB conditional write, not a probability reduction — so at most
   // one instance ever wins the claim and performs the real side effect.
   describe('claimLeadStepOnce', () => {
-    it('returns true and SETs the key when nobody else holds it', async () => {
+    it('returns true and SETs the key (with a claimedAt timestamp) when nobody else holds it', async () => {
       mockDocumentClientMethods.update.mockReturnValue({
         promise: jest.fn().mockResolvedValue({}),
       });
@@ -1043,16 +1043,25 @@ describe('CRM Database Service', () => {
       const claimCall = mockDocumentClientMethods.update.mock.calls[1][0];
       // `system` is a DynamoDB reserved keyword — must be a #system placeholder, not
       // the literal attribute name (confirmed live against a real table).
-      expect(claimCall.UpdateExpression).toContain('#system.#k = :v');
-      expect(claimCall.ConditionExpression).toBe('attribute_not_exists(#system.#k)');
+      expect(claimCall.UpdateExpression).toContain('#system.#k = :claim');
       expect(claimCall.ExpressionAttributeNames['#system']).toBe('system');
-      expect(claimCall.ExpressionAttributeValues[':v']).toBe('in_progress');
+      expect(claimCall.ExpressionAttributeValues[':claim']).toEqual({
+        status: 'in_progress',
+        claimedAt: expect.any(String),
+      });
+      // Greptile P1 on #2291 (round 17): the release-on-failure write is itself
+      // best-effort — if it also fails, a claim with no timestamp would stay
+      // 'in_progress' forever with no way to ever recover it. The condition must
+      // allow reclaiming, not just claiming fresh.
+      expect(claimCall.ConditionExpression).toBe(
+        'attribute_not_exists(#system.#k) OR (#system.#k.#status = :inProgress AND #system.#k.#claimedAt < :staleThreshold)',
+      );
     });
 
-    it('returns false without throwing when the key is already claimed (or done)', async () => {
+    it('returns false without throwing when the key is claimed by a NOT-yet-stale concurrent run', async () => {
       mockDocumentClientMethods.update
         .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) }) // bootstrap succeeds
-        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }) }); // claim loses
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }) }); // claim loses — real DynamoDB evaluates the OR condition itself; the mock just simulates "condition failed"
 
       const result = await crmDb.claimLeadStepOnce('list_123', 'lead_123', 'hubspotSynced::uri-1');
 
@@ -1068,6 +1077,23 @@ describe('CRM Database Service', () => {
 
       expect(result).toBe(false);
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('sets the stale threshold to CLAIM_STALE_MS (5 minutes) in the past', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      const before = Date.now();
+
+      await crmDb.claimLeadStepOnce('list_123', 'lead_123', 'hubspotSynced::uri-1');
+
+      const claimCall = mockDocumentClientMethods.update.mock.calls[1][0];
+      const staleThreshold = new Date(claimCall.ExpressionAttributeValues[':staleThreshold']).getTime();
+      const claimedAt = new Date(claimCall.ExpressionAttributeValues[':claim'].claimedAt).getTime();
+      // staleThreshold ~5 minutes before claimedAt (allow a little test-run slack).
+      expect(claimedAt - staleThreshold).toBeGreaterThan(4.9 * 60 * 1000);
+      expect(claimedAt - staleThreshold).toBeLessThan(5.1 * 60 * 1000);
+      expect(claimedAt).toBeGreaterThanOrEqual(before);
     });
   });
 

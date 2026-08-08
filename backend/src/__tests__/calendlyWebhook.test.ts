@@ -626,13 +626,13 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       // retry recognize exactly which steps are already done for THIS booking
       // specifically, without a different booking's completion overwriting it.
       expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-new', {
-        system: { [`hubspotSynced::${body.payload.uri}`]: 'done' },
+        system: { [`hubspotSynced::${body.payload.uri}`]: { status: 'done' } },
       });
       expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-new', {
-        system: { [`attioSynced::${body.payload.uri}`]: 'done' },
+        system: { [`attioSynced::${body.payload.uri}`]: { status: 'done' } },
       });
       expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-new', {
-        system: { [`alertSynced::${body.payload.uri}`]: 'done' },
+        system: { [`alertSynced::${body.payload.uri}`]: { status: 'done' } },
       });
     });
 
@@ -704,10 +704,10 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       // document-path SET that cannot touch any other key OR collide with a
       // different booking's own marker for the same step.
       const markerCall = mockSetLeadFields.mock.calls.find(
-        (call) => call[2]?.system?.[`hubspotSynced::${body.payload.uri}`] === 'done',
+        (call) => call[2]?.system?.[`hubspotSynced::${body.payload.uri}`]?.status === 'done',
       );
       expect(markerCall).toBeDefined();
-      expect(markerCall![2].system).toEqual({ [`hubspotSynced::${body.payload.uri}`]: 'done' });
+      expect(markerCall![2].system).toEqual({ [`hubspotSynced::${body.payload.uri}`]: { status: 'done' } });
     });
 
     // Greptile P1 (agentweb#2291): CAPI already dedupes redeliveries via Meta's own event_id
@@ -722,9 +722,9 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
         email: 'lead@example.com',
         customFields: { lastBookingUri: uri },
         system: {
-          [`hubspotSynced::${uri}`]: 'done',
-          [`attioSynced::${uri}`]: 'done',
-          [`alertSynced::${uri}`]: 'done',
+          [`hubspotSynced::${uri}`]: { status: 'done' },
+          [`attioSynced::${uri}`]: { status: 'done' },
+          [`alertSynced::${uri}`]: { status: 'done' },
         },
       };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
@@ -752,9 +752,9 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
         email: 'lead@example.com',
         customFields: { bookingUri: uri },
         system: {
-          [`hubspotSynced::${uri}`]: 'done',
-          [`attioSynced::${uri}`]: 'done',
-          [`alertSynced::${uri}`]: 'done',
+          [`hubspotSynced::${uri}`]: { status: 'done' },
+          [`attioSynced::${uri}`]: { status: 'done' },
+          [`alertSynced::${uri}`]: { status: 'done' },
         },
       };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
@@ -805,13 +805,13 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       // And once each succeeds, its own marker gets written so a further retry
       // would correctly skip exactly that step.
       expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
-        system: { [`hubspotSynced::${uri}`]: 'done' },
+        system: { [`hubspotSynced::${uri}`]: { status: 'done' } },
       });
       expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
-        system: { [`attioSynced::${uri}`]: 'done' },
+        system: { [`attioSynced::${uri}`]: { status: 'done' } },
       });
       expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
-        system: { [`alertSynced::${uri}`]: 'done' },
+        system: { [`alertSynced::${uri}`]: { status: 'done' } },
       });
     });
 
@@ -836,13 +836,13 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       await flushPromises();
 
       expect(mockSetLeadFields).not.toHaveBeenCalledWith('list-1', 'lead-existing', expect.objectContaining({
-        system: expect.objectContaining({ [`hubspotSynced::${uri}`]: 'done' }),
+        system: expect.objectContaining({ [`hubspotSynced::${uri}`]: { status: 'done' } }),
       }));
       expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
-        system: { [`attioSynced::${uri}`]: 'done' },
+        system: { [`attioSynced::${uri}`]: { status: 'done' } },
       });
       expect(mockSetLeadFields).toHaveBeenCalledWith('list-1', 'lead-existing', {
-        system: { [`alertSynced::${uri}`]: 'done' },
+        system: { [`alertSynced::${uri}`]: { status: 'done' } },
       });
       expect(mockMarkJobFailed).toHaveBeenCalledWith('calendly_webhook', uri, expect.any(Error));
     });
@@ -859,7 +859,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
         email: 'lead@example.com',
         customFields: { lastBookingUri: uri },
         // alert already succeeded on the prior attempt; neither sync marker is set.
-        system: { [`alertSynced::${uri}`]: 'done' },
+        system: { [`alertSynced::${uri}`]: { status: 'done' } },
       };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
@@ -1017,9 +1017,46 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       });
       // The step never got marked "done" for this failed attempt.
       expect(mockSetLeadFields).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), {
-        system: { [`hubspotSynced::${uri}`]: 'done' },
+        system: { [`hubspotSynced::${uri}`]: { status: 'done' } },
       });
       expect(mockMarkJobFailed).toHaveBeenCalledWith('calendly_webhook', uri, expect.any(Error));
+    });
+
+    // Greptile P1 on #2291 (round 17): the release write above is itself best-effort.
+    // If it fails too, the previous version just swallowed the error and moved on,
+    // wedging the claim 'in_progress' forever — every future retry's claim attempt
+    // would silently lose and skip the step, completing the job without ever
+    // delivering the failed sync/alert. Retried once as the fast path; the real
+    // backstop is claimLeadStepOnce's own staleness window (tested directly in
+    // crm.db.test.ts), not infinite retries here.
+    it('retries the claim release once, and logs loudly (does not silently swallow) if release fails twice', async () => {
+      const uri = 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1';
+      mockAutoSyncLead.mockImplementation((_userId: string, _listId: string, _lead: any, platform: string) =>
+        platform === 'hubspot' ? Promise.reject(new Error('hubspot down')) : Promise.resolve(undefined),
+      );
+      mockSetLeadFields.mockImplementation((_listId: string, _leadId: string, fields: any) => {
+        if (fields.removeSystemKeys) return Promise.reject(new Error('dynamo down'));
+        return Promise.resolve(undefined);
+      });
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      const body = makePayload({ email: 'lead@example.com', uri });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      const releaseCalls = mockSetLeadFields.mock.calls.filter((c) => c[2]?.removeSystemKeys?.[0] === `hubspotSynced::${uri}`);
+      expect(releaseCalls.length).toBe(2);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to release hubspot claim'),
+        expect.anything(),
+      );
+      // The original sync failure is still what fails the job — the release
+      // failure doesn't replace or hide it.
+      expect(mockMarkJobFailed).toHaveBeenCalledWith('calendly_webhook', uri, expect.objectContaining({ message: expect.stringContaining('hubspot down') }));
+
+      errorSpy.mockRestore();
     });
   });
 
