@@ -300,6 +300,16 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
         existingLead?.customFields?.lastBookingUri === payload.uri ||
         existingLead?.customFields?.bookingUri === payload.uri;
 
+      // Atomically records this booking on an already-known lead (existing or
+      // just-adopted-from-a-race) and returns the merged object downstream code
+      // should use — shared by the existingLead branch and the create-race
+      // adoption branch below, since both need the identical write.
+      const stampBookedFields = async (target: any) => {
+        const bookedFields = { lastBookedAt: new Date().toISOString(), lastBookingUri: payload.uri };
+        await crmDb.setLeadFields(listId!, target.leadId, { customFields: bookedFields });
+        return { ...target, customFields: { ...(target.customFields || {}), ...bookedFields } };
+      };
+
       let lead: any;
       let eventType: 'created' | 'updated';
       if (leadAlreadyRecordedForThisBooking) {
@@ -322,22 +332,43 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
         // sub-keys via a DynamoDB document-path SET
         // (`customFields.lastBookedAt = :v`), so two concurrent bookings' writes
         // to the SAME lead no longer clobber each other's fields.
-        const bookedFields = { lastBookedAt: new Date().toISOString(), lastBookingUri: payload.uri };
-        await crmDb.setLeadFields(listId, existingLead.leadId, { customFields: bookedFields });
-        lead = { ...existingLead, customFields: { ...(existingLead.customFields || {}), ...bookedFields } };
+        lead = await stampBookedFields(existingLead);
         eventType = 'updated';
       } else {
-        lead = await crmDb.createLead(listId, {
-          email: email.trim(),
-          firstName: payload.firstName,
-          lastName: payload.lastName,
-          customFields: {
-            source: 'calendly_booking',
-            bookedAt: new Date().toISOString(),
-            bookingUri: payload.uri,
-          },
-        });
-        eventType = 'created';
+        // Greptile P1 on #2291 (round 19): getLeadByEmail-then-createLead above is
+        // a read-then-write, not atomic — if a heartbeat-failure race (the same
+        // class already hardened in rounds 15/17/18) ever lets two instances
+        // process the SAME booking concurrently, BOTH could read "no existing
+        // lead" before either writes, and both would create one: two duplicate
+        // leads for the same email in the same list, neither aware of the other.
+        // A deterministic leadId (derived from list+email, the stable identity —
+        // not the booking URI, since a repeat booker must land on the SAME lead)
+        // plus failIfExists mirrors the exact pattern ENG-787 already established
+        // for this identical race in linkedInInviteCrmMirror.ts: both instances'
+        // conditional puts target the SAME item, so only one can ever win: the
+        // loser adopts the winner's lead instead of spawning a duplicate.
+        const deterministicLeadId = `lead_cal_${crypto.createHash('sha1').update(`${listId}\n${email.trim().toLowerCase()}`).digest('hex').slice(0, 20)}`;
+        try {
+          lead = await crmDb.createLead(listId, {
+            email: email.trim(),
+            firstName: payload.firstName,
+            lastName: payload.lastName,
+            customFields: {
+              source: 'calendly_booking',
+              bookedAt: new Date().toISOString(),
+              bookingUri: payload.uri,
+            },
+            leadId: deterministicLeadId,
+            failIfExists: true,
+          });
+          eventType = 'created';
+        } catch (err: any) {
+          if (!err?.leadAlreadyExists) throw err;
+          const winningLead = await crmDb.getLeadById(listId, deterministicLeadId);
+          if (!winningLead) throw err;
+          lead = await stampBookedFields(winningLead);
+          eventType = 'updated';
+        }
       }
 
       // Greptile P1 on #2291 (round 12): the previous version tracked each step's
