@@ -278,23 +278,40 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
 
       const existingLead = await crmDb.getLeadByEmail(listId, email.trim().toLowerCase());
 
-      // Idempotency: CAPI already dedupes a Calendly redelivery via Meta's own
-      // event_id collapsing (see file header comment) — but nothing protects THIS
-      // leg, so a redelivery of the same invitee.created event (e.g. our 200 response
-      // didn't reach Calendly) would otherwise repeat the HubSpot/Attio sync and fire
-      // a duplicate customer-facing alert for a booking already fully processed.
-      // bookingUri covers a redelivery of the very first booking (create path, before
-      // any update happened); lastBookingUri covers every booking after that.
-      const alreadyProcessed =
+      // Idempotency, split into two separate questions rather than one:
+      //   1. Has the lead record itself already been mutated for this booking?
+      //      bookingUri covers a redelivery of the very first booking (create path,
+      //      before any update happened); lastBookingUri covers every booking after
+      //      that. Only used to avoid a duplicate create/update.
+      //   2. Have the downstream steps (HubSpot/Attio sync, lead alert) already
+      //      completed for this booking? Tracked separately via syncCompletedUri,
+      //      written only once none of them failed.
+      // A single combined "alreadyProcessed" flag used to gate BOTH — correct for a
+      // genuine Calendly redelivery (nothing happened yet either way), but wrong for
+      // a queue retry after a downstream failure: the lead mutation had already
+      // landed, so the retry saw its own marker and skipped the ENTIRE block,
+      // silently losing whichever sync/alert actually failed with no way to ever
+      // retry it (Greptile P1 on #2291).
+      const leadAlreadyRecordedForThisBooking =
         existingLead?.customFields?.lastBookingUri === payload.uri ||
         existingLead?.customFields?.bookingUri === payload.uri;
+      const downstreamAlreadyCompletedForThisBooking =
+        existingLead?.customFields?.syncCompletedUri === payload.uri;
 
-      if (alreadyProcessed) {
-        console.log(`[Calendly Webhook] Duplicate delivery for already-processed booking ${payload.uri} — skipping CRM-forward re-processing`);
+      if (downstreamAlreadyCompletedForThisBooking) {
+        console.log(`[Calendly Webhook] Duplicate delivery for already fully-processed booking ${payload.uri} — skipping CRM-forward re-processing`);
       } else {
         let lead: any;
         let eventType: 'created' | 'updated';
-        if (existingLead) {
+        if (leadAlreadyRecordedForThisBooking) {
+          // A prior attempt already mutated the lead for this exact booking (the
+          // downstream steps below are what's being retried) — reuse it as-is
+          // rather than writing lastBookedAt/lastBookingUri again. bookingUri is
+          // set once at create time and never overwritten, so it still tells us
+          // whether that original attempt created or updated the lead.
+          lead = existingLead;
+          eventType = existingLead.customFields?.bookingUri === payload.uri ? 'created' : 'updated';
+        } else if (existingLead) {
           await crmDb.updateLead(listId, existingLead.leadId, {
             customFields: {
               ...(existingLead.customFields || {}),
@@ -318,6 +335,8 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
           eventType = 'created';
         }
 
+        let downstreamStepFailed = false;
+
         // Awaited (not fire-and-forget) so a genuine sync failure is counted below —
         // each still independently caught, so one platform's failure never blocks
         // the other's sync from being attempted.
@@ -325,11 +344,13 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
           .catch((err: any) => {
             console.error('[Calendly Webhook] HubSpot auto-sync error:', err?.message ?? err);
             failures.push(`HubSpot sync: ${err?.message ?? err}`);
+            downstreamStepFailed = true;
           });
         await externalCrmSyncService.autoSyncLead(payload.userId, listId, lead, 'attio', eventType)
           .catch((err: any) => {
             console.error('[Calendly Webhook] Attio auto-sync error:', err?.message ?? err);
             failures.push(`Attio sync: ${err?.message ?? err}`);
+            downstreamStepFailed = true;
           });
 
         // Same alert mechanism /forward-lead already uses — per-list opt-in via
@@ -350,6 +371,17 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
         } catch (alertError: any) {
           console.error('[Calendly Webhook] Lead alert failed:', alertError?.message ?? alertError);
           failures.push(`Lead alert: ${alertError?.message ?? alertError}`);
+          downstreamStepFailed = true;
+        }
+
+        // Only mark this booking as fully synced once every downstream step this
+        // attempt actually ran has succeeded — a retry re-checks this same flag, so
+        // a step recorded here as done is never re-attempted, and a step NOT
+        // recorded here still will be.
+        if (!downstreamStepFailed) {
+          await crmDb.updateLead(listId, lead.leadId, {
+            customFields: { ...(lead.customFields || {}), syncCompletedUri: payload.uri },
+          });
         }
 
         console.log(`[Calendly Webhook] CRM-forward: lead ${eventType} in list ${listId} for user ${payload.userId}`);
