@@ -3,7 +3,7 @@ import axios from 'axios';
 import { authenticateToken } from '../middleware/auth';
 import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, getAccountById, updateAccountConfig, FathomConfig, CalendlyConfig } from '../services/connectedAccountsDb';
 import { refreshCalendlyAccessToken } from './calendlyAuth';
-import { registerProcessor } from '../services/asyncJobQueue';
+import { registerProcessor, updateJobPayload } from '../services/asyncJobQueue';
 import { CALENDLY_WEBHOOK_CLEANUP_SOURCE, CalendlyWebhookCleanupPayload, queueCalendlyWebhookCleanup } from '../services/calendlyWebhookCleanupQueue';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
@@ -55,6 +55,19 @@ export async function processCalendlyWebhookCleanupJob(payload: CalendlyWebhookC
   const refreshed = await refreshCalendlyAccessToken(payload.refreshToken);
   if (!refreshed) {
     throw new Error(`Could not refresh token to clean up orphaned webhook ${payload.webhookId}`);
+  }
+  // Greptile P1 on #2291 (round 20): Calendly may rotate the refresh token on
+  // every use. If THIS refresh succeeded but the delete below then fails for an
+  // unrelated reason (network blip), a later retry re-reads the ORIGINAL
+  // enqueue-time payload — still carrying the now-invalid pre-rotation token —
+  // and can never successfully refresh again. This job is registered with
+  // maxAttempts: Infinity (round 9), so that isn't just a wasted attempt, it's
+  // an infinite loop that can never make progress. Persist the possibly-rotated
+  // refresh_token back to the durable row BEFORE attempting the delete, so any
+  // later retry always starts from a token that was valid as of the last
+  // successful refresh.
+  if (refreshed.refresh_token && refreshed.refresh_token !== payload.refreshToken) {
+    await updateJobPayload(CALENDLY_WEBHOOK_CLEANUP_SOURCE, payload.webhookId, { ...payload, refreshToken: refreshed.refresh_token });
   }
   await axios.delete(payload.webhookId, { headers: { Authorization: `Bearer ${refreshed.access_token}` } });
   console.log(`[Calendly] Cleaned up orphaned webhook ${payload.webhookId} via queued retry`);

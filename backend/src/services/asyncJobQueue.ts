@@ -170,6 +170,36 @@ export async function markJobFailed(source: string, dedupeKey: string, error: un
 }
 
 /**
+ * Overwrites a durable job's stored payload — for a processor that discovers,
+ * mid-attempt, that part of its own input has changed in a way future retries
+ * need to know about (Greptile P1 on #2291, round 20): Calendly's cleanup-retry
+ * job may refresh an OAuth token that Calendly rotates on every use. If that
+ * refresh succeeds but the actual cleanup call then fails for an unrelated
+ * reason, the NEXT retry re-reads the ORIGINAL enqueue-time payload — which
+ * still has the now-invalid pre-rotation token — and can never successfully
+ * refresh again. For a job registered with maxAttempts: Infinity this isn't
+ * just a wasted attempt, it's an infinite loop that can never make progress.
+ * Best-effort, matching markJobComplete/markJobFailed: if this write fails,
+ * the next retry just falls back to the stale payload it already had, which
+ * is the exact pre-existing behavior this call is layered on top of.
+ */
+export async function updateJobPayload(source: string, dedupeKey: string, payload: unknown): Promise<void> {
+  const id = jobId(source, dedupeKey);
+  try {
+    await dynamodb
+      .update({
+        TableName: TABLE_NAME,
+        Key: { id },
+        UpdateExpression: 'SET payload = :payload, updatedAt = :now',
+        ExpressionAttributeValues: { ':payload': JSON.stringify(payload), ':now': new Date().toISOString() },
+      })
+      .promise();
+  } catch (error: any) {
+    console.warn(`[AsyncJobQueue] updateJobPayload failed for ${id} (best-effort):`, error?.message ?? error);
+  }
+}
+
+/**
  * Keeps a claimed job's updatedAt fresh while it's genuinely still being
  * processed inline, so the poller's stale-reclamation query never mistakes
  * still-active work for an abandoned claim (Greptile P1 on #2291): without
