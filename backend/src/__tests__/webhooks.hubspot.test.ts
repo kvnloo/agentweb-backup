@@ -93,13 +93,11 @@ jest.mock('../services/hubspotService', () => ({
 const mockEnqueueJob = jest.fn();
 const mockMarkJobComplete = jest.fn();
 const mockMarkJobFailed = jest.fn();
-const mockMarkJobProcessing = jest.fn();
 const mockRegisterProcessor = jest.fn();
 jest.mock('../services/asyncJobQueue', () => ({
   enqueueJob: (...a: any[]) => mockEnqueueJob(...a),
   markJobComplete: (...a: any[]) => mockMarkJobComplete(...a),
   markJobFailed: (...a: any[]) => mockMarkJobFailed(...a),
-  markJobProcessing: (...a: any[]) => mockMarkJobProcessing(...a),
   registerProcessor: (...a: any[]) => mockRegisterProcessor(...a),
 }));
 
@@ -165,7 +163,6 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     mockEnqueueJob.mockResolvedValue('enqueued');
     mockMarkJobComplete.mockResolvedValue(undefined);
     mockMarkJobFailed.mockResolvedValue(undefined);
-    mockMarkJobProcessing.mockResolvedValue(undefined);
   });
 
   // ── Invalid inputs ──────────────────────────────────────────────────────────
@@ -621,6 +618,7 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
         'hubspot_webhook',
         expectedDedupeKey,
         expect.objectContaining({ changesByObjectId: expect.objectContaining({ '1': expect.objectContaining({ isCreation: true }) }) }),
+        { claimImmediately: true },
       );
     });
 
@@ -708,7 +706,6 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
     mockEnqueueJob.mockResolvedValue('enqueued');
     mockMarkJobComplete.mockResolvedValue(undefined);
     mockMarkJobFailed.mockResolvedValue(undefined);
-    mockMarkJobProcessing.mockResolvedValue(undefined);
   });
 
   it('deal.propertyChange: syncs amount → dealValue to the associated contact lead', async () => {

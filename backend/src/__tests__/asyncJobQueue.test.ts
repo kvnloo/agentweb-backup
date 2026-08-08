@@ -24,7 +24,6 @@ import {
   enqueueJob,
   markJobComplete,
   markJobFailed,
-  markJobProcessing,
   registerProcessor,
   pollAndProcessOnce,
 } from '../services/asyncJobQueue';
@@ -84,42 +83,38 @@ describe('asyncJobQueue', () => {
     });
   });
 
-  describe('markJobProcessing', () => {
+  describe('enqueueJob with claimImmediately', () => {
     // A caller that processes a job inline (same request that enqueued it) must
-    // claim it immediately, before starting real work. Without this, the row sits
-    // at status='pending' for the entire duration of inline processing, and the
-    // poller's next tick (every 30s in server.ts) can claim and re-run the SAME
-    // job concurrently with the still-running inline call — duplicate CRM writes,
-    // duplicate CAPI sends. This closes that window down to the gap between two
-    // sequential DynamoDB calls instead of up to a full poll interval.
-    it('marks a job processing with a fresh updatedAt', async () => {
-      await markJobProcessing('calendly_webhook', 'invitee-123');
+    // claim it as part of the SAME atomic write, not a separate follow-up call.
+    // An earlier version used a second update() to claim after enqueueing, which
+    // left a window — and a second independent failure mode — where the enqueue
+    // could succeed but the claim update fail, leaving the row 'pending' and
+    // claimable by the poller's next tick (every 30s in server.ts) while inline
+    // processing was still running: duplicate CRM writes, duplicate CAPI sends.
+    // Folding the claim into the enqueue's own put removes both the window and
+    // that second failure mode outright.
+    it('writes the row straight in as "processing" with a fresh updatedAt, in one put', async () => {
+      const result = await enqueueJob('calendly_webhook', 'invitee-123', { foo: 'bar' }, { claimImmediately: true });
 
-      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
-      expect(updateCall.Key.id).toBe('calendly_webhook_invitee-123');
-      expect(updateCall.ExpressionAttributeValues[':processing']).toBe('processing');
-      expect(updateCall.ExpressionAttributeValues[':now']).toBeDefined();
+      expect(result).toBe('enqueued');
+      expect(mockDocumentClientMethods.put).toHaveBeenCalledTimes(1);
+      expect(mockDocumentClientMethods.update).not.toHaveBeenCalled();
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.Item.status).toBe('processing');
+      expect(putCall.Item.updatedAt).toBeDefined();
     });
 
-    it('does not throw when markJobProcessing itself fails (best-effort)', async () => {
-      mockDocumentClientMethods.update.mockReturnValue({
-        promise: jest.fn().mockRejectedValue(new Error('down')),
-      });
-
-      await expect(markJobProcessing('calendly_webhook', 'invitee-123')).resolves.toBeUndefined();
-    });
-
-    it('a job claimed via markJobProcessing is not re-claimable by a poll tick that fires mid-processing', async () => {
-      // Simulates the real sequence: enqueue (pending) -> markJobProcessing (processing,
-      // fresh updatedAt) -> poller ticks while inline work is still running. The pending
-      // query legitimately returns nothing (status is no longer 'pending'), and the
-      // stale-processing query returns nothing either, because updatedAt was just
-      // refreshed and is nowhere near the 5-minute staleness threshold.
+    it('a job enqueued with claimImmediately is not re-claimable by a poll tick that fires mid-processing', async () => {
+      // Simulates the real sequence: enqueue-and-claim in one call -> poller ticks
+      // while inline work is still running. The pending query legitimately returns
+      // nothing (status was never 'pending'), and the stale-processing query returns
+      // nothing either, because updatedAt was just written and is nowhere near the
+      // 5-minute staleness threshold.
       const handler = jest.fn().mockResolvedValue(undefined);
       registerProcessor('test_source_claim_race', handler);
 
       mockDocumentClientMethods.query
-        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) }) // pending: none, already claimed
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) }) // pending: none, enqueued straight as processing
         .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) }); // stale-processing: not stale yet
 
       await pollAndProcessOnce();

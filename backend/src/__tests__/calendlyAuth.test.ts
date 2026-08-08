@@ -21,7 +21,8 @@ const createAccount = jest.fn(async (_userId: string, platform: string, input: a
   account_name: input.account_name,
   config: input.config,
 }));
-jest.mock('../services/connectedAccountsDb', () => ({ createAccount }));
+const getAccountByPlatform = jest.fn(async (): Promise<any> => null);
+jest.mock('../services/connectedAccountsDb', () => ({ createAccount, getAccountByPlatform }));
 
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
@@ -115,6 +116,7 @@ beforeEach(() => {
     account_name: input.account_name,
     config: input.config,
   }));
+  getAccountByPlatform.mockResolvedValue(null);
 });
 
 describe('GET /init', () => {
@@ -330,18 +332,20 @@ describe('POST /connect', () => {
     const duplicateError = {
       response: { status: 409, data: { title: 'Already Exists', message: 'Hook with this url already exists' } },
     };
-    const ourCallbackUrl = `${process.env.BACKEND_URL || 'http://localhost:3001'}/api/webhooks/calendly`;
-    const staleListResponse = (over: any = {}) => ({
-      data: {
-        collection: [{ uri: 'https://api.calendly.com/webhook_subscriptions/STALE111111111', callback_url: ourCallbackUrl }],
-        ...over,
-      },
+    // Matches meResponse()'s default resource.uri — the user_uri a genuine reconnect
+    // of the SAME Calendly identity would carry.
+    const SAME_USER_URI = 'https://api.calendly.com/users/AAAAAAAAAAAAAAAA';
+    const existingAccountFor = (webhookId: string, userUri: string = SAME_USER_URI) => ({
+      platform: 'calendly',
+      account_id: 'jane@customer.com',
+      account_name: 'Jane Customer',
+      config: { account_type: 'calendly', user_uri: userUri, webhook_id: webhookId },
     });
 
-    it('deletes the stale subscription and retries, succeeding with the new one', async () => {
+    it('deletes our own previously-recorded subscription and retries, succeeding with the new one', async () => {
+      getAccountByPlatform.mockResolvedValueOnce(existingAccountFor('https://api.calendly.com/webhook_subscriptions/STALE111111111'));
       const fin = await initAndFinalize();
       axios.post.mockRejectedValueOnce(duplicateError); // initial create: rejected as duplicate
-      axios.get.mockResolvedValueOnce(staleListResponse()); // list: finds the stale one
       axios.delete = jest.fn().mockResolvedValueOnce({ data: {} }); // delete: succeeds
       axios.post.mockResolvedValueOnce(webhookCreatedResponse({ uri: 'https://api.calendly.com/webhook_subscriptions/FRESH2222222222' })); // retry create: succeeds
 
@@ -359,51 +363,46 @@ describe('POST /connect', () => {
       );
     });
 
-    // Greptile P1 (agentweb#2291): the list query is scoped to this user + scope:'user', but
-    // Calendly doesn't further scope it to OUR app specifically — another third-party
-    // integration's scope:'user' webhook for the same Calendly user can legitimately appear
-    // in the same collection. Blindly deleting collection[0] risks deleting an unrelated
-    // app's webhook and leaving our own real stale one (with the actual URL conflict) intact.
-    it('deletes only the subscription matching our own callback URL, not an unrelated one listed first', async () => {
+    // Greptile P1 (agentweb#2291): every AgentWeb tenant shares the identical callback
+    // URL, so a prior version of this listed Calendly's webhook_subscriptions and matched
+    // by callback_url — tenant-ambiguous, since two different AgentWeb accounts connecting
+    // the SAME Calendly identity would both appear with that identical callback_url, and a
+    // match could delete the OTHER tenant's live subscription. Fixed by never listing
+    // Calendly's subscriptions at all — only ever deleting a webhook_id THIS account itself
+    // recorded. No prior record for this account/user_uri means we cannot safely identify
+    // anything to delete, so nothing is deleted, and no list call is ever made.
+    it('does not call Calendly to list subscriptions, and does not delete anything, when this account has no prior webhook_id on record', async () => {
+      getAccountByPlatform.mockResolvedValueOnce(null); // e.g. first-ever connect racing a duplicate, or a genuinely different tenant's conflict
       const fin = await initAndFinalize();
       axios.post.mockRejectedValueOnce(duplicateError);
-      axios.get.mockResolvedValueOnce({
-        data: {
-          collection: [
-            { uri: 'https://api.calendly.com/webhook_subscriptions/UNRELATED_APP', callback_url: 'https://some-other-app.example.com/webhooks/calendly' },
-            { uri: 'https://api.calendly.com/webhook_subscriptions/STALE111111111', callback_url: ourCallbackUrl },
-          ],
-        },
-      });
-      axios.delete = jest.fn().mockResolvedValueOnce({ data: {} });
-      axios.post.mockResolvedValueOnce(webhookCreatedResponse({ uri: 'https://api.calendly.com/webhook_subscriptions/FRESH2222222222' }));
+      axios.delete = jest.fn();
 
       const res = await request(app)
         .post('/api/oauth/calendly/connect')
         .send({ tokenSessionId: fin.body.tokenSessionId });
 
       expect(res.status).toBe(200);
-      expect(res.body.account.config.booking_tracking_active).toBe(true);
-      expect(axios.delete).toHaveBeenCalledWith(
-        'https://api.calendly.com/webhook_subscriptions/STALE111111111',
-        expect.objectContaining({ headers: expect.objectContaining({ Authorization: expect.stringContaining('Bearer') }) }),
-      );
-      expect(axios.delete).not.toHaveBeenCalledWith(
-        'https://api.calendly.com/webhook_subscriptions/UNRELATED_APP',
-        expect.anything(),
+      expect(res.body.upgradeRequired).toBe(true);
+      expect(res.body.account.config.booking_tracking_active).toBe(false);
+      expect(axios.delete).not.toHaveBeenCalled();
+      expect(axios.get).not.toHaveBeenCalledWith(
+        expect.stringContaining('webhook_subscriptions'),
+        expect.objectContaining({ params: expect.anything() }),
       );
     });
 
-    it('falls back to the upgrade-required message when the only listed subscription belongs to a different app', async () => {
+    // The core tenant-isolation guarantee: a webhook_id recorded for a DIFFERENT Calendly
+    // identity than the one currently reconnecting must never be reused as a delete target,
+    // even though it belongs to this same AgentWeb account — it isn't the thing Calendly is
+    // reporting as a duplicate right now, and using it either does nothing useful or, worse,
+    // deletes an unrelated live subscription of this account's own.
+    it('does not reuse a previously-recorded webhook_id that belongs to a DIFFERENT Calendly user_uri', async () => {
+      getAccountByPlatform.mockResolvedValueOnce(
+        existingAccountFor('https://api.calendly.com/webhook_subscriptions/OTHER_IDENTITY', 'https://api.calendly.com/users/SOME_OTHER_USER'),
+      );
       const fin = await initAndFinalize();
       axios.post.mockRejectedValueOnce(duplicateError);
-      axios.get.mockResolvedValueOnce({
-        data: {
-          collection: [
-            { uri: 'https://api.calendly.com/webhook_subscriptions/UNRELATED_APP', callback_url: 'https://some-other-app.example.com/webhooks/calendly' },
-          ],
-        },
-      });
+      axios.delete = jest.fn();
 
       const res = await request(app)
         .post('/api/oauth/calendly/connect')
@@ -415,24 +414,10 @@ describe('POST /connect', () => {
       expect(axios.delete).not.toHaveBeenCalled();
     });
 
-    it('falls back to the upgrade-required message when no stale subscription can be found', async () => {
-      const fin = await initAndFinalize();
-      axios.post.mockRejectedValueOnce(duplicateError);
-      axios.get.mockResolvedValueOnce({ data: { collection: [] } }); // list: nothing found
-
-      const res = await request(app)
-        .post('/api/oauth/calendly/connect')
-        .send({ tokenSessionId: fin.body.tokenSessionId });
-
-      expect(res.status).toBe(200);
-      expect(res.body.upgradeRequired).toBe(true);
-      expect(res.body.account.config.booking_tracking_active).toBe(false);
-    });
-
     it('falls back to the upgrade-required message when the retry after cleanup also fails', async () => {
+      getAccountByPlatform.mockResolvedValueOnce(existingAccountFor('https://api.calendly.com/webhook_subscriptions/STALE111111111'));
       const fin = await initAndFinalize();
       axios.post.mockRejectedValueOnce(duplicateError); // initial create
-      axios.get.mockResolvedValueOnce(staleListResponse()); // list finds stale
       axios.delete = jest.fn().mockResolvedValueOnce({ data: {} }); // delete succeeds
       axios.post.mockRejectedValueOnce(new Error('still failing')); // retry create fails
 
@@ -449,10 +434,12 @@ describe('POST /connect', () => {
     // NOT be routed through the duplicate-cleanup path — it should hit the original,
     // simple fallback exactly like the "plan does not support webhooks" test above.
     it('does not attempt duplicate cleanup for a non-duplicate failure', async () => {
+      getAccountByPlatform.mockResolvedValueOnce(existingAccountFor('https://api.calendly.com/webhook_subscriptions/STALE111111111'));
       const fin = await initAndFinalize();
       axios.post.mockRejectedValueOnce({
         response: { status: 403, data: { message: 'You must be on a paid plan to use this feature.' } },
       });
+      axios.delete = jest.fn();
 
       const res = await request(app)
         .post('/api/oauth/calendly/connect')
@@ -460,7 +447,7 @@ describe('POST /connect', () => {
 
       expect(res.status).toBe(200);
       expect(res.body.upgradeRequired).toBe(true);
-      expect(axios.get).not.toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ params: expect.anything() }));
+      expect(axios.delete).not.toHaveBeenCalled();
     });
   });
 });
