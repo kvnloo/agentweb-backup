@@ -561,6 +561,33 @@ describe('Connected Accounts Routes', () => {
             const response = await request(app).delete('/api/oauth/connected-accounts/gmail');
             expect(response.status).toBe(500);
         });
+
+        // Greptile P1 on #2291: this route previously used getAccountByPlatform,
+        // which only returns the FIRST matching account — but deleteAccount below
+        // removes ALL accounts for the platform. A user with more than one Calendly
+        // connection would have every subscription but one orphaned.
+        it('cleans up the webhook for every Calendly account the user has, not just the first', async () => {
+            (connectedAccountsDb.getAccountsByUserId as jest.Mock).mockResolvedValue([
+                { platform: 'calendly', account_id: 'a@example.com', config: { access_token: 'token-a', webhook_id: 'https://api.calendly.com/webhook_subscriptions/AAAA' } },
+                { platform: 'calendly', account_id: 'b@example.com', config: { access_token: 'token-b', webhook_id: 'https://api.calendly.com/webhook_subscriptions/BBBB' } },
+                { platform: 'gmail', account_id: 'c@example.com', config: {} },
+            ]);
+            (connectedAccountsDb.deleteAccount as jest.Mock).mockResolvedValue(undefined);
+            (axios.delete as jest.Mock).mockResolvedValue({ data: {} });
+
+            const response = await request(app).delete('/api/oauth/connected-accounts/calendly');
+
+            expect(response.status).toBe(200);
+            expect(axios.delete).toHaveBeenCalledWith(
+                'https://api.calendly.com/webhook_subscriptions/AAAA',
+                expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer token-a' }) }),
+            );
+            expect(axios.delete).toHaveBeenCalledWith(
+                'https://api.calendly.com/webhook_subscriptions/BBBB',
+                expect.objectContaining({ headers: expect.objectContaining({ Authorization: 'Bearer token-b' }) }),
+            );
+            expect(connectedAccountsDb.deleteAccount).toHaveBeenCalledWith('test_user_id', 'calendly');
+        });
     });
 
     describe('DELETE /connected-accounts/:platform/:accountId', () => {
@@ -632,6 +659,23 @@ describe('Connected Accounts Routes', () => {
                     'https://api.calendly.com/webhook_subscriptions/AAAA',
                     expect.objectContaining({ webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA', refreshToken: 'refresh-token-1' }),
                 );
+            });
+
+            // Greptile P1 on #2291 (round 5): this enqueue is the LAST chance to durably
+            // record webhook_id before the account is deleted — if the queue write itself
+            // is 'unavailable' (a transient blip, not necessarily the table missing), one
+            // retry gives it a real second chance before that identifier is gone for good.
+            it('retries the enqueue once when the first attempt reports the queue unavailable', async () => {
+                (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
+                (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+                (axios.delete as jest.Mock).mockRejectedValue(new Error('token expired'));
+                mockEnqueueJob.mockResolvedValueOnce('unavailable').mockResolvedValueOnce('enqueued');
+
+                const response = await request(app).delete('/api/oauth/connected-accounts/calendly/jane%40customer.com');
+
+                expect(response.status).toBe(200);
+                expect(mockEnqueueJob).toHaveBeenCalledTimes(2);
+                expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
             });
 
             it('does not attempt a remote delete when there is no webhook_id (booking tracking was already inactive)', async () => {

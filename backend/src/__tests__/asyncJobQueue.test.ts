@@ -26,6 +26,7 @@ import {
   markJobFailed,
   registerProcessor,
   pollAndProcessOnce,
+  startHeartbeat,
 } from '../services/asyncJobQueue';
 
 describe('asyncJobQueue', () => {
@@ -305,6 +306,61 @@ describe('asyncJobQueue', () => {
       });
 
       await expect(pollAndProcessOnce()).resolves.toBeUndefined();
+    });
+  });
+
+  // Greptile P1 on #2291: inline processing slower than the poller's stale
+  // threshold used to look identical, to the poller's stale-reclamation query,
+  // as a claim whose owning instance crashed — the poller would claim and
+  // re-run the SAME job concurrently with the still-running original. A
+  // periodic heartbeat that refreshes updatedAt while genuinely still
+  // processing closes that window.
+  describe('startHeartbeat', () => {
+    beforeEach(() => {
+      jest.useFakeTimers();
+    });
+
+    afterEach(() => {
+      jest.useRealTimers();
+    });
+
+    it('refreshes updatedAt on the claimed job at each interval tick', async () => {
+      const stop = startHeartbeat('calendly_webhook', 'invitee-123');
+
+      jest.advanceTimersByTime(60_000);
+      await Promise.resolve(); // let the fire-and-forget update's promise chain settle
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          Key: { id: 'calendly_webhook_invitee-123' },
+          ConditionExpression: '#status = :processing',
+        }),
+      );
+
+      stop();
+    });
+
+    it('stops ticking once the returned stop function is called', async () => {
+      const stop = startHeartbeat('calendly_webhook', 'invitee-123');
+      stop();
+
+      jest.advanceTimersByTime(5 * 60_000);
+      await Promise.resolve();
+
+      expect(mockDocumentClientMethods.update).not.toHaveBeenCalled();
+    });
+
+    it('is a safe no-op (never throws) when the conditional update fails — e.g. the job already moved past processing', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }),
+      });
+      const stop = startHeartbeat('calendly_webhook', 'invitee-123');
+
+      jest.advanceTimersByTime(60_000);
+      await Promise.resolve();
+      stop();
+
+      // No assertion needed beyond "did not throw" — reaching this line is the test.
     });
   });
 });

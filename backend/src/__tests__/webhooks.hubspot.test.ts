@@ -94,11 +94,13 @@ const mockEnqueueJob = jest.fn();
 const mockMarkJobComplete = jest.fn();
 const mockMarkJobFailed = jest.fn();
 const mockRegisterProcessor = jest.fn();
+const mockStartHeartbeat = jest.fn((..._args: any[]) => jest.fn());
 jest.mock('../services/asyncJobQueue', () => ({
   enqueueJob: (...a: any[]) => mockEnqueueJob(...a),
   markJobComplete: (...a: any[]) => mockMarkJobComplete(...a),
   markJobFailed: (...a: any[]) => mockMarkJobFailed(...a),
   registerProcessor: (...a: any[]) => mockRegisterProcessor(...a),
+  startHeartbeat: (...a: any[]) => mockStartHeartbeat(...a),
 }));
 
 const CLIENT_SECRET = 'test-client-secret';
@@ -633,6 +635,36 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
       await flushPromises();
 
       expect(mockMarkJobComplete).toHaveBeenCalledWith('hubspot_webhook', expectedDedupeKey);
+    });
+
+    // Greptile P1 on #2291: without a heartbeat, inline processing slower than
+    // the poller's stale threshold is indistinguishable from an abandoned claim.
+    it('starts a heartbeat for the claim while processing, and stops it once processing settles', async () => {
+      const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '1' }];
+      const expectedDedupeKey = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
+
+      await request(app)
+        .post('/api/webhooks/hubspot')
+        .set('x-hubspot-signature', makeSignature(body))
+        .send(body);
+      await flushPromises();
+
+      expect(mockStartHeartbeat).toHaveBeenCalledWith('hubspot_webhook', expectedDedupeKey);
+      const stopFn = mockStartHeartbeat.mock.results[0].value;
+      expect(stopFn).toHaveBeenCalled();
+    });
+
+    it('does not start a heartbeat when the queue is unavailable (nothing was claimed)', async () => {
+      mockEnqueueJob.mockResolvedValue('unavailable');
+      const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '1' }];
+
+      await request(app)
+        .post('/api/webhooks/hubspot')
+        .set('x-hubspot-signature', makeSignature(body))
+        .send(body);
+      await flushPromises();
+
+      expect(mockStartHeartbeat).not.toHaveBeenCalled();
     });
 
     it('skips processing entirely when enqueueJob reports a duplicate', async () => {
