@@ -139,7 +139,16 @@ async function cleanupCalendlyWebhook(userId: string, account: { config: unknown
     await attemptDelete(refreshed.access_token);
     console.log(`[Calendly] Deleted webhook ${config.webhook_id} on disconnect (after token refresh)`);
   } catch (retryErr: any) {
-    await queueCalendlyWebhookCleanup(userId, config);
+    // Greptile P1 on #2291 (round 20): the same rotation-loss bug as
+    // processCalendlyWebhookCleanupJob, one call site earlier — refreshed
+    // successfully refreshes the token above, but queuing the ORIGINAL
+    // (pre-refresh) `config` here would enqueue the durable retry job with a
+    // refresh_token Calendly may have already rotated and invalidated by this
+    // very refresh call, guaranteeing that job's own first refresh attempt
+    // fails too. refreshed.refresh_token is always the current valid one
+    // (refreshCalendlyAccessToken falls back to the input token if Calendly
+    // didn't rotate it) — use it, not the stale value still on `config`.
+    await queueCalendlyWebhookCleanup(userId, { ...config, refresh_token: refreshed.refresh_token });
     console.warn(`[Calendly] Failed to delete webhook ${config.webhook_id} on disconnect even after token refresh:`, retryErr?.response?.data || retryErr?.message);
   }
 }
