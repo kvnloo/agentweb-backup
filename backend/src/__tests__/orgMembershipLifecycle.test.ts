@@ -189,9 +189,14 @@ describe('demoting people (downgrading)', () => {
   });
 
   it('the LAST owner cannot be demoted — this is the path that orphans orgs', async () => {
+    // Filipe is also the billing root, so the billing-root guard answers first
+    // now. Same invariant, earlier and with a more actionable reason: the
+    // last owner in any org is necessarily the billing root, because roleOf
+    // counts ownerUserId as an owner permanently.
+
     const res = await setRole('u-filipe', 'member');
     expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/only owner/i);
+    expect(res.body.error).toMatch(/billing owner|only owner/i);
     expect(mockUsers['u-filipe'].orgRole).toBe('owner');
   });
 
@@ -202,6 +207,23 @@ describe('demoting people (downgrading)', () => {
     const res = await setRole('u-tyler', 'member');
     expect(res.status).toBe(200);
     expect(mockUsers['u-tyler'].orgRole).toBe('member');
+  });
+
+  it('the BILLING ROOT cannot be demoted — it would report success and move nothing', async () => {
+    // roleOf unions ownerUserId, so writing the column here changes no
+    // authority at all. Live run returned 200 twice while the target kept
+    // canDeleteOrg. Succeeding at nothing is worse than refusing.
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    const res = await setRole('u-filipe', 'member');
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/billing owner/i);
+    expect(mockUsers['u-filipe'].orgRole).toBe('owner');
+  });
+
+  it('the billing root can still be raised, and stays owner', async () => {
+    await setRole('u-filipe', 'owner');
+    expect(mockUsers['u-filipe'].orgRole).toBe('owner');
   });
 
   it('an ADMIN may not demote an owner', async () => {
@@ -377,25 +399,21 @@ describe('the roster reports EFFECTIVE authority, not the stored column', () => 
     return (res.body?.data?.members ?? []).find((m: any) => m.userId === userId)?.orgRole;
   };
 
-  it('a demoted billing root still reports as owner, because they still ARE one', async () => {
-    // Reachable in production: promote a second owner, have them demote the
-    // billing root, and the stored column says member while `roleOf` — which
-    // unions ownerUserId — still grants owner authority. Live run, ENG-954.
-    await setRole('u-eric', 'owner');
-    actingUserId = 'u-eric';
-    await setRole('u-filipe', 'member');
-    expect(mockUsers['u-filipe'].orgRole).toBe('member'); // the column did change
+  it('a drifted billing root still reports as owner, because they still ARE one', async () => {
+    // The API can no longer produce this drift — demoting the billing root is
+    // refused. The DATA still can, and has twice in production (the stale-role
+    // repairs in 15a47e29c and a7f320a80), plus every org created before
+    // orgRole existed. That is what this pins.
+    mockUsers['u-filipe'].orgRole = 'member';
+    expect(mockOrgs[ORG].ownerUserId).toBe('u-filipe');
 
-    // ...but the roster must not claim they are a plain member while the same
-    // response hands them canDeleteOrg.
+    // The roster must not call them a plain member while the same response
+    // hands that same user canDeleteOrg.
     expect(await roleInRoster('u-filipe')).toBe('owner');
   });
 
   it('the roster agrees with the capabilities in the same response', async () => {
-    await setRole('u-eric', 'owner');
-    actingUserId = 'u-eric';
-    await setRole('u-filipe', 'member');
-
+    mockUsers['u-filipe'].orgRole = 'member';
     actingUserId = 'u-filipe';
     const res = await roster();
     expect(res.body.data.capabilities.canDeleteOrg).toBe(true);

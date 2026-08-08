@@ -671,6 +671,21 @@ router.patch("/:orgId/members/:memberId/role", async (req: Request, res: Respons
       return res.json({ success: true, message: `Member is already ${role}`, role });
     }
 
+    // Demoting the billing root is a no-op that reports success. `roleOf`
+    // unions `ownerUserId`, so this writes the column and moves no authority:
+    // they remain an owner, the roster still says owner, and nothing the
+    // caller wanted actually happened. Observed live on the test env — the
+    // request returned 200 twice while the target kept `canDeleteOrg`.
+    //
+    // Refuse it and say why, rather than succeeding at nothing. Succession is
+    // still available: promote someone else, then this user leaves, which
+    // moves the billing root with them.
+    if (memberId === org.ownerUserId && role !== "owner") {
+      return res.status(409).json({
+        error: "This member is the organization's billing owner, so their access cannot be reduced. Promote another owner and have this member leave instead.",
+      });
+    }
+
     // Demoting the last owner orphans the org. This is the path Better Auth
     // missed (better-auth#3651) — remove and leave were guarded, changeRole was
     // not.
