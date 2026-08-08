@@ -855,9 +855,14 @@ describe('CRM Database Service', () => {
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
       const bootstrap = mockDocumentClientMethods.update.mock.calls[0][0];
-      expect(bootstrap.UpdateExpression).toContain('system = if_not_exists(system, :emptyMap)');
+      // `system` is a DynamoDB reserved keyword — must be a #system placeholder, not
+      // the literal attribute name (confirmed live against a real table: unescaped,
+      // this throws ValidationException, invisible to a mocked-DynamoDB unit test).
+      expect(bootstrap.UpdateExpression).toContain('#system = if_not_exists(#system, :emptyMap)');
+      expect(bootstrap.ExpressionAttributeNames['#system']).toBe('system');
       const main = mockDocumentClientMethods.update.mock.calls[1][0];
-      expect(main.UpdateExpression).toContain('system.#sys0 = :sys0');
+      expect(main.UpdateExpression).toContain('#system.#sys0 = :sys0');
+      expect(main.ExpressionAttributeNames['#system']).toBe('system');
       expect(main.ExpressionAttributeValues[':sys0']).toBe(true);
       // system keys are internal bookkeeping, not customer-visible custom fields —
       // must never register on the list's fieldNames.
@@ -1036,8 +1041,11 @@ describe('CRM Database Service', () => {
       // 1: bootstrap the system map, 2: the conditional claim SET.
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
       const claimCall = mockDocumentClientMethods.update.mock.calls[1][0];
-      expect(claimCall.UpdateExpression).toContain('system.#k = :v');
-      expect(claimCall.ConditionExpression).toBe('attribute_not_exists(system.#k)');
+      // `system` is a DynamoDB reserved keyword — must be a #system placeholder, not
+      // the literal attribute name (confirmed live against a real table).
+      expect(claimCall.UpdateExpression).toContain('#system.#k = :v');
+      expect(claimCall.ConditionExpression).toBe('attribute_not_exists(#system.#k)');
+      expect(claimCall.ExpressionAttributeNames['#system']).toBe('system');
       expect(claimCall.ExpressionAttributeValues[':v']).toBe('in_progress');
     });
 
