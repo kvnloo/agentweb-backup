@@ -1225,16 +1225,24 @@ export function scheduledRunSignalsConditionalSkip(
   // (2) A failure worded as a skip is not a cadence skip. But FIRST neutralize a
   // zero/none-valued failure ledger — a clean run routinely reports "Failed: 0" /
   // "Failed  0" (a "<td>Failed</td><td>0</td>" cell) / "failures: none", which is
-  // a SUCCESS signal, not a failure. Only the ledger's own value is dropped
-  // (label THEN count); a nonzero or asserted failure ("Failed 1", "post failed",
-  // "auth failed", "couldn't reach the API") is untouched and still vetoes. NB:
-  // matching a zero that PRECEDES the word (`0 failed`) is deliberately avoided —
-  // once tags are stripped, the prior ledger row's count ("Succeeded 0") sits
-  // right before the next row's "Failed" and would falsely neutralize it.
-  const failureScan = text.replace(
-    /\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi,
-    ' '
-  );
+  // a SUCCESS signal, not a failure. A nonzero or asserted failure ("Failed 1",
+  // "post failed", "auth failed", "couldn't reach the API") is untouched and still
+  // vetoes.
+  //
+  // BOTH orders must be neutralized (prod regression, session 25ec4670 on
+  // 2026-08-06): agents also write the count FIRST, as an inline ledger —
+  // "Ledger: 0 attempted / 0 succeeded / 0 failed / 0 queued." Only handling
+  // label-then-count let the bare word "failed" survive there and veto a perfectly
+  // legitimate cadence skip, sending the run into the full 20-attempt retry press
+  // this ticket exists to prevent.
+  //
+  // The count-then-label rule carries a negative lookahead for a FOLLOWING nonzero
+  // count, which is what makes it safe: a stripped HTML table renders as
+  // "Succeeded 0 Failed 1", where the "0" belongs to the PREVIOUS row — there,
+  // "Failed" is followed by "1", so it is left intact and still vetoes.
+  const failureScan = text
+    .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
+    .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[:=-]?\s*\d*[1-9])/gi, ' ');
   if (SKIP_FAILURE_SIGNAL_PATTERNS.some((re) => re.test(failureScan))) return false;
 
   // (3) Non-spoofable ledger check: a legitimate cadence skip makes NO write calls
