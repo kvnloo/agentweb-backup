@@ -422,6 +422,15 @@ async function processClaimedJob(job: AsyncJobRecord): Promise<void> {
       }
     }
     console.error(`[AsyncJobQueue] Processing failed for job ${job.id} (source=${job.source}, attempt ${attempts}):`, error?.message ?? error);
+    if (nextStatus === 'failed') {
+      // ENG-992: a job that exhausts its attempts used to just blend into the
+      // same "Processing failed" line above every other retry logs — nothing
+      // distinguished the terminal attempt from the 4 before it, so a
+      // permanently-stuck job (as opposed to a still-retrying one) had no way
+      // to surface itself for a human to notice. This line is deliberately
+      // distinct and greppable.
+      console.error(`[AsyncJobQueue] TERMINAL FAILURE: job ${job.id} (source=${job.source}) exhausted all ${attempts} attempts and will not be retried again.`);
+    }
   } finally {
     stopHeartbeat();
   }

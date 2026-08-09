@@ -100,10 +100,22 @@ export async function processCalendlyWebhookCleanupJob(payload: CalendlyWebhookC
 // 'failed' and never be retried again — permanently stranding the orphaned
 // Calendly-side subscription with no way left to recover its id and clean it
 // up, which then blocks a later reconnect with Calendly's "Already Exists".
-// Unlimited retries mean a Calendly outage or an initially-unrefreshable token
-// still eventually resolves the orphan instead of going silently and
-// permanently inert.
-registerProcessor(CALENDLY_WEBHOOK_CLEANUP_SOURCE, processCalendlyWebhookCleanupJob, { maxAttempts: Infinity });
+// A generous 20-attempt cap (~10 minutes at the 30s poll interval, round 25's
+// heartbeat/interval numbers) rides out a real Calendly outage or an
+// initially-unrefreshable token exactly like unlimited retries would.
+//
+// ENG-992 (live-tested round, #2291): unlimited retries used to be the
+// design here, but a real disconnect that hit a permanent (not transient)
+// 403 from Calendly showed the actual cost of that choice — the job retried
+// every 30s forever with zero escalation, indistinguishable in logs from a
+// healthy job. Bounding it lets processClaimedJob's terminal-'failed' log
+// (asyncJobQueue.ts) actually surface a permanently-stuck cleanup instead of
+// it scrolling silently forever. Safe to bound now specifically because
+// round 16's orphan-webhook table + reconnect self-heal (getOrphanedCalendlyWebhook
+// in calendlyAuth.ts) is an independent second recovery path that doesn't
+// depend on this job's retry state at all — the webhook_id is never actually
+// unrecoverable just because this job gives up.
+registerProcessor(CALENDLY_WEBHOOK_CLEANUP_SOURCE, processCalendlyWebhookCleanupJob, { maxAttempts: 20 });
 
 /**
  * Best-effort cleanup of the remote Calendly webhook subscription on disconnect,
