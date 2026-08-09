@@ -70,6 +70,13 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
   async function runRealLoop(
     makeTurn: (call: number, toolsOffered: boolean) => any,
     msPerCall = 60_000,
+    /**
+     * The caller's whole-turn deadline stamp (ENG-907). The controller takes it right
+     * before it starts `withGenerationTimeout`, i.e. BEFORE the session/message reads,
+     * the title LLM call and the fork IPC hop — so by the time the loop runs it is
+     * already in the past. Omitted here means "no cap enforced by the caller".
+     */
+    turnStartMs?: number,
   ) {
     let call = 0;
     const toolsOfferedPerCall: boolean[] = [];
@@ -93,8 +100,18 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       'test-user',
       service.default_model,
       'test-session',
+      false, // mockMode
+      undefined, // onProgress
+      undefined, // socketEmit
+      false, // isInteractiveShare
+      undefined, // isCancelled
+      undefined, // excludeTools
+      undefined, // screenshotUrl
+      false, // isDelegatedAccess
+      false, // persistIncrementally
+      turnStartMs,
     )) as any;
-    return { result, elapsedMs: nowMs - startedAt, toolsOfferedPerCall };
+    return { result, elapsedMs: nowMs - startedAt, endedAtMs: nowMs, toolsOfferedPerCall };
   }
 
   it('stops discovery and delivers a partial answer instead of running past the hard cap', async () => {
@@ -162,6 +179,46 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
 
     expect(result.truncatedByTimeBudget).toBe(true);
     expect(result.content).toMatch(/time limit/i);
+  });
+
+  it("measures against the CALLER's deadline, not the moment the loop happened to start", async () => {
+    // The turn the user waits on starts in the controller: it stamps `turnStartMs` and
+    // immediately arms withGenerationTimeout, then spends real time on the session and
+    // message reads, the title LLM call, the fork IPC hop and the memory backfill before
+    // the loop below ever runs. Anchoring on a local Date.now() here would put the loop's
+    // cap that much LATER than the deadline actually enforced — the setup latency would
+    // come straight out of the synthesis reserve, and a slow enough setup would let the
+    // controller guillotine the turn before the loop ever wrapped itself up.
+    const keepSearching = (call: number, toolsOffered: boolean) =>
+      toolsOffered
+        ? {
+            content: `Scanned batch ${call + 1}.`,
+            tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+          }
+        : { content: 'Partial results — here is what I gathered before the time limit.' };
+
+    const SETUP_LATENCY_MS = 180_000; // 3 min burned before the loop starts
+
+    const withoutStamp = await runRealLoop(keepSearching, 30_000);
+
+    // Same run, but the caller's cap started SETUP_LATENCY_MS ago.
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    installStandardMockDeps();
+    const callerTurnStartMs = nowMs;
+    nowMs += SETUP_LATENCY_MS;
+    const withStamp = await runRealLoop(keepSearching, 30_000, callerTurnStartMs);
+
+    // Both deliver a partial answer, but the stamped run stops sooner because it knows
+    // it has 3 fewer minutes — and it finishes before the caller's REAL deadline.
+    expect(withStamp.result.truncatedByTimeBudget).toBe(true);
+    expect(withStamp.result.content).toMatch(/Partial results/);
+    expect(withStamp.endedAtMs).toBeLessThanOrEqual(callerTurnStartMs + CAP_MS);
+    expect(withStamp.toolsOfferedPerCall.length)
+      .toBeLessThan(withoutStamp.toolsOfferedPerCall.length);
+    // Without the stamp the loop would have run SETUP_LATENCY_MS past that deadline.
+    expect(callerTurnStartMs + SETUP_LATENCY_MS + withoutStamp.elapsedMs)
+      .toBeGreaterThan(callerTurnStartMs + CAP_MS);
   });
 
   it('does NOT fire on a fast run that finishes well inside the budget (no false positive)', async () => {
