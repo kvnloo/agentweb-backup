@@ -11,6 +11,7 @@ import {
 } from "../services/v0Service";
 import { OWNED_FEATURES, OwnedFeature } from "../services/orgShareService";
 import { can, roleOf } from "../services/orgAuthz";
+import { reassignBillingRootOnDeparture } from "./org";
 
 const router = express.Router();
 
@@ -216,6 +217,18 @@ router.post("/:userId/remove", async (req, res) => {
         })()
       );
       await Promise.all(workers);
+    }
+
+    // Carry the billing root with the departure, exactly as the sibling route
+    // in routes/org.ts does. This route was missed when that landed, and it is
+    // the one the portal's remove dialog actually calls — so the fix shipped
+    // without covering the path a human uses.
+    // can() above returns false for a null org, so reaching here proves it is set.
+    if (!callerOrg) {
+      return res.status(404).json({ message: "Organization not found" });
+    }
+    if (!(await reassignBillingRootOnDeparture(callerOrg, target.userId, callerId))) {
+      return res.status(409).json({ message: "Cannot remove the only owner. Promote another member to owner first." });
     }
 
     // Clear org membership on the target user

@@ -39,6 +39,7 @@ const mockDeleteSkill = jest.fn();
 const mockSkillTransferOwner = jest.fn();
 const mockGetOrgById = jest.fn();
 const mockGetOrgMembers = jest.fn();
+const mockUpdateOrg = jest.fn();
 const mockDynamoGet = jest.fn();
 const mockDynamoPut = jest.fn();
 
@@ -52,6 +53,7 @@ jest.mock("../services/db", () => ({
     pruneEditorListsForUser: mockPruneEditorListsForUser,
     getOrgById: mockGetOrgById,
     getOrgMembers: mockGetOrgMembers,
+    updateOrg: mockUpdateOrg,
   },
   taskDb: {
     getTasksByUserId: mockGetTasksByUserId,
@@ -708,6 +710,47 @@ describe("orgMemberRemoval guards", () => {
     expect(res.status).toBe(400);
     expect(res.body.message).toMatch(/cannot remove yourself/i);
     expect(mockClearOrgMembership).not.toHaveBeenCalled();
+  });
+
+  it("carries the billing root to the remover — this route was missed the first time", async () => {
+    // The reassignment landed on routes/org.ts only, while the commit claimed
+    // both paths. This route is the one the portal's remove dialog calls, so
+    // the gap was the one a human would hit — and did, twice.
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    const targetRoot = { userId: "u-root", orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === "u-root") return Promise.resolve(targetRoot);
+      return Promise.resolve(null);
+    });
+    mockGetOrgMembers.mockResolvedValue([ownerCaller, targetRoot]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-root", name: "Test Org" });
+    mockUpdateOrg.mockResolvedValue({});
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-root/remove`)
+      .send({ confirm: true, decisions: allLeave });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateOrg).toHaveBeenCalledWith(orgId, { ownerUserId: callerUserId });
+    expect(mockClearOrgMembership).toHaveBeenCalledWith("u-root");
+  });
+
+  it("removing a NON-billing member leaves the pointer alone", async () => {
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === targetUserId) return Promise.resolve(targetMember);
+      return Promise.resolve(null);
+    });
+    mockGetOrgMembers.mockResolvedValue([ownerCaller, targetMember]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: callerUserId, name: "Test Org" });
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/${targetUserId}/remove`)
+      .send({ confirm: true, decisions: allLeave });
+    expect(res.status).toBe(200);
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
   });
 
   it("refuses to let an ADMIN remove an owner — and so never hands them the owner's content", async () => {

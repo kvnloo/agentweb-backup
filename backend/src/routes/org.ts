@@ -139,16 +139,25 @@ async function anotherOwnerRemains(org: Organization, losingUserId: string): Pro
  * that another owner remains — every caller here is behind that guard, and
  * this returns false rather than guessing if that is somehow untrue.
  */
-async function reassignBillingRootOnDeparture(
+export async function reassignBillingRootOnDeparture(
   org: Organization,
   departingUserId: string,
+  /**
+   * The owner performing the removal. They take billing, which is the rule
+   * Harsha asked for and the least surprising one: the person who decided the
+   * billing owner should go is the person who inherits it, and they find out
+   * by seeing the badge land on their own row. Absent on `leave`, where nobody
+   * is acting on anyone — that falls back to a deterministic pick.
+   */
+  actingUserId?: string,
 ): Promise<boolean> {
   if (org.ownerUserId !== departingUserId) return true; // not the billing root
   const members = await orgDb.getOrgMembers(org.orgId);
-  const successor = members
-    .filter((m) => m.userId !== departingUserId && m.orgRole === "owner")
+  const owners = members.filter((m) => m.userId !== departingUserId && m.orgRole === "owner");
+  const successor =
+    owners.find((m) => m.userId === actingUserId) ??
     // Deterministic, so a retry picks the same successor as the first attempt.
-    .sort((a, b) => a.userId.localeCompare(b.userId))[0];
+    owners.sort((a, b) => a.userId.localeCompare(b.userId))[0];
   if (!successor) return false;
   await orgDb.updateOrg(org.orgId, { ownerUserId: successor.userId });
   console.log(
@@ -783,7 +792,7 @@ router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) =
       }
     }
 
-    if (!(await reassignBillingRootOnDeparture(org, memberId))) {
+    if (!(await reassignBillingRootOnDeparture(org, memberId, userId))) {
       return res.status(409).json({
         error: "Cannot remove the only owner. Promote another member to owner first.",
       });

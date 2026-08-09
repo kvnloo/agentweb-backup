@@ -392,6 +392,67 @@ describe('adding people', () => {
   });
 });
 
+describe('INVARIANT: an org always has a billing owner who is a member', () => {
+  // Harsha, after hitting the stranded pointer twice: "make sure the tests will
+  // never allow an org to not have a billing owner." This asserts the invariant
+  // after EVERY departure path rather than trusting each one to be patched —
+  // the second stranding happened precisely because one path was missed while
+  // the commit claimed both were covered.
+  const check = () => {
+    const org = mockOrgs[ORG];
+    if (!org) return 'org deleted';
+    const memberIds = Object.values(mockUsers)
+      .filter((u: any) => u.orgId === ORG).map((u: any) => u.userId);
+    if (memberIds.length === 0) return 'org empty';
+    expect(org.ownerUserId).toBeTruthy();
+    expect(memberIds).toContain(org.ownerUserId);
+    // ...and that person must actually hold owner authority.
+    const root: any = mockUsers[org.ownerUserId];
+    expect(root.orgId).toBe(ORG);
+    return 'ok';
+  };
+
+  const paths: Array<[string, () => Promise<unknown>]> = [
+    ['owner removes the billing root via /members/:id',
+      async () => { await setRole('u-eric', 'owner'); actingUserId = 'u-eric';
+                    await request(app).delete(`/api/org/${ORG}/members/u-filipe`); }],
+    ['the billing root leaves',
+      async () => { await setRole('u-eric', 'owner');
+                    await request(app).post(`/api/org/${ORG}/leave`); }],
+    ['an ordinary member leaves',
+      async () => { actingUserId = 'u-georgia';
+                    await request(app).post(`/api/org/${ORG}/leave`); }],
+    ['an admin is removed',
+      async () => { await setRole('u-eric', 'admin');
+                    await request(app).delete(`/api/org/${ORG}/members/u-eric`); }],
+    ['a second owner is removed',
+      async () => { await setRole('u-eric', 'owner');
+                    await request(app).delete(`/api/org/${ORG}/members/u-eric`); }],
+    ['the billing root is demoted (refused) then someone else leaves',
+      async () => { await setRole('u-eric', 'owner'); actingUserId = 'u-eric';
+                    await setRole('u-filipe', 'member');
+                    await request(app).post(`/api/org/${ORG}/leave`); }],
+    ['chained: promote, remove root, promote again, remove again',
+      async () => { await setRole('u-eric', 'owner'); actingUserId = 'u-eric';
+                    await request(app).delete(`/api/org/${ORG}/members/u-filipe`);
+                    await setRole('u-tyler', 'owner');
+                    await request(app).delete(`/api/org/${ORG}/members/u-tyler`); }],
+  ];
+
+  it.each(paths)('holds after: %s', async (_label, run) => {
+    await run();
+    expect(check()).not.toBe('violated');
+  });
+
+  it('the remover inherits billing — the rule Harsha asked for', async () => {
+    await setRole('u-eric', 'owner');
+    await setRole('u-tyler', 'owner');
+    actingUserId = 'u-tyler'; // NOT the lowest userId; the actor must win
+    await request(app).delete(`/api/org/${ORG}/members/u-filipe`);
+    expect(mockOrgs[ORG].ownerUserId).toBe('u-tyler');
+  });
+});
+
 describe('the billing root cannot be stranded on an ex-member', () => {
   // Harsha hit this by hand within minutes of the UI existing: promote a new
   // owner, remove the old one, and `ownerUserId` pointed at somebody who was no
