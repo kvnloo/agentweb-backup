@@ -5149,7 +5149,8 @@ export class AgentModeService {
     'send_email_from_sender',
 
     // S3 overflow retrieval — always available so the LLM can read large tool
-    // responses that were offloaded to S3 by the 10KB overflow mechanism.
+    // responses that were offloaded to S3 by the TOOL_RESPONSE_S3_THRESHOLD
+    // overflow mechanism (pinned to CONTEXT_TRIM_TOOL_CONTENT_LIMIT).
     // Without these, the LLM sees the "[Full response stored at S3 key: ...]"
     // header but has no tool to retrieve the full content.
     'search_tool_response',

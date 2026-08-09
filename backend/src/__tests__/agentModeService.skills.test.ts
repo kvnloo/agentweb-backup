@@ -973,7 +973,8 @@ describe('AgentModeService - Skills', () => {
       // exposed to every tenant. It lives in ADMIN_SKILL_TOOL_NAMES instead.
       expect(foundationTools.has('get_registration_status')).toBe(false);
       // S3 overflow retrieval tools must always be available so the LLM can read
-      // large tool responses that were offloaded to S3 by the 10KB overflow mechanism.
+      // large tool responses that were offloaded to S3 by the
+      // TOOL_RESPONSE_S3_THRESHOLD overflow mechanism.
       expect(foundationTools.has('search_tool_response')).toBe(true);
       expect(foundationTools.has('read_tool_response')).toBe(true);
     });
