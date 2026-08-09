@@ -52,6 +52,9 @@ jest.mock('../services/db', () => ({
     }),
   },
   orgDb: {
+    // ENG-954: owner-loss serialization. Default-true = no contention,
+    // which is every test here except the explicit race case.
+    claimOwnerChange: jest.fn(() => Promise.resolve(true)),
     getOrgById: jest.fn((orgId: string) => Promise.resolve(mockOrgs[orgId] || null)),
     getOrgMembers: jest.fn((orgId: string) =>
       Promise.resolve(Object.values(mockUsers).filter((u: any) => u.orgId === orgId))),
@@ -451,6 +454,56 @@ describe('a PAYING billing owner cannot be removed — the card cannot follow th
     const res = await remove('u-eric');
     expect(res.status).toBe(200);
     expect(mockOrgs[ORG].ownerUserId).toBe('u-filipe');
+  });
+});
+
+describe('concurrent owner departures cannot both win', () => {
+  // The invariant spans member items, so no single conditional write can
+  // express it: two departures each read the roster, each see the other owner,
+  // and both proceed to zero. The org item is the serialization point — the
+  // loser's conditional claim fails and it refuses (Greptile, #2297).
+  const remove = (t: string) => request(app).delete(`/api/org/${ORG}/members/${t}`);
+  const claim = () => (orgDb as any).claimOwnerChange as jest.Mock;
+
+  it('the loser of the race is refused rather than completing', async () => {
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    claim().mockResolvedValueOnce(false); // another departure claimed this epoch
+
+    const res = await remove('u-filipe');
+    expect(res.status).toBe(409);
+    expect(mockUsers['u-filipe'].orgId).toBe(ORG); // still a member
+  });
+
+  it('the winner proceeds normally', async () => {
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    const res = await remove('u-filipe');
+    expect(res.status).toBe(200);
+    expect(mockUsers['u-filipe'].orgId).toBeUndefined();
+  });
+
+  it('leaving as an owner takes the same claim', async () => {
+    await setRole('u-eric', 'owner');
+    claim().mockResolvedValueOnce(false);
+    const res = await request(app).post(`/api/org/${ORG}/leave`);
+    expect(res.status).toBe(409);
+    expect(mockUsers['u-filipe'].orgId).toBe(ORG);
+  });
+
+  it('demoting an owner takes the same claim', async () => {
+    await setRole('u-eric', 'owner');
+    claim().mockResolvedValueOnce(false);
+    const res = await setRole('u-eric', 'member');
+    expect(res.status).toBe(409);
+    expect(mockUsers['u-eric'].orgRole).toBe('owner');
+  });
+
+  it('removing a NON-owner needs no claim at all', async () => {
+    claim().mockClear();
+    const res = await remove('u-georgia');
+    expect(res.status).toBe(200);
+    expect(claim()).not.toHaveBeenCalled();
   });
 });
 

@@ -61,6 +61,9 @@ jest.mock('../services/db', () => ({
     }),
   },
   orgDb: {
+    // ENG-954: owner-loss serialization. Default-true = no contention,
+    // which is every test here except the explicit race case.
+    claimOwnerChange: jest.fn(() => Promise.resolve(true)),
     createOrg: jest.fn((org: any) => {
       mockOrgs[org.orgId] = org;
       return Promise.resolve(org);

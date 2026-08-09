@@ -676,6 +676,11 @@ export interface User {
 }
 
 export interface Organization {
+  /**
+   * Optimistic-concurrency counter for owner-losing operations. Absent until
+   * the first one; see orgDb.claimOwnerChange.
+   */
+  ownerEpoch?: number;
   orgId: string;
   name: string;
   ownerUserId: string;
@@ -9029,6 +9034,45 @@ export const orgDb = {
     };
     const result = await dynamodb.get(params).promise();
     return (result.Item as Organization) || null;
+  },
+
+  /**
+   * Serialize owner-losing operations on one org.
+   *
+   * The "an org always keeps an owner" invariant spans MEMBER items, so no
+   * single conditional write can express it: two concurrent departures each
+   * read the roster, each see the other owner, and both proceed to zero.
+   *
+   * This makes the org item the serialization point. A caller reads
+   * `ownerEpoch` alongside the roster it validated, then claims the change
+   * conditionally. Whoever wins bumps the epoch; the loser's condition fails,
+   * so it must re-read and re-validate against the roster the winner left
+   * behind — where it will correctly find itself removing the last owner.
+   *
+   * No backfill: `attribute_not_exists` treats an org that has never had an
+   * owner change as epoch 0, so the attribute appears on first use.
+   *
+   * Returns false when another departure claimed the same epoch.
+   */
+  async claimOwnerChange(orgId: string, expectedEpoch: number): Promise<boolean> {
+    try {
+      await dynamodb
+        .update({
+          TableName: ORGS_TABLE,
+          Key: { orgId },
+          UpdateExpression: "SET ownerEpoch = :next",
+          ConditionExpression:
+            expectedEpoch === 0
+              ? "attribute_not_exists(ownerEpoch) OR ownerEpoch = :expected"
+              : "ownerEpoch = :expected",
+          ExpressionAttributeValues: { ":next": expectedEpoch + 1, ":expected": expectedEpoch },
+        })
+        .promise();
+      return true;
+    } catch (e: any) {
+      if (e?.code === "ConditionalCheckFailedException") return false;
+      throw e;
+    }
   },
 
   async updateOrg(orgId: string, updates: Partial<Organization>): Promise<Organization> {

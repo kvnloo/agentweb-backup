@@ -50,6 +50,9 @@ jest.mock("../services/db", () => ({
     clearOrgMembership: mockClearOrgMembership,
   },
   orgDb: {
+    // ENG-954: owner-loss serialization. Default-true = no contention,
+    // which is every test here except the explicit race case.
+    claimOwnerChange: jest.fn(() => Promise.resolve(true)),
     pruneEditorListsForUser: mockPruneEditorListsForUser,
     getOrgById: mockGetOrgById,
     getOrgMembers: mockGetOrgMembers,

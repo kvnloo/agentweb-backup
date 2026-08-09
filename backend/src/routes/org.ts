@@ -110,6 +110,30 @@ function canManageOrgAccounts(user: any, org: Organization): boolean {
  * `losingUserId` is the member about to stop being an owner. Returns true when
  * at least one OTHER owner would remain.
  */
+/**
+ * Validate the last-owner invariant AND claim the right to act on it.
+ *
+ * `anotherOwnerRemains` is a read. Between it and the write, another departure
+ * can pass the same read and both proceed, leaving the org with no owner —
+ * the invariant is over the member items, so no single conditional write can
+ * express it (Greptile, #2297).
+ *
+ * So the org item is the serialization point: read its epoch with the roster,
+ * then claim that epoch conditionally. The loser of a race gets `false` and
+ * refuses, rather than acting on a roster the winner has already invalidated.
+ *
+ * Callers that are NOT removing an owner skip this entirely — it only guards
+ * owner loss.
+ */
+async function claimOwnerLoss(org: Organization, losingUserId: string): Promise<boolean> {
+  if (!(await anotherOwnerRemains(org, losingUserId))) return false;
+  // Claim on the epoch from the org snapshot this decision was made against —
+  // not a fresher read. That is the point of optimistic concurrency: if
+  // anything moved since we loaded it, the condition fails and we refuse
+  // rather than acting on a roster that may already be stale.
+  return orgDb.claimOwnerChange(org.orgId, org.ownerEpoch ?? 0);
+}
+
 async function anotherOwnerRemains(org: Organization, losingUserId: string): Promise<boolean> {
   const members = await orgDb.getOrgMembers(org.orgId);
   return members.some(
@@ -782,7 +806,7 @@ router.patch("/:orgId/members/:memberId/role", async (req: Request, res: Respons
     // Demoting the last owner orphans the org. This is the path Better Auth
     // missed (better-auth#3651) — remove and leave were guarded, changeRole was
     // not.
-    if (currentRole === "owner" && !(await anotherOwnerRemains(org, memberId))) {
+    if (currentRole === "owner" && !(await claimOwnerLoss(org, memberId))) {
       return res.status(409).json({
         error: "Cannot demote the only owner. Promote another member to owner first.",
       });
@@ -829,7 +853,7 @@ router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) =
       if (roleOf({ userId, orgId, orgRole: caller?.orgRole }, org) !== "owner") {
         return res.status(403).json({ error: "Only an owner can remove an owner" });
       }
-      if (!(await anotherOwnerRemains(org, memberId))) {
+      if (!(await claimOwnerLoss(org, memberId))) {
         return res.status(409).json({
           error: "Cannot remove the only owner. Promote another member to owner first.",
         });
@@ -873,7 +897,7 @@ router.post("/:orgId/leave", async (req: Request, res: Response) => {
     // block on `ownerUserId === userId` and point at a transfer-ownership route
     // that was never built, which made the primary owner permanently unable to
     // leave their own org.
-    if (roleOf({ userId, orgId, orgRole: user.orgRole }, org) === "owner" && !(await anotherOwnerRemains(org, userId))) {
+    if (roleOf({ userId, orgId, orgRole: user.orgRole }, org) === "owner" && !(await claimOwnerLoss(org, userId))) {
       return res.status(409).json({
         error: "You are the only owner. Promote another member to owner before leaving.",
       });

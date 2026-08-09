@@ -112,6 +112,12 @@ router.post("/:userId/remove", async (req, res) => {
       return res.status(403).json({ message: "Org owners and admins only" });
     }
 
+    // can() above returns false for a null org, so reaching here proves it is
+    // set. Narrowed here, before any use, rather than beside the first one.
+    if (!callerOrg) {
+      return res.status(404).json({ message: "Organization not found" });
+    }
+
     if (req.body?.confirm !== true) {
       return res.status(400).json({ message: "confirm:true required" });
     }
@@ -143,6 +149,12 @@ router.post("/:userId/remove", async (req, res) => {
       if (!anotherOwner) {
         return res.status(409).json({ message: "Cannot remove the only owner. Promote another member to owner first." });
       }
+      // Claim the owner-loss slot on the org item. Without this, a concurrent
+      // departure that passed the same roster read proceeds too and the org
+      // ends with no owner (Greptile, #2297).
+      if (!(await orgDb.claimOwnerChange(caller.orgId, callerOrg.ownerEpoch ?? 0))) {
+        return res.status(409).json({ message: "Another owner change is in progress. Please retry." });
+      }
     }
 
     // Every refusal must precede the asset work below. This route honours
@@ -154,10 +166,6 @@ router.post("/:userId/remove", async (req, res) => {
     // Placing it here rather than beside the departure write is the point: the
     // departure write is the LAST thing this handler does, which is exactly
     // why the gate was ineffective when it lived next to it.
-    // can() above returns false for a null org, so reaching here proves it is set.
-    if (!callerOrg) {
-      return res.status(404).json({ message: "Organization not found" });
-    }
     const mayGo = await billingRootMayDepart(callerOrg, target.userId);
     if (!mayGo.ok) {
       return res.status(409).json({ message: mayGo.error, code: mayGo.code });
