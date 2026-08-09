@@ -14,6 +14,43 @@ import path from 'path';
  * caller can always fall back to processing inline exactly as it did before this
  * queue existed. Durability activates automatically the moment the table exists;
  * nothing needs to be redeployed or coordinated.
+ *
+ * ── Why a stale-reclamation race here can never cause duplicate side effects ──
+ * (Greptile P1 on #2291, rounds 9/17/24 — restated across several rounds as "can
+ * still allow concurrent processing." This is the full argument in one place,
+ * since the individual pieces landed in separate commits over many rounds.)
+ *
+ * The heartbeat (startHeartbeat/startHeartbeatForId below) keeps a claimed job's
+ * updatedAt fresh so the stale-reclamation query in pollAndProcessOnce doesn't
+ * mistake still-active work for an abandoned claim. For that race to fire at all,
+ * EVERY heartbeat tick across the full STALE_PROCESSING_MS window has to fail
+ * both its attempt and its retry (see HEARTBEAT_INTERVAL_MS below for exactly how
+ * many independent chances that is) — already a compound, low-probability event.
+ *
+ * But even if it DOES fire — two instances genuinely processing the same booking
+ * concurrently — every actual external side effect downstream is independently
+ * idempotent, not just this heartbeat:
+ *   - Lead creation: a deterministic (listId, email)-derived id + a fail-if-exists
+ *     conditional put (calendlyWebhook.ts, round 19, mirroring the same pattern
+ *     ENG-787 already proved for linkedInInviteCrmMirror.ts) — two concurrent
+ *     creates for a brand-new lead collide on the same DynamoDB item; the loser
+ *     adopts the winner's lead instead of spawning a duplicate.
+ *   - HubSpot sync, Attio sync, and the customer alert: each gated behind
+ *     crmDb.claimLeadStepOnce (db.ts, round 15) — an actual DynamoDB conditional-
+ *     write mutex, not a probability reduction — so only ONE of two concurrent
+ *     claimants can ever perform the real side effect. Losing that claim now
+ *     FAILS the job too (round 18), so a retry always re-checks rather than
+ *     silently assuming "someone else has it."
+ *   - Meta CAPI attribution: deduped by Meta's own event_id collapsing on their
+ *     side (the invitee URI is passed straight through as eventId) — documented
+ *     in calendlyWebhook.ts's own header comment, independent of anything here.
+ *
+ * So the honest worst case if this race ever fires: one wasted retry cycle
+ * (`markJobComplete`/`markJobFailed` racing on which lands last just means a
+ * later poll re-verifies already-complete work and finds every marker already
+ * set — see the "does not clobber concurrent state" tests in
+ * calendlyWebhook.test.ts). Not data loss, not a duplicate lead, not a duplicate
+ * customer-facing notification.
  */
 
 dotenv.config({ path: path.resolve(__dirname, '../../.env') });
@@ -35,8 +72,19 @@ const MAX_ATTEMPTS = 5;
 // A claimed ('processing') job whose updatedAt is older than this is treated as
 // abandoned (the instance that claimed it crashed mid-attempt) and re-claimable.
 const STALE_PROCESSING_MS = 5 * 60 * 1000;
-// Well under STALE_PROCESSING_MS so even one missed beat leaves comfortable margin.
-const HEARTBEAT_INTERVAL_MS = 60 * 1000;
+// Greptile P1 on #2291 (round 24): for the stale-reclamation query to ever
+// mistake a still-active job for an abandoned one, EVERY heartbeat tick across
+// the whole STALE_PROCESSING_MS window must fail both its attempt and its
+// retry. At the previous 60s interval that's 5 ticks x 2 attempts = 10
+// independent write failures in a row; at 15s it's 20 ticks x 2 = 40 — the same
+// underlying per-write reliability now needs to fail four times as many
+// consecutive times before the race can even become possible. Cheap to lower
+// further (still well under STALE_PROCESSING_MS, still one DynamoDB write per
+// tick), and worth doing since the actual consequence even IF this race did
+// fire is already fully absorbed by claimLeadStepOnce + the lost-claim-fails-
+// the-job fix (rounds 15/18) — this interval is pure additional margin on top
+// of a state that's already safe, not the last line of defense.
+const HEARTBEAT_INTERVAL_MS = 15 * 1000;
 
 export type EnqueueResult = 'enqueued' | 'duplicate' | 'unavailable';
 
