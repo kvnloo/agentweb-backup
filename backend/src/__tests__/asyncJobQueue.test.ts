@@ -409,6 +409,57 @@ describe('asyncJobQueue', () => {
 
       await expect(pollAndProcessOnce()).resolves.toBeUndefined();
     });
+
+    // Greptile P1 on #2291 (round 25): this failure-state write used to be a bare
+    // `.promise().catch(() => {})` with zero retry — every sibling write in this
+    // file (markJobComplete, markJobFailed, updateJobPayload) already retries once
+    // before giving up.
+    it('retries once and succeeds when the poller-claimed failure-state write transiently fails', async () => {
+      const handler = jest.fn().mockRejectedValue(new Error('boom'));
+      registerProcessor('test_source_retry_failure_write', handler);
+
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ id: 'test_source_retry_failure_write_abc', source: 'test_source_retry_failure_write', status: 'pending', payload: '{}', attempts: 0, updatedAt: '2026-01-01T00:00:00.000Z' }],
+          }),
+        })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) }) // claim conditional update
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('throttled')) }) // failure-state write attempt 1
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) }); // failure-state write retry succeeds
+
+      await expect(pollAndProcessOnce()).resolves.toBeUndefined();
+
+      const failCalls = mockDocumentClientMethods.update.mock.calls.filter(
+        (c: any) => c[0].ExpressionAttributeValues?.[':lastError'] === 'boom',
+      );
+      expect(failCalls).toHaveLength(2);
+      expect(failCalls[1][0].ExpressionAttributeValues[':attempts']).toBe(1);
+    });
+
+    it('does not throw, and leaves the job in "processing", when the poller-claimed failure-state write fails on both the attempt and the retry', async () => {
+      const handler = jest.fn().mockRejectedValue(new Error('boom'));
+      registerProcessor('test_source_lost_failure_write', handler);
+
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ id: 'test_source_lost_failure_write_abc', source: 'test_source_lost_failure_write', status: 'pending', payload: '{}', attempts: 0, updatedAt: '2026-01-01T00:00:00.000Z' }],
+          }),
+        })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) }) // claim conditional update
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('down')) }) // failure-state write attempt 1
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('still down')) }); // retry also fails
+
+      await expect(pollAndProcessOnce()).resolves.toBeUndefined();
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(3);
+    });
   });
 
   // Greptile P1 on #2291 (round 9): startHeartbeat existed but was only ever wired
