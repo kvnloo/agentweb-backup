@@ -38,6 +38,7 @@ const mockMcpFetch = mcpFetch as jest.MockedFunction<typeof mcpFetch>;
 
 // Import the registry (which gets populated by apiTools import)
 import { mcpToolRegistry } from '../mcp/server/registry';
+import type { SessionScoringStatus } from '../services/scoreBackfill';
 
 // Import apiTools to trigger tool registrations
 import '../mcp/server/apiTools';
@@ -1264,6 +1265,21 @@ describe('apiTools', () => {
       const tool = mcpToolRegistry.getTool('get_chat_history');
       expect(tool?.definition.description).toMatch(/scoringOutcome/);
       expect(tool?.definition.description).toMatch(/failed/i);
+    });
+
+    // The description is the only contract an external agent sees. If it documents
+    // a status literal the code never emits, an agent filtering on the documented
+    // spelling silently drops that cohort — which is the ENG-929 failure mode.
+    it('documents the scoringOutcome status literals exactly as the code emits them', () => {
+      const description = mcpToolRegistry.getTool('get_chat_history')!.definition.description!;
+      const emittedStatuses: SessionScoringStatus[] = [
+        'scored', 'skipped', 'failed', 'not-attempted',
+      ];
+      for (const status of emittedStatuses) {
+        expect(description).toContain(`status '${status}'`);
+      }
+      // camelCase is the scoringSummary *count* key, never a status value.
+      expect(description).not.toContain("status 'notAttempted'");
     });
   });
 
