@@ -189,10 +189,20 @@ export async function markJobFailed(source: string, dedupeKey: string, error: un
   const id = jobId(source, dedupeKey);
   const message = error instanceof Error ? error.message : String(error);
 
+  // Greptile P1 on #2291 (sixth pass): this used to hardcode the global MAX_ATTEMPTS
+  // instead of looking up the per-source override — processClaimedJob (the
+  // poller-claimed path) already did this lookup correctly, but markJobFailed (the
+  // inline/claimImmediately path, the common case for calendly_webhook — a fresh
+  // delivery is processed in the same request it's enqueued in) didn't. calendly_webhook
+  // is registered with maxAttempts: 15 specifically to outlast claimLeadStepOnce's
+  // 5-minute staleness window (an earlier round's fix) — that fix silently never took
+  // effect for inline-processed jobs, which terminally failed at the global 5-attempt
+  // default instead, exactly the premature-abandonment bug that fix was meant to close.
+  const maxAttempts = maxAttemptsBySource.get(source) ?? MAX_ATTEMPTS;
   const writeFailedState = async () => {
     const existing = await dynamodb.get({ TableName: TABLE_NAME, Key: { id } }).promise();
     const attempts = ((existing.Item as any)?.attempts ?? 0) + 1;
-    const nextStatus = attempts >= MAX_ATTEMPTS ? 'failed' : 'pending';
+    const nextStatus = attempts >= maxAttempts ? 'failed' : 'pending';
     await dynamodb
       .update({
         TableName: TABLE_NAME,
