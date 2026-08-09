@@ -156,6 +156,7 @@ Two things to know on EC2:
   To open them from your **laptop**, run the poller with `PREVIEW_IP=<instance-public-ip>`
   and open the three ports (`OPEN_PREVIEW_PORT=true` at provision, or
   `allow-ip.sh <your-ip> OPEN_PREVIEW_PORT=true`). Add `PREVIEW_IP=...` to `.linear-autofix/.env`.
+  **Never `0.0.0.0/0` on 3001/5173/5174** — see the posture rule below.
 - **Memory:** each kept bug holds ~1–1.5 GB (backend + 2 dev servers) and they accumulate
   across open bugs — watch `free -m` / `df -h`; t3.xlarge comfortably holds several. Set
   `config.keepPreviewUp: false` to go back to tear-down-after-verify, or bring individual
@@ -168,8 +169,28 @@ Three open ports (`5173` partner, `5174` customer, `3001` API) do it: the proxy 
 routes by bug-id host, and injects `VITE_API_URL` = the API URL — so the page **and** its
 API calls work. To be sure, make these true, in order:
 
-1. **Open the ports to your IP:** `provision.sh` with `OPEN_PREVIEW_PORT=true`, or later
-   `bash .linear-autofix/deploy/ec2/allow-ip.sh <your-ip> OPEN_PREVIEW_PORT=true`.
+1. **Reach the ports.** Two supported ways, in preference order:
+   - **SSM port forwarding — needs no inbound rule at all.** Preferred; survives IP changes,
+     is IAM-scoped, and is audited per person in CloudTrail:
+     ```bash
+     aws ssm start-session --region us-west-2 --target <instance-id> \
+       --document-name AWS-StartPortForwardingSession \
+       --parameters '{"portNumber":["5174"],"localPortNumber":["15174"]}'
+     # then browse http://<BUG-ID>.127.0.0.1.nip.io:15174/
+     ```
+     Requires the `session-manager-plugin` locally and `ssm:StartSession` on the instance.
+   - **Open the ports to your `/32`:** `provision.sh` with `OPEN_PREVIEW_PORT=true`, or later
+     `bash .linear-autofix/deploy/ec2/allow-ip.sh <your-ip> OPEN_PREVIEW_PORT=true`.
+
+   > **Posture rule — never open a preview port to `0.0.0.0/0`.** Neither script can do this;
+   > both only ever grant `<caller-ip>/32`. Every wide-open rule this SG has ever carried was
+   > added by hand with a raw `authorize-security-group-ingress`. Behind these ports is a
+   > **dev-credentialed backend** — `dev/AgentWeb/*` secrets and full CRUD on `Dev-AW-*`. The
+   > preview proxy's `?k=<token>` gate is a speed bump, not the control: it is one shared static
+   > token passed in a **query string**, so it lands in proxy logs, browser history and
+   > `Referer` headers. If your IP rotates, that is what SSM is for — do not trade the
+   > network boundary for convenience. (ENG-920: 3001/5173/5174 sat open to the internet from
+   > 2026-07-01 to 2026-08-09.)
 2. **Set `PREVIEW_IP` BEFORE the preview boots.** It's baked into `VITE_API_URL`,
    `CUSTOMER_FRONTEND_URL`, and `routes.json` at `preview up` time — a preview born on
    loopback can't be made public without a down+up. Put it where the poller sees it:
@@ -233,6 +254,13 @@ instance profile with `AmazonSSMManagedInstanceCore` (the SSM agent ships on AL2
 anyone with IAM access runs `aws ssm start-session --target <instance-id>` — no inbound SG
 rule and no SSH key to manage, all access is IAM-scoped and audited. Recommended if more
 than one person needs in regularly; then you can keep the SG SSH rule tight or drop it.
+
+> **This is already live on `i-0cb38aac2332941dc`** (agent `3.3.4624.0`, `PingStatus: Online`;
+> profile `autofix-runner-least-priv-profile`). Verified 2026-08-09: a shell session **and**
+> a port-forward to `3001` both worked with **zero** inbound preview rules on the SG. So the
+> "I need `0.0.0.0/0` because my IP rotates" tradeoff no longer exists here — use §7b's
+> port-forward snippet. Callers need `session-manager-plugin` locally
+> (`brew install --cask session-manager-plugin`) plus `ssm:StartSession` on the instance.
 
 ## 10. Teardown
 
