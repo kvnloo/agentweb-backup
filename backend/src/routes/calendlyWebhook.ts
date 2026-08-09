@@ -491,10 +491,25 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
         }
 
         if (!markerWritten) {
+          // Greptile P1 on #2291 (fourth pass): a single attempt at the fallback marker
+          // was strictly weaker than the 'done' write it falls back from — give it the
+          // SAME backoff-retry treatment instead of one shot, meaningfully shrinking the
+          // "genuinely everything fails" tail this whole section exists to guard against.
           leadSystemMarkers[key] = { status: 'done_unconfirmed' };
-          try {
-            await writeMarker('done_unconfirmed');
-          } catch (finalErr: any) {
+          let fallbackWritten = false;
+          let lastFallbackErr: any;
+          for (let attempt = 0; attempt < backoffMs.length; attempt++) {
+            if (backoffMs[attempt] > 0) await delay(backoffMs[attempt]);
+            try {
+              await writeMarker('done_unconfirmed');
+              fallbackWritten = true;
+              break;
+            } catch (err: any) {
+              lastFallbackErr = err;
+            }
+          }
+
+          if (!fallbackWritten) {
             // Greptile P1 on #2291 (third pass): silently resolving here — even though
             // work() genuinely succeeded — let this job go 'completed' (if every other
             // step also succeeded) with a claim still stuck 'in_progress' and no marker
@@ -506,10 +521,13 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
             // through the existing retry/terminal-failure machinery (markJobFailed,
             // asyncJobQueue.ts's TERMINAL FAILURE log) instead of disappearing silently —
             // real visibility for a human to intervene before the 5-minute staleness
-            // window can ever let this step run twice.
+            // window can ever let this step run twice. This is the genuine, irreducible
+            // floor: 6 total write attempts (3 'done' + 3 'done_unconfirmed') across two
+            // distinct status values to the same record all failing means the whole
+            // persistence layer is down for this record, not something more retries fix.
             console.error(
               `[Calendly Webhook] ${step} succeeded for ${payload.uri} but EVERY attempt to durably record it failed — the claim remains 'in_progress' and could eventually be reclaimed once stale, repeating this step. Needs immediate manual correction:`,
-              finalErr?.message ?? finalErr,
+              lastFallbackErr?.message ?? lastFallbackErr,
             );
             throw new Error(`${step} step for ${payload.uri} succeeded but could not be durably recorded after exhausting every write attempt`);
           }

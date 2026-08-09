@@ -86,6 +86,13 @@ const STALE_PROCESSING_MS = 5 * 60 * 1000;
 // of a state that's already safe, not the last line of defense.
 const HEARTBEAT_INTERVAL_MS = 15 * 1000;
 
+/** Small delay helper — only used by updateJobPayload's backoff below (matching
+ *  calendlyWebhookCleanupQueue.ts's recordOrphanedCalendlyWebhook), injectable so
+ *  tests never actually sleep. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export type EnqueueResult = 'enqueued' | 'duplicate' | 'unavailable';
 
 interface AsyncJobRecord {
@@ -243,6 +250,16 @@ export async function markJobFailed(source: string, dedupeKey: string, error: un
 // becomes permanently invalid) had no way to know whether it needs a DIFFERENT
 // fallback when this best-effort write fails. Still never throws — callers that don't
 // care about the outcome can keep ignoring the return value exactly as before.
+//
+// Greptile P1 on #2291 (fourth pass): a single retry (2 total attempts) was weaker
+// than the caller's OTHER durable write for the same rotated-token scenario
+// (recordOrphanedCalendlyWebhook already had a 3-attempt backoff, round 23) — bumped
+// to match, since a payload that fails to persist here means every future retry of
+// the job that owns it reloads a stale, invalidated Calendly refresh token and can
+// never succeed. This is the ONLY store connectedAccounts.ts's rotation-persistence
+// still relies on for jobs claimed via the poller (not claimImmediately), so it's
+// worth the same latency-tolerant backoff as the orphan-table fallback (this path is
+// never latency-sensitive — it runs from the poller's background retry, not inline).
 export async function updateJobPayload(source: string, dedupeKey: string, payload: unknown): Promise<boolean> {
   const id = jobId(source, dedupeKey);
   const writePayload = () =>
@@ -255,18 +272,19 @@ export async function updateJobPayload(source: string, dedupeKey: string, payloa
       })
       .promise();
 
-  try {
-    await writePayload();
-    return true;
-  } catch (firstError: any) {
+  const backoffMs = [0, 200, 600];
+  for (let attempt = 0; attempt < backoffMs.length; attempt++) {
+    if (backoffMs[attempt] > 0) await delay(backoffMs[attempt]);
     try {
       await writePayload();
       return true;
-    } catch (secondError: any) {
-      console.error(`[AsyncJobQueue] updateJobPayload failed for ${id} after retry — future retries will use the stale payload:`, secondError?.message ?? secondError);
-      return false;
+    } catch (err: any) {
+      if (attempt === backoffMs.length - 1) {
+        console.error(`[AsyncJobQueue] updateJobPayload failed for ${id} after ${backoffMs.length} attempts — future retries will use the stale payload:`, err?.message ?? err);
+      }
     }
   }
+  return false;
 }
 
 /**
@@ -303,7 +321,20 @@ function startHeartbeatForId(id: string): () => void {
     // One immediate retry on failure, same reasoning as markJobComplete/markJobFailed
     // — a transient write blip is exactly what a retry resolves, and each tick that
     // actually lands is one the next tick doesn't need to compensate for.
-    beat().catch(() => beat().catch(() => {}));
+    //
+    // Greptile P1 on #2291 (fourth pass): a double-failure here used to be swallowed
+    // silently — every OTHER write in this file (markJobComplete, markJobFailed,
+    // updateJobPayload, the failure-state write) logs loudly on double-failure; this
+    // one didn't, purely an inconsistency. This doesn't change the underlying
+    // accepted-and-bounded race (see the module doc-comment above — claimLeadStepOnce
+    // is the actual mutex preventing a duplicate side effect even if this job gets
+    // concurrently reclaimed), but sustained heartbeat failures are exactly the
+    // precondition for that race, so they deserve to be visible rather than silent.
+    beat().catch(() =>
+      beat().catch((err: any) => {
+        console.warn(`[AsyncJobQueue] Heartbeat failed twice in a row for job ${id} — if this persists past the staleness window, the poller may reclaim and concurrently reprocess this job:`, err?.message ?? err);
+      }),
+    );
   }, HEARTBEAT_INTERVAL_MS);
   return () => clearInterval(interval);
 }
