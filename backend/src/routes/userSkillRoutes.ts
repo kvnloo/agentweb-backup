@@ -1,6 +1,7 @@
 import express from "express";
 import { skillService, Skill } from "../services/skillService";
 import { userDb, orgDb } from "../services/db";
+import { can } from "../services/orgAuthz";
 import {
   canEditItem,
   isFeatureEffectivelyEnabled,
@@ -150,9 +151,12 @@ router.delete("/:skillId", async (req, res) => {
     if (skill.ownerId !== userId) {
       const callerUser = await userDb.getUserById(userId);
       let allowed = false;
-      if (callerUser?.orgRole === "owner" && callerUser?.orgId && skill.ownerId) {
-        const owner = await userDb.getUserById(skill.ownerId);
-        if (owner?.orgId === callerUser.orgId) allowed = true;
+      if (callerUser?.orgId && skill.ownerId) {
+        const callerOrg = await orgDb.getOrgById(callerUser.orgId);
+        if (can({ userId, orgId: callerUser.orgId, orgRole: callerUser.orgRole }, callerOrg, "org:content:manage")) {
+          const owner = await userDb.getUserById(skill.ownerId);
+          if (owner?.orgId === callerUser.orgId) allowed = true;
+        }
       }
       if (!allowed) return res.status(403).json({ message: "Not authorized" });
     }
