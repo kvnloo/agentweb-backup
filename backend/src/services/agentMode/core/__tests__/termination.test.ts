@@ -151,6 +151,32 @@ describe('decideTermination — ENG-946: the terminating turn owns the empty-syn
     expect(d.counterDelta.emptySynthesisRetries).toBe(1);
   });
 
+  it('nudges when THIS turn produced only whitespace', () => {
+    const d = decideTermination({
+      ...base,
+      content: 'stale narration',
+      currentTurnText: '   \n\t ',
+      toolCallsSoFar: 9,
+      emptySynthesisRetries: 0,
+      maxEmptySynthesisRetries: 1,
+    });
+    expect(d.shouldContinue).toBe(true);
+    expect(d.reason).toBe('empty_synthesis_retry');
+    expect(d.counterDelta.emptySynthesisRetries).toBe(1);
+  });
+
+  it('nudges when the accumulated content fallback is whitespace-only', () => {
+    const d = decideTermination({
+      ...base,
+      content: '  \n ',
+      toolCallsSoFar: 9,
+      emptySynthesisRetries: 0,
+      maxEmptySynthesisRetries: 1,
+    });
+    expect(d.shouldContinue).toBe(true);
+    expect(d.reason).toBe('empty_synthesis_retry');
+  });
+
   it('does NOT nudge when THIS turn produced real text (accumulated content irrelevant)', () => {
     const d = decideTermination({
       ...base,
