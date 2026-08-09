@@ -988,12 +988,42 @@ export async function scoreSessionWithJudgeIfNeeded(
   return judgeScore;
 }
 
-export async function scoreSessionIfNeeded(
+/**
+ * Why a session was deliberately NOT scored. Every one of these is a legitimate
+ * skip — the session is outside the cohort, already covered, or not finished yet.
+ * A scoring FAILURE is not in this union: it throws, so a caller can tell
+ * "correctly skipped" apart from "we tried and could not" (ENG-929). Before this,
+ * both surfaced identically as `satisfactionScore: null`, which is how four
+ * completed, expensive sessions dropped out of the daily report unnoticed.
+ */
+export type ScoringSkipReason =
+  | "admin-override"
+  | "no-user-message"
+  | "no-task-session"
+  | "already-scored"
+  | "test-run"
+  | "in-flight";
+
+export interface SessionScoringAttempt {
+  /** The newly-written score, or null when the session was skipped. */
+  score: ChatSession["satisfactionScore"] | null;
+  /** Present exactly when `score` is null. */
+  skipReason?: ScoringSkipReason;
+}
+
+const skip = (skipReason: ScoringSkipReason): SessionScoringAttempt => ({ score: null, skipReason });
+
+/**
+ * Score a session if it needs it, reporting WHY when it does not.
+ * `scoreSessionIfNeeded` is the score-only view of this for callers that do not
+ * care about the reason.
+ */
+export async function attemptSessionScore(
   session: ChatSession
-): Promise<ChatSession["satisfactionScore"] | null> {
+): Promise<SessionScoringAttempt> {
   // Skip if admin has overridden the score
   if (session.satisfactionScore?.adminOverride) {
-    return null;
+    return skip("admin-override");
   }
 
   const messageCount = session.messageCount ?? session.messages?.length ?? 0;
@@ -1003,7 +1033,7 @@ export async function scoreSessionIfNeeded(
     (m: any) => m.role === "user"
   );
   if (userMessages.length < MIN_USER_MESSAGES) {
-    return null;
+    return skip("no-user-message");
   }
 
   // No-task session (greeting-only, interruption, bare acknowledgement): no goal
@@ -1021,7 +1051,7 @@ export async function scoreSessionIfNeeded(
   // overwrite it).
   if (isNoTaskSession(session.messages, session.pageIdentifier) && hasAssistantTurn(session.messages)) {
     await retractSatisfactionScore(session);
-    return null;
+    return skip("no-task-session");
   }
 
   // Skip if already scored, up-to-date, and has dimensional scores
@@ -1030,7 +1060,7 @@ export async function scoreSessionIfNeeded(
     session.satisfactionScore.evaluatedMessageIndex >= messageCount &&
     session.satisfactionScore.dimensions
   ) {
-    return null;
+    return skip("already-scored");
   }
 
   // Manual "Test this schedule" runs are interactive QA actions, not production
@@ -1039,7 +1069,7 @@ export async function scoreSessionIfNeeded(
   // must not be scored/surfaced as a satisfaction reliability failure (ENG-499),
   // so drop it from the cohort like greeting-only sessions.
   if (isTestScheduledSession(session)) {
-    return null;
+    return skip("test-run");
   }
 
   // Abandoned run recovered by the reconciler/backstop (ENG-764): the transcript ends
@@ -1053,13 +1083,13 @@ export async function scoreSessionIfNeeded(
   let result: ScoringResult;
   if (endsWithRunFailurePlaceholder(session.messages)) {
     if (classifyTurnlessSession(session) === "in-flight") {
-      return null;
+      return skip("in-flight");
     }
     result = buildFailedRunResult(messageCount);
   } else if (!hasAssistantTurn(session.messages)) {
     // No assistant turn yet: skip if still in-flight, flag as failed if stale.
     if (classifyTurnlessSession(session) === "in-flight") {
-      return null;
+      return skip("in-flight");
     }
     // Convert the silent dead session into a visible failed run (user-facing
     // retry note + diagnostic error) before recording the deterministic score.
@@ -1069,7 +1099,7 @@ export async function scoreSessionIfNeeded(
     // Partial tool-loop persisted (tool result or pure tool-call turn is last).
     // Defer if still within the grace window; score the partial transcript if stale.
     if (classifyTurnlessSession(session) === "in-flight") {
-      return null;
+      return skip("in-flight");
     }
     result = await scoreSession(session.messages || [], messageCount, session.pageIdentifier, session.sessionType, {
       userId: session.userId,
@@ -1088,7 +1118,7 @@ export async function scoreSessionIfNeeded(
   // reaches here (see NO_TASK_JUDGMENT_CLAUSE).
   if (result.taskRequested === false) {
     await retractSatisfactionScore(session);
-    return null;
+    return skip("no-task-session");
   }
 
   const satisfactionScore: ChatSession["satisfactionScore"] = {
@@ -1106,5 +1136,15 @@ export async function scoreSessionIfNeeded(
     satisfactionScore
   );
 
-  return satisfactionScore;
+  return { score: satisfactionScore };
+}
+
+/**
+ * Score-only view of {@link attemptSessionScore} for callers that do not need
+ * the skip reason.
+ */
+export async function scoreSessionIfNeeded(
+  session: ChatSession
+): Promise<ChatSession["satisfactionScore"] | null> {
+  return (await attemptSessionScore(session)).score;
 }

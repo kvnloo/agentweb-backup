@@ -3152,6 +3152,13 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     // Sync mode: batch-score sessions that need it (default + all judges)
+    let scoringSummary: {
+      scored: number;
+      skipped: number;
+      failed: number;
+      notAttempted: number;
+      timedOut: boolean;
+    } | undefined;
     if (syncMode) {
       // Load all configured judges
       let judges: ScoringJudge[] = [];
@@ -3179,6 +3186,31 @@ router.get("/chat-sessions", async (req, res) => {
           `[chat-history] sync scoring hit its time budget: scored ${backfill.scored}/${backfill.scored + backfill.skipped}, ${backfill.skipped} left for a later run`
         );
       }
+
+      // ENG-929: attach each session's scoring verdict. sync=true promises to
+      // score whatever is unscored, but a scorer that failed and a session that
+      // is legitimately unscorable both used to come back as
+      // `satisfactionScore: null` — so the Daily Satisfaction Score Report
+      // silently under-sampled (four completed, expensive sessions, including
+      // the most expensive in the window, were simply missing). Reporting the
+      // outcome per session makes "we could not score this" visible.
+      const byId = new Map(sessionsWithMessages.map((s: any) => [s.sessionId, s]));
+      for (const outcome of backfill.outcomes) {
+        const session = byId.get(outcome.sessionId) as any;
+        if (!session) continue;
+        session.scoringOutcome = {
+          status: outcome.status,
+          ...(outcome.reason ? { reason: outcome.reason } : {}),
+          ...(outcome.judgeErrors ? { judgeErrors: outcome.judgeErrors } : {}),
+        };
+      }
+      scoringSummary = {
+        scored: backfill.outcomes.filter((o) => o.status === "scored").length,
+        skipped: backfill.outcomes.filter((o) => o.status === "skipped").length,
+        failed: backfill.outcomes.filter((o) => o.status === "failed").length,
+        notAttempted: backfill.outcomes.filter((o) => o.status === "not-attempted").length,
+        timedOut: backfill.timedOut,
+      };
     }
 
     const nextCursor = nextKey
@@ -3192,7 +3224,11 @@ router.get("/chat-sessions", async (req, res) => {
     );
 
     await ensureIshareLinkForReview(nonEmptySessions);
-    res.json({ sessions: nonEmptySessions, nextCursor });
+    res.json({
+      sessions: nonEmptySessions,
+      nextCursor,
+      ...(scoringSummary ? { scoringSummary } : {}),
+    });
   } catch (error) {
     console.error("Error fetching chat sessions:", error);
     res.status(500).json({ message: "Failed to fetch chat sessions" });

@@ -2585,6 +2585,13 @@ mcpToolRegistry.register({
     name: 'get_chat_history',
     description: `Get chat history by time range with satisfaction scores. Returns sessions with their metadata including satisfaction scores. Useful for generating support summaries and analyzing customer satisfaction. Admin-only. When sync=true, generates satisfaction scores for sessions that don't have them (slower but ensures all scores are present).
 
+SCORING COVERAGE — a null satisfactionScore is NOT self-explanatory. Under sync=true every session carries scoringOutcome {status, reason}, and the response carries scoringSummary {scored, skipped, failed, notAttempted, timedOut}:
+- status 'scored' — a score was generated on this call.
+- status 'skipped' — deliberately not scored; reason says which rule (in-flight, already-scored, no-task-session, test-run, no-user-message, admin-override). 'in-flight' means the run had not finished at read time, so it is legitimately unscorable — NOT a failure.
+- status 'failed' — scoring was attempted and errored (reason carries the error). The session IS in the cohort and is missing a score it should have. Report these; do not present the window as fully scored.
+- status 'notAttempted' — the sync pass ran out of its wall-clock budget before this session. Same effect as 'failed' for coverage: the session is unscored and nothing re-attempts it later.
+Any non-zero failed/notAttempted count means the satisfaction figures under-sample the window. Say so explicitly, with the counts, rather than reporting an average as if coverage were complete. scoringOutcome and scoringSummary are null when sync was not requested.
+
 MODEL ATTRIBUTION — use attributedModels. Do not derive it yourself.
 - attributedModels: the model(s) to name for this session. Already resolved for you. Null only when nothing is recorded at all.
 - attributionBasis: 'transcript' when EVERY assistant turn recorded a model (trustworthy provenance); 'partial-transcript' when only some did — the model list is real but incomplete, so do not present it as the session's full attribution; 'selection-only' when no turn recorded a model and this fell back to the picker (state that it is unverified whenever you report it).
@@ -2765,6 +2772,9 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
         totalCost: session.totalCost != null ? Math.round(Number(session.totalCost) * 1e6) / 1e6 : null,
         satisfactionScore: session.satisfactionScore || null,
         judgeScores: session.judgeScores || null,
+        // ENG-929: under sync=true, why this session does or does not have a
+        // score. Null when sync was not requested (nothing was attempted).
+        scoringOutcome: session.scoringOutcome || null,
         feedback: (likes > 0 || dislikes > 0) ? { likes, dislikes } : null,
         longestWaitMs: longestWaitMs > 0 ? longestWaitMs : null,
         maxHeapMB: maxHeapMB > 0 ? Math.round(maxHeapMB) : null,
@@ -2778,6 +2788,8 @@ Whenever you name a model — reports, cost/usage breakdowns, per-model grouping
       count: formattedSessions.length,
       timeRange: { startTime: args.start_time, endTime: args.end_time },
       syncMode: args.sync || false,
+      // ENG-929: coverage of THIS sync pass. Null when sync was not requested.
+      scoringSummary: (data as any)?.scoringSummary || null,
     });
   }
 });
