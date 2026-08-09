@@ -21,7 +21,7 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
-import { MAX_PUBLISH_PRESS_ATTEMPTS, shouldStopPressingForPublish } from '../utils/publishPressCircuitBreaker';
+import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, shouldStopPressingForPublish } from '../utils/publishPressCircuitBreaker';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -1686,6 +1686,13 @@ export async function runVerifiedChat(
   console.log('AgentMode runVerifiedChat: Received attachments:', attachmentsArray.length, attachmentsArray);
 
   let attempt = 0;
+  // ENG-947: attempts spent specifically on the publish requirement — the first
+  // attempt that ended with a publish tool as the ONLY outstanding requirement,
+  // plus every press sent afterwards. Deliberately separate from `attempt`, which
+  // work-plan reminders, zero-output/transient-LLM retries and AskUserQuestion
+  // auto-take continuations also consume: counting those would trip the breaker
+  // on a run that was never actually asked to publish.
+  let publishPressAttempts = 0;
   let allContent = '';
   const allToolCalls: any[] = [];
   const sessionForModel = await chatbotDb.getChatSession(sessionId);
@@ -2252,16 +2259,35 @@ export async function runVerifiedChat(
       // it would have spent to fail anyway. Scoped to scheduled runs
       // (completionGate) and only when the run is otherwise done: a pending work
       // plan or an unmet keyword still has genuinely useful work left to press for.
-      if (
+      //
+      // The budget is counted in PRESSES, not raw attempts. `attempt` is shared
+      // with the work-plan reminder, the zero-output and transient-LLM retries and
+      // the AskUserQuestion auto-take continuation — none of which name the publish
+      // tool. A run whose model opens with a work plan would otherwise burn its
+      // whole budget on "Please perform the work on pending steps." and be cut off
+      // having never been asked to publish once. So increment only on the attempts
+      // that actually reached the publish-only-unmet state, which is exactly the
+      // state whose next retry message carries the publish ask.
+      const publishIsTheOnlyThingLeft =
         completionGate &&
         !allFunctionCallsMet &&
         allKeywordsMet &&
         (!workPlan || workPlanCompleted) &&
-        shouldStopPressingForPublish({ attempt, unmetRequiredFunctions: functionCallMisses })
+        isPublishOnlyUnmet(functionCallMisses);
+      if (publishIsTheOnlyThingLeft) {
+        publishPressAttempts++;
+      }
+      if (
+        publishIsTheOnlyThingLeft &&
+        shouldStopPressingForPublish({
+          pressAttempt: publishPressAttempts,
+          unmetRequiredFunctions: functionCallMisses,
+        })
       ) {
         console.warn(
           `AgentMode runVerifiedChat: session ${sessionId} spent its publish-press budget ` +
-          `(${attempt}/${MAX_PUBLISH_PRESS_ATTEMPTS} attempts) with [${functionCallMisses.join(', ')}] still ` +
+          `(${publishPressAttempts}/${MAX_PUBLISH_PRESS_ATTEMPTS} press attempts, ${attempt} attempts overall) ` +
+          `with [${functionCallMisses.join(', ')}] still ` +
           `uncalled. Ending the run instead of re-pressing to ${maxAttempts} attempts — the content is held ` +
           `for approval, and repeating an identical press for an irreversible publish only burns prompt-cache ` +
           `writes (ENG-947).`

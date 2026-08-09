@@ -35,12 +35,20 @@ import { isPublishName } from './hardeningGaps';
  * stays unmet: the initial turn plus two presses. Sized off production — every
  * healthy run of the reported schedules published on attempt 1 or 2, so this
  * keeps the entire working range and cuts only the dead tail.
+ *
+ * These are PRESS attempts, not raw loop attempts. The run-wide `attempt`
+ * counter in runVerifiedChat is also spent on work-plan reminders, zero-output
+ * and transient-LLM retries, and AskUserQuestion auto-take continuations — none
+ * of which ever ask for the publish. Counting those would let a run whose model
+ * opens with a work plan trip the breaker having never been asked to publish at
+ * all, so the caller must count only the attempts that actually pressed.
  */
 export const MAX_PUBLISH_PRESS_ATTEMPTS = 3;
 
 /**
- * True when a scheduled run has spent its press budget and the ONLY thing still
- * missing is one or more publish tools.
+ * True when the ONLY thing a run still has outstanding is one or more publish
+ * tools — i.e. the state in which the next unmet-requirement retry would press
+ * for an irreversible publish and nothing else.
  *
  * Scoped deliberately tight:
  * - every unmet entry must be a publish tool. If anything cheap/reversible is
@@ -48,18 +56,28 @@ export const MAX_PUBLISH_PRESS_ATTEMPTS = 3;
  * - a non-string entry disqualifies the whole set rather than being skipped, so
  *   a malformed requirement can never be silently read as "publish only".
  */
+export function isPublishOnlyUnmet(unmetRequiredFunctions: string[]): boolean {
+  if (!Array.isArray(unmetRequiredFunctions) || unmetRequiredFunctions.length === 0) return false;
+  return unmetRequiredFunctions.every((name) => typeof name === 'string' && isPublishName(name));
+}
+
+/**
+ * True when a scheduled run has spent its press budget and the ONLY thing still
+ * missing is one or more publish tools.
+ *
+ * `pressAttempt` must be the caller's DEDICATED press counter — the number of
+ * attempts that ended in the publish-only-unmet state (the initial turn that
+ * reached it, plus each press sent afterwards) — never the run-wide attempt
+ * counter, which other retry paths also consume.
+ */
 export function shouldStopPressingForPublish(params: {
-  attempt: number;
+  pressAttempt: number;
   unmetRequiredFunctions: string[];
   /** Override for the press budget; defaults to MAX_PUBLISH_PRESS_ATTEMPTS. */
   maxPressAttempts?: number;
 }): boolean {
-  const { attempt, unmetRequiredFunctions } = params;
+  const { pressAttempt, unmetRequiredFunctions } = params;
   const budget = params.maxPressAttempts ?? MAX_PUBLISH_PRESS_ATTEMPTS;
-  if (!Array.isArray(unmetRequiredFunctions) || unmetRequiredFunctions.length === 0) return false;
-  const everyUnmetIsAPublish = unmetRequiredFunctions.every(
-    (name) => typeof name === 'string' && isPublishName(name)
-  );
-  if (!everyUnmetIsAPublish) return false;
-  return attempt >= budget;
+  if (!isPublishOnlyUnmet(unmetRequiredFunctions)) return false;
+  return pressAttempt >= budget;
 }
