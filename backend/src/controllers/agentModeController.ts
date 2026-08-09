@@ -1009,6 +1009,11 @@ const SCHEDULE_SKIP_AUTHORIZATION_PATTERNS: RegExp[] = [
   /\bnot\s+a\s+(?:publishing|posting)\s+day\b/i,
   /\bif\b[^.]*\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post))/i,
   /\b(?:skip|publish\s+nothing|post\s+nothing|no\s+post)\b[^.]*\b(?:mon|tue|wed|thu|fri|sat|sun|weekend|weekday)/i,
+  // A negative cadence stated directly — "DO NOT create or publish anything on
+  // Tue/Thu", "doesn't publish on weekends" (contractions are expanded first). The
+  // object between the negation and the verb is why the `if …` pattern above missed
+  // these (ENG-844 audit).
+  /\b(?:do|does|will|should)\s+not\b[^.]{0,40}?\b(?:publish|post|create|generate)\b/i,
 ];
 
 function instructionAuthorizesConditionalSkip(instruction: string): boolean {
@@ -1108,16 +1113,33 @@ function parseScheduleCadence(instruction: string): { publishDays: Set<number>; 
   const skipDays = new Set<number>();
   if (!instruction || typeof instruction !== 'string') return { publishDays, skipDays };
   const text = expandContractions(instruction.replace(/<[^>]+>/g, ' '));
-  const skipKeyword = /\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post)|non-?publishing|not\s+a\s+(?:publishing|posting)\s+day)\b/i;
-  const publishOnlyKeyword = /\b(?:publish|post|publishing)\s+only\b|\bonly\s+(?:publish|post|on)\b/i;
+  // "do not publish" must tolerate an intervening object — real instructions say
+  // "DO NOT create or publish anything" (ENG-844 audit). Contractions are already
+  // expanded above, so only the "do not" form needs matching here.
+  const skipKeyword =
+    /\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|non-?publishing|not\s+a\s+(?:publishing|posting)\s+day)\b|\b(?:do|does|will|should)\s+not\b[^.;\n]{0,40}?\b(?:publish|post|create|generate)\b/i;
+  // NB the inflections: `only\s+(?:publish|post)\b` does NOT match "only publishes",
+  // which is the single most common way owners write a cadence. That omission left
+  // publishDays EMPTY for the LUCAS schedule; it only ever corroborated because its
+  // skip clause happened to quote the words "non-publishing day". Any owner who
+  // wrote just "only publishes on Mon/Wed/Fri" got no cadence at all and every skip
+  // failed closed into the retry press (ENG-844 audit).
+  const publishOnlyKeyword =
+    /\b(?:publish|post|publishing)(?:es|s)?\s+only\b|\bonly\s+(?:publish|post)(?:es|ing|s)?\b|\bonly\s+on\b/i;
   for (const clause of text.split(/[.;\n]+/)) {
     const days = weekdaysInFragment(clause);
     if (days.length === 0) continue;
     const isSkip = skipKeyword.test(clause);
     const isPublishOnly = publishOnlyKeyword.test(clause);
     // A "publish only on <days>" clause names the PUBLISH days; a skip clause names
-    // the SKIP days. Publish-only wins a tie (its days are the positive cadence).
-    if (isPublishOnly) days.forEach((d) => publishDays.add(d));
+    // the SKIP days. A clause naming the verb ("publish only" / "only publishes") is
+    // an unambiguous positive cadence and wins. A bare "only on <days>" is a WEAK
+    // signal — "skip only on Saturday" also contains it — so when the clause also
+    // reads as a skip, the skip interpretation wins (otherwise Saturday would be
+    // recorded as a PUBLISH day and every legitimate Saturday skip rejected).
+    const strongPublishOnly =
+      /\b(?:publish|post|publishing)(?:es|s)?\s+only\b|\bonly\s+(?:publish|post)(?:es|ing|s)?\b/i.test(clause);
+    if (strongPublishOnly || (isPublishOnly && !isSkip)) days.forEach((d) => publishDays.add(d));
     else if (isSkip) days.forEach((d) => skipDays.add(d));
   }
   return { publishDays, skipDays };
