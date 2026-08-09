@@ -212,6 +212,37 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
     expect((result as any).publishHeldForApproval).toBeUndefined();
   });
 
+  it('still gives a WORK-PLAN run its two dedicated presses — plan reminders must not spend the publish budget', async () => {
+    // The model opens by creating a work plan, so the first retry is the generic
+    // "Please perform the work on pending steps." reminder, which never names the
+    // publish tool. Counting that against the publish budget would cut the run off
+    // having never asked it to publish at all.
+    let workerCalls = 0;
+    mockChatbotDb.getChatSession.mockImplementation(async () => ({
+      ...session,
+      // Completed from the moment the second turn lands; before that the run is
+      // still working the plan.
+      workPlan: { steps: [{ status: workerCalls >= 2 ? 'completed' : 'pending' }] },
+    }) as any);
+    mockWorker.runInWorker.mockImplementation(() => {
+      workerCalls++;
+      return Promise.resolve(workerReply([{ name: 'update_knowledge_base_file', arguments: {} }])) as any;
+    });
+
+    const result = await runScheduledChat(publishSchedule, 'kevin', true);
+
+    // One turn spent on the plan, then the publish-only state is reached and the
+    // budget (initial + two presses) is spent from there: 1 + 3 turns.
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(MAX_PUBLISH_PRESS_ATTEMPTS + 1);
+    const pressMessages = mockWorker.runInWorker.mock.calls.map((call: any[]) => call[0].messageContent);
+    expect(pressMessages[1]).toContain('pending steps');
+    expect(pressMessages[1]).not.toContain('post_on_connected_account');
+    // Two presses that actually ask for the publish, exactly as documented.
+    expect(pressMessages.filter((m: string) => m.includes('post_on_connected_account'))).toHaveLength(2);
+    expect((result as any).publishHeldForApproval).toBe(true);
+    expect(result.status).toBe('failure');
+  });
+
   it('leaves a MIXED requirement set on the full retry budget', async () => {
     const mixedSchedule = {
       ...publishSchedule,

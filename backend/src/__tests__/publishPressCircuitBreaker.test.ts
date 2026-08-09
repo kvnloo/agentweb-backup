@@ -1,24 +1,25 @@
 import {
   MAX_PUBLISH_PRESS_ATTEMPTS,
+  isPublishOnlyUnmet,
   shouldStopPressingForPublish,
 } from '../utils/publishPressCircuitBreaker';
 
 describe('shouldStopPressingForPublish (ENG-947)', () => {
   const press = (over: Partial<Parameters<typeof shouldStopPressingForPublish>[0]> = {}) =>
     shouldStopPressingForPublish({
-      attempt: MAX_PUBLISH_PRESS_ATTEMPTS,
+      pressAttempt: MAX_PUBLISH_PRESS_ATTEMPTS,
       unmetRequiredFunctions: ['post_on_connected_account'],
       ...over,
     });
 
   it('trips once the press budget is spent and the only unmet requirement is a publish tool', () => {
     expect(press()).toBe(true);
-    expect(press({ attempt: MAX_PUBLISH_PRESS_ATTEMPTS + 5 })).toBe(true);
+    expect(press({ pressAttempt: MAX_PUBLISH_PRESS_ATTEMPTS + 5 })).toBe(true);
   });
 
   it('leaves the early presses alone — a run that complies on a later attempt must still get there', () => {
-    for (let attempt = 1; attempt < MAX_PUBLISH_PRESS_ATTEMPTS; attempt++) {
-      expect(press({ attempt })).toBe(false);
+    for (let pressAttempt = 1; pressAttempt < MAX_PUBLISH_PRESS_ATTEMPTS; pressAttempt++) {
+      expect(press({ pressAttempt })).toBe(false);
     }
   });
 
@@ -50,7 +51,22 @@ describe('shouldStopPressingForPublish (ENG-947)', () => {
   });
 
   it('honours an explicit press budget override', () => {
-    expect(press({ attempt: 2, maxPressAttempts: 2 })).toBe(true);
-    expect(press({ attempt: 2, maxPressAttempts: 9 })).toBe(false);
+    expect(press({ pressAttempt: 2, maxPressAttempts: 2 })).toBe(true);
+    expect(press({ pressAttempt: 2, maxPressAttempts: 9 })).toBe(false);
+  });
+});
+
+describe('isPublishOnlyUnmet (ENG-947)', () => {
+  it('is true only when every outstanding requirement is a publish tool', () => {
+    expect(isPublishOnlyUnmet(['post_on_connected_account'])).toBe(true);
+    expect(isPublishOnlyUnmet(['post_on_connected_account', 'publish_blog_article'])).toBe(true);
+    expect(isPublishOnlyUnmet(['post_on_connected_account', 'get_marketing_tips'])).toBe(false);
+    expect(isPublishOnlyUnmet(['generate_image'])).toBe(false);
+  });
+
+  it('is false for an empty, missing or malformed set — the press counter must not advance on it', () => {
+    expect(isPublishOnlyUnmet([])).toBe(false);
+    expect(isPublishOnlyUnmet(undefined as any)).toBe(false);
+    expect(isPublishOnlyUnmet([null as any])).toBe(false);
   });
 });
