@@ -98,6 +98,28 @@ export type AuthzOrg = Pick<Organization, "orgId" | "ownerUserId">;
  */
 export function roleOf(user: AuthzUser | null | undefined, org: AuthzOrg | null | undefined): OrgRole {
   if (!user || !org) return "member";
+
+  // A role is only meaningful INSIDE the org that granted it.
+  //
+  // Without this, `orgRole: "owner"` is a global claim: an owner of one org
+  // satisfies an owner check against any other org, because nothing compared
+  // the two ids. Every `:orgId`-parameterized route ran on that comparison, so
+  // an owner of any org could rename, invite into, remove members from,
+  // re-role, and DELETE any other org by id. Proved at the route level in
+  // orgCrossTenant.proof.test.ts — five endpoints returned 200 where they had
+  // to return 403 (Greptile, #2297).
+  //
+  // `canInOrg` existed to make exactly this check and the routes did not call
+  // it, which is the argument for putting it here instead: this is the one
+  // place every authorization decision passes through, so a future call site
+  // cannot forget it.
+  //
+  // Only fires when the caller carries a DIFFERENT org. A caller with no
+  // `orgId` at all is unverifiable rather than hostile — that is the departed
+  // billing root and the legacy roleless owner, both of which still resolve
+  // through the ownerUserId union below.
+  if (user.orgId && org.orgId && user.orgId !== org.orgId) return "member";
+
   if (org.ownerUserId && org.ownerUserId === user.userId) return "owner";
   if (typeof user.orgRole === "string" && VALID_ROLES.has(user.orgRole)) {
     return user.orgRole as OrgRole;
@@ -192,5 +214,8 @@ export async function callerCan(
   const { userDb } = await import("./db");
   const user = await userDb.getUserById(userId);
   if (!user) return false;
+  // Deliberately passes the caller's OWN orgId. roleOf compares it to the
+  // target org and denies on mismatch; dropping it here would reopen the
+  // cross-tenant hole one layer down.
   return can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, permission);
 }

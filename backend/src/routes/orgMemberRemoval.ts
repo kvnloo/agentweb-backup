@@ -162,7 +162,6 @@ router.post("/:userId/remove", async (req, res) => {
     if (!mayGo.ok) {
       return res.status(409).json({ message: mayGo.error, code: mayGo.code });
     }
-
     const decisions: Partial<Record<OwnedFeature, Decision>> = req.body?.decisions || {};
     for (const f of OWNED_FEATURES) {
       const d = decisions[f];

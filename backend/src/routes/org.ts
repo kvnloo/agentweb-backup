@@ -186,7 +186,18 @@ export async function reassignBillingRootOnDeparture(
 ): Promise<boolean> {
   if (org.ownerUserId !== departingUserId) return true; // not the billing root
   const members = await orgDb.getOrgMembers(org.orgId);
-  const owners = members.filter((m) => m.userId !== departingUserId && m.orgRole === "owner");
+  // `roleOf`, not the raw column — deliberately the SAME predicate the
+  // last-owner guards use to admit the departure.
+  //
+  // They used to disagree: the guards ask roleOf (which unions ownerUserId),
+  // this asked `m.orgRole === "owner"`. A member who is an owner by union but
+  // not by column satisfied the guard and then could not be selected here, so
+  // this returned false and the caller got a 409 — AFTER the asset transfers
+  // had already run on the removal route. Two predicates for one question is
+  // what made that reachable (Greptile, #2297).
+  const owners = members.filter(
+    (m) => m.userId !== departingUserId &&
+      roleOf({ userId: m.userId, orgId: m.orgId, orgRole: m.orgRole }, org) === "owner");
   const successor =
     owners.find((m) => m.userId === actingUserId) ??
     // Deterministic, so a retry picks the same successor as the first attempt.
