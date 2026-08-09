@@ -27,6 +27,11 @@ export class LinkedInOutreachService {
   // NOT arm this breaker — that one is specific to a single recipient.
   private invitationCooldownUntil: Map<string, number> = new Map();
   private static readonly INVITATION_COOLDOWN_TTL_MS = 60 * 60 * 1000; // 1 hour
+  // Per-account people-search capability verdict (ENG-975). See
+  // probeSearchCapability below for why this exists; cached per account so a
+  // paging loop or a run that tries several queries pays at most one probe.
+  private searchCapabilityCache: Map<string, { state: 'ok' | 'degraded'; timestamp: number }> = new Map();
+  private static readonly SEARCH_CAPABILITY_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
   // ─── Logging helpers ────────────────────────────────────────────────────────
 
@@ -394,6 +399,78 @@ export class LinkedInOutreachService {
     // Unchanged semantics for every pre-existing caller: anything that is not a
     // proven-live session is `false`, including an indeterminate probe.
     return (await this.probeAccountSession(accountId)) === 'connected';
+  }
+
+  /**
+   * A maximally broad control query. Any LinkedIn account whose people search
+   * works at all matches this; a zero on it is about the ACCOUNT, not the query.
+   */
+  static readonly SEARCH_CAPABILITY_CANARY_KEYWORDS = 'marketing';
+
+  /**
+   * People-search capability canary (ENG-975).
+   *
+   * LinkedIn can revoke an account's people-search capability — commercial-use
+   * limit, search restriction, a soft block — while leaving profile reads and
+   * invitation lists fully functional. Unipile relays that as HTTP 200 with
+   * `items: []` and `paging.total_count: 0`, which is byte for byte what a
+   * genuine no-match looks like. So a zero-result search alone cannot tell
+   * "nobody matches" from "this account can no longer search", and callers that
+   * assume the former report a false empty (0 invites sent, 0 leads imported)
+   * on what is actually an outage.
+   *
+   * This re-runs one broad control query on the same account to break the tie:
+   *   'ok'        — the control matched people, so the caller's zero is real.
+   *   'degraded'  — the control ALSO returned zero: search is broken for this
+   *                 account. Callers should fail loudly.
+   *   'unknown'   — the probe itself failed. Same philosophy as the ENG-281
+   *                 session probe: an indeterminate probe proves nothing, so it
+   *                 is never cached and must never block the caller.
+   *
+   * Deliberately NOT called from `searchPeople`. CRM enrichment runs narrow
+   * person-name searches that legitimately return zero all day; probing there
+   * would double those calls against LinkedIn's rate limits. The guard belongs
+   * to the agent-facing callers, where a false empty is what reaches the user.
+   */
+  async probeSearchCapability(accountId: string): Promise<'ok' | 'degraded' | 'unknown'> {
+    const cached = this.searchCapabilityCache.get(accountId);
+    if (cached && Date.now() - cached.timestamp < LinkedInOutreachService.SEARCH_CAPABILITY_TTL_MS) {
+      return cached.state;
+    }
+    let state: 'ok' | 'degraded';
+    try {
+      const client = await this.getClient();
+      const result = await LinkedInOutreachService.withTimeout(
+        client.request.send({
+          method: 'POST',
+          path: ['linkedin', 'search'],
+          parameters: { account_id: accountId },
+          headers: { 'Content-Type': 'application/json' },
+          body: {
+            api: 'classic',
+            category: 'people',
+            keywords: LinkedInOutreachService.SEARCH_CAPABILITY_CANARY_KEYWORDS,
+          },
+        }) as Promise<any>,
+        LinkedInOutreachService.CONNECTIVITY_CHECK_TIMEOUT_MS,
+        `LinkedIn search capability probe for ${accountId}`,
+      ) as any;
+      state = Array.isArray(result?.items) && result.items.length > 0 ? 'ok' : 'degraded';
+    } catch (error: any) {
+      // Not cached: a probe that could not run says nothing about the account.
+      this.warn(`Search capability probe could not run — treating as indeterminate`, {
+        accountId,
+        reason: error?.message,
+      });
+      return 'unknown';
+    }
+    this.searchCapabilityCache.set(accountId, { state, timestamp: Date.now() });
+    this.log(`Search capability probe`, { accountId, state });
+    return state;
+  }
+
+  clearSearchCapabilityCache(accountId: string): void {
+    this.searchCapabilityCache.delete(accountId);
   }
 
   /**
