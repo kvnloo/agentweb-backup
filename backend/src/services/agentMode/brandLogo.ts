@@ -310,13 +310,15 @@ async function icoToPng(buf: Buffer): Promise<Buffer | null> {
  * logo either never got stored or got stored mislabelled. Rasterising here is
  * the one place every persist path funnels through.
  *
- * Returns null when the bytes are already a usable raster format or the
- * conversion fails — the caller then uploads them as-is.
+ * `png` is null when the bytes are already a usable raster format or the
+ * conversion fails — the caller then uploads them as-is, using the sniffed
+ * `isIco`/`isSvg` classification (which sees the ICO magic bytes a generic or
+ * absent Content-Type hides) to label the upload correctly.
  */
 async function normalizeLogoToPng(
   buf: Buffer,
   contentType: string,
-): Promise<Buffer | null> {
+): Promise<{ png: Buffer | null; isIco: boolean; isSvg: boolean }> {
   const isIco =
     contentType.includes('icon') ||
     contentType.includes('/ico') ||
@@ -326,19 +328,23 @@ async function normalizeLogoToPng(
       buf[2] === 1 &&
       buf[3] === 0);
   const isSvg = contentType.includes('svg');
-  if (!isIco && !isSvg) return null;
+  if (!isIco && !isSvg) return { png: null, isIco, isSvg };
   try {
-    if (isIco) return await icoToPng(buf);
+    if (isIco) return { png: await icoToPng(buf), isIco, isSvg };
     const sharp = (await import('sharp')).default;
     // SVGs often declare no pixel size; render at a high density so the
     // rasterised logo is usable rather than a 16px thumbnail.
-    return await sharp(buf, { density: 384 }).png().toBuffer();
+    return {
+      png: await sharp(buf, { density: 384 }).png().toBuffer(),
+      isIco,
+      isSvg,
+    };
   } catch (err: any) {
     console.warn(
       `Failed to convert ${isIco ? 'ICO' : 'SVG'} logo to PNG:`,
       err?.message ?? String(err),
     );
-    return null;
+    return { png: null, isIco, isSvg };
   }
 }
 
@@ -370,32 +376,42 @@ export async function downloadBrandLogoToS3(
   }
   let contentType = logoResponse.headers['content-type'] || '';
   let body = Buffer.from(logoResponse.data as ArrayBuffer);
-  const png = await normalizeLogoToPng(body, contentType);
-  if (png) {
+  const normalized = await normalizeLogoToPng(body, contentType);
+  if (normalized.png) {
     console.log(`Converted logo to PNG (was ${contentType || 'unknown type'})`);
-    body = png;
+    body = normalized.png;
     contentType = 'image/png';
-  } else if (contentType.includes('svg')) {
+  } else if (normalized.isSvg) {
     // Un-rasterisable SVG: brand guidelines reject it outright.
     console.log('Skipping SVG logo (not supported by brand guidelines)');
     return { status: 'svg' };
   }
   try {
+    // The sniffed classification, not just Content-Type: a site serving an
+    // undecodable .ico as application/octet-stream (or with no Content-Type at
+    // all) must still be stored as logo.ico, never as logo.jpg holding icon
+    // bytes — that mislabelling is what this fix exists to remove.
+    const isIco =
+      normalized.isIco || contentType.includes('icon') || contentType.includes('/ico');
     const ext = contentType.includes('png')
       ? 'png'
       : contentType.includes('gif')
         ? 'gif'
         : contentType.includes('webp')
           ? 'webp'
-          : contentType.includes('icon') || contentType.includes('/ico')
+          : isIco
             ? 'ico'
             : 'jpg';
+    const uploadContentType =
+      ext === 'ico' && !(contentType.includes('icon') || contentType.includes('/ico'))
+        ? 'image/x-icon'
+        : contentType;
     const filename = `logo.${ext}`;
     const { uploadFileToS3WithPath } = await import('../../utils/s3Utils');
     const uploadResult = await uploadFileToS3WithPath(
       body,
       filename,
-      contentType,
+      uploadContentType,
       `users/${userId}/brand/logo`,
     );
     if (uploadResult.success && uploadResult.url) {
