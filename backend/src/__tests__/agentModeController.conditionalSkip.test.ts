@@ -309,6 +309,43 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
   });
 
+  it('INSTRUCTION AUDIT: common cadence wordings are parsed into real day-sets', () => {
+    // The live preview run exposed this: `only\s+(?:publish|post)\b` never matched
+    // "only publishes", so publishDays came out EMPTY and the skip failed closed into
+    // the retry press. The production LUCAS schedule only ever corroborated because
+    // its skip clause happened to quote the words "non-publishing day" (ENG-844).
+    const SKIP = 'Non-publishing day, skipped per the cadence. Nothing was published.';
+    const SUN = new Date('2026-08-09T12:00:00Z'); // getUTCDay() === 0
+    const MON = new Date('2026-08-03T12:00:00Z'); // getUTCDay() === 1
+    const SAT = new Date('2026-08-08T12:00:00Z'); // getUTCDay() === 6
+    const v = (instruction: string, now: Date) =>
+      scheduledRunSignalsConditionalSkip(SKIP, { toolCalls: [], now, instruction });
+
+    // Each of these authorizes AND yields a usable weekday cadence.
+    [
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday.',
+      'Publish only on Mon/Wed/Fri.',
+      'Post only on Monday, Wednesday and Friday.',
+      'We only post on Mon, Wed and Fri.',
+      'Publishes only on Monday, Wednesday, Friday.',
+      'Only on Monday, Wednesday and Friday.',
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything.',
+      "Doesn't publish on weekends.",
+      'Publish only on weekdays.',
+    ].forEach((i) => expect([i, v(i, SUN)]).toEqual([i, true]));
+
+    // …and the same wordings must still REJECT a skip on a real publishing day.
+    [
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday.',
+      'Publish only on Mon/Wed/Fri.',
+      'We only post on Mon, Wed and Fri.',
+    ].forEach((i) => expect([i, v(i, MON)]).toEqual([i, false]));
+
+    // A bare "only on" inside a SKIP clause must not be read as a publish cadence —
+    // otherwise "skip only on Saturday" would make Saturday a publishing day.
+    expect(v('Skip only on Saturday.', SAT)).toBe(true);
+  });
+
   it('anchors the weekday cross-check to UTC, matching the model\'s UTC "Current date"', () => {
     // The model is handed its "Current date" as a UTC calendar date
     // (new Date().toISOString()), so its weekday reasoning is UTC-based. The
