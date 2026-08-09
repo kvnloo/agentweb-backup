@@ -179,14 +179,20 @@ export async function markJobFailed(source: string, dedupeKey: string, error: un
  * still has the now-invalid pre-rotation token — and can never successfully
  * refresh again. For a job registered with maxAttempts: Infinity this isn't
  * just a wasted attempt, it's an infinite loop that can never make progress.
- * Best-effort, matching markJobComplete/markJobFailed: if this write fails,
- * the next retry just falls back to the stale payload it already had, which
- * is the exact pre-existing behavior this call is layered on top of.
+ *
+ * Greptile P1 on #2291 (round 21): the first version of this was best-effort
+ * with NO retry — every sibling write in this file (markJobComplete,
+ * markJobFailed, the heartbeat beat) retries once before giving up, and this
+ * one didn't, purely an oversight. A transient write blip here is exactly
+ * what those retries exist to absorb. If BOTH attempts still fail, this is
+ * the last point where "the stored refresh token is about to become
+ * permanently unusable" is observable anywhere — console.error, not warn, so
+ * it's actionable in production monitoring rather than silently lost.
  */
 export async function updateJobPayload(source: string, dedupeKey: string, payload: unknown): Promise<void> {
   const id = jobId(source, dedupeKey);
-  try {
-    await dynamodb
+  const writePayload = () =>
+    dynamodb
       .update({
         TableName: TABLE_NAME,
         Key: { id },
@@ -194,8 +200,15 @@ export async function updateJobPayload(source: string, dedupeKey: string, payloa
         ExpressionAttributeValues: { ':payload': JSON.stringify(payload), ':now': new Date().toISOString() },
       })
       .promise();
-  } catch (error: any) {
-    console.warn(`[AsyncJobQueue] updateJobPayload failed for ${id} (best-effort):`, error?.message ?? error);
+
+  try {
+    await writePayload();
+  } catch (firstError: any) {
+    try {
+      await writePayload();
+    } catch (secondError: any) {
+      console.error(`[AsyncJobQueue] updateJobPayload failed for ${id} after retry — future retries will use the stale payload:`, secondError?.message ?? secondError);
+    }
   }
 }
 
