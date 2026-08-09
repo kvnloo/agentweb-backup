@@ -183,7 +183,7 @@ router.post('/finalize', authenticateToken, async (req: any, res) => {
 export async function refreshCalendlyAccessToken(
   refreshToken: string,
 ): Promise<{ access_token: string; refresh_token: string } | null> {
-  try {
+  const attempt = async () => {
     const config = await getCalendlyConfig();
     const response = await axios.post(
       config.tokenUrl,
@@ -198,9 +198,33 @@ export async function refreshCalendlyAccessToken(
     const { access_token, refresh_token } = response.data as { access_token: string; refresh_token?: string };
     // Calendly may or may not rotate the refresh token on use; keep the old one if not returned.
     return { access_token, refresh_token: refresh_token ?? refreshToken };
+  };
+
+  try {
+    return await attempt();
   } catch (error: any) {
-    console.warn('[Calendly] Token refresh failed:', error?.response?.data || error?.message);
-    return null;
+    // Greptile P1 on #2291 (round 24): a transient network blip talking to
+    // Calendly's OWN token endpoint used to force an immediate "could not
+    // refresh" failure with no retry — every internal DynamoDB write this
+    // session got this same fix already; this closes it on the outbound
+    // side too, before every caller's own rotation-persistence machinery
+    // (asyncJobQueue.ts, calendlyWebhookCleanupQueue.ts) ever needs to run
+    // at all. Retry only for failures that look transient (no HTTP response,
+    // or a 5xx from Calendly) — a genuine 4xx (invalid_grant: the
+    // refresh_token is actually revoked/expired) will never succeed on a
+    // second attempt, so don't waste one chasing it.
+    const status = error?.response?.status;
+    const looksTransient = !status || status >= 500;
+    if (!looksTransient) {
+      console.warn('[Calendly] Token refresh failed:', error?.response?.data || error?.message);
+      return null;
+    }
+    try {
+      return await attempt();
+    } catch (retryError: any) {
+      console.warn('[Calendly] Token refresh failed after retry:', retryError?.response?.data || retryError?.message);
+      return null;
+    }
   }
 }
 
