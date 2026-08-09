@@ -192,8 +192,12 @@ describe('ENG-982: one call completes the job', () => {
     const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
     const body = JSON.parse(res.content[0].text);
 
-    expect(body.status).toBe('complete');
     expect(body.result).toBe('campaign drafted');
+    // ...but a FAILED check is not a negative result. Reporting confirmed here
+    // would claim completion while the session might be awaiting input — the
+    // same false confidence this tool exists to avoid.
+    expect(body.completion_confirmed).toBe(false);
+    expect(body.next).toMatch(/unconfirmed/);
   });
 
   it('emma_get_task_result reports awaiting_input when Emma is blocked on a question', async () => {

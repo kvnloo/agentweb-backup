@@ -131,6 +131,7 @@ mcpToolRegistry.register({
     // confirm against the session before claiming a terminal result. One extra
     // read, only on the path where we would otherwise assert completion.
     let pending: any = null;
+    let confirmationFailed = false;
     if (!stillBuilding) {
       try {
         const session: any = await mcpFetch({
@@ -140,9 +141,12 @@ mcpToolRegistry.register({
         });
         pending = session?.pendingUserQuestion ?? null;
       } catch {
-        // The turn itself succeeded; failing the whole call because a
-        // confirmation read failed would discard a result we already have.
-        pending = null;
+        // The turn succeeded, so the result is real and worth returning — but a
+        // failed check is NOT a negative result. Swallowing it to `pending =
+        // null` would report "complete, confirmed" while the session might be
+        // awaiting input, which is the same false confidence this tool exists
+        // to avoid. Return the work, withhold the confirmation.
+        confirmationFailed = true;
       }
     }
 
@@ -151,16 +155,19 @@ mcpToolRegistry.register({
     return jsonResult({
       task_id: taskId,
       status,
-      // Confirmed for both terminal outcomes: a synchronous return IS the
-      // completion signal, and a pending question is persisted on the session.
-      completion_confirmed: !stillBuilding,
+      // Confirmed only when we actually verified it: a synchronous return IS
+      // the completion signal, but only once the session read has ruled out a
+      // blocking question. A failed check is not a negative result.
+      completion_confirmed: !stillBuilding && !confirmationFailed,
       result: data?.content ?? data?.message ?? null,
       awaiting_question: pending ?? null,
       next: pending
         ? 'Emma is waiting on an answer. Use emma_answer_question — a plain message abandons the question.'
         : stillBuilding
           ? 'Emma detached into a longer build. Poll emma_get_task_result with this task_id.'
-          : undefined,
+          : confirmationFailed
+            ? 'The result above is real, but the follow-up check failed, so it is unconfirmed — Emma may be awaiting an answer. Call emma_get_task_result to see.'
+            : undefined,
     });
   },
 });
