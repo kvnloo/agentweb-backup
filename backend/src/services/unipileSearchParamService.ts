@@ -4,7 +4,7 @@
  * Read order on every call: process LRU → DynamoDB (AW-EnrichmentRawCache)
  *                           → Unipile API → write-through to both layers.
  *
- * Caches negative results (empty list, 24h) and successful candidate lists
+ * Caches negative results (empty list, 1h) and successful candidate lists
  * (30d). Errors are NOT cached — Unipile rate limits and transient failures
  * shouldn't lock out a real resolution; the next call will retry.
  *
@@ -96,7 +96,15 @@ export interface UnipileSearchParamServiceDeps {
 // ─── TTLs ────────────────────────────────────────────────────────────────────
 
 const TTL_HIT_SECONDS = 30 * 86400;
-const TTL_NEGATIVE_SECONDS = 24 * 3600;
+// ENG-975: an empty candidate list is not reliably a fact about the query. When
+// LinkedIn revokes an account's people-search capability, Unipile relays THIS
+// endpoint as an empty list too — the reported outage cached `candidates: []`
+// for INDUSTRY 'hospital health care', so every later search silently lost that
+// filter (falling back to weak advanced_keywords) for the rest of the TTL, long
+// after the outage cleared. One hour still absorbs the repeated-lookup traffic
+// this cache exists for while bounding how long a transient upstream condition
+// can masquerade as "no such entity".
+const TTL_NEGATIVE_SECONDS = 3600;
 
 // ─── Process-local LRU (size 200, TTL 5min) ─────────────────────────────────
 //
