@@ -196,7 +196,7 @@ describe('demoting people (downgrading)', () => {
 
     const res = await setRole('u-filipe', 'member');
     expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/billing owner|only owner/i);
+    expect(res.body.error).toMatch(/billing|only owner/i);
     expect(mockUsers['u-filipe'].orgRole).toBe('owner');
   });
 
@@ -217,7 +217,7 @@ describe('demoting people (downgrading)', () => {
     actingUserId = 'u-eric';
     const res = await setRole('u-filipe', 'member');
     expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/billing owner/i);
+    expect(res.body.error).toMatch(/billing/i);
     expect(mockUsers['u-filipe'].orgRole).toBe('owner');
   });
 
@@ -389,6 +389,56 @@ describe('adding people', () => {
     }
     const res = await request(app).post(`/api/org/${ORG}/invite`).send({ email: 'fifteenth@xcures.com' });
     expect(res.status).toBe(200);
+  });
+});
+
+describe('the billing root cannot be stranded on an ex-member', () => {
+  // Harsha hit this by hand within minutes of the UI existing: promote a new
+  // owner, remove the old one, and `ownerUserId` pointed at somebody who was no
+  // longer in the org. The org stays administrable — the remaining owners hold
+  // authority by role — but resolveBillingUserId follows the pointer, so the
+  // org's tier and pooled quota resolve to a departed user and track THEIR
+  // subscription from then on.
+  const remove = (t: string) => request(app).delete(`/api/org/${ORG}/members/${t}`);
+  const leave = () => request(app).post(`/api/org/${ORG}/leave`);
+  const memberIds = () => Object.values(mockUsers).filter((u: any) => u.orgId === ORG).map((u: any) => u.userId);
+
+  it('removing the billing root moves it to another owner', async () => {
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    const res = await remove('u-filipe');
+    expect(res.status).toBe(200);
+    expect(mockOrgs[ORG].ownerUserId).toBe('u-eric');
+    expect(memberIds()).toContain(mockOrgs[ORG].ownerUserId);
+  });
+
+  it('the billing root leaving moves it too — this is promote-then-leave', async () => {
+    await setRole('u-eric', 'owner');
+    const res = await leave(); // acting as u-filipe, the billing root
+    expect(res.status).toBe(200);
+    expect(mockOrgs[ORG].ownerUserId).toBe('u-eric');
+    expect(mockUsers['u-filipe'].orgId).toBeUndefined();
+  });
+
+  it('an ordinary member leaving does not disturb it', async () => {
+    actingUserId = 'u-georgia';
+    await leave();
+    expect(mockOrgs[ORG].ownerUserId).toBe('u-filipe');
+  });
+
+  it('the successor is deterministic when several owners could take it', async () => {
+    await setRole('u-eric', 'owner');
+    await setRole('u-tyler', 'owner');
+    actingUserId = 'u-eric';
+    await remove('u-filipe');
+    // Lowest userId wins, so a retry lands on the same successor.
+    expect(mockOrgs[ORG].ownerUserId).toBe('u-eric');
+  });
+
+  it('never points at a non-member, whichever path the billing root leaves by', async () => {
+    await setRole('u-eric', 'owner');
+    await leave();
+    expect(memberIds()).toContain(mockOrgs[ORG].ownerUserId);
   });
 });
 

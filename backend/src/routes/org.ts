@@ -117,6 +117,46 @@ async function anotherOwnerRemains(org: Organization, losingUserId: string): Pro
   );
 }
 
+/**
+ * Move the billing root off a departing member.
+ *
+ * `Organization.ownerUserId` is written in exactly one place — org creation —
+ * and nothing has ever moved it. That was survivable only because the primary
+ * owner could not leave: the old leave route blocked on
+ * `ownerUserId === userId` and pointed at a transfer route nobody built.
+ *
+ * ENG-954 removed that block, which is correct — an owner must be able to
+ * leave — but the block was standing in for this. Without it, promote-then-
+ * leave (the succession path this design commits to, and the one the demote
+ * error tells people to use) leaves `ownerUserId` pointing at an ex-member.
+ * The org stays administrable, because the remaining owners hold authority by
+ * role; but billing does not. `resolveBillingUserId` follows the pointer, so
+ * the org's tier and pooled quota resolve to someone who has left, and follow
+ * THEIR subscription from then on.
+ *
+ * So departure carries the pointer with it. That IS the transfer, performed at
+ * the only moment it is unambiguous. Callers must have already established
+ * that another owner remains — every caller here is behind that guard, and
+ * this returns false rather than guessing if that is somehow untrue.
+ */
+async function reassignBillingRootOnDeparture(
+  org: Organization,
+  departingUserId: string,
+): Promise<boolean> {
+  if (org.ownerUserId !== departingUserId) return true; // not the billing root
+  const members = await orgDb.getOrgMembers(org.orgId);
+  const successor = members
+    .filter((m) => m.userId !== departingUserId && m.orgRole === "owner")
+    // Deterministic, so a retry picks the same successor as the first attempt.
+    .sort((a, b) => a.userId.localeCompare(b.userId))[0];
+  if (!successor) return false;
+  await orgDb.updateOrg(org.orgId, { ownerUserId: successor.userId });
+  console.log(
+    `[org] billing root moved ${departingUserId} -> ${successor.userId} on departure from ${org.orgId}`,
+  );
+  return true;
+}
+
 // Domain always derived server-side from the acting user's own email — never
 // client-supplied — so nobody can claim a domain they don't belong to.
 function deriveDomainFromEmail(email: string): string | undefined {
@@ -682,7 +722,7 @@ router.patch("/:orgId/members/:memberId/role", async (req: Request, res: Respons
     // moves the billing root with them.
     if (memberId === org.ownerUserId && role !== "owner") {
       return res.status(409).json({
-        error: "This member is the organization's billing owner, so their access cannot be reduced. Promote another owner and have this member leave instead.",
+        error: "This member owns the organization's billing, so changing their role here would not actually change anything. To hand the organization over, make someone else an owner first — billing moves to them automatically when this member leaves or is removed.",
       });
     }
 
@@ -743,6 +783,11 @@ router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) =
       }
     }
 
+    if (!(await reassignBillingRootOnDeparture(org, memberId))) {
+      return res.status(409).json({
+        error: "Cannot remove the only owner. Promote another member to owner first.",
+      });
+    }
     await userDb.clearOrgMembership(memberId);
     return res.json({ success: true, message: "Member removed" });
   } catch (error) {
@@ -777,6 +822,11 @@ router.post("/:orgId/leave", async (req: Request, res: Response) => {
       });
     }
 
+    if (!(await reassignBillingRootOnDeparture(org, userId))) {
+      return res.status(409).json({
+        error: "You are the only owner. Promote another member to owner before leaving.",
+      });
+    }
     await userDb.clearOrgMembership(userId);
     return res.json({ success: true, message: "Left the organization" });
   } catch (error) {
