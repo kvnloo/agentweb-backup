@@ -772,6 +772,43 @@ describe("orgMemberRemoval guards", () => {
     expect(mockUpdateOrg).toHaveBeenCalledWith(orgId, { ownerUserId: callerUserId });
   });
 
+  it("a failed billing reassignment mutates nothing — it runs before the asset work", async () => {
+    // The failure path exists (two roster reads can disagree under GSI lag), so
+    // it must not sit downstream of transfers. Greptile, #2297.
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    const targetRoot = { userId: "u-root", orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === "u-root") return Promise.resolve(targetRoot);
+      return Promise.resolve(null);
+    });
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-root", name: "Test Org" });
+    // The admitting guard sees both owners; the reassignment's read then lags
+    // and sees only the departing one, so it cannot find a successor.
+    mockGetOrgMembers
+      .mockResolvedValueOnce([ownerCaller, targetRoot])
+      .mockResolvedValue([targetRoot]);
+    // The target genuinely owns things, or the loops would iterate over nothing
+    // and this assertion would hold regardless of ordering.
+    mockGetTasksByUserId.mockResolvedValue(makeTasks(3));
+    mockGetLandingPagesByOwner.mockResolvedValue(makeLandingPages(2));
+    mockGetSkillsByOwner.mockResolvedValue(makeSkills(2));
+    mockGetWorkPlansByOwner.mockResolvedValue(makeWorkPlans(2));
+    mockGetTemplatesByOwner.mockResolvedValue(makeTemplates(2));
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-root/remove`)
+      .send({ confirm: true, decisions: allTransfer });
+
+    expect(res.status).toBe(409);
+    expect(mockClearOrgMembership).not.toHaveBeenCalled();
+    expect(mockUpdateTaskOwner).not.toHaveBeenCalled();
+    expect(mockTransferLandingPageOwner).not.toHaveBeenCalled();
+    expect(mockSkillTransferOwner).not.toHaveBeenCalled();
+    expect(mockWorkPlanTransferOwner).not.toHaveBeenCalled();
+    expect(mockTransferAllTemplates).not.toHaveBeenCalled();
+  });
+
   it("carries the billing root to the remover — this route was missed the first time", async () => {
     // The reassignment landed on routes/org.ts only, while the commit claimed
     // both paths. This route is the one the portal's remove dialog calls, so

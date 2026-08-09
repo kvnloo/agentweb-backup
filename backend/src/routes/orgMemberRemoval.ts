@@ -162,6 +162,23 @@ router.post("/:userId/remove", async (req, res) => {
     if (!mayGo.ok) {
       return res.status(409).json({ message: mayGo.error, code: mayGo.code });
     }
+    // Move the billing pointer BEFORE any asset work, not after.
+    //
+    // It has no ordering dependency on the transfers — it only has to happen
+    // by the time the member is gone. Running it afterwards meant its failure
+    // path returned 409 with the target's landing pages, skills, work plans
+    // and knowledge base already transferred or destroyed, and the target
+    // still in the org. Two reads of the roster can also disagree under GSI
+    // lag, so "the guard already proved a successor exists" is not something
+    // the later call can rely on (Greptile, #2297).
+    //
+    // Failing here instead leaves nothing mutated. If the asset work below
+    // fails after this point, the pointer has moved to another owner and the
+    // target is still a member — consistent, and harmless, unlike the reverse.
+    if (!(await reassignBillingRootOnDeparture(callerOrg, target.userId, callerId))) {
+      return res.status(409).json({ message: "Cannot remove the only owner. Promote another member to owner first." });
+    }
+
     const decisions: Partial<Record<OwnedFeature, Decision>> = req.body?.decisions || {};
     for (const f of OWNED_FEATURES) {
       const d = decisions[f];
@@ -240,10 +257,6 @@ router.post("/:userId/remove", async (req, res) => {
     // in routes/org.ts does. This route was missed when that landed, and it is
     // the one the portal's remove dialog actually calls — so the fix shipped
     // without covering the path a human uses.
-    if (!(await reassignBillingRootOnDeparture(callerOrg, target.userId, callerId))) {
-      return res.status(409).json({ message: "Cannot remove the only owner. Promote another member to owner first." });
-    }
-
     // Clear org membership on the target user
     await userDb.clearOrgMembership(target.userId);
     // Prune editor lists
