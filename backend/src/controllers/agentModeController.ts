@@ -21,6 +21,7 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
+import { MAX_PUBLISH_PRESS_ATTEMPTS, shouldStopPressingForPublish } from '../utils/publishPressCircuitBreaker';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -1595,6 +1596,12 @@ type RunVerifiedChatResult = {
   // produced zero write calls. The run is a SUCCESSFUL skip — required write-call
   // minimums are waived instead of retry-pressed toward irreversible publishing.
   conditionalSkip?: boolean;
+  // ENG-947: set when the run spent its publish-press budget with an irreversible
+  // publish requirement still unmet, and stopped instead of re-pressing to
+  // maxAttempts. The run still FAILED (nothing was published) — this only records
+  // WHY it ended early, so the outcome is distinguishable from a run that
+  // exhausted all 20 attempts for some other reason.
+  publishHeldForApproval?: boolean;
 };
 
 // Common function to run verified chat with work plan, keywords, and function call verification
@@ -2227,6 +2234,61 @@ export async function runVerifiedChat(
         };
       }
 
+      // ENG-947: publish-press circuit breaker. The unmet-requirement retry above
+      // re-sends "Please try again. Make sure to <tool> (N more time(s) needed)."
+      // and runs another attempt, up to 20. When the ONLY thing still missing is an
+      // irreversible publish to a live account, that press has a very short useful
+      // life: the model either makes the call within a turn or two, or it has
+      // decided not to (its skill prompts carry an absolute publish gate telling it
+      // to draft-and-notify in unattended runs) and re-asking cannot move it. In
+      // production the reported schedules published on attempt 2 while they worked,
+      // and have run to attempt 20 with nothing published every day since — 55-69
+      // messages at ~$6 a run, nearly all of it prompt-cache WRITE cost from
+      // re-sending the prefix another 17 times. Stop once the budget is spent.
+      //
+      // This can only ever end a run EARLIER; it never publishes anything, and it
+      // never converts a would-be success into a failure — the run is already
+      // failing its requirements at this point and the remaining presses are what
+      // it would have spent to fail anyway. Scoped to scheduled runs
+      // (completionGate) and only when the run is otherwise done: a pending work
+      // plan or an unmet keyword still has genuinely useful work left to press for.
+      if (
+        completionGate &&
+        !allFunctionCallsMet &&
+        allKeywordsMet &&
+        (!workPlan || workPlanCompleted) &&
+        shouldStopPressingForPublish({ attempt, unmetRequiredFunctions: functionCallMisses })
+      ) {
+        console.warn(
+          `AgentMode runVerifiedChat: session ${sessionId} spent its publish-press budget ` +
+          `(${attempt}/${MAX_PUBLISH_PRESS_ATTEMPTS} attempts) with [${functionCallMisses.join(', ')}] still ` +
+          `uncalled. Ending the run instead of re-pressing to ${maxAttempts} attempts — the content is held ` +
+          `for approval, and repeating an identical press for an irreversible publish only burns prompt-cache ` +
+          `writes (ENG-947).`
+        );
+        return {
+          success: false,
+          publishHeldForApproval: true,
+          content: allContent,
+          toolCalls: allToolCalls,
+          keywordMatches: keywords.filter(k => !remainingKeywords.includes(k)),
+          keywordMisses: remainingKeywords,
+          functionCallMatches,
+          functionCallMisses,
+          functionStatus: requiredFunctions.map((reqFunc) => {
+            const actualCount = countCallsForRequirement(reqFunc.functionName, allActualFunctionCallsForReporting);
+            return {
+              functionName: reqFunc.functionName,
+              requiredCount: reqFunc.minCount,
+              actualCount,
+              met: actualCount >= reqFunc.minCount,
+            };
+          }),
+          attempts: attempt,
+          workPlanCompleted: workPlanCompleted || !workPlan,
+        };
+      }
+
       // Deterministic completion gate (opt-in, scheduled runs only): if all other
       // requirements are met but the latest turn admits it left work unfinished,
       // spend one more continuation turn instead of returning success — unless we
@@ -2429,6 +2491,9 @@ export async function runScheduledChat(
   summary?: string;
   // Present only on a parked run — links the pending question for the UI.
   pendingQuestionId?: string;
+  // ENG-947: present only when the run stopped early on the publish-press budget
+  // with the publish tool still uncalled (content drafted and held, not published).
+  publishHeldForApproval?: boolean;
 }> {
   const now = new Date();
   let sessionId: string = '';
@@ -3178,6 +3243,12 @@ export async function runScheduledChat(
       // downstream reporting — a bare success would otherwise hide the waived
       // write-call minimums.
       ...(result.conditionalSkip ? { conditionalSkip: true } : {}),
+      // ENG-947: the run ended early because its publish-press budget ran out with
+      // the publish tool still uncalled — the content was drafted and held, not
+      // published. Still a `failure` (nothing shipped, so the streak/oncall
+      // escalation must keep firing), but marked so a held run is distinguishable
+      // from a run that exhausted all 20 attempts for some other reason.
+      ...(result.publishHeldForApproval ? { publishHeldForApproval: true } : {}),
     };
 
     // Save the result to database (without actualResponse to save space)
