@@ -81,7 +81,9 @@ function batchResult(newCount: number, mergedCount: number, idPrefix = 'newlead'
     mergedCount,
     errorCount: 0,
     errors: [],
-    created: Array.from({ length: newCount }, (_, i) => ({ leadId: `${idPrefix}-${i + 1}` })),
+    // sourceIndex mirrors the real crmDb contract: the position in the input
+    // array each created lead came from (ENG-1002).
+    created: Array.from({ length: newCount }, (_, i) => ({ leadId: `${idPrefix}-${i + 1}`, sourceIndex: i })),
   };
 }
 
@@ -660,5 +662,182 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     expect(mockDeleteLead).toHaveBeenCalledWith('list-1', 'p2-2');
     expect(mockDeleteLead).toHaveBeenCalledWith('list-1', 'p2-3');
     expect(enqueueSpy).toHaveBeenCalledWith('user-1', 'list-1', ['p1-1', 'p1-2', 'p1-3', 'p2-1']);
+  });
+});
+
+// ─── ENG-1002: anonymized results + importedLeads fidelity ───────────────────
+
+/** An out-of-network LinkedIn search hit: no public_identifier, placeholder name. */
+function anonymizedItem(idx: number): any {
+  return { name: 'LinkedIn Member', headline: 'Regional Property Manager', location: `City ${idx}` };
+}
+
+describe('AgentModeService.importLeadsFromSearch — anonymized search results', () => {
+  let service: AgentModeService;
+
+  beforeEach(() => {
+    mockSearchPeople.mockReset();
+    mockBatchCreateLeads.mockReset();
+    mockResolveAccountId.mockReset();
+    mockGetLeadListById.mockReset();
+    mockDeleteLead.mockReset();
+    mockSetLeadListSearchCursor.mockReset();
+    mockGetProfile.mockReset();
+    service = new AgentModeService();
+    mockResolveAccountId.mockResolvedValue('test-account-id');
+    mockGetLeadListById.mockResolvedValue({ listId: 'list-1', leadCount: 0 });
+    mockDeleteLead.mockResolvedValue(undefined);
+    mockSetLeadListSearchCursor.mockResolvedValue(undefined);
+  });
+
+  it('never writes "LinkedIn Member" placeholder profiles to the CRM', async () => {
+    mockSearchPeople.mockResolvedValueOnce({
+      items: [anonymizedItem(1), makeItem(2), anonymizedItem(3)],
+      cursor: null,
+    });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(1, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    const written = mockBatchCreateLeads.mock.calls[0][1];
+    expect(written).toHaveLength(1);
+    expect(written[0].firstName).toBe('Lead');
+    expect(written.some((l: any) => l.firstName === 'LinkedIn' && l.lastName === 'Member')).toBe(false);
+    expect(result.anonymizedSkipped).toBe(2);
+  });
+
+  it('drops results that have neither a name nor a profile URL', async () => {
+    mockSearchPeople.mockResolvedValueOnce({
+      items: [{ headline: 'Property Manager', location: 'Houston, TX' }, makeItem(2)],
+      cursor: null,
+    });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(1, 0, 'p1'));
+
+    await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    const written = mockBatchCreateLeads.mock.calls[0][1];
+    expect(written).toHaveLength(1);
+    expect(written[0].linkedin).toBe('https://www.linkedin.com/in/lead-2');
+  });
+
+  it('keeps a named result even when its title/company cannot be resolved', async () => {
+    mockSearchPeople.mockResolvedValueOnce({
+      items: [{ name: 'Amy Foley', public_identifier: 'amy-foley', headline: 'Regional Property Manager' }],
+      cursor: null,
+    });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(1, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    const written = mockBatchCreateLeads.mock.calls[0][1];
+    expect(written).toHaveLength(1);
+    expect(written[0].firstName).toBe('Amy');
+    expect(result.anonymizedSkipped).toBe(0);
+  });
+
+  it('skips the CRM write entirely when a whole page is anonymized, and keeps paginating', async () => {
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [anonymizedItem(1), anonymizedItem(2)], cursor: 'c2' })
+      .mockResolvedValueOnce({ items: [makeItem(3)], cursor: null });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(1, 0, 'p2'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    expect(mockBatchCreateLeads).toHaveBeenCalledTimes(1);
+    expect(mockSearchPeople).toHaveBeenCalledTimes(2);
+    expect(result.imported).toBe(1);
+    expect(result.anonymizedSkipped).toBe(2);
+    expect(result.total).toBe(3);
+  });
+
+  it('does not spend a getProfile company lookup on an anonymized result', async () => {
+    mockSearchPeople.mockResolvedValueOnce({
+      items: [{ name: 'LinkedIn Member', public_identifier: 'ACoAAA-opaque', headline: 'Property Manager' }],
+      cursor: null,
+    });
+
+    await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    expect(mockGetProfile).not.toHaveBeenCalled();
+    expect(mockBatchCreateLeads).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentModeService.importLeadsFromSearch — importedLeads reflects what was written', () => {
+  let service: AgentModeService;
+
+  beforeEach(() => {
+    mockSearchPeople.mockReset();
+    mockBatchCreateLeads.mockReset();
+    mockResolveAccountId.mockReset();
+    mockGetLeadListById.mockReset();
+    mockDeleteLead.mockReset();
+    mockSetLeadListSearchCursor.mockReset();
+    service = new AgentModeService();
+    mockResolveAccountId.mockResolvedValue('test-account-id');
+    mockGetLeadListById.mockResolvedValue({ listId: 'list-1', leadCount: 0 });
+    mockDeleteLead.mockResolvedValue(undefined);
+    mockSetLeadListSearchCursor.mockResolvedValue(undefined);
+  });
+
+  it('previews only the leads that were actually created, not every candidate', async () => {
+    // 5 candidates fetched, but only index 3 is new — the rest already exist
+    // in the list and are silently no-ops (the ENG-1002 production shape).
+    mockSearchPeople.mockResolvedValueOnce({
+      items: [makeItem(1), makeItem(2), makeItem(3), makeItem(4), makeItem(5)],
+      cursor: null,
+    });
+    mockBatchCreateLeads.mockResolvedValueOnce({
+      successCount: 1, newCount: 1, mergedCount: 0, errorCount: 0, errors: [],
+      created: [{ leadId: 'only-new', sourceIndex: 3 }],
+    });
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    expect(result.imported).toBe(1);
+    expect(result.importedLeads).toHaveLength(1);
+    expect(result.importedLeads[0].firstName).toBe('Lead');
+    expect(result.importedLeads[0].linkedin).toBe('https://www.linkedin.com/in/lead-4');
+  });
+
+  it('excludes trimmed-away leads from importedLeads', async () => {
+    mockSearchPeople.mockResolvedValueOnce({
+      items: [makeItem(1), makeItem(2), makeItem(3)],
+      cursor: null,
+    });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(3, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 2 });
+
+    expect(result.trimmed).toBe(1);
+    expect(result.importedLeads).toHaveLength(2);
+    expect(result.importedLeads.map((l: any) => l.linkedin)).toEqual([
+      'https://www.linkedin.com/in/lead-1',
+      'https://www.linkedin.com/in/lead-2',
+    ]);
+  });
+
+  it('caps importedLeads at 5 while importing more', async () => {
+    mockSearchPeople.mockResolvedValueOnce({
+      items: Array.from({ length: 8 }, (_, i) => makeItem(i + 1)),
+      cursor: null,
+    });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(8, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 8 });
+
+    expect(result.imported).toBe(8);
+    expect(result.importedLeads).toHaveLength(5);
+  });
+
+  it('previews nothing when nothing was written', async () => {
+    mockSearchPeople.mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: null });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(0, 2, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    expect(result.imported).toBe(0);
+    expect(result.skipped).toBe(2);
+    expect(result.importedLeads).toEqual([]);
   });
 });
