@@ -8820,17 +8820,21 @@ export class AgentModeService {
         };
       }
 
-      // Cap competitors at 40
-      const MAX_COMPETITORS = 40;
-      if (marketStrategy.competitors && marketStrategy.competitors.length > MAX_COMPETITORS) {
-        console.log(`AgentMode: Capping competitors from ${marketStrategy.competitors.length} to ${MAX_COMPETITORS}`);
-        marketStrategy.competitors = marketStrategy.competitors.slice(0, MAX_COMPETITORS);
-      }
+      // Bound the size of the tool result WITHOUT hiding entries (ENG-945).
+      // This used to slice the competitor list down to 40 and drop the rest
+      // silently, so a caller that wrote 49 competitors read back 40 and
+      // concluded the write had discarded records. Now the first
+      // COMPETITOR_DETAIL_LIMIT competitors are rendered in full and the
+      // remainder are listed by name only — every stored competitor is still
+      // visible, and the true count is reported alongside.
+      const COMPETITOR_DETAIL_LIMIT = 40;
+      const competitorCount = Array.isArray(marketStrategy.competitors) ? marketStrategy.competitors.length : 0;
 
       // Format the market strategy for LLM consumption
       const formattedContent = this.formatMarketStrategy({
         exists: true,
-        marketData: marketStrategy
+        marketData: marketStrategy,
+        competitorDetailLimit: COMPETITOR_DETAIL_LIMIT
       });
 
       // Return structured response — no raw marketData to keep tool result size manageable
@@ -8838,6 +8842,8 @@ export class AgentModeService {
         success: true,
         message: `Market strategy retrieved successfully`,
         exists: true,
+        totalCompetitors: competitorCount,
+        competitorsWithFullDetail: Math.min(competitorCount, COMPETITOR_DETAIL_LIMIT),
         createdAt: marketStrategy.createdAt,
         updatedAt: marketStrategy.updatedAt,
         formattedContent
@@ -22706,15 +22712,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     // Competitors Section (matches UI structure)
-    formattedSummary += `<strong>🏆 Competitors</strong><br>`;
-    if (marketData.competitors && marketData.competitors.length > 0) {
-      marketData.competitors.forEach((competitor: any, index: number) => {
+    // ENG-945: entries past `competitorDetailLimit` are rendered by name only
+    // rather than dropped, so the reader always sees the complete roster.
+    const competitors: any[] = Array.isArray(marketData.competitors) ? marketData.competitors : [];
+    const detailLimit = typeof marketResult.competitorDetailLimit === 'number'
+      ? marketResult.competitorDetailLimit
+      : competitors.length;
+    const detailedCompetitors = competitors.slice(0, detailLimit);
+    const nameOnlyCompetitors = competitors.slice(detailLimit);
+
+    formattedSummary += `<strong>🏆 Competitors (${competitors.length} total)</strong><br>`;
+    if (competitors.length > 0) {
+      detailedCompetitors.forEach((competitor: any) => {
         if (typeof competitor === 'object' && competitor.name) {
           formattedSummary += `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
         } else {
           formattedSummary += `• ${competitor}<br>`;
         }
       });
+      if (nameOnlyCompetitors.length > 0) {
+        const names = nameOnlyCompetitors.map((competitor: any) =>
+          (typeof competitor === 'object' && competitor.name) ? competitor.name : String(competitor)
+        );
+        formattedSummary += `<br><strong>ℹ️ ${nameOnlyCompetitors.length} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again:<br>`;
+        names.forEach((name: string) => {
+          formattedSummary += `• ${name}<br>`;
+        });
+      }
     } else {
       formattedSummary += `• No competitors identified yet<br>`;
     }
