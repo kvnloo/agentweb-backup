@@ -529,6 +529,30 @@ describe('POST /connect', () => {
       expect(clearOrphanedCalendlyWebhook).toHaveBeenCalledWith('user-123', SAME_USER_URI);
     });
 
+    // Greptile P1 on #2291 (fifth pass): clearing the orphan record used to be
+    // unconditional — wrong exactly here, where the self-heal itself fails (delete
+    // AND retry-create both fail) and the stale subscription is still live on
+    // Calendly's side, never actually deleted. Clearing the orphan record in this
+    // case would erase the only remaining durable identifier for it, permanently
+    // disabling booking tracking with no way to ever self-heal again.
+    it('does NOT clear the orphan-webhook record when the self-heal itself fails (delete and retry-create both fail)', async () => {
+      getAccountsByUserId.mockResolvedValueOnce([]); // no local record — sourced from the orphan table only
+      getOrphanedCalendlyWebhook.mockResolvedValueOnce({ webhookId: 'https://api.calendly.com/webhook_subscriptions/ORPHAN9999999999' });
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce(duplicateError);
+      axios.delete = jest.fn().mockRejectedValueOnce({ response: { status: 403, data: { message: 'Permission Denied' } } });
+      axios.post.mockRejectedValueOnce(new Error('still failing'));
+
+      const res = await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.upgradeRequired).toBe(true);
+      expect(res.body.account.config.booking_tracking_active).toBe(false);
+      expect(clearOrphanedCalendlyWebhook).not.toHaveBeenCalled();
+    });
+
     it('prefers the local account record over the orphan-webhook table when both exist', async () => {
       // Deliberately does NOT seed getOrphanedCalendlyWebhook with a distinct value —
       // the `??` in provisionCalendlyWebhook's caller short-circuits on the local
