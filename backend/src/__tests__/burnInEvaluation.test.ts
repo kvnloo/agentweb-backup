@@ -247,13 +247,13 @@ describe('evaluateBurnIn — the burn-in period is a fixed window count (ENG-938
     expect(assessment.postRelease?.date).toBe('2026-08-06');
   });
 
-  it('a low-volume day inside the window does not slide a later day into it', () => {
+  it('a low-volume day inside the window makes the period unevaluable, not clean', () => {
     // The fixed period is the first 7 post-release windows: 07-31 … 08-06.
-    // 08-01 is below minRunCount, so it carries no readable evidence — but it
-    // still OCCUPIES its slot in the period. Filtering before slicing would drop
-    // it from the list, pulling 08-07 (the 8th window) into the 7th slot, so a
-    // regression ten days out would block closure for a burn-in that only ever
-    // covered days 1-7.
+    // 08-01 is below minRunCount, so nobody can say whether the release was
+    // healthy that day. Crediting the clean prefix (07-31) would report `clean`
+    // on a burn-in period containing a day that was never read, so the verdict
+    // fails closed. 08-07 — outside the period entirely — is still never
+    // reached, so an out-of-period regression cannot fail the release either.
     const assessment = evaluateBurnIn({
       snapshots: extendedSnapshots({
         '2026-08-01': { runCount: 1, okRuns: 1, degradedRuns: 0, failedRuns: 0 },
@@ -263,19 +263,14 @@ describe('evaluateBurnIn — the burn-in period is a fixed window count (ENG-938
       releaseIssueId: 'ENG-SYNTHETIC',
     });
 
-    expect(assessment.verdict).toBe('clean');
-    expect(assessment.passesClosureCheck4).toBe(true);
-    // Evidence stops at the thin day: 07-31 is credited, 08-01 onward is not
-    // read, and 08-07 — outside the period entirely — is never reached.
-    expect(assessment.postRelease?.date).toBe('2026-07-31');
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.reason).toContain('2026-08-01');
   });
 
   it('does not credit a clean day that sits behind an unevaluable one', () => {
-    // 08-01 is below minRunCount, so nobody can say whether the release was
-    // healthy that day. Skipping it and crediting 08-06 would let a later clean
-    // day paper over an unreadable earlier one — closure passing on a burn-in
-    // period containing days that were never evaluated. Evidence must be
-    // contiguous from the start of the period, so the verdict stops at 07-31.
+    // 08-06 is clean, but 08-01 inside the same period is unreadable. A later
+    // clean day does not paper over an earlier unevaluable one.
     const assessment = evaluateBurnIn({
       snapshots: extendedSnapshots({
         '2026-08-01': { runCount: 1, okRuns: 1, degradedRuns: 0, failedRuns: 0 },
@@ -284,7 +279,8 @@ describe('evaluateBurnIn — the burn-in period is a fixed window count (ENG-938
       releaseIssueId: 'ENG-SYNTHETIC',
     });
 
-    expect(assessment.postRelease?.date).toBe('2026-07-31');
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
   });
 
   it('is insufficient when the FIRST window of the period is unevaluable', () => {
@@ -320,9 +316,11 @@ describe('evaluateBurnIn — the burn-in period is a fixed window count (ENG-938
       releaseIssueId: 'ENG-SYNTHETIC',
     });
 
-    expect(assessment.verdict).toBe('clean');
-    expect(assessment.passesClosureCheck4).toBe(true);
-    expect(assessment.postRelease?.date).toBe('2026-08-06');
+    // The period keeps both ends, so the 08-07 regression is out of period and
+    // never read. The missing opening day is itself unread evidence, so the
+    // verdict fails closed rather than crediting the days that survived.
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
   });
 
   it('a date with NO snapshot row at all does not slide a later day into the period', () => {
@@ -340,9 +338,12 @@ describe('evaluateBurnIn — the burn-in period is a fixed window count (ENG-938
       releaseIssueId: 'ENG-SYNTHETIC',
     });
 
-    expect(assessment.verdict).toBe('clean');
-    expect(assessment.passesClosureCheck4).toBe(true);
-    expect(assessment.postRelease?.date).toBe('2026-08-06');
+    // 08-07 stays out of period (the clock, not row count, bounds it), and the
+    // missing 08-01 row leaves the period with an unread day, so the verdict is
+    // insufficient rather than a clean read of the rows that happen to exist.
+    expect(assessment.verdict).toBe('insufficient_data');
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.reason).toContain('2026-08-02');
   });
 
   it('is insufficient when no window inside the fixed period carries enough runs', () => {

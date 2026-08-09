@@ -390,17 +390,47 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
       return Number.isFinite(start) && start >= periodStartMs && start < periodEndMs;
     });
 
-    // Evidence must be CONTIGUOUS from the start of the period, not merely
-    // present somewhere in it. Dropping every below-`minRunCount` row and then
-    // crediting whatever clean row is left lets a later clean day paper over an
-    // earlier unevaluable one: closure passes on a burn-in period containing
-    // days nobody could read. Stopping at the first thin day truncates the
-    // credited period instead — a day we cannot evaluate ends the evidence, it
-    // does not get skipped over. If that leaves nothing, `scanned` is empty, the
-    // loop below never sets `latestClean`, and the existing `!latestClean` guard
-    // returns `insufficient` rather than reaching outside the period.
+    // Evidence must be CONTIGUOUS from the start of the period AND unbroken up
+    // to the last window read. Two weaker rules were tried and both produce a
+    // false green:
+    //
+    //   - dropping thin rows and crediting whatever clean row survives lets a
+    //     later clean day paper over an earlier unreadable one;
+    //   - truncating at the first thin day and crediting the clean prefix still
+    //     returns `clean` for a period that contains a day nobody could read.
+    //     "Days 1-2 were fine, day 3 was unreadable" is not evidence that the
+    //     release burned in — it is missing evidence, and closure check 4 must
+    //     fail closed on it.
+    //
+    // So an unreadable window inside the period — too few runs, or a row that
+    // was never written between two rows that were — makes the whole period
+    // unevaluable. Windows at the END of the period that have not happened yet
+    // are simply absent, not a gap: the period is still running, and the
+    // elapsed part of it remains fully readable.
     const firstThin = inPeriod.findIndex((snapshot) => snapshot.runCount < minRunCount);
-    const scanned = firstThin === -1 ? inPeriod : inPeriod.slice(0, firstThin);
+    if (firstThin !== -1) {
+      return insufficient(
+        `Cannot evaluate burn-in for ${input.releaseIssueId}: ${inPeriod[firstThin].date} lies inside the ` +
+          `burn-in period but recorded ${inPeriod[firstThin].runCount} runs, below the ${minRunCount} ` +
+          'required for its rates to mean anything. A period containing a day nobody can read is missing ' +
+          'evidence, not a clean burn-in — earlier clean days do not cover for it.',
+        { ...ctx, baseline },
+      );
+    }
+
+    const gapIndex = inPeriod.findIndex(
+      (snapshot, i) => boundaryMs(snapshot.windowStart) !== periodStartMs + i * BURN_IN_WINDOW_MS,
+    );
+    if (gapIndex !== -1) {
+      return insufficient(
+        `Cannot evaluate burn-in for ${input.releaseIssueId}: the burn-in period is missing the snapshot ` +
+          `window that should precede ${inPeriod[gapIndex].date}. A day of the period with no row at all is ` +
+          'unread, so the windows after it cannot stand in for it.',
+        { ...ctx, baseline },
+      );
+    }
+
+    const scanned = inPeriod;
 
     // AC3's no-blending rule applies to the rows this verdict READS: the
     // baseline and the scanned burn-in windows. Demanding a 24h/7d pair across
