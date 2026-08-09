@@ -185,4 +185,55 @@ describe('ENG-953 — GET /api/org/me projection', () => {
       expect(body).not.toContain(secret);
     }
   });
+
+  // --- boundary + invalid-input coverage for the collection branches (Greptile) ---
+
+  it('legacy record with no collections: fields are absent, nothing crashes', async () => {
+    delete mockOrgs['org-1'].connected_accounts;
+    delete mockOrgs['org-1'].pendingInvites;
+    delete mockOrgs['org-1'].pendingDomainJoinRequests;
+    const res = await request(app).get('/api/org/me');
+    expect(res.status).toBe(200);
+    expect(res.body.data.connected_accounts).toBeUndefined();
+    expect(res.body.data.pendingInvites).toBeUndefined();
+    expect(res.body.data.pendingDomainJoinRequests).toBeUndefined();
+    expect(res.body.data.name).toBe('Acme');
+  });
+
+  it('empty collections stay empty rather than becoming undefined', async () => {
+    mockOrgs['org-1'].connected_accounts = [];
+    mockOrgs['org-1'].pendingInvites = [];
+    const res = await request(app).get('/api/org/me');
+    expect(res.body.data.connected_accounts).toEqual([]);
+    expect(res.body.data.pendingInvites).toEqual([]);
+  });
+
+  it('FAILS CLOSED: a non-array connected_accounts is dropped, not passed through', async () => {
+    // A malformed/legacy record shaped as an object must not bypass the
+    // sanitizer. Passing the raw value through would re-open the disclosure.
+    mockOrgs['org-1'].connected_accounts = {
+      google: { config: { access_token: 'ya29.a0-super-secret-access-token' } },
+    } as any;
+    const res = await request(app).get('/api/org/me');
+    expect(res.body.data.connected_accounts).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain('ya29.a0-super-secret-access-token');
+  });
+
+  it('FAILS CLOSED: non-array invite collections are dropped, tokens never leak', async () => {
+    mockOrgs['org-1'].pendingInvites = { a: { inviteToken: 'invite-token-abc123' } } as any;
+    mockOrgs['org-1'].pendingDomainJoinRequests = 'corrupt' as any;
+    const res = await request(app).get('/api/org/me');
+    expect(res.body.data.pendingInvites).toBeUndefined();
+    expect(res.body.data.pendingDomainJoinRequests).toBeUndefined();
+    expect(JSON.stringify(res.body)).not.toContain('invite-token-abc123');
+  });
+
+  it('tolerates null entries inside the collections', async () => {
+    mockOrgs['org-1'].pendingInvites = [null, { email: 'x@y.com', invitedAt: 'now', inviteToken: 'invite-token-abc123' }] as any;
+    const res = await request(app).get('/api/org/me');
+    expect(res.status).toBe(200);
+    expect(res.body.data.pendingInvites).toHaveLength(2);
+    expect(res.body.data.pendingInvites[1].email).toBe('x@y.com');
+    expect(JSON.stringify(res.body)).not.toContain('invite-token-abc123');
+  });
 });

@@ -166,25 +166,33 @@ function projectOrgForMemberResponse(org: any): Record<string, any> {
     shareAnalyticsWithOrg: org.shareAnalyticsWithOrg,
     orgMemoryEnabled: org.orgMemoryEnabled,
 
+    // Each collection FAILS CLOSED on a non-array. Passing the raw value
+    // through on `else` would have re-opened the exact hole this function
+    // closes: a malformed or legacy record whose `connected_accounts` is an
+    // object rather than an array would bypass the sanitizer and ship its
+    // tokens verbatim. `undefined` serializes away, so a legacy record with the
+    // field absent and a malformed record with a junk value both render as
+    // "no accounts" rather than as a disclosure. (Greptile flagged these
+    // branches as untested; they were also wrong.)
     connected_accounts: Array.isArray(org.connected_accounts)
       ? org.connected_accounts.map(sanitizeConnectedAccountForOrgResponse)
-      : org.connected_accounts,
+      : undefined,
 
     pendingInvites: Array.isArray(org.pendingInvites)
       ? org.pendingInvites.map((invite: any) => ({
-          email: invite.email,
-          invitedAt: invite.invitedAt,
-          invitedBy: invite.invitedBy,
+          email: invite?.email,
+          invitedAt: invite?.invitedAt,
+          invitedBy: invite?.invitedBy,
         }))
-      : org.pendingInvites,
+      : undefined,
 
     pendingDomainJoinRequests: Array.isArray(org.pendingDomainJoinRequests)
       ? org.pendingDomainJoinRequests.map((r: any) => ({
-          userId: r.userId,
-          email: r.email,
-          requestedAt: r.requestedAt,
+          userId: r?.userId,
+          email: r?.email,
+          requestedAt: r?.requestedAt,
         }))
-      : org.pendingDomainJoinRequests,
+      : undefined,
 
     // `secrets` is deliberately absent and must stay absent.
   };
