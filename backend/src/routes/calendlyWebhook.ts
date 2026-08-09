@@ -44,6 +44,13 @@ const router = express.Router();
 
 const QUEUE_SOURCE = 'calendly_webhook';
 
+/** Small delay helper — only used by runStepOnce's done-marker backoff below (matching
+ *  calendlyWebhookCleanupQueue.ts's recordOrphanedCalendlyWebhook), injectable so tests
+ *  never actually sleep. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ── CRM-forward: target-list resolution ─────────────────────────────────
 //
 // A customer's booking gets created/updated as a lead in one of their own
@@ -420,7 +427,7 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
       // above), and a retry that finds it still stuck tries again.
       const runStepOnce = async (step: 'hubspot' | 'attio' | 'alert', work: () => Promise<void>): Promise<void> => {
         const key = stepMarkerKey(step);
-        if (leadSystemMarkers[key]?.status === 'done') return;
+        if (leadSystemMarkers[key]?.status === 'done' || leadSystemMarkers[key]?.status === 'done_unconfirmed') return;
         const claimed = await crmDb.claimLeadStepOnce(listId!, lead.leadId, key);
         if (!claimed) {
           throw new Error(`${step} step for ${payload.uri} could not be claimed (held by another run) — retrying to confirm completion`);
@@ -441,23 +448,56 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
         // writing the 'done' marker is NOT the same failure as work() itself failing, but
         // the previous version caught both in one handler and released the claim either
         // way. Releasing here would make the step look unclaimed again, so a future retry
-        // repeats the already-successful HubSpot/Attio sync or customer alert — a real
-        // customer-facing duplicate, not just a bookkeeping gap. Retry the marker write
-        // once (same pattern as every other write in this file); if it still fails, leave
-        // the claim exactly as it is (still 'in_progress', NOT released) rather than ever
-        // letting this step run again — a marker that needs manual correction is
-        // recoverable, a duplicated side effect is not.
+        // repeats the already-successful HubSpot/Attio sync or customer alert.
+        const writeMarker = (status: 'done' | 'done_unconfirmed') =>
+          crmDb.setLeadFields(listId!, lead.leadId, { system: { [key]: { status } } });
+
+        // Greptile P1 on #2291 (second pass): merely leaving the claim 'in_progress'
+        // (not released) is NOT enough — claimLeadStepOnce's own staleness window
+        // (CLAIM_STALE_MS) reclaims any 'in_progress' claim once it's old enough,
+        // with no way to tell "the original claimant crashed before work() ran" (safe
+        // to redo) apart from "work() succeeded but we could never confirm it" (must
+        // never be redone). A stale-but-unreleased claim from THIS branch would
+        // eventually become reclaimable and repeat the already-successful side effect
+        // — exactly the bug this whole section exists to prevent, just delayed by up
+        // to 5 minutes instead of happening immediately.
+        //
+        // Fixed two ways: (1) a short backoff-retry (matching
+        // calendlyWebhookCleanupQueue.ts's recordOrphanedCalendlyWebhook — this path is
+        // never latency-sensitive, it runs after the 200 ack) gives 'done' three real
+        // chances to land instead of two. (2) If all three still fail, write a
+        // DIFFERENT terminal status, 'done_unconfirmed', instead of leaving 'in_progress'
+        // — claimLeadStepOnce's staleness condition only ever matches status
+        // 'in_progress', so this status can never be reclaimed via that path, and the
+        // guard at the top of this function treats it exactly like 'done'. The step can
+        // now never run twice, even if we can never confirm the marker cleanly.
         leadSystemMarkers[key] = { status: 'done' };
-        const writeMarker = () => crmDb.setLeadFields(listId!, lead.leadId, { system: { [key]: { status: 'done' } } });
-        try {
-          await writeMarker();
-        } catch (firstErr: any) {
+        const backoffMs = [0, 200, 600];
+        let markerWritten = false;
+        for (let attempt = 0; attempt < backoffMs.length; attempt++) {
+          if (backoffMs[attempt] > 0) await delay(backoffMs[attempt]);
           try {
-            await writeMarker();
-          } catch (secondErr: any) {
+            await writeMarker('done');
+            markerWritten = true;
+            break;
+          } catch (err: any) {
+            if (attempt === backoffMs.length - 1) {
+              console.warn(
+                `[Calendly Webhook] ${step} succeeded for ${payload.uri} but its done-marker write failed after ${backoffMs.length} attempts — falling back to a terminal marker so this step can never repeat:`,
+                err?.message ?? err,
+              );
+            }
+          }
+        }
+
+        if (!markerWritten) {
+          leadSystemMarkers[key] = { status: 'done_unconfirmed' };
+          try {
+            await writeMarker('done_unconfirmed');
+          } catch (finalErr: any) {
             console.error(
-              `[Calendly Webhook] ${step} succeeded for ${payload.uri} but its done-marker write failed twice — leaving the claim in place (not releasing) to avoid repeating the side effect; needs manual correction:`,
-              secondErr?.message ?? secondErr,
+              `[Calendly Webhook] ${step} succeeded for ${payload.uri} but EVERY attempt to durably record it failed — the claim remains 'in_progress' and could eventually be reclaimed once stale, repeating this step. Needs immediate manual correction:`,
+              finalErr?.message ?? finalErr,
             );
           }
         }
