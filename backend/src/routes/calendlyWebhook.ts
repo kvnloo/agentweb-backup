@@ -427,14 +427,39 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
         }
         try {
           await work();
-          leadSystemMarkers[key] = { status: 'done' };
-          await crmDb.setLeadFields(listId!, lead.leadId, { system: { [key]: { status: 'done' } } });
         } catch (err: any) {
+          // work() itself threw — the real side effect did NOT happen, so releasing the
+          // claim and letting a future retry redo it from scratch is correct here.
           const release = () => crmDb.setLeadFields(listId!, lead.leadId, { removeSystemKeys: [key] });
           await release().catch(() => release().catch((releaseErr: any) => {
             console.error(`[Calendly Webhook] Failed to release ${step} claim for ${payload.uri} after retry — will self-heal once the claim goes stale:`, releaseErr?.message ?? releaseErr);
           }));
           throw err;
+        }
+
+        // Greptile P1 on #2291: work() has already succeeded at this point — a failure
+        // writing the 'done' marker is NOT the same failure as work() itself failing, but
+        // the previous version caught both in one handler and released the claim either
+        // way. Releasing here would make the step look unclaimed again, so a future retry
+        // repeats the already-successful HubSpot/Attio sync or customer alert — a real
+        // customer-facing duplicate, not just a bookkeeping gap. Retry the marker write
+        // once (same pattern as every other write in this file); if it still fails, leave
+        // the claim exactly as it is (still 'in_progress', NOT released) rather than ever
+        // letting this step run again — a marker that needs manual correction is
+        // recoverable, a duplicated side effect is not.
+        leadSystemMarkers[key] = { status: 'done' };
+        const writeMarker = () => crmDb.setLeadFields(listId!, lead.leadId, { system: { [key]: { status: 'done' } } });
+        try {
+          await writeMarker();
+        } catch (firstErr: any) {
+          try {
+            await writeMarker();
+          } catch (secondErr: any) {
+            console.error(
+              `[Calendly Webhook] ${step} succeeded for ${payload.uri} but its done-marker write failed twice — leaving the claim in place (not releasing) to avoid repeating the side effect; needs manual correction:`,
+              secondErr?.message ?? secondErr,
+            );
+          }
         }
       };
 
