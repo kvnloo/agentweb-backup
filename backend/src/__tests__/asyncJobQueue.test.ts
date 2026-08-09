@@ -249,7 +249,11 @@ describe('asyncJobQueue', () => {
     // no other durable store to fall back to (connectedAccounts.ts persisting a
     // rotated Calendly refresh token) had no way to know this best-effort write also
     // failed. Now resolves false so the caller can react.
-    it('does not throw, but resolves false, when the write fails on both the attempt and the retry, and logs loudly', async () => {
+    //
+    // Greptile P1 on #2291 (fourth pass): bumped from a single retry (2 attempts) to
+    // a 3-attempt backoff, matching recordOrphanedCalendlyWebhook's pattern for the
+    // same rotated-token scenario.
+    it('does not throw, but resolves false, when the write fails on all 3 backoff attempts, and logs loudly', async () => {
       mockDocumentClientMethods.update.mockReturnValue({
         promise: jest.fn().mockRejectedValue(new Error('down')),
       });
@@ -257,7 +261,7 @@ describe('asyncJobQueue', () => {
 
       await expect(updateJobPayload('calendly_webhook_cleanup', 'id-1', { any: 'payload' })).resolves.toBe(false);
 
-      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(3);
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('updateJobPayload failed'), expect.anything());
 
       errorSpy.mockRestore();
@@ -628,6 +632,32 @@ describe('asyncJobQueue', () => {
       stop();
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+    });
+
+    // Greptile P1 on #2291 (fourth pass): a double-failure here used to be swallowed
+    // silently — every OTHER write in this file logs loudly on double-failure, this
+    // one was the one inconsistency. Doesn't change the accepted, bounded race itself
+    // (claimLeadStepOnce is the actual mutex), but sustained heartbeat failures — the
+    // precondition for that race — deserve to be visible, not silent.
+    it('logs a warning (does not silently swallow) when a beat fails on both the attempt and the retry', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('dynamo down')),
+      });
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const stop = startHeartbeat('calendly_webhook', 'invitee-123');
+
+      jest.advanceTimersByTime(15_000);
+      await Promise.resolve();
+      await Promise.resolve();
+      stop();
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Heartbeat failed twice in a row for job calendly_webhook_invitee-123'),
+        expect.anything(),
+      );
+
+      warnSpy.mockRestore();
     });
   });
 });

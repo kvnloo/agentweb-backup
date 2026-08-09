@@ -1277,7 +1277,10 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       const res = await postSigned(body);
 
       expect(res.status).toBe(200);
-      await waitReal(1000);
+      // Both the 'done' (3 attempts, up to 800ms backoff) and 'done_unconfirmed' (3 more
+      // attempts, up to another 800ms) phases run their full backoff in this total-failure
+      // case — needs more real wall-clock time than the two-tier-success sibling tests.
+      await waitReal(2000);
 
       expect(mockAutoSyncLead.mock.calls.filter((c: any) => c[3] === 'hubspot')).toHaveLength(1);
       // Still never released, even in the total-failure case — releasing is the one thing
@@ -1285,6 +1288,15 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       expect(mockSetLeadFields).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), {
         removeSystemKeys: [`hubspotSynced::${uri}`],
       });
+      // Both the 'done' and 'done_unconfirmed' backoff sequences ran their full 3 attempts.
+      const doneAttempts = mockSetLeadFields.mock.calls.filter(
+        (c: any) => c[2]?.system?.[`hubspotSynced::${uri}`]?.status === 'done',
+      );
+      const unconfirmedAttempts = mockSetLeadFields.mock.calls.filter(
+        (c: any) => c[2]?.system?.[`hubspotSynced::${uri}`]?.status === 'done_unconfirmed',
+      );
+      expect(doneAttempts).toHaveLength(3);
+      expect(unconfirmedAttempts).toHaveLength(3);
       expect(errorSpy).toHaveBeenCalledWith(
         expect.stringContaining('EVERY attempt to durably record it failed'),
         expect.anything(),
