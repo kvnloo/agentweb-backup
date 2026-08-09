@@ -95,10 +95,20 @@ const ADMIN_SKILL_TOOL_NAMES = ['manage_linear_governance_label', 'manage_predef
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
 const MAX_TOOL_CONTENT_SIZE = 300_000;
 
+// Floor above which trimToolMessagesForContext compresses an OLD tool result down to a
+// 200-char preview (per-tool allowances in LARGE_TOOL_RESULT_LIMIT may raise it, never lower it).
+export const CONTEXT_TRIM_TOOL_CONTENT_LIMIT = 8_000;
+
 // Threshold above which a tool response is saved in full to S3 so the LLM can search it later.
-// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed 8KB context-trim limit and
+// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed the context-trim limit and
 // get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
 // to retrieve specific fields from the original payload without needing the full text in context.
+//
+// ENG-940: this MUST stay at (or below) the context-trim floor. It used to be 10_000 while the
+// trim floor was 8_000, which opened a dead zone: a response of 8,000–10,000 chars was big enough
+// to be compressed to a 200-char preview on the next turn, yet too small to be offloaded — so the
+// payload was destroyed with no S3 key to recover it. A Daily PR Digest run lost its entire
+// get_pr_digest payload (~8,981 chars) that way and nearly reported fabricated PR details.
 
 // extractToolContent now lives in ../utils/extractToolContent (pure, monolith-free)
 // so the tool-output contract validator and the toolDispatch unit suite can wire
@@ -106,6 +116,7 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 // existing `from '../services/agentModeService'` importers are unaffected.
 export { extractToolContent } from '../utils/extractToolContent';
 import { extractToolContent } from '../utils/extractToolContent';
+import { extractToolResponseS3Ref } from '../utils/toolResponseS3Ref';
 
 /**
  * Normalize a video timecode to a numeric number of seconds.
@@ -149,7 +160,7 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 // re-exported so any importer of the old path keeps working.
 export { normalizeMetaCampaignIds };
 
-const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
+export const TOOL_RESPONSE_S3_THRESHOLD = CONTEXT_TRIM_TOOL_CONTENT_LIMIT;
 
 // Max output tokens for agent-mode LLM turns. Must be large enough to hold a
 // single big tool-call argument (e.g. create_html_file's content_draft, which
@@ -22332,7 +22343,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'update_html_file': { fields: ['html_content', 'css_content'], limit: 200 },
   };
 
-  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
+  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = CONTEXT_TRIM_TOOL_CONTENT_LIMIT): any[] {
     // Single linear scan: collect tool-role indices and map each tool_call_id to
     // the index of its (first) resolving tool message. This map replaces the
     // original per-assistant nested forward scan (O(n^2) per call) with O(1)
@@ -22388,9 +22399,16 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       ) {
         const limit = AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
         if (msg.content.length > limit) {
+          // ENG-940: an offloaded response carries its "[Full response stored at S3 key: …]"
+          // header at the very front. Preview it separately from the header, otherwise the
+          // 200-char slice spends its whole budget on (and can cut in half) the only key that
+          // lets search_tool_response / read_tool_response recover the payload.
+          const s3Ref = extractToolResponseS3Ref(msg.content);
+          const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
-          const preview = msg.content.slice(0, 200).replace(/\n/g, ' ').trim();
-          return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
+          const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
+          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }
 

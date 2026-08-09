@@ -29,6 +29,7 @@ import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
+import { buildToolResponseS3Header } from '../../../utils/toolResponseS3Ref';
 // OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
 // exporter env config (spans become no-ops), so they don't entangle the module
 // or affect the characterization contract — telemetry only, never behavior.
@@ -917,7 +918,7 @@ export async function executePreparedTools(
             `tool-responses/${sessionId}`,
           );
           if (uploadResult.success && uploadResult.key) {
-            const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
+            const header = buildToolResponseS3Header(uploadResult.key, toolContent.length);
             const preview = toolContent.length > S3_IN_MEMORY_CAP
               ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
               : toolContent;
