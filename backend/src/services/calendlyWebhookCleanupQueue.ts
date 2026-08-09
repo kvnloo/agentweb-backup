@@ -33,6 +33,12 @@ function orphanId(userId: string, userUri: string): string {
   return `${userId}_${userUri}`;
 }
 
+/** Small delay helper — only used by recordOrphanedCalendlyWebhook's backoff below,
+ *  injectable so tests never actually sleep. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Last-resort durable record of a webhook_id that couldn't be deleted remotely AND
  * couldn't be durably enqueued for cleanup retry — Greptile P1 on #2291 (round 16):
@@ -41,21 +47,37 @@ function orphanId(userId: string, userUri: string): string {
  * a genuinely separate table, so the fallback has a real chance of succeeding when
  * the queue table specifically (not DynamoDB broadly) is the problem.
  *
- * Best-effort: if even this write fails, there is nowhere else left to record it —
- * logs loudly and gives up, exactly like the queue-enqueue exhaustion case above.
+ * Greptile P1 on #2291 (round 23): this is the ABSOLUTE last resort — by the time
+ * this is called, the queue enqueue already failed (twice). Every other durable
+ * write in this session's work retries at least once; this one had none at all,
+ * purely an oversight. Since this call sits on a rare, latency-tolerant path
+ * (disconnect/rollback failure recovery, never a webhook response), it can afford
+ * a few retries with backoff rather than the single-retry pattern used on hot
+ * paths — every extra attempt here is one more chance to avoid the truly
+ * unrecoverable "nowhere left to write this" outcome.
  */
 export async function recordOrphanedCalendlyWebhook(userId: string, userUri: string, webhookId: string, refreshToken?: string): Promise<void> {
-  try {
-    await dynamodb.put({
+  const attemptWrite = () =>
+    dynamodb.put({
       TableName: ORPHANED_WEBHOOKS_TABLE,
       Item: { id: orphanId(userId, userUri), userId, userUri, webhookId, refreshToken, createdAt: new Date().toISOString() },
     }).promise();
-    console.error(`[Calendly] Recorded orphaned webhook ${webhookId} in the fallback durable store (async job queue was unavailable) — a later reconnect for this identity will find and clean it up`);
-  } catch (err: any) {
-    console.error(
-      `[Calendly] LOST webhook cleanup record for ${webhookId} — both the async job queue and the fallback durable store are unavailable; this subscription can no longer be identified for cleanup and requires manual intervention`,
-      err?.message ?? err,
-    );
+
+  const backoffMs = [0, 200, 600];
+  for (let attempt = 0; attempt < backoffMs.length; attempt++) {
+    if (backoffMs[attempt] > 0) await delay(backoffMs[attempt]);
+    try {
+      await attemptWrite();
+      console.error(`[Calendly] Recorded orphaned webhook ${webhookId} in the fallback durable store (async job queue was unavailable) — a later reconnect for this identity will find and clean it up`);
+      return;
+    } catch (err: any) {
+      if (attempt === backoffMs.length - 1) {
+        console.error(
+          `[Calendly] LOST webhook cleanup record for ${webhookId} — both the async job queue and the fallback durable store are unavailable after ${backoffMs.length} attempts; this subscription can no longer be identified for cleanup and requires manual intervention`,
+          err?.message ?? err,
+        );
+      }
+    }
   }
 }
 
