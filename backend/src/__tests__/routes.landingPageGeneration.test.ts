@@ -1569,6 +1569,50 @@ describe("POST /api/landing-pages/v0/generated/:id/duplicate", () => {
     expect(mockGetLeadListsForUser).toHaveBeenCalledWith("test-user-id");
     expect(mockGenerateLandingPage.mock.calls[0][4]).toBe("default-list-1");
   });
+
+  // ENG-967: /generate enables public access on the list it binds; duplicate bound one
+  // and stopped there, so the copy's form 403'd on every submission at forward-lead.
+  it("FAIL CASE (ENG-967): a carried-over private list is made publicly submittable before the copy is generated", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGetLeadListById.mockResolvedValue({ id: "list-original", publicAccessEnabled: false });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateLeadList).toHaveBeenCalledWith("list-original", { publicAccessEnabled: true });
+  });
+
+  it("SUCCESS (ENG-967): an already-public carried-over list is not re-written", async () => {
+    mockGetLandingPageById.mockResolvedValueOnce({
+      id: "page-1",
+      userId: "test-user-id",
+      name: "Original",
+      prompt: "Build a page",
+      status: "deployed",
+      iterations: 0,
+      leadListId: "list-original",
+    });
+    mockGetLeadListById.mockResolvedValue({ id: "list-original", publicAccessEnabled: true });
+    mockGenerateLandingPage.mockResolvedValueOnce({ id: "page-2", status: "draft" });
+
+    const res = await request(app)
+      .post("/api/landing-pages/v0/generated/page-1/duplicate")
+      .send({ name: "Copy" });
+
+    expect(res.status).toBe(201);
+    expect(mockUpdateLeadList).not.toHaveBeenCalled();
+  });
 });
 
 // =============================================================================
