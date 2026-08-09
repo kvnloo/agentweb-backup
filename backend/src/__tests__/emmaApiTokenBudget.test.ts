@@ -13,9 +13,12 @@
 import express from 'express';
 import request from 'supertest';
 
+// Mutable so a test can simulate authenticateToken letting a request through
+// without populating req.user — the branch the middleware fails closed on.
+let mockAuthUser: any;
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
-    req.user = { userId: 'user-1', email: 'u@example.com', isAdmin: false };
+    if (mockAuthUser) req.user = mockAuthUser;
     next();
   },
 }));
@@ -63,6 +66,7 @@ const UNDER_QUOTA = { ...OVER_QUOTA, allowed: true, warning: false, used: 10, pe
 describe('ENG-973: /api/emma/* enforces the monthly token quota', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockAuthUser = { userId: 'user-1', email: 'u@example.com', isAdmin: false };
     mockScanPromise.mockResolvedValue({ Items: [] });
     mockGenerateImage.mockResolvedValue({ url: 'https://example.com/i.png' });
     mockGetBookContent.mockResolvedValue({ content: 'chapter one' });
@@ -125,6 +129,46 @@ describe('ENG-973: /api/emma/* enforces the monthly token quota', () => {
     // No second, divergent quota rule — enforcement calls the one existing gate
     // with the authenticated user, and resolveBillingUserId does the rest.
     expect(mockCheckTokenUsage).toHaveBeenCalledWith('user-1');
+  });
+
+  // ── The two fail-closed branches (Greptile P2 on #2298) ───────────────────
+  // These are the branches most likely to rot into fail-open, because nothing
+  // exercises them in normal operation. Untested, "fails closed" is a comment
+  // rather than a property.
+
+  it('fails closed on an unattributable request: no req.user means no spend', async () => {
+    mockAuthUser = undefined; // auth middleware let it through without a user
+    mockCheckTokenUsage.mockResolvedValue(UNDER_QUOTA);
+
+    const res = await request(app).post('/api/emma/generate-image').send({ prompt: 'a cat' });
+
+    expect(res.status).toBe(401);
+    expect(mockGenerateImage).not.toHaveBeenCalled();
+    // Never quietly bill or bypass: an unattributable caller is refused before
+    // the meter is even consulted.
+    expect(mockCheckTokenUsage).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the meter itself errors, rather than letting the call through', async () => {
+    mockCheckTokenUsage.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+    const res = await request(app).post('/api/emma/generate-image').send({ prompt: 'a cat' });
+
+    // Surfaced as an error, not silently degraded into an allowed request —
+    // failing open here would restore the exact bypass this middleware closes.
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(mockGenerateImage).not.toHaveBeenCalled();
+  });
+
+  it('an exempt route still serves when the meter errors', async () => {
+    mockCheckTokenUsage.mockRejectedValue(new Error('DynamoDB unavailable'));
+
+    // Exempt routes never consult the meter, so a meter outage must not take
+    // the customer's own activity log down with it.
+    const res = await request(app).get('/api/emma/actions');
+
+    expect(res.status).toBe(200);
+    expect(mockCheckTokenUsage).not.toHaveBeenCalled();
   });
 });
 
