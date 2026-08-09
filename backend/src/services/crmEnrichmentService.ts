@@ -452,11 +452,54 @@ export class CrmEnrichmentService {
     return false;
   }
 
+  /**
+   * Reserved / filler domains that belong to no real company. Base names only —
+   * `isPlaceholderDomain` also matches their subdomains.
+   */
+  private static readonly PLACEHOLDER_DOMAINS = new Set([
+    // RFC 2606 reserved second-level names
+    'example.com', 'example.net', 'example.org', 'example.edu', 'example.co',
+    // Canonical filler addresses people type into test/seed rows
+    'company.com', 'yourcompany.com', 'mycompany.com', 'thecompany.com',
+    'domain.com', 'yourdomain.com', 'mydomain.com',
+    'test.com', 'testing.com', 'sample.com', 'notarealdomain.com',
+    // Our own QA domain (matches the onboarding stuck-detector filter)
+    'agenttest.com',
+    'localhost',
+  ]);
+
+  /**
+   * True for reserved / placeholder / QA domains that can never be a real
+   * prospect's employer: RFC 2606 + 6761 reserved names (example.*, .test,
+   * .invalid, .localhost) and the canonical filler domains that show up in
+   * seeded test rows.
+   *
+   * ENG-968: these were treated as ordinary business domains, so junk rows like
+   * `queue-verify@example.com` and `test2@company.com` seeded firmographic
+   * lookups and came back with an invented company, funding_round and revenue.
+   * A couple of these bases (company.com, domain.com) do host real businesses;
+   * refusing to enrich them is the deliberate fail-closed trade — a not-found is
+   * recoverable, a fabricated funding round flowing into ICP scoring is not.
+   */
+  static isPlaceholderDomain(domain: string): boolean {
+    const d = domain.toLowerCase().trim().replace(/\.+$/, '');
+    if (!d) return false;
+    if (CrmEnrichmentService.PLACEHOLDER_DOMAINS.has(d)) return true;
+    // RFC 6761 reserved TLDs.
+    if (/\.(test|example|invalid|localhost)$/.test(d)) return true;
+    // Subdomains of a reserved/filler base (mail.example.com, corp.test.com).
+    for (const base of CrmEnrichmentService.PLACEHOLDER_DOMAINS) {
+      if (d.endsWith(`.${base}`)) return true;
+    }
+    return false;
+  }
+
   static isPersonalEmailDomain(email: string): boolean {
     const domain = (email.split('@')[1] || '').toLowerCase().trim();
     if (!domain) return false;
     if (CrmEnrichmentService.PERSONAL_EMAIL_DOMAINS.has(domain)) return true;
     if (CrmEnrichmentService.isInstitutionalDomain(domain)) return true;
+    if (CrmEnrichmentService.isPlaceholderDomain(domain)) return true;
     return false;
   }
 
@@ -465,6 +508,7 @@ export class CrmEnrichmentService {
     if (!d) return false;
     if (CrmEnrichmentService.PERSONAL_EMAIL_DOMAINS.has(d)) return true;
     if (CrmEnrichmentService.isInstitutionalDomain(d)) return true;
+    if (CrmEnrichmentService.isPlaceholderDomain(d)) return true;
     return false;
   }
 

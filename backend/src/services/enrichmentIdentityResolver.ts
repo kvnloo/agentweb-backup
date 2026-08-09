@@ -245,6 +245,21 @@ export async function resolveIdentity(
   // Email is normalized (trim+lowercase) once at entry so every downstream
   // dep sees the same cache key.
   let email = typeof lead.email === 'string' ? lead.email.trim().toLowerCase() : '';
+  // ENG-968: a reserved/filler address (queue-verify@example.com,
+  // test2@company.com) identifies nobody, yet as an anchor it still reaches
+  // every provider — sibling lookup pools other tenants' junk rows onto it, and
+  // the web-search tiers turn its domain into a plausible-looking company with
+  // an invented funding round and revenue. Drop it as an identity signal so the
+  // lead is resolvable only through a real one (linkedin / name+company) and
+  // otherwise trips the completeness gate below: a not-found the caller can see,
+  // instead of a fabrication indistinguishable from real data. The address stays
+  // on the lead — it is just never used to identify anyone.
+  const emailIsPlaceholder =
+    !!email && CrmEnrichmentService.isPlaceholderDomain(email.split('@')[1] || '');
+  if (emailIsPlaceholder) {
+    console.log(`${logTag} placeholder/test email domain — ignoring email as an identity signal`);
+    email = '';
+  }
   const linkedinUrl = typeof lead.linkedin === 'string' ? lead.linkedin.trim() : '';
   const hasName =
     typeof lead.firstName === 'string' && lead.firstName.trim() !== '' &&
@@ -843,6 +858,10 @@ export async function resolveIdentity(
     // otherwise "LinkedIn only" would still write the company discovered
     // while resolving the LinkedIn URL.
     if (input.excludePersistFields?.has(key)) continue;
+    // The lead's own address was dropped as an anchor above, so the usual
+    // "only fill an empty field" guard no longer protects it — an email found
+    // via another signal must not silently replace what the user imported.
+    if (key === 'email' && emailIsPlaceholder) continue;
     if (typeof value === 'string' && value.length > 0) {
       writableFields[key] = value;
     }
