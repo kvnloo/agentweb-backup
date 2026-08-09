@@ -25,6 +25,14 @@ module.exports = {
     // ever fails to register, resolution falls back here instead of the real SDK, so a test can
     // never silently make a live HTTP call to X's production API. See __mocks__/twitter-api-v2.ts.
     '^twitter-api-v2$': '<rootDir>/__mocks__/twitter-api-v2.ts',
+    // @slack/web-api's real WebClient constructs an axios client at `new WebClient(...)` time,
+    // which throws under this project's jest/ts-jest/dependency combination (test-harness-only
+    // artifact — the same compiled code runs fine outside Jest). Every file that transitively
+    // imports slackService.ts (most of them, via agentModeService.ts) was crashing at
+    // module-load time regardless of whether it exercises Slack at all. Tests that actually
+    // test Slack behavior keep their own jest.mock('@slack/web-api', ...), which takes
+    // precedence over this. See __mocks__/slack-web-api.ts.
+    '^@slack/web-api$': '<rootDir>/__mocks__/slack-web-api.ts',
   },
   collectCoverageFrom: [
     'src/utils/**/*.ts',

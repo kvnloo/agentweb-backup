@@ -4,7 +4,7 @@ import { userDb, User } from './db';
 // Type Definitions
 // ============================================
 
-export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive';
+export type PlatformType = 'linkedin' | 'unipile' | 'meta' | 'twitter' | 'instagram' | 'gmail' | 'outlook' | 'youtube' | 'fathom' | 'linkedin_ads' | 'hubspot' | 'attio' | 'google_ads' | 'google_drive' | 'calendly';
 
 /**
  * Base OAuth configuration shared across all platforms
@@ -286,7 +286,34 @@ export interface TwitterXConfig extends BaseOAuthConfig {
   needs_reconnect?: boolean; // set when token refresh fails (revoked/expired refresh token); cleared on reconnect
 }
 
-export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig;
+/**
+ * Calendly OAuth configuration (ENG-524).
+ *
+ * `booking_tracking_active` is false when the connecting account's Calendly plan
+ * doesn't support webhooks (Free tier) — OAuth still succeeds and the account is
+ * stored, but no `webhook_id`/`webhook_signing_key` exist and no booking events
+ * will ever arrive. Distinct from `needs_reconnect`, which means the OAuth grant
+ * itself is broken; this means the grant is fine but the plan doesn't qualify.
+ */
+export interface CalendlyConfig extends BaseOAuthConfig {
+  account_type: 'calendly';
+  email?: string;             // From /users/me, used as account_id
+  display_name?: string;
+  user_uri: string;           // Calendly user URI — resolves the webhook scope
+  organization_uri: string;   // Calendly organization URI — required by the webhook subscription body regardless of scope
+  webhook_id?: string;        // Set only when booking_tracking_active is true
+  webhook_signing_key?: string; // HMAC secret WE generate and hand to Calendly at subscription-create time
+  booking_tracking_active: boolean;
+  needs_reconnect?: boolean;
+  // Which of the customer's own lead lists a booking gets created/updated in
+  // (CRM-forward, ENG-524 §6 step 4). Either set explicitly via Settings, or
+  // auto-resolved to an idempotent system-managed list on first booking and
+  // persisted here so every later delivery reuses it directly — see
+  // resolveOrCreateBookingList in calendlyWebhook.ts.
+  booking_lead_list_id?: string;
+}
+
+export type PlatformConfig = LinkedInConfig | LinkedInOutreachConfig | MetaConfig | GmailConfig | OutlookConfig | YouTubeConfig | FathomConfig | LinkedInAdsAdAccountConfig | HubSpotConfig | AttioConfig | GoogleAdsConfig | GoogleDriveConfig | TwitterXConfig | CalendlyConfig;
 
 /**
  * Per-connection engagement memory: a persona profile generated from LinkedIn data
@@ -701,6 +728,58 @@ export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<stri
   } catch (error) {
     console.error('Error resolving HubSpot Portal ID to User ID:', error);
     return null;
+  }
+};
+
+/**
+ * Find the user (and the specific connected account) that owns a given Calendly
+ * user_uri. Used by the incoming booking webhook (ENG-524) to resolve who a
+ * delivery belongs to. Matches on user_uri, not organization_uri — the webhook
+ * subscription is created with scope 'user' bound to a specific user_uri, and a
+ * real invitee.created payload carries no organization_uri at all (confirmed via
+ * a live test delivery), so organization_uri isn't usable as an anchor here.
+ * Returns every account alongside its userId (not just the userId, unlike
+ * getUserIdByHubSpotPortalId) since the caller needs each candidate's own
+ * config.webhook_signing_key immediately.
+ *
+ * ENG-994 (live-tested, #2291): this used to return only the FIRST matching
+ * account across ALL users, with no awareness of which tenant a given webhook
+ * delivery actually belongs to. Two different AgentWeb tenants can each
+ * independently connect the SAME underlying Calendly identity (same login,
+ * two separate webhook subscriptions) — confirmed live by creating a second
+ * tenant sharing a real connection's user_uri: whichever tenant this function
+ * happened to return first "won" resolution for EVERY delivery targeting that
+ * user_uri, and the other tenant's own genuinely-signed deliveries were
+ * silently dropped (no matching key ever attempted for them). DynamoDB scan
+ * order isn't guaranteed stable, so which tenant lost was arbitrary and could
+ * vary between individual deliveries. Returning every match lets the caller
+ * (calendlyWebhook.ts) try each candidate's own signing key against the
+ * signature, instead of committing to a single guess.
+ */
+export const getAccountsByCalendlyUserUri = async (
+  userUri: string
+): Promise<Array<{ userId: string; account: ConnectedAccountConfig }>> => {
+  try {
+    const { userDb } = await import('./db');
+    const users = await userDb.getAllUsers();
+    const matches: Array<{ userId: string; account: ConnectedAccountConfig }> = [];
+
+    for (const user of users) {
+      // normalizeAccounts (not a direct User.connected_accounts iteration, unlike
+      // getUserIdByHubSpotPortalId above) — db.ts's local connected_accounts type is a
+      // stale, narrower union that was never updated to include 'calendly' (or several
+      // other real platforms), separate from this file's richer ConnectedAccountConfig.
+      const accounts = normalizeAccounts((user as User).connected_accounts);
+      for (const account of accounts) {
+        if (account.platform === 'calendly' && (account.config as CalendlyConfig).user_uri === userUri) {
+          matches.push({ userId: user.userId, account });
+        }
+      }
+    }
+    return matches;
+  } catch (error) {
+    console.error('Error resolving Calendly user_uri to accounts:', error);
+    return [];
   }
 };
 

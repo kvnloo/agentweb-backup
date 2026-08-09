@@ -25,10 +25,26 @@ jest.mock('aws-sdk', () => ({
 }));
 
 // Mock axios
-jest.mock('axios', () => ({
-  get: jest.fn(),
-  post: jest.fn()
-}));
+// `create` matters even though this suite never calls it: when SLACK_BOT_TOKEN is
+// set in the environment, importing agentModeService constructs a Slack WebClient
+// at module load, which calls axios.create(). Without it the suite fails to load.
+jest.mock('axios', () => {
+  const instance = {
+    get: jest.fn(),
+    post: jest.fn(),
+    request: jest.fn(),
+    defaults: { headers: { common: {}, post: {} } },
+    interceptors: {
+      request: { use: jest.fn(), eject: jest.fn() },
+      response: { use: jest.fn(), eject: jest.fn() }
+    }
+  };
+  return {
+    get: jest.fn(),
+    post: jest.fn(),
+    create: jest.fn(() => instance)
+  };
+});
 
 // Mock crypto
 jest.mock('crypto', () => ({
@@ -165,7 +181,33 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(createLLMService).toHaveBeenCalledWith(
         'anthropic.claude-sonnet-4-6',
         0.8,
-        64000
+        64000,
+        expect.any(Object)
+      );
+    });
+
+    // ENG-873: the render is fetched with a NON-streaming ConverseCommand by
+    // default, which puts no bytes on the socket until the whole document is
+    // generated — so anything taking over five minutes trips the Bedrock
+    // client's socket-inactivity timeout deterministically, and retrying
+    // reproduces it. Streaming keeps the timer reset. This is the root-cause
+    // fix; the deterministic fallback below is only the backstop.
+    it('streams the render so a long generation cannot trip the inactivity timeout', async () => {
+      const { createLLMService } = require('../utils/llmService');
+
+      await (agentModeService as any).createHtmlFile(
+        'Test Title',
+        'Test content',
+        '',
+        'user123',
+        'session123'
+      );
+
+      expect(createLLMService).toHaveBeenCalledWith(
+        'anthropic.claude-sonnet-4-6',
+        0.8,
+        64000,
+        expect.objectContaining({ streaming: true })
       );
     });
 
@@ -200,10 +242,12 @@ describe('AgentModeService - createHtmlFile', () => {
       expect(result.error).toContain('S3 upload failed');
     });
 
-    it('should handle LLM generation errors', async () => {
+    // ENG-873: a render failure must no longer discard the draft. The draft is
+    // rendered deterministically instead, so the deliverable still exists.
+    it('degrades to a deterministic render when the LLM generation errors', async () => {
       mockGenerateHTML.mockRejectedValue(new Error('LLM API error'));
 
-      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+      const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
 
       const result = await (agentModeService as any).createHtmlFile(
         'Test Title',
@@ -213,17 +257,19 @@ describe('AgentModeService - createHtmlFile', () => {
         'session123'
       );
 
-      expect(result.success).toBe(false);
-      expect(result.message).toBe('Failed to create HTML file');
-      expect(result.error).toContain('LLM API error');
-      expect(consoleErrorSpy).toHaveBeenCalled();
+      expect(result.success).toBe(true);
+      expect(result.degraded).toBe(true);
+      expect(result.degraded_reason).toContain('LLM API error');
+      expect(result.s3_url).toBeDefined();
 
-      consoleErrorSpy.mockRestore();
+      consoleWarnSpy.mockRestore();
     });
 
-    it('should handle empty HTML content from LLM', async () => {
+    it('degrades to a deterministic render when the LLM returns empty content', async () => {
       mockGenerateHTML.mockResolvedValue('');
 
+      const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
       const result = await (agentModeService as any).createHtmlFile(
         'Test Title',
         'Test content',
@@ -232,13 +278,17 @@ describe('AgentModeService - createHtmlFile', () => {
         'session123'
       );
 
-      expect(result.success).toBe(false);
-      expect(result.message).toBe('Failed to create HTML file');
-      expect(result.error).toContain('LLM did not generate HTML content');
+      expect(result.success).toBe(true);
+      expect(result.degraded).toBe(true);
+      expect(result.degraded_reason).toContain('LLM did not generate HTML content');
+
+      consoleWarnSpy.mockRestore();
     });
 
-    it('should handle whitespace-only HTML content', async () => {
+    it('degrades to a deterministic render when the LLM returns whitespace-only content', async () => {
       mockGenerateHTML.mockResolvedValue('   \n\t  ');
+
+      const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
 
       const result = await (agentModeService as any).createHtmlFile(
         'Test Title',
@@ -248,9 +298,11 @@ describe('AgentModeService - createHtmlFile', () => {
         'session123'
       );
 
-      expect(result.success).toBe(false);
-      expect(result.message).toBe('Failed to create HTML file');
-      expect(result.error).toContain('LLM did not generate HTML content');
+      expect(result.success).toBe(true);
+      expect(result.degraded).toBe(true);
+      expect(result.degraded_reason).toContain('LLM did not generate HTML content');
+
+      consoleWarnSpy.mockRestore();
     });
 
     // ENG-203: the final HTML render is a single long-running LLM call that can
@@ -295,7 +347,7 @@ describe('AgentModeService - createHtmlFile', () => {
         // "invalid" is a terminal error — retrying the identical call is pointless.
         mockGenerateHTML.mockRejectedValue(new Error('invalid request payload'));
 
-        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
 
         const result = await (agentModeService as any).createHtmlFile(
           'Test Title',
@@ -305,14 +357,16 @@ describe('AgentModeService - createHtmlFile', () => {
           'session123'
         );
 
-        expect(result.success).toBe(false);
-        expect(result.error).toContain('invalid request payload');
         expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
+        // ENG-873: terminal or not, the draft is still delivered.
+        expect(result.success).toBe(true);
+        expect(result.degraded).toBe(true);
+        expect(result.degraded_reason).toContain('invalid request payload');
 
-        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
       });
 
-      it('gives up after exhausting retries on a persistent transient error', async () => {
+      it('stops retrying after exhausting attempts on a persistent transient error', async () => {
         const timeoutError = Object.assign(new Error('Connection timed out'), { name: 'TimeoutError' });
         mockGenerateHTML.mockRejectedValue(timeoutError);
 
@@ -327,15 +381,301 @@ describe('AgentModeService - createHtmlFile', () => {
           'session123'
         );
 
-        expect(result.success).toBe(false);
-        expect(result.error).toContain('timed out');
         expect(mockGenerateHTML).toHaveBeenCalledTimes(3);
+        expect(result.degraded).toBe(true);
+        expect(result.degraded_reason).toContain('timed out');
         // Exhaustion on a transient error is logged distinctly so it can be
         // separated from one-off blips and terminal errors (ENG-203 observability).
         expect(consoleErrorSpy).toHaveBeenCalledWith(
           expect.stringContaining('exhausted all 3 attempts on a transient error'),
           expect.anything()
         );
+
+        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
+      });
+    });
+
+    // ENG-873: a scheduled 40-competitor report completed 100% of its research and
+    // then lost the deliverable entirely — create_html_file timed out twice on a
+    // ~45K-char draft ("Stream timed out because of no activity for 300000 ms"),
+    // each attempt burning the full retry budget, and the session ended with no
+    // HTML report at all. A render timeout on a draft that large is a deterministic
+    // property of the payload, not a blip: re-running the same monolithic render
+    // spends another five minutes reaching the same failure. So the render stops
+    // retrying, and the completed draft is delivered as a deterministically
+    // rendered HTML document instead of being discarded.
+    describe('large-draft render timeout degrades gracefully (ENG-873)', () => {
+      // Between CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS (20K) and
+      // CREATE_HTML_RENDER_SINGLE_PASS_MAX_DRAFT_CHARS (24K): still rendered in
+      // one pass, but a timeout at this size is a property of the payload, so it
+      // must not be retried.
+      const largeDraft = `# Monthly Competitor Intelligence Report\n\n${'Competitor detail line.\n'.repeat(900)}`;
+
+      beforeEach(() => {
+        mockGenerateHTML.mockReset();
+        jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined);
+      });
+
+      const streamTimeout = () =>
+        new Error('Stream timed out because of no activity for 300000 ms');
+
+      it('does not retry the render after the first timeout on a large draft', async () => {
+        mockGenerateHTML.mockRejectedValue(streamTimeout());
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          largeDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
+
+        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
+      });
+
+      it('delivers the draft as a deterministically rendered HTML file instead of failing', async () => {
+        mockGenerateHTML.mockRejectedValue(streamTimeout());
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          largeDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.s3_url).toBeDefined();
+        expect(result.degraded).toBe(true);
+        expect(result.degraded_reason).toContain('timed out');
+        // The model must be told not to re-issue the identical call — a second
+        // monolithic attempt is what stranded the reported session.
+        expect(result.message).toMatch(/do not call create_html_file again/i);
+
+        // The uploaded file is a complete HTML document carrying the draft content.
+        const [uploadedContent, uploadedName, uploadedUser, uploadedType] =
+          mockUploadFileToS3.mock.calls[0];
+        expect(uploadedContent.startsWith('<!DOCTYPE html>')).toBe(true);
+        expect(uploadedContent).toContain('Monthly Competitor Intelligence Report');
+        expect(uploadedContent).toContain('Competitor detail line.');
+        expect(uploadedName).toMatch(/\.html$/);
+        expect(uploadedUser).toBe('user123');
+        expect(uploadedType).toBe('text/html');
+
+        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
+      });
+
+      it('reports a real failure when the fallback upload also fails', async () => {
+        mockGenerateHTML.mockRejectedValue(streamTimeout());
+        mockUploadFileToS3.mockResolvedValue({ success: false, error: 'S3 upload failed' });
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          largeDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(false);
+        expect(result.message).toBe('Failed to create HTML file');
+        expect(result.error).toContain('timed out');
+
+        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
+      });
+    });
+
+    describe('very large drafts render section by section (ENG-873)', () => {
+      // Over CREATE_HTML_RENDER_SINGLE_PASS_MAX_DRAFT_CHARS (24K): a single
+      // monolithic render at this size is all-or-nothing and times out
+      // deterministically in prod, so the draft is rendered in sections.
+      const section = (n: number) =>
+        `## Competitor ${n}\n\n${`Funding, headcount and recent news for competitor ${n}. `.repeat(120)}`;
+      const chunkedDraft = `# Monthly Competitor Intelligence Report\n\n${[1, 2, 3, 4, 5, 6]
+        .map(section)
+        .join('\n\n')}`;
+
+      beforeEach(() => {
+        mockGenerateHTML.mockReset();
+        jest.spyOn(agentModeService as any, 'sleep').mockResolvedValue(undefined);
+      });
+
+      const renderSectionsInOrder = () => {
+        let call = 0;
+        mockGenerateHTML.mockImplementation(async () => {
+          call += 1;
+          return `<h2>Rendered section ${call}</h2>`;
+        });
+      };
+
+      it('splits the draft across several render calls instead of one', async () => {
+        renderSectionsInOrder();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.degraded).toBeUndefined();
+        expect(mockGenerateHTML.mock.calls.length).toBeGreaterThan(1);
+
+        // Every section is asked for as a body FRAGMENT of the same document.
+        const [systemPrompt] = mockGenerateHTML.mock.calls[0];
+        expect(systemPrompt).toMatch(/fragment/i);
+        expect(systemPrompt).not.toContain('<!DOCTYPE');
+
+        // And the fragments are assembled into exactly one document.
+        const [uploadedContent] = mockUploadFileToS3.mock.calls[0];
+        expect(uploadedContent.match(/<!DOCTYPE html>/g)).toHaveLength(1);
+        expect(uploadedContent).toContain('Rendered section 1');
+        expect(uploadedContent).toContain(`Rendered section ${mockGenerateHTML.mock.calls.length}`);
+        expect(uploadedContent).toContain('<title>Monthly Competitor Intelligence Report</title>');
+      });
+
+      it('sends every part of the draft to exactly one section render', async () => {
+        renderSectionsInOrder();
+
+        await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        const sent = mockGenerateHTML.mock.calls.map(([, userPrompt]) => userPrompt).join('\n');
+        [1, 2, 3, 4, 5, 6].forEach((n) => {
+          expect(sent).toContain(`## Competitor ${n}`);
+        });
+      });
+
+      it('unwraps a full document returned for a section', async () => {
+        mockGenerateHTML.mockResolvedValue(
+          '<!DOCTYPE html><html><head><title>x</title></head><body><h2>Section body</h2></body></html>',
+        );
+
+        await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        const [uploadedContent] = mockUploadFileToS3.mock.calls[0];
+        expect(uploadedContent.match(/<!DOCTYPE html>/g)).toHaveLength(1);
+        expect(uploadedContent).not.toContain('<html><head>');
+        expect(uploadedContent).toContain('<h2>Section body</h2>');
+      });
+
+      it('keeps the single-pass render for a draft under the threshold', async () => {
+        mockGenerateHTML.mockResolvedValue(mockHtmlContent);
+
+        await (agentModeService as any).createHtmlFile(
+          'Small Report',
+          'Short draft.',
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
+      });
+
+      it('does not section an email — an email is one assembled layout', async () => {
+        mockGenerateHTML.mockResolvedValue(mockHtmlContent);
+
+        await (agentModeService as any).createHtmlFile(
+          'Monthly Newsletter',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123',
+          'email'
+        );
+
+        expect(mockGenerateHTML).toHaveBeenCalledTimes(1);
+      });
+
+      it('retries a section once on a transient failure', async () => {
+        let call = 0;
+        mockGenerateHTML.mockImplementation(async () => {
+          call += 1;
+          if (call === 1) throw new Error('Stream timed out because of no activity for 300000 ms');
+          return `<h2>Section ${call}</h2>`;
+        });
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.degraded).toBeUndefined();
+
+        consoleWarnSpy.mockRestore();
+      });
+
+      it('degrades to the deterministic document when a section keeps failing', async () => {
+        mockGenerateHTML.mockRejectedValue(
+          new Error('Stream timed out because of no activity for 300000 ms'),
+        );
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.success).toBe(true);
+        expect(result.degraded).toBe(true);
+        const [uploadedContent] = mockUploadFileToS3.mock.calls[0];
+        expect(uploadedContent.startsWith('<!DOCTYPE html>')).toBe(true);
+        // Nothing from the completed research is lost.
+        expect(uploadedContent).toContain('Competitor 6');
+
+        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
+      });
+
+      it('degrades when a section renders empty', async () => {
+        mockGenerateHTML.mockResolvedValue('   ');
+        const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation();
+        const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation();
+
+        const result = await (agentModeService as any).createHtmlFile(
+          'Monthly Competitor Intelligence Report',
+          chunkedDraft,
+          '',
+          'user123',
+          'session123'
+        );
+
+        expect(result.degraded).toBe(true);
 
         consoleErrorSpy.mockRestore();
         consoleWarnSpy.mockRestore();
