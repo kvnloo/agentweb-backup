@@ -310,6 +310,115 @@ describe('downloadBrandLogoToS3 (extracted from extractCSSFromURL — discrimina
     ).resolves.toEqual({ status: 'upload-failed', detail: 'AccessDenied' });
   });
 
+  // ENG-933: websites embed their logo as an .ico or .svg far more often than
+  // as a .png. Those used to be stored mislabelled (`logo.jpg` holding ICO
+  // bytes) or skipped outright, so the account ended up with no usable logo.
+  describe('non-raster logo formats are rasterised to PNG (ENG-933)', () => {
+    /** Minimal single-frame 32bpp BITMAPINFOHEADER icon, like the reported site's. */
+    const makeIco = (width: number, height: number): Buffer => {
+      const stride = width * 4;
+      const dib = Buffer.alloc(40 + stride * height);
+      dib.writeUInt32LE(40, 0);
+      dib.writeInt32LE(width, 4);
+      dib.writeInt32LE(height * 2, 8); // XOR image + AND mask
+      dib.writeUInt16LE(1, 12);
+      dib.writeUInt16LE(32, 14);
+      for (let i = 0; i < width * height; i++) {
+        const o = 40 + i * 4;
+        dib[o] = 0x99; // B
+        dib[o + 1] = 0x28; // G
+        dib[o + 2] = 0xec; // R
+        dib[o + 3] = 0xff; // A
+      }
+      const header = Buffer.alloc(22);
+      header.writeUInt16LE(1, 2); // type: icon
+      header.writeUInt16LE(1, 4); // one frame
+      header[6] = width % 256;
+      header[7] = height % 256;
+      header.writeUInt16LE(1, 10);
+      header.writeUInt16LE(32, 12);
+      header.writeUInt32LE(dib.length, 14);
+      header.writeUInt32LE(22, 18);
+      return Buffer.concat([header, dib]);
+    };
+
+    it('converts an ICO logo to PNG before pinning it to S3', async () => {
+      mockedAxiosGet.mockResolvedValue({
+        headers: { 'content-type': 'image/vnd.microsoft.icon' },
+        data: makeIco(4, 4),
+      });
+      s3Utils.uploadFileToS3WithPath.mockResolvedValue({
+        success: true,
+        url: 'https://s3/logo.png',
+      });
+
+      await expect(
+        downloadBrandLogoToS3('https://acme.com/assets/logo-abc.ico', 'u1'),
+      ).resolves.toEqual({ status: 'uploaded', url: 'https://s3/logo.png' });
+
+      const [buffer, filename, contentType, path] =
+        s3Utils.uploadFileToS3WithPath.mock.calls[0];
+      expect(filename).toBe('logo.png');
+      expect(contentType).toBe('image/png');
+      expect(path).toBe('users/u1/brand/logo');
+      const sharp = require('sharp');
+      await expect(sharp(buffer).metadata()).resolves.toMatchObject({
+        format: 'png',
+        width: 4,
+        height: 4,
+      });
+    });
+
+    it('rasterises an SVG logo to PNG instead of skipping it', async () => {
+      mockedAxiosGet.mockResolvedValue({
+        headers: { 'content-type': 'image/svg+xml' },
+        data: Buffer.from(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32">' +
+            '<rect width="32" height="32" fill="#ec4899"/></svg>',
+        ),
+      });
+      s3Utils.uploadFileToS3WithPath.mockResolvedValue({
+        success: true,
+        url: 'https://s3/logo.png',
+      });
+
+      await expect(
+        downloadBrandLogoToS3('https://acme.com/logo.svg', 'u1'),
+      ).resolves.toEqual({ status: 'uploaded', url: 'https://s3/logo.png' });
+
+      const [buffer, filename, contentType] =
+        s3Utils.uploadFileToS3WithPath.mock.calls[0];
+      expect(filename).toBe('logo.png');
+      expect(contentType).toBe('image/png');
+      const sharp = require('sharp');
+      await expect(sharp(buffer).metadata()).resolves.toMatchObject({ format: 'png' });
+    });
+
+    it('keeps the true extension when an ICO frame cannot be decoded', async () => {
+      // A palettised/compressed frame we refuse to guess at must still be
+      // stored as logo.ico — never as logo.jpg holding icon bytes.
+      const ico = makeIco(4, 4);
+      ico.writeUInt16LE(8, 22 + 14); // 8bpp: unsupported by the decoder
+      mockedAxiosGet.mockResolvedValue({
+        headers: { 'content-type': 'image/x-icon' },
+        data: ico,
+      });
+      s3Utils.uploadFileToS3WithPath.mockResolvedValue({
+        success: true,
+        url: 'https://s3/logo.ico',
+      });
+
+      await downloadBrandLogoToS3('https://acme.com/logo.ico', 'u1');
+
+      expect(s3Utils.uploadFileToS3WithPath).toHaveBeenCalledWith(
+        expect.any(Buffer),
+        'logo.ico',
+        'image/x-icon',
+        'users/u1/brand/logo',
+      );
+    });
+  });
+
   it('reports upload-failed when the S3 upload throws', async () => {
     mockedAxiosGet.mockResolvedValue({
       headers: { 'content-type': 'image/png' },
@@ -335,10 +444,11 @@ describe('ensureBrandLogoPersisted (deterministic onboarding step — AC-1)', ()
     classifyExisting: jest.fn().mockResolvedValue('usable' as const),
   });
 
-  it('skips when a logo is already persisted AND still loads (Emma did her job)', async () => {
+  it('skips when a logo ASSET is already persisted AND still loads (Emma did her job)', async () => {
     const deps = baseDeps();
     deps.resolveBrand.mockResolvedValue({
       brandData: { logoUrl: 'https://s3/already.png' },
+      attachments: [{ type: 'logo', url: 'https://s3/already.png' }],
     });
 
     const out = await ensureBrandLogoPersisted('u1', 'https://acme.com', deps);
@@ -351,6 +461,54 @@ describe('ensureBrandLogoPersisted (deterministic onboarding step — AC-1)', ()
     expect(deps.classifyExisting).toHaveBeenCalledWith('https://s3/already.png');
     expect(deps.discoverLogoUrl).not.toHaveBeenCalled();
     expect(deps.persist).not.toHaveBeenCalled();
+  });
+
+  it('pins brandData.logoUrl as a brand ASSET when Emma left no attachment (ENG-933)', async () => {
+    // The reported account: Emma wrote brandData.logoUrl (the site's .ico) and
+    // no asset, so Brand Guidelines' "Logo & Assets" card showed "No logos
+    // uploaded". A structurally-present logoUrl used to short-circuit this
+    // step, so the asset was never created.
+    const deps = baseDeps();
+    deps.resolveBrand.mockResolvedValue({
+      brandData: { logoUrl: 'https://acme.com/assets/logo-abc.ico' },
+      attachments: [],
+    });
+
+    const out = await ensureBrandLogoPersisted('u1', 'https://acme.com', deps);
+
+    // Emma already found the logo — pin THAT URL, don't re-scrape the site.
+    expect(deps.discoverLogoUrl).not.toHaveBeenCalled();
+    expect(deps.download).toHaveBeenCalledWith(
+      'https://acme.com/assets/logo-abc.ico',
+      'u1',
+    );
+    expect(deps.persist).toHaveBeenCalledWith(
+      'u1',
+      'https://s3/brand/logo.png',
+      'logo.png',
+    );
+    expect(out).toEqual({
+      persisted: true,
+      logoUrl: 'https://s3/brand/logo.png',
+      reason: 'persisted',
+    });
+  });
+
+  it('falls back to rediscovery when the unattached brandData.logoUrl is broken (ENG-933)', async () => {
+    const deps = baseDeps();
+    deps.resolveBrand.mockResolvedValue({
+      brandData: { logoUrl: 'https://dead/logo.png' },
+      attachments: [],
+    });
+    deps.classifyExisting.mockResolvedValue('broken' as const);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const out = await ensureBrandLogoPersisted('u1', 'https://acme.com', deps);
+
+    warnSpy.mockRestore();
+    expect(deps.discoverLogoUrl).toHaveBeenCalledWith('https://acme.com');
+    expect(deps.download).toHaveBeenCalledWith('https://acme.com/logo.png', 'u1');
+    expect(out.persisted).toBe(true);
   });
 
   it('rediscovers when the persisted logo is definitively broken (ENG-792)', async () => {
@@ -380,6 +538,7 @@ describe('ensureBrandLogoPersisted (deterministic onboarding step — AC-1)', ()
     const deps = baseDeps();
     deps.resolveBrand.mockResolvedValue({
       brandData: { logoUrl: 'https://s3/real-uploaded-logo.png' },
+      attachments: [{ type: 'logo', url: 'https://s3/real-uploaded-logo.png' }],
     });
     deps.classifyExisting.mockResolvedValue('unknown' as const);
 
