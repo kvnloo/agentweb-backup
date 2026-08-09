@@ -145,6 +145,24 @@ router.post("/:userId/remove", async (req, res) => {
       }
     }
 
+    // Every refusal must precede the asset work below. This route honours
+    // `transfer` and `delete` decisions, so a 409 raised after those loops
+    // leaves the target still in the org with their landing pages, skills,
+    // work plans and knowledge base already moved to the caller or destroyed —
+    // strictly worse than the removal it was refusing (Greptile, #2297).
+    //
+    // Placing it here rather than beside the departure write is the point: the
+    // departure write is the LAST thing this handler does, which is exactly
+    // why the gate was ineffective when it lived next to it.
+    // can() above returns false for a null org, so reaching here proves it is set.
+    if (!callerOrg) {
+      return res.status(404).json({ message: "Organization not found" });
+    }
+    const mayGo = await billingRootMayDepart(callerOrg, target.userId);
+    if (!mayGo.ok) {
+      return res.status(409).json({ message: mayGo.error, code: mayGo.code });
+    }
+
     const decisions: Partial<Record<OwnedFeature, Decision>> = req.body?.decisions || {};
     for (const f of OWNED_FEATURES) {
       const d = decisions[f];
@@ -223,19 +241,6 @@ router.post("/:userId/remove", async (req, res) => {
     // in routes/org.ts does. This route was missed when that landed, and it is
     // the one the portal's remove dialog actually calls — so the fix shipped
     // without covering the path a human uses.
-    // can() above returns false for a null org, so reaching here proves it is set.
-    if (!callerOrg) {
-      return res.status(404).json({ message: "Organization not found" });
-    }
-    // Same gate as the sibling route. Added after a live run removed a paying
-    // billing owner through THIS route and returned 200 while the org silently
-    // dropped Pro -> Free — the second time a guard landed on routes/org.ts and
-    // not here. The invariant test below now covers both, so a third omission
-    // fails the suite instead of a customer's plan.
-    const mayGo = await billingRootMayDepart(callerOrg, target.userId);
-    if (!mayGo.ok) {
-      return res.status(409).json({ message: mayGo.error, code: mayGo.code });
-    }
     if (!(await reassignBillingRootOnDeparture(callerOrg, target.userId, callerId))) {
       return res.status(409).json({ message: "Cannot remove the only owner. Promote another member to owner first." });
     }

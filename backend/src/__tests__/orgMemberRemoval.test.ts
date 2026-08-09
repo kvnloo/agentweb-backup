@@ -729,14 +729,28 @@ describe("orgMemberRemoval guards", () => {
     mockGetOrgMembers.mockResolvedValue([ownerCaller, payingRoot]);
     mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-root", name: "Test Org" });
 
+    // allTRANSFER, not allLeave. The first version of this test used `leave`
+    // decisions, which mutate nothing — so it passed while the gate sat AFTER
+    // the asset loops and a refused removal had already moved the target's
+    // content to the caller. Greptile caught what the test could not.
     const res = await request(app)
       .post(`/api/orgs/me/members/u-root/remove`)
-      .send({ confirm: true, decisions: allLeave });
+      .send({ confirm: true, decisions: allTransfer });
 
     expect(res.status).toBe(409);
     expect(res.body.code).toBe("BILLING_OWNER_HAS_SUBSCRIPTION");
     expect(mockClearOrgMembership).not.toHaveBeenCalled();
     expect(mockUpdateOrg).not.toHaveBeenCalled();
+    // Nothing of theirs may have moved or died on a refused removal.
+    expect(mockUpdateTaskOwner).not.toHaveBeenCalled();
+    expect(mockTransferLandingPageOwner).not.toHaveBeenCalled();
+    expect(mockWorkPlanTransferOwner).not.toHaveBeenCalled();
+    expect(mockSkillTransferOwner).not.toHaveBeenCalled();
+    expect(mockTransferAllTemplates).not.toHaveBeenCalled();
+    expect(mockDeleteTask).not.toHaveBeenCalled();
+    expect(mockDeleteLandingPageByRecord).not.toHaveBeenCalled();
+    expect(mockDeleteSkill).not.toHaveBeenCalled();
+    expect(mockDeleteAllTemplates).not.toHaveBeenCalled();
   });
 
   it("a FREE billing owner still goes through this route", async () => {
