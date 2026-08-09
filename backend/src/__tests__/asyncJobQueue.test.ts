@@ -231,12 +231,32 @@ describe('asyncJobQueue', () => {
       });
     });
 
-    it('does not throw when the write fails (best-effort — a future retry just falls back to the stale payload it already had)', async () => {
+    // Greptile P1 on #2291 (round 21): the first version had no retry at all —
+    // every sibling write in this file (markJobComplete, markJobFailed, the
+    // heartbeat beat) retries once before giving up, and this one didn't,
+    // purely an oversight this closes.
+    it('retries once and succeeds when the first write transiently fails', async () => {
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('throttled')) })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
+
+      await expect(updateJobPayload('calendly_webhook_cleanup', 'id-1', { any: 'payload' })).resolves.toBeUndefined();
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not throw when the write fails on both the attempt and the retry, and logs loudly (not just a warning)', async () => {
       mockDocumentClientMethods.update.mockReturnValue({
         promise: jest.fn().mockRejectedValue(new Error('down')),
       });
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
       await expect(updateJobPayload('calendly_webhook_cleanup', 'id-1', { any: 'payload' })).resolves.toBeUndefined();
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('updateJobPayload failed'), expect.anything());
+
+      errorSpy.mockRestore();
     });
   });
 
