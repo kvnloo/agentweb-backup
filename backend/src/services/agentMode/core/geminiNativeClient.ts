@@ -264,6 +264,39 @@ function contentToParts(content: any): any[] {
   return parts;
 }
 
+/**
+ * Placeholder text emitted for an UNSIGNED assistant tool_call (see toGeminiRequest).
+ * Kept as a named builder so `isHistoryDegradationEcho` below can never drift from
+ * the string this actually produces.
+ */
+function degradedToolCallText(name: string | undefined, args: string | undefined): string {
+  return `[Previously called ${name}(${args || '{}'})]`;
+}
+
+/** Matches ONE whole line of degraded history (a tool call or its paired result). */
+const DEGRADED_HISTORY_LINE = /^\[(?:Previously called |Result of ).*\]$/;
+
+/**
+ * ENG-946: is this model output nothing but the degraded history we fed it?
+ *
+ * When the agent loop falls back mid-run from Bedrock Claude to native Gemini, every
+ * prior Claude tool_call is unsigned, so the whole tool history is degraded into
+ * `[Previously called ...]` MODEL-role text (and `[Result of ...]` user-role text).
+ * Production scheduled runs showed Gemini then *parroting* that placeholder back as
+ * its entire final turn — a non-empty string, so the loop shipped it as the answer
+ * and the empty-synthesis nudge never fired. Such a turn carries no information:
+ * callers must treat it as no output.
+ *
+ * Deliberately strict — every non-blank line must be a placeholder. A real answer
+ * that merely quotes one line still counts as real output.
+ */
+export function isHistoryDegradationEcho(text: string): boolean {
+  if (typeof text !== 'string') return false;
+  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) return false;
+  return lines.every((line) => DEGRADED_HISTORY_LINE.test(line));
+}
+
 /** Parse a tool-result string into the object Gemini's functionResponse.response requires. */
 function toFunctionResponseObject(content: any): any {
   const raw = typeof content === 'string' ? content : JSON.stringify(content ?? '');
@@ -336,7 +369,7 @@ export function toGeminiRequest(
           } else {
             // No signature (legacy/compat history) → degrade to text; an unsigned
             // functionCall part would 400 the whole request.
-            parts.push({ text: `[Previously called ${tc.function?.name}(${tc.function?.arguments || '{}'})]` });
+            parts.push({ text: degradedToolCallText(tc.function?.name, tc.function?.arguments) });
           }
         }
       }

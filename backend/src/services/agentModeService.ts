@@ -14,7 +14,7 @@ import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { computeTermination } from './agentMode/core/agentStep';
-import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
+import { createGeminiNativeClient, isHistoryDegradationEcho } from './agentMode/core/geminiNativeClient';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -3797,6 +3797,18 @@ export class AgentModeService {
             .join('\n');
         } else if (responseMessage.content && typeof responseMessage.content === 'object') {
           responseContent = (responseMessage.content as any).text || '';
+        }
+
+        // ENG-946: a turn whose entire text is the `[Previously called ...]` /
+        // `[Result of ...]` placeholder is the model parroting the degraded history
+        // we hand it after a mid-run cross-provider fallback (Bedrock Claude -> native
+        // Gemini strips unsigned tool calls to text). It carries no answer, so treat it
+        // as no output — both for what the user sees and for the termination decision
+        // below, which would otherwise read it as a finished response.
+        if (responseContent && isHistoryDegradationEcho(responseContent)) {
+          console.warn(`AgentMode: Discarding degraded-history echo from "${llmModel}" in session ${sessionId} — treating turn as empty`);
+          responseContent = '';
+          responseMessage.content = '';
         }
 
         // Update content with LLM's response
