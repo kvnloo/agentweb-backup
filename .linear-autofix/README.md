@@ -196,6 +196,11 @@ node .linear-autofix/preview/preview.mjs list
   (persist in `/etc/sysctl.d/90-autofix.conf`).
 - `node_modules` is symlinked and `.env`/`.env.local` copied from your local repos into the worktree, so copies boot fast with your dev config (the backend needs your local AWS dev creds).
 - Set `PREVIEW_IP` (default `127.0.0.1`) to a LAN IP to reach previews from another device.
+- **Access gate (ENG-920):** the proxy is the only listener on those ports and the app behind it
+  holds live dev AWS creds, so **off-box** requests must present `PREVIEW_ACCESS_TOKEN` (in
+  `.linear-autofix/.env`): open the URL once with `?k=<token>` and the proxy sets a 30-day cookie
+  covering every bug and port. Loopback/private/self addresses are allowlisted, so nothing on the
+  box (including Playwright verify) needs it. Unset token ⇒ fails **closed** for off-box callers.
 - **Browser verification (wired in):** after a fix passes the code-review gate, `autofix.mjs` auto-starts the proxy, brings up the full preview, and **preflights it with plain HTTP checks** — if the environment isn't healthy it retries the bring-up once, then records `env_down` and skips the agent run instead of burning a 12-min pass against a dead env. When healthy, a Playwright verify pass (`claude -p` with a Playwright-only MCP config) drives a real browser to confirm the bug is gone — *then* the draft PR(s) open with the verdict + screenshots attached. A `not_fixed` verdict triggers ONE re-fix + re-verify (`verify.retryNotFixed`). Toggle with `config.verify.enabled`.
 
 ## Testing a fix (after a PR opens)

@@ -44,7 +44,8 @@ REGION=us-west-2 bash .linear-autofix/deploy/ec2/provision.sh
 ```
 Note the printed **Public IP** and SSH command. (Only SSH is opened. The automated
 browser-verify runs Playwright on the box over loopback, so no app port is exposed.
-Re-run with `OPEN_PREVIEW_PORT=true` only if you want to manually browse previews.)
+Re-run with `OPEN_PREVIEW_PORT=true` only if you want to manually browse previews — those
+ports are token-gated in code either way, see 7b.)
 
 ## 2. Bootstrap the instance
 
@@ -150,6 +151,40 @@ backend  API    : http://<id>.<ip>.nip.io:3001/
 ```
 Many bugs coexist because the host differentiates them (`config.previewPorts`). `gc.mjs`
 stops a preview when its issue reaches Done/Canceled.
+
+### Opening a preview as a reviewer (access token — ENG-920)
+
+Those three ports are open to the internet and the app behind them runs with **live dev AWS
+credentials**, so `preview/proxy.mjs` — the only listener on them, since `preview.mjs` binds every
+real server to `127.0.0.1` — refuses off-box requests without a shared secret.
+
+**Open the URL once with `?k=<token>`:**
+
+```
+http://<id>.<ip>.nip.io:5174/?k=<PREVIEW_ACCESS_TOKEN>
+```
+
+The proxy sets a 30-day `HttpOnly; SameSite=Lax` cookie and redirects to the same URL without the
+token, so it doesn't linger in the address bar or in a referer. The cookie is scoped to
+`<ip>.nip.io`, so **one visit covers every bug and all three ports** — do it once per browser.
+Anything else gets a bare `401 preview access required` page, identical whether or not that bug id
+exists (a 401 must not confirm which bugs are in flight).
+
+**Where the token lives:** `PREVIEW_ACCESS_TOKEN` in `~/agentweb/.linear-autofix/.env` on the box
+(gitignored; documented in `.env.example`). Read it with
+`grep PREVIEW_ACCESS_TOKEN ~/agentweb/.linear-autofix/.env` over SSH. To rotate: replace the value
+and restart the proxy — every existing cookie stops working immediately.
+
+- **Nothing on the box needs the token.** Loopback, RFC1918 sources, and the instance's own public
+  IP (on-box requests to the nip.io URL hairpin through the IGW and arrive SNAT'd to it) are
+  allowlisted, so the Playwright browser-verify step is untouched. `X-Forwarded-For` is deliberately
+  ignored — the proxy is the edge, so honouring it would make the allowlist forgeable.
+- `/__preview_health__` stays open (host-agnostic, leaks nothing) so `check-reachability.sh` can
+  still separate "port/SG closed" from "not authorized". Export `PREVIEW_ACCESS_TOKEN` before
+  running that script or its L3 layer reports 401.
+- **Fail-closed:** if `PREVIEW_ACCESS_TOKEN` is unset the proxy logs a loud banner and refuses every
+  non-private request — a missing env var can never silently re-open the ports. On-box previews and
+  verify keep working, so it can't brick the runner either.
 
 Two things to know on EC2:
 - **Reachability:** the URLs use `PREVIEW_IP` (loopback by default → only works on the box).
