@@ -3867,6 +3867,10 @@ export class AgentModeService {
             finishReason,
             stopReason,
             content,
+            // ENG-946: the empty-synthesis decision keys off THIS turn's text, not the
+            // accumulator — `content` is replace-on-nonempty, so a mid-run narration
+            // survived into an empty final turn and suppressed the nudge.
+            currentTurnText: responseContent,
             toolCallsSoFar: toolCalls.length,
             maxTokensContinuations,
             maxTokenContinuationsLimit: MAX_TOKEN_CONTINUATIONS,

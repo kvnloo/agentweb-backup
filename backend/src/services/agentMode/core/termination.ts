@@ -12,7 +12,8 @@
  *        -> continue, inject "continue where you left off", increment continuations
  *   2. content_filter / guardrail_intervened / content_filtered
  *        -> set canned safety message IF no content yet; then fall through to (3/4)
- *   3. no content AND tools ran earlier AND emptySynthesisRetries < limit
+ *   3. the terminating turn produced no text AND tools ran earlier AND
+ *      emptySynthesisRetries < limit
  *        -> continue, inject synthesis nudge, increment retries
  *   4. otherwise -> final response (stop)
  *
@@ -29,6 +30,19 @@ export interface TerminationInput {
   stopReason?: string;
   /** accumulated assistant content so far (the loop's `content` variable) */
   content: string;
+  /**
+   * ENG-946: the text THIS terminating turn produced, independent of `content`.
+   *
+   * The loop's `content` is replace-on-nonempty, so a mid-run narration
+   * ("I'll scan his roster…") survives into a final turn that came back empty —
+   * making an unanswered run look answered and suppressing the synthesis nudge.
+   * The empty-synthesis decision belongs to the turn that is ending, not to
+   * whatever text is still sitting in the accumulator.
+   *
+   * Optional: when omitted the ladder falls back to `content`, i.e. exactly the
+   * pre-fix behavior (the characterization harness relies on this).
+   */
+  currentTurnText?: string;
   /** how many tool calls have run this whole session so far */
   toolCallsSoFar: number;
   /** continuations already used after max_tokens truncation */
@@ -96,17 +110,20 @@ export function decideTermination(input: TerminationInput): TerminationDecision 
     input.finishReason === 'content_filter' ||
     input.stopReason === 'guardrail_intervened' ||
     input.stopReason === 'content_filtered';
-  const effectiveContent =
-    isContentFiltered && !input.content ? CONTENT_FILTER_MESSAGE : input.content;
   const contentIfEmpty =
     isContentFiltered && !input.content ? CONTENT_FILTER_MESSAGE : undefined;
 
   // 3. empty synthesis after tools -> nudge once (bounded).
-  //    Uses effectiveContent so a content-filter canned message counts as "has content"
-  //    and does NOT trigger a synthesis retry — matching the monolith's `if (!content ...)`
-  //    which runs AFTER the content-filter block has already set `content`.
+  //    ENG-946: judged on THIS turn's text when the caller supplies it, so a stale
+  //    accumulated narration can no longer masquerade as the final answer. When
+  //    `currentTurnText` is omitted this falls back to `content` — the pre-fix input.
+  //    A content-filtered turn never nudges (the canned message is the answer),
+  //    which is what the monolith did by filling `content` before this check.
+  const terminatingText =
+    input.currentTurnText !== undefined ? input.currentTurnText : input.content;
   if (
-    !effectiveContent &&
+    !isContentFiltered &&
+    !terminatingText &&
     input.toolCallsSoFar > 0 &&
     input.emptySynthesisRetries < input.maxEmptySynthesisRetries
   ) {
