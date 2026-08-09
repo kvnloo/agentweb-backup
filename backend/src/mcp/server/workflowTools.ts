@@ -72,7 +72,8 @@ mcpToolRegistry.register({
       'Give Emma a marketing goal in plain language and she plans and executes it end to end — campaigns, content, research, outreach. ' +
       'Use this when none of the more specific emma_* tools fits the request. ' +
       'Starts a new task unless you pass task_id to continue an existing one. ' +
-      'Returns a task_id; poll emma_get_task_result for the outcome.',
+      'Usually returns the finished result directly (status "complete"). Only poll emma_get_task_result ' +
+      'when status is "running", or answer with emma_answer_question when it is "awaiting_input".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -113,11 +114,30 @@ mcpToolRegistry.register({
       body: { sessionId: taskId, userMessage: args?.goal },
     });
 
+    // `/api/agent-mode/generate` is SYNCHRONOUS in the normal case: it returns
+    // `{ content }` once the turn is finished. It only returns early, with
+    // `stillBuilding: true`, when the run detached into a long build. So the
+    // common path already has a confirmed terminal result and there is nothing
+    // to poll for — telling every caller to poll would send them looking for an
+    // answer they are already holding.
+    const stillBuilding = data?.stillBuilding === true;
+    const pending = data?.pendingUserQuestion;
+
+    const status = pending ? 'awaiting_input' : stillBuilding ? 'running' : 'complete';
+
     return jsonResult({
       task_id: taskId,
-      status: 'running',
-      reply: data?.message ?? data?.response ?? data,
-      next: 'Poll emma_get_task_result with this task_id for the finished output.',
+      status,
+      // Confirmed for both terminal outcomes: a synchronous return IS the
+      // completion signal, and a pending question is persisted on the session.
+      completion_confirmed: !stillBuilding,
+      result: data?.content ?? data?.message ?? null,
+      awaiting_question: pending ?? null,
+      next: pending
+        ? 'Emma is waiting on an answer. Use emma_answer_question — a plain message abandons the question.'
+        : stillBuilding
+          ? 'Emma detached into a longer build. Poll emma_get_task_result with this task_id.'
+          : undefined,
     });
   },
 });
@@ -130,8 +150,9 @@ mcpToolRegistry.register({
   definition: {
     name: 'emma_get_task_result',
     description:
-      'Check whether an Emma task has finished and get its output. ' +
-      'Use with the task_id returned by emma_run_marketing_task.',
+      'Check on an Emma task that is still running and get its latest output. ' +
+      'Only needed when emma_run_marketing_task returned status "running" — a "complete" status ' +
+      'already carries the finished result, so polling it adds nothing.',
     inputSchema: {
       type: 'object',
       properties: {

@@ -81,9 +81,9 @@ describe('ENG-982: one call completes the job', () => {
 
     expect(paths()).toEqual(['/api/agent-mode/sessions', '/api/agent-mode/generate']);
     const body = JSON.parse(res.content[0].text);
+    // The caller gets a handle for the task either way; whether it needs to be
+    // polled is asserted separately, per the synchronous-vs-detached contract.
     expect(body.task_id).toBe('task-42');
-    // The agent is told what to do next rather than left to guess.
-    expect(body.next).toMatch(/emma_get_task_result/);
   });
 
   it('emma_run_marketing_task continues an existing task without creating a second one', async () => {
@@ -112,6 +112,48 @@ describe('ENG-982: one call completes the job', () => {
     const generate = mockMcpFetch.mock.calls.find(c => c[0]?.path === '/api/agent-mode/generate');
     expect(generate[0].body).toMatchObject({ sessionId: 'task-42', userMessage: 'launch a campaign' });
     expect(generate[0].body.message).toBeUndefined();
+  });
+
+  it('emma_run_marketing_task returns a CONFIRMED result when generate answers synchronously', async () => {
+    // /api/agent-mode/generate returns { content } once the turn finishes, and
+    // only returns early with stillBuilding on a detached long build. Telling
+    // every caller to poll sent them hunting for an answer already in hand.
+    mockMcpFetch
+      .mockResolvedValueOnce({ sessionId: 'task-42' })
+      .mockResolvedValueOnce({ content: 'campaign drafted and scheduled' });
+
+    const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
+    const body = JSON.parse(res.content[0].text);
+
+    expect(body.status).toBe('complete');
+    expect(body.completion_confirmed).toBe(true);
+    expect(body.result).toBe('campaign drafted and scheduled');
+    expect(body.next).toBeUndefined();
+  });
+
+  it('emma_run_marketing_task only asks the caller to poll when the run actually detached', async () => {
+    mockMcpFetch
+      .mockResolvedValueOnce({ sessionId: 'task-42' })
+      .mockResolvedValueOnce({ content: 'still building…', stillBuilding: true });
+
+    const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
+    const body = JSON.parse(res.content[0].text);
+
+    expect(body.status).toBe('running');
+    expect(body.completion_confirmed).toBe(false);
+    expect(body.next).toMatch(/emma_get_task_result/);
+  });
+
+  it('emma_run_marketing_task surfaces a blocking question instead of reporting completion', async () => {
+    mockMcpFetch
+      .mockResolvedValueOnce({ sessionId: 'task-42' })
+      .mockResolvedValueOnce({ content: 'which audience?', pendingUserQuestion: { question: 'which audience?' } });
+
+    const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
+    const body = JSON.parse(res.content[0].text);
+
+    expect(body.status).toBe('awaiting_input');
+    expect(body.next).toMatch(/emma_answer_question/);
   });
 
   it('emma_get_task_result reports awaiting_input when Emma is blocked on a question', async () => {
