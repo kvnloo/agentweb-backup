@@ -624,6 +624,45 @@ describe('POST /connect', () => {
       expect(res.body.account.config.booking_tracking_active).toBe(false);
     });
 
+    // Greptile P1 on #2291 (live-tested round): ownPreviousWebhookId can come from the
+    // orphan-webhook fallback table (round 16), which can itself go stale — Calendly may
+    // no longer recognize the recorded subscription (e.g. it was already cleaned up by an
+    // earlier process). The delete failing here does NOT mean the retry create is doomed:
+    // if the only real conflict was that stale subscription, it's already gone, and the
+    // retry create should succeed cleanly rather than disabling tracking on a paid account.
+    it('still succeeds when deleting the stale subscription fails, as long as the retry create succeeds', async () => {
+      getAccountsByUserId.mockResolvedValueOnce([existingAccountFor('https://api.calendly.com/webhook_subscriptions/STALE111111111')]);
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce(duplicateError); // initial create: rejected as duplicate
+      axios.delete = jest.fn().mockRejectedValueOnce({ response: { status: 404, data: { message: 'Not Found' } } }); // delete fails — Calendly no longer recognizes it
+      axios.post.mockResolvedValueOnce(webhookCreatedResponse({ uri: 'https://api.calendly.com/webhook_subscriptions/FRESH4444444444' })); // retry create still succeeds
+
+      const res = await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.upgradeRequired).toBeUndefined();
+      expect(res.body.account.config.booking_tracking_active).toBe(true);
+      expect(res.body.account.config.webhook_id).toBe('https://api.calendly.com/webhook_subscriptions/FRESH4444444444');
+    });
+
+    it('falls back to the upgrade-required message when BOTH the delete and the retry create fail', async () => {
+      getAccountsByUserId.mockResolvedValueOnce([existingAccountFor('https://api.calendly.com/webhook_subscriptions/STALE111111111')]);
+      const fin = await initAndFinalize();
+      axios.post.mockRejectedValueOnce(duplicateError);
+      axios.delete = jest.fn().mockRejectedValueOnce({ response: { status: 403, data: { message: 'Permission Denied' } } });
+      axios.post.mockRejectedValueOnce(new Error('still failing'));
+
+      const res = await request(app)
+        .post('/api/oauth/calendly/connect')
+        .send({ tokenSessionId: fin.body.tokenSessionId });
+
+      expect(res.status).toBe(200);
+      expect(res.body.upgradeRequired).toBe(true);
+      expect(res.body.account.config.booking_tracking_active).toBe(false);
+    });
+
     // Regression guard: a genuine plan-tier rejection (no `title: 'Already Exists'`) must
     // NOT be routed through the duplicate-cleanup path — it should hit the original,
     // simple fallback exactly like the "plan does not support webhooks" test above.
