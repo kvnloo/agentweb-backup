@@ -93,11 +93,18 @@ jest.mock('../services/asyncJobQueue', () => ({
 
 // ─── App setup ───────────────────────────────────────────────────────────────
 
-import calendlyWebhookRouter from '../routes/calendlyWebhook';
+import calendlyWebhookRouter, { processCalendlyWebhookJob } from '../routes/calendlyWebhook';
 
 const app = express();
 app.use('/api/webhooks/calendly', express.raw({ type: 'application/json' }));
 app.use('/api/webhooks/calendly', calendlyWebhookRouter);
+
+// Captured at module scope (once, at import time) — registerProcessor is called
+// when this route module first loads, and every test's beforeEach clears mock
+// call history, so this must be read before that first clearAllMocks runs.
+const registeredCalendlyWebhookCall = (mockRegisterProcessor as jest.Mock).mock.calls.find(
+  (call) => call[0] === 'calendly_webhook',
+);
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -166,6 +173,18 @@ const mockOwner = { userId: USER_ID, email: 'host@example.com' };
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
+  // Greptile P1 on #2291: runStepOnce must treat a lost/held step claim as a
+  // failure for this attempt (round 18), but claimLeadStepOnce's own staleness
+  // window is 5 minutes (CLAIM_STALE_MS) — the default MAX_ATTEMPTS (5, at the
+  // ~30s poll interval) only covers ~2.5 minutes, so the job could exhaust its
+  // whole retry budget and go terminally 'failed' before a stuck claim ever
+  // becomes reclaimable, permanently omitting that step's CRM sync or alert.
+  it('is registered with a retry budget generous enough to outlast claimLeadStepOnce\'s 5-minute staleness window', () => {
+    expect(registeredCalendlyWebhookCall).toBeDefined();
+    expect(registeredCalendlyWebhookCall![1]).toBe(processCalendlyWebhookJob);
+    expect(registeredCalendlyWebhookCall![2]).toEqual({ maxAttempts: 15 });
+  });
+
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: mockAccount }]);
