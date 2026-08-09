@@ -117,7 +117,11 @@ describe('UnipileSearchParamService.resolve', () => {
     expect(r2.fromCache).toBe(true);
   });
 
-  it('caches an empty result with short TTL (24h, not 30d)', async () => {
+  // ENG-975 shortened this from 24h to 1h: an empty list here is not reliably a
+  // fact about the query — an account-scoped LinkedIn search outage empties this
+  // endpoint too, and a day-long negative silently drops the filter from every
+  // later search long after the outage clears.
+  it('caches an empty result with short TTL (1h, not 30d)', async () => {
     const http = makeHttp({
       searchParameters: jest.fn().mockResolvedValue({ items: [] }),
     });
@@ -131,9 +135,9 @@ describe('UnipileSearchParamService.resolve', () => {
     const stored = Array.from(store._items.values())[0] as any;
     expect(stored).toBeDefined();
     const ttlSeconds = stored.expiresAt - Math.floor(Date.now() / 1000);
-    // 24h ± 60s tolerance
-    expect(ttlSeconds).toBeGreaterThan(24 * 3600 - 60);
-    expect(ttlSeconds).toBeLessThan(24 * 3600 + 60);
+    // 1h ± 60s tolerance
+    expect(ttlSeconds).toBeGreaterThan(3600 - 60);
+    expect(ttlSeconds).toBeLessThan(3600 + 60);
     expect(stored.status).toBe('not_found');
   });
 
