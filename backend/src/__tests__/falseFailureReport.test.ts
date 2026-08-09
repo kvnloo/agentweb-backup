@@ -65,6 +65,28 @@ describe('falseFailureReport', () => {
       ).toBe(false);
     });
 
+    it('still fires on a not-saved claim that is not negated', () => {
+      expect(
+        assertsUnsavedInterruption(
+          'The session timed out. Your changes were not saved due to a validation error.',
+        ),
+      ).toBe(true);
+    });
+
+    // FAIL cases: a NEGATED loss is a truthful reassurance, not the ENG-971 pattern.
+    it('does not fire when the message says no work was lost', () => {
+      expect(
+        assertsUnsavedInterruption(
+          'There was a brief connection interruption, but no work was lost.',
+        ),
+      ).toBe(false);
+      expect(
+        assertsUnsavedInterruption(
+          'The session timed out; however, none of your work was lost.',
+        ),
+      ).toBe(false);
+    });
+
     it('does not fire on a clean success message', () => {
       expect(assertsUnsavedInterruption('Published and verified live. All done.')).toBe(false);
       expect(assertsUnsavedInterruption('')).toBe(false);
