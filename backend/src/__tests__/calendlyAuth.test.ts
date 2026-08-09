@@ -63,7 +63,7 @@ jest.mock('../services/calendlyWebhookCleanupQueue', () => ({
 process.env.JWT_SECRET = 'test-jwt-secret';
 process.env.CUSTOMER_FRONTEND_URL = 'http://localhost:5174';
 
-import calendlyAuthRouter from '../routes/calendlyAuth';
+import calendlyAuthRouter, { refreshCalendlyAccessToken } from '../routes/calendlyAuth';
 
 const app = express();
 app.use(express.json());
@@ -643,5 +643,71 @@ describe('POST /connect', () => {
       expect(res.body.upgradeRequired).toBe(true);
       expect(axios.delete).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('refreshCalendlyAccessToken', () => {
+  const refreshTokenResponse = (over: any = {}) => ({
+    data: {
+      access_token: 'new-access-token',
+      refresh_token: 'new-refresh-token',
+      ...over,
+    },
+  });
+
+  it('succeeds on the first attempt without retrying', async () => {
+    axios.post.mockResolvedValueOnce(refreshTokenResponse());
+
+    const result = await refreshCalendlyAccessToken('old-refresh-token');
+
+    expect(result).toEqual({ access_token: 'new-access-token', refresh_token: 'new-refresh-token' });
+    expect(axios.post).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the original refresh_token when Calendly does not rotate it', async () => {
+    axios.post.mockResolvedValueOnce(refreshTokenResponse({ refresh_token: undefined }));
+
+    const result = await refreshCalendlyAccessToken('old-refresh-token');
+
+    expect(result).toEqual({ access_token: 'new-access-token', refresh_token: 'old-refresh-token' });
+  });
+
+  it('retries once after a transient failure with no HTTP response, then succeeds', async () => {
+    axios.post.mockRejectedValueOnce(new Error('socket hang up'));
+    axios.post.mockResolvedValueOnce(refreshTokenResponse());
+
+    const result = await refreshCalendlyAccessToken('old-refresh-token');
+
+    expect(result).toEqual({ access_token: 'new-access-token', refresh_token: 'new-refresh-token' });
+    expect(axios.post).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries once after a 5xx from Calendly, then succeeds', async () => {
+    axios.post.mockRejectedValueOnce({ response: { status: 503, data: { error: 'service_unavailable' } } });
+    axios.post.mockResolvedValueOnce(refreshTokenResponse());
+
+    const result = await refreshCalendlyAccessToken('old-refresh-token');
+
+    expect(result).toEqual({ access_token: 'new-access-token', refresh_token: 'new-refresh-token' });
+    expect(axios.post).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a genuine 4xx auth failure and returns null', async () => {
+    axios.post.mockRejectedValueOnce({ response: { status: 400, data: { error: 'invalid_grant' } } });
+
+    const result = await refreshCalendlyAccessToken('revoked-refresh-token');
+
+    expect(result).toBeNull();
+    expect(axios.post).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns null without throwing when both the initial attempt and the retry fail', async () => {
+    axios.post.mockRejectedValueOnce(new Error('socket hang up'));
+    axios.post.mockRejectedValueOnce({ response: { status: 502, data: { error: 'bad_gateway' } } });
+
+    const result = await refreshCalendlyAccessToken('old-refresh-token');
+
+    expect(result).toBeNull();
+    expect(axios.post).toHaveBeenCalledTimes(2);
   });
 });
