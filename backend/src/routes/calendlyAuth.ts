@@ -309,6 +309,19 @@ async function provisionCalendlyWebhook(
     console.warn('[Calendly OAuth /connect] duplicate webhook subscription detected — deleting our own previously-recorded subscription and retrying');
     try {
       await axios.delete(ownPreviousWebhookId, { headers: { Authorization: `Bearer ${accessToken}` } });
+    } catch (deleteError: any) {
+      // Greptile P1 on #2291 (live-tested round): this delete failing does NOT
+      // mean the retry create is doomed — ownPreviousWebhookId can come from the
+      // orphan-webhook fallback table (round 16), which can itself go stale (e.g.
+      // Calendly has already forgotten the subscription, or a prior cleanup attempt
+      // already removed it). Treating any delete failure as fatal previously gave up
+      // here unconditionally, disabling booking tracking on a paid account even when
+      // the only real conflict — the stale subscription — was already gone and the
+      // retry create below would have succeeded cleanly. Log and proceed regardless;
+      // the retry create is the only thing that actually needs to succeed.
+      console.warn('[Calendly OAuth /connect] failed to delete stale webhook (may already be gone) — attempting create anyway', deleteError?.response?.data || deleteError.message);
+    }
+    try {
       const retryResponse = await createWebhookSubscription(config, accessToken, profile, webhookSigningKey);
       return { webhookId: (retryResponse.data as any)?.resource?.uri, active: true };
     } catch (retryError: any) {
