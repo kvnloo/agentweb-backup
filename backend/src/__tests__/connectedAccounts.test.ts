@@ -964,7 +964,12 @@ describe('Connected Accounts Routes', () => {
         // persists a rotation, a delete failure AFTER a successful refresh leaves
         // every future retry stuck refreshing with the same now-invalid
         // pre-rotation token forever — an infinite loop that can never succeed.
-        it('persists a rotated refresh token back to the durable queue row BEFORE attempting the delete', async () => {
+        // Greptile P1 on #2291 (round 22): the persist is only NEEDED when this
+        // attempt is about to fail anyway — a successful delete already used a
+        // valid access_token in hand and never needs the persisted value at all,
+        // so persisting unconditionally (the round-20 ordering) risked a write
+        // failure on an attempt that would otherwise have succeeded cleanly.
+        it('does NOT persist the rotated token when the delete succeeds — it was never needed', async () => {
             (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
                 access_token: 'fresh-access-token',
                 refresh_token: 'rotated-refresh-token',
@@ -976,11 +981,8 @@ describe('Connected Accounts Routes', () => {
                 refreshToken: 'refresh-token-1',
             });
 
-            expect(mockUpdateJobPayload).toHaveBeenCalledWith(
-                'calendly_webhook_cleanup',
-                'https://api.calendly.com/webhook_subscriptions/AAAA',
-                { webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA', refreshToken: 'rotated-refresh-token' },
-            );
+            expect(mockUpdateJobPayload).not.toHaveBeenCalled();
+            expect(mockOrphanTableMethods.put).not.toHaveBeenCalled();
         });
 
         it('does not touch the durable queue row when the refresh token is unchanged', async () => {
@@ -1015,6 +1017,59 @@ describe('Connected Accounts Routes', () => {
                 'https://api.calendly.com/webhook_subscriptions/AAAA',
                 { webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA', refreshToken: 'rotated-refresh-token' },
             );
+        });
+
+        // Greptile P1 on #2291 (round 22): a single fallible write with one retry
+        // (updateJobPayload) still leaves a tail where both attempts fail. Writing
+        // the rotation to a SECOND, genuinely independent table (the orphan-webhook
+        // store, round 16) as well means that tail requires BOTH tables' writes to
+        // fail, not just one.
+        it('also persists the rotated token to the orphan-webhook table when userId/userUri are present and the delete fails', async () => {
+            (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                access_token: 'fresh-access-token',
+                refresh_token: 'rotated-refresh-token',
+            });
+            (axios.delete as jest.Mock).mockRejectedValue(new Error('calendly down'));
+
+            await expect(processCalendlyWebhookCleanupJob({
+                webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                refreshToken: 'refresh-token-1',
+                userId: 'user-abc',
+                userUri: 'https://api.calendly.com/users/XYZ',
+            })).rejects.toThrow('calendly down');
+
+            expect(mockOrphanTableMethods.put).toHaveBeenCalledWith(expect.objectContaining({
+                Item: expect.objectContaining({
+                    id: 'user-abc_https://api.calendly.com/users/XYZ',
+                    webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                    refreshToken: 'rotated-refresh-token',
+                }),
+            }));
+        });
+
+        it('checks the orphan-webhook table for a fresher refresh token before refreshing, when userId/userUri are present', async () => {
+            mockOrphanTableMethods.get.mockReturnValueOnce({
+                promise: jest.fn().mockResolvedValue({
+                    Item: { refreshToken: 'fresher-token-from-orphan-table' },
+                }),
+            });
+            (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                access_token: 'fresh-access-token',
+                refresh_token: 'fresher-token-from-orphan-table',
+            });
+            (axios.delete as jest.Mock).mockResolvedValue({ data: {} });
+
+            await processCalendlyWebhookCleanupJob({
+                webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                refreshToken: 'stale-token-from-queue-payload',
+                userId: 'user-abc',
+                userUri: 'https://api.calendly.com/users/XYZ',
+            });
+
+            // The STALE queue-payload token was never even tried — the orphan
+            // table's fresher one was used instead.
+            expect(refreshCalendlyAccessToken).toHaveBeenCalledWith('fresher-token-from-orphan-table');
+            expect(refreshCalendlyAccessToken).not.toHaveBeenCalledWith('stale-token-from-queue-payload');
         });
 
         it('throws (so the poller re-queues it) when there is no refresh token to work with', async () => {
