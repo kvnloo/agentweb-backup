@@ -902,6 +902,8 @@ const CADENCE_SKIP_PATTERNS: RegExp[] = [
   /\btoday\s+is\s+(?:not\s+a\s+(?:publishing|posting)\s+day|a\s+(?:non-?publishing|skip|rest|off)\s+day)\b/i,
   /\b(?:rest|off|skip|non-?publishing)\s+day\s+for\s+this\s+(?:schedule|cadence)\b/i,
   /\bcreat(?:e|ing)\s+and\s+publish(?:ing)?\s+nothing\b/i,
+  // Self-contained because it names the publishing window itself (ENG-844 audit).
+  /\boutside\s+(?:the\s+|its\s+|this\s+)?(?:publish(?:ing)?|post(?:ing)?)\s+(?:window|cadence|days?|schedule)\b/i,
 ];
 
 // A bare skip declaration. On its own this is ambiguous (a failure can be worded
@@ -911,6 +913,12 @@ const SKIP_DECLARATION_PATTERNS: RegExp[] = [
   /\bskipp?(?:ing|ed)?\s+(?:today|this\s+(?:run|cycle|schedule|post))\b/i,
   /\bno\s+(?:post|publishing|publish)\s+(?:today|scheduled\s+(?:for\s+)?today)\b/i,
   /\bnothing\s+to\s+(?:post|publish)\s+today\b/i,
+  // Real phrasings a model reaches for that the original set missed (audited against
+  // production skip transcripts, ENG-844). Each still requires a CADENCE_RATIONALE
+  // match in the same turn, so none of these can authorize a skip on its own.
+  /\bstanding\s+down\b/i,
+  /\bno\s+action\s+(?:taken|needed|required)\b/i,
+  /\b(?:no\s+(?:content|posts?|images?)\s+(?:was|were)\s+(?:produced|created|generated|published)|nothing\s+(?:was|were)\s+(?:produced|created|generated|published))\b/i,
 ];
 
 // Evidence the skip is driven by the schedule's PUBLISHING CADENCE (a weekday
@@ -928,16 +936,49 @@ const CADENCE_RATIONALE_PATTERNS: RegExp[] = [
 
 // A run that hit a FAILURE (missing access, auth, timeout, tool error) is NOT a
 // cadence skip — it must still retry + alert. Any of these veto the carve-out.
-const SKIP_FAILURE_SIGNAL_PATTERNS: RegExp[] = [
-  // Contractions only fire on a real apostrophe so words like "current" (…nt) do
-  // not false-veto: couldn't, wasn't, isn't, can't, don't, won't, …
-  /\b\w+n['’]t\b/i,
-  /\b(?:cannot|could\s+not|was\s+not\s+able|were\s+not\s+able|not\s+able\s+to|unable\s+to)\b/i,
+// HARD failure signals: unambiguous evidence something broke. These veto wherever
+// they appear (after the zero-ledger neutralisation below).
+const HARD_FAILURE_PATTERNS: RegExp[] = [
   /\b(?:failed(?:\s+to)?|failure|errored?|an?\s+error|timed?\s*out|time[\s-]?out)\b/i,
-  /\b(?:unauthori[sz]ed|not\s+authori[sz]ed|no\s+access|access\s+denied|permission\s+denied|forbidden|rate[\s-]?limit)\b/i,
+  /\b(?:unauthori[sz]ed|not\s+authori[sz]ed|access\s+denied|permission\s+denied|forbidden|rate[\s-]?limit)\b/i,
   /\bauth(?:entication|orization)?\s+(?:fail(?:ed|ure)?|error|issue|problem)\b/i,
   /\b(?:token\s+expired|invalid\s+(?:token|credential))/i,
+  /\bdid\s+not\s+work\b/i,
 ];
+
+// INABILITY / REFUSAL phrasing. This is genuinely ambiguous: on a skip day
+// "I cannot post today because the cadence forbids it" is a correct REFUSAL, while
+// "I could not access LinkedIn" is a FAILURE. The original rule vetoed on ANY
+// `\w+n't` contraction, which silently rejected the most natural ways to describe a
+// legitimate skip — "today isn't a publishing day", "I won't publish anything
+// today", "I didn't create anything" — the same phrasing-fragility class that caused
+// the 2026-08-06 production regression (ENG-844). So these veto ONLY when the
+// sentence does not justify itself by the cadence, or when it names an external
+// resource (which turns a refusal into a report of a broken dependency).
+const INABILITY_PATTERNS: RegExp[] = [
+  /\b(?:cannot|could\s+not|was\s+not\s+able|were\s+not\s+able|not\s+able\s+to|unable\s+to|would\s+not|refused)\b/i,
+];
+
+// An external dependency named alongside an inability means it is a failure report
+// ("LinkedIn would not accept the post"), not a cadence refusal.
+const FAILURE_RESOURCE_PATTERN =
+  /\b(?:linkedin|instagram|twitter|facebook|api|endpoint|server|network|gateway|upstream|http|token|credential|account)\b/i;
+
+// "no access" is only an auth failure when it is about an external resource
+// ("no access to the LinkedIn account"). On its own it is ordinary prose — e.g.
+// "no access to the calendar was needed" — and must not veto a legitimate skip.
+const NO_ACCESS_PATTERN = /\bno\s+access\b/i;
+
+// Expand contractions so the veto reasons about words, not apostrophes: "couldn't"
+// → "could not" (still an inability), while "isn't"/"didn't"/"won't" become plain
+// negations that no longer trip anything by themselves.
+function expandContractions(text: string): string {
+  return text
+    .replace(/\bcan['’]t\b/gi, 'cannot')
+    .replace(/\bwon['’]t\b/gi, 'will not')
+    .replace(/\bshan['’]t\b/gi, 'shall not')
+    .replace(/\b(\w+)n['’]t\b/gi, '$1 not');
+}
 
 const WEEKDAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
 
@@ -972,7 +1013,9 @@ const SCHEDULE_SKIP_AUTHORIZATION_PATTERNS: RegExp[] = [
 
 function instructionAuthorizesConditionalSkip(instruction: string): boolean {
   if (!instruction || typeof instruction !== 'string') return false;
-  const text = instruction.replace(/<[^>]+>/g, ' ');
+  // Expand contractions here too, so an owner who wrote "doesn't publish on
+  // weekends" is read the same as "does not publish on weekends" (ENG-844 audit).
+  const text = expandContractions(instruction.replace(/<[^>]+>/g, ' '));
   return SCHEDULE_SKIP_AUTHORIZATION_PATTERNS.some((re) => re.test(text));
 }
 
@@ -1064,7 +1107,7 @@ function parseScheduleCadence(instruction: string): { publishDays: Set<number>; 
   const publishDays = new Set<number>();
   const skipDays = new Set<number>();
   if (!instruction || typeof instruction !== 'string') return { publishDays, skipDays };
-  const text = instruction.replace(/<[^>]+>/g, ' ');
+  const text = expandContractions(instruction.replace(/<[^>]+>/g, ' '));
   const skipKeyword = /\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post)|non-?publishing|not\s+a\s+(?:publishing|posting)\s+day)\b/i;
   const publishOnlyKeyword = /\b(?:publish|post|publishing)\s+only\b|\bonly\s+(?:publish|post|on)\b/i;
   for (const clause of text.split(/[.;\n]+/)) {
@@ -1213,7 +1256,12 @@ export function scheduledRunSignalsConditionalSkip(
   // weekday assertion and a "<td>Failed</td><td>0</td>" completion ledger is read
   // as prose. Verified against the real ENG-844 session (442e7880…): both
   // happened, and without this the carve-out never fired on the actual skip.
-  const text = content.replace(/<[^>]+>/g, ' ');
+  // Contractions are expanded up-front so EVERY stage reasons about words rather
+  // than apostrophes. Without this, the most natural skip phrasing of all —
+  // "today isn't a publishing day" — never even matched the cadence-skip patterns
+  // (which look for "not a publishing day"), so the run was never recognised as a
+  // skip (ENG-844 audit).
+  const text = expandContractions(content.replace(/<[^>]+>/g, ' '));
 
   // (1) Must be a cadence-anchored skip, not a bare "skip today".
   const isCadenceSkip =
@@ -1240,10 +1288,26 @@ export function scheduledRunSignalsConditionalSkip(
   // count, which is what makes it safe: a stripped HTML table renders as
   // "Succeeded 0 Failed 1", where the "0" belongs to the PREVIOUS row — there,
   // "Failed" is followed by "1", so it is left intact and still vetoes.
-  const failureScan = text
-    .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
-    .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[:=-]?\s*\d*[1-9])/gi, ' ');
-  if (SKIP_FAILURE_SIGNAL_PATTERNS.some((re) => re.test(failureScan))) return false;
+  const failureScan = expandContractions(
+    text
+      .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
+      .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[:=-]?\s*\d*[1-9])/gi, ' ')
+  );
+  // (2a) Hard failure evidence vetoes anywhere in the turn.
+  if (HARD_FAILURE_PATTERNS.some((re) => re.test(failureScan))) return false;
+  // (2b) Inability/refusal is judged PER SENTENCE: it only vetoes when the sentence
+  // does not justify itself by the cadence, or when it names an external resource
+  // (a broken dependency rather than a deliberate refusal).
+  for (const sentence of failureScan.split(/[.;!?\n]+/)) {
+    // "no access" + a named external resource is an auth failure.
+    if (NO_ACCESS_PATTERN.test(sentence) && FAILURE_RESOURCE_PATTERN.test(sentence)) return false;
+    if (!INABILITY_PATTERNS.some((re) => re.test(sentence))) continue;
+    const cadenceJustified =
+      CADENCE_RATIONALE_PATTERNS.some((re) => re.test(sentence)) ||
+      CADENCE_SKIP_PATTERNS.some((re) => re.test(sentence));
+    if (cadenceJustified && !FAILURE_RESOURCE_PATTERN.test(sentence)) continue;
+    return false;
+  }
 
   // (3) Non-spoofable ledger check: a legitimate cadence skip makes NO write calls
   // AND no tool errors. Any tool error means this was a failure, not a skip; any
