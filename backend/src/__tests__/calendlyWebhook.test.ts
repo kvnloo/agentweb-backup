@@ -142,6 +142,13 @@ function flushPromises(): Promise<void> {
   return new Promise(setImmediate as unknown as (resolve: () => void) => void);
 }
 
+/** Waits real wall-clock time — needed for tests exercising runStepOnce's real
+ *  setTimeout-based backoff (0/200/600ms), which flushPromises' single-tick flush
+ *  doesn't wait out. */
+function waitReal(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function postSigned(body: object, signingKey: string = SIGNING_KEY) {
   const rawBody = JSON.stringify(body);
   const timestamp = Math.floor(Date.now() / 1000);
@@ -1177,10 +1184,14 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     // way. That's correct when work() failed (nothing happened, safe to retry), but wrong
     // when work() succeeded (the real HubSpot/Attio sync or alert already fired) — a
     // released claim lets a future retry repeat that already-successful side effect.
-    it('does not release the claim or repeat the side effect when only the done-marker write fails (retries the marker write instead)', async () => {
+    it('does not release the claim or repeat the side effect when the done-marker write fails once (backoff-retries the marker write instead)', async () => {
       const uri = 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1';
+      let doneAttempts = 0;
       mockSetLeadFields.mockImplementation((_listId: string, _leadId: string, fields: any) => {
-        if (fields.system?.[`hubspotSynced::${uri}`]) return Promise.reject(new Error('dynamo blip'));
+        if (fields.system?.[`hubspotSynced::${uri}`]?.status === 'done') {
+          doneAttempts += 1;
+          if (doneAttempts === 1) return Promise.reject(new Error('dynamo blip'));
+        }
         return Promise.resolve(undefined);
       });
 
@@ -1188,48 +1199,94 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       const res = await postSigned(body);
 
       expect(res.status).toBe(200);
-      await flushPromises();
+      await waitReal(1000);
 
       // work() itself (the real HubSpot sync) only ran once — never repeated.
-      expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, expect.anything(), expect.anything(), 'hubspot', expect.anything());
       expect(mockAutoSyncLead.mock.calls.filter((c: any) => c[3] === 'hubspot')).toHaveLength(1);
       // The claim was never released — releasing would make the step look unclaimed.
       expect(mockSetLeadFields).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), {
         removeSystemKeys: [`hubspotSynced::${uri}`],
       });
-      // The marker write was retried once and succeeded on the second attempt.
-      const markerWriteCalls = mockSetLeadFields.mock.calls.filter((c: any) => c[2]?.system?.[`hubspotSynced::${uri}`]);
-      expect(markerWriteCalls).toHaveLength(2);
-    });
+      // Never fell back to the terminal 'done_unconfirmed' marker — 'done' itself succeeded on retry.
+      expect(mockSetLeadFields).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), {
+        system: { [`hubspotSynced::${uri}`]: { status: 'done_unconfirmed' } },
+      });
+      expect(doneAttempts).toBe(2);
+    }, 10000);
 
-    it('leaves the claim in place (still unreleased) and does not fail the job when the done-marker write fails on both attempts', async () => {
+    // Greptile P1 on #2291 (second pass): merely NOT releasing the claim isn't enough —
+    // claimLeadStepOnce's own staleness window reclaims any 'in_progress' claim once it's
+    // old enough, with no way to distinguish "crashed before work() ran" (safe to redo)
+    // from "work() succeeded but we could never confirm it" (must never be redone). A
+    // stale-but-still-'in_progress' claim from this branch would eventually become
+    // reclaimable and repeat the already-successful side effect.
+    it('falls back to a terminal done_unconfirmed marker (never reclaimable) when every "done" write attempt fails', async () => {
       const uri = 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1';
       mockSetLeadFields.mockImplementation((_listId: string, _leadId: string, fields: any) => {
-        if (fields.system?.[`hubspotSynced::${uri}`]) return Promise.reject(new Error('dynamo down'));
+        if (fields.system?.[`hubspotSynced::${uri}`]?.status === 'done') return Promise.reject(new Error('dynamo down'));
         return Promise.resolve(undefined);
       });
-      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 
       const body = makePayload({ email: 'lead@example.com', uri });
       const res = await postSigned(body);
 
       expect(res.status).toBe(200);
-      await flushPromises();
+      await waitReal(1000);
 
       expect(mockAutoSyncLead.mock.calls.filter((c: any) => c[3] === 'hubspot')).toHaveLength(1);
       expect(mockSetLeadFields).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), {
         removeSystemKeys: [`hubspotSynced::${uri}`],
       });
-      expect(errorSpy).toHaveBeenCalledWith(
-        expect.stringContaining('done-marker write failed twice'),
+      // All 3 backoff attempts at 'done' were made before falling back.
+      const doneAttempts = mockSetLeadFields.mock.calls.filter(
+        (c: any) => c[2]?.system?.[`hubspotSynced::${uri}`]?.status === 'done',
+      );
+      expect(doneAttempts).toHaveLength(3);
+      // The terminal fallback marker was written successfully.
+      expect(mockSetLeadFields).toHaveBeenCalledWith(expect.anything(), expect.anything(), {
+        system: { [`hubspotSynced::${uri}`]: { status: 'done_unconfirmed' } },
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining('falling back to a terminal marker'),
         expect.anything(),
       );
-      // The real side effect succeeded — this must NOT be treated as a job failure,
-      // unlike a genuine work() failure (the sibling test above).
+      // The real side effect succeeded — this must NOT be treated as a job failure.
+      expect(mockMarkJobFailed).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+    }, 10000);
+
+    it('escalates loudly and leaves the claim in place when EVERY write attempt fails, including the terminal fallback marker', async () => {
+      const uri = 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1';
+      mockSetLeadFields.mockImplementation((_listId: string, _leadId: string, fields: any) => {
+        if (fields.system?.[`hubspotSynced::${uri}`]) return Promise.reject(new Error('dynamo fully down'));
+        return Promise.resolve(undefined);
+      });
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const body = makePayload({ email: 'lead@example.com', uri });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await waitReal(1000);
+
+      expect(mockAutoSyncLead.mock.calls.filter((c: any) => c[3] === 'hubspot')).toHaveLength(1);
+      // Still never released, even in the total-failure case — releasing is the one thing
+      // that's never safe once work() has already succeeded.
+      expect(mockSetLeadFields).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), {
+        removeSystemKeys: [`hubspotSynced::${uri}`],
+      });
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('EVERY attempt to durably record it failed'),
+        expect.anything(),
+      );
       expect(mockMarkJobFailed).not.toHaveBeenCalled();
 
       errorSpy.mockRestore();
-    });
+      (console.warn as jest.Mock).mockRestore();
+    }, 10000);
   });
 
   describe('Multi-host event resolution', () => {
