@@ -35,6 +35,24 @@ import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import { ctx, jsonResult } from './toolHelpers';
 
+/**
+ * Read one optional profile section.
+ *
+ * A 404 means the account has not configured it — a real, reportable answer.
+ * Anything else (401, 429, 5xx, network) is an operational failure and must NOT
+ * be flattened into "not configured": an agent told the brand is empty will
+ * cheerfully invent one. `mcpFetch` puts the HTTP status in its error message.
+ */
+async function section(name: string, path: string, identity: any) {
+  try {
+    return { name, data: await mcpFetch({ method: 'GET', path, context: identity }), error: undefined as string | undefined };
+  } catch (err: any) {
+    const message = String(err?.message ?? err);
+    if (/\(404\)/.test(message)) return { name, data: null, error: undefined };
+    return { name, data: null, error: message };
+  }
+}
+
 // ─── 1. Delegate a goal to Emma ─────────────────────────────────────────────
 
 mcpToolRegistry.register({
@@ -81,7 +99,10 @@ mcpToolRegistry.register({
       method: 'POST',
       path: '/api/agent-mode/generate',
       context: ctx(context),
-      body: { sessionId: taskId, message: args?.goal },
+      // The endpoint's field is `userMessage`, not `message` — see
+      // agentModeController. emma_send_message maps its own `message` argument
+      // onto `userMessage` for exactly this reason.
+      body: { sessionId: taskId, userMessage: args?.goal },
     });
 
     return jsonResult({
@@ -118,14 +139,27 @@ mcpToolRegistry.register({
       context: ctx(context),
     });
 
-    const messages = data?.messages ?? [];
-    const last = Array.isArray(messages) && messages.length ? messages[messages.length - 1] : undefined;
+    const messages = Array.isArray(data?.messages) ? data.messages : [];
+    const last = messages.length ? messages[messages.length - 1] : undefined;
+
+    // A ChatSession has NO top-level `status` field, so reading one would report
+    // "unknown" forever. Derive it from what the session actually carries:
+    //   - a pendingUserQuestion means Emma is blocked on the caller
+    //   - otherwise the last speaker tells us whether she has replied yet
+    const pending = data?.pendingUserQuestion;
+    const status = pending ? 'awaiting_input' : last?.role === 'assistant' ? 'idle' : 'running';
 
     return jsonResult({
       task_id: args?.task_id,
-      status: data?.status ?? 'unknown',
-      latest_output: last?.content ?? last?.text ?? null,
-      message_count: Array.isArray(messages) ? messages.length : 0,
+      status,
+      latest_output: last?.content ?? null,
+      message_count: messages.length,
+      // Surfaced deliberately: a blocking question answered with a plain message
+      // is abandoned rather than answered, so the caller needs to see it.
+      awaiting_question: pending ?? null,
+      next: pending
+        ? 'Emma is waiting on an answer. Use emma_answer_question — a plain message abandons the question.'
+        : undefined,
     });
   },
 });
@@ -206,16 +240,24 @@ mcpToolRegistry.register({
     // that it wanted all three.
     const identity = ctx(context);
     const [brand, strategy, knowledge] = await Promise.all([
-      mcpFetch({ method: 'GET', path: '/api/brand/guidelines', context: identity }).catch(() => null),
-      mcpFetch({ method: 'GET', path: '/api/market-strategy', context: identity }).catch(() => null),
-      mcpFetch({ method: 'GET', path: '/api/emma/knowledge-bases', context: identity }).catch(() => null),
+      section('brand_guidelines', '/api/brand/guidelines', identity),
+      section('market_strategy', '/api/market-strategy', identity),
+      section('knowledge_base_files', '/api/emma/knowledge-bases', identity),
     ]);
 
+    const failures = [brand, strategy, knowledge].filter(s => s.error).map(s => `${s.name}: ${s.error}`);
+
     return jsonResult({
-      brand_guidelines: brand,
-      market_strategy: strategy,
-      knowledge_base_files: knowledge,
-      note: 'Any section that is null is not configured on this account yet.',
+      brand_guidelines: brand.data,
+      market_strategy: strategy.data,
+      knowledge_base_files: knowledge.data,
+      // "Not configured" and "we could not reach the service" are different
+      // facts. Collapsing both to null tells the agent this company has no
+      // brand, and it will then invent one.
+      unavailable: failures.length ? failures : undefined,
+      note: failures.length
+        ? 'Some sections could not be read — treat those as UNKNOWN, not as unconfigured. Do not generate content that assumes they are empty.'
+        : 'A null section is genuinely not configured on this account yet.',
     });
   },
 });

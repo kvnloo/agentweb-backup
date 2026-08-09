@@ -94,6 +94,54 @@ describe('ENG-982: one call completes the job', () => {
     expect(paths()).toEqual(['/api/agent-mode/generate']);
   });
 
+  // ── REST contract assertions ──────────────────────────────────────────────
+  // Greptile caught three P1s on #2306 that this suite missed entirely, because
+  // it asserted only which PATHS were called and never what was SENT or how the
+  // response was read. Mocking mcpFetch and then checking your own arguments is
+  // tautological. These assert the contracts the endpoints actually enforce.
+
+  it('emma_run_marketing_task sends userMessage, the field the endpoint requires', async () => {
+    mockMcpFetch
+      .mockResolvedValueOnce({ sessionId: 'task-42' })
+      .mockResolvedValueOnce({ message: 'on it' });
+
+    await tool('emma_run_marketing_task').execute({ goal: 'launch a campaign' }, CALLER);
+
+    // /api/agent-mode/generate rejects a body without `userMessage` with a 400.
+    // Sending `message` made every call fail; nothing here caught it before.
+    const generate = mockMcpFetch.mock.calls.find(c => c[0]?.path === '/api/agent-mode/generate');
+    expect(generate[0].body).toMatchObject({ sessionId: 'task-42', userMessage: 'launch a campaign' });
+    expect(generate[0].body.message).toBeUndefined();
+  });
+
+  it('emma_get_task_result reports awaiting_input when Emma is blocked on a question', async () => {
+    mockMcpFetch.mockResolvedValueOnce({
+      messages: [{ role: 'assistant', content: 'which audience?' }],
+      pendingUserQuestion: { question: 'which audience?' },
+    });
+
+    const res: any = await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER);
+    const body = JSON.parse(res.content[0].text);
+
+    expect(body.status).toBe('awaiting_input');
+    expect(body.awaiting_question).toEqual({ question: 'which audience?' });
+    expect(body.next).toMatch(/emma_answer_question/);
+  });
+
+  it('emma_get_task_result derives status from the transcript, never a nonexistent field', async () => {
+    // A ChatSession has no top-level `status`. Reading one returned "unknown"
+    // forever, so a caller could never tell a finished task from a running one.
+    mockMcpFetch.mockResolvedValueOnce({ messages: [{ role: 'assistant', content: 'done' }] });
+    let body = JSON.parse((await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER) as any).content[0].text);
+    expect(body.status).toBe('idle');
+    expect(body.latest_output).toBe('done');
+
+    jest.clearAllMocks();
+    mockMcpFetch.mockResolvedValueOnce({ messages: [{ role: 'user', content: 'go' }] });
+    body = JSON.parse((await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER) as any).content[0].text);
+    expect(body.status).toBe('running');
+  });
+
   it('emma_get_brand_profile collapses three lookups into one call', async () => {
     mockMcpFetch
       .mockResolvedValueOnce({ tone: 'direct' })
@@ -111,19 +159,36 @@ describe('ENG-982: one call completes the job', () => {
     expect(body.knowledge_base_files).toEqual([{ name: 'positioning.md' }]);
   });
 
-  it('emma_get_brand_profile degrades one missing section to null rather than failing the whole call', async () => {
+  it('emma_get_brand_profile reports a genuinely unconfigured section (404) as null', async () => {
     mockMcpFetch
       .mockResolvedValueOnce({ tone: 'direct' })
-      .mockRejectedValueOnce(new Error('not configured'))
+      .mockRejectedValueOnce(new Error('API error (404): not found'))
       .mockResolvedValueOnce([]);
 
     const res: any = await tool('emma_get_brand_profile').execute({}, CALLER);
     const body = JSON.parse(res.content[0].text);
 
-    // An account without a market strategy still gets its brand back — a
-    // half-onboarded account is the common case, not an error.
+    // A half-onboarded account is the common case, not an error.
     expect(body.brand_guidelines).toEqual({ tone: 'direct' });
     expect(body.market_strategy).toBeNull();
+    expect(body.unavailable).toBeUndefined();
+  });
+
+  it('emma_get_brand_profile does NOT disguise an operational failure as "unconfigured"', async () => {
+    // The bug this replaces: `.catch(() => null)` told the agent this company
+    // had no brand whenever the service was down or the caller was over quota,
+    // and an agent told the brand is empty will invent one.
+    mockMcpFetch
+      .mockResolvedValueOnce({ tone: 'direct' })
+      .mockRejectedValueOnce(new Error('API error (429): quota exceeded'))
+      .mockResolvedValueOnce([]);
+
+    const res: any = await tool('emma_get_brand_profile').execute({}, CALLER);
+    const body = JSON.parse(res.content[0].text);
+
+    expect(body.market_strategy).toBeNull();
+    expect(body.unavailable).toEqual([expect.stringContaining('market_strategy')]);
+    expect(body.note).toMatch(/UNKNOWN, not as unconfigured/);
   });
 
   it('emma_research routes news questions to the news index and general ones to web', async () => {
