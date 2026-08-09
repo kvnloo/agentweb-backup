@@ -436,11 +436,21 @@ router.post('/connect', authenticateToken, async (req: any, res) => {
       throw createAccountError;
     }
 
-    // Any orphan-webhook fallback record for this identity is now stale — either it
-    // was the one we just found, deleted, and replaced (ownPreviousWebhookId), or
-    // this connect never needed it. Best-effort: a leftover row is harmless, just a
-    // future lookup returning an id Calendly may already have forgotten about.
-    await clearOrphanedCalendlyWebhook(userId, profile.user_uri!).catch(() => {});
+    // Greptile P1 on #2291 (fifth pass): clearing the orphan record was previously
+    // unconditional, on the assumption that it was "either the one we just found,
+    // deleted, and replaced, or never needed" — wrong exactly when the self-heal
+    // ITSELF fails (delete AND retry-create both fail, provisionCalendlyWebhook
+    // returns bookingTrackingActive: false). In that case the stale subscription is
+    // still LIVE on Calendly's side, never actually deleted — clearing the orphan
+    // record here would erase the only remaining durable identifier for it, so no
+    // future reconnect could ever find and clean it up again, leaving booking
+    // tracking permanently disabled with "Already Exists" on every retry. Only clear
+    // it once the self-heal (or a plain fresh connect that never needed it) actually
+    // succeeded — a leftover row when it didn't is harmless, just a future lookup
+    // returning an id Calendly may already have forgotten about.
+    if (bookingTrackingActive) {
+      await clearOrphanedCalendlyWebhook(userId, profile.user_uri!).catch(() => {});
+    }
 
     res.json({
       success: true,
