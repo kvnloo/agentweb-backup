@@ -7257,3 +7257,80 @@ separate them. Automation is blocked on its *own* PRs by two independent signals
 `swarm/*`/`autofix/*` head branch, or an `Execution-Actor:` attribution line in the body), but on
 a human-authored PR an agent acting as Harsha could still post an override. The structural fix is
 the dedicated bot identity `automated-work-attribution.md` already calls for.
+
+## ENG-967 — "two landing pages returned 0 leads": a real bug, and two lists that do not have it (2026-08-21)
+
+Reported as one bug: two CRM lead lists returned 0 leads on every Inbound Website Lead
+Engagement run since May 2026. Investigating it surfaced a genuine silent-lead-loss defect —
+but **neither reported list is an instance of it.** Both halves are recorded here because the
+fix and the report do not line up, and a future reader will otherwise assume they did.
+
+### The defect that is real, and is fixed here
+
+A landing page can be bound to a lead list that the platform will not accept public
+submissions for. The generated capture route posts to `POST /api/webhooks/forward-lead`,
+which rejects any list with `publicAccessEnabled !== true` with a 403 (`webhooks.ts`) — and
+the visitor is still shown a success screen. The page reports "saving leads to X" while
+dropping every submission, indefinitely.
+
+`crmDb.createLeadList` defaults `publicAccessEnabled` to **false** (`db.ts`), and `/generate`
+has enabled it on the list it binds since ENG-449 — but the two other paths that bind a list
+did not: `PATCH /generated/:id/lead-list` (the portal picker and the agent's MCP equivalent)
+and `/generated/:id/duplicate`. Either could wire a page to a list that could never accept a
+lead.
+
+`ensureLeadListAcceptsPublicSubmissions` now runs on all three paths. It is idempotent (no
+write when the list is already public) and never throws — a failed enabling write returns a
+warning that the PATCH response surfaces, rather than reporting a clean save.
+
+⚠ **`publicAccessEnabled` gates WRITES only.** Its readers are `forward-lead`,
+`crmPublic.ts`'s `POST /leads/:listId`, `crmAutoSyncService` and `admin.ts`; there is no
+public READ path behind it. Enabling it opens an unauthenticated lead-insert on that list —
+which is what a page-bound list is for — and exposes no stored lead to anyone.
+
+### The two reported lists — checked against production, 2026-08-21
+
+| list | name | publicAccess | bound page | live route |
+| --- | --- | --- | --- | --- |
+| `list_1779584823329_md99qvwnk` | LP Leads - 2026 State of AI Marketing | false | **none** | **404** |
+| `list_1779822422539_l5yvansu2` | LP Leads - Emma Partner Network | true | 1 (`110edb3d…`) | 200 |
+
+**Neither is explained by the bug above. Nothing posts to either list.**
+
+- **2026 State of AI Marketing** — no `AW-LandingPages` record names it (`Scan` of all 167
+  records), no code in the `AgentWebPro` org references it (GitHub code search, 0 hits), and
+  `hireemma.ai/2026-state-of-ai-marketing` returns **404**. It is an orphaned list for a page
+  that does not exist. Owned by `harsha@agentweb.pro`, not by the reporter.
+- **Emma Partner Network** — the `AW-LandingPages` record names this list, but the live form
+  does not use it. `/emma-partner-network` posts through `/api/partner-capture` →
+  `PARTNER_LEAD_LIST_ID` → `LANDERS['/emma-partner-network'].listId` =
+  **`list_1780522372186_ve7ebuzp8`** ("Partner Network Briefs"), read from `lib/landers.ts`
+  in `agentweb-landing-page`, not from the doc that describes it. That list is public and has
+  received a brief. The repo's own `LANDERS.md` already calls `l5yvansu2` a **duplicate** and
+  says to delete it.
+
+⚠ **An earlier revision of this section asserted that `md99qvwnk` "is bound to a landing page"
+and that the backfill script below is "the one-time repair" for it. Both were wrong.** They
+were written from the autofix runner, whose IAM role is denied `Scan`/`Query` on
+`AW-LandingPages`, so the binding was inferred rather than read. The script enumerates lists
+*from* `AW-LandingPages.leadListId` and would never have enumerated that list at all. **A
+claim that could not be read was recorded as if it had been** — the failure mode this repo's
+own evidence rules exist to prevent.
+
+### Remediation for pages that are already broken
+
+`src/scripts/backfill-eng967-lead-list-public-access.ts`. The code fix only runs on a future
+bind, so it repairs nothing already broken. The script scans `AW-LandingPages` and, for every
+lead list a page names in `leadListId`, enables `publicAccessEnabled` where it is not already
+true. Dry run by default; `--list=<id>` targets one list.
+
+**Bulk production data mutation — needs Harsha's data-plane approval per `CLAUDE.md` before
+anyone runs it with `--apply`.** It deliberately does not touch a list no page binds: a
+private list nothing posts to is private on purpose.
+
+### What is left, and who owns it
+
+Both reported lists need **CRM cleanup, not code** — delete or rename the orphaned
+`md99qvwnk`, and reconcile the Emma Partner Network page record onto the list its form
+actually writes to (or delete the duplicate, as `LANDERS.md` already says). Both are
+production data mutations behind the same data-plane gate.
