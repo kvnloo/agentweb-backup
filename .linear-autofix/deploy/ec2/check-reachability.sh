@@ -6,6 +6,9 @@
 #   partner  = <bug>.<ip>.nip.io:5173     customer = <bug>.<ip>.nip.io:5174
 #   API      = <bug>.<ip>.nip.io:3001
 # Override ports via PARTNER_PORT / CUSTOMER_PORT / API_PORT to match config.previewPorts.
+#
+# Previews are gated by a shared secret (ENG-920): export PREVIEW_ACCESS_TOKEN=<the value from the
+# box's .linear-autofix/.env> before running, or L3 will (correctly) report 401.
 set -uo pipefail
 
 IP="${1:?usage: check-reachability.sh <public-ip> <bug-id>}"
@@ -47,15 +50,23 @@ else fail "L2 DNS ${HOST} -> ${R} (expected ${IP})" "wrong public IP, or PREVIEW
 fi
 
 # --- L3: each portal returns HTTP (route registered + app up + PREVIEW_IP match) ---
+# The access gate answers BEFORE the route lookup, so an ungated probe can only ever say 401 — it
+# can't tell "preview down" from "no token". Send the token so L3 keeps proving the layer it's for.
+TOKEN="${PREVIEW_ACCESS_TOKEN:-}"
+Q=""; [ -n "$TOKEN" ] && Q="?k=${TOKEN}"
 for pp in "customer:$CUSTOMER_PORT" "partner:$PARTNER_PORT" "api:$API_PORT"; do
   role="${pp%%:*}"; port="${pp##*:}"
-  C="$(code "http://${HOST}:${port}/")"
-  if [ "$C" = "502" ] || [ "$C" = "000" ]; then
+  C="$(code "http://${HOST}:${port}/${Q}")"
+  if [ "$C" = "401" ]; then
+    fail "L3 ${role} http://${HOST}:${port}/ -> 401 (preview access gate)" \
+         "export PREVIEW_ACCESS_TOKEN=<value from the box's .linear-autofix/.env> and re-run"
+  elif [ "$C" = "502" ] || [ "$C" = "000" ]; then
     fail "L3 ${role} http://${HOST}:${port}/ -> ${C}" \
          "preview for '${BUG}' not up on this port, or born with a different PREVIEW_IP. On the box: preview.mjs list; then PREVIEW_IP=${IP} preview.mjs up ${BUG^^} <worktree>"
   else
-    pass "L3 ${role} http://${HOST}:${port}/ -> ${C}"
+    pass "L3 ${role} http://${HOST}:${port}/ -> ${C}"   # 302 = gate granting the cookie, then the app
   fi
 done
 
-echo "Done. All PASS ⇒ open http://${HOST}:${CUSTOMER_PORT}/ (customer) or :${PARTNER_PORT}/ (partner)."
+echo "Done. All PASS ⇒ open http://${HOST}:${CUSTOMER_PORT}/${Q} (customer) or :${PARTNER_PORT}/${Q} (partner)."
+[ -z "$TOKEN" ] && echo "  NOTE: append ?k=<PREVIEW_ACCESS_TOKEN> the first time — the proxy then sets a 30-day cookie."

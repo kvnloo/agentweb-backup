@@ -9,11 +9,13 @@
 
 import http from 'node:http';
 import net from 'node:net';
+import os from 'node:os';
 import { readFileSync, writeFileSync, statSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from '../config.mjs';
+import { decideAccess, DENY_BODY } from './auth.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -55,6 +57,63 @@ function noteAccess(bug) {
   try { writeFileSync(ACCESS, JSON.stringify(access, null, 2)); } catch { /* best effort */ }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Access gate (ENG-920). preview.mjs binds the real servers to 127.0.0.1, so THIS is the only
+// process listening on the public ports — and the backend behind it runs with live dev AWS creds.
+// Anything that isn't on-box must present the shared secret. See ./auth.mjs for the decision.
+// ---------------------------------------------------------------------------------------------
+
+// These normally arrive via the environment (run.sh sources .env before spawning us), but the proxy
+// is also restarted by hand from a plain shell — fall back to reading .env directly, so a manual
+// restart never silently 401s every reviewer (or drops the public IP out of the on-box allowlist).
+function fromEnvFile(name) {
+  if (process.env[name]) return process.env[name];
+  try {
+    const envFile = readFileSync(path.join(PREVIEW_DIR, '..', '.env'), 'utf8');
+    const m = new RegExp(`^\\s*(?:export\\s+)?${name}\\s*=\\s*(.*)$`, 'm').exec(envFile);
+    if (m) return m[1].trim().replace(/^(['"])(.*)\1$/, '$2');
+  } catch { /* no .env — treated as unset (the token case then fails closed for public callers) */ }
+  return '';
+}
+const TOKEN = fromEnvFile('PREVIEW_ACCESS_TOKEN');
+
+// Our own addresses: on-box requests to the public nip.io URL hairpin through the IGW and come back
+// with the instance's PUBLIC ip as the source, so private ranges alone aren't enough to keep the
+// Playwright verify step working.
+const PREVIEW_IP = fromEnvFile('PREVIEW_IP');
+const SELF_IPS = [
+  ...Object.values(os.networkInterfaces()).flat().filter(Boolean).map((n) => n.address),
+  ...(PREVIEW_IP ? [PREVIEW_IP] : []),
+];
+
+if (!TOKEN) {
+  console.error('[preview-proxy] ############################################################');
+  console.error('[preview-proxy] PREVIEW_ACCESS_TOKEN is NOT SET — refusing every non-private');
+  console.error('[preview-proxy] request. Previews work on-box only. Set it in .linear-autofix/.env');
+  console.error('[preview-proxy] (see .env.example) and restart the proxy to let reviewers in.');
+  console.error('[preview-proxy] ############################################################');
+}
+
+// Returns true when the request may proceed; otherwise it has ALREADY been answered (401 or the
+// cookie-setting redirect). Identical for every host/path so a 401 never reveals whether a bug exists.
+function gate(req, res) {
+  const d = decideAccess({
+    secret: TOKEN,
+    url: req.url,
+    host: req.headers.host,
+    cookieHeader: req.headers.cookie,
+    remoteAddress: req.socket && req.socket.remoteAddress,
+    selfIps: SELF_IPS,
+  });
+  if (d.action === 'allow') return true;
+  if (d.action === 'grant') {
+    res.writeHead(302, { 'set-cookie': d.setCookie, location: d.location, 'cache-control': 'no-store' }).end();
+    return false;
+  }
+  res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }).end(DENY_BODY);
+  return false;
+}
+
 // listen port -> routes.json key suffix for that portal ('' = customer/root).
 const PP = config.previewPorts || { partner: 5173, customer: 5174, api: 3001 };
 const PORT_SUFFIX = [
@@ -82,7 +141,10 @@ function makeRequestHandler(suffix) {
     // A client that resets the connection mid-request must not crash the proxy.
     req.on('error', () => {});
     res.on('error', () => {});
+    // Health stays open: it's host-agnostic, leaks nothing, and check-reachability.sh probes it from
+    // a laptop to separate "port/SG closed" from "preview not up" before a token is ever involved.
     if (req.url === HEALTH) { res.writeHead(200, { 'content-type': 'text/plain' }).end('preview-proxy-ok'); return; }
+    if (!gate(req, res)) return;                  // 401 / cookie-grant redirect — before any route lookup
     noteAccess(keyOf(req.headers.host)); // stamp "URL opened" for the eviction policy (throttled)
     const key = keyOf(req.headers.host) + suffix;
     const port = getRoutes()[key];
@@ -100,6 +162,18 @@ function makeRequestHandler(suffix) {
 function makeUpgradeHandler(suffix) {
   return (req, socket, head) => {
     socket.on('error', () => socket.destroy());   // client socket reset must not crash the proxy
+    // Same gate as HTTP — otherwise socket.io/HMR would be an ungated way into the same servers.
+    // There's no page to redirect here, so a valid ?k= simply passes (the browser already holds the
+    // cookie for any upgrade it makes from a granted page).
+    const d = decideAccess({
+      secret: TOKEN,
+      url: req.url,
+      host: req.headers.host,
+      cookieHeader: req.headers.cookie,
+      remoteAddress: socket.remoteAddress,
+      selfIps: SELF_IPS,
+    });
+    if (d.action === 'deny') { socket.destroy(); return; }
     const port = getRoutes()[keyOf(req.headers.host) + suffix];
     if (!port) { socket.destroy(); return; }
     const up = net.connect(port, '127.0.0.1', () => {
