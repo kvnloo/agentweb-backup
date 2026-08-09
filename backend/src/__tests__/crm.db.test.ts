@@ -95,6 +95,55 @@ describe('CRM Database Service', () => {
       expect(mockDocumentClientMethods.put).toHaveBeenCalled();
       expect(result.name).toBe(name);
     });
+
+    // Idempotent-create support (ENG-524): a caller that needs a deterministic,
+    // race-safe "create if absent" (e.g. one auto-created list per user, safe
+    // across multiple backend instances) can pass an explicit listId. This
+    // must NOT change behavior for the many existing callers that omit it.
+    it('uses the explicit listId verbatim when provided, instead of generating a random one', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      const result = await crmDb.createLeadList(
+        'user1', 'Test List', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+        'list_deterministic_id',
+      );
+
+      expect(result.listId).toBe('list_deterministic_id');
+    });
+
+    it('adds a ConditionExpression guarding against overwriting an existing item when an explicit listId is given', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      await crmDb.createLeadList(
+        'user1', 'Test List', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+        'list_deterministic_id',
+      );
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.ConditionExpression).toBe('attribute_not_exists(listId)');
+    });
+
+    it('does not add a ConditionExpression when no explicit listId is given (existing random-ID behavior unchanged)', async () => {
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockResolvedValue({}) });
+
+      await crmDb.createLeadList('user1', 'Test List');
+
+      const putCall = mockDocumentClientMethods.put.mock.calls[0][0];
+      expect(putCall.ConditionExpression).toBeUndefined();
+    });
+
+    it('propagates a ConditionalCheckFailedException when the explicit listId already exists (lost the create race)', async () => {
+      const conditionalError: any = new Error('The conditional request failed');
+      conditionalError.code = 'ConditionalCheckFailedException';
+      mockDocumentClientMethods.put.mockReturnValue({ promise: jest.fn().mockRejectedValue(conditionalError) });
+
+      await expect(
+        crmDb.createLeadList(
+          'user1', 'Test List', undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+          'list_deterministic_id',
+        ),
+      ).rejects.toMatchObject({ code: 'ConditionalCheckFailedException' });
+    });
   });
 
   describe('getLeadListById', () => {
@@ -788,6 +837,54 @@ describe('CRM Database Service', () => {
       mergeSpy.mockRestore();
     });
 
+    // Greptile P1 on #2291: internal per-booking idempotency markers (e.g. Calendly
+    // webhook completion flags) must never show up in CSV exports or the Configure
+    // Display Fields UI the way customFields does — `system` is the existing sidecar
+    // map for exactly this (see updateLead's `system` param), but setLeadFields only
+    // supported atomic writes to customFields/enrichmentMetadata, not system, forcing
+    // callers needing atomicity to (mis)use customFields instead.
+    it('writes system sub-keys atomically, bootstraps the system map, and never triggers the customFields fieldNames sync', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      const mergeSpy = jest.spyOn(crmDb, 'mergeFieldNames').mockResolvedValue();
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        system: { 'hubspotSynced::https://api.calendly.com/x/invitees/y': true },
+      });
+
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      const bootstrap = mockDocumentClientMethods.update.mock.calls[0][0];
+      // `system` is a DynamoDB reserved keyword — must be a #system placeholder, not
+      // the literal attribute name (confirmed live against a real table: unescaped,
+      // this throws ValidationException, invisible to a mocked-DynamoDB unit test).
+      expect(bootstrap.UpdateExpression).toContain('#system = if_not_exists(#system, :emptyMap)');
+      expect(bootstrap.ExpressionAttributeNames['#system']).toBe('system');
+      const main = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(main.UpdateExpression).toContain('#system.#sys0 = :sys0');
+      expect(main.ExpressionAttributeNames['#system']).toBe('system');
+      expect(main.ExpressionAttributeValues[':sys0']).toBe(true);
+      // system keys are internal bookkeeping, not customer-visible custom fields —
+      // must never register on the list's fieldNames.
+      expect(mergeSpy).not.toHaveBeenCalled();
+
+      mergeSpy.mockRestore();
+    });
+
+    it('removes system sub-keys via removeSystemKeys', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      await crmDb.setLeadFields('list_123', 'lead_123', {
+        removeSystemKeys: ['stale_marker'],
+      });
+
+      const main = mockDocumentClientMethods.update.mock.calls[1][0];
+      expect(main.UpdateExpression).toContain('REMOVE');
+      expect(main.UpdateExpression).toContain('system.#rmsys0');
+    });
+
     it('uses if_not_exists in all SET clauses when ifNotExists=true', async () => {
       mockDocumentClientMethods.update.mockReturnValue({
         promise: jest.fn().mockResolvedValue({}),
@@ -922,6 +1019,81 @@ describe('CRM Database Service', () => {
       const main = mockDocumentClientMethods.update.mock.calls[1][0];
       expect(main.UpdateExpression).toContain('REMOVE');
       expect(main.UpdateExpression).toContain('customFields.#rmcf0');
+    });
+  });
+
+  // Greptile P1 on #2291 (round 15): a stale-reclamation race in the async job
+  // queue can, in the worst case, let two processor instances both start
+  // processing the SAME booking concurrently. Per-step completion markers alone
+  // stop a THIRD run from repeating a step, but two instances racing to the same
+  // not-yet-done step would both pass that check. claimLeadStepOnce is the actual
+  // mutex — a DynamoDB conditional write, not a probability reduction — so at most
+  // one instance ever wins the claim and performs the real side effect.
+  describe('claimLeadStepOnce', () => {
+    it('returns true and SETs the key (with a claimedAt timestamp) when nobody else holds it', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.claimLeadStepOnce('list_123', 'lead_123', 'hubspotSynced::uri-1');
+
+      expect(result).toBe(true);
+      // 1: bootstrap the system map, 2: the conditional claim SET.
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
+      const claimCall = mockDocumentClientMethods.update.mock.calls[1][0];
+      // `system` is a DynamoDB reserved keyword — must be a #system placeholder, not
+      // the literal attribute name (confirmed live against a real table).
+      expect(claimCall.UpdateExpression).toContain('#system.#k = :claim');
+      expect(claimCall.ExpressionAttributeNames['#system']).toBe('system');
+      expect(claimCall.ExpressionAttributeValues[':claim']).toEqual({
+        status: 'in_progress',
+        claimedAt: expect.any(String),
+      });
+      // Greptile P1 on #2291 (round 17): the release-on-failure write is itself
+      // best-effort — if it also fails, a claim with no timestamp would stay
+      // 'in_progress' forever with no way to ever recover it. The condition must
+      // allow reclaiming, not just claiming fresh.
+      expect(claimCall.ConditionExpression).toBe(
+        'attribute_not_exists(#system.#k) OR (#system.#k.#status = :inProgress AND #system.#k.#claimedAt < :staleThreshold)',
+      );
+    });
+
+    it('returns false without throwing when the key is claimed by a NOT-yet-stale concurrent run', async () => {
+      mockDocumentClientMethods.update
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) }) // bootstrap succeeds
+        .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }) }); // claim loses — real DynamoDB evaluates the OR condition itself; the mock just simulates "condition failed"
+
+      const result = await crmDb.claimLeadStepOnce('list_123', 'lead_123', 'hubspotSynced::uri-1');
+
+      expect(result).toBe(false);
+    });
+
+    it('returns false without throwing when the lead itself does not exist (bootstrap condition fails)', async () => {
+      mockDocumentClientMethods.update.mockReturnValueOnce({
+        promise: jest.fn().mockRejectedValue({ code: 'ConditionalCheckFailedException' }),
+      });
+
+      const result = await crmDb.claimLeadStepOnce('list_123', 'missing-lead', 'hubspotSynced::uri-1');
+
+      expect(result).toBe(false);
+      expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(1);
+    });
+
+    it('sets the stale threshold to CLAIM_STALE_MS (5 minutes) in the past', async () => {
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      const before = Date.now();
+
+      await crmDb.claimLeadStepOnce('list_123', 'lead_123', 'hubspotSynced::uri-1');
+
+      const claimCall = mockDocumentClientMethods.update.mock.calls[1][0];
+      const staleThreshold = new Date(claimCall.ExpressionAttributeValues[':staleThreshold']).getTime();
+      const claimedAt = new Date(claimCall.ExpressionAttributeValues[':claim'].claimedAt).getTime();
+      // staleThreshold ~5 minutes before claimedAt (allow a little test-run slack).
+      expect(claimedAt - staleThreshold).toBeGreaterThan(4.9 * 60 * 1000);
+      expect(claimedAt - staleThreshold).toBeLessThan(5.1 * 60 * 1000);
+      expect(claimedAt).toBeGreaterThanOrEqual(before);
     });
   });
 

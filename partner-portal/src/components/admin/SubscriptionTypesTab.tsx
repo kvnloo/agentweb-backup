@@ -63,6 +63,7 @@ const AVAILABLE_CONNECTED_ACCOUNTS = [
   { id: 'twitter', label: 'Twitter/X' },
   { id: 'gmail', label: 'Gmail' },
   { id: 'outlook', label: 'Outlook / Microsoft 365' },
+  { id: 'calendly', label: 'Calendly' },
   { id: 'youtube', label: 'YouTube' },
   { id: 'fathom', label: 'Fathom' },
   { id: 'hubspot', label: 'HubSpot' },
