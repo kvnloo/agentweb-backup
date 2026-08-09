@@ -121,7 +121,30 @@ mcpToolRegistry.register({
     // to poll for — telling every caller to poll would send them looking for an
     // answer they are already holding.
     const stillBuilding = data?.stillBuilding === true;
-    const pending = data?.pendingUserQuestion;
+
+    // The generate response does NOT carry pendingUserQuestion — no `res.json`
+    // in agentModeController includes it. Reading it off `data` was dead code,
+    // so a run blocked on a question reported "complete" and the caller walked
+    // away from work that was waiting on them.
+    //
+    // The session GET does expose it (the handler spreads `...session`), so
+    // confirm against the session before claiming a terminal result. One extra
+    // read, only on the path where we would otherwise assert completion.
+    let pending: any = null;
+    if (!stillBuilding) {
+      try {
+        const session: any = await mcpFetch({
+          method: 'GET',
+          path: `/api/agent-mode/session/${taskId}`,
+          context: ctx(context),
+        });
+        pending = session?.pendingUserQuestion ?? null;
+      } catch {
+        // The turn itself succeeded; failing the whole call because a
+        // confirmation read failed would discard a result we already have.
+        pending = null;
+      }
+    }
 
     const status = pending ? 'awaiting_input' : stillBuilding ? 'running' : 'complete';
 
@@ -194,6 +217,15 @@ mcpToolRegistry.register({
     // instance than the one running the task sees false while work continues.
     // Calling that "finished" would make a client stop polling mid-run, so the
     // response says plainly that completion is unconfirmed and how to check.
+    //
+    // A durable terminal status DOES exist — `markRunTerminal` writes it to the
+    // `AW-AgentRuns` table (services/agentMode/runStore.ts) — but no REST route
+    // exposes it, so a tool that reaches the backend over mcpFetch cannot read
+    // it. Exposing it is the fix that makes a detached run confirmable; see
+    // ENG-1015. Until then this path is honestly unconfirmed
+    // rather than falsely terminal. The common case does not depend on it:
+    // emma_run_marketing_task confirms completion at submission, because
+    // /api/agent-mode/generate is synchronous unless it detaches.
     const status = pending ? 'awaiting_input' : active ? 'running' : 'idle';
     const completionConfirmed = pending || active ? true : false;
 

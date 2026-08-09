@@ -79,7 +79,9 @@ describe('ENG-982: one call completes the job', () => {
 
     const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch a campaign' }, CALLER);
 
-    expect(paths()).toEqual(['/api/agent-mode/sessions', '/api/agent-mode/generate']);
+    // Session created and goal sent from a single tool call. The trailing read
+    // is the pending-question confirmation on the terminal path.
+    expect(paths().slice(0, 2)).toEqual(['/api/agent-mode/sessions', '/api/agent-mode/generate']);
     const body = JSON.parse(res.content[0].text);
     // The caller gets a handle for the task either way; whether it needs to be
     // polled is asserted separately, per the synchronous-vs-detached contract.
@@ -91,7 +93,9 @@ describe('ENG-982: one call completes the job', () => {
 
     await tool('emma_run_marketing_task').execute({ goal: 'and add a CTA', task_id: 'task-42' }, CALLER);
 
-    expect(paths()).toEqual(['/api/agent-mode/generate']);
+    // The point: no SECOND session is created when one was supplied.
+    expect(paths()).not.toContain('/api/agent-mode/sessions');
+    expect(paths()[0]).toBe('/api/agent-mode/generate');
   });
 
   // ── REST contract assertions ──────────────────────────────────────────────
@@ -144,16 +148,52 @@ describe('ENG-982: one call completes the job', () => {
     expect(body.next).toMatch(/emma_get_task_result/);
   });
 
-  it('emma_run_marketing_task surfaces a blocking question instead of reporting completion', async () => {
+  it('emma_run_marketing_task confirms a blocking question against the SESSION, not the generate reply', async () => {
+    // The generate response does not carry pendingUserQuestion — no res.json in
+    // agentModeController includes it. Reading it off the reply was dead code,
+    // so a run blocked on a question reported "complete" and the caller walked
+    // away from work waiting on them.
     mockMcpFetch
       .mockResolvedValueOnce({ sessionId: 'task-42' })
-      .mockResolvedValueOnce({ content: 'which audience?', pendingUserQuestion: { question: 'which audience?' } });
+      .mockResolvedValueOnce({ content: 'which audience?' }) // generate: no pending field
+      .mockResolvedValueOnce({ pendingUserQuestion: { question: 'which audience?' } }); // session GET
 
     const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
     const body = JSON.parse(res.content[0].text);
 
+    expect(paths()).toEqual([
+      '/api/agent-mode/sessions',
+      '/api/agent-mode/generate',
+      '/api/agent-mode/session/task-42',
+    ]);
     expect(body.status).toBe('awaiting_input');
     expect(body.next).toMatch(/emma_answer_question/);
+  });
+
+  it('emma_run_marketing_task does not spend a confirmation read when the run detached', async () => {
+    // stillBuilding already means "not terminal", so there is nothing to confirm.
+    mockMcpFetch
+      .mockResolvedValueOnce({ sessionId: 'task-42' })
+      .mockResolvedValueOnce({ content: 'still building…', stillBuilding: true });
+
+    await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
+
+    expect(paths()).toEqual(['/api/agent-mode/sessions', '/api/agent-mode/generate']);
+  });
+
+  it('emma_run_marketing_task still returns the result if the confirmation read fails', async () => {
+    // The turn succeeded; discarding a result we already hold because a
+    // follow-up read failed would lose real work.
+    mockMcpFetch
+      .mockResolvedValueOnce({ sessionId: 'task-42' })
+      .mockResolvedValueOnce({ content: 'campaign drafted' })
+      .mockRejectedValueOnce(new Error('API error (500): boom'));
+
+    const res: any = await tool('emma_run_marketing_task').execute({ goal: 'launch' }, CALLER);
+    const body = JSON.parse(res.content[0].text);
+
+    expect(body.status).toBe('complete');
+    expect(body.result).toBe('campaign drafted');
   });
 
   it('emma_get_task_result reports awaiting_input when Emma is blocked on a question', async () => {
