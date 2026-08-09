@@ -38,23 +38,16 @@ jest.mock('../services/db', () => ({
       }
       return Promise.resolve(mockUsers[userId]);
     }),
-    // Mirrors the real atomic transaction: check-and-set with no await in
-    // between, so it can't be raced within a single test's synchronous mock
-    // body — matching what the real DynamoDB transaction guarantees.
-    joinOrgWithCapacityCheck: jest.fn((userId: string, orgId: string, orgRole: string, maxMembers: number) => {
+    // Mirrors the real conditional write: a user who already belongs to an org
+    // is rejected, checked and set with no await in between so it cannot be
+    // raced within a single test's synchronous mock body.
+    joinOrg: jest.fn((userId: string, orgId: string, orgRole: string) => {
       const user = mockUsers[userId];
       if (!user) return Promise.resolve('already_in_org');
       if (user.orgId) return Promise.resolve('already_in_org');
-      const org = mockOrgs[orgId];
-      // Fail closed: a missing memberCount is never seeded from a live count
-      // here — only the reviewed backfill migration is allowed to initialize
-      // it. A live path just requires it to already exist and be under cap.
-      if (org?.memberCount === undefined) return Promise.resolve('not_migrated');
-      if (org.memberCount >= maxMembers) return Promise.resolve('org_full');
       user.orgId = orgId;
       user.orgRole = orgRole;
       user.pendingOrgInvite = null;
-      org.memberCount += 1;
       return Promise.resolve('joined');
     }),
     clearOrgMembership: jest.fn((userId: string) => {
@@ -63,16 +56,14 @@ jest.mock('../services/db', () => ({
         const orgId = user.orgId;
         delete user.orgId;
         delete user.orgRole;
-        // Fail closed: skip the decrement entirely if memberCount isn't set
-        // yet, rather than seeding it here (non-fatal, matches real behavior).
-        if (orgId && mockOrgs[orgId] && mockOrgs[orgId].memberCount !== undefined) {
-          mockOrgs[orgId].memberCount = Math.max(0, mockOrgs[orgId].memberCount - 1);
-        }
       }
       return Promise.resolve();
     }),
   },
   orgDb: {
+    // ENG-954: owner-loss serialization. Default-true = no contention,
+    // which is every test here except the explicit race case.
+    claimOwnerChange: jest.fn(() => Promise.resolve(true)),
     createOrg: jest.fn((org: any) => {
       mockOrgs[org.orgId] = org;
       return Promise.resolve(org);
@@ -164,9 +155,7 @@ describe('Organization routes', () => {
       expect(res.body.success).toBe(true);
       expect(res.body.data.name).toBe('My Org');
       expect(res.body.data.ownerUserId).toBe('user-1');
-      expect(res.body.data.maxMembers).toBe(5);
       // Owner is the first member — seeded directly, no transaction needed.
-      expect(res.body.data.memberCount).toBe(1);
 
       // User should be updated with orgId and owner role
       expect(mockUsers['user-1'].orgId).toBe(res.body.data.orgId);
@@ -211,7 +200,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -233,7 +221,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -265,7 +252,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -383,7 +369,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
         pendingInvites: [],
       };
       mockUsers['user-1'].orgId = 'org-1';
@@ -421,6 +406,27 @@ describe('Organization routes', () => {
       expect(res.body.success).toBe(true);
       expect(res.body.message).toMatch(/invitation sent/i);
     });
+
+    // Replaces the removed maxMembers/memberCount capacity tests. Org size is no
+    // longer capped: tiers are usage-based, not seat-based, so there is nothing
+    // for a seat limit to enforce. Orgs that predate this still carry a stored
+    // maxMembers attribute; nothing reads it, so it is inert.
+    it('does not cap org size — an invite succeeds well past the old limit of 5', async () => {
+      for (let i = 0; i < 12; i++) {
+        mockUsers[`filler-${i}`] = { userId: `filler-${i}`, email: `filler-${i}@example.com`, orgId: 'org-1', orgRole: 'member' };
+      }
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'thirteenth@example.com' });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
+
+    it('ignores a stale maxMembers attribute left on an org created before the cap was removed', async () => {
+      (mockOrgs['org-1'] as any).maxMembers = 5;
+      (mockOrgs['org-1'] as any).memberCount = 5;
+      const res = await request(app).post('/api/org/org-1/invite').send({ email: 'sixth@example.com' });
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+    });
   });
 
   describe('POST /api/org/accept-invite - accept invite', () => {
@@ -429,8 +435,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
-        memberCount: 1,
         pendingInvites: [{
           email: 'member@example.com',
           inviteToken: 'valid-token',
@@ -487,32 +491,6 @@ describe('Organization routes', () => {
       expect(mockUsers['user-2'].orgRole).toBe('member');
     });
 
-    it('fails loudly (no silent drop) when the org is already at maxMembers — atomic capacity check', async () => {
-      mockOrgs['org-1'].maxMembers = 1;
-      mockOrgs['org-1'].memberCount = 1;
-      const res = await request(app).post('/api/org/accept-invite').send({
-        orgId: 'org-1',
-        inviteToken: 'valid-token',
-      });
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/full/i);
-      // The invite must not be silently consumed on failure.
-      expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
-      expect(mockUsers['user-2'].orgId).toBeUndefined();
-    });
-
-    it('fails closed (not silently seeded) when memberCount has not been backfilled yet', async () => {
-      delete mockOrgs['org-1'].memberCount;
-      const res = await request(app).post('/api/org/accept-invite').send({
-        orgId: 'org-1',
-        inviteToken: 'valid-token',
-      });
-      expect(res.status).toBe(409);
-      expect(res.body.error).toMatch(/not yet ready/i);
-      expect(mockOrgs['org-1'].pendingInvites).toHaveLength(1);
-      expect(mockUsers['user-2'].orgId).toBeUndefined();
-    });
-
     it('should NOT snapshot the owner tier onto the member on accept (ENG-288)', async () => {
       const res = await request(app).post('/api/org/accept-invite').send({
         orgId: 'org-1',
@@ -536,8 +514,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
-        memberCount: 2,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -556,12 +532,11 @@ describe('Organization routes', () => {
       expect(res.status).toBe(400);
     });
 
-    it('should succeed and remove member, decrementing memberCount', async () => {
+    it('should succeed and remove the member', async () => {
       const res = await request(app).delete('/api/org/org-1/members/user-2');
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(mockUsers['user-2'].orgId).toBeUndefined();
-      expect(mockOrgs['org-1'].memberCount).toBe(1);
     });
   });
 
@@ -571,8 +546,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
-        memberCount: 2,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';
@@ -580,19 +553,31 @@ describe('Organization routes', () => {
       mockUsers['user-2'].orgRole = 'member';
     });
 
-    it('should fail if owner tries to leave', async () => {
+    // Behavior change (ENG-954): what blocks the owner is being the LAST owner,
+    // not being the owner. The old 400 fired unconditionally and told them to
+    // "transfer ownership" via a route that was never built, which made the
+    // primary owner permanently unable to leave their own org. Now it is a 409
+    // naming the actual remedy, and it lifts as soon as a second owner exists.
+    it('should fail if the only owner tries to leave, naming the remedy', async () => {
       const res = await request(app).post('/api/org/org-1/leave');
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/owner cannot leave/i);
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/only owner/i);
+      expect(res.body.error).toMatch(/promote another member/i);
     });
 
-    it('should succeed for a member, decrementing memberCount', async () => {
+    it('should succeed for an owner once a second owner exists', async () => {
+      mockUsers['user-2'].orgRole = 'owner';
+      const res = await request(app).post('/api/org/org-1/leave');
+      expect(res.status).toBe(200);
+      expect(mockUsers['user-1'].orgId).toBeUndefined();
+    });
+
+    it('should succeed for a member', async () => {
       mockUser = mockUsers['user-2'];
       const res = await request(app).post('/api/org/org-1/leave');
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(mockUsers['user-2'].orgId).toBeUndefined();
-      expect(mockOrgs['org-1'].memberCount).toBe(1);
     });
   });
 
@@ -602,7 +587,6 @@ describe('Organization routes', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
       };
       mockUsers['user-1'].orgId = 'org-1';
       mockUsers['user-1'].orgRole = 'owner';

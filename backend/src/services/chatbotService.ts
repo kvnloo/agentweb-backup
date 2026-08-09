@@ -3813,23 +3813,61 @@ Example of good formatting:
 
 Be helpful, concise, and accurate. If you don't know the answer, suggest the user contact support.`;
 
+// Org-role context for Emma, one variant per role.
+//
+// This replaces a single member-only addendum that (a) asserted "there is only 1
+// owner per organization; co-owner roles do not exist on this platform", which
+// ENG-954 made false, (b) claimed only the owner can edit Brand Guidelines and
+// Market Strategy, which the per-feature `editors[]` grant has been able to
+// delegate for months, and (c) was gated on `orgRole === "member"`, so an admin
+// received no org context at all — the role most likely to be asked permission
+// questions got the least information.
+const ORG_OWNER_ADDENDUM = `
+
+## Organization membership — the current user is an owner
+
+The current user is an **owner** of their organization. Be accurate about what that means:
+
+- An organization can have **multiple owners and multiple admins**. Owners can promote another member to admin or owner, and can demote them again.
+- **Owners** can do everything: manage members and roles, edit all org settings and shared content, manage billing, and delete the organization.
+- An organization must always keep at least one owner. The last owner cannot be removed, demoted, or leave until another owner is promoted.
+- To hand over an organization, promote someone else to owner first, then leave. There is no separate "transfer ownership" step.`;
+
+const ORG_ADMIN_ADDENDUM = `
+
+## Organization membership — the current user is an admin
+
+The current user is an **admin** of their organization, not an owner. Be accurate about what admins can and cannot do:
+
+- **Admins can** invite and remove members, change org settings, manage shared content across the organization, and promote members to admin.
+- **Admins cannot** delete the organization, and cannot grant or revoke the owner role — only an owner can do that.
+- An organization can have multiple owners and multiple admins.
+
+If the user wants to do something reserved to owners, explain which owner action is needed rather than implying the capability does not exist.`;
+
 const ORG_MEMBER_ADDENDUM = `
 
-## Organization membership — current user is a member (not the owner)
+## Organization membership — the current user is a member
 
-The current user is a **member** of an organization, not the owner. Be accurate about what members can and cannot do:
+The current user is a **member** of an organization, not an owner or admin. Be accurate about what members can and cannot do:
 
-- There is only **1 owner** per organization. Co-owner roles do not exist on this platform. Do NOT suggest that someone can be made a co-owner or share ownership.
-- Members **cannot** edit Brand Guidelines or Market Strategy — those pages are read-only for members. Only the owner can modify them.
-- Members can use all other platform features (tasks, schedules, marketing hub, social posts, SEO, CRM, etc.) within the organization.
+- Members can use all platform features for their own work — tasks, schedules, marketing hub, social posts, SEO, CRM — and can see whatever the organization has chosen to share.
+- Members **cannot** manage the organization: inviting or removing people, changing org settings, and changing anyone's role are reserved to owners and admins.
+- Brand Guidelines and Market Strategy are read-only for members **unless** an owner or admin has added them as an editor for that area. The same is true for the organization's knowledge base, templates and landing pages.
+- Organizations can have multiple owners and multiple admins. If the user needs broader access, the thing to ask an owner or admin for is to be made an editor, an admin, or an owner — whichever matches what they are trying to do.`;
 
-If a user asks about making someone a co-owner, giving ownership to another person, or assigning owner-level permissions, clearly explain that only one owner is supported per organization and that co-owner assignment is not a feature of this platform.`;
+function orgRoleAddendum(orgRole?: string): string {
+  if (orgRole === "owner") return ORG_OWNER_ADDENDUM;
+  if (orgRole === "admin") return ORG_ADMIN_ADDENDUM;
+  if (orgRole === "member") return ORG_MEMBER_ADDENDUM;
+  return "";
+}
 
 // Emma sidebar system prompt = Agent Mode prompt + sidebar-specific addendum.
 // Both are code-controlled in backend/src/docs/agentModeSystemPrompt.ts.
 // To update: edit that file and open a PR.
 export function getEmmaSystemContext(sessionType?: string, orgRole?: string): string {
-  const memberAddendum = orgRole === "member" ? ORG_MEMBER_ADDENDUM : "";
+  const memberAddendum = orgRoleAddendum(orgRole);
   return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${getScheduledSessionOverride(sessionType)}${memberAddendum}`;
 }
 
