@@ -486,7 +486,18 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
   }
 }
 
-registerProcessor(QUEUE_SOURCE, processCalendlyWebhookJob);
+// Greptile P1 on #2291: runStepOnce (above) MUST treat a lost/held claim as a
+// failure for this attempt (round 18 — otherwise a crashed claim owner leaves
+// the job completing "successfully" with the step silently never done). But
+// claimLeadStepOnce's own staleness window (CLAIM_STALE_MS, db.ts) is 5
+// minutes, and the default MAX_ATTEMPTS (5, at the ~30s poll interval) only
+// covers ~2.5 minutes — the job could exhaust its entire retry budget and go
+// terminally 'failed' well before the stuck claim ever becomes reclaimable,
+// permanently omitting that step's CRM sync or customer alert even though the
+// claim would have genuinely self-healed given enough time. 15 attempts
+// (~7.5 minutes) gives a real window of retries AFTER the 5-minute mark,
+// rather than exhausting exactly at or before it.
+registerProcessor(QUEUE_SOURCE, processCalendlyWebhookJob, { maxAttempts: 15 });
 
 type PreparedCalendlyDelivery =
   | { kind: 'ignored' }
