@@ -139,6 +139,39 @@ async function anotherOwnerRemains(org: Organization, losingUserId: string): Pro
  * that another owner remains — every caller here is behind that guard, and
  * this returns false rather than guessing if that is somehow untrue.
  */
+/** Stripe's own convention for "this subscription is entitling", used throughout stripeService. */
+function hasLiveSubscription(u: { subscription_status?: string } | null | undefined): boolean {
+  return u?.subscription_status === "active" || u?.subscription_status === "trialing";
+}
+
+/**
+ * Whether the billing root can be released from this org without silently
+ * ending its plan.
+ *
+ * Moving `ownerUserId` moves who the org bills THROUGH. It cannot move the
+ * money: the subscription and the card belong to that person's Stripe
+ * customer, and Stripe has no way to reassign a subscription to a different
+ * customer. So if they are paying, handing the pointer to someone with no
+ * subscription drops the whole org to Free — no error, no webhook, exactly the
+ * silent-downgrade trap this PR set out to close.
+ *
+ * Free orgs hop freely. Paying orgs stop and say so.
+ */
+async function billingRootMayDepart(
+  org: Organization,
+  departingUserId: string,
+): Promise<{ ok: true } | { ok: false; error: string; code: "BILLING_OWNER_HAS_SUBSCRIPTION" }> {
+  if (org.ownerUserId !== departingUserId) return { ok: true };
+  const departing = await userDb.getUserById(departingUserId);
+  if (!hasLiveSubscription(departing)) return { ok: true };
+  return {
+    ok: false,
+    code: "BILLING_OWNER_HAS_SUBSCRIPTION",
+    error:
+      "This member's card pays for the organization, and a card cannot be handed to someone else. Have another owner start their own subscription first — then this member can be removed and billing moves to them. If you're stuck, contact support and we can switch it for you.",
+  };
+}
+
 export async function reassignBillingRootOnDeparture(
   org: Organization,
   departingUserId: string,
@@ -792,6 +825,10 @@ router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) =
       }
     }
 
+    const mayGo = await billingRootMayDepart(org, memberId);
+    if (!mayGo.ok) {
+      return res.status(409).json({ error: mayGo.error, code: mayGo.code });
+    }
     if (!(await reassignBillingRootOnDeparture(org, memberId, userId))) {
       return res.status(409).json({
         error: "Cannot remove the only owner. Promote another member to owner first.",
@@ -831,6 +868,14 @@ router.post("/:orgId/leave", async (req: Request, res: Response) => {
       });
     }
 
+    const mayLeave = await billingRootMayDepart(org, userId);
+    if (!mayLeave.ok) {
+      return res.status(409).json({
+        code: mayLeave.code,
+        error:
+          "Your card pays for this organization, and a card cannot be handed to someone else. Have another owner start their own subscription first — then you can leave and billing moves to them. If you're stuck, contact support and we can switch it for you.",
+      });
+    }
     if (!(await reassignBillingRootOnDeparture(org, userId))) {
       return res.status(409).json({
         error: "You are the only owner. Promote another member to owner before leaving.",

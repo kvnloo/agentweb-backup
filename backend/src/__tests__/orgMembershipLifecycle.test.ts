@@ -392,6 +392,68 @@ describe('adding people', () => {
   });
 });
 
+describe('a PAYING billing owner cannot be removed — the card cannot follow the badge', () => {
+  // Moving ownerUserId moves who the org bills THROUGH. Stripe cannot reassign a
+  // subscription to a different customer, so handing the pointer to someone with
+  // no subscription drops the whole org to Free with no error and no webhook —
+  // the exact silent downgrade this PR set out to close, one level up.
+  const pay = (u: string) => { mockUsers[u].subscription_status = 'active'; mockUsers[u].subscriptionType = 'Pro'; };
+  const remove = (t: string) => request(app).delete(`/api/org/${ORG}/members/${t}`);
+  const leave = () => request(app).post(`/api/org/${ORG}/leave`);
+
+  it('refuses removal, and says what to do about it', async () => {
+    pay('u-filipe');
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    const res = await remove('u-filipe');
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('BILLING_OWNER_HAS_SUBSCRIPTION');
+    expect(res.body.error).toMatch(/start their own subscription/i);
+    expect(mockUsers['u-filipe'].orgId).toBe(ORG);
+    expect(mockOrgs[ORG].ownerUserId).toBe('u-filipe');
+  });
+
+  it('refuses the leave path too — same hole, other door', async () => {
+    pay('u-filipe');
+    await setRole('u-eric', 'owner');
+    const res = await leave(); // acting as u-filipe
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe('BILLING_OWNER_HAS_SUBSCRIPTION');
+    expect(mockUsers['u-filipe'].orgId).toBe(ORG);
+  });
+
+  it('trialing counts as paying — it is entitling', async () => {
+    mockUsers['u-filipe'].subscription_status = 'trialing';
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    expect((await remove('u-filipe')).status).toBe(409);
+  });
+
+  it('a canceled subscription does not block — nothing is being paid', async () => {
+    mockUsers['u-filipe'].subscription_status = 'canceled';
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    const res = await remove('u-filipe');
+    expect(res.status).toBe(200);
+    expect(mockOrgs[ORG].ownerUserId).toBe('u-eric');
+  });
+
+  it('a FREE billing owner still hops freely — this must not become a blanket block', async () => {
+    await setRole('u-eric', 'owner');
+    actingUserId = 'u-eric';
+    expect((await remove('u-filipe')).status).toBe(200);
+    expect(mockOrgs[ORG].ownerUserId).toBe('u-eric');
+  });
+
+  it("a paying NON-billing owner is removable — it is the pointer that matters, not the card", async () => {
+    await setRole('u-eric', 'owner');
+    pay('u-eric'); // paying, but not the billing root
+    const res = await remove('u-eric');
+    expect(res.status).toBe(200);
+    expect(mockOrgs[ORG].ownerUserId).toBe('u-filipe');
+  });
+});
+
 describe('INVARIANT: an org always has a billing owner who is a member', () => {
   // Harsha, after hitting the stranded pointer twice: "make sure the tests will
   // never allow an org to not have a billing owner." This asserts the invariant
