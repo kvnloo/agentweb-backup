@@ -385,21 +385,42 @@ async function processClaimedJob(job: AsyncJobRecord): Promise<void> {
     const attempts = (job.attempts ?? 0) + 1;
     const maxAttempts = maxAttemptsBySource.get(job.source) ?? MAX_ATTEMPTS;
     const nextStatus = attempts >= maxAttempts ? 'failed' : 'pending';
-    await dynamodb
-      .update({
-        TableName: TABLE_NAME,
-        Key: { id: job.id },
-        UpdateExpression: 'SET #status = :status, attempts = :attempts, lastError = :lastError, updatedAt = :now',
-        ExpressionAttributeNames: { '#status': 'status' },
-        ExpressionAttributeValues: {
-          ':status': nextStatus,
-          ':attempts': attempts,
-          ':lastError': error?.message ?? String(error),
-          ':now': new Date().toISOString(),
-        },
-      })
-      .promise()
-      .catch(() => {});
+    const writeFailureState = () =>
+      dynamodb
+        .update({
+          TableName: TABLE_NAME,
+          Key: { id: job.id },
+          UpdateExpression: 'SET #status = :status, attempts = :attempts, lastError = :lastError, updatedAt = :now',
+          ExpressionAttributeNames: { '#status': 'status' },
+          ExpressionAttributeValues: {
+            ':status': nextStatus,
+            ':attempts': attempts,
+            ':lastError': error?.message ?? String(error),
+            ':now': new Date().toISOString(),
+          },
+        })
+        .promise();
+    try {
+      await writeFailureState();
+    } catch (firstError: any) {
+      // Greptile P1 on #2291 (round 25): this used to be a bare
+      // `.promise().catch(() => {})` with zero retry — every sibling write in
+      // this file (markJobComplete, markJobFailed, updateJobPayload) already
+      // retries once before giving up. Losing this specific write is worse
+      // than those: the job is left stuck in 'processing' with its attempt
+      // count never advanced, so stale reclamation (STALE_PROCESSING_MS
+      // later) picks it back up as if this attempt never happened — re-running
+      // a finite-attempts job's side effects more times than its own
+      // maxAttempts configuration allows.
+      try {
+        await writeFailureState();
+      } catch (secondError: any) {
+        console.error(
+          `[AsyncJobQueue] LOST failure-state write for job ${job.id} after retry — job remains 'processing' and will be re-run via stale reclamation, potentially exceeding maxAttempts:`,
+          secondError?.message ?? secondError,
+        );
+      }
+    }
     console.error(`[AsyncJobQueue] Processing failed for job ${job.id} (source=${job.source}, attempt ${attempts}):`, error?.message ?? error);
   } finally {
     stopHeartbeat();
