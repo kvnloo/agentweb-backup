@@ -1,12 +1,8 @@
-const mockGetAccountByPlatform = jest.fn();
+const mockResolveDefaultEmailAccount = jest.fn();
 const mockListEmails = jest.fn();
 const mockSearchEmails = jest.fn();
 const mockGetEmails = jest.fn();
 const mockResolveEmailAccount = jest.fn();
-
-jest.mock('../../services/connectedAccountsDb', () => ({
-  getAccountByPlatform: (...args: any[]) => mockGetAccountByPlatform(...args),
-}));
 
 jest.mock('../../services/emailProviderService', () => ({
   bootstrapEmailProviders: jest.fn().mockResolvedValue(undefined),
@@ -16,6 +12,7 @@ jest.mock('../../services/emailProviderService', () => ({
     getEmails: (...args: any[]) => mockGetEmails(...args),
   }),
   resolveEmailAccount: (...args: any[]) => mockResolveEmailAccount(...args),
+  resolveDefaultEmailAccount: (...args: any[]) => mockResolveDefaultEmailAccount(...args),
   EmailProviderError: class EmailProviderError extends Error {},
 }));
 
@@ -27,7 +24,19 @@ if (!tool) throw new Error('read_verification_code tool not registered');
 
 const context = { userId: 'user-123', sessionId: 'session-abc', llmModel: 'test-model', service: {} };
 
-const GMAIL_ACCOUNT = { platform: 'gmail', account_id: 'founders@agentweb.pro', account_name: 'founders@agentweb.pro' };
+const GMAIL_PROVIDER = {
+  listEmails: (...args: any[]) => mockListEmails(...args),
+  searchEmails: (...args: any[]) => mockSearchEmails(...args),
+  getEmails: (...args: any[]) => mockGetEmails(...args),
+};
+
+/** What resolveDefaultEmailAccount hands back for a caller's own Gmail. */
+const GMAIL_ACCOUNT = {
+  platform: 'gmail',
+  provider: GMAIL_PROVIDER,
+  accountId: 'founders@agentweb.pro',
+  ownerUserId: 'user-123',
+};
 
 /** A message summary as the email providers return it. */
 function summary(over: Partial<{ id: string; subject: string; from: string; date: string; receivedAt: string }> = {}) {
@@ -50,9 +59,7 @@ function summary(over: Partial<{ id: string; subject: string; from: string; date
 
 beforeEach(() => {
   jest.clearAllMocks();
-  mockGetAccountByPlatform.mockImplementation(async (_userId: string, platform: string) =>
-    platform === 'gmail' ? GMAIL_ACCOUNT : null
-  );
+  mockResolveDefaultEmailAccount.mockResolvedValue(GMAIL_ACCOUNT);
   mockListEmails.mockResolvedValue([]);
   mockSearchEmails.mockResolvedValue([]);
   mockGetEmails.mockResolvedValue([]);
@@ -187,7 +194,7 @@ describe('read_verification_code — failure paths', () => {
   });
 
   it('fails loudly when the user has no connected mailbox', async () => {
-    mockGetAccountByPlatform.mockResolvedValue(null);
+    mockResolveDefaultEmailAccount.mockResolvedValue(null);
 
     const result = await tool.execute({ wait_seconds: 0 }, context);
 
@@ -399,6 +406,8 @@ describe('read_verification_code — success paths', () => {
     mockResolveEmailAccount.mockResolvedValue({
       platform: 'outlook',
       provider: { listEmails: mockListEmails, searchEmails: mockSearchEmails, getEmails: mockGetEmails },
+      accountId: 'work-outlook',
+      ownerUserId: 'user-123',
     });
     mockListEmails.mockResolvedValue([summary()]);
     mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 998877' }]);
@@ -499,6 +508,8 @@ describe('read_verification_code — success paths', () => {
     mockResolveEmailAccount.mockResolvedValue({
       platform: 'outlook',
       provider: { listEmails: mockListEmails, searchEmails: mockSearchEmails, getEmails: mockGetEmails },
+      accountId: 'work-outlook',
+      ownerUserId: 'user-123',
     });
     mockListEmails.mockResolvedValue([summary()]);
     mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 998877' }]);
@@ -508,6 +519,47 @@ describe('read_verification_code — success paths', () => {
     expect(result.success).toBe(true);
     expect(result.code).toBe('998877');
     expect(mockResolveEmailAccount).toHaveBeenCalledWith('user-123', 'work-outlook');
-    expect(mockGetAccountByPlatform).not.toHaveBeenCalled();
+    expect(mockResolveDefaultEmailAccount).not.toHaveBeenCalled();
+  });
+});
+
+// ── ENG-943: org-shared mailboxes ──────────────────────────────────────────
+// list_connected_accounts reports a teammate's shared Gmail, so this tool has
+// to be able to read it — and has to read it AS THE OWNER, since that is the
+// record holding the OAuth tokens.
+describe('read_verification_code — org-shared mailbox (ENG-943)', () => {
+  const SHARED_MAILBOX = {
+    platform: 'gmail',
+    provider: GMAIL_PROVIDER,
+    accountId: 'teammate@agentweb.pro',
+    ownerUserId: 'teammate-user-id',
+  };
+
+  it('reads an auto-resolved org-shared mailbox as its owner', async () => {
+    mockResolveDefaultEmailAccount.mockResolvedValue(SHARED_MAILBOX);
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
+
+    const result = await tool.execute({ wait_seconds: 0 }, context);
+
+    expect(result.success).toBe(true);
+    expect(result.code).toBe('424242');
+    expect(mockListEmails).toHaveBeenCalledWith('teammate-user-id', 'teammate@agentweb.pro', 'INBOX', expect.any(Number));
+    expect(mockGetEmails).toHaveBeenCalledWith('teammate-user-id', 'teammate@agentweb.pro', ['msg-1']);
+  });
+
+  it('reads an explicitly named org-shared mailbox as its owner', async () => {
+    mockResolveEmailAccount.mockResolvedValue(SHARED_MAILBOX);
+    mockListEmails.mockResolvedValue([summary()]);
+    mockGetEmails.mockResolvedValue([{ id: 'msg-1', body: 'Your code is 424242' }]);
+
+    const result = await tool.execute(
+      { account_id: 'teammate@agentweb.pro', wait_seconds: 0 },
+      context
+    );
+
+    expect(result.success).toBe(true);
+    expect(mockResolveEmailAccount).toHaveBeenCalledWith('user-123', 'teammate@agentweb.pro');
+    expect(mockGetEmails).toHaveBeenCalledWith('teammate-user-id', 'teammate@agentweb.pro', ['msg-1']);
   });
 });
