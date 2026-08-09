@@ -654,6 +654,37 @@ createTestAccount().then(async () => {
       }
 
 
+      // ENG-916: Meta Ads Metrics Snapshot — runs daily at 09:00 UTC (after
+      // ActivationCron at 08:00), re-pulling the last 3 days each run so
+      // attribution-window settling doesn't leave stale numbers stored.
+      try {
+        const METRICS_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
+        const { runMetaMetricsSnapshot } = await import('./cron/metaMetricsSnapshotCron');
+
+        const nowForMetricsCron = new Date();
+        const nextMetricsRunUTC = new Date(nowForMetricsCron);
+        nextMetricsRunUTC.setUTCHours(9, 0, 0, 0);
+        if (nextMetricsRunUTC <= nowForMetricsCron) {
+          nextMetricsRunUTC.setUTCDate(nextMetricsRunUTC.getUTCDate() + 1);
+        }
+        const msUntilNextMetricsRun = nextMetricsRunUTC.getTime() - nowForMetricsCron.getTime();
+
+        console.log(`[MetaMetricsSnapshotCron] Initialized — first run at 09:00 UTC (in ${Math.round(msUntilNextMetricsRun / 60000)} min)`);
+        setTimeout(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('MetaMetricsSnapshotCron', runMetaMetricsSnapshot())
+            .catch(e => console.error('[MetaMetricsSnapshotCron] Error:', e));
+          setInterval(() => {
+            if (!isCronEnabled()) return;
+            cronJobRegistry.track('MetaMetricsSnapshotCron', runMetaMetricsSnapshot())
+              .catch(e => console.error('[MetaMetricsSnapshotCron] Error:', e));
+          }, METRICS_SNAPSHOT_INTERVAL_MS);
+        }, msUntilNextMetricsRun);
+      } catch (error) {
+        console.error('[MetaMetricsSnapshotCron] Failed to initialize:', error);
+      }
+
+
       // Drip Sequence Worker — runs every 5 minutes
       try {
         const { processDueEnrollments } = await import('./services/dripSequenceWorker');
