@@ -744,19 +744,43 @@ describe('Connected Accounts Routes', () => {
                 errorSpy.mockRestore();
             });
 
-            it('logs "LOST webhook cleanup record" when BOTH the durable enqueue and the orphan-webhook fallback table are unavailable', async () => {
+            it('logs "LOST webhook cleanup record" when BOTH the durable enqueue and ALL orphan-webhook fallback attempts are unavailable', async () => {
                 (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
                 (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
                 (axios.delete as jest.Mock).mockRejectedValue(new Error('token expired'));
                 mockEnqueueJob.mockResolvedValue('unavailable');
-                mockOrphanTableMethods.put.mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('dynamo down too')) });
+                // Greptile P1 on #2291 (round 23): recordOrphanedCalendlyWebhook now
+                // retries with backoff (3 attempts total) rather than a single try — all
+                // three must fail to reach the genuinely-exhausted "LOST" outcome.
+                mockOrphanTableMethods.put.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('dynamo down too')) });
                 const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
                 const response = await request(app).delete('/api/oauth/connected-accounts/calendly/jane%40customer.com');
 
                 expect(response.status).toBe(200);
+                expect(mockOrphanTableMethods.put).toHaveBeenCalledTimes(3);
                 expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('LOST webhook cleanup record'), expect.anything());
                 expect(connectedAccountsDb.deleteAccountById).toHaveBeenCalledWith('test_user_id', 'calendly', 'jane@customer.com');
+
+                errorSpy.mockRestore();
+            });
+
+            it('recovers on the second backoff attempt when the first orphan-webhook write transiently fails', async () => {
+                (connectedAccountsDb.getAccountById as jest.Mock).mockResolvedValue(calendlyAccount);
+                (connectedAccountsDb.deleteAccountById as jest.Mock).mockResolvedValue(undefined);
+                (axios.delete as jest.Mock).mockRejectedValue(new Error('token expired'));
+                mockEnqueueJob.mockResolvedValue('unavailable');
+                mockOrphanTableMethods.put
+                    .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('throttled')) })
+                    .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
+                const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+                const response = await request(app).delete('/api/oauth/connected-accounts/calendly/jane%40customer.com');
+
+                expect(response.status).toBe(200);
+                expect(mockOrphanTableMethods.put).toHaveBeenCalledTimes(2);
+                expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('Recorded orphaned webhook'));
+                expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining('LOST webhook cleanup record'), expect.anything());
 
                 errorSpy.mockRestore();
             });
