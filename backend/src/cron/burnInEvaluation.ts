@@ -75,6 +75,13 @@ export const BURN_IN_AUTHORITATIVE_WINDOW_LABEL = '24h' as const;
  */
 export const BURN_IN_POST_RELEASE_WINDOW_LIMIT = 7;
 
+/**
+ * Length of one authoritative burn-in window, in ms. The authoritative label is
+ * `24h`, so the period bound below is arithmetic on real time rather than a
+ * count of however many rows the store happens to hold.
+ */
+const BURN_IN_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 /** The subset of a snapshot the verdict is actually computed from. */
 export interface BurnInRates {
   date: string;
@@ -349,24 +356,33 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
   const postRelease = toRates(postSnap);
 
   if (attributableReplay) {
-    // The burn-in period is a fixed number of post-release windows, NOT however
-    // much history the caller happened to read. See
-    // BURN_IN_POST_RELEASE_WINDOW_LIMIT.
-    // Slice BEFORE filtering. `afterAll` is chronological, so the slice is what
-    // makes the burn-in period fixed — the first N post-release windows. Filtering
-    // first drops low-volume days out of the list entirely, so later days slide
-    // into the freed slots and the boundary walks forward: a regression on day 12
-    // could block closure for a burn-in that was only ever meant to cover days
-    // 1-7. Slicing first pins the period to real time; the run-count filter then
-    // decides which of those fixed windows carry enough traffic to read.
+    // The burn-in period is a fixed span of real time, NOT however much history
+    // the caller happened to read and NOT a count of rows that happen to exist.
+    // See BURN_IN_POST_RELEASE_WINDOW_LIMIT.
     //
-    // This also fixes the reverse failure. If none of the first N windows clears
-    // `minRunCount`, `scanned` is empty, the loop below never sets `latestClean`,
-    // and the existing `!latestClean` guard returns `insufficient` — instead of
-    // reaching for qualifying rows outside the period and reporting `clean` on
-    // evidence the burn-in window never contained.
+    // Bound the period by the CLOCK, not by array position. Taking the first N
+    // elements assumes every day inside the period produced a snapshot row; when
+    // a date is missing entirely (the snapshot cron skipped a run, a day of the
+    // store was never written), a row from outside the period slides into the
+    // freed slot and the boundary walks forward. A regression on day 12 could
+    // then block closure for a burn-in that was only ever meant to cover days
+    // 1-7, and evidence from outside the period could produce a clean verdict.
+    // Comparing `windowStart` against a computed end instant makes an absent day
+    // simply absent — the period keeps its length either way.
+    //
+    // The run-count filter runs after the period bound, never before, so
+    // low-volume days do not shorten the period either. If none of the windows
+    // inside the period clears `minRunCount`, `scanned` is empty, the loop below
+    // never sets `latestClean`, and the existing `!latestClean` guard returns
+    // `insufficient` — instead of reaching for qualifying rows outside the
+    // period and reporting `clean` on evidence the burn-in never contained.
+    const periodStartMs = boundaryMs(afterAll[0].windowStart);
+    const periodEndMs = periodStartMs + BURN_IN_POST_RELEASE_WINDOW_LIMIT * BURN_IN_WINDOW_MS;
     const scanned = afterAll
-      .slice(0, BURN_IN_POST_RELEASE_WINDOW_LIMIT)
+      .filter((snapshot) => {
+        const start = boundaryMs(snapshot.windowStart);
+        return Number.isFinite(start) && start < periodEndMs;
+      })
       .filter((snapshot) => snapshot.runCount >= minRunCount);
 
     // AC3's no-blending rule applies to the rows this verdict READS: the

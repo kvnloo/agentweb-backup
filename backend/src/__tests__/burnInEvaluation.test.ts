@@ -269,6 +269,26 @@ describe('evaluateBurnIn — the burn-in period is a fixed window count (ENG-938
     expect(assessment.postRelease?.date).toBe('2026-08-06');
   });
 
+  it('a date with NO snapshot row at all does not slide a later day into the period', () => {
+    // Stronger than the low-volume case: 08-01 produced no row whatsoever (the
+    // snapshot cron skipped that day). Counting rows instead of measuring time
+    // would let 08-07 — the 8th window — occupy the freed slot, so a regression
+    // eight days out would block closure for a 7-day burn-in. The period is
+    // bounded by the clock, so an absent day is simply absent.
+    const snapshots = extendedSnapshots({ '2026-08-07': { failedRunRate: 0.9 } }).filter(
+      (s) => s.date !== '2026-08-01',
+    );
+    const assessment = evaluateBurnIn({
+      snapshots,
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.verdict).toBe('clean');
+    expect(assessment.passesClosureCheck4).toBe(true);
+    expect(assessment.postRelease?.date).toBe('2026-08-06');
+  });
+
   it('is insufficient when no window inside the fixed period carries enough runs', () => {
     // Every window in 07-31 … 08-06 is below minRunCount. Reaching past the
     // period for qualifying rows would report `clean` on evidence the burn-in
