@@ -1015,6 +1015,55 @@ describe('CrmEnrichmentService', () => {
     });
   });
 
+  describe('isPlaceholderDomain', () => {
+    it('identifies RFC 2606 / 6761 reserved domains and TLDs', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('example.org')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('mail.example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.test')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.invalid')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.localhost')).toBe(true);
+    });
+
+    it('identifies canonical filler domains typed into test rows', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('company.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('yourcompany.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('mycompany.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('yourdomain.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('test.com')).toBe(true);
+      expect(CrmEnrichmentService.isPlaceholderDomain('agenttest.com')).toBe(true);
+    });
+
+    it('is case- and trailing-dot-insensitive', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('  Example.COM. ')).toBe(true);
+    });
+
+    it('does not flag real company domains', () => {
+      expect(CrmEnrichmentService.isPlaceholderDomain('acme.com')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('agentweb.pro')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('testflight.apple.com')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('examplecorp.com')).toBe(false);
+      expect(CrmEnrichmentService.isPlaceholderDomain('')).toBe(false);
+    });
+
+    it('makes placeholder domains non-business everywhere (ENG-968)', () => {
+      // Folded into the personal/institutional guards so no firmographic path
+      // (Apollo org match, web-search templates, V3 identity) ever treats a
+      // reserved domain as the lead's employer.
+      expect(CrmEnrichmentService.isPersonalDomain('example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('queue-verify@example.com')).toBe(true);
+      expect(CrmEnrichmentService.isPersonalEmailDomain('test2@company.com')).toBe(true);
+    });
+
+    it('drops the {{emailDomain}} token for placeholder-domain leads', () => {
+      const query = CrmEnrichmentService.applySearchTemplate(
+        '{{emailDomain}} company overview',
+        { leadId: 'l1', email: 'test2@company.com' } as any,
+      );
+      expect(query).toBe('company overview');
+    });
+  });
+
   describe('isPersonalEmailDomain', () => {
     it('identifies common personal providers', () => {
       expect(CrmEnrichmentService.isPersonalEmailDomain('user@gmail.com')).toBe(true);

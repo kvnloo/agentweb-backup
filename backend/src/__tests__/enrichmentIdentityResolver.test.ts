@@ -2324,3 +2324,158 @@ describe('resolveIdentity — makeApiMeta per-field confidence (Fix 6)', () => {
     expect(meta.linkedin.confidence).toBe('medium');
   });
 });
+
+// ─── ENG-968: placeholder / test email addresses must fail closed ────────────
+//
+// Repro of the Aug 8 2026 "Main Landing Page" preview: two obvious test rows
+// were enriched with invented firmographics (company / funding_round /
+// revenue) instead of being reported as not-found. A reserved or filler email
+// domain identifies nobody, so it must not act as an identity anchor: with it
+// dropped, the completeness gate below returns not-ok and the orchestrator
+// records an identityResolution skip.
+
+describe('resolveIdentity — placeholder/test email addresses (ENG-968)', () => {
+  it('FAIL CASE: a lead whose only signal is a filler-domain email is unresolvable', async () => {
+    // test2@company.com — no name, no company.
+    const deps = makeDeps();
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'test2@company.com' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('no_identity_signal');
+    // Nothing may be asked about a lead that identifies nobody.
+    expect(deps.findSiblingLeads).not.toHaveBeenCalled();
+    expect(deps.resolveCompanyDomainViaWebSearch).not.toHaveBeenCalled();
+    expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
+    expect(deps.enrichSoReverseLookup).not.toHaveBeenCalled();
+    expect(deps.writeLeadFields).not.toHaveBeenCalled();
+  });
+
+  it('FAIL CASE: a test row with a name but an example.com email is unresolvable for company fields', async () => {
+    // queue-verify@example.com, firstName "Queue", lastName "Verification Test".
+    const deps = makeDeps();
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'queue-verify@example.com',
+          firstName: 'Queue',
+          lastName: 'Verification Test',
+        },
+        needsCompanyFields: true,
+        listContext: 'Main Landing Page',
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toBe('identity_unresolvable');
+    // example.com is not a business domain — no firmographic web search may run
+    // off it (that is what invented "Company.com" / "Series A" / "10M").
+    expect(deps.resolveCompanyDomainViaWebSearch).not.toHaveBeenCalled();
+    expect(deps.apolloPeopleMatch).not.toHaveBeenCalled();
+  });
+
+  it('FAIL CASE: the placeholder email is not used as a sibling-lookup key', async () => {
+    // Cross-tenant pooling on a junk address would copy another tenant's junk
+    // row (name/company) onto this lead and make it look resolvable.
+    const findSiblingLeads = jest.fn().mockResolvedValue([]);
+    const deps = makeDeps({ findSiblingLeads });
+    await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'queue-verify@example.com',
+          firstName: 'Queue',
+          lastName: 'Verification Test',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(findSiblingLeads).toHaveBeenCalledWith(
+      expect.objectContaining({ email: undefined, firstName: 'Queue' }),
+    );
+  });
+
+  it('FAIL CASE: a real email found via another signal never overwrites the imported placeholder address', async () => {
+    const writeLeadFields = jest.fn().mockResolvedValue(undefined);
+    const deps = makeDeps({
+      apolloPeopleMatch: jest.fn().mockResolvedValue({
+        email: 'real.person@acme.com',
+        company: 'Acme',
+        website: 'https://acme.com',
+      }),
+      writeLeadFields,
+    });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'qa+seed@example.com',
+          linkedin: 'https://www.linkedin.com/in/real-person',
+        },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    const written = (writeLeadFields as jest.Mock).mock.calls[0][0].fields;
+    expect(written.email).toBeUndefined();
+    expect(written.company).toBe('Acme');
+  });
+
+  it('SUCCESS CASE: a placeholder email does not block a lead that carries a real signal', async () => {
+    // LinkedIn URL present → identity still resolves; only the junk email is
+    // ignored, so the guard cannot silently kill legitimate enrichment.
+    const apolloPeopleMatch = jest.fn().mockResolvedValue({
+      firstName: 'Real',
+      lastName: 'Person',
+      company: 'Acme',
+    });
+    const deps = makeDeps({ apolloPeopleMatch });
+    const result = await resolveIdentity(
+      makeInput({
+        lead: {
+          leadId: LEAD_ID,
+          email: 'noreply@example.com',
+          linkedin: 'https://www.linkedin.com/in/real-person',
+        },
+        needsPersonFields: true,
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    // Apollo is anchored on the LinkedIn URL only — the junk email is not sent.
+    expect(apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ linkedinUrl: 'https://www.linkedin.com/in/real-person' }),
+    );
+    expect(apolloPeopleMatch.mock.calls[0][0].email).toBeUndefined();
+  });
+
+  it('SUCCESS CASE: a real business email is still a full identity anchor', async () => {
+    const deps = makeDeps();
+    const result = await resolveIdentity(
+      makeInput({
+        lead: { leadId: LEAD_ID, email: 'jane@acme.com' },
+        needsCompanyFields: true,
+      }),
+      deps,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(deps.apolloPeopleMatch).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'jane@acme.com' }),
+    );
+    expect(deps.resolveCompanyDomainViaWebSearch).toHaveBeenCalled();
+  });
+});
