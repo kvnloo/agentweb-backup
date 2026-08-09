@@ -3873,7 +3873,14 @@ export async function generateSessionResponse(
   answerAck?: string,
   // ENG-396: the structured selection stamped on this reply's metadata, so a card can
   // show which option was CLICKED (never inferred from the message text).
-  answeredQuestionMeta?: { questionId: string; optionId: string; delegated: boolean }
+  answeredQuestionMeta?: { questionId: string; optionId: string; delegated: boolean },
+  // ENG-907: epoch ms stamped by the caller immediately before it wraps this promise in
+  // withGenerationTimeout. Threaded down to the tool loop so its wall-clock budget is
+  // measured against the deadline that is actually enforced — everything this function
+  // does first (session/message reads, the title LLM call, the fork IPC hop, the memory
+  // embedding backfill) would otherwise be silently subtracted from the synthesis
+  // reserve. Omitted by callers that run without a whole-turn cap.
+  turnStartMs?: number
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -4127,7 +4134,10 @@ export async function generateSessionResponse(
       // ENG-473: persist each settled turn as it completes so a hard process kill
       // (OOM/SIGKILL/force-exit past drain) leaves a visible partial transcript
       // instead of a silent zero-output session.
-      persistIncrementally: true
+      persistIncrementally: true,
+      // ENG-907: the caller's whole-turn deadline stamp (undefined when the caller
+      // enforces no cap), so the loop wraps itself up against the real deadline.
+      turnStartMs
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -4769,6 +4779,9 @@ export const agentModeController = {
 
       // ENG-510: stamp when this turn's generation began so that, if the whole-turn cap
       // kills it mid-flight, we count only the media THIS turn saved (not prior turns').
+      // ENG-907: this is also the base of the cap itself (withGenerationTimeout starts
+      // in the same tick, just below), so it is threaded into the run as the anchor for
+      // the loop's own wall-clock budget.
       const turnStartMs = Date.now();
 
       // Capture the generation promise so the durable path can reattach to it if the
@@ -4784,7 +4797,8 @@ export const agentModeController = {
         isDelegatedAccessForMessage,
         undefined, // ishareSenderInfo
         answerAck, // ENG-396: make Emma name the chosen option in her reply
-        answeredQuestionMeta // ENG-396: structured click record stamped on the reply
+        answeredQuestionMeta, // ENG-396: structured click record stamped on the reply
+        turnStartMs // ENG-907: the deadline withGenerationTimeout below enforces
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;

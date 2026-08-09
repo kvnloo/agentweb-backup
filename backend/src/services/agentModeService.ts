@@ -3116,7 +3116,11 @@ export class AgentModeService {
     excludeTools?: string[],
     screenshotUrl?: string,
     isDelegatedAccess: boolean = false,
-    persistIncrementally: boolean = false
+    persistIncrementally: boolean = false,
+    // ENG-907: epoch ms at which the CALLER started this turn's wall-clock cap
+    // (the controller stamps it right before it hands the promise to
+    // withGenerationTimeout). Optional — callers without a cap omit it.
+    turnStartMs?: number
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -3497,7 +3501,20 @@ export class AgentModeService {
       // tools away and force one final synthesis turn while there is still time to deliver.
       // Unlike `generationHardCapMs` above this is NOT tied to the media switch — it guards
       // every turn. Set AGENT_MODE_GENERATION_TIMEOUT_MS=0 to disable.
-      const turnStartedAtMs = Date.now();
+      //
+      // The deadline belongs to the CALLER, not to this loop: the controller starts
+      // withGenerationTimeout right after it stamps `turnStartMs`, and the session and
+      // message reads, the title LLM call, the fork IPC hop and the memory embedding
+      // backfill all run before control reaches here. Anchoring on a local Date.now()
+      // would put our cap strictly later than the one actually enforced and silently
+      // spend that setup latency out of the synthesis reserve. Use the caller's stamp
+      // when we have one (clamped so a skewed/future value can't extend the budget),
+      // and fall back to now for callers that run without a cap (Slack, benchmarks,
+      // direct service calls).
+      const turnStartedAtMs =
+        Number.isFinite(turnStartMs as number) && (turnStartMs as number) > 0
+          ? Math.min(turnStartMs as number, Date.now())
+          : Date.now();
       const turnHardCapMs = generationTimeoutMs > 0 ? turnStartedAtMs + generationTimeoutMs : undefined;
       let longestLlmCallMsThisRun = 0;
       let timeBudgetWrapUpWarned = false;
