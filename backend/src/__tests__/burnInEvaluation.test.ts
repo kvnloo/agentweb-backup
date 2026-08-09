@@ -265,7 +265,63 @@ describe('evaluateBurnIn — the burn-in period is a fixed window count (ENG-938
 
     expect(assessment.verdict).toBe('clean');
     expect(assessment.passesClosureCheck4).toBe(true);
-    // The last readable window inside the fixed period, not 08-07.
+    // Evidence stops at the thin day: 07-31 is credited, 08-01 onward is not
+    // read, and 08-07 — outside the period entirely — is never reached.
+    expect(assessment.postRelease?.date).toBe('2026-07-31');
+  });
+
+  it('does not credit a clean day that sits behind an unevaluable one', () => {
+    // 08-01 is below minRunCount, so nobody can say whether the release was
+    // healthy that day. Skipping it and crediting 08-06 would let a later clean
+    // day paper over an unreadable earlier one — closure passing on a burn-in
+    // period containing days that were never evaluated. Evidence must be
+    // contiguous from the start of the period, so the verdict stops at 07-31.
+    const assessment = evaluateBurnIn({
+      snapshots: extendedSnapshots({
+        '2026-08-01': { runCount: 1, okRuns: 1, degradedRuns: 0, failedRuns: 0 },
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.postRelease?.date).toBe('2026-07-31');
+  });
+
+  it('is insufficient when the FIRST window of the period is unevaluable', () => {
+    // 07-31 is the first post-release window and carries too few runs. With no
+    // readable evidence at the start of the period there is nothing to credit,
+    // and reaching forward to 08-02 would report clean on a burn-in whose
+    // opening day was never evaluated.
+    const assessment = evaluateBurnIn({
+      snapshots: extendedSnapshots({
+        '2026-07-31': { runCount: 1, okRuns: 1, degradedRuns: 0, failedRuns: 0 },
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.verdict).not.toBe('clean');
+  });
+
+  it('anchors the period to the release even when the first day has no row', () => {
+    // 07-31 — the first post-release window — was never written. Anchoring on
+    // the earliest row that happens to exist would start the period at 08-01 and
+    // walk its end out to 08-07, so a regression on the 8th day would block
+    // closure for a burn-in meant to cover 07-31 … 08-06. The anchor is the
+    // release instant, so the period keeps both ends regardless of which rows
+    // survived.
+    const snapshots = extendedSnapshots({ '2026-08-07': { failedRunRate: 0.9 } }).filter(
+      (s) => s.date !== '2026-07-31',
+    );
+    const assessment = evaluateBurnIn({
+      snapshots,
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.verdict).toBe('clean');
+    expect(assessment.passesClosureCheck4).toBe(true);
     expect(assessment.postRelease?.date).toBe('2026-08-06');
   });
 

@@ -370,20 +370,37 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
     // Comparing `windowStart` against a computed end instant makes an absent day
     // simply absent — the period keeps its length either way.
     //
-    // The run-count filter runs after the period bound, never before, so
-    // low-volume days do not shorten the period either. If none of the windows
-    // inside the period clears `minRunCount`, `scanned` is empty, the loop below
-    // never sets `latestClean`, and the existing `!latestClean` guard returns
-    // `insufficient` — instead of reaching for qualifying rows outside the
-    // period and reporting `clean` on evidence the burn-in never contained.
-    const periodStartMs = boundaryMs(afterAll[0].windowStart);
+    // The anchor is the FIRST post-release window, not the first row that
+    // happens to exist. `afterAll[0]` is only the earliest row we were handed;
+    // when day 1's snapshot was never written, anchoring there starts the period
+    // on day 2 and walks its end out to day 8, so an out-of-period regression
+    // gets scanned. Snapshot windows are 24h wide on a daily cadence but are NOT
+    // midnight-aligned (they close whenever the snapshot cron runs), so the
+    // boundary cannot be computed from the release instant alone. Instead, walk
+    // the earliest surviving window start back a day at a time for as long as
+    // the earlier slot would still be post-release: that reconstructs the first
+    // window the period should have contained, whether or not its row exists.
+    let periodStartMs = boundaryMs(afterAll[0].windowStart);
+    while (Number.isFinite(periodStartMs) && periodStartMs - BURN_IN_WINDOW_MS >= releaseMs) {
+      periodStartMs -= BURN_IN_WINDOW_MS;
+    }
     const periodEndMs = periodStartMs + BURN_IN_POST_RELEASE_WINDOW_LIMIT * BURN_IN_WINDOW_MS;
-    const scanned = afterAll
-      .filter((snapshot) => {
-        const start = boundaryMs(snapshot.windowStart);
-        return Number.isFinite(start) && start < periodEndMs;
-      })
-      .filter((snapshot) => snapshot.runCount >= minRunCount);
+    const inPeriod = afterAll.filter((snapshot) => {
+      const start = boundaryMs(snapshot.windowStart);
+      return Number.isFinite(start) && start >= periodStartMs && start < periodEndMs;
+    });
+
+    // Evidence must be CONTIGUOUS from the start of the period, not merely
+    // present somewhere in it. Dropping every below-`minRunCount` row and then
+    // crediting whatever clean row is left lets a later clean day paper over an
+    // earlier unevaluable one: closure passes on a burn-in period containing
+    // days nobody could read. Stopping at the first thin day truncates the
+    // credited period instead — a day we cannot evaluate ends the evidence, it
+    // does not get skipped over. If that leaves nothing, `scanned` is empty, the
+    // loop below never sets `latestClean`, and the existing `!latestClean` guard
+    // returns `insufficient` rather than reaching outside the period.
+    const firstThin = inPeriod.findIndex((snapshot) => snapshot.runCount < minRunCount);
+    const scanned = firstThin === -1 ? inPeriod : inPeriod.slice(0, firstThin);
 
     // AC3's no-blending rule applies to the rows this verdict READS: the
     // baseline and the scanned burn-in windows. Demanding a 24h/7d pair across
