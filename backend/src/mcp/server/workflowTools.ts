@@ -36,20 +36,28 @@ import { mcpFetch } from './httpClient';
 import { ctx, jsonResult } from './toolHelpers';
 
 /**
- * Read one optional profile section.
+ * Read one profile section.
  *
- * A 404 means the account has not configured it — a real, reportable answer.
- * Anything else (401, 429, 5xx, network) is an operational failure and must NOT
- * be flattened into "not configured": an agent told the brand is empty will
- * cheerfully invent one. `mcpFetch` puts the HTTP status in its error message.
+ * EVERY thrown error is an operational failure. There is deliberately no
+ * "missing means unconfigured" case: these endpoints return **200** when a
+ * section is simply not filled in, and reserve 404 for *User not found*
+ * (`routes/brand.ts` — 401 no email, 404 user missing, 200 otherwise). So an
+ * exception here never means "unconfigured", and treating one as such would
+ * report a missing-user failure as an empty brand.
+ *
+ * That distinction matters because an agent told the brand is empty will
+ * cheerfully invent one. "Not configured" is expressed by the 200 body's own
+ * contents, not by an exception.
  */
 async function section(name: string, path: string, identity: any) {
   try {
-    return { name, data: await mcpFetch({ method: 'GET', path, context: identity }), error: undefined as string | undefined };
+    return {
+      name,
+      data: await mcpFetch({ method: 'GET', path, context: identity }),
+      error: undefined as string | undefined,
+    };
   } catch (err: any) {
-    const message = String(err?.message ?? err);
-    if (/\(404\)/.test(message)) return { name, data: null, error: undefined };
-    return { name, data: null, error: message };
+    return { name, data: null, error: String(err?.message ?? err) };
   }
 }
 
@@ -267,8 +275,8 @@ mcpToolRegistry.register({
       // brand, and it will then invent one.
       unavailable: failures.length ? failures : undefined,
       note: failures.length
-        ? 'Some sections could not be read — treat those as UNKNOWN, not as unconfigured. Do not generate content that assumes they are empty.'
-        : 'A null section is genuinely not configured on this account yet.',
+        ? 'Some sections could NOT be read — treat those as UNKNOWN, not as unconfigured. Do not generate content that assumes they are empty.'
+        : 'Every section was read successfully. An empty one is genuinely not filled in on this account yet.',
     });
   },
 });

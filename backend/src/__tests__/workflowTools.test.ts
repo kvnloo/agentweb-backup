@@ -185,19 +185,38 @@ describe('ENG-982: one call completes the job', () => {
     expect(body.knowledge_base_files).toEqual([{ name: 'positioning.md' }]);
   });
 
-  it('emma_get_brand_profile reports a genuinely unconfigured section (404) as null', async () => {
+  it('emma_get_brand_profile treats an unfilled section as unconfigured only when the read SUCCEEDS', async () => {
+    // routes/brand.ts returns 200 when a section is simply not filled in — it
+    // reserves 404 for "User not found". So "unconfigured" is an empty 200
+    // body, never an exception.
     mockMcpFetch
       .mockResolvedValueOnce({ tone: 'direct' })
-      .mockRejectedValueOnce(new Error('API error (404): not found'))
+      .mockResolvedValueOnce(null)
       .mockResolvedValueOnce([]);
 
     const res: any = await tool('emma_get_brand_profile').execute({}, CALLER);
     const body = JSON.parse(res.content[0].text);
 
-    // A half-onboarded account is the common case, not an error.
     expect(body.brand_guidelines).toEqual({ tone: 'direct' });
     expect(body.market_strategy).toBeNull();
     expect(body.unavailable).toBeUndefined();
+    expect(body.note).toMatch(/genuinely not filled in/);
+  });
+
+  it('emma_get_brand_profile surfaces a 404 as a failure, because 404 here means "user not found"', async () => {
+    // The trap: 404 looks like "no profile" but these endpoints only return it
+    // when the USER is missing. Reporting that as an empty brand would hand the
+    // agent fabricated context.
+    mockMcpFetch
+      .mockResolvedValueOnce({ tone: 'direct' })
+      .mockRejectedValueOnce(new Error('API error (404): User not found'))
+      .mockResolvedValueOnce([]);
+
+    const res: any = await tool('emma_get_brand_profile').execute({}, CALLER);
+    const body = JSON.parse(res.content[0].text);
+
+    expect(body.unavailable).toEqual([expect.stringContaining('market_strategy')]);
+    expect(body.note).toMatch(/UNKNOWN, not as unconfigured/);
   });
 
   it('emma_get_brand_profile does NOT disguise an operational failure as "unconfigured"', async () => {
