@@ -16,10 +16,10 @@ import * as crypto from 'crypto';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────────
 
-const mockGetAccountByCalendlyUserUri = jest.fn();
+const mockGetAccountsByCalendlyUserUri = jest.fn();
 const mockUpdateAccountConfig = jest.fn();
 jest.mock('../services/connectedAccountsDb', () => ({
-  getAccountByCalendlyUserUri: (...a: any[]) => mockGetAccountByCalendlyUserUri(...a),
+  getAccountsByCalendlyUserUri: (...a: any[]) => mockGetAccountsByCalendlyUserUri(...a),
   updateAccountConfig: (...a: any[]) => mockUpdateAccountConfig(...a),
 }));
 
@@ -168,7 +168,7 @@ const mockOwner = { userId: USER_ID, email: 'host@example.com' };
 describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: mockAccount });
+    mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: mockAccount }]);
     mockGetUserById.mockResolvedValue(mockOwner);
     mockResolveMetaPixelForUser.mockResolvedValue({ pixelId: 'pixel-1', accountId: 'act-1' });
     mockGetMetaAccountCredentials.mockResolvedValue({ accountId: 'act-1', accessToken: 'meta-token', accountName: 'Ad Account' });
@@ -218,7 +218,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
   });
 
   it('returns 200 but does not call CAPI when no account matches the payload user_uri', async () => {
-    mockGetAccountByCalendlyUserUri.mockResolvedValue(null);
+    mockGetAccountsByCalendlyUserUri.mockResolvedValue([]);
     const body = makePayload();
     const res = await postSigned(body);
 
@@ -475,7 +475,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
         // 'list-1' is the id the shared getLeadListById mock resolves as an existing,
         // alert-configured list (see beforeEach) — needed so the alert branch is reached.
         const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-        mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+        mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
         mockNotifyLeadListOwnerIfConfigured.mockRejectedValue(new Error('email service down'));
         const body = makePayload({ email: 'lead@example.com', uri: 'https://api.calendly.com/scheduled_events/evt-23/invitees/inv-23' });
 
@@ -523,7 +523,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
         ...mockAccount,
         config: { ...mockAccount.config, booking_lead_list_id: 'list-1' },
       };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -543,7 +543,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
         ...mockAccount,
         config: { ...mockAccount.config, booking_lead_list_id: 'list-deleted' },
       };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
       mockCreateLeadList.mockResolvedValue({ listId: 'list-fresh' });
 
       const body = makePayload({ email: 'lead@example.com' });
@@ -570,7 +570,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
         ...mockAccount,
         config: { ...mockAccount.config, booking_lead_list_id: 'list-ghost' },
       };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
       mockGetLeadListById.mockImplementation((id: string) => {
         if (id === 'list-1') return Promise.resolve({ listId: 'list-1', userId: USER_ID, name: 'Test List', alertEvents: ['api.lead_added', 'api.lead_updated'] });
         if (id === 'list-ghost') return Promise.resolve({ listId: 'list-ghost', fieldNames: [], leadCount: 1, updatedAt: '2026-01-01T00:00:00Z' }); // no userId, no name
@@ -611,7 +611,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       mockGetLeadByEmail.mockResolvedValue(null);
       mockCreateLead.mockResolvedValue({ leadId: 'lead-new', email: 'lead@example.com' });
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -643,7 +643,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       mockGetLeadByEmail.mockResolvedValue(null);
       mockCreateLead.mockResolvedValue({ leadId: 'lead-new', email: 'lead@example.com' });
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       await postSigned(body);
@@ -680,7 +680,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       mockCreateLead.mockRejectedValue(Object.assign(new Error('Lead already exists for this deterministic key'), { leadAlreadyExists: true }));
       mockGetLeadById.mockResolvedValue({ leadId: 'lead-won-the-race', email: 'lead@example.com', customFields: { foo: 'bar' } });
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -706,7 +706,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       mockGetLeadByEmail.mockResolvedValue(null);
       mockCreateLead.mockRejectedValue(new Error('dynamo down'));
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -722,7 +722,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       const existingLead = { leadId: 'lead-existing', email: 'lead@example.com', customFields: { foo: 'bar' } };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -768,7 +768,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       const existingLead = { leadId: 'lead-existing', email: 'lead@example.com', customFields: { foo: 'bar' } };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -811,7 +811,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       // Default makePayload() uri is exactly 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1'.
       const body = makePayload({ email: 'lead@example.com' });
@@ -841,7 +841,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -868,7 +868,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -906,7 +906,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
       mockAutoSyncLead.mockImplementation((_userId, _listId, _lead, platform: string) =>
         platform === 'hubspot' ? Promise.reject(new Error('still down')) : Promise.resolve(undefined),
       );
@@ -945,7 +945,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com', uri });
       const res = await postSigned(body);
@@ -974,7 +974,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     it('still runs CRM-forward when the Meta pixel cannot be resolved', async () => {
       mockResolveMetaPixelForUser.mockResolvedValue({ unresolved: true, reason: 'No Meta ad account connected' });
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -1006,7 +1006,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       const existingLead = { leadId: 'lead-shared', email: 'lead@example.com', customFields: {}, system: {} };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const resA = await postSigned(makePayload({ email: 'lead@example.com', uri: uriA }));
       expect(resA.status).toBe(200);
@@ -1073,7 +1073,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     it('claims each step independently — losing the HubSpot claim does not block the Attio or alert steps from claiming and running', async () => {
       const uri = 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1';
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
       mockClaimLeadStepOnce.mockImplementation((_listId: string, _leadId: string, key: string) =>
         Promise.resolve(!key.startsWith('hubspotSynced::')),
       );
@@ -1185,10 +1185,10 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     }
 
     beforeEach(() => {
-      mockGetAccountByCalendlyUserUri.mockImplementation((uri: string) => {
-        if (uri === HOST_A_URI) return Promise.resolve({ userId: USER_ID_A, account: accountA });
-        if (uri === HOST_B_URI) return Promise.resolve({ userId: USER_ID_B, account: accountB });
-        return Promise.resolve(null);
+      mockGetAccountsByCalendlyUserUri.mockImplementation((uri: string) => {
+        if (uri === HOST_A_URI) return Promise.resolve([{ userId: USER_ID_A, account: accountA }]);
+        if (uri === HOST_B_URI) return Promise.resolve([{ userId: USER_ID_B, account: accountB }]);
+        return Promise.resolve([]);
       });
       mockGetUserById.mockImplementation((id: string) => {
         if (id === USER_ID_A) return Promise.resolve(ownerA);
@@ -1295,13 +1295,97 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     });
   });
 
+  // ENG-994 (live-tested, #2291): two different AgentWeb tenants can independently
+  // connect the SAME underlying Calendly identity (same login, two separate webhook
+  // subscriptions). getAccountsByCalendlyUserUri returns every match instead of just
+  // one, so resolution must try each candidate's own signing key rather than
+  // committing to whichever tenant happens to come back first.
+  describe('Cross-tenant Calendly identity resolution (ENG-994)', () => {
+    const SHARED_URI = 'https://api.calendly.com/users/shared-identity';
+    const TENANT_A_KEY = 'signing-key-tenant-a';
+    const TENANT_B_KEY = 'signing-key-tenant-b';
+    const TENANT_A_ID = 'tenant-a';
+    const TENANT_B_ID = 'tenant-b';
+
+    const tenantAAccount = {
+      ...mockAccount,
+      account_id: 'acct-tenant-a',
+      config: { ...mockAccount.config, user_uri: SHARED_URI, webhook_signing_key: TENANT_A_KEY },
+    };
+    const tenantBAccount = {
+      ...mockAccount,
+      account_id: 'acct-tenant-b',
+      config: { ...mockAccount.config, user_uri: SHARED_URI, webhook_signing_key: TENANT_B_KEY },
+    };
+    const ownerA = { userId: TENANT_A_ID, email: 'tenant-a@example.com' };
+    const ownerB = { userId: TENANT_B_ID, email: 'tenant-b@example.com' };
+
+    beforeEach(() => {
+      // Both tenants resolve for the SAME user_uri — this is exactly the shape a real
+      // cross-tenant collision produces, unlike the multi-host tests above where each
+      // membership URI maps to a distinct, single account.
+      mockGetAccountsByCalendlyUserUri.mockImplementation((uri: string) => {
+        if (uri === SHARED_URI) {
+          return Promise.resolve([
+            { userId: TENANT_A_ID, account: tenantAAccount },
+            { userId: TENANT_B_ID, account: tenantBAccount },
+          ]);
+        }
+        return Promise.resolve([]);
+      });
+      mockGetUserById.mockImplementation((id: string) => {
+        if (id === TENANT_A_ID) return Promise.resolve(ownerA);
+        if (id === TENANT_B_ID) return Promise.resolve(ownerB);
+        return Promise.resolve(null);
+      });
+    });
+
+    it('resolves to tenant A when the delivery is signed with tenant A\'s key, even though tenant B is listed first', async () => {
+      const body = makePayload({ email: 'lead@example.com' }) as any;
+      body.payload.scheduled_event.event_memberships = [{ user: SHARED_URI }];
+      const res = await postSigned(body, TENANT_A_KEY);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetUserById).toHaveBeenCalledWith(TENANT_A_ID);
+      expect(mockGetUserById).not.toHaveBeenCalledWith(TENANT_B_ID);
+      expect(mockSendCapiLeadEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it('resolves to tenant B when the delivery is signed with tenant B\'s key — the case that used to be silently dropped', async () => {
+      const body = makePayload({ email: 'lead@example.com' }) as any;
+      body.payload.scheduled_event.event_memberships = [{ user: SHARED_URI }];
+      const res = await postSigned(body, TENANT_B_KEY);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetUserById).toHaveBeenCalledWith(TENANT_B_ID);
+      expect(mockGetUserById).not.toHaveBeenCalledWith(TENANT_A_ID);
+      expect(mockSendCapiLeadEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops the delivery when its signature matches neither tenant sharing the identity', async () => {
+      const body = makePayload({ email: 'lead@example.com' }) as any;
+      body.payload.scheduled_event.event_memberships = [{ user: SHARED_URI }];
+      const res = await postSigned(body, 'some-unrelated-key');
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockGetUserById).not.toHaveBeenCalled();
+      expect(mockSendCapiLeadEvent).not.toHaveBeenCalled();
+    });
+  });
+
   describe('Lead-added/updated alert (gap 4)', () => {
     it('fires an api.lead_added alert when a new lead is created', async () => {
       mockGetLeadByEmail.mockResolvedValue(null);
       const createdLead = { leadId: 'lead-new', email: 'lead@example.com' };
       mockCreateLead.mockResolvedValue(createdLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -1322,7 +1406,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       const existingLead = { leadId: 'lead-existing', email: 'lead@example.com', customFields: {} };
       mockGetLeadByEmail.mockResolvedValue(existingLead);
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);
@@ -1342,7 +1426,7 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
     it('does not throw and still completes the CRM-forward leg when the alert call fails', async () => {
       mockNotifyLeadListOwnerIfConfigured.mockRejectedValue(new Error('email service down'));
       const accountWithList = { ...mockAccount, config: { ...mockAccount.config, booking_lead_list_id: 'list-1' } };
-      mockGetAccountByCalendlyUserUri.mockResolvedValue({ userId: USER_ID, account: accountWithList });
+      mockGetAccountsByCalendlyUserUri.mockResolvedValue([{ userId: USER_ID, account: accountWithList }]);
 
       const body = makePayload({ email: 'lead@example.com' });
       const res = await postSigned(body);

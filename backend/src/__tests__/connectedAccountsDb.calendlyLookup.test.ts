@@ -1,10 +1,11 @@
 /**
- * Unit tests for getAccountByCalendlyUserUri() — resolves which AgentWeb user
- * owns a given Calendly user_uri, for the incoming webhook receiver (ENG-524).
- * Mirrors getUserIdByHubSpotPortalId's full-scan pattern, but returns both the
- * userId and the matched account/config in one pass (the webhook handler needs
- * the account's webhook_signing_key immediately after resolving the user, and
- * a user could in principle have multiple Calendly accounts connected).
+ * Unit tests for getAccountsByCalendlyUserUri() — resolves every AgentWeb
+ * account matching a given Calendly user_uri, for the incoming webhook
+ * receiver (ENG-524). Mirrors getUserIdByHubSpotPortalId's full-scan pattern,
+ * but returns every match (not just the first) alongside its userId and
+ * config — two different tenants can independently connect the same
+ * underlying Calendly identity, and the webhook receiver needs to try each
+ * candidate's own webhook_signing_key against a delivery's signature (ENG-994).
  */
 
 let mockUsers: any[] = [];
@@ -16,9 +17,9 @@ jest.mock('../services/db', () => ({
   },
 }));
 
-import { getAccountByCalendlyUserUri } from '../services/connectedAccountsDb';
+import { getAccountsByCalendlyUserUri } from '../services/connectedAccountsDb';
 
-const makeCalendlyAccount = (userUri: string) => ({
+const makeCalendlyAccount = (userUri: string, signingKey = 'signing-key-abc') => ({
   platform: 'calendly',
   account_id: `${userUri}@example.com`,
   account_name: 'Test Calendly Account',
@@ -29,7 +30,7 @@ const makeCalendlyAccount = (userUri: string) => ({
     user_uri: userUri,
     organization_uri: 'https://api.calendly.com/organizations/org-1',
     booking_tracking_active: true,
-    webhook_signing_key: 'signing-key-abc',
+    webhook_signing_key: signingKey,
   },
 });
 
@@ -39,45 +40,59 @@ beforeEach(() => {
   mockGetAllUsersImpl = () => Promise.resolve(mockUsers);
 });
 
-describe('getAccountByCalendlyUserUri', () => {
-  it('returns null when there are no users', async () => {
-    const result = await getAccountByCalendlyUserUri('https://api.calendly.com/users/target');
-    expect(result).toBeNull();
+describe('getAccountsByCalendlyUserUri', () => {
+  it('returns an empty array when there are no users', async () => {
+    const result = await getAccountsByCalendlyUserUri('https://api.calendly.com/users/target');
+    expect(result).toEqual([]);
   });
 
-  it('returns null when users exist but none have a calendly account', async () => {
+  it('returns an empty array when users exist but none have a calendly account', async () => {
     mockUsers = [
       { userId: 'user-a', connected_accounts: [] },
       { userId: 'user-b', connected_accounts: [{ platform: 'gmail', account_id: 'x', account_name: 'x', config: {} }] },
     ];
-    const result = await getAccountByCalendlyUserUri('https://api.calendly.com/users/target');
-    expect(result).toBeNull();
+    const result = await getAccountsByCalendlyUserUri('https://api.calendly.com/users/target');
+    expect(result).toEqual([]);
   });
 
-  it('returns null when a user has a calendly account with a different user_uri', async () => {
+  it('returns an empty array when a user has a calendly account with a different user_uri', async () => {
     mockUsers = [
       { userId: 'user-a', connected_accounts: [makeCalendlyAccount('https://api.calendly.com/users/other')] },
     ];
-    const result = await getAccountByCalendlyUserUri('https://api.calendly.com/users/target');
-    expect(result).toBeNull();
+    const result = await getAccountsByCalendlyUserUri('https://api.calendly.com/users/target');
+    expect(result).toEqual([]);
   });
 
-  it('returns the userId and account when user_uri matches', async () => {
+  it('returns the userId and account when user_uri matches exactly one account', async () => {
     const targetUri = 'https://api.calendly.com/users/target';
     mockUsers = [
       { userId: 'user-a', connected_accounts: [makeCalendlyAccount('https://api.calendly.com/users/other')] },
       { userId: 'user-b', connected_accounts: [makeCalendlyAccount(targetUri)] },
     ];
-    const result = await getAccountByCalendlyUserUri(targetUri);
-    expect(result).not.toBeNull();
-    expect(result!.userId).toBe('user-b');
-    expect(result!.account.platform).toBe('calendly');
-    expect((result!.account.config as any).user_uri).toBe(targetUri);
+    const result = await getAccountsByCalendlyUserUri(targetUri);
+    expect(result).toHaveLength(1);
+    expect(result[0].userId).toBe('user-b');
+    expect(result[0].account.platform).toBe('calendly');
+    expect((result[0].account.config as any).user_uri).toBe(targetUri);
   });
 
-  it('returns null when userDb.getAllUsers throws', async () => {
+  // ENG-994: the core case this function exists to fix — two different tenants
+  // independently connecting the same underlying Calendly identity.
+  it('returns every matching account across different tenants sharing the same user_uri', async () => {
+    const targetUri = 'https://api.calendly.com/users/target';
+    mockUsers = [
+      { userId: 'tenant-a', connected_accounts: [makeCalendlyAccount(targetUri, 'tenant-a-key')] },
+      { userId: 'tenant-b', connected_accounts: [makeCalendlyAccount(targetUri, 'tenant-b-key')] },
+    ];
+    const result = await getAccountsByCalendlyUserUri(targetUri);
+    expect(result).toHaveLength(2);
+    expect(result.map((r) => r.userId).sort()).toEqual(['tenant-a', 'tenant-b']);
+    expect(result.map((r) => (r.account.config as any).webhook_signing_key).sort()).toEqual(['tenant-a-key', 'tenant-b-key']);
+  });
+
+  it('returns an empty array when userDb.getAllUsers throws', async () => {
     mockGetAllUsersImpl = () => Promise.reject(new Error('DynamoDB unavailable'));
-    const result = await getAccountByCalendlyUserUri('https://api.calendly.com/users/target');
-    expect(result).toBeNull();
+    const result = await getAccountsByCalendlyUserUri('https://api.calendly.com/users/target');
+    expect(result).toEqual([]);
   });
 });
