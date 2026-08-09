@@ -92,14 +92,49 @@ const NOT_SAVED_CLAIM_RE =
   /\b(?:was|were|are|is)\s*n[o']?t\s+saved\b|\bnot\s+(?:been\s+)?saved\b|\bnothing\s+(?:was\s+)?saved\b|\bnot\s+persisted\b|\bdid\s*n[o']?t\s+save\b|\b(?:changes?|edits?|updates?|work|progress|fixes?)\b[^.!?\n]{0,40}\b(?:were|was|are|is)?\s*(?:lost|discarded|rolled\s+back|reverted)\b/i;
 
 /**
+ * Negators that turn a not-saved clause into a truthful REASSURANCE — "but no work
+ * was lost", "however, none of your work was lost", "recovered without any work
+ * lost". Matched only against the text PRECEDING the loss/save term inside the same
+ * clause, so a genuine "nothing was saved" (where the negator IS the subject that
+ * went missing) still counts as an assertion.
+ */
+const NEGATED_LOSS_PREFIX_RE = /\b(?:no|none|nothing|without|never)\b[^.!?;,\n]{0,24}$/i;
+
+/** Clause boundaries — a negator only negates within its own clause. */
+const CLAUSE_BOUNDARY_RE = /[.!?;,\n][^.!?;,\n]*$/;
+
+/**
+ * The not-saved half of the pattern, ignoring clauses whose loss/save term is negated.
+ * All matches are considered: one truthful "no work was lost" clause elsewhere in the
+ * message must not excuse a real "your changes were not saved" claim, and vice versa.
+ */
+function assertsWorkNotSaved(content: string): boolean {
+  const re = new RegExp(NOT_SAVED_CLAIM_RE.source, `${NOT_SAVED_CLAIM_RE.flags}g`);
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    if (match[0].length === 0) {
+      re.lastIndex += 1;
+      continue;
+    }
+    const before = content.slice(0, match.index);
+    const boundary = before.search(CLAUSE_BOUNDARY_RE);
+    const clausePrefix = boundary === -1 ? before : before.slice(boundary + 1);
+    if (!NEGATED_LOSS_PREFIX_RE.test(clausePrefix)) return true;
+  }
+  return false;
+}
+
+/**
  * Does the final text assert the ENG-971 pattern — an interruption AND that the work
  * was not saved? Both halves are required: an interruption alone ("the web search
  * timed out, everything else is saved") and a save-failure alone ("I could not save a
- * memory note") are each legitimate and must not trigger a correction.
+ * memory note") are each legitimate and must not trigger a correction. A negated loss
+ * ("the session timed out; however, none of your work was lost") is truthful too, and
+ * is likewise excluded.
  */
 export function assertsUnsavedInterruption(content: string): boolean {
   if (typeof content !== 'string' || content.length === 0) return false;
-  return INTERRUPTION_CLAIM_RE.test(content) && NOT_SAVED_CLAIM_RE.test(content);
+  return INTERRUPTION_CLAIM_RE.test(content) && assertsWorkNotSaved(content);
 }
 
 /** True when this ledger entry is a publish/deploy that genuinely went live. */
