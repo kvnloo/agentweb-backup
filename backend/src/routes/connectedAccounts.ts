@@ -4,7 +4,7 @@ import { authenticateToken } from '../middleware/auth';
 import { getAccountsByUserId, getAccountsWithOwnerIncludingOrgShared, deleteAccount, deleteAccountById, getAccountByPlatform, getAccountById, updateAccountConfig, FathomConfig, CalendlyConfig } from '../services/connectedAccountsDb';
 import { refreshCalendlyAccessToken } from './calendlyAuth';
 import { registerProcessor, updateJobPayload } from '../services/asyncJobQueue';
-import { CALENDLY_WEBHOOK_CLEANUP_SOURCE, CalendlyWebhookCleanupPayload, queueCalendlyWebhookCleanup } from '../services/calendlyWebhookCleanupQueue';
+import { CALENDLY_WEBHOOK_CLEANUP_SOURCE, CalendlyWebhookCleanupPayload, queueCalendlyWebhookCleanup, getOrphanedCalendlyWebhook, recordOrphanedCalendlyWebhook } from '../services/calendlyWebhookCleanupQueue';
 import { getTokenStatus, formatExpiryMessage } from '../utils/tokenUtils';
 import { linkedInOutreachService } from '../services/linkedInOutreachService';
 import { FathomApiService } from '../services/fathomApiService';
@@ -49,28 +49,49 @@ async function canCallerDisconnectAccount(userId: string, platform: string, acco
  * token was current at enqueue-time is almost certainly stale again.
  */
 export async function processCalendlyWebhookCleanupJob(payload: CalendlyWebhookCleanupPayload): Promise<void> {
-  if (!payload.refreshToken) {
+  // Greptile P1 on #2291 (round 22): the orphan-webhook table (round 16) is a
+  // genuinely independent durable store from this job's own queue row — if an
+  // EARLIER attempt's rotation made it there but not here (its updateJobPayload
+  // write failed), this is the one place a fresher token could still be
+  // recovered from before giving up on the one this attempt was enqueued with.
+  let effectiveRefreshToken = payload.refreshToken;
+  if (payload.userId && payload.userUri) {
+    const orphaned = await getOrphanedCalendlyWebhook(payload.userId, payload.userUri);
+    if (orphaned?.refreshToken) effectiveRefreshToken = orphaned.refreshToken;
+  }
+
+  if (!effectiveRefreshToken) {
     throw new Error(`No refresh token available to clean up orphaned webhook ${payload.webhookId}`);
   }
-  const refreshed = await refreshCalendlyAccessToken(payload.refreshToken);
+  const refreshed = await refreshCalendlyAccessToken(effectiveRefreshToken);
   if (!refreshed) {
     throw new Error(`Could not refresh token to clean up orphaned webhook ${payload.webhookId}`);
   }
-  // Greptile P1 on #2291 (round 20): Calendly may rotate the refresh token on
-  // every use. If THIS refresh succeeded but the delete below then fails for an
-  // unrelated reason (network blip), a later retry re-reads the ORIGINAL
-  // enqueue-time payload — still carrying the now-invalid pre-rotation token —
-  // and can never successfully refresh again. This job is registered with
-  // maxAttempts: Infinity (round 9), so that isn't just a wasted attempt, it's
-  // an infinite loop that can never make progress. Persist the possibly-rotated
-  // refresh_token back to the durable row BEFORE attempting the delete, so any
-  // later retry always starts from a token that was valid as of the last
-  // successful refresh.
-  if (refreshed.refresh_token && refreshed.refresh_token !== payload.refreshToken) {
-    await updateJobPayload(CALENDLY_WEBHOOK_CLEANUP_SOURCE, payload.webhookId, { ...payload, refreshToken: refreshed.refresh_token });
+
+  try {
+    await axios.delete(payload.webhookId, { headers: { Authorization: `Bearer ${refreshed.access_token}` } });
+    console.log(`[Calendly] Cleaned up orphaned webhook ${payload.webhookId} via queued retry`);
+  } catch (deleteError: any) {
+    // Greptile P1 on #2291 (round 20/22): Calendly may rotate the refresh token
+    // on every use. Persisting the rotation is only NEEDED if this attempt is
+    // about to fail anyway — this attempt already has a valid access_token in
+    // hand and doesn't need the persisted value at all if the delete above just
+    // succeeds, so only pay for the persist (and its own failure risk) when
+    // there's actually a future retry to prepare for. On that future retry,
+    // rely on TWO independent durable writes rather than one fallible write
+    // with one retry: the queue's own payload (updateJobPayload, fast path for
+    // this exact job) AND the orphan-webhook table (a different table, checked
+    // above, so the two failure domains are genuinely separate) — the compound
+    // "both writes to both stores failed" tail is meaningfully rarer than
+    // "one write failed twice."
+    if (refreshed.refresh_token && refreshed.refresh_token !== effectiveRefreshToken) {
+      await updateJobPayload(CALENDLY_WEBHOOK_CLEANUP_SOURCE, payload.webhookId, { ...payload, refreshToken: refreshed.refresh_token });
+      if (payload.userId && payload.userUri) {
+        await recordOrphanedCalendlyWebhook(payload.userId, payload.userUri, payload.webhookId, refreshed.refresh_token);
+      }
+    }
+    throw deleteError;
   }
-  await axios.delete(payload.webhookId, { headers: { Authorization: `Bearer ${refreshed.access_token}` } });
-  console.log(`[Calendly] Cleaned up orphaned webhook ${payload.webhookId} via queued retry`);
 }
 
 // Greptile P1 on #2291 (round 9, issue 3): this job carries the ONLY remaining

@@ -15,6 +15,14 @@ export const CALENDLY_WEBHOOK_CLEANUP_SOURCE = 'calendly_webhook_cleanup';
 export interface CalendlyWebhookCleanupPayload {
   webhookId: string;
   refreshToken?: string;
+  // Greptile P1 on #2291 (round 22): lets the cleanup processor cross-check the
+  // orphan-webhook table (a genuinely independent durable store, round 16) for a
+  // possibly-fresher rotated refresh token — a single write to the queue's own
+  // payload (updateJobPayload) is still just one fallible write with one retry;
+  // writing the rotation to BOTH stores means the compound "both writes on both
+  // tables failed" tail is meaningfully less likely than "one write failed twice."
+  userId?: string;
+  userUri?: string;
 }
 
 const TABLE_PREFIX = process.env.NODE_ENV === 'development' ? 'Dev-' : '';
@@ -36,7 +44,7 @@ function orphanId(userId: string, userUri: string): string {
  * Best-effort: if even this write fails, there is nowhere else left to record it —
  * logs loudly and gives up, exactly like the queue-enqueue exhaustion case above.
  */
-async function recordOrphanedCalendlyWebhook(userId: string, userUri: string, webhookId: string, refreshToken?: string): Promise<void> {
+export async function recordOrphanedCalendlyWebhook(userId: string, userUri: string, webhookId: string, refreshToken?: string): Promise<void> {
   try {
     await dynamodb.put({
       TableName: ORPHANED_WEBHOOKS_TABLE,
@@ -92,7 +100,12 @@ export async function clearOrphanedCalendlyWebhook(userId: string, userUri: stri
  * terminally inert and stranding the subscription.
  */
 export async function queueCalendlyWebhookCleanup(userId: string, config: Pick<CalendlyConfig, 'webhook_id' | 'refresh_token' | 'user_uri'>): Promise<void> {
-  const payload: CalendlyWebhookCleanupPayload = { webhookId: config.webhook_id!, refreshToken: config.refresh_token };
+  const payload: CalendlyWebhookCleanupPayload = {
+    webhookId: config.webhook_id!,
+    refreshToken: config.refresh_token,
+    userId,
+    userUri: config.user_uri,
+  };
   let result = await enqueueJob(CALENDLY_WEBHOOK_CLEANUP_SOURCE, config.webhook_id!, payload);
   if (result === 'unavailable') {
     // Greptile P1 on #2291: this enqueue is the LAST chance to durably record
