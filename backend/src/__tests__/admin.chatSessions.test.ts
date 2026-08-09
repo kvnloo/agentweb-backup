@@ -23,7 +23,9 @@ jest.mock("../services/settingsService", () => ({
 }));
 
 jest.mock("../services/sessionScoringService", () => ({
-  scoreSessionIfNeeded: jest.fn(),
+  // ENG-929: sync scoring now goes through attemptSessionScore, which reports WHY
+  // a session was not scored instead of returning a bare null.
+  attemptSessionScore: jest.fn(),
   scoreSessionWithJudgeIfNeeded: jest.fn(),
   ScoringJudge: {},
 }));
@@ -40,7 +42,7 @@ const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb> & {
   createOrReuseInteractiveShare: jest.MockedFunction<(sessionId: string, days: number) => Promise<string>>;
 };
 const mockSettingsService = settingsService as jest.Mocked<typeof settingsService>;
-const mockScoreSessionIfNeeded = sessionScoringService.scoreSessionIfNeeded as jest.MockedFunction<typeof sessionScoringService.scoreSessionIfNeeded>;
+const mockAttemptSessionScore = sessionScoringService.attemptSessionScore as jest.MockedFunction<typeof sessionScoringService.attemptSessionScore>;
 const mockScoreSessionWithJudgeIfNeeded = sessionScoringService.scoreSessionWithJudgeIfNeeded as jest.MockedFunction<typeof sessionScoringService.scoreSessionWithJudgeIfNeeded>;
 
 const app = express();
@@ -212,24 +214,67 @@ describe("Admin chat sessions endpoint", () => {
         lastEvaluatedKey: undefined,
       });
       mockChatbotDb.getChatSession.mockResolvedValue(session as any);
-      mockScoreSessionIfNeeded.mockResolvedValue(null);
+      mockAttemptSessionScore.mockResolvedValue({ score: null, skipReason: "already-scored" });
       mockScoreSessionWithJudgeIfNeeded.mockResolvedValue(null);
     });
 
-    it("calls scoreSessionIfNeeded for each session when sync=true", async () => {
+    it("calls the session scorer for each session when sync=true", async () => {
       mockSettingsService.getSetting.mockResolvedValue(null as any);
 
       await request(app)
         .get("/api/admin/chat-sessions?sync=true")
         .expect(200);
 
-      expect(mockScoreSessionIfNeeded).toHaveBeenCalledTimes(1);
+      expect(mockAttemptSessionScore).toHaveBeenCalledTimes(1);
     });
 
     it("does not call scoring when sync is not set", async () => {
       await request(app).get("/api/admin/chat-sessions").expect(200);
 
-      expect(mockScoreSessionIfNeeded).not.toHaveBeenCalled();
+      expect(mockAttemptSessionScore).not.toHaveBeenCalled();
+    });
+
+    it("reports a per-session scoring outcome when sync=true (ENG-929)", async () => {
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true")
+        .expect(200);
+
+      expect(res.body.sessions[0].scoringOutcome).toEqual({
+        status: "skipped",
+        reason: "already-scored",
+      });
+      expect(res.body.scoringSummary).toEqual({
+        scored: 0,
+        skipped: 1,
+        failed: 0,
+        notAttempted: 0,
+        timedOut: false,
+      });
+    });
+
+    it("reports a failed scoring attempt rather than a silent null score (ENG-929)", async () => {
+      mockSettingsService.getSetting.mockResolvedValue(null as any);
+      mockAttemptSessionScore.mockRejectedValue(new Error("Scoring LLM call timed out after 40000ms"));
+
+      const res = await request(app)
+        .get("/api/admin/chat-sessions?sync=true")
+        .expect(200);
+
+      expect(res.body.sessions[0].satisfactionScore).toBeUndefined();
+      expect(res.body.sessions[0].scoringOutcome).toEqual({
+        status: "failed",
+        reason: "Scoring LLM call timed out after 40000ms",
+      });
+      expect(res.body.scoringSummary.failed).toBe(1);
+    });
+
+    it("omits scoring outcomes entirely when sync is not set", async () => {
+      const res = await request(app).get("/api/admin/chat-sessions").expect(200);
+
+      expect(res.body.sessions[0].scoringOutcome).toBeUndefined();
+      expect(res.body.scoringSummary).toBeUndefined();
     });
 
     it("scores sessions with all configured judges when sync=true", async () => {
@@ -327,7 +372,7 @@ describe("Admin chat sessions endpoint", () => {
       mockSettingsService.getSetting.mockResolvedValue(null as any);
 
       const newScore = { score: 2, reason: "poor", evaluatedAt: "2024-01-01T01:00:00Z", evaluatedMessageIndex: 2, dimensions: { goalCompletion: 2, dataAccuracy: 2, outputQuality: 2 } };
-      mockScoreSessionIfNeeded.mockResolvedValue(newScore as any);
+      mockAttemptSessionScore.mockResolvedValue({ score: newScore as any });
 
       const res = await request(app)
         .get("/api/admin/chat-sessions?sync=true")

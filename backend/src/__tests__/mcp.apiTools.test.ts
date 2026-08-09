@@ -1182,6 +1182,89 @@ describe('apiTools', () => {
 
       expect(session.delegateInfo).toBeNull();
     });
+
+    // ENG-929: sync=true promises to score everything unscored. A scorer that
+    // failed and a session that is legitimately unscorable both came back as
+    // `satisfactionScore: null`, so the daily report silently under-sampled —
+    // and the sessions it dropped were disproportionately the long, expensive
+    // ones. The outcome must reach the caller.
+    it('should surface the per-session scoring outcome and a coverage summary under sync=true', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [
+          {
+            sessionId: 'sess-failed',
+            userId: 'user-1',
+            title: 'Scheduled: long expensive run',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            sessionType: 'scheduled',
+            satisfactionScore: null,
+            scoringOutcome: { status: 'failed', reason: 'Scoring LLM call timed out after 40000ms' },
+            messages: [{ role: 'user', content: 'run' }, { role: 'assistant', content: 'done' }],
+          },
+          {
+            sessionId: 'sess-inflight',
+            userId: 'user-2',
+            title: 'Scheduled: still running',
+            createdAt: '2026-03-28T00:00:00Z',
+            updatedAt: '2026-03-28T01:00:00Z',
+            sessionType: 'scheduled',
+            satisfactionScore: null,
+            scoringOutcome: { status: 'skipped', reason: 'in-flight' },
+            messages: [{ role: 'user', content: 'run' }],
+          },
+        ],
+        scoringSummary: { scored: 0, skipped: 1, failed: 1, notAttempted: 0, timedOut: false },
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+        sync: true,
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.sessions[0].scoringOutcome).toEqual({
+        status: 'failed',
+        reason: 'Scoring LLM call timed out after 40000ms',
+      });
+      expect(parsed.sessions[1].scoringOutcome).toEqual({ status: 'skipped', reason: 'in-flight' });
+      expect(parsed.scoringSummary).toEqual({
+        scored: 0, skipped: 1, failed: 1, notAttempted: 0, timedOut: false,
+      });
+    });
+
+    it('should report a null scoringOutcome when sync was not requested', async () => {
+      mockMcpFetch.mockResolvedValue({
+        sessions: [{
+          sessionId: 'sess-plain',
+          userId: 'user-1',
+          title: 'Plain',
+          createdAt: '2026-03-28T00:00:00Z',
+          updatedAt: '2026-03-28T01:00:00Z',
+          messages: [],
+        }],
+        nextCursor: null,
+      });
+
+      const result = await mcpToolRegistry.execute('get_chat_history', {
+        start_time: '2026-03-28T00:00:00Z',
+        end_time: '2026-03-29T00:00:00Z',
+      }, context);
+
+      const parsed = JSON.parse((result as any).content[0].text);
+
+      expect(parsed.sessions[0].scoringOutcome).toBeNull();
+      expect(parsed.scoringSummary).toBeNull();
+    });
+
+    it('should tell the caller that a null satisfactionScore is not the same as a failed one', () => {
+      const tool = mcpToolRegistry.getTool('get_chat_history');
+      expect(tool?.definition.description).toMatch(/scoringOutcome/);
+      expect(tool?.definition.description).toMatch(/failed/i);
+    });
   });
 
   // ─── get_account_status ───────────────────────────────────────────────
