@@ -166,7 +166,7 @@ describe('asyncJobQueue', () => {
       expect(updateCall.ExpressionAttributeValues[':lastError']).toBe('CAPI down');
     });
 
-    it('dead-letters (failed) once attempts reach the max', async () => {
+    it('dead-letters (failed) once attempts reach the default max', async () => {
       mockDocumentClientMethods.get.mockReturnValue({
         promise: jest.fn().mockResolvedValue({ Item: { id: 'calendly_webhook_invitee-123', attempts: 4 } }),
       });
@@ -175,6 +175,28 @@ describe('asyncJobQueue', () => {
 
       const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
       expect(updateCall.ExpressionAttributeValues[':status']).toBe('failed');
+      expect(updateCall.ExpressionAttributeValues[':attempts']).toBe(5);
+    });
+
+    // Greptile P1 on #2291 (sixth pass): this used to hardcode the global MAX_ATTEMPTS
+    // regardless of the source's own registered override — processClaimedJob (the
+    // poller-claimed path) already looked this up correctly, but markJobFailed (the
+    // inline/claimImmediately path, the common case for a fresh webhook delivery)
+    // didn't, silently undoing calendly_webhook's own maxAttempts: 15 override
+    // (registered specifically to outlast claimLeadStepOnce's 5-minute staleness
+    // window) for every inline-processed job.
+    it('respects a source\'s own registered maxAttempts override instead of the global default', async () => {
+      registerProcessor('test_source_custom_max_inline', jest.fn(), { maxAttempts: 15 });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { id: 'test_source_custom_max_inline_abc', attempts: 4 } }),
+      });
+
+      // attempts 4 -> 5: would dead-letter under the global default (5), but this
+      // source's own override (15) means it should still be re-queued as 'pending'.
+      await markJobFailed('test_source_custom_max_inline', 'abc', new Error('still down'));
+
+      const updateCall = mockDocumentClientMethods.update.mock.calls[0][0];
+      expect(updateCall.ExpressionAttributeValues[':status']).toBe('pending');
       expect(updateCall.ExpressionAttributeValues[':attempts']).toBe(5);
     });
 
