@@ -262,6 +262,103 @@ function sanitizeConnectedAccountForOrgResponse(account: any): any {
   };
 }
 
+/**
+ * ENG-953. Projection for `GET /me`, which is membership-gated only — every
+ * member of an org reads it, not just the owner.
+ *
+ * This is an ALLOWLIST, deliberately. The previous code spread the whole
+ * `Organization` record (`{ ...org }`), so it returned `secrets` — the
+ * encrypted per-org credential map written by the ClickUp and Foreplay OAuth
+ * callbacks — and unsanitized `connected_accounts`, to every member. A denylist
+ * would re-open the moment someone adds a field, and the failure is silent: a
+ * new credential-bearing field leaks with no test turning red and no reviewer
+ * prompt. An allowlist fails the other way — a genuinely new *safe* field is
+ * merely missing until someone adds it here, which surfaces as a visible bug
+ * rather than a quiet disclosure.
+ *
+ * Tokens are stripped from the two invite collections as well. `pendingInvites`
+ * carries `inviteToken` and `pendingDomainJoinRequests` carries `requestToken`;
+ * both are bearer values that grant org access, and the portal renders neither
+ * (it shows `email` + `invitedAt` only — `OrganizationTab.tsx:599-615`). They
+ * were not named in the ENG-953 report; they are the same disclosure class and
+ * are covered here rather than left for a second incident.
+ */
+function projectOrgForMemberResponse(org: any): Record<string, any> {
+  return {
+    orgId: org.orgId,
+    name: org.name,
+    ownerUserId: org.ownerUserId,
+    // Still projected even though ENG-954 deletes the seat cap that wrote
+    // them, because ENG-953's AC4 pins their presence. They resolve to
+    // undefined and JSON drops them, so no client sees a stale cap; removing
+    // the keys is a follow-up for whoever owns that contract, not something to
+    // take unilaterally out of another PR's acceptance criteria.
+    maxMembers: org.maxMembers,
+    memberCount: org.memberCount,
+    createdAt: org.createdAt,
+    updatedAt: org.updatedAt,
+
+    brandGuidelines: org.brandGuidelines,
+    marketStrategy: org.marketStrategy,
+    startupProfiles: org.startupProfiles,
+
+    seoDomains: org.seoDomains,
+    cmsType: org.cmsType,
+    emailDomain: org.emailDomain,
+    fromName: org.fromName,
+    slackChannel: org.slackChannel,
+    googleAnalyticsProperties: org.googleAnalyticsProperties,
+    primaryAnalyticsPropertyId: org.primaryAnalyticsPropertyId,
+    gaFilteredDomains: org.gaFilteredDomains,
+    clarityProjects: org.clarityProjects,
+    productDomain: org.productDomain,
+    analyticsConfigSource: org.analyticsConfigSource,
+    googleDriveFolders: org.googleDriveFolders,
+
+    autoJoinEnabled: org.autoJoinEnabled,
+    autoJoinDomain: org.autoJoinDomain,
+    shareSettings: org.shareSettings,
+    shareAnalyticsWithOrg: org.shareAnalyticsWithOrg,
+    orgMemoryEnabled: org.orgMemoryEnabled,
+
+    // Each collection FAILS CLOSED on a non-array. Passing the raw value
+    // through on `else` would have re-opened the exact hole this function
+    // closes: a malformed or legacy record whose `connected_accounts` is an
+    // object rather than an array would bypass the sanitizer and ship its
+    // tokens verbatim. `undefined` serializes away, so a legacy record with the
+    // field absent and a malformed record with a junk value both render as
+    // "no accounts" rather than as a disclosure. (Greptile flagged these
+    // branches as untested; they were also wrong.)
+    // Non-object entries are dropped before the sanitizer, which reads
+    // `account.config` and would throw on a null — 500-ing `/me` for every
+    // member of that org. Dropping rather than passing through keeps the
+    // fail-closed direction: an entry we cannot sanitize is never emitted.
+    connected_accounts: Array.isArray(org.connected_accounts)
+      ? org.connected_accounts
+          .filter((account: any) => account !== null && typeof account === "object")
+          .map(sanitizeConnectedAccountForOrgResponse)
+      : undefined,
+
+    pendingInvites: Array.isArray(org.pendingInvites)
+      ? org.pendingInvites.map((invite: any) => ({
+          email: invite?.email,
+          invitedAt: invite?.invitedAt,
+          invitedBy: invite?.invitedBy,
+        }))
+      : undefined,
+
+    pendingDomainJoinRequests: Array.isArray(org.pendingDomainJoinRequests)
+      ? org.pendingDomainJoinRequests.map((r: any) => ({
+          userId: r?.userId,
+          email: r?.email,
+          requestedAt: r?.requestedAt,
+        }))
+      : undefined,
+
+    // `secrets` is deliberately absent and must stay absent.
+  };
+}
+
 // Create organization
 router.post("/", async (req: Request, res: Response) => {
   try {
@@ -361,34 +458,7 @@ router.get("/me", async (req: Request, res: Response) => {
     return res.json({
       success: true,
       data: {
-        orgId: org.orgId,
-        name: org.name,
-        ownerUserId: org.ownerUserId,
-        brandGuidelines: org.brandGuidelines,
-        marketStrategy: org.marketStrategy,
-        startupProfiles: org.startupProfiles,
-        connected_accounts: (org.connected_accounts || []).map(sanitizeConnectedAccountForOrgResponse),
-        seoDomains: org.seoDomains,
-        cmsType: org.cmsType,
-        emailDomain: org.emailDomain,
-        fromName: org.fromName,
-        slackChannel: org.slackChannel,
-        googleAnalyticsProperties: org.googleAnalyticsProperties,
-        primaryAnalyticsPropertyId: org.primaryAnalyticsPropertyId,
-        gaFilteredDomains: org.gaFilteredDomains,
-        clarityProjects: org.clarityProjects,
-        productDomain: org.productDomain,
-        googleDriveFolders: org.googleDriveFolders,
-        pendingInvites: org.pendingInvites,
-        autoJoinEnabled: org.autoJoinEnabled,
-        autoJoinDomain: org.autoJoinDomain,
-        pendingDomainJoinRequests: org.pendingDomainJoinRequests,
-        shareSettings: org.shareSettings,
-        shareAnalyticsWithOrg: org.shareAnalyticsWithOrg,
-        orgMemoryEnabled: org.orgMemoryEnabled,
-        analyticsConfigSource: org.analyticsConfigSource,
-        createdAt: org.createdAt,
-        updatedAt: org.updatedAt,
+...projectOrgForMemberResponse(org),
         members: safeMembers,
         // Server-computed capabilities. Clients must gate on these rather than
         // comparing orgRole themselves — that comparison is exactly what has to
