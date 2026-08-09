@@ -447,7 +447,7 @@ describe('asyncJobQueue', () => {
         await Promise.resolve();
       }
 
-      await jest.advanceTimersByTimeAsync(60_000);
+      await jest.advanceTimersByTimeAsync(15_000);
 
       const heartbeatCall = mockDocumentClientMethods.update.mock.calls.find(
         (c: any) => c[0].ConditionExpression === '#status = :processing' && c[0].Key?.id === 'test_source_hb_abc',
@@ -461,7 +461,7 @@ describe('asyncJobQueue', () => {
         (c: any) => c[0].ConditionExpression === '#status = :processing',
       ).length;
 
-      await jest.advanceTimersByTimeAsync(60_000);
+      await jest.advanceTimersByTimeAsync(15_000);
 
       const heartbeatCallsAfterAnotherTick = mockDocumentClientMethods.update.mock.calls.filter(
         (c: any) => c[0].ConditionExpression === '#status = :processing',
@@ -488,7 +488,7 @@ describe('asyncJobQueue', () => {
     it('refreshes updatedAt on the claimed job at each interval tick', async () => {
       const stop = startHeartbeat('calendly_webhook', 'invitee-123');
 
-      jest.advanceTimersByTime(60_000);
+      jest.advanceTimersByTime(15_000);
       await Promise.resolve(); // let the fire-and-forget update's promise chain settle
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalledWith(
@@ -517,7 +517,7 @@ describe('asyncJobQueue', () => {
       });
       const stop = startHeartbeat('calendly_webhook', 'invitee-123');
 
-      jest.advanceTimersByTime(60_000);
+      jest.advanceTimersByTime(15_000);
       await Promise.resolve();
       stop();
 
@@ -530,7 +530,7 @@ describe('asyncJobQueue', () => {
         .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
       const stop = startHeartbeat('calendly_webhook', 'invitee-123');
 
-      jest.advanceTimersByTime(60_000);
+      jest.advanceTimersByTime(15_000);
       await Promise.resolve();
       await Promise.resolve(); // second microtask hop for the nested retry's own .catch chain
       stop();
