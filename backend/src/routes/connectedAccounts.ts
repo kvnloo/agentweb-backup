@@ -85,9 +85,24 @@ export async function processCalendlyWebhookCleanupJob(payload: CalendlyWebhookC
     // "both writes to both stores failed" tail is meaningfully rarer than
     // "one write failed twice."
     if (refreshed.refresh_token && refreshed.refresh_token !== effectiveRefreshToken) {
-      await updateJobPayload(CALENDLY_WEBHOOK_CLEANUP_SOURCE, payload.webhookId, { ...payload, refreshToken: refreshed.refresh_token });
-      if (payload.userId && payload.userUri) {
-        await recordOrphanedCalendlyWebhook(payload.userId, payload.userUri, payload.webhookId, refreshed.refresh_token);
+      const persistedToQueue = await updateJobPayload(CALENDLY_WEBHOOK_CLEANUP_SOURCE, payload.webhookId, { ...payload, refreshToken: refreshed.refresh_token });
+      const persistedToOrphanTable = payload.userId && payload.userUri
+        ? await recordOrphanedCalendlyWebhook(payload.userId, payload.userUri, payload.webhookId, refreshed.refresh_token)
+        : false;
+      // Greptile P1 on #2291 (third pass): both persistence writes are best-effort by
+      // design (retry-then-log, never throw) — but previously nothing here checked
+      // whether EITHER actually landed before re-throwing the unrelated deleteError.
+      // Calendly has already consumed the OLD refresh token by rotating it, so if
+      // BOTH writes failed, the new one exists nowhere durable — every future retry
+      // of this job will keep reloading the now-permanently-invalid old token,
+      // fail refreshCalendlyAccessToken every time, and exhaust its retry budget
+      // without ever having a real chance to succeed. Throwing a distinct error here
+      // makes that diagnosable in logs instead of looking identical to an ordinary
+      // transient delete failure that a later retry might still resolve.
+      if (!persistedToQueue && !persistedToOrphanTable) {
+        throw new Error(
+          `Calendly rotated the refresh token for webhook ${payload.webhookId}, but persisting the new token failed in both the queue payload and the orphan-webhook fallback table — every future retry of this cleanup job will use the now-invalid old token and can never succeed. Original delete error: ${deleteError?.message ?? deleteError}`,
+        );
       }
     }
     throw deleteError;

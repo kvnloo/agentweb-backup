@@ -237,7 +237,13 @@ export async function markJobFailed(source: string, dedupeKey: string, error: un
  * permanently unusable" is observable anywhere — console.error, not warn, so
  * it's actionable in production monitoring rather than silently lost.
  */
-export async function updateJobPayload(source: string, dedupeKey: string, payload: unknown): Promise<void> {
+// Greptile P1 on #2291 (third pass): returns whether the write actually landed —
+// this used to be void, so a caller persisting something irrecoverable-if-lost (e.g.
+// connectedAccounts.ts persisting a rotated Calendly refresh token before the old one
+// becomes permanently invalid) had no way to know whether it needs a DIFFERENT
+// fallback when this best-effort write fails. Still never throws — callers that don't
+// care about the outcome can keep ignoring the return value exactly as before.
+export async function updateJobPayload(source: string, dedupeKey: string, payload: unknown): Promise<boolean> {
   const id = jobId(source, dedupeKey);
   const writePayload = () =>
     dynamodb
@@ -251,11 +257,14 @@ export async function updateJobPayload(source: string, dedupeKey: string, payloa
 
   try {
     await writePayload();
+    return true;
   } catch (firstError: any) {
     try {
       await writePayload();
+      return true;
     } catch (secondError: any) {
       console.error(`[AsyncJobQueue] updateJobPayload failed for ${id} after retry — future retries will use the stale payload:`, secondError?.message ?? secondError);
+      return false;
     }
   }
 }

@@ -495,10 +495,23 @@ export async function processCalendlyWebhookJob(payload: CalendlyJobPayload): Pr
           try {
             await writeMarker('done_unconfirmed');
           } catch (finalErr: any) {
+            // Greptile P1 on #2291 (third pass): silently resolving here — even though
+            // work() genuinely succeeded — let this job go 'completed' (if every other
+            // step also succeeded) with a claim still stuck 'in_progress' and no marker
+            // ever written. A 'completed' job is never revisited by anything, so nothing
+            // would ever get another chance to write the marker before the claim
+            // eventually goes stale and a later reclaim repeats this step. Throwing
+            // instead (still WITHOUT releasing the claim — that's still never safe once
+            // work() has succeeded) makes this attempt count as a job failure, surfacing
+            // through the existing retry/terminal-failure machinery (markJobFailed,
+            // asyncJobQueue.ts's TERMINAL FAILURE log) instead of disappearing silently —
+            // real visibility for a human to intervene before the 5-minute staleness
+            // window can ever let this step run twice.
             console.error(
               `[Calendly Webhook] ${step} succeeded for ${payload.uri} but EVERY attempt to durably record it failed — the claim remains 'in_progress' and could eventually be reclaimed once stale, repeating this step. Needs immediate manual correction:`,
               finalErr?.message ?? finalErr,
             );
+            throw new Error(`${step} step for ${payload.uri} succeeded but could not be durably recorded after exhausting every write attempt`);
           }
         }
       };

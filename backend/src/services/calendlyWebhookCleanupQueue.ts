@@ -56,7 +56,12 @@ function delay(ms: number): Promise<void> {
  * paths — every extra attempt here is one more chance to avoid the truly
  * unrecoverable "nowhere left to write this" outcome.
  */
-export async function recordOrphanedCalendlyWebhook(userId: string, userUri: string, webhookId: string, refreshToken?: string): Promise<void> {
+// Greptile P1 on #2291 (third pass): returns whether the write actually landed —
+// this used to be void, so a caller with no OTHER durable store to fall back to
+// (connectedAccounts.ts persisting a rotated Calendly refresh token) had no way to
+// know this last-resort write also failed, and would silently proceed as if the
+// rotation had been recorded somewhere. Still never throws.
+export async function recordOrphanedCalendlyWebhook(userId: string, userUri: string, webhookId: string, refreshToken?: string): Promise<boolean> {
   const attemptWrite = () =>
     dynamodb.put({
       TableName: ORPHANED_WEBHOOKS_TABLE,
@@ -69,7 +74,7 @@ export async function recordOrphanedCalendlyWebhook(userId: string, userUri: str
     try {
       await attemptWrite();
       console.error(`[Calendly] Recorded orphaned webhook ${webhookId} in the fallback durable store (async job queue was unavailable) — a later reconnect for this identity will find and clean it up`);
-      return;
+      return true;
     } catch (err: any) {
       if (attempt === backoffMs.length - 1) {
         console.error(
@@ -79,6 +84,7 @@ export async function recordOrphanedCalendlyWebhook(userId: string, userUri: str
       }
     }
   }
+  return false;
 }
 
 /**
