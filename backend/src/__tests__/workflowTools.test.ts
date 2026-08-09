@@ -128,18 +128,37 @@ describe('ENG-982: one call completes the job', () => {
     expect(body.next).toMatch(/emma_answer_question/);
   });
 
-  it('emma_get_task_result derives status from the transcript, never a nonexistent field', async () => {
-    // A ChatSession has no top-level `status`. Reading one returned "unknown"
-    // forever, so a caller could never tell a finished task from a running one.
+  it('emma_get_task_result never claims completion it cannot prove', async () => {
+    // progressStore is an in-process Map, so a poll served by a different
+    // instance than the one running the task sees no progress while work
+    // continues. Reporting that as a confirmed finish would make a client stop
+    // polling mid-run, so `idle` is always completion_confirmed: false.
     mockMcpFetch.mockResolvedValueOnce({ messages: [{ role: 'assistant', content: 'done' }] });
-    let body = JSON.parse((await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER) as any).content[0].text);
+    const body = JSON.parse(
+      (await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER) as any).content[0].text
+    );
+
     expect(body.status).toBe('idle');
+    expect(body.completion_confirmed).toBe(false);
     expect(body.latest_output).toBe('done');
+    expect(body.next).toMatch(/not proof the task finished/);
+  });
+
+  it('emma_get_task_result marks the two states it CAN prove as confirmed', async () => {
+    mockMcpFetch.mockResolvedValueOnce({ messages: [], hasActiveProgress: true });
+    let body = JSON.parse(
+      (await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER) as any).content[0].text
+    );
+    expect(body.status).toBe('running');
+    expect(body.completion_confirmed).toBe(true);
 
     jest.clearAllMocks();
-    mockMcpFetch.mockResolvedValueOnce({ messages: [{ role: 'user', content: 'go' }] });
-    body = JSON.parse((await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER) as any).content[0].text);
-    expect(body.status).toBe('running');
+    mockMcpFetch.mockResolvedValueOnce({ messages: [], pendingUserQuestion: { question: 'q?' } });
+    body = JSON.parse(
+      (await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER) as any).content[0].text
+    );
+    expect(body.status).toBe('awaiting_input');
+    expect(body.completion_confirmed).toBe(true);
   });
 
   it('emma_get_task_result keeps polling while an iteration is active, even after an assistant message', async () => {

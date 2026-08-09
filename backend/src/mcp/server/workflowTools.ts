@@ -160,17 +160,27 @@ mcpToolRegistry.register({
     //      client stop polling while Emma is still working
     //   3. only then does the last speaker tell us whether she has replied
     const pending = data?.pendingUserQuestion;
-    const status = pending
-      ? 'awaiting_input'
-      : data?.hasActiveProgress === true
-        ? 'running'
-        : last?.role === 'assistant'
-          ? 'idle'
-          : 'running';
+    const active = data?.hasActiveProgress === true;
+
+    // Only two states can be PROVEN, and we refuse to assert the third.
+    //
+    //   awaiting_input  pendingUserQuestion is persisted on the session, so it
+    //                   is true regardless of which instance answers the poll.
+    //   running         hasActiveProgress is true on THIS instance.
+    //
+    // Absence of progress is NOT proof of completion: `progressStore` is an
+    // in-process Map (utils/sseProgress.ts), so a poll served by a different
+    // instance than the one running the task sees false while work continues.
+    // Calling that "finished" would make a client stop polling mid-run, so the
+    // response says plainly that completion is unconfirmed and how to check.
+    const status = pending ? 'awaiting_input' : active ? 'running' : 'idle';
+    const completionConfirmed = pending || active ? true : false;
 
     return jsonResult({
       task_id: args?.task_id,
       status,
+      // Machine-readable honesty: `idle` never means "provably done".
+      completion_confirmed: completionConfirmed,
       latest_output: last?.content ?? null,
       message_count: messages.length,
       // Surfaced deliberately: a blocking question answered with a plain message
@@ -178,7 +188,9 @@ mcpToolRegistry.register({
       awaiting_question: pending ?? null,
       next: pending
         ? 'Emma is waiting on an answer. Use emma_answer_question — a plain message abandons the question.'
-        : undefined,
+        : status === 'idle'
+          ? 'No active iteration was observed, but progress tracking is per-instance so this is not proof the task finished. If the output looks incomplete, poll again: a higher message_count means it was still running.'
+          : undefined,
     });
   },
 });
