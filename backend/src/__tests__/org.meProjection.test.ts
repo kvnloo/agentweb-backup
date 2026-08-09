@@ -236,4 +236,24 @@ describe('ENG-953 — GET /api/org/me projection', () => {
     expect(res.body.data.pendingInvites[1].email).toBe('x@y.com');
     expect(JSON.stringify(res.body)).not.toContain('invite-token-abc123');
   });
+
+  it('a null or primitive entry in connected_accounts does not 500 the endpoint', async () => {
+    // sanitizeConnectedAccountForOrgResponse reads account.config; a null entry
+    // would throw and take /me down for every member of the org.
+    mockOrgs['org-1'].connected_accounts = [
+      null,
+      'garbage',
+      {
+        platform: 'google',
+        account_id: 'acct-1',
+        config: { profile_id: 'p-1', access_token: 'ya29.a0-super-secret-access-token' },
+      },
+    ] as any;
+    const res = await request(app).get('/api/org/me');
+    expect(res.status).toBe(200);
+    // Unsanitizable entries are dropped, the real one survives sanitized.
+    expect(res.body.data.connected_accounts).toHaveLength(1);
+    expect(res.body.data.connected_accounts[0].config.profile_id).toBe('p-1');
+    expect(JSON.stringify(res.body)).not.toContain('ya29.a0-super-secret-access-token');
+  });
 });

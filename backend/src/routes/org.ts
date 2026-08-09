@@ -174,8 +174,14 @@ function projectOrgForMemberResponse(org: any): Record<string, any> {
     // field absent and a malformed record with a junk value both render as
     // "no accounts" rather than as a disclosure. (Greptile flagged these
     // branches as untested; they were also wrong.)
+    // Non-object entries are dropped before the sanitizer, which reads
+    // `account.config` and would throw on a null — 500-ing `/me` for every
+    // member of that org. Dropping rather than passing through keeps the
+    // fail-closed direction: an entry we cannot sanitize is never emitted.
     connected_accounts: Array.isArray(org.connected_accounts)
-      ? org.connected_accounts.map(sanitizeConnectedAccountForOrgResponse)
+      ? org.connected_accounts
+          .filter((account: any) => account !== null && typeof account === "object")
+          .map(sanitizeConnectedAccountForOrgResponse)
       : undefined,
 
     pendingInvites: Array.isArray(org.pendingInvites)
