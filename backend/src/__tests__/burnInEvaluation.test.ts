@@ -247,6 +247,46 @@ describe('evaluateBurnIn — the burn-in period is a fixed window count (ENG-938
     expect(assessment.postRelease?.date).toBe('2026-08-06');
   });
 
+  it('a low-volume day inside the window does not slide a later day into it', () => {
+    // The fixed period is the first 7 post-release windows: 07-31 … 08-06.
+    // 08-01 is below minRunCount, so it carries no readable evidence — but it
+    // still OCCUPIES its slot in the period. Filtering before slicing would drop
+    // it from the list, pulling 08-07 (the 8th window) into the 7th slot, so a
+    // regression ten days out would block closure for a burn-in that only ever
+    // covered days 1-7.
+    const assessment = evaluateBurnIn({
+      snapshots: extendedSnapshots({
+        '2026-08-01': { runCount: 1, okRuns: 1, degradedRuns: 0, failedRuns: 0 },
+        '2026-08-07': { failedRunRate: 0.9 },
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.verdict).toBe('clean');
+    expect(assessment.passesClosureCheck4).toBe(true);
+    // The last readable window inside the fixed period, not 08-07.
+    expect(assessment.postRelease?.date).toBe('2026-08-06');
+  });
+
+  it('is insufficient when no window inside the fixed period carries enough runs', () => {
+    // Every window in 07-31 … 08-06 is below minRunCount. Reaching past the
+    // period for qualifying rows would report `clean` on evidence the burn-in
+    // window never contained; the verdict must fail closed instead.
+    const thin = { runCount: 1, okRuns: 1, degradedRuns: 0, failedRuns: 0 };
+    const assessment = evaluateBurnIn({
+      snapshots: extendedSnapshots({
+        '2026-07-31': thin, '2026-08-01': thin, '2026-08-02': thin, '2026-08-03': thin,
+        '2026-08-04': thin, '2026-08-05': thin, '2026-08-06': thin,
+      }),
+      releaseAt: REPLAY_RELEASE_AT,
+      releaseIssueId: 'ENG-SYNTHETIC',
+    });
+
+    expect(assessment.passesClosureCheck4).toBe(false);
+    expect(assessment.verdict).not.toBe('clean');
+  });
+
   it('does not fail a release on a regression past the burn-in period', () => {
     // 2026-08-08 is the 9th post-release window — ten days after the release,
     // and no longer this release's burn-in evidence.

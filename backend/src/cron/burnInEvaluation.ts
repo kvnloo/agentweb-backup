@@ -352,9 +352,22 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
     // The burn-in period is a fixed number of post-release windows, NOT however
     // much history the caller happened to read. See
     // BURN_IN_POST_RELEASE_WINDOW_LIMIT.
+    // Slice BEFORE filtering. `afterAll` is chronological, so the slice is what
+    // makes the burn-in period fixed — the first N post-release windows. Filtering
+    // first drops low-volume days out of the list entirely, so later days slide
+    // into the freed slots and the boundary walks forward: a regression on day 12
+    // could block closure for a burn-in that was only ever meant to cover days
+    // 1-7. Slicing first pins the period to real time; the run-count filter then
+    // decides which of those fixed windows carry enough traffic to read.
+    //
+    // This also fixes the reverse failure. If none of the first N windows clears
+    // `minRunCount`, `scanned` is empty, the loop below never sets `latestClean`,
+    // and the existing `!latestClean` guard returns `insufficient` — instead of
+    // reaching for qualifying rows outside the period and reporting `clean` on
+    // evidence the burn-in window never contained.
     const scanned = afterAll
-      .filter((snapshot) => snapshot.runCount >= minRunCount)
-      .slice(0, BURN_IN_POST_RELEASE_WINDOW_LIMIT);
+      .slice(0, BURN_IN_POST_RELEASE_WINDOW_LIMIT)
+      .filter((snapshot) => snapshot.runCount >= minRunCount);
 
     // AC3's no-blending rule applies to the rows this verdict READS: the
     // baseline and the scanned burn-in windows. Demanding a 24h/7d pair across
