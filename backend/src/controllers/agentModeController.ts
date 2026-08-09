@@ -1454,7 +1454,10 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 //       tool loop hits maxIterations, so it fires whether the final content is
 //       the canned "reached the maximum steps" apology OR the model's own
 //       partial text (the model usually complies with the "wrap up" nudge and
-//       writes non-report text, so text-pattern matching alone misses it);
+//       writes non-report text, so text-pattern matching alone misses it).
+//       ENG-907 adds the wall-clock twin, `truncatedByTimeBudget`: the run hit
+//       the whole-turn time cap and delivered a forced partial synthesis. Same
+//       meaning for the gate — real partial work that needs one more turn;
 //   (b) 'confirmation' — the turn halted to ask a human to confirm/approve
 //       before proceeding, with no human present to answer (ENG-369); or
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
@@ -1469,10 +1472,11 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
 }): ScheduledContinuationReason | null {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
-  if (response?.truncatedByStepBudget === true) return 'budget';
+  if (response?.truncatedByStepBudget === true || response?.truncatedByTimeBudget === true) return 'budget';
   const content = response?.content || '';
   if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
@@ -1484,6 +1488,7 @@ export function classifyScheduledContinuation(response: {
 export function scheduledRunSignalsIncompleteResponse(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
 }): boolean {
   return classifyScheduledContinuation(response) !== null;
@@ -1547,10 +1552,11 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
 export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
 }): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
-  if (response?.truncatedByStepBudget === true) return 'budget';
+  if (response?.truncatedByStepBudget === true || response?.truncatedByTimeBudget === true) return 'budget';
   const content = response?.content || '';
   if (await scheduledTurnDefersToUser(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
@@ -3883,6 +3889,9 @@ export async function generateSessionResponse(
   // and was truncated before emitting the final deliverable. The scheduled-run
   // completion gate uses this flag (not response text) to force a synthesis turn.
   truncatedByStepBudget?: boolean;
+  // ENG-907: the wall-clock counterpart — the turn ran out of time and delivered a
+  // partial answer from a forced tool-free synthesis instead of the full deliverable.
+  truncatedByTimeBudget?: boolean;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);

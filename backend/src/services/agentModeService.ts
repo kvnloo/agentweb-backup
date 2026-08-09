@@ -13,6 +13,11 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
+import {
+  evaluateTurnTimeBudget,
+  buildTurnTimeBudgetNudge,
+  TURN_TIME_BUDGET_FALLBACK_CONTENT,
+} from '../utils/turnTimeBudget';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import {
@@ -3112,7 +3117,7 @@ export class AgentModeService {
     screenshotUrl?: string,
     isDelegatedAccess: boolean = false,
     persistIncrementally: boolean = false
-  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; persistedResponseCount?: number }> {
+  ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; truncatedByTimeBudget?: boolean; persistedResponseCount?: number }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
     let _initialMessageCount = 0;
@@ -3483,6 +3488,23 @@ export class AgentModeService {
       // later iteration (e.g. resuming after a timeout) instead of regenerating the image.
       const mediaCallKeysThisRun = new Map<string, string>();
 
+      // ENG-907: whole-turn WALL-CLOCK budget — the analogue of the step budget below.
+      // A broad research turn can stay far under `maxIterations` and still burn the whole
+      // 10-minute controller cap issuing discovery calls; when the cap fires the run is
+      // force-rejected and every bit of text it produced is discarded (the user gets a bare
+      // "please try again" after real spend). We track the same deadline here so the loop
+      // can wrap itself up: nudge to stop new discovery at 70% of the budget, then take the
+      // tools away and force one final synthesis turn while there is still time to deliver.
+      // Unlike `generationHardCapMs` above this is NOT tied to the media switch — it guards
+      // every turn. Set AGENT_MODE_GENERATION_TIMEOUT_MS=0 to disable.
+      const turnStartedAtMs = Date.now();
+      const turnHardCapMs = generationTimeoutMs > 0 ? turnStartedAtMs + generationTimeoutMs : undefined;
+      let longestLlmCallMsThisRun = 0;
+      let timeBudgetWrapUpWarned = false;
+      // Sticky: once the loop switches to synthesis it never offers tools again this turn.
+      let forceFinalSynthesis = false;
+      let truncatedByTimeBudget = false;
+
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
       let iteration = 0;
@@ -3538,6 +3560,36 @@ export class AgentModeService {
             ? `[SYSTEM WARNING] Only ${remaining} step${remaining === 1 ? '' : 's'} remaining. Stop all searching/pagination immediately. Complete any pending writes, then give your final response with what you have so far.`
             : `[SYSTEM] Step budget: ${iteration}/${maxIterations} used, ${remaining} steps remaining. Prefer batch operations, avoid unnecessary pagination, and wrap up soon.`;
           (messages as any[]).push({ role: 'user', content: urgency });
+        }
+
+        // ENG-907: same self-regulation for the wall-clock budget. The first iteration is
+        // exempt from the synthesis switch — with no work done yet there is nothing to
+        // synthesize, and the run should fail loudly rather than emit an empty "partial".
+        if (turnHardCapMs !== undefined && !forceFinalSynthesis) {
+          const timeBudget = evaluateTurnTimeBudget({
+            startedAtMs: turnStartedAtMs,
+            hardCapMs: turnHardCapMs,
+            longestLlmCallMs: longestLlmCallMsThisRun,
+          });
+          if (timeBudget.phase === 'final_synthesis' && iteration > 1) {
+            forceFinalSynthesis = true;
+            truncatedByTimeBudget = true;
+            console.warn(
+              `AgentMode: whole-turn time budget nearly exhausted for session ${sessionId} ` +
+              `(${Math.round(timeBudget.elapsedMs / 1000)}s used, ${Math.round(timeBudget.remainingMs / 1000)}s left) — ` +
+              'disabling tools and forcing a final synthesis so the work so far is delivered'
+            );
+            (messages as any[]).push({
+              role: 'user',
+              content: buildTurnTimeBudgetNudge(timeBudget, 'final_synthesis'),
+            });
+          } else if (timeBudget.phase === 'wrap_up' && !timeBudgetWrapUpWarned) {
+            timeBudgetWrapUpWarned = true;
+            (messages as any[]).push({
+              role: 'user',
+              content: buildTurnTimeBudgetNudge(timeBudget, 'wrap_up'),
+            });
+          }
         }
 
         // 4. Refresh Context if Skills Changed
@@ -3709,9 +3761,13 @@ export class AgentModeService {
           [ATTR_GEN_AI_PROVIDER_NAME]: providerForModel(llmModel),
           [ATTR_SESSION_ID]: sessionId,
         });
+        // ENG-907: on the forced synthesis turn the tool list is withheld entirely, so the
+        // model has no way to start more work and must answer with what it already has.
+        // (callLLM omits `tools`/`tool_choice` from the request when this is undefined.)
+        const toolsForCall = forceFinalSynthesis ? undefined : filteredToolsCache;
         try {
           response = await this.callLLM(llmModel, trimmedMessages, {
-            tools: filteredToolsCache,
+            tools: toolsForCall,
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
@@ -3735,7 +3791,7 @@ export class AgentModeService {
               llmModel = backup;
               backupModelUsed = true;
               response = await this.callLLM(llmModel, trimmedMessages, {
-                tools: filteredToolsCache,
+                tools: toolsForCall,
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
@@ -3755,6 +3811,9 @@ export class AgentModeService {
           endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
         }
         const llmDurationMs = Date.now() - llmStart;
+        // ENG-907: size the synthesis reserve off the slowest call actually observed —
+        // a fixed 90s is not enough headroom on a model that takes minutes per turn.
+        if (llmDurationMs > longestLlmCallMsThisRun) longestLlmCallMsThisRun = llmDurationMs;
 
         // Yield control back to event loop after LLM call to allow health checks and other requests
         // This prevents blocking the main thread during long-running generateResponse operations
@@ -4163,6 +4222,13 @@ export class AgentModeService {
         }
       }
 
+      // ENG-907: same contract for the wall-clock budget. The forced synthesis turn
+      // normally writes the partial deliverable itself; if it came back empty, say the
+      // time limit was hit rather than returning nothing at all.
+      if (truncatedByTimeBudget && !content) {
+        content = TURN_TIME_BUDGET_FALLBACK_CONTENT;
+      }
+
       // Finalize guard (ENG-143/135/124): claimed-vs-executed truthfulness check at
       // the loop edge, AFTER the final message and BEFORE emit/persist.
       // Two independent flags, most-enforcing wins:
@@ -4344,6 +4410,9 @@ export class AgentModeService {
         persistedResponseCount,
         ...(wasCancelled ? { cancelled: true } : {}),
         ...(truncatedByStepBudget ? { truncatedByStepBudget: true } : {}),
+        // ENG-907: the wall-clock counterpart — the turn delivered a partial answer
+        // because it ran out of time, so a scheduled run must continue it.
+        ...(truncatedByTimeBudget ? { truncatedByTimeBudget: true } : {}),
         ...(backupModelUsed ? { backupModelUsed: true, originalModel: originalLlmModel, backupModel: llmModel } : {})
       };
     } catch (error: any) {
