@@ -1,4 +1,4 @@
-import { getAccountById } from './connectedAccountsDb';
+import { getAccountsWithOwnerIncludingOrgShared } from './connectedAccountsDb';
 
 // ── Shared email result types ──────────────────────────────────────────────
 // These live here, not in a provider implementation. They used to be imported
@@ -116,26 +116,88 @@ export function getEmailProvider(platform: string): IEmailService {
 
 // ── Account resolution ────────────────────────────────────────────────────
 
+export interface ResolvedEmailAccount {
+  platform: EmailPlatform;
+  provider: IEmailService;
+  accountId: string;
+  /**
+   * The member whose record OWNS this mailbox — the caller for their own
+   * account, a teammate for one shared with the org.
+   *
+   * Every provider call must be made with THIS id, not the caller's: the OAuth
+   * tokens live in the owner's record, so the caller's id fails the lookup one
+   * level down, and a refreshed token written under the caller would leave the
+   * owner's stale forever (see getAccountsWithOwnerIncludingOrgShared).
+   */
+  ownerUserId: string;
+}
+
 /**
- * Resolve a connected account and return its platform + provider.
+ * Every email account the caller can reach — their own plus any an org teammate
+ * shared — tagged with its owner.
+ *
+ * This is the same set list_connected_accounts reports. Resolution used to read
+ * the caller's own record only, so an org-shared mailbox was listed as active
+ * and then rejected as "not found" by the very tools the list points at, and a
+ * scheduled run needing a login code from it had nowhere to go (ENG-943).
+ */
+async function accessibleEmailAccounts(userId: string) {
+  const accounts = await getAccountsWithOwnerIncludingOrgShared(userId);
+  return (accounts || []).filter(acc => EMAIL_PLATFORMS.includes(acc.platform as EmailPlatform));
+}
+
+/**
+ * Resolve a connected account and return its platform + provider + owner.
  * Throws a descriptive error if the account isn't found or isn't an email platform.
  */
 export async function resolveEmailAccount(
   userId: string,
   accountId: string
-): Promise<{ platform: EmailPlatform; provider: IEmailService }> {
-  const account = await getAccountById(accountId, userId);
+): Promise<ResolvedEmailAccount> {
+  const accounts = (await getAccountsWithOwnerIncludingOrgShared(userId)) || [];
+  const sameId = accounts.filter(acc => acc.account_id === accountId);
+
+  // Prefer an email platform rather than taking the first id match: one Google
+  // account connected for both Gmail and Drive carries the same address as
+  // account_id on both, and picking Drive would reject a perfectly good mailbox
+  // as "not an email account".
+  const account = sameId.find(acc => EMAIL_PLATFORMS.includes(acc.platform as EmailPlatform));
   if (!account) {
+    if (sameId.length > 0) {
+      throw new Error(`Account "${accountId}" is a ${sameId[0].platform} account, not an email account.`);
+    }
     throw new Error(`Connected account "${accountId}" not found. Use list_connected_accounts to get valid account IDs.`);
   }
 
   const platform = account.platform as EmailPlatform;
-  if (!EMAIL_PLATFORMS.includes(platform)) {
-    throw new Error(`Account "${accountId}" is a ${platform} account, not an email account.`);
+  const provider = getEmailProvider(platform);
+  return { platform, provider, accountId, ownerUserId: account.userId };
+}
+
+/**
+ * Pick a mailbox for a caller who didn't name one, in EMAIL_PLATFORMS order and
+ * preferring the caller's own account over a teammate's shared one. Null when
+ * the caller can reach no mailbox at all.
+ */
+export async function resolveDefaultEmailAccount(
+  userId: string
+): Promise<ResolvedEmailAccount | null> {
+  const accounts = await accessibleEmailAccounts(userId);
+
+  for (const platform of EMAIL_PLATFORMS) {
+    const onPlatform = accounts.filter(acc => acc.platform === platform);
+    const account = onPlatform.find(acc => acc.userId === userId) ?? onPlatform[0];
+    if (account) {
+      return {
+        platform,
+        provider: getEmailProvider(platform),
+        accountId: account.account_id,
+        ownerUserId: account.userId,
+      };
+    }
   }
 
-  const provider = getEmailProvider(platform);
-  return { platform, provider };
+  return null;
 }
 
 // ── Lazy provider bootstrap ───────────────────────────────────────────────

@@ -6327,20 +6327,22 @@ emmaToolRegistry.register({
     await bootstrapEmailProviders();
 
     try {
-      const { provider } = await resolveEmailAccount(userId, args.account_id);
+      // ownerUserId, not userId: an org-shared mailbox lives in the teammate's
+      // record, and that is where the provider reads (and refreshes) its tokens.
+      const { provider, ownerUserId } = await resolveEmailAccount(userId, args.account_id);
 
       switch (args.action) {
         case 'search': {
           if (!args.query) return { error: 'search action requires a query parameter.' };
           const maxResults = Math.min(args.max_results || 10, 50);
-          const results = await provider.searchEmails(userId, args.account_id, args.query, maxResults);
+          const results = await provider.searchEmails(ownerUserId, args.account_id, args.query, maxResults);
           if (results.length === 0) return { message: 'No emails found matching your search.' };
           return { emails: results, count: results.length };
         }
 
         case 'list': {
           const maxResults = Math.min(args.max_results || 20, 50);
-          const results = await provider.listEmails(userId, args.account_id, args.folder || 'INBOX', maxResults);
+          const results = await provider.listEmails(ownerUserId, args.account_id, args.folder || 'INBOX', maxResults);
           if (results.length === 0) return { message: 'No emails found.' };
           return { emails: results, count: results.length };
         }
@@ -6348,7 +6350,7 @@ emmaToolRegistry.register({
         case 'get': {
           const ids: string[] = Array.isArray(args.message_ids) ? args.message_ids : [];
           if (ids.length === 0) return { error: 'get action requires a message_ids array with at least one ID.' };
-          const emails = await provider.getEmails(userId, args.account_id, ids);
+          const emails = await provider.getEmails(ownerUserId, args.account_id, ids);
           return { emails, count: emails.length };
         }
 
@@ -6356,7 +6358,7 @@ emmaToolRegistry.register({
           if (!args.to) return { error: 'send action requires a "to" parameter.' };
           if (!args.subject) return { error: 'send action requires a "subject" parameter.' };
           if (!args.body) return { error: 'send action requires a "body" parameter.' };
-          const result = await provider.sendEmail(userId, args.account_id, {
+          const result = await provider.sendEmail(ownerUserId, args.account_id, {
             to: args.to,
             subject: args.subject,
             body: args.body,

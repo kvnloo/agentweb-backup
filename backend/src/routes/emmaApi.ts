@@ -228,31 +228,33 @@ router.post('/email', async (req: Request, res: Response) => {
   try {
     const { bootstrapEmailProviders, resolveEmailAccount } = await import('../services/emailProviderService');
     await bootstrapEmailProviders();
-    const { provider } = await resolveEmailAccount(userId(req), req.body.account_id);
+    // ownerUserId, not the caller: an org-shared mailbox lives in the teammate's
+    // record, and that is where the provider reads (and refreshes) its tokens.
+    const { provider, ownerUserId } = await resolveEmailAccount(userId(req), req.body.account_id);
 
     const { action } = req.body;
     let result;
     switch (action) {
       case 'search': {
         const maxResults = Math.min(req.body.max_results || 10, 50);
-        const emails = await provider.searchEmails(userId(req), req.body.account_id, req.body.query, maxResults);
+        const emails = await provider.searchEmails(ownerUserId, req.body.account_id, req.body.query, maxResults);
         result = { emails, count: emails.length };
         break;
       }
       case 'list': {
         const maxResults = Math.min(req.body.max_results || 20, 50);
-        const emails = await provider.listEmails(userId(req), req.body.account_id, req.body.folder || 'INBOX', maxResults);
+        const emails = await provider.listEmails(ownerUserId, req.body.account_id, req.body.folder || 'INBOX', maxResults);
         result = { emails, count: emails.length };
         break;
       }
       case 'get': {
         const ids: string[] = Array.isArray(req.body.message_ids) ? req.body.message_ids : [];
-        const emails = await provider.getEmails(userId(req), req.body.account_id, ids);
+        const emails = await provider.getEmails(ownerUserId, req.body.account_id, ids);
         result = { emails, count: emails.length };
         break;
       }
       case 'send': {
-        const sendResult = await provider.sendEmail(userId(req), req.body.account_id, {
+        const sendResult = await provider.sendEmail(ownerUserId, req.body.account_id, {
           to: req.body.to,
           subject: req.body.subject,
           body: req.body.body,

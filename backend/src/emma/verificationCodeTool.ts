@@ -41,9 +41,6 @@ const INBOX_SCAN_SIZE = 25;
 /** Bodies fetched per pass — codes land at the top of the inbox, not page 3. */
 const MAX_BODIES_PER_PASS = 5;
 
-/** Email platforms tried, in order, when the caller does not name an account. */
-const AUTO_RESOLVE_PLATFORMS = ['gmail', 'outlook'] as const;
-
 const NO_FABRICATION_NOTE =
   'Do NOT guess a code and do NOT continue as if the login succeeded — report the failure instead.';
 
@@ -252,22 +249,31 @@ emmaToolRegistry.register({
       ? Date.parse(args.since)
       : invokedAt - DEFAULT_FRESHNESS_GRACE_MS;
 
-    const { bootstrapEmailProviders, resolveEmailAccount, getEmailProvider } = await import(
+    const { bootstrapEmailProviders, resolveEmailAccount, resolveDefaultEmailAccount } = await import(
       '../services/emailProviderService'
     );
     await bootstrapEmailProviders();
 
     // ── Resolve the mailbox ────────────────────────────────────────────────
+    // Both paths resolve over the accounts the caller can actually reach — own
+    // AND org-shared — which is the same set list_connected_accounts reports.
+    // Reading only the caller's own record made a shared mailbox listed as
+    // active unusable here, and left an unattended run with no way to finish an
+    // email-code login (ENG-943).
     let provider: any;
     let accountId: string;
     let platform: string;
+    // The mailbox's owner, which is whose record the provider must authenticate
+    // against — not necessarily the caller.
+    let mailboxUserId: string;
 
     if (args?.account_id) {
       try {
         const resolved = await resolveEmailAccount(userId, args.account_id);
         provider = resolved.provider;
         platform = resolved.platform;
-        accountId = args.account_id;
+        accountId = resolved.accountId;
+        mailboxUserId = resolved.ownerUserId;
       } catch (error: any) {
         return {
           success: false,
@@ -276,17 +282,8 @@ emmaToolRegistry.register({
         };
       }
     } else {
-      const { getAccountByPlatform } = await import('../services/connectedAccountsDb');
-      let account: any = null;
-      let foundPlatform = '';
-      for (const candidate of AUTO_RESOLVE_PLATFORMS) {
-        account = await getAccountByPlatform(userId, candidate as any);
-        if (account) {
-          foundPlatform = candidate;
-          break;
-        }
-      }
-      if (!account) {
+      const resolved = await resolveDefaultEmailAccount(userId);
+      if (!resolved) {
         return {
           success: false,
           reason: 'no_email_account',
@@ -295,9 +292,10 @@ emmaToolRegistry.register({
             `then retry. ${NO_FABRICATION_NOTE}`,
         };
       }
-      provider = getEmailProvider(foundPlatform as any);
-      platform = foundPlatform;
-      accountId = account.account_id;
+      provider = resolved.provider;
+      platform = resolved.platform;
+      accountId = resolved.accountId;
+      mailboxUserId = resolved.ownerUserId;
     }
 
     // ── Poll for a fresh matching message ──────────────────────────────────
@@ -323,7 +321,7 @@ emmaToolRegistry.register({
       let searched: any[] = [];
       if (query) {
         try {
-          searched = (await provider.searchEmails(userId, accountId, query, INBOX_SCAN_SIZE)) || [];
+          searched = (await provider.searchEmails(mailboxUserId, accountId, query, INBOX_SCAN_SIZE)) || [];
         } catch (error: any) {
           console.warn(`[read_verification_code] Mailbox search failed, using the inbox scan only: ${error?.message || error}`);
         }
@@ -331,7 +329,7 @@ emmaToolRegistry.register({
 
       let listed: any[] = [];
       try {
-        listed = (await provider.listEmails(userId, accountId, 'INBOX', INBOX_SCAN_SIZE)) || [];
+        listed = (await provider.listEmails(mailboxUserId, accountId, 'INBOX', INBOX_SCAN_SIZE)) || [];
       } catch (error: any) {
         return {
           success: false,
@@ -368,7 +366,7 @@ emmaToolRegistry.register({
         const ids = fresh.slice(0, MAX_BODIES_PER_PASS).map((email: any) => email.id);
         let details: any[] = [];
         try {
-          details = await provider.getEmails(userId, accountId, ids);
+          details = await provider.getEmails(mailboxUserId, accountId, ids);
         } catch (error: any) {
           return {
             success: false,
