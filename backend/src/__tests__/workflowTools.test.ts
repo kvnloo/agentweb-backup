@@ -142,6 +142,32 @@ describe('ENG-982: one call completes the job', () => {
     expect(body.status).toBe('running');
   });
 
+  it('emma_get_task_result keeps polling while an iteration is active, even after an assistant message', async () => {
+    // A multi-iteration run emits intermediate assistant messages. Reading only
+    // the last speaker would call that "idle" and the client would stop polling
+    // while Emma is still working, so hasActiveProgress outranks the transcript.
+    mockMcpFetch.mockResolvedValueOnce({
+      messages: [{ role: 'assistant', content: 'working on step 2...' }],
+      hasActiveProgress: true,
+    });
+
+    const res: any = await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER);
+    expect(JSON.parse(res.content[0].text).status).toBe('running');
+  });
+
+  it('emma_get_task_result still reports a blocking question ahead of active progress', async () => {
+    // If Emma is waiting on the caller, that is the actionable fact regardless
+    // of what the progress flag says.
+    mockMcpFetch.mockResolvedValueOnce({
+      messages: [{ role: 'assistant', content: 'which audience?' }],
+      pendingUserQuestion: { question: 'which audience?' },
+      hasActiveProgress: true,
+    });
+
+    const res: any = await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER);
+    expect(JSON.parse(res.content[0].text).status).toBe('awaiting_input');
+  });
+
   it('emma_get_brand_profile collapses three lookups into one call', async () => {
     mockMcpFetch
       .mockResolvedValueOnce({ tone: 'direct' })

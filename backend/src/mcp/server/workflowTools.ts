@@ -143,11 +143,22 @@ mcpToolRegistry.register({
     const last = messages.length ? messages[messages.length - 1] : undefined;
 
     // A ChatSession has NO top-level `status` field, so reading one would report
-    // "unknown" forever. Derive it from what the session actually carries:
-    //   - a pendingUserQuestion means Emma is blocked on the caller
-    //   - otherwise the last speaker tells us whether she has replied yet
+    // "unknown" forever. Derive it from what the session actually carries, in
+    // this order:
+    //   1. a pendingUserQuestion means Emma is blocked on the caller
+    //   2. hasActiveProgress means an agent iteration is still running — this
+    //      MUST outrank the transcript, because a multi-iteration run emits
+    //      intermediate assistant messages, and treating one as "idle" makes a
+    //      client stop polling while Emma is still working
+    //   3. only then does the last speaker tell us whether she has replied
     const pending = data?.pendingUserQuestion;
-    const status = pending ? 'awaiting_input' : last?.role === 'assistant' ? 'idle' : 'running';
+    const status = pending
+      ? 'awaiting_input'
+      : data?.hasActiveProgress === true
+        ? 'running'
+        : last?.role === 'assistant'
+          ? 'idle'
+          : 'running';
 
     return jsonResult({
       task_id: args?.task_id,
