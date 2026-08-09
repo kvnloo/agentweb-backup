@@ -117,10 +117,13 @@ export function decideTermination(input: TerminationInput): TerminationDecision 
   //    ENG-946: judged on THIS turn's text when the caller supplies it, so a stale
   //    accumulated narration can no longer masquerade as the final answer. When
   //    `currentTurnText` is omitted this falls back to `content` — the pre-fix input.
+  //    Trimmed, so a whitespace-only turn counts as no answer (same test as
+  //    `isFinalAssistantAnswer` applies downstream).
   //    A content-filtered turn never nudges (the canned message is the answer),
   //    which is what the monolith did by filling `content` before this check.
-  const terminatingText =
-    input.currentTurnText !== undefined ? input.currentTurnText : input.content;
+  const terminatingText = (
+    input.currentTurnText !== undefined ? input.currentTurnText : input.content
+  )?.trim();
   if (
     !isContentFiltered &&
     !terminatingText &&
