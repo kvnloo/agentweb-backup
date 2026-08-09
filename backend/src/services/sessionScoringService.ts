@@ -119,6 +119,52 @@ const MAX_MESSAGES_FOR_SCORING = 50;
 const MIN_USER_MESSAGES = 1;
 
 /**
+ * Hard ceiling on the transcript handed to the scoring judge (ENG-929).
+ *
+ * MAX_MESSAGES_FOR_SCORING bounds the message COUNT but not their size: a long
+ * scheduled run (30-69 turns of report-sized assistant output) serializes to a
+ * transcript several times larger than a short chat. The scoring model is a
+ * thinking model, so latency grows with input, and the whole call used to sit
+ * behind a flat 20s timeout — long, expensive sessions therefore timed out,
+ * threw, and were silently left with satisfactionScore: null forever (the daily
+ * report's window moves on, so nothing ever retries them). That structurally
+ * excluded the LONGEST runs from quality monitoring — exactly where regressions
+ * hide.
+ *
+ * Capping the transcript bounds the worst-case call, and the surviving head+tail
+ * still carries what the judge needs (the opening request and the final
+ * outcome). A truncated judgement is labelled rather than dropped.
+ */
+export const MAX_TRANSCRIPT_CHARS_FOR_SCORING = 40000;
+
+/** Inserted where the middle of an over-long transcript was removed. */
+export const TRANSCRIPT_TRUNCATION_MARKER =
+  "\n\n[… middle of transcript omitted to fit the scoring context — the opening turns and the final turns are shown in full …]\n\n";
+
+/**
+ * Fraction of the budget kept from the START of the transcript. The tail is
+ * weighted heavier because goal completion is judged on how the run ENDED.
+ */
+const TRANSCRIPT_HEAD_FRACTION = 0.35;
+
+/**
+ * Shorten an over-long transcript by removing its middle, keeping the opening
+ * and (mostly) the closing turns. Returns the text unchanged when it already
+ * fits, so short sessions are never labelled as truncated.
+ */
+function capTranscriptForScoring(text: string): { text: string; truncated: boolean } {
+  if (text.length <= MAX_TRANSCRIPT_CHARS_FOR_SCORING) {
+    return { text, truncated: false };
+  }
+  const headChars = Math.floor(MAX_TRANSCRIPT_CHARS_FOR_SCORING * TRANSCRIPT_HEAD_FRACTION);
+  const tailChars = MAX_TRANSCRIPT_CHARS_FOR_SCORING - headChars;
+  return {
+    text: text.slice(0, headChars) + TRANSCRIPT_TRUNCATION_MARKER + text.slice(text.length - tailChars),
+    truncated: true,
+  };
+}
+
+/**
  * Backstop for zero-task sessions the static phrase lists below cannot
  * enumerate ("hey, just checking in", "sorry wrong window", …). The judge is
  * asked one extra, purely factual question — did the user ever ask for
@@ -506,7 +552,49 @@ function buildFailedRunResult(messageCount: number): ScoringResult {
     dimensions: { goalCompletion: 1, dataAccuracy: 1, outputQuality: 1 },
   };
 }
-const SCORING_TIMEOUT_MS = 20000; // 20 seconds per session
+/**
+ * Wall-clock allowance for ONE scoring call.
+ *
+ * It used to be a flat 20s, which is generous for a short chat and far too tight
+ * for a 30-70 turn scheduled run: the configured scoring model is a *thinking*
+ * model, so its latency scales with the size of the transcript. Long sessions
+ * therefore lost the race, `scoreSession` threw, and the session was left
+ * unscored — permanently, since nothing re-attempts a window that has passed
+ * (ENG-929). Scale the allowance with the transcript instead, bounded at both
+ * ends: the baseline keeps short sessions snappy and the ceiling keeps one huge
+ * session from eating the sync-scoring budget on its own. The transcript itself
+ * is capped (MAX_TRANSCRIPT_CHARS_FOR_SCORING), so the ceiling is reachable but
+ * never exceeded by an unbounded input.
+ */
+export const SCORING_TIMEOUT_BASE_MS = 20000; // short transcript
+const SCORING_TIMEOUT_PER_10K_CHARS_MS = 10000;
+export const SCORING_TIMEOUT_MAX_MS = 60000;
+
+export function scoringTimeoutMs(conversationText: string): number {
+  const extra = Math.floor((conversationText?.length ?? 0) / 10000) * SCORING_TIMEOUT_PER_10K_CHARS_MS;
+  return Math.min(SCORING_TIMEOUT_MAX_MS, SCORING_TIMEOUT_BASE_MS + extra);
+}
+
+/**
+ * Race an LLM call against a transcript-sized timeout. The timer is always
+ * cleared, so a fast call never leaves a pending handle behind (a per-session
+ * leak at sync-scoring volumes).
+ */
+async function raceWithScoringTimeout<T>(call: Promise<T>, conversationText: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutMs = scoringTimeoutMs(conversationText);
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Scoring LLM call timed out after ${timeoutMs}ms`)),
+      timeoutMs
+    );
+  });
+  try {
+    return await Promise.race([call, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 async function getDefaultScoringPrompt(): Promise<string> {
   try {
@@ -587,6 +675,12 @@ type ScoringResult = {
    * NO_TASK_JUDGMENT_CLAUSE.
    */
   taskRequested?: boolean;
+  /**
+   * True when the transcript handed to the judge was shortened to fit
+   * MAX_TRANSCRIPT_CHARS_FOR_SCORING. Surfaced on the persisted score so a
+   * partial-context judgement is never mistaken for a full-context one (ENG-929).
+   */
+  transcriptTruncated?: boolean;
 };
 
 function parseDimensions(raw: any): ScoringResult["dimensions"] | undefined {
@@ -626,11 +720,11 @@ export async function scoreSession(
   usageContext?: { userId?: string; feature?: string; sessionId?: string }
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
-  const baseConversationText = serializeMessagesForScoring(recentMessages);
+  const capped = capTranscriptForScoring(serializeMessagesForScoring(recentMessages));
   const header = getSessionTypeHeader(pageIdentifier, sessionType);
   const conversationText = header
-    ? `${header}\n\n${baseConversationText}`
-    : baseConversationText;
+    ? `${header}\n\n${capped.text}`
+    : capped.text;
 
   // Lazy-import to avoid pulling heavy dependencies at module load time
   const { agentModeService } = await import("./agentModeService");
@@ -655,11 +749,7 @@ export async function scoreSession(
     }
   );
 
-  const timeoutPromise = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error("Scoring LLM call timed out")), SCORING_TIMEOUT_MS)
-  );
-
-  const res = await Promise.race([llmPromise, timeoutPromise]);
+  const res = await raceWithScoringTimeout(llmPromise, conversationText);
 
   const raw = res.choices?.[0]?.message?.content ?? "{}";
   const parsed = JSON.parse(raw);
@@ -671,6 +761,7 @@ export async function scoreSession(
     evaluatedMessageIndex: currentMessageCount,
     dimensions: parseDimensions(parsed),
     taskRequested: parseTaskRequested(parsed),
+    ...(capped.truncated ? { transcriptTruncated: true } : {}),
   };
 }
 
@@ -691,11 +782,11 @@ export async function scoreSessionWithJudge(
   usageContext?: { userId?: string; feature?: string; sessionId?: string }
 ): Promise<ScoringResult> {
   const recentMessages = messages.slice(-MAX_MESSAGES_FOR_SCORING);
-  const baseConversationText = serializeMessagesForScoring(recentMessages);
+  const capped = capTranscriptForScoring(serializeMessagesForScoring(recentMessages));
   const header = getSessionTypeHeader(undefined, sessionType);
   const conversationText = header
-    ? `${header}\n\n${baseConversationText}`
-    : baseConversationText;
+    ? `${header}\n\n${capped.text}`
+    : capped.text;
 
   const { agentModeService } = await import("./agentModeService");
 
@@ -720,11 +811,7 @@ export async function scoreSessionWithJudge(
     }
   );
 
-  const timeoutPromise = new Promise<never>((_, reject) =>
-    setTimeout(() => reject(new Error("Scoring LLM call timed out")), SCORING_TIMEOUT_MS)
-  );
-
-  const res = await Promise.race([llmPromise, timeoutPromise]);
+  const res = await raceWithScoringTimeout(llmPromise, conversationText);
 
   const raw = res.choices?.[0]?.message?.content ?? "{}";
   const parsed = JSON.parse(raw);
@@ -736,6 +823,7 @@ export async function scoreSessionWithJudge(
     evaluatedMessageIndex: currentMessageCount,
     dimensions: parseDimensions(parsed),
     taskRequested: parseTaskRequested(parsed),
+    ...(capped.truncated ? { transcriptTruncated: true } : {}),
   };
 }
 
@@ -1009,6 +1097,7 @@ export async function scoreSessionIfNeeded(
     evaluatedAt: new Date().toISOString(),
     evaluatedMessageIndex: result.evaluatedMessageIndex,
     ...(result.dimensions ? { dimensions: result.dimensions } : {}),
+    ...(result.transcriptTruncated ? { transcriptTruncated: true } : {}),
   };
 
   // Persist to DB
