@@ -197,6 +197,9 @@ describe('ENG-982: one call completes the job', () => {
     // would claim completion while the session might be awaiting input — the
     // same false confidence this tool exists to avoid.
     expect(body.completion_confirmed).toBe(false);
+    // `complete` is terminal in this contract — the tool description tells the
+    // caller not to poll it. An unverified turn must not wear it.
+    expect(body.status).toBe('unconfirmed');
     expect(body.next).toMatch(/unconfirmed/);
   });
 

@@ -72,8 +72,9 @@ mcpToolRegistry.register({
       'Give Emma a marketing goal in plain language and she plans and executes it end to end — campaigns, content, research, outreach. ' +
       'Use this when none of the more specific emma_* tools fits the request. ' +
       'Starts a new task unless you pass task_id to continue an existing one. ' +
-      'Usually returns the finished result directly (status "complete"). Only poll emma_get_task_result ' +
-      'when status is "running", or answer with emma_answer_question when it is "awaiting_input".',
+      'Usually returns the finished result directly (status "complete"). Poll emma_get_task_result ' +
+      'when status is "running" or "unconfirmed" — "unconfirmed" means the result is real but we could ' +
+      'not verify Emma is not waiting on you. Answer with emma_answer_question when status is "awaiting_input".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -150,7 +151,19 @@ mcpToolRegistry.register({
       }
     }
 
-    const status = pending ? 'awaiting_input' : stillBuilding ? 'running' : 'complete';
+    // `complete` is a TERMINAL status in this contract: a caller reading it is
+    // told, in the tool description, that polling adds nothing. Reporting it
+    // when the confirming read failed sends that caller away from work that may
+    // still be blocked on their answer — the exact failure this confirmation
+    // step exists to prevent. An unconfirmed turn gets its own non-terminal
+    // status so the contract and the flag cannot disagree.
+    const status = pending
+      ? 'awaiting_input'
+      : stillBuilding
+        ? 'running'
+        : confirmationFailed
+          ? 'unconfirmed'
+          : 'complete';
 
     return jsonResult({
       task_id: taskId,
@@ -181,8 +194,8 @@ mcpToolRegistry.register({
     name: 'emma_get_task_result',
     description:
       'Check on an Emma task that is still running and get its latest output. ' +
-      'Only needed when emma_run_marketing_task returned status "running" — a "complete" status ' +
-      'already carries the finished result, so polling it adds nothing.',
+      'Needed when emma_run_marketing_task returned status "running" or "unconfirmed" — a "complete" ' +
+      'status already carries a verified finished result, so polling it adds nothing.',
     inputSchema: {
       type: 'object',
       properties: {
