@@ -17,8 +17,12 @@
  * preview cut mid-URL and no way back to the PR titles/authors/diff stats.
  *
  * A second failure mode is the header itself: the 200-char preview slices from
- * the START of the content, so a long S3 key could be cut in half, leaving a
- * key that read_tool_response cannot use.
+ * the START of the content and then wraps it in "[Tool: name — …...]", so the
+ * recovery header no longer sits at the front of the compressed output. Both
+ * extractToolResponseS3Ref and parseToolResponseS3Key are ^-anchored, so the
+ * key becomes unreadable even when its characters survive — and for a key long
+ * enough to run past the 200-char slice (>167 chars, since the header prefix is
+ * 33) the characters do not survive either.
  */
 
 import {
@@ -57,8 +61,10 @@ describe('ENG-940: tool responses that can be trimmed away are always offloaded'
 });
 
 describe('ENG-940: trimming preserves the S3 recovery reference', () => {
-  // A long-but-realistic key: "tool-responses/" + a 36-char sessionId + a
-  // Bedrock tool_use id. A naive 200-char slice cuts this key in half.
+  // A realistic key: "tool-responses/" + a 36-char sessionId + a Bedrock
+  // tool_use id. Its characters survive a naive 200-char slice (the key ends at
+  // index 121), but the slice is re-wrapped in "[Tool: name — …]" so the header
+  // is no longer at the front and the ^-anchored parser cannot read it back.
   const s3Key =
     'tool-responses/da2a8433-3c62-4e56-be04-a86f164969f3/tooluse_9Qb1Kx7ZTAyH3mNpVrW8sQ_0.txt';
 
@@ -98,6 +104,23 @@ describe('ENG-940: trimming preserves the S3 recovery reference', () => {
     expect(digest.content).toContain(s3Key);
     // The key must be recoverable verbatim, not just present as a prefix.
     expect(parseToolResponseS3Key(digest.content)).toBe(s3Key);
+  });
+
+  it('keeps a key too long to survive a 200-char slice', () => {
+    // The header prefix is 33 chars, so any key past 167 runs off the end of a
+    // naive 200-char slice and would come back truncated mid-key.
+    const longKey = `tool-responses/da2a8433-3c62-4e56-be04-a86f164969f3/${'d'.repeat(150)}/tooluse_9Qb1Kx7ZTAyH3mNpVrW8sQ_0.txt`;
+    expect(longKey.length).toBeGreaterThan(167);
+
+    const body = `{\n  "totalPRs": 2\n}${'y'.repeat(9000)}`;
+    const content = buildToolResponseS3Header(longKey, body.length) + body;
+
+    const service = new AgentModeService();
+    const trimmed = service.trimToolMessagesForContext(buildMessages(content));
+    const digest = trimmed.find((m: any) => m.tool_call_id === 'tc_digest');
+
+    expect(digest.content.length).toBeLessThan(content.length);
+    expect(parseToolResponseS3Key(digest.content)).toBe(longKey);
   });
 
   it('still shows a preview of the payload alongside the S3 reference', () => {
