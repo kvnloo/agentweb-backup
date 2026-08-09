@@ -260,6 +260,55 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     );
   });
 
+  it('PHRASING AUDIT: benign skip wordings are waived; real failures still veto', () => {
+    // The 2026-08-06 regression was phrasing-fragility, so this pins the whole
+    // phrasing surface rather than the single wording that happened to break.
+    // Derived from an audit of the production LUCAS transcripts (ENG-844).
+    const INST =
+      'This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday. ' +
+      'If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — ' +
+      'simply stop and report "non-publishing day, skipped."';
+    const THU = new Date('2026-08-06T13:00:00Z');
+    const verdict = (t: string) =>
+      scheduledRunSignalsConditionalSkip(t, { toolCalls: [], now: THU, instruction: INST });
+
+    // Legitimate skips — including every contraction form, which the original
+    // blanket /\w+n't/ veto silently rejected, and the alternative skip wordings
+    // a model reaches for.
+    [
+      "Today isn't a publishing day for this schedule, so I'm skipping.",
+      "Non-publishing day, skipped. I won't publish anything today.",
+      "Non-publishing day, skipped. Re-running doesn't change the weekday.",
+      "Non-publishing day, skipped. I didn't create or publish anything.",
+      'Non-publishing day, skipped. I cannot post today because the cadence forbids it.',
+      'Non-publishing day, skipped. No access to the calendar was needed.',
+      'Non-publishing day, skipped. No errors, nothing published.',
+      'Today is outside the publishing window for this schedule, so nothing was created.',
+      'Per the Mon/Wed/Fri cadence, no content was produced this run.',
+      'Standing down for today; the schedule only publishes on Mon/Wed/Fri.',
+      'No action taken: today falls outside the Mon/Wed/Fri publishing cadence.',
+      "I won't force the calls: today isn't a publishing day under the Mon/Wed/Fri cadence.",
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, true]));
+
+    // Genuine failures — including ones sharing a sentence with a cadence rationale,
+    // which must NOT be laundered by the cadence-justification exemption.
+    [
+      'Skipping today — I could not access LinkedIn.',
+      'No post today; auth failed.',
+      'Non-publishing day, skipped. The LinkedIn API timed out.',
+      'Non-publishing day, skipped. Ledger: 0 attempted / 1 failed.',
+      'Non-publishing day, skipped. Publishing was forbidden (403).',
+      "Non-publishing day, skipped. I couldn't reach the Instagram API.",
+      'Non-publishing day per the cadence, and the LinkedIn API timed out.',
+      "Non-publishing day per the cadence; LinkedIn wouldn't accept the post.",
+      'Skipping — the schedule only publishes Mon/Wed/Fri, and I could not access LinkedIn.',
+      'Non-publishing day, skipped. Token expired.',
+      'Non-publishing day, skipped. Succeeded 0 Failed 1.',
+      'Non-publishing day, skipped. Rate limit hit.',
+      "Non-publishing day, skipped. It didn't work.",
+    ].forEach((t) => expect([t, verdict(t)]).toEqual([t, false]));
+  });
+
   it('anchors the weekday cross-check to UTC, matching the model\'s UTC "Current date"', () => {
     // The model is handed its "Current date" as a UTC calendar date
     // (new Date().toISOString()), so its weekday reasoning is UTC-based. The
