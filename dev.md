@@ -1,3 +1,45 @@
+## ENG-973: the quota gate was one layer above what MCP actually calls (2026-08-08)
+
+`/api/emma/*` is 59 routes (now 60 counting a PATCH the source-level regex sweep missed) and none
+of them checked token usage. Findings from the investigation, because the shape of this mistake
+generalises:
+
+- **The guardrail and the logic sat on different layers.** `checkTokenUsage` appears 3x in
+  `controllers/agentModeController.ts` and 0x in `services/agentModeService.ts`. The `/api/emma/*`
+  routes are thin delegates *to the service*. The design intent — stated at the time as "route
+  everything through agentModeService so external callers cannot bypass Emma's controls" — was
+  therefore never true: delegating to the service hands over the tool logic and skips the
+  controller where the control lives. A protection is only inherited by callers that go through
+  the layer it lives on.
+
+- **Do not enforce at N call sites when N grows.** The obvious fix was 59 `checkTokenUsage` calls.
+  That reproduces the bug at route 60. Enforcement is one router-level middleware plus an explicit
+  `EMMA_ROUTE_BUDGET` classification, with unclassified routes failing closed to metered and a
+  contract test that reads the router's own stack. That test found `PATCH /work-plans/status`
+  within a minute of being written — a route a `grep` for `router.(get|post|put|delete)` had
+  silently skipped. Enumerate from the runtime object, not from the source text.
+
+- **A borrowed `node_modules` produced 18 fake type errors.** The worktree symlinked
+  `backend/node_modules` to the primary checkout, whose `package.json` predates the
+  `@opentelemetry/*` dependencies on `main` (0 references vs 5). `npm run typecheck` reported
+  errors in `observability/tracing.ts` and `twitterService.ts` that had nothing to do with the
+  change. Per ENG-731: check the environment before believing an unexplained red. Unlink (never
+  `rm -rf`, which would follow the symlink into the primary checkout) and `npm ci`.
+
+- **Adjacent finding, filed as ENG-974.** `internal: true` on an MCP tool filters `tools/list` but
+  `registry.execute()` never checks it, and `security.mcpServer.test.ts:199-216` asserts that on
+  purpose: *"if a tool name is known, it can be called. The real defense is that external clients
+  never discover internal tool names."* The ten hidden names include `generate_image`,
+  `send_email` and `google_search_web`. They are hidden because they cost money or send something
+  outward — so this fix bounds the cost half of that exposure by metering the REST routes those
+  tools self-call. The entitlement half remains a decision, because closing it means rewriting a
+  test that deliberately asserts the opposite.
+
+- **The March 2026 IDOR report is genuinely closed.** `c03713f46` prevents external clients from
+  overriding `userId`, and section B of `security.mcpServer.test.ts` regression-tests it (17/17
+  green). The cross-account vector is fixed; what remained were the cost and entitlement holes
+  above, which are different bugs wearing its reputation.
+
 ## ENG-837: EB accepts a deploy and rejects it later, so "no error" from update-environment proves nothing (2026-08-03)
 
 Production was undeployable for ~17 hours on 2026-08-01 and nobody noticed. The deploy job itself
