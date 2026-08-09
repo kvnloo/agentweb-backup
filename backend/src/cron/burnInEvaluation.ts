@@ -188,6 +188,17 @@ function boundaryMs(iso: string | undefined): number {
   return new Date(iso).getTime();
 }
 
+/**
+ * UTC day index (days since epoch) on which a snapshot window CLOSES, or NaN if
+ * the row is malformed. This is the period's unit of position: exactly one
+ * authoritative window closes per day, and unlike `windowStart` it does not
+ * depend on the time of day the producer happened to close the row.
+ */
+function closingDayIndex(snapshot: ReliabilitySnapshot): number {
+  const end = boundaryMs(snapshot.windowEnd);
+  return Number.isFinite(end) ? Math.floor(end / BURN_IN_WINDOW_MS) : NaN;
+}
+
 function fmtPct(rate: number): string {
   return `${(rate * 100).toFixed(2)}%`;
 }
@@ -380,14 +391,31 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
     // the earliest surviving window start back a day at a time for as long as
     // the earlier slot would still be post-release: that reconstructs the first
     // window the period should have contained, whether or not its row exists.
+    // The period is indexed by the UTC DAY each window closes on, not by the
+    // exact `windowStart` instant. Snapshot rows are 24h wide on a daily
+    // cadence, but they are not all written on the same time-of-day grid: the
+    // producer closes a completed day at `T23:59:59.999Z` and the CURRENT day
+    // at `now`, so today's row starts at an arbitrary time of day. An exact
+    // timestamp comparison reads that legitimate row as off-grid and reports
+    // the period as missing a window — `insufficient_data` on contiguous, clean
+    // evidence, blocking closure check 4 for every burn-in still in progress.
+    // One window closes per UTC day either way, so the day of `windowEnd` is
+    // the stable index: it survives both alignments and still makes an absent
+    // day absent rather than letting a later row slide into its slot.
     let periodStartMs = boundaryMs(afterAll[0].windowStart);
+    let stepsBack = 0;
     while (Number.isFinite(periodStartMs) && periodStartMs - BURN_IN_WINDOW_MS >= releaseMs) {
       periodStartMs -= BURN_IN_WINDOW_MS;
+      stepsBack += 1;
     }
-    const periodEndMs = periodStartMs + BURN_IN_POST_RELEASE_WINDOW_LIMIT * BURN_IN_WINDOW_MS;
+    const firstPeriodDay = closingDayIndex(afterAll[0]) - stepsBack;
     const inPeriod = afterAll.filter((snapshot) => {
-      const start = boundaryMs(snapshot.windowStart);
-      return Number.isFinite(start) && start >= periodStartMs && start < periodEndMs;
+      const day = closingDayIndex(snapshot);
+      return (
+        Number.isFinite(day) &&
+        day >= firstPeriodDay &&
+        day < firstPeriodDay + BURN_IN_POST_RELEASE_WINDOW_LIMIT
+      );
     });
 
     // Evidence must be CONTIGUOUS from the start of the period AND unbroken up
@@ -419,7 +447,7 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
     }
 
     const gapIndex = inPeriod.findIndex(
-      (snapshot, i) => boundaryMs(snapshot.windowStart) !== periodStartMs + i * BURN_IN_WINDOW_MS,
+      (snapshot, i) => closingDayIndex(snapshot) !== firstPeriodDay + i,
     );
     if (gapIndex !== -1) {
       return insufficient(

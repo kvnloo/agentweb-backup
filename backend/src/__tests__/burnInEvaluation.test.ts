@@ -752,3 +752,82 @@ describe('evaluateBurnIn — invariants (AC5: no weakening of fail-closed)', () 
     expect(a.passesClosureCheck4).toBe(false);
   });
 });
+
+/**
+ * The producer's real boundaries, not the tidy midnight grid the fixtures above
+ * use. `agentReliabilitySnapshotCron` closes a COMPLETED day at `T23:59:59.999Z`
+ * and the CURRENT day at `now`, so the in-progress row starts at an arbitrary
+ * time of day. Every burn-in still running contains exactly that row.
+ */
+describe('evaluateBurnIn — production window alignment (ENG-938)', () => {
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  const NOW = new Date('2026-08-04T17:45:00.000Z');
+  const RELEASE = new Date('2026-07-30T12:00:00.000Z');
+
+  /** Completed day: window closes at end-of-day, so it starts a day earlier. */
+  function completed(date: string, over: Partial<ReliabilitySnapshot> = {}): ReliabilitySnapshot[] {
+    const end = `${date}T23:59:59.999Z`;
+    const start = new Date(Date.parse(end) - MS_PER_DAY).toISOString();
+    return ['24h', '7d'].map((windowLabel) =>
+      snap(date, { windowStart: start, windowEnd: end, windowLabel, ...over }),
+    );
+  }
+
+  /** Current day: window closes at `now` — off the completed-day grid. */
+  function inProgress(date: string, over: Partial<ReliabilitySnapshot> = {}): ReliabilitySnapshot[] {
+    const end = NOW.toISOString();
+    const start = new Date(NOW.getTime() - MS_PER_DAY).toISOString();
+    return ['24h', '7d'].map((windowLabel) =>
+      snap(date, { windowStart: start, windowEnd: end, windowLabel, ...over }),
+    );
+  }
+
+  const snapshots = [
+    ...completed('2026-07-28'),
+    ...completed('2026-07-29'),
+    ...completed('2026-07-31'),
+    ...completed('2026-08-01'),
+    ...completed('2026-08-02'),
+    ...completed('2026-08-03'),
+    ...inProgress('2026-08-04'),
+  ];
+
+  it('reads the in-progress current-day window as present, not as a gap', () => {
+    const a = evaluateBurnIn({
+      snapshots,
+      releaseAt: RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.reason).not.toMatch(/missing the snapshot window/i);
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+    expect(a.postRelease?.date).toBe('2026-08-04');
+  });
+
+  it('still fails closed on a day that produced no row at all', () => {
+    const a = evaluateBurnIn({
+      snapshots: snapshots.filter((s) => s.date !== '2026-08-02'),
+      releaseAt: RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.verdict).toBe('insufficient_data');
+    expect(a.passesClosureCheck4).toBe(false);
+    expect(a.reason).toMatch(/missing the snapshot window/i);
+  });
+
+  it('still refuses to scan a regression outside the seven-window period', () => {
+    const a = evaluateBurnIn({
+      snapshots: [
+        ...snapshots,
+        ...completed('2026-08-08', { failedRunRate: 0.9 }),
+      ],
+      releaseAt: RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+  });
+});
