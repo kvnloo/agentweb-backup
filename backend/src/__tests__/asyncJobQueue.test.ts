@@ -360,6 +360,43 @@ describe('asyncJobQueue', () => {
       expect(failCall![0].ExpressionAttributeValues[':attempts']).toBe(5);
     });
 
+    // ENG-992: a job hitting its terminal 'failed' state used to blend into the same
+    // "Processing failed" line every retry logs — nothing distinguished the terminal
+    // attempt from the ones before it, so a permanently-stuck job had no way to
+    // surface itself. This confirms the distinct, greppable escalation log fires
+    // exactly on the terminal attempt, not on any earlier one.
+    it('logs a distinct terminal-failure line only on the attempt that exhausts maxAttempts', async () => {
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const handler = jest.fn().mockRejectedValue(new Error('still down'));
+      registerProcessor('test_source_terminal_log', handler);
+
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ id: 'test_source_terminal_log_abc', source: 'test_source_terminal_log', status: 'pending', payload: '{}', attempts: 3, updatedAt: '2026-01-01T00:00:00.000Z' }],
+          }),
+        })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+
+      await pollAndProcessOnce(); // attempts 3 -> 4, still 'pending', not terminal yet
+
+      expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining('TERMINAL FAILURE'));
+
+      mockDocumentClientMethods.query
+        .mockReturnValueOnce({
+          promise: jest.fn().mockResolvedValue({
+            Items: [{ id: 'test_source_terminal_log_abc', source: 'test_source_terminal_log', status: 'pending', payload: '{}', attempts: 4, updatedAt: '2026-01-01T00:00:00.000Z' }],
+          }),
+        })
+        .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({ Items: [] }) });
+
+      await pollAndProcessOnce(); // attempts 4 -> 5, hits default MAX_ATTEMPTS, terminal
+
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('TERMINAL FAILURE: job test_source_terminal_log_abc'));
+
+      errorSpy.mockRestore();
+    });
+
     // Greptile P1 on #2291 (round 9, issue 3): calendly_webhook_cleanup jobs are
     // enqueued to durably record a webhook_id BEFORE the local account (the only
     // other copy of that identifier) is deleted on disconnect. Once the job hits

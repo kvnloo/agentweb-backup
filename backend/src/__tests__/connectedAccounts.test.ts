@@ -955,13 +955,21 @@ describe('Connected Accounts Routes', () => {
         // Greptile P1 on #2291 (round 9, issue 3): this job holds the ONLY
         // remaining durable copy of a webhook_id once disconnect deletes the local
         // account record. The default 5-attempt cap let it go permanently 'failed'
-        // and unclaimable, stranding the orphaned subscription forever. Registered
-        // with maxAttempts: Infinity so it keeps retrying instead of ever going
-        // terminally inert.
-        it('is registered with unlimited retry attempts, since it holds the only remaining copy of an orphaned webhook_id once the local account is deleted', () => {
+        // and unclaimable, stranding the orphaned subscription forever.
+        //
+        // ENG-992 (live-tested round): unlimited retries used to be the fix here,
+        // but a real permanent (non-transient) failure showed the cost — the job
+        // retried every 30s forever with zero escalation. A generous 20-attempt
+        // cap (~10 minutes) rides out a real transient failure exactly like
+        // unlimited retries would, while still letting a genuinely permanent one
+        // go terminally 'failed' and log distinctly (asyncJobQueue.ts). Safe to
+        // bound now because round 16's orphan-webhook table + reconnect self-heal
+        // is an independent second recovery path that doesn't depend on this
+        // job's retry state at all.
+        it('is registered with a generous but bounded retry cap, not unlimited retries', () => {
             expect(registeredCleanupProcessorCall).toBeDefined();
             expect(registeredCleanupProcessorCall![1]).toBe(processCalendlyWebhookCleanupJob);
-            expect(registeredCleanupProcessorCall![2]).toEqual({ maxAttempts: Infinity });
+            expect(registeredCleanupProcessorCall![2]).toEqual({ maxAttempts: 20 });
         });
 
         it('refreshes the token and deletes the webhook', async () => {
@@ -984,10 +992,10 @@ describe('Connected Accounts Routes', () => {
         });
 
         // Greptile P1 on #2291 (round 20): Calendly may rotate the refresh token on
-        // every use. If this job (registered with maxAttempts: Infinity) never
-        // persists a rotation, a delete failure AFTER a successful refresh leaves
-        // every future retry stuck refreshing with the same now-invalid
-        // pre-rotation token forever — an infinite loop that can never succeed.
+        // every use. If this job never persists a rotation, a delete failure AFTER
+        // a successful refresh leaves every future retry stuck refreshing with the
+        // same now-invalid pre-rotation token — burning through its whole retry
+        // budget (bounded, ENG-992) without ever having a chance to succeed.
         // Greptile P1 on #2291 (round 22): the persist is only NEEDED when this
         // attempt is about to fail anyway — a successful delete already used a
         // valid access_token in hand and never needs the persisted value at all,
