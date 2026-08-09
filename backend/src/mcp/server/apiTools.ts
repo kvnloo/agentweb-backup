@@ -14,13 +14,9 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function ctx(context: any) {
-  return { userId: context?.userId, agentUserId: context?.agentUserId, isDelegatedAccess: context?.isDelegatedAccess };
-}
-
-function jsonResult(data: unknown) {
-  return { content: [{ type: 'text' as const, text: typeof data === 'string' ? data : JSON.stringify(data, null, 2) }] };
-}
+// ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
+// share them instead of keeping a second copy. Behaviour unchanged.
+import { ctx, jsonResult } from './toolHelpers';
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
