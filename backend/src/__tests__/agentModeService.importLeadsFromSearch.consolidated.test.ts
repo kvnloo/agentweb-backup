@@ -750,6 +750,21 @@ describe('AgentModeService.importLeadsFromSearch — anonymized search results',
     expect(result.total).toBe(3);
   });
 
+  it('explains the out-of-network drop when every page is anonymized and nothing is imported', async () => {
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [anonymizedItem(1), anonymizedItem(2)], cursor: 'c2' })
+      .mockResolvedValueOnce({ items: [anonymizedItem(3)], cursor: null });
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    expect(result.imported).toBe(0);
+    expect(result.anonymizedSkipped).toBe(3);
+    expect(mockBatchCreateLeads).not.toHaveBeenCalled();
+    expect(result.message).toContain('out-of-network LinkedIn profiles');
+    expect(result.message).toContain('3 search result(s)');
+    expect(result.importedLeads).toEqual([]);
+  });
+
   it('does not spend a getProfile company lookup on an anonymized result', async () => {
     mockSearchPeople.mockResolvedValueOnce({
       items: [{ name: 'LinkedIn Member', public_identifier: 'ACoAAA-opaque', headline: 'Property Manager' }],
