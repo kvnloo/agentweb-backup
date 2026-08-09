@@ -712,6 +712,52 @@ describe("orgMemberRemoval guards", () => {
     expect(mockClearOrgMembership).not.toHaveBeenCalled();
   });
 
+  it("refuses to remove a PAYING billing owner — the gate this route kept missing", async () => {
+    // Live run, 2026-08-09: this exact route returned 200 while the org went
+    // Pro -> Free and the departed payer's sub_... stayed active. Twice now a
+    // guard landed on routes/org.ts and not here.
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    const payingRoot = {
+      userId: "u-root", orgId, orgRole: "owner",
+      subscriptionType: "Pro", subscription_status: "active", stripe_customer_id: "cus_x",
+    };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === "u-root") return Promise.resolve(payingRoot);
+      return Promise.resolve(null);
+    });
+    mockGetOrgMembers.mockResolvedValue([ownerCaller, payingRoot]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-root", name: "Test Org" });
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-root/remove`)
+      .send({ confirm: true, decisions: allLeave });
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("BILLING_OWNER_HAS_SUBSCRIPTION");
+    expect(mockClearOrgMembership).not.toHaveBeenCalled();
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
+  });
+
+  it("a FREE billing owner still goes through this route", async () => {
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    const freeRoot = { userId: "u-root", orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === "u-root") return Promise.resolve(freeRoot);
+      return Promise.resolve(null);
+    });
+    mockGetOrgMembers.mockResolvedValue([ownerCaller, freeRoot]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-root", name: "Test Org" });
+    mockUpdateOrg.mockResolvedValue({});
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-root/remove`)
+      .send({ confirm: true, decisions: allLeave });
+    expect(res.status).toBe(200);
+    expect(mockUpdateOrg).toHaveBeenCalledWith(orgId, { ownerUserId: callerUserId });
+  });
+
   it("carries the billing root to the remover — this route was missed the first time", async () => {
     // The reassignment landed on routes/org.ts only, while the commit claimed
     // both paths. This route is the one the portal's remove dialog calls, so

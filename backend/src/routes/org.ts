@@ -157,7 +157,7 @@ function hasLiveSubscription(u: { subscription_status?: string } | null | undefi
  *
  * Free orgs hop freely. Paying orgs stop and say so.
  */
-async function billingRootMayDepart(
+export async function billingRootMayDepart(
   org: Organization,
   departingUserId: string,
 ): Promise<{ ok: true } | { ok: false; error: string; code: "BILLING_OWNER_HAS_SUBSCRIPTION" }> {

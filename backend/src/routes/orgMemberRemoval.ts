@@ -11,7 +11,7 @@ import {
 } from "../services/v0Service";
 import { OWNED_FEATURES, OwnedFeature } from "../services/orgShareService";
 import { can, roleOf } from "../services/orgAuthz";
-import { reassignBillingRootOnDeparture } from "./org";
+import { billingRootMayDepart, reassignBillingRootOnDeparture } from "./org";
 
 const router = express.Router();
 
@@ -226,6 +226,15 @@ router.post("/:userId/remove", async (req, res) => {
     // can() above returns false for a null org, so reaching here proves it is set.
     if (!callerOrg) {
       return res.status(404).json({ message: "Organization not found" });
+    }
+    // Same gate as the sibling route. Added after a live run removed a paying
+    // billing owner through THIS route and returned 200 while the org silently
+    // dropped Pro -> Free — the second time a guard landed on routes/org.ts and
+    // not here. The invariant test below now covers both, so a third omission
+    // fails the suite instead of a customer's plan.
+    const mayGo = await billingRootMayDepart(callerOrg, target.userId);
+    if (!mayGo.ok) {
+      return res.status(409).json({ message: mayGo.error, code: mayGo.code });
     }
     if (!(await reassignBillingRootOnDeparture(callerOrg, target.userId, callerId))) {
       return res.status(409).json({ message: "Cannot remove the only owner. Promote another member to owner first." });
