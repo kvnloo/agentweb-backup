@@ -738,16 +738,31 @@ export const getUserIdByHubSpotPortalId = async (portalId: number): Promise<stri
  * subscription is created with scope 'user' bound to a specific user_uri, and a
  * real invitee.created payload carries no organization_uri at all (confirmed via
  * a live test delivery), so organization_uri isn't usable as an anchor here.
- * Returns the account alongside the userId (not just the userId, unlike
- * getUserIdByHubSpotPortalId) since the caller needs config.webhook_signing_key
- * immediately, and a user could in principle connect multiple Calendly accounts.
+ * Returns every account alongside its userId (not just the userId, unlike
+ * getUserIdByHubSpotPortalId) since the caller needs each candidate's own
+ * config.webhook_signing_key immediately.
+ *
+ * ENG-994 (live-tested, #2291): this used to return only the FIRST matching
+ * account across ALL users, with no awareness of which tenant a given webhook
+ * delivery actually belongs to. Two different AgentWeb tenants can each
+ * independently connect the SAME underlying Calendly identity (same login,
+ * two separate webhook subscriptions) — confirmed live by creating a second
+ * tenant sharing a real connection's user_uri: whichever tenant this function
+ * happened to return first "won" resolution for EVERY delivery targeting that
+ * user_uri, and the other tenant's own genuinely-signed deliveries were
+ * silently dropped (no matching key ever attempted for them). DynamoDB scan
+ * order isn't guaranteed stable, so which tenant lost was arbitrary and could
+ * vary between individual deliveries. Returning every match lets the caller
+ * (calendlyWebhook.ts) try each candidate's own signing key against the
+ * signature, instead of committing to a single guess.
  */
-export const getAccountByCalendlyUserUri = async (
+export const getAccountsByCalendlyUserUri = async (
   userUri: string
-): Promise<{ userId: string; account: ConnectedAccountConfig } | null> => {
+): Promise<Array<{ userId: string; account: ConnectedAccountConfig }>> => {
   try {
     const { userDb } = await import('./db');
     const users = await userDb.getAllUsers();
+    const matches: Array<{ userId: string; account: ConnectedAccountConfig }> = [];
 
     for (const user of users) {
       // normalizeAccounts (not a direct User.connected_accounts iteration, unlike
@@ -757,14 +772,14 @@ export const getAccountByCalendlyUserUri = async (
       const accounts = normalizeAccounts((user as User).connected_accounts);
       for (const account of accounts) {
         if (account.platform === 'calendly' && (account.config as CalendlyConfig).user_uri === userUri) {
-          return { userId: user.userId, account };
+          matches.push({ userId: user.userId, account });
         }
       }
     }
-    return null;
+    return matches;
   } catch (error) {
-    console.error('Error resolving Calendly user_uri to account:', error);
-    return null;
+    console.error('Error resolving Calendly user_uri to accounts:', error);
+    return [];
   }
 };
 

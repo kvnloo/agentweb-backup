@@ -33,7 +33,7 @@
  */
 import express from 'express';
 import crypto from 'crypto';
-import { getAccountByCalendlyUserUri, updateAccountConfig } from '../services/connectedAccountsDb';
+import { getAccountsByCalendlyUserUri, updateAccountConfig } from '../services/connectedAccountsDb';
 import { userDb, crmDb } from '../services/db';
 import { metaService } from '../services/metaService';
 import { externalCrmSyncService } from '../services/externalCrmSyncService';
@@ -529,14 +529,24 @@ async function prepareCalendlyDelivery(req: express.Request): Promise<PreparedCa
   // connected candidate's key rather than committing to the first membership that resolves
   // to a connected account — otherwise a later host's delivery is silently dropped whenever
   // an earlier-listed host is also connected (confirmed as a real gap, not just untested).
+  //
+  // ENG-994 (live-tested, #2291): the SAME reasoning applies one level deeper. Two
+  // different AgentWeb tenants can independently connect the same underlying Calendly
+  // identity (one membership's user_uri resolving to more than one connected account
+  // across tenants) — confirmed live: whichever tenant happened to come back first
+  // "won" every delivery for that user_uri, silently dropping the other tenant's own
+  // genuinely-signed bookings. Try every account sharing that user_uri's own signing
+  // key, not just the first one found.
   let resolved: { userId: string; account: any } | null = null;
   for (const membership of memberships) {
     if (!membership.user) continue;
-    const candidate = await getAccountByCalendlyUserUri(membership.user);
-    if (!candidate) continue;
-    const candidateKey: string | undefined = (candidate.account.config as any)?.webhook_signing_key;
-    if (candidateKey && verifyCalendlySignature(candidateKey, rawBody, signatureHeader)) {
-      resolved = candidate;
+    const candidates = await getAccountsByCalendlyUserUri(membership.user);
+    const match = candidates.find((candidate) => {
+      const candidateKey: string | undefined = (candidate.account.config as any)?.webhook_signing_key;
+      return candidateKey && verifyCalendlySignature(candidateKey, rawBody, signatureHeader);
+    });
+    if (match) {
+      resolved = match;
       break;
     }
   }
