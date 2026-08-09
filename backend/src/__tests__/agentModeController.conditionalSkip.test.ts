@@ -222,6 +222,44 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     expect(scheduledRunSignalsConditionalSkip(realFailureLedger, { now: SUNDAY, toolCalls: [] })).toBe(false);
   });
 
+  it('fires on the REAL 2026-08-06 prod regression: an inline COUNT-FIRST zero ledger (session 25ec4670)', () => {
+    // Verbatim wording from the prod run that regressed AFTER the original fix
+    // shipped (LUCAS, Thursday 2026-08-06). The skip was perfect — zero tool calls,
+    // correct weekday — but the agent wrote its ledger count-FIRST:
+    //   "Ledger: 0 attempted / 0 succeeded / 0 failed / 0 queued."
+    // The zero-ledger neutralizer only handled label-then-count ("Failed: 0"), so the
+    // bare word "failed" survived, the failure-veto fired, and the run was pressed
+    // for generate_image / post_on_connected_account across all 20 attempts.
+    const THURSDAY = new Date('2026-08-06T13:00:26Z');
+    expect(THURSDAY.getUTCDay()).toBe(4);
+    const instruction =
+      'You are LUCAS, the LinkedIn thought-leadership agent for IncentivPay. This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday.\n\n' +
+      'FIRST: check today\'s actual weekday. If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — simply stop and report "LUCAS: non-publishing day, skipped."';
+    const realSkip =
+      'LUCAS: non-publishing day, skipped.\n\n' +
+      '<p><strong>Date check:</strong> Today is <strong>Thursday, 6 August 2026</strong>. This schedule only publishes Monday / Wednesday / Friday, so no post, no image, and no publishing calls were made this run.</p>\n\n' +
+      '<p><strong>Nothing published:</strong> no LinkedIn company page post, no Hannah K profile post, no Instagram post, no X post, no image generated, no comments seeded. Ledger: 0 attempted / 0 succeeded / 0 failed / 0 queued.</p>';
+    expect(scheduledRunSignalsConditionalSkip(realSkip, { now: THURSDAY, toolCalls: [], instruction })).toBe(true);
+
+    // A NONZERO count in the same inline format is a real failure and must still veto.
+    const realFailureInline = realSkip.replace('0 failed', '1 failed');
+    expect(scheduledRunSignalsConditionalSkip(realFailureInline, { now: THURSDAY, toolCalls: [], instruction })).toBe(false);
+
+    // The count-first rule must NOT swallow a stripped HTML TABLE ledger, where the
+    // "0" belongs to the PREVIOUS row: "Succeeded 0 Failed 1" is a real failure.
+    const tableFailure =
+      'Today is a non-publishing day per the Mon/Wed/Fri cadence. Skipping.' +
+      '<table><tr><td>Succeeded</td><td>0</td><td>Failed</td><td>1</td></tr></table>';
+    expect(scheduledRunSignalsConditionalSkip(tableFailure, { now: THURSDAY, toolCalls: [], instruction })).toBe(false);
+    const tableClean = tableFailure.replace('<td>Failed</td><td>1</td>', '<td>Failed</td><td>0</td>');
+    expect(scheduledRunSignalsConditionalSkip(tableClean, { now: THURSDAY, toolCalls: [], instruction })).toBe(true);
+
+    // Asserted failures worded as skips are still rejected regardless of ledger shape.
+    ['The post failed to publish.', 'auth failed.', 'I could not access LinkedIn.'].forEach((tail) =>
+      expect(scheduledRunSignalsConditionalSkip(`Non-publishing day, skipped. ${tail}`, { now: THURSDAY, toolCalls: [], instruction })).toBe(false)
+    );
+  });
+
   it('anchors the weekday cross-check to UTC, matching the model\'s UTC "Current date"', () => {
     // The model is handed its "Current date" as a UTC calendar date
     // (new Date().toISOString()), so its weekday reasoning is UTC-based. The
@@ -514,6 +552,46 @@ describe('runScheduledChat — conditional skip day', () => {
   // deterministic regardless of the day CI runs.
   const SUNDAY_NON_PUBLISH = new Date('2026-08-02T12:00:00Z'); // getUTCDay() === 0
   const MONDAY_PUBLISH = new Date('2026-08-03T12:00:00Z'); // getUTCDay() === 1
+
+  it('END-TO-END prod regression (session 25ec4670, Thu 2026-08-06): count-first ledger still exits as a clean skip', async () => {
+    // Mirrors the PROD schedule exactly as stored: no `timezone` (UTC fallback) and
+    // an EMPTY functionCallMinCalls map, with both write tools required. Before the
+    // fix this run burned all 20 attempts and was recorded as a failure.
+    const prodSchedule = {
+      scheduleId: mockScheduleId,
+      scheduleName: 'LUCAS — LinkedIn Thought Leadership (Mon/Wed/Fri)',
+      startingMessage:
+        'You are LUCAS, the LinkedIn thought-leadership agent for IncentivPay. This schedule runs DAILY but only publishes on Monday, Wednesday, and Friday.\n\n' +
+        'FIRST: check today\'s actual weekday. If today is Tuesday, Thursday, Saturday, or Sunday, DO NOT create or publish anything — simply stop and report "LUCAS: non-publishing day, skipped."',
+      keywords: [],
+      requiredFunctionCalls: ['generate_image', 'post_on_connected_account'],
+      functionCallMinCalls: {},
+      userId: mockUserId,
+    };
+    mockScheduleDb.getScheduleById.mockResolvedValue(prodSchedule);
+    mockWorker.runInWorker.mockResolvedValue({
+      content:
+        'LUCAS: non-publishing day, skipped.\n\n' +
+        '<p><strong>Date check:</strong> Today is <strong>Thursday, 6 August 2026</strong>. This schedule only publishes Monday / Wednesday / Friday, so no post, no image, and no publishing calls were made this run.</p>\n\n' +
+        '<p><strong>Nothing published:</strong> no image generated, no comments seeded. Ledger: 0 attempted / 0 succeeded / 0 failed / 0 queued.</p>',
+      toolCalls: [],
+      knowledgeBaseQueries: [], sources: [], responseMessages: [],
+    });
+
+    const THURSDAY = new Date('2026-08-06T13:00:26Z');
+    const result = await runScheduledChat(prodSchedule, mockUserId, true, undefined, THURSDAY);
+
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+    expect(result).toEqual(
+      expect.objectContaining({
+        status: 'success',
+        passed: true,
+        attempt: 1,
+        functionCallMisses: [],
+        conditionalSkip: true,
+      })
+    );
+  });
 
   it('does NOT waive a resumed run whose abandoned portion made a non-required write (Greptile P1)', async () => {
     // The current turn reports a legitimate cadence skip with zero writes, but the
