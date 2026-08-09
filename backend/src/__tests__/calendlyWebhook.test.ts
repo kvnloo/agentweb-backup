@@ -1171,6 +1171,65 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
 
       errorSpy.mockRestore();
     });
+
+    // Greptile P1 on #2291: work() succeeding and the done-marker write failing used to
+    // be caught by the SAME handler as work() itself failing — releasing the claim either
+    // way. That's correct when work() failed (nothing happened, safe to retry), but wrong
+    // when work() succeeded (the real HubSpot/Attio sync or alert already fired) — a
+    // released claim lets a future retry repeat that already-successful side effect.
+    it('does not release the claim or repeat the side effect when only the done-marker write fails (retries the marker write instead)', async () => {
+      const uri = 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1';
+      mockSetLeadFields.mockImplementation((_listId: string, _leadId: string, fields: any) => {
+        if (fields.system?.[`hubspotSynced::${uri}`]) return Promise.reject(new Error('dynamo blip'));
+        return Promise.resolve(undefined);
+      });
+
+      const body = makePayload({ email: 'lead@example.com', uri });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      // work() itself (the real HubSpot sync) only ran once — never repeated.
+      expect(mockAutoSyncLead).toHaveBeenCalledWith(USER_ID, expect.anything(), expect.anything(), 'hubspot', expect.anything());
+      expect(mockAutoSyncLead.mock.calls.filter((c: any) => c[3] === 'hubspot')).toHaveLength(1);
+      // The claim was never released — releasing would make the step look unclaimed.
+      expect(mockSetLeadFields).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), {
+        removeSystemKeys: [`hubspotSynced::${uri}`],
+      });
+      // The marker write was retried once and succeeded on the second attempt.
+      const markerWriteCalls = mockSetLeadFields.mock.calls.filter((c: any) => c[2]?.system?.[`hubspotSynced::${uri}`]);
+      expect(markerWriteCalls).toHaveLength(2);
+    });
+
+    it('leaves the claim in place (still unreleased) and does not fail the job when the done-marker write fails on both attempts', async () => {
+      const uri = 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1';
+      mockSetLeadFields.mockImplementation((_listId: string, _leadId: string, fields: any) => {
+        if (fields.system?.[`hubspotSynced::${uri}`]) return Promise.reject(new Error('dynamo down'));
+        return Promise.resolve(undefined);
+      });
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      const body = makePayload({ email: 'lead@example.com', uri });
+      const res = await postSigned(body);
+
+      expect(res.status).toBe(200);
+      await flushPromises();
+
+      expect(mockAutoSyncLead.mock.calls.filter((c: any) => c[3] === 'hubspot')).toHaveLength(1);
+      expect(mockSetLeadFields).not.toHaveBeenCalledWith(expect.anything(), expect.anything(), {
+        removeSystemKeys: [`hubspotSynced::${uri}`],
+      });
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('done-marker write failed twice'),
+        expect.anything(),
+      );
+      // The real side effect succeeded — this must NOT be treated as a job failure,
+      // unlike a genuine work() failure (the sibling test above).
+      expect(mockMarkJobFailed).not.toHaveBeenCalled();
+
+      errorSpy.mockRestore();
+    });
   });
 
   describe('Multi-host event resolution', () => {
