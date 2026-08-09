@@ -72,6 +72,23 @@ export function getPersistedBrandLogoUrl(
 }
 
 /**
+ * The logo as a stored brand ASSET — attachments (or the legacy brandAssets
+ * array), never `brandData.logoUrl`.
+ *
+ * ENG-933: the Brand Guidelines "Logo & Assets" card renders `attachments`
+ * only, so an account whose logo lives solely on `brandData.logoUrl` shows
+ * "No logos uploaded" — the reported symptom. `ensureBrandLogoPersisted` uses
+ * this (not `getPersistedBrandLogoUrl`) to decide whether onboarding actually
+ * finished the job.
+ */
+export function getPersistedBrandLogoAssetUrl(
+  brand: BrandGuidelinesLike | null | undefined,
+): string | null {
+  if (!brand) return null;
+  return firstLogoAssetUrl(brand.attachments) ?? firstLogoAssetUrl(brand.brandAssets);
+}
+
+/**
  * Org-aware brandGuidelines read off an ALREADY-LOADED user record — same
  * resolution as `agentModeService.readBrandGuidelines` (org members read the
  * org record, because that is where updateBrandGuidelines and brand-config
@@ -200,13 +217,139 @@ export type BrandLogoDownloadOutcome =
   | { status: 'download-failed'; detail?: string }
   | { status: 'upload-failed'; detail?: string };
 
+const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47]);
+
+/** Directory entry of the largest frame in an ICO container, if it parses. */
+function largestIcoFrame(
+  buf: Buffer,
+): { offset: number; size: number; width: number; height: number } | null {
+  // ICONDIR: reserved(0) | type(1 = icon) | count
+  if (buf.length < 6) return null;
+  if (buf.readUInt16LE(0) !== 0 || buf.readUInt16LE(2) !== 1) return null;
+  const count = buf.readUInt16LE(4);
+  if (count < 1 || buf.length < 6 + count * 16) return null;
+  let best: { offset: number; size: number; width: number; height: number } | null =
+    null;
+  for (let i = 0; i < count; i++) {
+    const e = 6 + i * 16;
+    // A dimension byte of 0 means 256 (it doesn't fit in a byte).
+    const width = buf[e] === 0 ? 256 : buf[e];
+    const height = buf[e + 1] === 0 ? 256 : buf[e + 1];
+    const size = buf.readUInt32LE(e + 8);
+    const offset = buf.readUInt32LE(e + 12);
+    if (size <= 0 || offset + size > buf.length) continue;
+    if (!best || width * height > best.width * best.height) {
+      best = { offset, size, width, height };
+    }
+  }
+  return best;
+}
+
+/**
+ * Convert an ICO container to PNG bytes, or null when it isn't an ICO we can
+ * decode. sharp/libvips has no ICO decoder, so the frame is unpacked here:
+ * modern icons embed a whole PNG per frame, older ones a headerless
+ * BITMAPINFOHEADER DIB (bottom-up BGRA/BGR rows).
+ */
+async function icoToPng(buf: Buffer): Promise<Buffer | null> {
+  const frame = largestIcoFrame(buf);
+  if (!frame) return null;
+  const bytes = buf.subarray(frame.offset, frame.offset + frame.size);
+  const sharp = (await import('sharp')).default;
+
+  if (bytes.subarray(0, 4).equals(PNG_MAGIC)) {
+    return sharp(bytes).png().toBuffer();
+  }
+
+  const headerSize = bytes.length >= 40 ? bytes.readUInt32LE(0) : 0;
+  if (headerSize < 40) return null;
+  const width = bytes.readInt32LE(4);
+  // An ICO's DIB height covers the XOR image plus the AND mask, so it is
+  // double the real height.
+  const height = Math.floor(Math.abs(bytes.readInt32LE(8)) / 2);
+  const bitCount = bytes.readUInt16LE(14);
+  const compression = bytes.readUInt32LE(16);
+  if (
+    width !== frame.width ||
+    height !== frame.height ||
+    compression !== 0 ||
+    (bitCount !== 32 && bitCount !== 24)
+  ) {
+    // Palettised or compressed frames need a full BMP decoder — leave them to
+    // the raw-upload fallback rather than guessing at pixels.
+    return null;
+  }
+
+  const stride = (((width * bitCount + 31) / 32) | 0) * 4;
+  const pixels = bytes.subarray(headerSize);
+  if (pixels.length < stride * height) return null;
+  const rgba = Buffer.alloc(width * height * 4);
+  const bytesPerPixel = bitCount / 8;
+  for (let y = 0; y < height; y++) {
+    // DIB rows are stored bottom-up.
+    const row = (height - 1 - y) * stride;
+    for (let x = 0; x < width; x++) {
+      const s = row + x * bytesPerPixel;
+      const d = (y * width + x) * 4;
+      rgba[d] = pixels[s + 2];
+      rgba[d + 1] = pixels[s + 1];
+      rgba[d + 2] = pixels[s];
+      rgba[d + 3] = bitCount === 32 ? pixels[s + 3] : 255;
+    }
+  }
+  return sharp(rgba, { raw: { width, height, channels: 4 } }).png().toBuffer();
+}
+
+/**
+ * ENG-933: normalise a downloaded logo to PNG when the site serves it in a
+ * format brand guidelines and the image models can't consume.
+ *
+ * Websites overwhelmingly embed their logo as an `.ico` (the reported Zetld
+ * case) or an `.svg` — neither is a raster asset the Brand Guidelines "Logo &
+ * Assets" card, the ad-image pipeline, or `generate_image` can use, so the
+ * logo either never got stored or got stored mislabelled. Rasterising here is
+ * the one place every persist path funnels through.
+ *
+ * Returns null when the bytes are already a usable raster format or the
+ * conversion fails — the caller then uploads them as-is.
+ */
+async function normalizeLogoToPng(
+  buf: Buffer,
+  contentType: string,
+): Promise<Buffer | null> {
+  const isIco =
+    contentType.includes('icon') ||
+    contentType.includes('/ico') ||
+    (buf.length >= 4 &&
+      buf[0] === 0 &&
+      buf[1] === 0 &&
+      buf[2] === 1 &&
+      buf[3] === 0);
+  const isSvg = contentType.includes('svg');
+  if (!isIco && !isSvg) return null;
+  try {
+    if (isIco) return await icoToPng(buf);
+    const sharp = (await import('sharp')).default;
+    // SVGs often declare no pixel size; render at a high density so the
+    // rasterised logo is usable rather than a 16px thumbnail.
+    return await sharp(buf, { density: 384 }).png().toBuffer();
+  } catch (err: any) {
+    console.warn(
+      `Failed to convert ${isIco ? 'ICO' : 'SVG'} logo to PNG:`,
+      err?.message ?? String(err),
+    );
+    return null;
+  }
+}
+
 /**
  * Download a discovered logo and pin it to S3 under
  * `users/{userId}/brand/logo`. The download + upload mechanics are the block
- * extracted from `agentModeService.extractCSSFromURL` (ENG-326): SVGs are
- * skipped by CONTENT-TYPE (brand guidelines reject them; extensions lie),
- * failures log a warning. Never throws — every branch resolves to a
- * `BrandLogoDownloadOutcome`.
+ * extracted from `agentModeService.extractCSSFromURL` (ENG-326), plus the
+ * ENG-933 PNG normalisation: ICO/SVG logos are rasterised so they can be
+ * stored as a real brand asset, and only an SVG we could NOT rasterise still
+ * reports `svg` (brand guidelines reject raw SVG). Failures log a warning.
+ * Never throws — every branch resolves to a `BrandLogoDownloadOutcome`.
  */
 export async function downloadBrandLogoToS3(
   logoUrl: string,
@@ -225,9 +368,15 @@ export async function downloadBrandLogoToS3(
     console.warn('Failed to download logo:', detail);
     return { status: 'download-failed', detail };
   }
-  const contentType = logoResponse.headers['content-type'] || '';
-  // Skip SVG since brand guidelines doesn't accept it
-  if (contentType.includes('svg')) {
+  let contentType = logoResponse.headers['content-type'] || '';
+  let body = Buffer.from(logoResponse.data as ArrayBuffer);
+  const png = await normalizeLogoToPng(body, contentType);
+  if (png) {
+    console.log(`Converted logo to PNG (was ${contentType || 'unknown type'})`);
+    body = png;
+    contentType = 'image/png';
+  } else if (contentType.includes('svg')) {
+    // Un-rasterisable SVG: brand guidelines reject it outright.
     console.log('Skipping SVG logo (not supported by brand guidelines)');
     return { status: 'svg' };
   }
@@ -236,11 +385,15 @@ export async function downloadBrandLogoToS3(
       ? 'png'
       : contentType.includes('gif')
         ? 'gif'
-        : 'jpg';
+        : contentType.includes('webp')
+          ? 'webp'
+          : contentType.includes('icon') || contentType.includes('/ico')
+            ? 'ico'
+            : 'jpg';
     const filename = `logo.${ext}`;
     const { uploadFileToS3WithPath } = await import('../../utils/s3Utils');
     const uploadResult = await uploadFileToS3WithPath(
-      Buffer.from(logoResponse.data as ArrayBuffer),
+      body,
       filename,
       contentType,
       `users/${userId}/brand/logo`,
@@ -453,7 +606,8 @@ export async function ensureBrandLogoPersisted(
 ): Promise<EnsureBrandLogoOutcome> {
   try {
     const resolveBrand = deps.resolveBrand ?? resolveBrandGuidelinesForUser;
-    const existing = getPersistedBrandLogoUrl(await resolveBrand(userId));
+    const brand = await resolveBrand(userId);
+    const classifyExisting = deps.classifyExisting ?? classifyBrandLogoUrl;
     // ENG-792: "already present" used to be a purely STRUCTURAL check — any
     // non-empty string short-circuited this step. Emma's brand-build session
     // writes `logoUrl` voluntarily and, when a site renders its logo as inline
@@ -466,20 +620,40 @@ export async function ensureBrandLogoPersisted(
     // DEFINITIVE negative. `'unknown'` (timeout / DNS / 5xx) keeps the existing
     // URL: replacing an account's real logo because of a transient blip would
     // be far worse than leaving a possibly-stale one in place.
-    if (existing) {
-      const classifyExisting = deps.classifyExisting ?? classifyBrandLogoUrl;
-      const usability = await classifyExisting(existing);
+    //
+    // ENG-933: "present" now means a stored brand ASSET. Emma routinely writes
+    // `brandData.logoUrl` and nothing else, which left Brand Guidelines showing
+    // "No logos uploaded" (the card renders `attachments`) even though the step
+    // considered itself done. When only `brandData.logoUrl` exists we pin THAT
+    // URL instead of re-scraping the site — it is the logo Emma already found.
+    const existingAsset = getPersistedBrandLogoAssetUrl(brand);
+    let sourceUrl: string | null = null;
+    if (existingAsset) {
+      const usability = await classifyExisting(existingAsset);
       if (usability !== 'broken') {
-        return { persisted: false, logoUrl: existing, reason: 'already-present' };
+        return { persisted: false, logoUrl: existingAsset, reason: 'already-present' };
       }
       console.warn(
         '[brandLogo] persisted logo is unfetchable — rediscovering (ENG-792)',
-        { userId, existing },
+        { userId, existing: existingAsset },
       );
+    } else {
+      const brandDataUrl = getPersistedBrandLogoUrl(brand);
+      if (brandDataUrl) {
+        const usability = await classifyExisting(brandDataUrl);
+        if (usability !== 'broken') {
+          sourceUrl = brandDataUrl;
+        } else {
+          console.warn(
+            '[brandLogo] persisted logo is unfetchable — rediscovering (ENG-792)',
+            { userId, existing: brandDataUrl },
+          );
+        }
+      }
     }
 
     const discoverLogoUrl = deps.discoverLogoUrl ?? defaultDiscoverLogoUrl;
-    const discovered = await discoverLogoUrl(companyUrl);
+    const discovered = sourceUrl ?? (await discoverLogoUrl(companyUrl));
     if (!discovered) {
       return { persisted: false, logoUrl: null, reason: 'no-logo-found' };
     }
