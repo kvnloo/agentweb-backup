@@ -240,18 +240,22 @@ describe('asyncJobQueue', () => {
         .mockReturnValueOnce({ promise: jest.fn().mockRejectedValue(new Error('throttled')) })
         .mockReturnValueOnce({ promise: jest.fn().mockResolvedValue({}) });
 
-      await expect(updateJobPayload('calendly_webhook_cleanup', 'id-1', { any: 'payload' })).resolves.toBeUndefined();
+      await expect(updateJobPayload('calendly_webhook_cleanup', 'id-1', { any: 'payload' })).resolves.toBe(true);
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
     });
 
-    it('does not throw when the write fails on both the attempt and the retry, and logs loudly (not just a warning)', async () => {
+    // Greptile P1 on #2291 (third pass): this used to resolve to void — a caller with
+    // no other durable store to fall back to (connectedAccounts.ts persisting a
+    // rotated Calendly refresh token) had no way to know this best-effort write also
+    // failed. Now resolves false so the caller can react.
+    it('does not throw, but resolves false, when the write fails on both the attempt and the retry, and logs loudly', async () => {
       mockDocumentClientMethods.update.mockReturnValue({
         promise: jest.fn().mockRejectedValue(new Error('down')),
       });
       const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
 
-      await expect(updateJobPayload('calendly_webhook_cleanup', 'id-1', { any: 'payload' })).resolves.toBeUndefined();
+      await expect(updateJobPayload('calendly_webhook_cleanup', 'id-1', { any: 'payload' })).resolves.toBe(false);
 
       expect(mockDocumentClientMethods.update).toHaveBeenCalledTimes(2);
       expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('updateJobPayload failed'), expect.anything());

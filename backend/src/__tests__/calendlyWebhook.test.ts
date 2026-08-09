@@ -1257,7 +1257,14 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
       warnSpy.mockRestore();
     }, 10000);
 
-    it('escalates loudly and leaves the claim in place when EVERY write attempt fails, including the terminal fallback marker', async () => {
+    // Greptile P1 on #2291 (third pass): silently resolving here — even though work()
+    // genuinely succeeded — let the job go 'completed' with a claim still stuck
+    // 'in_progress' and no marker ever written anywhere. A 'completed' job is never
+    // revisited by anything, so nothing would ever get another chance to fix the
+    // marker before the claim eventually goes stale and a later reclaim repeats the
+    // side effect. Throwing instead (still never releasing the claim) surfaces this
+    // through the existing retry/terminal-failure machinery instead of disappearing.
+    it('escalates loudly, never releases the claim, but DOES fail the job when EVERY write attempt fails (including the terminal fallback marker)', async () => {
       const uri = 'https://api.calendly.com/scheduled_events/evt-1/invitees/inv-1';
       mockSetLeadFields.mockImplementation((_listId: string, _leadId: string, fields: any) => {
         if (fields.system?.[`hubspotSynced::${uri}`]) return Promise.reject(new Error('dynamo fully down'));
@@ -1282,7 +1289,14 @@ describe('POST /api/webhooks/calendly — booking webhook receiver', () => {
         expect.stringContaining('EVERY attempt to durably record it failed'),
         expect.anything(),
       );
-      expect(mockMarkJobFailed).not.toHaveBeenCalled();
+      // Unlike the two-tier fallback succeeding (sibling tests above), a TOTAL failure
+      // to record anything now DOES fail the job — surfacing it through
+      // markJobFailed/the terminal-failure log rather than silently completing.
+      expect(mockMarkJobFailed).toHaveBeenCalledWith(
+        'calendly_webhook',
+        uri,
+        expect.objectContaining({ message: expect.stringContaining('could not be durably recorded') }),
+      );
 
       errorSpy.mockRestore();
       (console.warn as jest.Mock).mockRestore();

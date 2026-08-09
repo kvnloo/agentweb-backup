@@ -92,7 +92,11 @@ describe('Connected Accounts Routes', () => {
         (userDb.getUserById as jest.Mock).mockResolvedValue(null);
         (orgDb.getOrgById as jest.Mock).mockResolvedValue(null);
         mockEnqueueJob.mockResolvedValue('enqueued');
-        mockUpdateJobPayload.mockResolvedValue(undefined);
+        // updateJobPayload now resolves a boolean (Greptile P1, third pass) — default
+        // to success so existing tests that don't care about this specific outcome
+        // aren't accidentally exercising the new "both persistence writes failed"
+        // branch in processCalendlyWebhookCleanupJob.
+        mockUpdateJobPayload.mockResolvedValue(true);
     });
 
     describe('GET /connected-accounts', () => {
@@ -1077,6 +1081,46 @@ describe('Connected Accounts Routes', () => {
                     refreshToken: 'rotated-refresh-token',
                 }),
             }));
+        });
+
+        // Greptile P1 on #2291 (third pass): both persistence writes are best-effort by
+        // design — but Calendly has already consumed the OLD refresh token by rotating
+        // it, so if BOTH writes fail, the new one exists nowhere durable. Every future
+        // retry would keep reloading the now-permanently-invalid old token and can never
+        // succeed. Confirms the compound failure throws a DISTINCT, diagnosable error
+        // instead of the generic (and in this case misleading) deleteError.
+        it('throws a distinct error when the rotated token could not be persisted to EITHER the queue payload or the orphan-webhook table', async () => {
+            (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                access_token: 'fresh-access-token',
+                refresh_token: 'rotated-refresh-token',
+            });
+            (axios.delete as jest.Mock).mockRejectedValue(new Error('calendly down'));
+            mockUpdateJobPayload.mockResolvedValue(false);
+            mockOrphanTableMethods.put.mockReturnValue({ promise: jest.fn().mockRejectedValue(new Error('dynamo down too')) });
+
+            await expect(processCalendlyWebhookCleanupJob({
+                webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                refreshToken: 'refresh-token-1',
+                userId: 'user-abc',
+                userUri: 'https://api.calendly.com/users/XYZ',
+            })).rejects.toThrow(/rotated the refresh token .* persisting the new token failed in both/);
+        });
+
+        it('throws the original deleteError (NOT the distinct compound-failure error) when only ONE of the two persistence writes succeeds', async () => {
+            (refreshCalendlyAccessToken as jest.Mock).mockResolvedValue({
+                access_token: 'fresh-access-token',
+                refresh_token: 'rotated-refresh-token',
+            });
+            (axios.delete as jest.Mock).mockRejectedValue(new Error('calendly down'));
+            mockUpdateJobPayload.mockResolvedValue(false);
+            // orphan table write still succeeds (default mock) — one durable copy exists.
+
+            await expect(processCalendlyWebhookCleanupJob({
+                webhookId: 'https://api.calendly.com/webhook_subscriptions/AAAA',
+                refreshToken: 'refresh-token-1',
+                userId: 'user-abc',
+                userUri: 'https://api.calendly.com/users/XYZ',
+            })).rejects.toThrow('calendly down');
         });
 
         it('checks the orphan-webhook table for a fresher refresh token before refreshing, when userId/userUri are present', async () => {
