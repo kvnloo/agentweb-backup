@@ -19,6 +19,11 @@ dotenv.config({ path: path.resolve(__dirname, "../../.env") });
 // Get table prefix based on NODE_ENV (defaults to empty string for production)
 const TABLE_PREFIX = process.env.NODE_ENV === "development" ? "Dev-" : "";
 
+// An 'in_progress' claimLeadStepOnce claim older than this is treated as
+// abandoned (its release write never landed) and becomes reclaimable — see
+// claimLeadStepOnce for the full reasoning (Greptile P1 on #2291, round 17).
+const CLAIM_STALE_MS = 5 * 60 * 1000;
+
 // For debugging
 
 // Configure AWS SDK
@@ -4459,16 +4464,25 @@ export const crmDb = {
     autoSendEnabled?: boolean,
     statusConfig?: Array<{ value: string; label: string; color: string; type: 'active' | 'won' | 'lost' | 'churned' }>,
     listType?: 'sales' | 'customers',
-    isSystemManaged?: boolean
+    isSystemManaged?: boolean,
+    // Idempotent-create support (ENG-524): pass a caller-chosen deterministic ID
+    // (instead of the usual random one) to get a race-safe "create if absent" —
+    // the write is conditioned on the ID not already existing, so concurrent
+    // callers (e.g. two backend instances resolving the same customer's
+    // auto-created default list at once) can't create duplicates. A caller
+    // that loses the race gets a ConditionalCheckFailedException and should
+    // fetch the winner's record via getLeadListById instead.
+    explicitListId?: string
   ) {
     try {
-      const listId = `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const listId = explicitListId ?? `list_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
       const normalizedAlertEvents = Array.isArray(alertEvents)
         ? alertEvents
         : ['email.received'];
 
-      const params = {
+      const params: AWS.DynamoDB.DocumentClient.PutItemInput = {
         TableName: `${TABLE_PREFIX}AW-LeadLists`,
+        ...(explicitListId ? { ConditionExpression: 'attribute_not_exists(listId)' } : {}),
         Item: {
           listId,
           userId,
@@ -7830,8 +7844,14 @@ export const crmDb = {
       topLevel?: Record<string, string>;
       enrichmentMetadata?: Record<string, any>;
       customFields?: Record<string, string>;
+      /** CRM-internal bookkeeping sidecar (see updateLead's `system` param) — same
+       *  atomic per-key document-path SET as customFields/enrichmentMetadata, but
+       *  never triggers the customFields fieldNames sync below, since these keys
+       *  must NOT show up in CSV exports or the Configure Display Fields UI. */
+      system?: Record<string, any>;
       removeEnrichmentMetadataKeys?: string[];
       removeCustomFieldKeys?: string[];
+      removeSystemKeys?: string[];
       /** When true, all SET clauses use if_not_exists() — atomically skips any
        *  field already present in the DB. Use for bulk enrichment paths that
        *  must never overwrite user-entered or concurrently-written data. */
@@ -7845,22 +7865,31 @@ export const crmDb = {
       : sanitizeCustomFields(options.customFields, { source: 'db.setLeadFields', listId, leadId });
     const hasMetaKeys = Object.keys(options.enrichmentMetadata ?? {}).length > 0;
     const hasCustomKeys = Object.keys(safeCustomFields ?? {}).length > 0;
+    const hasSystemKeys = Object.keys(options.system ?? {}).length > 0;
     const hasTopLevel = Object.keys(options.topLevel ?? {}).length > 0;
     const hasRemoveMeta = (options.removeEnrichmentMetadataKeys ?? []).length > 0;
     const hasRemoveCustom = (options.removeCustomFieldKeys ?? []).length > 0;
-    if (!hasTopLevel && !hasMetaKeys && !hasCustomKeys && !hasRemoveMeta && !hasRemoveCustom) return;
+    const hasRemoveSystem = (options.removeSystemKeys ?? []).length > 0;
+    if (!hasTopLevel && !hasMetaKeys && !hasCustomKeys && !hasSystemKeys && !hasRemoveMeta && !hasRemoveCustom && !hasRemoveSystem) return;
 
     // Step 1: ensure parent maps exist so document-path SETs/REMOVEs don't throw.
     // REMOVE on a nested path (e.g. customFields.key) also requires the parent
     // map to exist — bootstrap whenever we touch either map at all.
-    if (hasMetaKeys || hasCustomKeys || hasRemoveMeta || hasRemoveCustom) {
+    if (hasMetaKeys || hasCustomKeys || hasSystemKeys || hasRemoveMeta || hasRemoveCustom || hasRemoveSystem) {
       try {
         await dynamodb.update({
           TableName: tableName,
           Key: key,
+          // `system` is a DynamoDB reserved keyword — confirmed live against a real
+          // table (round 15/16 smoke test): using it unescaped throws
+          // ValidationException, invisible to unit tests since they mock
+          // dynamodb.update() and never validate expression syntax. #system placeholder
+          // required wherever it appears as a top-level attribute name in an expression.
           UpdateExpression:
             'SET customFields = if_not_exists(customFields, :emptyMap), ' +
-            'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap)',
+            'enrichmentMetadata = if_not_exists(enrichmentMetadata, :emptyMap), ' +
+            '#system = if_not_exists(#system, :emptyMap)',
+          ExpressionAttributeNames: { '#system': 'system' },
           ExpressionAttributeValues: { ':emptyMap': {} },
           ConditionExpression: 'attribute_exists(leadId)',
         }).promise();
@@ -7933,6 +7962,17 @@ export const crmDb = {
       idx++;
     }
 
+    idx = 0;
+    for (const [k, v] of Object.entries(options.system ?? {})) {
+      attrNames['#system'] = 'system'; // reserved keyword — must be a placeholder, see bootstrap above
+      attrNames[`#sys${idx}`] = k;
+      attrValues[`:sys${idx}`] = v;
+      setClauses.push(ine
+        ? `#system.#sys${idx} = if_not_exists(#system.#sys${idx}, :sys${idx})`
+        : `#system.#sys${idx} = :sys${idx}`);
+      idx++;
+    }
+
     let rmIdx = 0;
     for (const k of options.removeEnrichmentMetadataKeys ?? []) {
       attrNames[`#rmem${rmIdx}`] = k;
@@ -7944,6 +7984,14 @@ export const crmDb = {
     for (const k of options.removeCustomFieldKeys ?? []) {
       attrNames[`#rmcf${rmIdx}`] = k;
       removeClauses.push(`customFields.#rmcf${rmIdx}`);
+      rmIdx++;
+    }
+
+    rmIdx = 0;
+    for (const k of options.removeSystemKeys ?? []) {
+      attrNames['#system'] = 'system'; // reserved keyword — must be a placeholder, see bootstrap above
+      attrNames[`#rmsys${rmIdx}`] = k;
+      removeClauses.push(`#system.#rmsys${rmIdx}`);
       rmIdx++;
     }
 
@@ -7994,6 +8042,91 @@ export const crmDb = {
         // eslint-disable-next-line no-console
         console.warn('[setLeadFields] fieldNames sync failed:', (err as Error).message);
       }
+    }
+  },
+
+  /**
+   * Atomic claim-before-act lock on a single `system` sub-key: SETs it ONLY if it
+   * doesn't already exist, returning whether THIS caller won the claim.
+   *
+   * Greptile P1 on #2291 (round 15): a stale-reclamation race in the async job
+   * queue (asyncJobQueue.ts — if every heartbeat write for a claimed job fails
+   * across the whole staleness window) can, in the worst case, let two instances
+   * both start processing the SAME booking concurrently. Per-step completion
+   * markers (setLeadFields's `system` writes) already stop a THIRD run from
+   * repeating a step once one instance finishes it, but two instances racing
+   * to the SAME not-yet-done step would both pass that check and both fire the
+   * external side effect (a duplicate HubSpot/Attio sync call, a duplicate
+   * customer alert) before either gets to write "done".
+   *
+   * This closes that specific gap: callers claim the step BEFORE doing the
+   * side-effecting work, not after. Only one of two concurrent claimants can
+   * ever win (DynamoDB's conditional write is the actual mutex — not a
+   * probabilistic reduction like more retries would be), so at most one
+   * instance ever performs the real side effect, regardless of how the race
+   * that caused two instances to run in the first place happened.
+   *
+   * Callers MUST release the claim (removeSystemKeys) if the guarded work then
+   * fails, or the step is wedged forever — see calendlyWebhook.ts's runStepOnce.
+   */
+  async claimLeadStepOnce(listId: string, leadId: string, key: string): Promise<boolean> {
+    const tableName = `${TABLE_PREFIX}AW-Leads`;
+    const dynKey = { listId, leadId };
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        // `system` is a DynamoDB reserved keyword — confirmed live against a real
+        // table (round 15/16 smoke test): unescaped, this throws ValidationException,
+        // invisible to unit tests since they mock dynamodb.update() and never
+        // validate expression syntax against DynamoDB's actual reserved-word list.
+        UpdateExpression: 'SET #system = if_not_exists(#system, :emptyMap)',
+        ExpressionAttributeNames: { '#system': 'system' },
+        ExpressionAttributeValues: { ':emptyMap': {} },
+        ConditionExpression: 'attribute_exists(leadId)',
+      }).promise();
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'claimLeadStepOnce:bootstrap');
+      throw err;
+    }
+
+    // Greptile P1 on #2291 (round 17): the release-on-failure write in
+    // calendlyWebhook.ts's runStepOnce is itself best-effort (swallows its own
+    // errors) — if THAT write also fails, a bare-value claim would stay
+    // 'in_progress' forever, and every future retry's claim attempt would keep
+    // losing to it indefinitely: not a probability reduction problem, a
+    // structural one, the same class already fixed twice this session for the
+    // async queue's own staleness model. So the claim carries its own
+    // timestamp and the condition below allows reclaiming an 'in_progress'
+    // claim that's older than CLAIM_STALE_MS — recoverable within a bounded
+    // window even if the release write is never seen again, while still
+    // conservative enough (5 minutes, same order of magnitude as the queue's
+    // own STALE_PROCESSING_MS) that a genuinely still-running external call
+    // is never reclaimed out from under itself.
+    const now = new Date().toISOString();
+    const staleThreshold = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
+    try {
+      await dynamodb.update({
+        TableName: tableName,
+        Key: dynKey,
+        UpdateExpression: 'SET #system.#k = :claim, updatedAt = :ts',
+        ExpressionAttributeNames: { '#system': 'system', '#k': key, '#status': 'status', '#claimedAt': 'claimedAt' },
+        ExpressionAttributeValues: {
+          ':claim': { status: 'in_progress', claimedAt: now },
+          ':ts': now,
+          ':inProgress': 'in_progress',
+          ':staleThreshold': staleThreshold,
+        },
+        ConditionExpression:
+          'attribute_not_exists(#system.#k) OR ' +
+          '(#system.#k.#status = :inProgress AND #system.#k.#claimedAt < :staleThreshold)',
+      }).promise();
+      return true;
+    } catch (err: any) {
+      if (err.code === 'ConditionalCheckFailedException') return false;
+      handleDynamoDbError(err, 'claimLeadStepOnce');
+      throw err;
     }
   },
 
