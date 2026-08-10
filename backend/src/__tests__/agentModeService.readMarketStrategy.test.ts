@@ -399,6 +399,70 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(res.formattedContent).toMatch(/\[offset \d+\]/);
   });
 
+  // Greptile P2: when the detail window runs to the end of the list while earlier
+  // entries are still name-only, the prose used to advertise "nextCompetitorOffset
+  // (currently 0)" while the structured field was null — telling a sequential
+  // reader to restart and re-read what it had already seen.
+  it('never advertises a next page when there is none', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
+
+    const res = await svc.readMarketStrategy('u1', { competitorOffset: 45 });
+
+    expect(res.nextCompetitorOffset).toBeNull();
+    expect(res.formattedContent).not.toMatch(/nextCompetitorOffset/);
+    expect(res.formattedContent).not.toMatch(/currently 0/);
+    // The jump affordance must survive — the earlier entries are still reachable.
+    expect(res.formattedContent).toContain('[offset 0]');
+  });
+
+  // Greptile P1: the name index grew without bound, so a large enough strategy
+  // pushed the tail (and the "nothing is missing" statement) past the 20,000-char
+  // in-memory tool-result cap — and the CRM email path embedded the same
+  // unbounded tail straight into its prompt. Bounding it is fine; going SILENT
+  // is not, so the remainder must still be counted and reachable.
+  it('bounds the name index instead of growing without limit', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(400, 'Bulk', 300))));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.totalCompetitors).toBe(400);
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+  });
+
+  it('states the unlisted remainder explicitly rather than dropping it silently', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(400, 'Bulk', 300))));
+
+    const res = await svc.readMarketStrategy('u1');
+    const listedByName = (res.formattedContent.match(/• \[offset \d+\]/g) || []).length;
+    const unlisted = 400 - res.competitorsWithFullDetail - listedByName;
+
+    expect(unlisted).toBeGreaterThan(0);              // the cap actually engaged
+    expect(res.formattedContent).toContain(String(unlisted)); // and is stated
+    expect(res.formattedContent).toContain('400');            // true total intact
+    expect(res.formattedContent).toMatch(/competitorOffset/);  // and still reachable
+  });
+
+  it('does not engage the name-index cap on a normal-sized strategy', async () => {
+    const competitors = makeCompetitors(49);
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(competitors)));
+
+    const res = await svc.readMarketStrategy('u1');
+    const listedByName = (res.formattedContent.match(/• \[offset \d+\]/g) || []).length;
+
+    expect(res.competitorsWithFullDetail + listedByName).toBe(49);
+    for (const c of competitors) expect(res.formattedContent).toContain(c.name);
+  });
+
+  it('bounds the name index on the prompt-embedded path too, without tool directives', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(400, 'Bulk', 300))));
+
+    const res = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 40, pagingHints: false } as any);
+
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+    expect(res.formattedContent).not.toMatch(/competitorOffset/);
+    expect(res.formattedContent).toContain('400');
+  });
+
   it('exposes competitorOffset on the tool schema so the model can actually ask for it', async () => {
     require('../emma/tools');
     const { emmaToolRegistry } = require('../emma/registry');
