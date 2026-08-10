@@ -3061,10 +3061,24 @@ export const scheduleDb = {
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions). Default off.
       fullAutonomy?: boolean;
+      // ENG-803: owner opt-OUT holding this schedule's unattended runs at the publish
+      // step. Distinct from fullAutonomy on purpose: that waives "pause and ask me"
+      // on mid-run decisions, which is not the same consent as "post to the world on
+      // my behalf". Settable ONLY by the owner — deliberately absent from the
+      // manage_scheduled_chat MCP allowlist so the model can neither grant itself
+      // publishing authority nor silence its own publishing. Default off (= publish).
+      requirePublishApproval?: boolean;
       // ENG-827: opt-in authorization to PUBLISH to a live connected account during
       // an unattended scheduled run, without showing the owner the content first.
       // Its own consent control precisely because the required-function picker is a
       // verification control, not a waiver. Default off.
+      //
+      // POLARITY, AND WHY BOTH FIELDS EXIST (see schedulePublishAuthorization.ts):
+      // requirePublishApproval above is the owner's HOLD; autopublishAuthorized is
+      // the owner's WAIVER of the per-post review that a hold would otherwise
+      // require. They are not duplicates and they do not fight: a schedule that is
+      // not held publishes as it always has, and the waiver only ever matters on a
+      // schedule that IS held. A hold with no waiver drafts and notifies.
       autopublishAuthorized?: boolean;
       // ENG-827: the publish tools the owner could see when they consented. Consent
       // is bound to THIS list, so a later edit to requiredFunctionCalls cannot
