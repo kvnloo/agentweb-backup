@@ -22937,6 +22937,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static readonly RESPONSE_FIXED_CHROME = 900;
   private static readonly MIN_COMPETITOR_DETAIL_CHARS = 1200;
   private static readonly MIN_COMPETITOR_NAME_INDEX_CHARS = 400;
+  // Per-field ceiling. Names and descriptions are unbounded on write, so one
+  // record could otherwise dominate the whole response.
+  private static readonly COMPETITOR_FIELD_MAX_CHARS = 3000;
+  // Hard ceiling for a TOOL response, under the 20,000-char in-context cap.
+  // Callers that embed the text in their own prompt are not clamped — they have
+  // no transport cap, and clamping them would undo the ENG-945 non-regression.
+  private static readonly RESPONSE_HARD_CAP = 19000;
+  private static readonly BUSINESS_OVERVIEW_MAX_CHARS = 2500;
+  private static readonly ICP_SECTION_MAX_CHARS = 6000;
 
   // Rendered separately from formatMarketStrategy so its true cost can be
   // measured BEFORE the competitor budgets are allocated (ENG-945 / Greptile):
@@ -22986,11 +22995,39 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return { detail, nameIndex };
   }
 
+  /**
+   * Cut `text` to `allowed` characters, ALWAYS saying how much was removed.
+   * ENG-945's rule is "never hide silently", not "never bound" — an explicit
+   * marker is what separates this from the bug this ticket fixed.
+   */
+  private truncateWithNotice(text: string, allowed: number): string {
+    if (text.length <= allowed) return text;
+    if (allowed <= 0) return '';
+    const marker = (n: number) => ` …<em>[truncated — ${n} characters omitted; open the Market Strategy page to read the full text]</em>`;
+    const full = marker(text.length);
+    // The marker itself must fit inside the allowance, or the "hard" bound
+    // would be breached by the very notice that announces the cut.
+    if (full.length >= allowed) {
+      const short = '…[truncated]';
+      return short.length <= allowed ? short : text.slice(0, allowed);
+    }
+    // marker(text.length) is an upper bound on marker(text.length - keep) — the
+    // omitted count can only have fewer digits — so the result never exceeds
+    // `allowed`.
+    const keep = allowed - full.length;
+    return text.slice(0, keep) + marker(text.length - keep);
+  }
+
   private formatCompetitorDetailLine(competitor: any): string {
     if (typeof competitor === 'object' && competitor && competitor.name) {
-      return `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
+      const name = this.truncateWithNotice(String(competitor.name), AgentModeService.COMPETITOR_FIELD_MAX_CHARS);
+      const description = this.truncateWithNotice(
+        String(competitor.description || 'No description provided'),
+        AgentModeService.COMPETITOR_FIELD_MAX_CHARS,
+      );
+      return `• <strong>${name}:</strong> ${description}<br>`;
     }
-    return `• ${competitor}<br>`;
+    return `• ${this.truncateWithNotice(String(competitor), AgentModeService.COMPETITOR_FIELD_MAX_CHARS)}<br>`;
   }
 
   /**
@@ -23033,10 +23070,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     let formattedSummary = `<strong>📊 Market Strategy Retrieved</strong><br>`;
     formattedSummary += `I've successfully retrieved your market strategy. Here's what I found:<br><br>`;
 
-    // Business Overview Section (matches UI structure)
+    // Business Overview Section (matches UI structure). Bounded on the tool path
+    // only — see RESPONSE_HARD_CAP.
+    const clamp = marketResult.pagingHints !== false;
     formattedSummary += `<strong>🏢 Business Overview</strong><br>`;
     if (marketData.businessOverview) {
-      formattedSummary += `${marketData.businessOverview}<br><br>`;
+      const overview = clamp
+        ? this.truncateWithNotice(String(marketData.businessOverview), AgentModeService.BUSINESS_OVERVIEW_MAX_CHARS)
+        : String(marketData.businessOverview);
+      formattedSummary += `${overview}<br><br>`;
     } else {
       formattedSummary += `No business overview provided yet.<br><br>`;
     }
@@ -23125,24 +23167,33 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     formattedSummary += `<br>`;
 
     // Ideal Customer Profile (ICP) Section (matches UI structure)
-    formattedSummary += this.formatIcpSection(marketData.icp);
+    const icpSection = this.formatIcpSection(marketData.icp);
+    formattedSummary += clamp
+      ? this.truncateWithNotice(icpSection, AgentModeService.ICP_SECTION_MAX_CHARS)
+      : icpSection;
 
     formattedSummary += `<br><em>💡 I'll use this market strategy information to inform marketing campaigns, content strategy, and business development decisions.</em>`;
     // Only tell the model the read is exhaustive when it actually is. With a
     // name-only tail, a second call is the supported way to read the rest —
     // unless the caller has no tools to call, in which case say nothing about
     // tools at all.
-    if (!pagingHints) {
-      formattedSummary += nameOnlyCount > 0
+    const closingNote = !pagingHints
+      ? (nameOnlyCount > 0
         ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above; ${nameOnlyCount} of them by name only. Nothing is missing.`
-        : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete.`;
-    } else {
-      formattedSummary += nameOnlyCount > 0
+        : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete.`)
+      : (nameOnlyCount > 0
         ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above, but ${nameOnlyCount} of them are shown by name only. Nothing is missing. To read any of those in full, call read_market_strategy again with competitorOffset set to the offset shown beside the name.`
-        : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`;
-    }
+        : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`);
 
-    return formattedSummary;
+    if (!clamp) return formattedSummary + closingNote;
+
+    // Final guarantee. Every section above is individually bounded, but the only
+    // way to PROVE the tool result fits the transport's in-context cap is to
+    // clamp the assembled string — while reserving the closing note, because the
+    // "nothing is missing" guidance is exactly what must never be the thing that
+    // gets cut (that would be ENG-945 all over again).
+    const room = AgentModeService.RESPONSE_HARD_CAP - closingNote.length;
+    return this.truncateWithNotice(formattedSummary, room) + closingNote;
   }
 
   // Helper function to format market strategy update feedback for AI analysis
