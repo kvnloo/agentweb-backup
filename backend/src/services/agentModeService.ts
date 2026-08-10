@@ -843,6 +843,25 @@ export interface DiagnosisContext {
 }
 
 /**
+ * ENG-975. Shared by every agent-facing surface that can hit a LinkedIn
+ * people-search outage: the `search-people` and `search-parameters` actions and
+ * the find-leads top-up loop. Wording matters as much as the detection — the
+ * failure it describes is one an agent has already been observed to misread as
+ * "no one matches", so it names the outage, rules out the two signals that
+ * wrongly suggest health (a working get-profile, an HTTP 200), and forbids the
+ * retry-with-another-variant loop that burned ten calls in the reported session.
+ */
+const LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE = [
+  'LinkedIn returned zero results for a maximally broad control query on this account, so the people-search endpoint is NOT working for it right now. This is not "no one matches your filters" — the search itself is unavailable.',
+  '',
+  'This is account-scoped and specific to search: profile lookups, connection lists and invitation lists on the same account keep working, so a successful get-profile does NOT mean search is healthy. As of 2026-08-10 the known cause is an open Unipile incident — LinkedIn is rolling out changes to Classic Search account by account, and an affected account returns zero results for every query until Unipile ships its adapted integration. The same symptom also appears when an account hits its commercial-use search limit or is temporarily restricted.',
+  '',
+  'DO NOT retry with different keywords, filters, or a search URL — every variant returns the same empty result and burns attempts. Stop searching now.',
+  '',
+  'Report to the user that LinkedIn search is currently unavailable for their account and that no prospects could be sourced this run — never report this as "no matching people were found". Their account is not broken and reconnecting it will not help, so do not tell them to reconnect. Do not promise a specific recovery time: say the outage is upstream at LinkedIn/Unipile and the run will resume sourcing once search returns for their account.',
+].join('\n');
+
+/**
  * Build a short, human-readable audit string describing why a lead was
  * discovered. Written to lead.system.findReason (NOT customFields, which
  * leaks into CSV exports and email-template variables). Returns null when
@@ -14110,6 +14129,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       // Convert file URLs to attachments
       const attachments = this.convertUrlsToAttachments(attachedFileUrls);
 
+      if (templateData.isDeepResearch) {
+        console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, templateId: templateData.templateId, source: 'createTaskFromTemplate' });
+      }
+
       // Create task using template
       const task = {
         taskId: Date.now().toString(),
@@ -14119,7 +14142,9 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         status: 'active',
         emailNotification: templateData.isDeepResearch || false,
         isInteractive: templateData.isInteractive || false,
-        isDeepResearch: templateData.isDeepResearch || false,
+        // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
+        // never persist true, even from an older template that still has it.
+        isDeepResearch: false,
         isComplexTask: templateData.isComplexTask || false,
         extractPageContent: false,
         outputAsJson: templateData.outputAsJson || false,
@@ -29901,6 +29926,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     };
   }
 
+  /**
+   * ENG-975. A LinkedIn people search that returns zero because the ACCOUNT has
+   * lost its search capability is indistinguishable from one that returns zero
+   * because nobody matches — Unipile relays both as HTTP 200 with `items: []`
+   * and `paging.total_count: 0`. Once `probeSearchCapability` has proven it is
+   * the former, say so in the terms the agent needs: this is an outage, more
+   * query variants will not help, and reporting "no matches" would be a lie.
+   */
+  private linkedInSearchUnavailableResponse() {
+    return {
+      success: false,
+      message: 'LinkedIn people search is unavailable',
+      error: LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE,
+      searchUnavailable: true,
+    };
+  }
+
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
@@ -29997,6 +30039,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             company_id, location, location_id,
             industry, industry_id, school, school_id,
           });
+          // ENG-975: an empty FIRST page is ambiguous — it means either "nobody
+          // matches" or "this account can no longer search". Only a broad control
+          // query can tell those apart, so run one before reporting an empty
+          // result the agent would otherwise pass on to the user as fact. A
+          // cursor'd continuation is skipped: running out of pages is exhaustion,
+          // not an outage.
+          if (Array.isArray(searchResult?.items) && searchResult.items.length === 0 && !cursor) {
+            if (await linkedInOutreachService.probeSearchCapability(account_id) === 'degraded') {
+              console.log(`[AgentMode] linkedinOutreach: search-people returned 0 and the control query also returned 0 — account ${account_id} cannot search`);
+              return this.linkedInSearchUnavailableResponse();
+            }
+          }
           // Trim to essential fields only — full profiles (skills, education, photos, etc.)
           // inflate context by 10x and degrade LLM output quality in long sessions.
           if (Array.isArray(searchResult?.items)) {
@@ -30525,6 +30579,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             keywords,
             limit,
           });
+          // ENG-975: the same account-scoped search outage empties entity
+          // resolution too — the reported session got `candidates: []` for
+          // INDUSTRY 'hospital health care'. An empty list here silently drops
+          // the filter downstream, so confirm the account can search before
+          // handing back "no such entity".
+          if ((resolveResult.candidates || []).length === 0
+            && await linkedInOutreachService.probeSearchCapability(account_id) === 'degraded') {
+            console.log(`[AgentMode] linkedinOutreach: search-parameters returned 0 candidates and account ${account_id} cannot search`);
+            return this.linkedInSearchUnavailableResponse();
+          }
           // Trim each candidate to id/title/subtitle so the LLM doesn't see internal
           // resolver fields (mirrors the trimming pattern used by search-people above).
           const trimmedCandidates = (resolveResult.candidates || []).map((c: any) => ({
@@ -31529,6 +31593,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     let lastFetchCursor: string | null | undefined = nextCursor;
     let safetyCapHit = false;
     let searchError: string | null = null;
+    let searchUnavailable = false;
     const allErrors: string[] = [];
     const allCreated: Array<{ leadId: string; email?: string }> = [];
     const allMappedLeadsPreview: any[] = []; // first-5 preview only
@@ -31563,7 +31628,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       const items = Array.isArray(searchResult?.items) ? searchResult.items : [];
       nextCursor = searchResult?.cursor ?? null;
 
-      if (items.length === 0) break;
+      if (items.length === 0) {
+        // ENG-975: breaking here with nothing imported reports "No results found
+        // for the given search criteria." — which is also exactly what a schedule
+        // whose account has lost people-search capability produces, making a
+        // silent no-op look like an honest empty. Only the FIRST fetch of this
+        // call is ambiguous; a later page running dry is normal exhaustion.
+        //
+        // That first fetch is ambiguous even when it resumes from a cursor. A
+        // recurring schedule persists its cursor per (list, criteria) and picks
+        // it up on the next run without the caller ever passing one, so keying
+        // off "no cursor" would exempt precisely the repeat-schedule case this
+        // bug was reported from. The probe settles it either way: an exhausted
+        // search on a healthy account answers 'ok' and still reports the plain
+        // empty, at the cost of one broad query per account per 10 minutes.
+        if (iterationCount === 1
+          && await linkedInOutreachService.probeSearchCapability(accountId) === 'degraded') {
+          searchUnavailable = true;
+          searchError = LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE;
+        }
+        break;
+      }
       totalFetched += items.length;
 
       // Map Unipile search result fields → CRM lead fields, then resolve
@@ -31740,6 +31825,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       safetyCapHit,
     };
     if (searchError) response.searchError = searchError;
+    if (searchUnavailable) response.searchUnavailable = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
     }
