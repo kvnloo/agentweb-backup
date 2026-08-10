@@ -691,7 +691,8 @@ describe('AgentModeService.importLeadsFromSearch — zero-result search capabili
     jest.clearAllMocks();
     service = new AgentModeService();
     mockResolveAccountId.mockResolvedValue('test-account-id');
-    mockGetLeadListById.mockResolvedValue({ leadCount: 0 });
+    // Caller owns the list (ENG-1049 access check short-circuits on this).
+    mockGetLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1', leadCount: 0 });
     mockProbeSearchCapability.mockResolvedValue('ok');
   });
 
@@ -738,6 +739,7 @@ describe('AgentModeService.importLeadsFromSearch — zero-result search capabili
     const hash = expectedCriteriaHash({ title: 'CTO' });
     mockGetLeadListById.mockResolvedValue({
       listId: 'list-1',
+      userId: 'user-1',
       leadCount: 0,
       searchCursors: { [hash]: { cursor: 'cursor-from-yesterdays-run', lastUsedAt: '2026-08-07T17:03:00Z' } },
     });
@@ -755,6 +757,7 @@ describe('AgentModeService.importLeadsFromSearch — zero-result search capabili
     const hash = expectedCriteriaHash({ title: 'CTO' });
     mockGetLeadListById.mockResolvedValue({
       listId: 'list-1',
+      userId: 'user-1',
       leadCount: 0,
       searchCursors: { [hash]: { cursor: 'cursor-from-yesterdays-run', lastUsedAt: '2026-08-07T17:03:00Z' } },
     });
