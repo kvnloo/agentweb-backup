@@ -211,6 +211,51 @@ describe('AgentModeService - Social Media Tools', () => {
       mockSocialPlatformService.getAdapter.mockReturnValue(mockAdapter);
     });
 
+    // ENG-827 (Greptile, security): admission to publish is granted BEFORE the slow
+    // work — resolving accounts, downloading media, uploading a video (minutes on
+    // YouTube). A consent withdrawal landing during that work must still stop the
+    // post, so the handler re-validates at its last moment before committing.
+    it('does NOT create the post when consent is withdrawn while the call is in flight', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'p1', postUrl: 'u1' });
+
+      const result = await service.postOnConnectedAccount(
+        'user-123',
+        'urn:li:organization:123456',
+        'Hello from the API!',
+        [],
+        undefined,
+        {
+          assertPublishStillAuthorized: async () => ({
+            success: false as const,
+            error: 'post_on_connected_account was not executed: this unattended scheduled run is not authorized to publish.',
+          }),
+        }
+      );
+
+      // Not reaching the adapter IS the fix — the post cannot be un-made.
+      expect(mockAdapter.createPost).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      expect(result.message).toContain('not authorized to publish');
+    });
+
+    it('posts normally when the in-flight re-check still allows it', async () => {
+      mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
+      mockAdapter.createPost.mockResolvedValue({ success: true, message: 'Posted', postId: 'p1', postUrl: 'u1' });
+
+      const result = await service.postOnConnectedAccount(
+        'user-123',
+        'urn:li:organization:123456',
+        'Hello from the API!',
+        [],
+        undefined,
+        { assertPublishStillAuthorized: async () => null }
+      );
+
+      expect(mockAdapter.createPost).toHaveBeenCalledTimes(1);
+      expect(result.success).toBe(true);
+    });
+
     it('should successfully post content to account', async () => {
       mockGetAccountsWithOwnerIncludingOrgShared.mockResolvedValue([mockLinkedInAccount] as any);
       mockAdapter.createPost.mockResolvedValue({

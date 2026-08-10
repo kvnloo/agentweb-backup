@@ -97,6 +97,57 @@ describe('ENG-827 — dispatch refuses an unauthorized scheduled publish', () =>
     expect(result.success).toBe(false);
   });
 
+  // Greptile (security): admission and the irreversible act are separate, and the
+  // work between them can run for minutes (media download, YouTube upload). The
+  // handler therefore gets a re-validation to run at its LAST moment.
+  it('hands the publishing handler a re-check that refuses once consent is revoked in flight', async () => {
+    getScheduleById.mockResolvedValue({
+      scheduleId: SCHEDULE_ID,
+      requiredFunctionCalls: ['post_on_connected_account'],
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
+    });
+
+    let recheck: any;
+    publishHandler.mockImplementation(async (_args: any, context: any) => {
+      // Stands in for the slow work: the owner revokes while it is running.
+      getScheduleById.mockResolvedValue({
+        scheduleId: SCHEDULE_ID,
+        requiredFunctionCalls: ['post_on_connected_account'],
+        autopublishAuthorized: false,
+        autopublishAuthorizedTools: [],
+      });
+      recheck = await context.assertPublishStillAuthorized();
+      return { success: true };
+    });
+
+    await registry.execute(
+      'post_on_connected_account',
+      { content: 'hello world' },
+      { userId: 'u1', sessionId: 'sess-scheduled' }
+    );
+
+    // Admission passed (consent was live then) — the LAST-MOMENT check is what
+    // catches the withdrawal that landed during the work.
+    expect(publishHandler).toHaveBeenCalledTimes(1);
+    expect(recheck).not.toBeNull();
+    expect(recheck.success).toBe(false);
+    expect(recheck.error).toContain('not authorized to publish');
+  });
+
+  it('does not attach the re-check to a non-publishing tool', async () => {
+    const readHandler = jest.fn().mockResolvedValue({ success: true });
+    registry.register({
+      name: 'read_brand_guidelines',
+      definition: { name: 'read_brand_guidelines' },
+      execute: readHandler,
+    });
+
+    await registry.execute('read_brand_guidelines', {}, { userId: 'u1', sessionId: 'sess-scheduled' });
+
+    expect(readHandler.mock.calls[0][1].assertPublishStillAuthorized).toBeUndefined();
+  });
+
   it('leaves interactive publishing untouched', async () => {
     getChatSession.mockResolvedValue({ sessionId: 'sess-interactive', sessionType: 'agent' });
 
