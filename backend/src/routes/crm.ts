@@ -6,6 +6,7 @@ import {
   canDestructiveCrmList,
   CRM_EDITOR_REQUIRED_MESSAGE,
   CRM_SHARING_DISABLED_MESSAGE,
+  getReadableOrgMemberIds,
 } from '../services/crmAccessControl';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
@@ -936,14 +937,14 @@ router.get('/lists', async (req: Request, res: Response) => {
 
     const ownLists = await crmDb.getLeadListsByUserId(userId);
 
-    // Also include org members' lists
-    const user = await userDb.getUserById(userId);
-    if (user?.orgId) {
-      const members = await orgDb.getOrgMembers(user.orgId);
+    // Also include org members' lists — gated on shareSettings.crm.enabled
+    // (ENG-686 follow-up: this route pre-dated the org-share model and
+    // unconditionally merged in every member's lists regardless of the
+    // toggle; found via live QA).
+    const memberIds = await getReadableOrgMemberIds(userId);
+    if (memberIds.length > 0) {
       const memberListArrays = await Promise.all(
-        members
-          .filter((m) => m.userId !== userId)
-          .map((m) => crmDb.getLeadListsByUserId(m.userId))
+        memberIds.map((id) => crmDb.getLeadListsByUserId(id))
       );
       const memberLists = memberListArrays.flat().filter(Boolean).map((l) => ({ ...l, fromOrgMember: true }));
       return res.json([...(ownLists || []), ...memberLists]);
@@ -1008,14 +1009,14 @@ router.get('/contacts', async (req: Request, res: Response) => {
       ? listIds.split(',').map((s) => s.trim()).filter(Boolean)
       : undefined;
 
-    // Collect userIds to dedup across: own + all org members
+    // Collect userIds to dedup across: own + readable org members — gated on
+    // shareSettings.crm.enabled (ENG-686 follow-up: this route pre-dated the
+    // org-share model and unconditionally merged in every member's contacts
+    // regardless of the toggle; found via live QA).
     const userIdsToDedup: string[] = [userId];
-    const user = await userDb.getUserById(userId);
-    if (user?.orgId) {
-      const members = await orgDb.getOrgMembers(user.orgId);
-      for (const m of members) {
-        if (m.userId !== userId) userIdsToDedup.push(m.userId);
-      }
+    {
+      const memberIds = await getReadableOrgMemberIds(userId);
+      userIdsToDedup.push(...memberIds);
     }
 
     const started = Date.now();

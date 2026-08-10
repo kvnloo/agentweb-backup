@@ -46,3 +46,20 @@ export async function canDestructiveCrmList(userId: string, list: { userId: stri
   const org = await orgDb.getOrgById(user.orgId);
   return canEditItem({ userId: list.userId }, user as UserLike, org as OrgLike | null, owner?.orgId, "crm");
 }
+
+// Org member IDs whose CRM lists/contacts the caller may read, honouring
+// shareSettings.crm.enabled — the org-wide fan-out list. Returns [] when the
+// caller has no org, or crm sharing is disabled and the caller is neither the
+// org owner nor a listed crm.editor. Used by aggregate routes (GET /lists,
+// GET /contacts) that merge data across every org member; per-list routes use
+// canAccessCrmList/canDestructiveCrmList instead (ENG-686 follow-up — these
+// two routes pre-dated the org-share model and never adopted its gating,
+// found via live QA on ENG-686/ENG-1049).
+export async function getReadableOrgMemberIds(userId: string): Promise<string[]> {
+  const user = await userDb.getUserById(userId);
+  if (!user?.orgId) return [];
+  const org = await orgDb.getOrgById(user.orgId);
+  if (!isFeatureEffectivelyEnabled(user as UserLike, org as OrgLike | null, "crm")) return [];
+  const members = await orgDb.getOrgMembers(user.orgId);
+  return members.filter((m) => m.userId !== userId).map((m) => m.userId);
+}
