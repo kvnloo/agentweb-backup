@@ -25,6 +25,9 @@ jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn().mockResolvedValue({ userId: 'user-1' }),
   },
+  orgDb: {
+    getOrgById: jest.fn().mockResolvedValue(null),
+  },
 }));
 
 jest.mock('../services/externalCrmSyncService', () => ({
@@ -49,6 +52,7 @@ jest.mock('../services/externalCrmSyncService', () => ({
       apiKeyEncrypted: 'enc:something',
     }),
     deleteConfig: jest.fn().mockResolvedValue(undefined),
+    disconnectAccount: jest.fn().mockResolvedValue(undefined),
     getDistinctCustomFieldKeys: jest.fn().mockResolvedValue([]),
     testConnection: jest.fn().mockResolvedValue({ valid: true }),
     pushAllLeads: jest.fn().mockResolvedValue({ successCount: 0, newCount: 0, updatedCount: 0, errorCount: 0, errors: [] }),
@@ -413,8 +417,25 @@ describe('GET /api/crm-sync/push/:listId/:provider/status — job status', () =>
 });
 
 describe('Org-aware access control on CRM sync routes', () => {
-  const { crmDb, userDb } = require('../services/db');
+  const { crmDb, userDb, orgDb } = require('../services/db');
   const { externalCrmSyncService } = require('../services/externalCrmSyncService');
+
+  // Same-org fixtures reused across the read (GET) and write (PUT/POST/DELETE)
+  // cases below. `owner-2` always owns the target list; `org-owner-id` is a
+  // third party who is never the requester unless a test says so.
+  function setSameOrgUsers() {
+    userDb.getUserById.mockImplementation((id: string) =>
+      Promise.resolve(id === 'owner-2' ? { userId: 'owner-2', orgId: 'org-A' } : { userId: 'user-1', orgId: 'org-A' })
+    );
+  }
+  function orgWithCrm(overrides: Record<string, any> = {}) {
+    return {
+      orgId: 'org-A',
+      ownerUserId: 'org-owner-id',
+      shareSettings: { crm: { enabled: true, editors: [] as string[] } },
+      ...overrides,
+    };
+  }
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -426,9 +447,8 @@ describe('Org-aware access control on CRM sync routes', () => {
     // List owned by a different user...
     crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
     // ...but both users belong to the same org.
-    userDb.getUserById.mockImplementation((id: string) =>
-      Promise.resolve(id === 'owner-2' ? { userId: 'owner-2', orgId: 'org-A' } : { userId: 'user-1', orgId: 'org-A' })
-    );
+    setSameOrgUsers();
+    orgDb.getOrgById.mockResolvedValue(orgWithCrm());
 
     const res = await request(app)
       .get('/api/crm-sync/config/list-1/hubspot')
@@ -459,11 +479,34 @@ describe('Org-aware access control on CRM sync routes', () => {
       .expect(403);
   });
 
-  it('allows an org member to save config for a list owned by another member', async () => {
+  it('denies a same-org member reading config when crm.enabled is false and they are not owner/editor (ENG-686)', async () => {
     crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
-    userDb.getUserById.mockImplementation((id: string) =>
-      Promise.resolve(id === 'owner-2' ? { userId: 'owner-2', orgId: 'org-A' } : { userId: 'user-1', orgId: 'org-A' })
-    );
+    setSameOrgUsers();
+    orgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: false, editors: [] } } }));
+
+    await request(app)
+      .get('/api/crm-sync/config/list-1/hubspot')
+      .expect(403);
+  });
+
+  it('returns 403 when org member is not the list owner and not a CRM editor (ENG-686)', async () => {
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+    setSameOrgUsers();
+    orgDb.getOrgById.mockResolvedValue(orgWithCrm());
+
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ autoSyncEnabled: false })
+      .expect(403);
+
+    expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
+    expect(res.body.error).toMatch(/access denied/i);
+  });
+
+  it('allows a listed crm.editor to save config for another member\'s list', async () => {
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+    setSameOrgUsers();
+    orgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: ['user-1'] } } }));
     externalCrmSyncService.saveConfig.mockResolvedValue({
       provider: 'hubspot', listId: 'list-1', userId: 'user-1',
       autoSyncEnabled: false, contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [],
@@ -477,6 +520,76 @@ describe('Org-aware access control on CRM sync routes', () => {
       .expect(200);
 
     expect(res.body.configured).toBe(true);
+    expect(externalCrmSyncService.saveConfig).toHaveBeenCalled();
+  });
+
+  it('allows the org owner to save config for another member\'s list', async () => {
+    crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+    setSameOrgUsers();
+    orgDb.getOrgById.mockResolvedValue(orgWithCrm({ ownerUserId: 'user-1' }));
+    externalCrmSyncService.saveConfig.mockResolvedValue({
+      provider: 'hubspot', listId: 'list-1', userId: 'user-1',
+      autoSyncEnabled: false, contactFieldMapping: [], dealFieldMapping: [], customFieldMapping: [],
+      deleteOnPush: false, deleteOnPull: false, webhookEnabled: true, webhookSecret: 'abc',
+      createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+    });
+
+    const res = await request(app)
+      .put('/api/crm-sync/config/list-1/hubspot')
+      .send({ autoSyncEnabled: false })
+      .expect(200);
+
+    expect(res.body.configured).toBe(true);
+    expect(externalCrmSyncService.saveConfig).toHaveBeenCalled();
+  });
+
+  // Every other mutating endpoint on this router must apply the same rule.
+  // Table-driven so each of the 8 remaining write endpoints gets all three
+  // cases without hand-rolling near-identical blocks (ENG-686).
+  const otherMutatingEndpoints: Array<{
+    name: string;
+    method: 'post' | 'put' | 'delete';
+    path: string;
+    body?: Record<string, any>;
+    successStatus: number;
+  }> = [
+    { name: 'disconnect account', method: 'delete', path: '/api/crm-sync/config/list-1/hubspot/account', successStatus: 200 },
+    { name: 'delete sync config', method: 'delete', path: '/api/crm-sync/config/list-1/hubspot', successStatus: 200 },
+    { name: 'create lifecycle stage', method: 'post', path: '/api/crm-sync/lifecycle-stages/list-1/hubspot', body: { label: 'Test Stage' }, successStatus: 200 },
+    { name: 'change pipeline', method: 'put', path: '/api/crm-sync/config/list-1/hubspot/pipeline', body: { externalPipelineId: 'pipe-1' }, successStatus: 200 },
+    { name: 'test connection (persists on success)', method: 'post', path: '/api/crm-sync/test/list-1/hubspot', body: {}, successStatus: 200 },
+    { name: 'push leads', method: 'post', path: '/api/crm-sync/push/list-1/hubspot', body: {}, successStatus: 202 },
+    { name: 'pull contacts', method: 'post', path: '/api/crm-sync/pull/list-1/hubspot', body: {}, successStatus: 200 },
+    { name: 'delete lead from CRM', method: 'post', path: '/api/crm-sync/delete-lead/list-1/hubspot', body: { lead: { leadId: 'lead-1' } }, successStatus: 200 },
+  ];
+
+  describe.each(otherMutatingEndpoints)('$name (ENG-686)', ({ method, path, body, successStatus }) => {
+    it('returns 403 for a same-org member who is not the owner and not a CRM editor', async () => {
+      crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+      setSameOrgUsers();
+      orgDb.getOrgById.mockResolvedValue(orgWithCrm());
+
+      const res = await request(app)[method](path).send(body ?? {});
+      expect(res.status).toBe(403);
+    });
+
+    it('allows a listed crm.editor', async () => {
+      crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+      setSameOrgUsers();
+      orgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: ['user-1'] } } }));
+
+      const res = await request(app)[method](path).send(body ?? {});
+      expect(res.status).toBe(successStatus);
+    });
+
+    it('allows the org owner', async () => {
+      crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+      setSameOrgUsers();
+      orgDb.getOrgById.mockResolvedValue(orgWithCrm({ ownerUserId: 'user-1' }));
+
+      const res = await request(app)[method](path).send(body ?? {});
+      expect(res.status).toBe(successStatus);
+    });
   });
 });
 
