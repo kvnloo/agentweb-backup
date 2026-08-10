@@ -7967,6 +7967,70 @@ export const agentModeController = {
   },
 
 
+  /**
+   * POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
+   *
+   * ENG-827 (Greptile): a REVOKE-ONLY lever for a schedule's unattended publishing.
+   *
+   * The setting itself is not writable from the generic update body or the MCP
+   * allowlist, because a model that could GRANT it would be manufacturing standing
+   * consent to post under the owner's name. Revoking is the opposite: it can only ever
+   * make a schedule safer, and it is what lets an owner (or Emma acting on their spoken
+   * instruction — "stop auto-posting on this one") stop future unattended publishing
+   * without hunting through the schedule form.
+   *
+   * The asymmetry is enforced here rather than trusted to the caller: `authorized: true`
+   * is REJECTED outright. There is no request shape that turns publishing on.
+   *
+   * ENG-803's concern is real and is why this stays revoke-only: a model able to switch
+   * the hold ON could quietly stop a schedule publishing and then truthfully cite the
+   * block, recreating that ticket's bug through a legitimate mechanism. That failure is
+   * visible, durable and reversible by the owner — a stray grant would be an
+   * irreversible public post — so the two directions do not deserve the same treatment.
+   */
+  async revokeScheduledChatPublishConsent(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+      const { authorized } = req.body || {};
+
+      if (authorized !== false) {
+        return res.status(403).json({
+          error:
+            'This endpoint can only REVOKE unattended publishing (send { "authorized": false }). ' +
+            'Turning it back on is done by the owner on the schedule form — it means posts go out ' +
+            'without anyone seeing them first, so it is not grantable through the API.',
+        });
+      }
+
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      // Written on its own, never as part of a larger body: a partial SET expression
+      // touching this key alone cannot be clobbered by a concurrent generic update.
+      await scheduleDb.updateSchedule(scheduleId, {
+        requirePublishApproval: true,
+        updatedAt: new Date().toISOString(),
+      } as any);
+
+      console.log(
+        `AgentMode: ENG-827 publish consent REVOKED for schedule ${scheduleId} by user ${user.userId}.`
+      );
+
+      res.json({
+        requirePublishApproval: true,
+        message:
+          'This schedule will now draft content and tell you what is waiting, instead of publishing ' +
+          'to your connected accounts. Turn it back on from the schedule form when you want it to publish again.',
+      });
+    } catch (error) {
+      console.error('AgentMode: Revoke scheduled chat publish consent error:', error);
+      res.status(500).json({ error: 'Failed to revoke publish consent' });
+    }
+  },
+
   async toggleScheduledChatStatus(req: Request, res: Response) {
     try {
       const user = req.user as User;

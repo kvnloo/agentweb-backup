@@ -503,6 +503,7 @@ mcpToolRegistry.register({
         variable_values: { type: 'object', description: 'Initial variable values (create/update)' },
         llm_model: { type: 'string', description: 'LLM model to use (create/update)' },
         session_id: { type: 'string', description: 'Existing chat session ID to base the schedule on (create only)' },
+        revoke_autopublish: { type: 'boolean', description: 'Set true to STOP this schedule publishing to the user\'s live connected accounts on its unattended runs, so future runs draft the content and tell them what is waiting instead. Revoking is always safe and always allowed. You CANNOT turn it back on — that means posts go live without the user ever seeing them, so only they can do it, on the schedule form. If a user asks you to enable automatic posting, point them there and never claim you have enabled it.' },
         status: { type: 'string', enum: ['active', 'paused'], description: 'Status (toggle only)' }
       },
       required: ['action']
@@ -554,17 +555,29 @@ mcpToolRegistry.register({
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
 
-        // ENG-827/ENG-803: the schedule's unattended-publish setting is NOT reachable
-        // from here, in either direction, and is deliberately absent from this
-        // allowlist. The model can neither grant itself publishing authority nor
-        // silence its own publishing — one able to switch the hold on could durably
-        // recreate ENG-803's reported bug (a run that quietly stops posting) at the
-        // schedule level, which is worse than the single-run refusal it replaces. Only
-        // the owner changes it, from the schedule form. A source-scanning test in
-        // schedulePublishApproval.mcpGuard.test.ts enforces this, so do not name the
-        // field here — the field name itself is what that guard greps for.
+        // ENG-827: the publish setting never travels on this generic body — that route
+        // ignores it, so a revoke sent there would be silently dropped. It goes to the
+        // dedicated revoke-only endpoint, and it goes FIRST: if the ordinary update then
+        // fails, the schedule is already in the SAFER (not publishing) state. Revoking
+        // afterwards would leave publishing enabled whenever the second call failed.
+        //
+        // ONE DIRECTION ONLY. The endpoint rejects anything but `authorized: false`, so
+        // no argument the model can pass turns publishing on. Do not name the underlying
+        // schedule field anywhere in this file — a source-scanning test
+        // (schedulePublishApproval.mcpGuard.test.ts) enforces that it stays unwritable
+        // through the generic surface.
+        let publishConsent: any;
+        if (args.revoke_autopublish === true) {
+          publishConsent = await mcpFetch({
+            method: 'POST',
+            path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/publish-consent`,
+            context: c,
+            body: { authorized: false },
+          });
+        }
+
         const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
-        return jsonResult(data);
+        return jsonResult(publishConsent ? { ...(data as any), publishConsent } : data);
       }
       case 'toggle': {
         const data = await mcpFetch({ method: 'PATCH', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/toggle`, context: c, body: { status: args.status } });

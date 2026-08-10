@@ -272,6 +272,11 @@ router.post('/scheduled-chats/:scheduleId/variables', asyncHandler(agentModeCont
 // Test scheduled chat
 router.post('/scheduled-chats/:scheduleId/test', asyncHandler(agentModeController.testScheduledChat));
 
+// POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
+// ENG-827: REVOKE-ONLY. Accepts { authorized: false } and nothing else — the grant
+// direction is deliberately unreachable from the API (see the controller).
+router.post('/scheduled-chats/:scheduleId/publish-consent', asyncHandler(agentModeController.revokeScheduledChatPublishConsent));
+
 // PATCH /api/agent-mode/scheduled-chats/:scheduleId/toggle
 // Toggle scheduled chat status (enable/disable)
 router.patch('/scheduled-chats/:scheduleId/toggle', asyncHandler(agentModeController.toggleScheduledChatStatus));
