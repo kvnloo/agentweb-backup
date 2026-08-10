@@ -162,7 +162,8 @@ router.post("/", authenticateToken, async (req, res) => {
         // never populated — otherwise a partial save wipes the fields the caller
         // did not touch (ENG-927).
         existingSource =
-          (await resolveOrgProfileField(user, org, "marketStrategy")) || null;
+          (await resolveOrgProfileField(user, org, "marketStrategy", { forWrite: true })) ||
+          null;
       }
 
       const existingMarketStrategyMerged = existingSource || {

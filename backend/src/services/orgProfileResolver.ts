@@ -29,7 +29,8 @@ export type OrgProfileField = "brandGuidelines" | "marketStrategy";
 export async function resolveOrgProfileField(
   user: any,
   org: any | null | undefined,
-  field: OrgProfileField
+  field: OrgProfileField,
+  opts?: { forWrite?: boolean }
 ): Promise<any> {
   if (!org) return user?.[field];
   if (org[field]) return org[field];
@@ -47,6 +48,22 @@ export async function resolveOrgProfileField(
     // editor's personal brand/strategy to the whole org. `analyticsConfigResolver`
     // leaves its owner lookup unguarded for the same reason.
     const owner: any = await userDb.getUserById(ownerUserId);
+    // A MISSING owner record is not the same as an owner who has no brand yet,
+    // and on a write path the difference is permanent. The caller is about to
+    // merge this baseline and persist it as the ORG profile — and once the org
+    // record is populated the fallback stops firing for good, so a partial save
+    // built on a phantom-empty baseline masks the owner's real data forever.
+    // That is precisely the ENG-927 failure this resolver exists to prevent.
+    // `getUserById` reads the eventually consistent UserIdIndex GSI, so "not
+    // found" can just mean "not visible yet". Fail closed where the result gets
+    // persisted; on reads, degrade as before — nothing is written and the next
+    // request self-heals, whereas throwing would turn a transient GSI miss into
+    // a 500 on /me and the settings pages.
+    if (!owner && opts?.forWrite) {
+      throw new Error(
+        `orgProfileResolver: owner ${ownerUserId} of org ${org.orgId} not found — refusing to build a ${field} write baseline`
+      );
+    }
     fallback = owner?.[field];
   }
 

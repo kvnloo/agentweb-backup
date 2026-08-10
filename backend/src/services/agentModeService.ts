@@ -9074,7 +9074,7 @@ export class AgentModeService {
         }
         // Same owner-record fallback as the brand path — merging onto an
         // unpopulated org record would drop the owner's competitors/ICPs.
-        existingMarketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
+        existingMarketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy', { forWrite: true });
       } else {
         existingMarketStrategy = user.marketStrategy;
       }
@@ -12817,7 +12817,7 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         // Fall back to the org owner's record when the org record was never
         // populated, so a tweak merges onto the existing brand instead of
         // building a fresh empty structure over it (ENG-927).
-        existingBrand = await resolveOrgProfileField(user, org, 'brandGuidelines');
+        existingBrand = await resolveOrgProfileField(user, org, 'brandGuidelines', { forWrite: true });
       } else {
         existingBrand = user.brandGuidelines;
       }

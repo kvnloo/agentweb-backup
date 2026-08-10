@@ -299,7 +299,8 @@ router.post(
           existingBrandGuidelines = await resolveOrgProfileField(
             user,
             postOrg,
-            "brandGuidelines"
+            "brandGuidelines",
+            { forWrite: true }
           );
         }
       }
