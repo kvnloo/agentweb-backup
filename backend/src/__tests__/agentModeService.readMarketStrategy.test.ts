@@ -364,6 +364,41 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(worse.competitorsWithFullDetail).toBe(baseline.competitorsWithFullDetail);
   });
 
+  // The paging instructions are meaningful ONLY in a tool result. The CRM email
+  // drafter embeds formattedContent in a prompt that cannot call any tool, so
+  // telling it to "call read_market_strategy again with competitorOffset" is at
+  // best noise and at worst leaks offset chatter into customer-facing copy.
+  it('omits tool-calling instructions when the caller embeds the content in its own prompt', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
+
+    const res = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 40, pagingHints: false } as any);
+
+    expect(res.formattedContent).not.toMatch(/competitorOffset/);
+    expect(res.formattedContent).not.toMatch(/nextCompetitorOffset/);
+    expect(res.formattedContent).not.toMatch(/read_market_strategy/);
+    expect(res.formattedContent).not.toMatch(/\[offset \d+\]/);
+  });
+
+  it('still names every competitor and states the true total without paging hints', async () => {
+    const competitors = makeCompetitors(49);
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(competitors)));
+
+    const res = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 40, pagingHints: false } as any);
+
+    expect(res.formattedContent).toContain('49 total');
+    expect(res.competitorsWithFullDetail).toBe(40);
+    for (const c of competitors) expect(res.formattedContent).toContain(c.name);
+  });
+
+  it('keeps the paging instructions on the default tool path', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.formattedContent).toMatch(/competitorOffset/);
+    expect(res.formattedContent).toMatch(/\[offset \d+\]/);
+  });
+
   it('exposes competitorOffset on the tool schema so the model can actually ask for it', async () => {
     require('../emma/tools');
     const { emmaToolRegistry } = require('../emma/registry');
