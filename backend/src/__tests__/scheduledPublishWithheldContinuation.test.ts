@@ -27,6 +27,7 @@
 import {
   scheduledRunWithheldPublish,
   classifyScheduledContinuation,
+  classifyScheduledContinuationAsync,
 } from '../controllers/agentModeController';
 
 const MARKER = 'PUBLISH WITHHELD: this schedule requires approval before publishing.';
@@ -105,5 +106,87 @@ describe('classifyScheduledContinuation — publish-withheld exemption (ENG-803)
     expect(
       classifyScheduledContinuation({ content: 'Should I proceed with sending these?' })
     ).toBe('confirmation');
+  });
+});
+
+/**
+ * ENG-803 — the authorization must be the one that is true NOW (Greptile review #30).
+ *
+ * A scheduled run lives for minutes and the owner can flip "Require approval before
+ * publishing" while it is in flight. The prompt builder and the dispatch guard both
+ * re-read the record when they act, so a boolean snapshotted at worker start is a
+ * third, disagreeing opinion. The dangerous direction is a stale `false`: the owner
+ * has just AUTHORIZED publishing, but the run still believes its own model-authored
+ * marker and suppresses the corrective continuation — ENG-803's "finished without
+ * posting" failure rebuilt out of a cache.
+ *
+ * These tests drive the resolver directly, which is the only way to express "the
+ * value CHANGED mid-run" — a plain boolean parameter cannot represent it, and that
+ * un-representability was the bug.
+ *
+ * The withheld report matches the confirmation regex, so scheduledTurnDefersToUser
+ * short-circuits on its fast path and no LLM judge call is made.
+ */
+describe('classifyScheduledContinuationAsync — live publish authorization (ENG-803)', () => {
+  const withheldReport = 'Drafts saved. Nothing was posted; these are awaiting your approval.';
+  const withheldContent = `${withheldReport}\n\n${MARKER}`;
+
+  it('refuses the exemption once the owner AUTHORIZES publishing mid-run', async () => {
+    // The regression: snapshot said "withheld", the owner has since said "publish".
+    // The marker must stop being believed the moment the record says authorized.
+    expect(
+      await classifyScheduledContinuationAsync({ content: withheldContent }, async () => true)
+    ).toBe('confirmation');
+  });
+
+  it('honours the exemption while the record still withholds', async () => {
+    expect(
+      await classifyScheduledContinuationAsync({ content: withheldContent }, async () => false)
+    ).toBeNull();
+  });
+
+  it('re-reads on EVERY classification rather than caching the first answer', async () => {
+    // The staleness proof: one resolver, two calls, the record changed in between.
+    let authorized = false;
+    const resolver = jest.fn(async () => authorized);
+
+    expect(await classifyScheduledContinuationAsync({ content: withheldContent }, resolver)).toBeNull();
+    authorized = true;
+    expect(
+      await classifyScheduledContinuationAsync({ content: withheldContent }, resolver)
+    ).toBe('confirmation');
+    expect(resolver).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses the exemption when the record cannot be read', async () => {
+    // A DynamoDB blip must not manufacture the one value that makes model-authored
+    // text believable. Costs one bounded continuation; the dispatch guard still
+    // independently refuses any unauthorized publish the continuation attempts.
+    expect(
+      await classifyScheduledContinuationAsync({ content: withheldContent }, async () => undefined)
+    ).toBe('confirmation');
+  });
+
+  it('never honours the marker for a caller with no schedule to read', async () => {
+    expect(await classifyScheduledContinuationAsync({ content: withheldContent })).toBe('confirmation');
+  });
+
+  it('does not read the schedule on a turn that emitted no marker', async () => {
+    // Lazy by design: the exemption is the only consumer, so a turn without the
+    // marker must not pay a schedule read on every completion-gate evaluation.
+    const resolver = jest.fn(async () => false);
+    expect(
+      await classifyScheduledContinuationAsync({ content: 'Posted 5 replies.' }, resolver)
+    ).toBeNull();
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
+  it('still continues a withheld run that was truncated, whatever the live value', async () => {
+    expect(
+      await classifyScheduledContinuationAsync(
+        { content: withheldContent, truncatedByStepBudget: true },
+        async () => false
+      )
+    ).toBe('budget');
   });
 });
