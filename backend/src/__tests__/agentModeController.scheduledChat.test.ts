@@ -984,6 +984,55 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(requeue).toBeUndefined();
       });
 
+      // A run that published 1 of 5 pages and died must NOT be abandoned part-done.
+      // Resume continues the SAME session from its last settled step, so the rest
+      // finishes and the publish is not repeated.
+      it('requeues as a RESUME when the transcript can be safely continued', async () => {
+        const balanced = [
+          { role: 'system', content: 'automated run' },
+          { role: 'user', content: 'Publish the five vertical landers.' },
+          { role: 'assistant', content: 'Publishing the first.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+          { role: 'tool', tool_call_id: 'p1', content: '{"success":true}' },
+        ];
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(balanced);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions: { publish_landing_page_changes: 1 },
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        const requeue = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1
+        );
+        expect(requeue).toBeDefined();
+        // The marker that makes the retry CONTINUE instead of restart.
+        expect(requeue![1].pendingResumeSessionId).toBe('test-session-123');
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note![1].content).toContain('published your landing-page changes');
+        expect(note![1].content).toMatch(/pick up where this run left off/i);
+        // No owner alert: nothing needs a human when the run self-heals.
+        expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+      });
+
+      // Not safely continuable: stopping is right, but it must not be SILENT.
+      it('notifies the owner when a published run cannot be safely continued', async () => {
+        await runWithLedger({ publish_landing_page_changes: 1 });
+
+        expect(
+          mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantRetryCount === 1)
+        ).toBeUndefined();
+        expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalled();
+      });
+
       it('tells the user what went live and that it will not be retried', async () => {
         await runWithLedger({ publish_landing_page_changes: 1 });
 
