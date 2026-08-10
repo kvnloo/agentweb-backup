@@ -501,6 +501,36 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(res.competitorsWithFullDetail).toBe(40);
   });
 
+  // Greptile P1: `listed > 0` admitted the first name-index entry however long it
+  // was, so one pathological competitor name blew the index budget. Enforcing the
+  // cap strictly means the index can legitimately be EMPTY — which must not crash
+  // and must not hide anyone: the remainder line then accounts for all of them.
+  it('enforces the name-index budget even on the first entry', async () => {
+    const competitors = makeCompetitors(3, 'Small', 2000);
+    competitors[1].name = 'X'.repeat(9000);
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(competitors)));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.totalCompetitors).toBe(3);
+    expect(res.formattedContent).toContain('3 total');
+    expect(res.formattedContent).not.toContain('X'.repeat(9000));
+  });
+
+  it('does not crash when the name index is squeezed to nothing', async () => {
+    const competitors = makeCompetitors(4, 'Tiny', 2500);
+    competitors.forEach((c, i) => { if (i > 0) c.name = 'N'.repeat(5000); });
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(competitors)));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.success).toBe(true);
+    expect(res.totalCompetitors).toBe(4);
+    // Everyone unaccounted for by name is still counted and still reachable.
+    expect(res.formattedContent).toMatch(/more stored competitor/);
+    expect(res.formattedContent).toMatch(/competitorOffset/);
+  });
+
   it('exposes competitorOffset on the tool schema so the model can actually ask for it', async () => {
     require('../emma/tools');
     const { emmaToolRegistry } = require('../emma/registry');
