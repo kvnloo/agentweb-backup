@@ -587,21 +587,6 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       }, after: ${updatedAttachments.length}`
     );
 
-    // Delete from S3
-    if (s3Key) {
-      try {
-        await s3
-          .deleteObject({
-            Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
-            Key: s3Key,
-          })
-          .promise();
-      } catch (s3Error) {
-        console.warn("Failed to delete from S3:", s3Error);
-        // Continue with database update even if S3 deletion fails
-      }
-    }
-
     // Update brand guidelines
     const updatedBrandGuidelines = {
       ...brandGuidelines,
@@ -610,37 +595,35 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     };
 
     if (isOrgLevel) {
-      await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedBrandGuidelines });
-      console.log(`[BRAND DEBUG] Successfully updated org brand guidelines after asset deletion`);
-
-      // The attachments came from the org owner's record, but the pruned list
-      // was just written to the ORG. Prune the source too: the S3 object is
-      // gone, so leaving the owner's record pointing at it keeps a dead
-      // reference that resurfaces the moment the org is deleted (that clears
-      // orgId and sends reads back to the user record).
+      // The attachments came from the org OWNER's record, so prune that source
+      // BEFORE promoting the pruned copy onto the org. Order is the whole point:
+      // this write is the one most likely to fail (a second record, a second
+      // table call), and doing it first means a failure aborts the request with
+      // nothing destroyed and a clean retry. Pruning it afterwards can only ever
+      // fail in the one direction that matters — owner still pointing at an
+      // object we have already deleted, a dead reference that resurfaces the
+      // moment the org is deleted (that clears orgId and sends reads back to the
+      // user record). Deliberately uncaught: it is part of the delete, not tidy-up.
       if (fallbackOwnerUserId) {
-        try {
-          const ownerRecord: any =
-            fallbackOwnerUserId === user.userId ? user : await userDb.getUserById(fallbackOwnerUserId);
-          const ownerAttachments: any[] = ownerRecord?.brandGuidelines?.attachments || [];
-          const prunedOwnerAttachments = ownerAttachments.filter((attachment: any) =>
-            isValidKey ? attachment.key !== key : attachment.url !== urlFallback
-          );
-          if (prunedOwnerAttachments.length !== ownerAttachments.length) {
-            await userDb.updateUser(fallbackOwnerUserId, {
-              brandGuidelines: {
-                ...ownerRecord.brandGuidelines,
-                attachments: prunedOwnerAttachments,
-                updatedAt: new Date().toISOString(),
-              },
-            });
-          }
-        } catch (ownerPruneError) {
-          // The authoritative org write already succeeded — a failure to tidy
-          // the source record must not fail the delete.
-          console.warn("Failed to prune the owner's source attachments:", ownerPruneError);
+        const ownerRecord: any =
+          fallbackOwnerUserId === user.userId ? user : await userDb.getUserById(fallbackOwnerUserId);
+        const ownerAttachments: any[] = ownerRecord?.brandGuidelines?.attachments || [];
+        const prunedOwnerAttachments = ownerAttachments.filter((attachment: any) =>
+          isValidKey ? attachment.key !== key : attachment.url !== urlFallback
+        );
+        if (prunedOwnerAttachments.length !== ownerAttachments.length) {
+          await userDb.updateUser(fallbackOwnerUserId, {
+            brandGuidelines: {
+              ...ownerRecord.brandGuidelines,
+              attachments: prunedOwnerAttachments,
+              updatedAt: new Date().toISOString(),
+            },
+          });
         }
       }
+
+      await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedBrandGuidelines });
+      console.log(`[BRAND DEBUG] Successfully updated org brand guidelines after asset deletion`);
     } else {
       await dynamodb
         .update({
@@ -655,6 +638,23 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
         })
         .promise();
       console.log(`[BRAND DEBUG] Successfully updated user brand guidelines after asset deletion`);
+    }
+
+    // Delete the S3 object LAST, once every record has stopped pointing at it.
+    // A failure here leaks bytes; a failure with this ordering reversed strands
+    // a reference to a key that no longer resolves, which is what the UI renders.
+    if (s3Key) {
+      try {
+        await s3
+          .deleteObject({
+            Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
+            Key: s3Key,
+          })
+          .promise();
+      } catch (s3Error) {
+        console.warn("Failed to delete from S3:", s3Error);
+        // The records are already updated — a stale object is not worth failing on.
+      }
     }
 
     res.json({ message: "Asset deleted successfully" });
