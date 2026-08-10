@@ -2,6 +2,7 @@ import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { orgMemoryDb, orgDb, userDb } from '../services/db';
 import { embedText } from '../utils/embeddings';
+import { callerCan } from "../services/orgAuthz";
 
 const router = express.Router();
 
@@ -51,7 +52,7 @@ router.put('/:orgId/memory/settings', async (req, res) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: 'Organization not found' });
 
-    if (org.ownerUserId !== userId) {
+    if (!(await callerCan(userId, org, "org:configure"))) {
       return res.status(403).json({ error: 'Only the org owner can change memory settings' });
     }
 
@@ -119,7 +120,7 @@ router.put('/:orgId/memory/:memoryId', async (req, res) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: 'Organization not found' });
 
-    if (org.ownerUserId !== userId) {
+    if (!(await callerCan(userId, org, "org:configure"))) {
       return res.status(403).json({ error: 'Only the org owner can edit org memories' });
     }
 
@@ -147,7 +148,7 @@ router.delete('/:orgId/memory/:memoryId', async (req, res) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: 'Organization not found' });
 
-    if (org.ownerUserId !== userId) {
+    if (!(await callerCan(userId, org, "org:configure"))) {
       return res.status(403).json({ error: 'Only the org owner can delete org memories' });
     }
 

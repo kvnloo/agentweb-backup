@@ -141,7 +141,10 @@ router.get('/me', authenticateToken, async (req, res) => {
         // is genuinely paying independently (same discriminator as getUserSubscriptionType).
         const hasOwnActiveSubscriptionForOverlay =
           user.subscription_status === 'active' || user.subscription_status === 'trialing';
-        if (!hasOwnActiveSubscriptionForOverlay && user.orgRole === 'member' && org?.ownerUserId && org.ownerUserId !== userId) {
+        // Keyed on the billing root rather than on `orgRole === 'member'`: an admin
+        // (or a second owner) is not "member", so the old test skipped the overlay
+        // and showed them their own empty billing record instead of the org's.
+        if (!hasOwnActiveSubscriptionForOverlay && org?.ownerUserId && org.ownerUserId !== userId) {
           const ownerUser = await userDb.getUserById(org.ownerUserId);
           if (ownerUser) {
             response.subscription_status = ownerUser.subscription_status;
