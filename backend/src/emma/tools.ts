@@ -7771,8 +7771,13 @@ async function resolveLeadForAction(
   if (!listId || !leadId) return { error: 'list_id and lead_id are required' };
   const list = await crmDb.getLeadListById(listId);
   if (!list) return { error: `Lead list ${listId} not found` };
-  if ((list as any).userId && (list as any).userId !== userId) {
-    return { error: 'Not authorized for this lead list' };
+  // ENG-1049: was a strict `list.userId !== userId` owner-only check, which
+  // over-blocked the org owner and listed crm.editors from acting on lists
+  // they don't personally own — inconsistent with every other CRM write
+  // surface. Delegate to the shared destructive guard instead.
+  const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('../services/crmAccessControl');
+  if (!(await canDestructiveCrmList(userId, list as any))) {
+    return { error: CRM_EDITOR_REQUIRED_MESSAGE };
   }
   const lead = await crmDb.getLeadById(listId, leadId);
   if (!lead) return { error: `Lead ${leadId} not found in list ${listId}` };
