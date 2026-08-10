@@ -716,6 +716,84 @@ run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
 check 'ENG-878: a Green deploy never invokes the probe' 0 'SUCCESS: environment'
 
 # ---------------------------------------------------------------------------
+# ENG-878 follow-up — EB_HEALTH_PROBE_DRYRUN exercises the probe on a healthy
+# deploy.
+#
+# The probe only runs when the rollup is still Grey/Red past the settle window,
+# which has not happened since #2264 merged. So the branch the fix exists for,
+# and the four extra IAM actions it needs, have never executed in production —
+# an inert probe and a working one look identical from outside. The dry run
+# makes the probe deliberately reachable on an ordinary Green deploy: it runs
+# the real AWS calls, reports what it saw, and never touches the exit status.
+# ---------------------------------------------------------------------------
+
+# A Green deploy with the dry run on: the probe runs, reports LAGGING-equivalent
+# healthy underlying signals, and the deploy still passes on its own merits.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1'
+check 'ENG-878 dry run: a Green deploy still succeeds' 0 'SUCCESS: environment'
+check 'ENG-878 dry run: and reports the probe verdict it would have used' 0 \
+  'probe dry run: verdict=LAGGING'
+check 'ENG-878 dry run: and says the verdict did not affect this deploy' 0 \
+  'did not affect this deploy'
+
+# The case this exists to catch: the deploy role is missing one of the four IAM
+# actions, so the probe is inert. Today that only surfaces during a real Red
+# rollup — i.e. exactly when it is too late. The dry run must name it loudly on
+# an otherwise-passing deploy, without failing that deploy.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'ERROR|An error occurred (AccessDenied) when calling the DescribeInstancesHealth operation\n' \
+  >"$M/instances_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1'
+check 'ENG-878 dry run: an inert probe does not fail a healthy deploy' 0 \
+  'SUCCESS: environment'
+check 'ENG-878 dry run: but it is reported as INERT, not quietly swallowed' 0 \
+  'probe dry run: verdict=UNKNOWN'
+check 'ENG-878 dry run: and names the denied AWS call' 0 'AccessDenied'
+
+# A genuinely unhealthy target under a Green rollup is still only an
+# observation: the dry run reports it and the deploy's own verdict stands.
+# Making the dry run able to fail a deploy would turn a diagnostic into a new
+# and untested gate.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'i-0d6a42c54cfc58bd7\tunhealthy\n' >"$M/target_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1'
+check 'ENG-878 dry run: never changes the deploy verdict' 0 'SUCCESS: environment'
+check 'ENG-878 dry run: reports UNHEALTHY as an observation' 0 \
+  'probe dry run: verdict=UNHEALTHY'
+
+# Default off: no flag, no extra AWS calls, output identical to before. This is
+# the property the merged fix deliberately has, and the dry run must not cost
+# every deploy four API calls to keep it.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60'
+check 'ENG-878 dry run: off by default' 0 'SUCCESS: environment'
+if printf '%s' "${LAST_OUTPUT}" | grep -qF 'probe dry run'; then
+  printf '  FAIL ENG-878 dry run: off by default emits no probe output\n       output:\n%s\n' \
+    "${LAST_OUTPUT}"
+  TESTS_FAILED=$(( TESTS_FAILED + 1 ))
+else
+  pass 'ENG-878 dry run: off by default emits no probe output'
+fi
+TESTS_RUN=$(( TESTS_RUN + 1 ))
+
+# The Red-rollup path is authoritative and must be unchanged by the flag: with
+# the dry run on, a real lagging rollup still passes through the normal probe
+# and reports the lag, not a dry-run observation.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1'
+check 'ENG-878 dry run: the authoritative Red path is unaffected' 0 'lagging aggregate'
+
+# ---------------------------------------------------------------------------
 
 printf '\n%s checks run, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ] || exit 1
