@@ -356,12 +356,19 @@ run_health_probe_dryrun() {
   # would burn the whole budget on a probe that already returned.
   local result="${TMPDIR:-/tmp}/eb-probe-dryrun.$$"
   rm -f "${result}" "${result}.partial"
+  # Job control puts the child in its own process group, so abandoning the probe
+  # can signal the whole tree. Killing only the wrapper subshell would leave the
+  # stalled `aws` descendant alive holding this script's stdout/stderr, and the
+  # runner can wait on those descriptors — which is the same already-confirmed-
+  # deploy-reported-as-failed defect, one level down.
+  set -m
   (
     underlying_health_verdict
     printf '%s\n%s\n' "${EB_HEALTH_VERDICT}" "${EB_UNHEALTHY_DETAIL:-}" >"${result}.partial"
     mv "${result}.partial" "${result}"
   ) &
   local pid=$!
+  set +m
 
   local waited=0
   while [ ! -f "${result}" ] && [ "${waited}" -lt "${budget}" ]; do
@@ -370,9 +377,11 @@ run_health_probe_dryrun() {
   done
 
   if [ ! -f "${result}" ]; then
-    kill -TERM "${pid}" 2>/dev/null || true
+    # Signal the group first (negative PID), so the stalled AWS call dies with
+    # its wrapper; fall back to the bare PID if the group is already gone.
+    kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
     sleep 1
-    kill -KILL "${pid}" 2>/dev/null || true
+    kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
     wait "${pid}" 2>/dev/null || true
     rm -f "${result}.partial"
     log "probe dry run: verdict=UNKNOWN detail=the probe did not finish within ${budget}s and was abandoned"

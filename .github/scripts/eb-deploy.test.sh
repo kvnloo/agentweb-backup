@@ -136,7 +136,9 @@ case "$operation" in
       fi
       if [ "${first%%|*}" = "SLEEP" ]; then
         # Simulates a stalled/throttled AWS call so the dry run's own timeout
-        # is exercised rather than assumed.
+        # is exercised rather than assumed. The PID is recorded so a test can
+        # prove the descendant was actually reaped, not just its wrapper.
+        printf '%s\n' "$$" >"${MOCK_DIR}/stall_pid"
         sleep "${first#*|}"
         printf 'None\n'
         exit 0
@@ -813,6 +815,18 @@ run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1' \
 check 'ENG-878 dry run: a stalled probe never fails the deploy' 0 'SUCCESS: environment'
 check 'ENG-878 dry run: the stall is reported, not swallowed' 0 'was abandoned'
 check 'ENG-878 dry run: and a stalled probe reads as INERT' 0 'probe dry run: INERT'
+
+# Abandoning the probe must kill the stalled AWS call itself, not just the shell
+# wrapping it: a surviving descendant keeps the script's stdout/stderr open and
+# can hold the already-successful step until the workflow timeout kills it.
+TESTS_RUN=$((TESTS_RUN + 1))
+stall_pid=$(cat "$M/stall_pid" 2>/dev/null || true)
+if [ -n "${stall_pid}" ] && ! kill -0 "${stall_pid}" 2>/dev/null; then
+  printf 'PASS: ENG-878 dry run: the stalled AWS descendant is killed, not just its wrapper\n'
+else
+  TESTS_FAILED=$((TESTS_FAILED + 1))
+  printf 'FAIL: ENG-878 dry run: the stalled AWS descendant is killed, not just its wrapper (pid=%s)\n' "${stall_pid:-<none>}"
+fi
 
 # With almost none of the deploy budget left, the diagnostic is skipped outright
 # rather than spending the seconds the script needs to exit on its own terms.
