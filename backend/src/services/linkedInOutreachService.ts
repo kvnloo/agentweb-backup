@@ -410,9 +410,13 @@ export class LinkedInOutreachService {
   /**
    * People-search capability canary (ENG-975).
    *
-   * LinkedIn can revoke an account's people-search capability — commercial-use
-   * limit, search restriction, a soft block — while leaving profile reads and
-   * invitation lists fully functional. Unipile relays that as HTTP 200 with
+   * An account can lose its people-search capability while leaving profile
+   * reads and invitation lists fully functional. Confirmed cause for the
+   * reported outage: an open Unipile incident (2026-08) — LinkedIn is rolling
+   * out changes to Classic Search account by account, so a given account either
+   * searches normally or returns zero for everything. A commercial-use limit,
+   * search restriction or soft block produces the same shape. Whatever the
+   * cause, Unipile relays it as HTTP 200 with
    * `items: []` and `paging.total_count: 0`, which is byte for byte what a
    * genuine no-match looks like. So a zero-result search alone cannot tell
    * "nobody matches" from "this account can no longer search", and callers that

@@ -1,9 +1,11 @@
 /**
  * ENG-975 — people-search capability canary.
  *
- * LinkedIn can revoke an account's people-search capability (commercial-use
- * limit / search restriction) while leaving profile reads and invitation lists
- * fully functional. Unipile relays that as HTTP 200 with `items: []` and
+ * An account can lose its people-search capability (an open Unipile incident as
+ * of 2026-08 — LinkedIn is rolling out Classic Search changes account by
+ * account — or a commercial-use limit / search restriction) while leaving
+ * profile reads and invitation lists fully functional. Unipile relays that as
+ * HTTP 200 with `items: []` and
  * `paging.total_count: 0` — byte for byte identical to a genuine no-match, so a
  * caller cannot tell "nobody matches" from "search is broken". Confirmed in
  * production: every query on one account returned that exact payload while

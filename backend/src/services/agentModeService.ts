@@ -854,11 +854,11 @@ export interface DiagnosisContext {
 const LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE = [
   'LinkedIn returned zero results for a maximally broad control query on this account, so the people-search endpoint is NOT working for it right now. This is not "no one matches your filters" — the search itself is unavailable.',
   '',
-  'This is account-scoped and specific to search: profile lookups, connection lists and invitation lists on the same account keep working, so a successful get-profile does NOT mean search is healthy. LinkedIn applies this when an account hits its commercial-use search limit or is temporarily restricted, and it typically clears on its own.',
+  'This is account-scoped and specific to search: profile lookups, connection lists and invitation lists on the same account keep working, so a successful get-profile does NOT mean search is healthy. As of 2026-08-10 the known cause is an open Unipile incident — LinkedIn is rolling out changes to Classic Search account by account, and an affected account returns zero results for every query until Unipile ships its adapted integration. The same symptom also appears when an account hits its commercial-use search limit or is temporarily restricted.',
   '',
   'DO NOT retry with different keywords, filters, or a search URL — every variant returns the same empty result and burns attempts. Stop searching now.',
   '',
-  'Report to the user that LinkedIn search is currently unavailable for their account and that no prospects could be sourced this run — never report this as "no matching people were found". If a monthly search limit is the cause it resets at the start of the next month; otherwise retry the run in a few hours.',
+  'Report to the user that LinkedIn search is currently unavailable for their account and that no prospects could be sourced this run — never report this as "no matching people were found". Their account is not broken and reconnecting it will not help, so do not tell them to reconnect. Do not promise a specific recovery time: say the outage is upstream at LinkedIn/Unipile and the run will resume sourcing once search returns for their account.',
 ].join('\n');
 
 /**
