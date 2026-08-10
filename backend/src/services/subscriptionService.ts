@@ -74,7 +74,14 @@ export async function getUserSubscriptionType(userId: string): Promise<string> {
     // already used throughout stripeService.ts).
     const hasOwnActiveSubscription =
       user?.subscription_status === "active" || user?.subscription_status === "trialing";
-    if (user?.orgId && user.orgRole === "member" && !hasOwnActiveSubscription && orgDb?.getOrgById) {
+    // Anchored on the org's billing root (Organization.ownerUserId), NOT on a role.
+    // This used to read `user.orgRole === "member"` as a stand-in for "not the
+    // owner", which silently breaks the moment a third role exists: an admin is
+    // neither "member" nor the billing root, so they fell through to :103 and were
+    // downgraded to their own (usually empty) subscription — Free tier, no error,
+    // no log. Every org member except the billing root inherits, which is correct
+    // for members, admins, and second owners alike.
+    if (user?.orgId && !hasOwnActiveSubscription && orgDb?.getOrgById) {
       // Isolated from the outer catch: a transient failure resolving the org
       // (network blip, throttling) must fall back to the user's own already-
       // fetched tier, not the hard "Free" default — we have real user data in
