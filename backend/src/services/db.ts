@@ -3061,6 +3061,13 @@ export const scheduleDb = {
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions). Default off.
       fullAutonomy?: boolean;
+      // ENG-803: owner opt-OUT holding this schedule's unattended runs at the publish
+      // step. Distinct from fullAutonomy on purpose: that waives "pause and ask me"
+      // on mid-run decisions, which is not the same consent as "post to the world on
+      // my behalf". Settable ONLY by the owner — deliberately absent from the
+      // manage_scheduled_chat MCP allowlist so the model can neither grant itself
+      // publishing authority nor silence its own publishing. Default off (= publish).
+      requirePublishApproval?: boolean;
       promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;
