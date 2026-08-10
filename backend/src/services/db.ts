@@ -3096,7 +3096,12 @@ export const scheduleDb = {
       zeroAssistantRetryCount: number;
       lastZeroAssistantOutputAt: string;
       lastZeroAssistantOutputSessionId: string;
-    }>
+    }>,
+    /**
+     * ENG-827: attributes that must STILL hold for this write to land, as read a
+     * moment ago. `undefined` means the attribute must still be absent.
+     */
+    expect?: Record<string, any>
   ) {
     try {
       const updateExpressions: string[] = [];
@@ -3109,7 +3114,25 @@ export const scheduleDb = {
         expressionAttributeValues[`:${key}`] = value;
       });
 
-      const params = {
+      // ENG-827: an optional "only if this is still true" clause. A caller that
+      // DERIVES what it writes from what it read cannot write unconditionally — a
+      // concurrent edit between the two turns the write into a decision nobody made.
+      // Expressed as expected attribute values so the check and the write are one
+      // operation; on mismatch DynamoDB throws ConditionalCheckFailedException and
+      // the caller decides what to tell the user.
+      const conditionExpressions: string[] = [];
+      Object.entries(expect || {}).forEach(([key, value], index) => {
+        const alias = `expected${index}`;
+        expressionAttributeNames[`#${alias}`] = key;
+        if (value === undefined) {
+          conditionExpressions.push(`attribute_not_exists(#${alias})`);
+          return;
+        }
+        conditionExpressions.push(`#${alias} = :${alias}`);
+        expressionAttributeValues[`:${alias}`] = value;
+      });
+
+      const params: any = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         Key: {
           scheduleId,
@@ -3119,6 +3142,9 @@ export const scheduleDb = {
         ExpressionAttributeValues: expressionAttributeValues,
         ReturnValues: "ALL_NEW",
       };
+      if (conditionExpressions.length > 0) {
+        params.ConditionExpression = conditionExpressions.join(" AND ");
+      }
 
       const result = await dynamodb.update(params).promise();
       return result.Attributes;

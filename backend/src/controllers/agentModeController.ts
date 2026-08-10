@@ -8038,13 +8038,41 @@ export const agentModeController = {
         });
       }
 
-      await scheduleDb.updateSchedule(scheduleId, {
-        autopublishAuthorized: authorized,
-        autopublishAuthorizedTools: authorized ? approvedTools : [],
-        autopublishAuthorizedAt: authorized ? new Date().toISOString() : null,
-        autopublishAuthorizedBy: authorized ? user.userId : null,
-        updatedAt: new Date().toISOString(),
-      } as any);
+      try {
+        await scheduleDb.updateSchedule(
+          scheduleId,
+          {
+            autopublishAuthorized: authorized,
+            autopublishAuthorizedTools: authorized ? approvedTools : [],
+            autopublishAuthorizedAt: authorized ? new Date().toISOString() : null,
+            autopublishAuthorizedBy: authorized ? user.userId : null,
+            updatedAt: new Date().toISOString(),
+          } as any,
+          // ENG-827 (Greptile): a GRANT writes a scope DERIVED from the required tools
+          // read a few lines up. If a concurrent edit changes those tools in between,
+          // an unconditional write records consent for a tool set the owner never saw.
+          // Bind the write to the read: same tools, or no grant.
+          //
+          // A REVOKE is not conditioned. It narrows permission no matter what else
+          // changed, and making it fail on a concurrent edit would be a refusal to
+          // take away a permission — the one direction that must always be available.
+          authorized ? { requiredFunctionCalls: schedule.requiredFunctionCalls } : undefined
+        );
+      } catch (writeError: any) {
+        if (writeError?.code === 'ConditionalCheckFailedException' || writeError?.name === 'ConditionalCheckFailedException') {
+          console.warn(
+            `AgentMode: ENG-827 publish consent grant for schedule ${scheduleId} refused — its required tools changed during the request.`
+          );
+          return res.status(409).json({
+            error:
+              'This schedule\'s required functions changed while you were authorizing it, so nothing was ' +
+              'saved — the authorization would have covered a different set of tools than the one you ' +
+              'approved. Reopen the schedule to see its current tools, then turn on "Publish without my ' +
+              'review" again if it still looks right.',
+          });
+        }
+        throw writeError;
+      }
 
       console.log(
         `AgentMode: ENG-827 publish consent ${authorized ? 'GRANTED' : 'REVOKED'} for schedule ` +

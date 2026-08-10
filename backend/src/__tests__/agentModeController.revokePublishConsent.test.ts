@@ -60,7 +60,9 @@ describe('scheduled-chat publish consent (ENG-827)', () => {
         autopublishAuthorized: true,
         autopublishAuthorizedTools: ['post_on_connected_account'],
         autopublishAuthorizedBy: OWNER,
-      })
+      }),
+      // ENG-827: a grant is conditioned on the tools it was derived from.
+      { requiredFunctionCalls: PUBLISHING_SCHEDULE.requiredFunctionCalls }
     );
     expect(r.json).toHaveBeenCalledWith(
       expect.objectContaining({ autopublishAuthorized: true })
@@ -85,7 +87,9 @@ describe('scheduled-chat publish consent (ENG-827)', () => {
         autopublishAuthorizedTools: [],
         autopublishAuthorizedAt: null,
         autopublishAuthorizedBy: null,
-      })
+      }),
+      // A revoke is unconditional — narrowing must always be available.
+      undefined
     );
   });
 
@@ -111,7 +115,8 @@ describe('scheduled-chat publish consent (ENG-827)', () => {
 
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
       SCHEDULE_ID,
-      expect.objectContaining({ autopublishAuthorized: false })
+      expect.objectContaining({ autopublishAuthorized: false }),
+      undefined
     );
   });
 
@@ -165,6 +170,65 @@ describe('scheduled-chat publish consent (ENG-827)', () => {
     (mockScheduleDb.updateSchedule as any).mockRejectedValue(new Error('throttled'));
     const r = res();
     await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: false }), r);
+    expect(r.status).toHaveBeenCalledWith(500);
+  });
+});
+
+describe('ENG-827 — a grant is bound to the tools it was derived from', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('conditions the grant on the required tools it just read', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(PUBLISHING_SCHEDULE as any);
+    mockScheduleDb.updateSchedule.mockResolvedValue({} as any);
+
+    const r = res();
+    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: true }), r);
+
+    // The scope written is derived from requiredFunctionCalls read a moment earlier,
+    // so the write must assert that read still holds.
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+      SCHEDULE_ID,
+      expect.objectContaining({ autopublishAuthorized: true }),
+      { requiredFunctionCalls: (PUBLISHING_SCHEDULE as any).requiredFunctionCalls }
+    );
+  });
+
+  it('refuses the grant with 409 when the tools changed underneath it', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(PUBLISHING_SCHEDULE as any);
+    const conditionFailed: any = new Error('The conditional request failed');
+    conditionFailed.code = 'ConditionalCheckFailedException';
+    mockScheduleDb.updateSchedule.mockRejectedValue(conditionFailed);
+
+    const r = res();
+    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: true }), r);
+
+    expect(r.status).toHaveBeenCalledWith(409);
+    expect(r.json.mock.calls[0][0].error).toMatch(/changed while you were authorizing/i);
+  });
+
+  it('does NOT condition a revoke — narrowing must always be available', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(PUBLISHING_SCHEDULE as any);
+    mockScheduleDb.updateSchedule.mockResolvedValue({} as any);
+
+    const r = res();
+    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: false }), r);
+
+    // Failing a revoke because something else changed would be a refusal to take a
+    // permission away, which is the one direction that must never be blocked.
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+      SCHEDULE_ID,
+      expect.objectContaining({ autopublishAuthorized: false }),
+      undefined
+    );
+  });
+
+  it('still surfaces a non-condition write failure as a 500', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(PUBLISHING_SCHEDULE as any);
+    mockScheduleDb.updateSchedule.mockRejectedValue(new Error('DynamoDB is down'));
+
+    const r = res();
+    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: true }), r);
+
     expect(r.status).toHaveBeenCalledWith(500);
   });
 });
