@@ -44,6 +44,26 @@ async function defaultDeps(): Promise<ScheduledPublishGuardDeps> {
   };
 }
 
+/**
+ * One retry, no backoff. This sits directly in front of a user-visible tool call,
+ * so the budget is "absorb a dropped connection", not "ride out an outage" —
+ * during a real outage the refusal is the correct answer anyway.
+ */
+async function readSessionWithOneRetry(
+  deps: ScheduledPublishGuardDeps,
+  sessionId: string
+): Promise<any> {
+  try {
+    return await deps.getChatSession(sessionId);
+  } catch (firstAttemptError) {
+    console.warn(
+      `ENG-827: session read for ${sessionId} failed while checking publish consent; retrying once:`,
+      firstAttemptError
+    );
+    return await deps.getChatSession(sessionId);
+  }
+}
+
 function refuse(toolName: string, detail: string): ScheduledPublishRefusal {
   return {
     success: false,
@@ -59,9 +79,12 @@ function refuse(toolName: string, detail: string): ScheduledPublishRefusal {
  * null when the call may proceed.
  *
  * Only scheduled sessions are gated. An interactive session has a human in the
- * conversation who approves the post there and then — that path is untouched, and
- * costs not even a read, because the guard returns before touching storage for any
- * non-publishing tool or any session it was given no id for.
+ * conversation who approves the post there and then — that path proceeds normally,
+ * and costs not even a read for any non-publishing tool or any session it was given
+ * no id for, because the guard returns before touching storage in those cases.
+ *
+ * Everything that cannot be established is treated as withheld. There is no
+ * "probably fine" branch: the action being gated is irreversible.
  */
 export async function refuseUnauthorizedScheduledPublish(
   toolName: string,
@@ -76,19 +99,28 @@ export async function refuseUnauthorizedScheduledPublish(
 
   let session: any;
   try {
-    session = await resolved.getChatSession(sessionId);
+    // The session read is what identifies an unattended run, so a failure here is
+    // not "probably interactive" — it is "unknown", and an unknown authorization
+    // must not produce an irreversible public post. Retry once first, because the
+    // cost of the two outcomes is wildly asymmetric in BOTH directions: a refused
+    // interactive post is recoverable in seconds by a human who is right there,
+    // while a post made against consent the owner has just withdrawn cannot be
+    // un-made. One retry absorbs the transient blip; a persistent failure refuses.
+    session = await readSessionWithOneRetry(resolved, sessionId);
   } catch (sessionReadError) {
-    // We could not establish whether this is even an unattended run. Refusing here
-    // would break INTERACTIVE publishing — where a human is present and has already
-    // approved — for every user, on any transient read blip. The exposure left is
-    // narrow and requires two coincidences (a revocation mid-turn AND a failed read
-    // in the same moment); the between-turn re-check and the prompt directive still
-    // apply. Deliberately the one place this design does not fail closed.
     console.error(
-      `ENG-827: could not read session ${sessionId} to check publish consent for ${toolName}; ` +
-      'allowing the call rather than blocking interactive publishing:', sessionReadError
+      `ENG-827: could not read session ${sessionId} to check publish consent for ${toolName} ` +
+      '(after one retry); withholding the publish (fail-closed):', sessionReadError
     );
-    return null;
+    return {
+      success: false,
+      error:
+        `${toolName} was not executed: this run's publishing authorization could not be confirmed, ` +
+        `and an unconfirmed permission is treated as withheld — a live post cannot be un-made. ` +
+        `Nothing was published. If someone is present in this conversation, they can ask you to try ` +
+        `again; otherwise save the content as a draft, say it is awaiting approval, and carry on ` +
+        `with the rest of the task.`,
+    };
   }
 
   if (session?.sessionType !== 'scheduled') return null;
