@@ -111,13 +111,18 @@ describe("resolveOrgProfileField — boundary / error paths", () => {
     ).resolves.toBeUndefined();
   });
 
-  test("owner lookup failure degrades to the caller's own record instead of a 500", async () => {
+  test("owner lookup failure propagates instead of substituting the caller's profile", async () => {
+    // Substituting the caller here is not a harmless read degradation: the
+    // write paths merge this value and persist it as the ORG profile, so a
+    // transient owner-read failure during an editor's partial save would
+    // promote that editor's personal brand to the whole org. Fail instead —
+    // the same thing `analyticsConfigResolver` does with its owner lookup.
     const member = { userId: MEMBER_ID, orgId: "org-1", brandGuidelines: ownerBrand };
     mockUserDb.getUserById.mockRejectedValue(new Error("dynamo down"));
 
     await expect(
       resolveOrgProfileField(member, unpopulatedOrg, "brandGuidelines")
-    ).resolves.toEqual(ownerBrand);
+    ).rejects.toThrow("dynamo down");
   });
 
   test("nothing to recover (brand-new org, no brand anywhere) → no warning", async () => {

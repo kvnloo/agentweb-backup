@@ -40,16 +40,14 @@ export async function resolveOrgProfileField(
   if (!ownerUserId || ownerUserId === user?.userId) {
     fallback = user?.[field];
   } else {
-    try {
-      const owner: any = await userDb.getUserById(ownerUserId);
-      fallback = owner?.[field];
-    } catch (error: any) {
-      console.error(
-        `[orgProfileResolver] failed to load owner ${ownerUserId} for org ${org.orgId}:`,
-        error?.message
-      );
-      fallback = user?.[field];
-    }
+    // A failed owner read propagates. Substituting the caller's own record here
+    // would not be a harmless read degradation: the write paths merge whatever
+    // this returns and persist it as the ORGANIZATION profile, so one transient
+    // owner-read failure during an editor's partial save would promote that
+    // editor's personal brand/strategy to the whole org. `analyticsConfigResolver`
+    // leaves its owner lookup unguarded for the same reason.
+    const owner: any = await userDb.getUserById(ownerUserId);
+    fallback = owner?.[field];
   }
 
   // Warn only when the fallback actually recovered something. An org that has
