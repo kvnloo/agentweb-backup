@@ -245,6 +245,60 @@ router.patch("/orgs/:orgId/analytics-sharing", async (req, res) => {
   }
 });
 
+// ─── Org billing owner (admin-controlled) ────────────────────────────────
+// PATCH /api/admin/orgs/:orgId/billing-owner  { userId }
+//
+// The escape hatch for the refusal in routes/org.ts: a paying billing owner
+// cannot be removed, because their card cannot follow the badge. When a
+// customer is genuinely stuck — the payer has left the company, say — this
+// moves the pointer deliberately, by a human who knows the plan will now
+// resolve to the new owner's subscription.
+//
+// It does NOT move money. Whatever the new owner is paying becomes what the
+// org gets, which is why the response says so explicitly rather than leaving
+// the operator to infer it.
+router.patch("/orgs/:orgId/billing-owner", async (req, res) => {
+  try {
+    const { orgId } = req.params;
+    const { userId } = req.body ?? {};
+    if (!userId || typeof userId !== "string") {
+      return res.status(400).json({ message: "Body field 'userId' is required" });
+    }
+    const org = await orgDb.getOrgById(orgId);
+    if (!org) return res.status(404).json({ message: "Organization not found" });
+    if (org.ownerUserId === userId) {
+      return res.json({ orgId, ownerUserId: userId, unchanged: true });
+    }
+
+    const target = await userDb.getUserById(userId);
+    if (!target || target.orgId !== orgId) {
+      return res.status(400).json({ message: "That user is not a member of this organization" });
+    }
+    // Owner-only, so the pointer can never rest on someone without the
+    // authority to manage what it pays for.
+    if (target.orgRole !== "owner") {
+      return res.status(400).json({ message: "The billing owner must be an owner of the organization" });
+    }
+
+    const previous = org.ownerUserId;
+    await orgDb.updateOrg(orgId, { ownerUserId: userId });
+    console.log(`[admin] billing owner for ${orgId}: ${previous} -> ${userId} (by ${(req as any).user?.userId})`);
+
+    return res.json({
+      orgId,
+      ownerUserId: userId,
+      previousOwnerUserId: previous,
+      // Said out loud: this moved the pointer, not the payment method.
+      note: "Billing pointer moved. The org's plan now resolves to the new owner's own subscription; the previous owner's Stripe subscription is untouched and still bills them.",
+      newOwnerSubscription: target.subscriptionType ?? "Free",
+      newOwnerSubscriptionStatus: target.subscription_status ?? "none",
+    });
+  } catch (error: any) {
+    console.error("Error updating org billing owner:", error.message);
+    return res.status(500).json({ message: "Failed to update billing owner" });
+  }
+});
+
 // Get all Unipile (LinkedIn outreach) accounts across all users (with live status + orphan detection)
 router.get("/unipile-accounts", async (req, res) => {
   try {
