@@ -365,7 +365,8 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(publishAuthorizedDirective).toContain('ALREADY SATISFIED');
     // it must name the concrete publishing tool the run was refusing to call
     expect(publishAuthorizedDirective).toContain('post_on_connected_account');
-    expect(publishAuthorizedDirective).toContain('you MUST call post_on_connected_account');
+    expect(publishAuthorizedDirective).toContain('specifically requires post_on_connected_account');
+    expect(publishAuthorizedDirective).toContain('you MUST call the publishing tool');
     // and it must NOT tell the run to withhold / seek sign-off
     expect(publishAuthorizedDirective.toLowerCase()).not.toContain('awaiting the owner');
   });
@@ -391,23 +392,27 @@ describe('getUnattendedExecutionDirective — per-entity completion guidance', (
     expect(getUnattendedExecutionDirective(undefined, true, 'authorized')).toBe('');
   });
 
-  it('names the exact publish tools the owner designated when they are supplied', () => {
+  it('calls out a required publish tool when the schedule names one', () => {
     const scoped = getUnattendedExecutionDirective('scheduled', false, 'authorized', ['post_on_connected_account']);
-    expect(scoped).toContain('designated post_on_connected_account');
-    expect(scoped).toContain('you MUST call post_on_connected_account');
-    // authorization must be scoped — it does not silently cover other publish tools
-    expect(scoped).toContain('covers ONLY post_on_connected_account');
-    expect(scoped).not.toContain('publish_landing_page_changes');
-    expect(scoped).toContain('does not waive any non-publishing limit');
+    expect(scoped).toContain('specifically requires post_on_connected_account');
+    expect(scoped).toContain('does not waive any NON-publishing limit');
   });
 
-  // Greptile P1 #5 (security): authorization with no designated tool must never
-  // become a licence to reach for any live-publishing tool. Defence in depth — the
-  // resolver already refuses to emit this state.
-  it('emits NO authorization block when authorized with no tools named', () => {
+  // Greptile: an AUTHORIZED schedule that names no publish tool must still be told it
+  // is authorized. This assertion used to demand the opposite, and that is precisely
+  // the reported bug for the majority of affected schedules: 21 of the 25 active
+  // publishing schedules name no publish tool at all and just tell Emma to post in
+  // the prompt, so every one of them was told "NOT pre-authorized" and drafted.
+  //
+  // The scope-bound reading it came from belonged to the opt-IN polarity, which was
+  // removed — see the note in schedulePublishAuthorization.ts. Consent is schedule-wide
+  // now, so an empty tool list is a normal authorized shape, not a suspicious one.
+  it('AUTHORIZES a prompt-driven schedule that names no publish tool', () => {
     const broad = getUnattendedExecutionDirective('scheduled', false, 'authorized', []);
-    expect(broad).not.toContain('PRE-AUTHORIZED to publish');
-    expect(broad).toContain('NOT pre-authorized to publish');
+    expect(broad).toContain('PRE-AUTHORIZED to publish');
+    expect(broad).not.toContain('NOT pre-authorized to publish');
+    // ...without inventing a requirement the owner never set
+    expect(broad).not.toContain('specifically requires');
   });
 
   // Greptile P1: the prompt is rebuilt (and the schedule re-read) on EVERY

@@ -123,6 +123,34 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
     expect(decisionIdx).toBeGreaterThan(lastUserIdx);
   });
 
+  // The majority case, and the one that regressed: 21 of the 25 active publishing
+  // schedules name NO publish tool and simply tell Emma to post in the prompt. The
+  // directive used to require a non-empty tool list for its authorized branch, so
+  // every one of those schedules was told it was NOT authorized and drafted instead —
+  // the reported bug, still live for most of the affected schedules.
+  it('AUTHORIZED with NO required publish tool still says PRE-AUTHORIZED', async () => {
+    const messages = await capture(
+      { ...ADMITTED_SESSION, publishAdmission: { authorized: true, tools: [], recordedAt: 'x' } },
+      { scheduleId: SCHEDULE_ID, requiredFunctionCalls: ['you_search_web'] }
+    );
+
+    const last = messages[messages.length - 1];
+    expect(last.content).toContain('PRE-AUTHORIZED to publish');
+    expect(last.content).not.toContain('NOT pre-authorized to publish');
+    // ...and it must not invent a tool requirement the schedule never set.
+    expect(last.content).not.toContain('specifically requires');
+  });
+
+  it('AUTHORIZED with a required tool names that tool as well', async () => {
+    const messages = await capture(ADMITTED_SESSION, {
+      scheduleId: SCHEDULE_ID,
+      requiredFunctionCalls: ['post_on_connected_account'],
+    });
+    const last = messages[messages.length - 1];
+    expect(last.content).toContain('PRE-AUTHORIZED to publish');
+    expect(last.content).toContain('specifically requires post_on_connected_account');
+  });
+
   it('WITHHELD: says so, on the same delivered path', async () => {
     const messages = await capture(ADMITTED_SESSION, {
       scheduleId: SCHEDULE_ID,
