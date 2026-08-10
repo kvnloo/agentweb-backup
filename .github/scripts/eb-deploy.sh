@@ -23,6 +23,12 @@
 #   EB_HEALTH_SETTLE_SECONDS     Grace for health to leave Grey/Red once Ready (default 180)
 #   EB_POLL_INTERVAL_SECONDS     Seconds between describe-environments polls (default 15)
 #   EB_UPDATE_MAX_ATTEMPTS       Retries for a concurrent-update collision (default 3)
+#   EB_HEALTH_PROBE_DRYRUN       '1' exercises the lagging-rollup health probe on
+#                                an already-successful deploy and logs what it
+#                                saw. Observation only — it runs after the deploy
+#                                is confirmed and cannot change the exit status.
+#                                Off by default, so a normal deploy still makes
+#                                no extra AWS calls.
 #
 # EB_TOTAL_TIMEOUT_SECONDS is an absolute deadline covering settling, retries and
 # verification together, so the worst case cannot exceed it no matter how many
@@ -46,7 +52,9 @@
 #   elbv2:DescribeTargetGroups
 #   elbv2:DescribeTargetHealth
 # Missing any of them degrades to today's behaviour (fail on a Red rollup) and
-# names the denied call in the failure message.
+# names the denied call in the failure message. Because that degradation is
+# silent until an incident, EB_HEALTH_PROBE_DRYRUN exists to exercise the probe
+# on a healthy deploy and prove those permissions before they are needed.
 
 set -euo pipefail
 
@@ -56,6 +64,7 @@ EB_HEALTH_SETTLE_SECONDS="${EB_HEALTH_SETTLE_SECONDS:-180}"
 EB_POLL_INTERVAL_SECONDS="${EB_POLL_INTERVAL_SECONDS:-15}"
 EB_UPDATE_MAX_ATTEMPTS="${EB_UPDATE_MAX_ATTEMPTS:-3}"
 EB_REJECTION_GRACE_SECONDS="${EB_REJECTION_GRACE_SECONDS:-180}"
+EB_HEALTH_PROBE_DRYRUN="${EB_HEALTH_PROBE_DRYRUN:-0}"
 
 # Absolute epoch deadline for the whole run; set in main().
 EB_RUN_DEADLINE=0
@@ -290,6 +299,43 @@ underlying_health_verdict() {
   EB_HEALTH_VERDICT='LAGGING'
 }
 
+# Run the lag probe on a deploy that already passed, purely to observe it.
+#
+# underlying_health_verdict is only reachable when the rollup is still Grey/Red
+# past the settle window, and that has not happened on a real deploy since this
+# fix merged. So its four extra IAM actions and its output parsing have never
+# executed in production, and an inert probe is indistinguishable from a working
+# one until the incident it exists for — at which point a denied API call
+# silently degrades back to the false failure this whole change removed.
+#
+# Setting EB_HEALTH_PROBE_DRYRUN=1 makes the probe deliberately reachable on an
+# ordinary healthy deploy. It runs the real calls, prints what it saw, and is
+# explicitly NOT part of the verdict: the deploy has already been confirmed by
+# the time this runs, and nothing here can change the exit status. A dry run
+# that could fail a deploy would be a new, untested gate rather than a
+# diagnostic — the opposite of the point.
+#
+# Off by default, so an ordinary deploy still makes zero extra AWS calls.
+run_health_probe_dryrun() {
+  [ "${EB_HEALTH_PROBE_DRYRUN}" = "1" ] || return 0
+
+  log "Probe dry run requested; exercising the lagging-rollup health probe against ${EB_ENVIRONMENT_NAME}."
+  underlying_health_verdict
+  log "probe dry run: verdict=${EB_HEALTH_VERDICT} detail=${EB_UNHEALTHY_DETAIL:-none}"
+
+  case "${EB_HEALTH_VERDICT}" in
+    LAGGING)
+      log "probe dry run: the probe can read every instance and target, so it would speak for a lagging rollup. Its IAM permissions are proven. This observation did not affect this deploy."
+      ;;
+    UNHEALTHY)
+      log "probe dry run: the probe reached every signal and found something unhealthy. Its IAM permissions are proven; the finding did not affect this deploy, whose own health check already passed."
+      ;;
+    *)
+      log "probe dry run: INERT — the probe could not complete, so on a real Grey/Red rollup it would fall back to failing the deploy. Fix this before relying on it. This did not affect this deploy."
+      ;;
+  esac
+}
+
 # Fails immediately on a status the environment cannot recover from, so a dead
 # environment surfaces now instead of burning the whole timeout.
 fail_on_terminal_status() {
@@ -481,6 +527,7 @@ verify_deployment() {
       # calling either one a failure. Green/Yellow are accepted immediately.
       if [ "${EB_HEALTH}" != "Grey" ] && [ "${EB_HEALTH}" != "Red" ]; then
         log "SUCCESS: environment '${EB_ENVIRONMENT_NAME}' is Ready, running version '${EB_VERSION_LABEL}', health=${EB_HEALTH}."
+        run_health_probe_dryrun
         return 0
       fi
 
