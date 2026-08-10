@@ -138,7 +138,7 @@ function zeroAssistantPublishedMessage(actions: string[], willResume: boolean): 
     : landed
       + 'The rest of this run could not be continued safely, and re-running it from the start '
       + 'would repeat what already went out — so it has NOT been retried automatically. '
-      + 'Check whether anything is still outstanding; the schedule owner has been notified.';
+      + 'Check whether anything is still outstanding.';
 }
 
 const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
@@ -3716,10 +3716,15 @@ export async function runScheduledChat(
         // batches" advice that can't help — that mislabels the transcript for anyone
         // debugging it. Budget-shaped failures keep the original guidance.
         const failureClass = classifyZeroAssistantFailure(error);
+        // ENG-971: the published-run message is written AFTER the requeue decision
+        // (below), because its two variants make opposite promises and only the
+        // outcome knows which is true — the resume wording would be a lie if the
+        // requeue write then failed. This is the very failure class this issue is
+        // about, so the message must never run ahead of the fact.
         const incompleteMessage = publishedActions.length > 0
-          ? zeroAssistantPublishedMessage(publishedActions, willResumePublishedRun)
+          ? null
           : zeroAssistantIncompleteMessage(error);
-        try {
+        if (incompleteMessage) try {
           await chatbotDb.addMessageToSession(sessionId, {
             role: 'assistant',
             content: incompleteMessage,
@@ -3748,6 +3753,7 @@ export async function runScheduledChat(
         timestamp: new Date().toISOString(),
       });
 
+      let publishedRunDidResume = false;
       if (publishedActions.length > 0) {
         if (willResumePublishedRun) {
           // Requeue AS A RESUME: same session, continued from its last settled step.
@@ -3763,11 +3769,15 @@ export async function runScheduledChat(
               pendingResumeSessionId: sessionId || '',
               updatedAt: new Date().toISOString(),
             });
+            publishedRunDidResume = true;
             console.error(
               `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
               + `(${publishedActions.join('; ')}); requeued as a RESUME so the rest completes without repeating it.`
             );
           } catch (requeueError) {
+            // The resume did NOT happen — drop the marker so neither the run result
+            // nor the transcript claims one.
+            zeroAssistantRequeuedAt = undefined;
             console.error(`Failed to requeue-as-resume zero-output scheduled chat ${schedule.scheduleId}:`, requeueError);
           }
         } else {
@@ -3783,6 +3793,24 @@ export async function runScheduledChat(
               failedAttempts: zeroOutputNextRetryCount,
               failureClass: classifyZeroAssistantFailure(error),
             });
+          }
+        }
+        // Outcome settled — now the transcript can state it truthfully.
+        if (sessionId) {
+          try {
+            await chatbotDb.addMessageToSession(sessionId, {
+              role: 'assistant',
+              content: zeroAssistantPublishedMessage(publishedActions, publishedRunDidResume),
+              timestamp: new Date().toISOString(),
+              metadata: {
+                timestamp: new Date().toISOString(),
+                isErrorMessage: true,
+                jobIncomplete: true,
+                failureClass: classifyZeroAssistantFailure(error),
+              },
+            });
+          } catch (persistError) {
+            console.error('Failed to persist published-run job-incomplete message:', persistError);
           }
         }
       } else if (!isTest) {
