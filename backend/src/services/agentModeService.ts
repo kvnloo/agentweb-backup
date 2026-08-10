@@ -22766,8 +22766,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     // Competitors Section (matches UI structure)
-    // ENG-945: entries past `competitorDetailLimit` are rendered by name only
-    // rather than dropped, so the reader always sees the complete roster.
+    // ENG-945: entries outside the [competitorDetailStart, competitorDetailEnd)
+    // window are rendered by name only rather than dropped, so the reader always
+    // sees the complete roster. With no window supplied the whole list is
+    // rendered in full, which is what non-tool callers get.
     const competitors: any[] = Array.isArray(marketData.competitors) ? marketData.competitors : [];
     const detailStart = typeof marketResult.competitorDetailStart === 'number' ? marketResult.competitorDetailStart : 0;
     const detailEnd = typeof marketResult.competitorDetailEnd === 'number' ? marketResult.competitorDetailEnd : competitors.length;
