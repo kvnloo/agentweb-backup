@@ -39,6 +39,33 @@ import { resolvePublishAuthorized, SchedulePublishApprovalInput } from './schedu
  * and is restated in schedulePublishApproval.ts: prompt prose, `requiredFunctionCalls`,
  * and `fullAutonomy` are each NOT consent. Do not reinstate any of them here.
  *
+ * WHY CONSENT IS NOT BOUND TO A TOOL LIST — deliberately, and against review advice
+ * ---------------------------------------------------------------------------------
+ * Review has twice asked for the grant to be scope-bound: authorized ONLY for a set of
+ * designated publishing tools, so a later edit to `requiredFunctionCalls` cannot widen
+ * what standing consent covers. Under the opt-IN polarity that was right, and this
+ * module used to do exactly that.
+ *
+ * Under an opt-OUT it inverts into the bug. Scope-binding requires a non-empty list to
+ * authorize anything, and most publishing schedules HAVE no such list: measured on the
+ * live table, only 4 of the 25 active publishing-shaped schedules require a publish
+ * tool outright — the other 21 simply tell Emma to post in the prompt. Binding consent
+ * to the list therefore refuses 21 of 25, which is the same deny-by-construction
+ * failure the reconciliation exists to remove, applied to a subset instead of to
+ * everything. This is not a projection: the identical mistake, in two smaller places
+ * (`readAdmittedAuthorization` and the dispatch guard, both keyed on `tools.length`),
+ * was caught mid-implementation and would have shipped the same outcome.
+ *
+ * The widening the scope-bound design protects against does not exist here anyway: the
+ * grant is already schedule-wide, exactly as ENG-803 enforces it at `executeTool`, so
+ * editing `requiredFunctionCalls` cannot ADD authority that was not already present.
+ * What bounds the blast radius instead is the owner's opt-out, which no model can
+ * write, plus per-run admission — a run cannot gain rights it did not start with.
+ *
+ * `tools` therefore means "what the deterministic checker may nudge for", not "what
+ * may publish". Anyone tempted to gate dispatch on it again should re-read this and
+ * the two tests named for the 21 prompt-only publishers.
+ *
  * WHAT THIS MODULE STILL ADDS OVER ENG-803's CHECK — none of it is redundant:
  *
  *  - `filterRequiredFunctionsToAuthorizedScope`, so the deterministic checker cannot
