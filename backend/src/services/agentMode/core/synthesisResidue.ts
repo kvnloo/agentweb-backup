@@ -50,6 +50,24 @@ export interface ExecutedToolCall {
   name?: string;
   /** the loop sets an `error` key on a ledger entry whose tool threw */
   error?: unknown;
+  /**
+   * set by the dispatcher when this call was collapsed into an identical earlier
+   * one. That earlier call is its own ledger entry, so counting this as well would
+   * double-report a single action.
+   */
+  duplicateOf?: unknown;
+  /**
+   * a `{ deferred: true }` result means the call was NOT executed — the media
+   * budget paused it for a later turn. It carries no `error`, so without its own
+   * bucket it would be reported as an action that already ran.
+   */
+  result?: unknown;
+}
+
+/** True for a ledger entry the dispatcher deferred instead of executing. */
+function isDeferred(call: ExecutedToolCall): boolean {
+  const result = call.result as { deferred?: unknown } | null | undefined;
+  return Boolean(result && typeof result === 'object' && result.deferred === true);
 }
 
 /**
@@ -58,12 +76,16 @@ export interface ExecutedToolCall {
  * counts — never invented results — so it cannot manufacture a false success.
  */
 export function buildExecutedActionsFallback(toolCalls: ExecutedToolCall[]): string {
-  const counts = new Map<string, { ok: number; failed: number }>();
+  const counts = new Map<string, { ok: number; failed: number; deferred: number }>();
   for (const call of toolCalls || []) {
     const name = call && typeof call.name === 'string' ? call.name.trim() : '';
     if (!name) continue;
-    const entry = counts.get(name) || { ok: 0, failed: 0 };
-    if (call && 'error' in call) entry.failed++;
+    // A collapsed duplicate never ran: the call it points at did, and is counted
+    // separately. Including it would report the same action twice.
+    if (call.duplicateOf !== undefined && call.duplicateOf !== null) continue;
+    const entry = counts.get(name) || { ok: 0, failed: 0, deferred: 0 };
+    if ('error' in call) entry.failed++;
+    else if (isDeferred(call)) entry.deferred++;
     else entry.ok++;
     counts.set(name, entry);
   }
@@ -76,18 +98,29 @@ export function buildExecutedActionsFallback(toolCalls: ExecutedToolCall[]): str
   }
 
   const lines: string[] = [];
-  for (const [name, { ok, failed }] of counts) {
+  let totalOk = 0;
+  let totalDeferred = 0;
+  for (const [name, { ok, failed, deferred }] of counts) {
     const parts: string[] = [];
     if (ok > 0) parts.push(`${ok} succeeded`);
     if (failed > 0) parts.push(`${failed} failed`);
+    if (deferred > 0) parts.push(`${deferred} not run (paused for budget)`);
+    totalOk += ok;
+    totalDeferred += deferred;
     lines.push(`- ${name} — ${parts.join(', ')}`);
   }
 
-  return [
-    preamble,
-    '',
-    lines.join('\n'),
-    '',
-    "These actions have already been applied — please don't re-run them. Ask me to summarize what I just did and I'll write up the details.",
-  ].join('\n');
+  // Only the succeeded bucket may be described as applied. A deferred call was
+  // never executed, so telling the user not to re-run it would be the exact false
+  // success this module exists to prevent.
+  const closing: string[] = [];
+  if (totalOk > 0) {
+    closing.push("The ones marked “succeeded” have already been applied — please don't re-run them.");
+  }
+  if (totalDeferred > 0) {
+    closing.push('The ones marked “not run” were never executed, so nothing was applied for them.');
+  }
+  closing.push("Ask me to summarize what I just did and I'll write up the details.");
+
+  return [preamble, '', lines.join('\n'), '', closing.join(' ')].join('\n');
 }
