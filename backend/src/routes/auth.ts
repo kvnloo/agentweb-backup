@@ -173,10 +173,20 @@ router.get('/me', authenticateToken, async (req, res) => {
       response.orgName = org.name;
       response.orgRole = user.orgRole;
       // Org-level brand, falling back to the owner's record when the org was
-      // created without copying the profile over — otherwise the owner is
-      // pushed back into brand onboarding the moment they create an org (ENG-927).
-      const orgBrand = await resolveOrgProfileField(user, org, 'brandGuidelines');
-      response.hasBrandGuidelines = !!(orgBrand?.brandData?.brandName);
+      // created without copying the profile over, so this reports the same
+      // brand the Brand Guidelines page serves (ENG-927). Read by MCP's
+      // `emma_get_account_status` as `is_onboarded`.
+      // Guarded like every other org-derived enrichment in this handler: the
+      // fallback can issue an owner-record read, and `/me` is the endpoint the
+      // whole app boots off — a transient failure must degrade this one flag,
+      // not the entire response.
+      try {
+        const orgBrand = await resolveOrgProfileField(user, org, 'brandGuidelines');
+        response.hasBrandGuidelines = !!(orgBrand?.brandData?.brandName);
+      } catch (e: any) {
+        console.error('Error resolving org brand for /me:', e?.message);
+        response.hasBrandGuidelines = !!(org.brandGuidelines?.brandData?.brandName);
+      }
       // Merge org-level and user-level Drive folders so legacy user-record folders
       // (added before the org feature) continue to appear in the UI without migration.
       const orgFolders: Array<{ folderId: string; name: string }> =
