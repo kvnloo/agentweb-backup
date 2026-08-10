@@ -28,7 +28,7 @@ import { settingsService } from './settingsService';
 
 const TOKEN_SESSION_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
-export type OAuthProvider = 'gmail' | 'outlook';
+export type OAuthProvider = 'gmail' | 'outlook' | 'calendly';
 
 export interface OAuthTokens {
   access_token: string;
@@ -42,6 +42,8 @@ export interface OAuthProfile {
   name: string;
   picture?: string;
   tenant_id?: string;
+  user_uri?: string;         // Calendly
+  organization_uri?: string; // Calendly
 }
 
 interface StoredSession {
