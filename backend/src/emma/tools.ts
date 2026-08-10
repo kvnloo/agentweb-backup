@@ -6547,8 +6547,8 @@ emmaToolRegistry.register({
     if (!org) {
       return { success: false, message: 'Organization not found.' };
     }
-    if (org.ownerUserId !== userId) {
-      return { success: false, message: 'Only the org owner can delete org memories.' };
+    if (!can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:configure")) {
+      return { success: false, message: 'Only org owners and admins can delete org memories.' };
     }
 
     await orgMemoryDb.deleteMemory(user.orgId, args.memoryId);
@@ -6929,6 +6929,7 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
 // Ensure apiTools has registered its tools before we try to bridge them.
 import '../mcp/server/apiTools';
 import { mcpToolRegistry } from '../mcp/server/registry';
+import { can } from "../services/orgAuthz";
 
 // Also register get_visual_context in mcpToolRegistry (after the import above, which is needed
 // for mcpToolRegistry to be available).
