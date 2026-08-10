@@ -95,43 +95,36 @@ describe('Scheduled Chat MCP Tools', () => {
   // reading of a conversation, which is the same inferred-consent failure that
   // already sank three earlier signals. Keep this surface closed.
   describe('manage_scheduled_chat - publish consent is not agent-settable', () => {
-    it('exposes only a REVOKE lever, never a grant, in the tool schema', () => {
+    it('exposes NO publish-consent lever at all, in either direction', () => {
       const def = mcpToolRegistry.getTool('manage_scheduled_chat')?.definition as any;
-      const props = def?.inputSchema?.properties || {};
-      expect(Object.keys(props)).toContain('revoke_autopublish');
-      expect(Object.keys(props)).not.toContain('autopublish_authorized');
-      // and the description must tell the model it cannot grant it
-      expect(props.revoke_autopublish.description).toMatch(/cannot grant/i);
+      const props = Object.keys(def?.inputSchema?.properties || {});
+      // ENG-827/ENG-803: the schedule's publish setting is not model-writable EITHER
+      // WAY. A grant would let the model mint standing consent from its own reading
+      // of a conversation; a revoke would let it durably silence its own publishing
+      // and then truthfully cite the block — recreating ENG-803's reported bug at
+      // schedule level. Only the owner changes it, from the schedule form.
+      for (const forbidden of [
+        'revoke_autopublish', 'autopublish_authorized', 'autopublishAuthorized',
+        'require_publish_approval', 'requirePublishApproval',
+      ]) {
+        expect(props).not.toContain(forbidden);
+      }
     });
 
-    // The revoke must reach the DEDICATED consent endpoint. Sending it on the
-    // generic update body looks correct but is silently dropped: that route
-    // deliberately preserves the stored consent value so no broad update can grant
-    // publishing. Asserting the request is *sent* is not enough — assert where.
-    it('REVOKES via the dedicated consent endpoint, not the generic update body', async () => {
+    it('never reaches a consent endpoint, whatever the model passes', async () => {
       mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
       await mcpToolRegistry.execute('manage_scheduled_chat', {
         action: 'update',
         schedule_id: 'sc-1',
         revoke_autopublish: true,
+        autopublish_authorized: true,
       } as any, context);
 
       const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
+      expect(calls.find(c => String(c.path).includes('publish-consent'))).toBeUndefined();
       const put = calls.find(c => c.method === 'PUT');
-      const consent = calls.find(c => c.path.endsWith('/publish-consent'));
-
-      // ORDER matters: revoke first. If the ordinary update then fails, the
-      // schedule is already in the safer (not publishing) state. Revoking after
-      // would leave consent enabled whenever the second call failed.
-      expect(calls.indexOf(consent)).toBeLessThan(calls.indexOf(put));
-
-      // the generic update must NOT carry consent — it would be ignored there
       expect(put.body).not.toHaveProperty('autopublishAuthorized');
-      // the revoke must actually land on the endpoint that can apply it
-      expect(consent).toBeDefined();
-      expect(consent.method).toBe('POST');
-      expect(consent.path).toBe('/api/agent-mode/scheduled-chats/sc-1/publish-consent');
-      expect(consent.body).toEqual({ authorized: false });
+      expect(put.body).not.toHaveProperty('requirePublishApproval');
     });
 
     it('does not touch consent at all when revoke_autopublish is absent or false', async () => {

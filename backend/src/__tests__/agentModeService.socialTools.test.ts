@@ -277,7 +277,10 @@ describe('AgentModeService - Social Media Tools', () => {
         mockLinkedInAccount,
         'Hello from the API!',
         [],
-        'user-123'
+        'user-123',
+        // ENG-827: the last-moment consent re-check, undefined outside a gated
+        // scheduled dispatch so interactive posting is unchanged.
+        undefined
       );
       expect(result.success).toBe(true);
       expect(result.post_id).toBe('urn:li:share:123');
@@ -863,7 +866,7 @@ describe('AgentModeService - Social Media Tools', () => {
         commentary: 'Nice!',
       });
 
-      expect(service.linkedinRepost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:orig', 'Nice!');
+      expect(service.linkedinRepost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:orig', 'Nice!', undefined);
     });
 
     it('should dispatch comment action', async () => {
@@ -876,7 +879,7 @@ describe('AgentModeService - Social Media Tools', () => {
         comment_text: 'Hello',
       });
 
-      expect(service.commentOnLinkedInPost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:123', 'Hello', undefined);
+      expect(service.commentOnLinkedInPost).toHaveBeenCalledWith('user-123', 'acc-1', 'urn:li:share:123', 'Hello', undefined, undefined);
     });
 
     it('should dispatch list_comments action', async () => {

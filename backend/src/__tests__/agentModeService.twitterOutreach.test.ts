@@ -273,7 +273,9 @@ describe('AgentModeService.twitterManagePost', () => {
 
   it('post_thread forwards the tweets array', async () => {
     const res = await service.twitterManagePost('u', { action: 'post_thread', tweets: ['a', 'b'] });
-    expect(mockPostThread).toHaveBeenCalledWith(OWNER, 'tw1', ['a', 'b']);
+    // ENG-827: the per-tweet consent re-check is threaded in; undefined outside a
+    // gated scheduled dispatch, so interactive threads post exactly as before.
+    expect(mockPostThread).toHaveBeenCalledWith(OWNER, 'tw1', ['a', 'b'], undefined);
     expect(res.data).toHaveLength(2);
   });
 
