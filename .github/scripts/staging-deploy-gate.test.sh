@@ -108,6 +108,154 @@ job_if() {
 }
 
 # ---------------------------------------------------------------------------
+# paths-filter step extractor (ENG-1041)
+#
+# The deploy decision stopped being expressible as one `if:` clause: it is now
+# an `if:` clause reading a job output that a `dorny/paths-filter` step
+# computes. Reading only the `if:` would leave the half that actually decides
+# whether staging deploys unasserted.
+#
+# `audit` mode exists for one specific fail-open. dorny/paths-filter compiles
+# EACH pattern in a filter into its own picomatch matcher and OR-combines them
+# (`patterns.some(...)`; `predicate-quantifier` defaults to `some`) — verified
+# in src/filter.ts at the pinned SHA. So a `!`-negated pattern written in a
+# default filter is not an exclusion: picomatch returns TRUE for every path
+# outside the named one, so `'backend/**'` + `'!backend/**/__tests__/**'` is
+# true for README.md, and the filter it sits in is permanently true. A
+# narrowing that reads correctly would silently become a widening that deploys
+# staging on every PR in the repo. The only thing standing between those two
+# outcomes is `predicate-quantifier: 'every'`, one line away from the patterns
+# it governs, so it gets its own assertion rather than trust.
+# ---------------------------------------------------------------------------
+STEP_EXTRACTOR="${WORKDIR}/filter_steps.py"
+cat >"${STEP_EXTRACTOR}" <<'PY'
+import re
+import sys
+
+path, mode = sys.argv[1], sys.argv[2]
+arg = sys.argv[3] if len(sys.argv) > 3 else ""
+
+with open(path, encoding="utf-8") as fh:
+    lines = fh.read().split("\n")
+
+# Steps are the 6-space `      - ` entries; their bodies sit at 8+ spaces, so
+# any shallower non-blank line closes the block.
+steps = []
+cur = None
+for line in lines:
+    if re.match(r"^      - \S", line):
+        if cur is not None:
+            steps.append(cur)
+        cur = [line]
+    elif cur is not None:
+        if line.strip() and (len(line) - len(line.lstrip())) <= 5:
+            steps.append(cur)
+            cur = None
+        else:
+            cur.append(line)
+if cur is not None:
+    steps.append(cur)
+
+filters = []
+for s in steps:
+    text = "\n".join(s)
+    if "dorny/paths-filter" not in text:
+        continue
+    sid = ""
+    for line in s:
+        m = re.match(r"^        id:\s*(\S+)\s*$", line)
+        if m:
+            sid = m.group(1)
+            break
+    filters.append((sid, s, text))
+
+# Anchored to the real YAML key at its `with:`-child indent, never a substring.
+# A prose mention of predicate-quantifier in one of this file's own explanatory
+# comments would otherwise satisfy the check, and those comments sit inside the
+# step block — so the loosely-written version of this test passes on a workflow
+# that has the comment and not the setting.
+def quantifier(step_lines):
+    for line in step_lines:
+        m = re.match(r"^          predicate-quantifier:\s*['\"]?(\w+)['\"]?\s*$", line)
+        if m:
+            return m.group(1)
+    return "some"
+
+
+def has_negated_pattern(step_lines):
+    return any(re.match(r"^\s+- ['\"]?!", line) for line in step_lines)
+
+
+def filter_patterns(step_lines, filter_name):
+    """Return the scalar patterns belonging to one named inline filter."""
+    header = re.compile(r"^(\s*)%s:\s*$" % re.escape(filter_name))
+    start = None
+    indent = 0
+    for index, line in enumerate(step_lines):
+        match = header.match(line)
+        if match:
+            start = index + 1
+            indent = len(match.group(1))
+            break
+    if start is None:
+        return []
+
+    patterns = []
+    for line in step_lines[start:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        match = re.match(r"^\s+-\s+(['\"]?)(.+?)\1\s*$", line)
+        if match:
+            patterns.append(match.group(2))
+    return patterns
+
+
+if mode == "step":
+    for sid, _s, text in filters:
+        if sid == arg:
+            sys.stdout.write(text)
+            sys.exit(0)
+    sys.exit(4)
+
+if mode == "quant":
+    for sid, s, _text in filters:
+        if sid == arg:
+            sys.stdout.write(quantifier(s))
+            sys.exit(0)
+    sys.exit(4)
+
+if mode == "patterns":
+    filter_name = sys.argv[4] if len(sys.argv) > 4 else ""
+    for sid, s, _text in filters:
+        if sid == arg:
+            sys.stdout.write("\n".join(filter_patterns(s, filter_name)))
+            sys.exit(0)
+    sys.exit(4)
+
+if mode == "audit":
+    bad = []
+    for sid, s, _text in filters:
+        if has_negated_pattern(s) and quantifier(s) != "every":
+            bad.append(sid or "<no id>")
+    sys.stdout.write("\n".join(bad))
+    sys.exit(0)
+
+sys.exit(5)
+PY
+
+filter_step() {
+  python3 "${STEP_EXTRACTOR}" "${WORKFLOW}" step "$1"
+}
+
+filter_quantifier() {
+  python3 "${STEP_EXTRACTOR}" "${WORKFLOW}" quant "$1"
+}
+
+filter_patterns() {
+  python3 "${STEP_EXTRACTOR}" "${WORKFLOW}" patterns "$1" "$2"
+}
+
+# ---------------------------------------------------------------------------
 # Assertions
 # ---------------------------------------------------------------------------
 pass_test() {
@@ -151,8 +299,8 @@ printf '  if: %s\n' "${DEPLOY_IF}"
 # --- The five pre-existing gates. These are the load-bearing assertions. -----
 assert_contains "${DEPLOY_IF}" "github.event.pull_request.draft == false" \
   "drafts do not deploy to staging"
-assert_contains "${DEPLOY_IF}" "needs.detect-changes.outputs.backend == 'true'" \
-  "only backend-touching PRs deploy (ENG-743 path filter)"
+assert_contains "${DEPLOY_IF}" "needs.detect-changes.outputs.backend_deployable == 'true'" \
+  "only deployable-backend PRs deploy (ENG-743 path filter, narrowed by ENG-1041)"
 assert_contains "${DEPLOY_IF}" "needs.backend-tests-a.result == 'success'" \
   "agentMode suite must have PASSED, not merely not-failed"
 assert_contains "${DEPLOY_IF}" "needs.backend-tests-b.result == 'success'" \
@@ -183,6 +331,87 @@ for job in backend-tests-a backend-tests-b greptile-review; do
     "${job} still runs for Dependabot PRs" \
     "Dependabot bumps must be tested and reviewed like any other PR"
 done
+
+# --- ENG-1041: the deploy decision and the test decision are separate. -------
+# `backend` answers "should this diff be tested"; `backend_deployable` answers
+# "should this diff reach the staging environment". They were one boolean, so a
+# PR changing only test files ran a full build → package → S3 → EB deploy and,
+# worse, held `concurrency: backend-staging-deploy` — a group keyed on nothing
+# but its own name, with `cancel-in-progress: false`, i.e. the single global
+# non-preemptable staging lane every other backend PR queues behind.
+assert_not_contains "${DEPLOY_IF}" "outputs.backend == 'true'" \
+  "deploy does not gate on the bare backend output" \
+  "the bare 'backend' output is true for a test-only diff — re-coupling them puts test-only PRs back in the global staging lane"
+
+# The mirror assertion, and the more dangerous direction to get wrong: the test
+# suites must NOT inherit the narrowing. Gating them on deployability would stop
+# running tests on PRs whose whole purpose is changing tests.
+for job in backend-tests-a backend-tests-b; do
+  job_expr="$(job_if "${job}")"
+  assert_contains "${job_expr}" "needs.detect-changes.outputs.backend == 'true'" \
+    "${job} still runs on any backend diff, test-only included"
+  assert_not_contains "${job_expr}" "backend_deployable" \
+    "${job} is not narrowed to deployable paths" \
+    "a test-only PR must still be tested; gating the suites on deployability would stop testing test changes"
+done
+
+# --- The filter step behind that output. -------------------------------------
+DEPLOY_FILTER="$(filter_step filter_deploy || true)"
+if [ -z "${DEPLOY_FILTER}" ]; then
+  fail_test "detect-changes has a dorny/paths-filter step with id 'filter_deploy'" \
+    "not found — backend_deployable would have no source, and an undefined output is the empty string, which silently never equals 'true' and disables staging deploys entirely"
+else
+  # Read as a parsed YAML key, not a substring: this file's own comments
+  # explain the setting, and a substring check would be satisfied by the
+  # explanation of the fix rather than the fix.
+  assert_contains "$(filter_quantifier filter_deploy)" "every" \
+    "the deploy filter requires EVERY pattern to match"
+  assert_contains "${DEPLOY_FILTER}" "'backend/**'" \
+    "the deploy decision still starts from the whole backend tree"
+  assert_contains "${DEPLOY_FILTER}" "'!backend/**/__tests__/**'" \
+    "test directories are excluded from the deploy decision"
+  # ENG-743, restated against the new output. The `backend` filter counts this
+  # workflow and eb-deploy.sh as backend changes precisely so a change to the
+  # deploy path is exercised by the deploy path on its own PR. Narrowing the
+  # deploy decision without carrying these forward would ship the next
+  # backend-staging-deploy fix unexercised.
+  DEPLOY_CI_PATTERNS="$(filter_patterns filter_deploy deploy_ci)"
+  DEPLOY_CI_COUNT="$(printf '%s\n' "${DEPLOY_CI_PATTERNS}" | grep -c . || true)"
+  if [ "${DEPLOY_CI_COUNT}" -eq 1 ]; then
+    pass_test "deploy_ci uses one pattern under the EVERY quantifier"
+  else
+    fail_test "deploy_ci uses one pattern under the EVERY quantifier" \
+      "found ${DEPLOY_CI_COUNT}: separate entries require every deployment-path file to change in the same PR"
+  fi
+  assert_contains "${DEPLOY_CI_PATTERNS}" ".github/{workflows/tests.yml,scripts/eb-deploy.sh}" \
+    "one brace pattern independently matches either deploy-path file (ENG-743)"
+  if printf '%s\n' "${DEPLOY_CI_PATTERNS}" | grep -Fxq ".github/workflows/tests.yml"; then
+    fail_test "tests.yml is not a separate deploy_ci entry" \
+      "under predicate-quantifier: every, separate entries require tests.yml AND eb-deploy.sh to change together"
+  else
+    pass_test "tests.yml is not a separate deploy_ci entry"
+  fi
+  if printf '%s\n' "${DEPLOY_CI_PATTERNS}" | grep -Fxq ".github/scripts/eb-deploy.sh"; then
+    fail_test "eb-deploy.sh is not a separate deploy_ci entry" \
+      "under predicate-quantifier: every, separate entries require tests.yml AND eb-deploy.sh to change together"
+  else
+    pass_test "eb-deploy.sh is not a separate deploy_ci entry"
+  fi
+fi
+
+# --- The fail-open guard, stated generally so it also covers future filters. --
+NEGATION_OFFENDERS="$(python3 "${STEP_EXTRACTOR}" "${WORKFLOW}" audit)"
+if [ -z "${NEGATION_OFFENDERS}" ]; then
+  pass_test "every '!'-negated pattern sits in a predicate-quantifier: every step"
+else
+  fail_test "every '!'-negated pattern sits in a predicate-quantifier: every step" \
+    "these paths-filter steps negate a pattern under the default 'some' quantifier, which makes their filter TRUE for every path outside the excluded one: ${NEGATION_OFFENDERS}"
+fi
+
+# --- The output has to be declared, or the `if:` reads an empty string. -------
+WORKFLOW_TEXT="$(cat "${WORKFLOW}")"
+assert_contains "${WORKFLOW_TEXT}" "steps.filter_deploy.outputs" \
+  "backend_deployable is derived from the filter_deploy step"
 
 # ---------------------------------------------------------------------------
 printf '\nstaging-deploy-gate: %d run, %d failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"

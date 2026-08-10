@@ -7019,3 +7019,49 @@ User supplied real transparent PNGs (3-color for header, all-white for footer). 
 
 ### Tests
 `imageGeneration.backgroundRemoval.test.ts` (real Sharp — proves alpha, interior-counter preservation, tolerance, corner-median, WCAG helpers), `agentModeService.removeImageBackground.test.ts` (orchestration, filename, contrast, error paths), `remove_image_background.registration.test.ts` (tool registry + updated descriptions). 107 image-related tests pass; `npx tsc` clean.
+
+## ENG-1063 — a human override for the Greptile 5/5 gate (2026-08-10)
+
+`Require Greptile Review` is a required check on `main` and had no override. Measured across
+`tests.yml` PR runs 2026-07-27..08-10: **35 gate failures to 32 passes** (30 skipped = drafts,
+3 cancelled). **None was an outage** — the gate's own `unavailable` verdict (exit 75) appeared
+zero times; every failure was a landed verdict below the bar. Sampling 14 of the 35: **ten 4/5,
+four 3/5**. So the block was routine and quality-shaped, not flaky, and each refusal forced a
+fix-and-repush to move 4 → 5.
+
+### Assumptions checked, and one that was wrong
+
+- **Branch protection could not deliver this.** `enforce_admins: true` on all three repos, so
+  nobody can bypass — and the only admins are `harshmoney123` and `agentwebdeployer`. The
+  Argusoft team has `push`. Flipping `enforce_admins` would therefore not have unblocked the
+  team at all; it would only have unblocked Harsha, and would simultaneously have handed the
+  bypass to the swarm, which authenticates as `harshmoney123`. Rulesets can express per-team
+  bypass, but a bypass actor bypasses *every* rule in the ruleset, including the test checks.
+  Hence: the override lives in the gate, scoped to exactly the Greptile bar.
+- **GitHub auto-merge needed no change.** It never bypasses a required check, so "auto-merge
+  only on a true 5/5" was already the behaviour; only the human half was missing.
+- **WRONG, and caught before shipping:** the first implementation authorized the overrider via
+  `GET /repos/{owner}/{repo}/collaborators/{login}/permission`. That endpoint requires push
+  access, and `tests.yml` declares `permissions: contents: read, checks: read, issues: read,
+  pull-requests: write` — no scope reaches it. The call would have 403'd on every run and the
+  feature would have been dead on arrival while looking correct in tests, because the test mock
+  was happily serving an endpoint production cannot call. Replaced with `author_association`,
+  which is already on every comment in the payload the gate fetches: zero extra API calls, zero
+  extra token scope. Verified against live comments on #2290/#2300/#2310/#2315/#2318 — the
+  Argusoft team and Harsha all comment as `MEMBER`.
+
+### What that authorization does and does not prove
+
+`OWNER|MEMBER|COLLABORATOR` proves org membership or repo collaboration, **not** a repo write
+bit. In this org that set is the seven accounts in `orgs/AgentWebPro/members` minus the denied
+machine accounts, which is the intended audience. If the org grows past the point where every
+member is trusted to merge backend code, this needs a real permission lookup and the token scope
+to make it — do not quietly widen the trusted set instead.
+
+### Residual gap (tracked)
+
+The swarm commits as `harshmoney123`, the same principal as human-Harsha, so no gate can fully
+separate them. Automation is blocked on its *own* PRs by two independent signals (a
+`swarm/*`/`autofix/*` head branch, or an `Execution-Actor:` attribution line in the body), but on
+a human-authored PR an agent acting as Harsha could still post an override. The structural fix is
+the dedicated bot identity `automated-work-attribution.md` already calls for.

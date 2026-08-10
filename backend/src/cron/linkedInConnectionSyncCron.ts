@@ -24,60 +24,14 @@ import {
   normalizeLinkedInUrl,
   UnipileConnection,
 } from '../services/unipileConnectionsDb';
-import {
-  upsertSentInvitations,
-  pruneStaleSentInvitations,
-  profileUrlFromPublicId,
-  getAllSentInvitationsByAccount,
-  UnipileSentInvitation,
-} from '../services/unipileSentInvitationsDb';
+import { syncSentInvitationsForAccount } from '../services/linkedInSentInvitationsSyncService';
 
+export {
+  sentInvitationChanged,
+  syncSentInvitationsForAccount,
+} from '../services/linkedInSentInvitationsSyncService';
 
 const TAG = '[linkedInConnectionSync]';
-
-/**
- * True when a freshly-read invitation differs from its cached row in any way a
- * consumer can observe (ENG-875).
- *
- * `syncedAt` is deliberately excluded. It is stamped `now` on every run, so
- * including it would make every row differ and defeat the check entirely. It is
- * written but never read anywhere in the codebase — no query, filter or branch
- * depends on it — so a skipped row keeps its previous value, which then means
- * "when this row last changed" rather than "when the cron last ran".
- *
- * `sentAt` is also excluded, and this one was learned the hard way. The first
- * version of this function compared it, on the assumption that a changed send
- * time meant Unipile had corrected it. Production proved that false: LinkedIn
- * exposes invitation age RELATIVELY ("3 months ago") and Unipile resolves that
- * to an absolute datetime at the moment of the API call, so `parsed_datetime`
- * moves every single request. Two real rows, hours after the first deploy:
- *
- *   sentAt 2026-05-04T04:38:52.378Z  syncedAt 2026-08-04T04:38:44.973Z
- *   sentAt 2026-04-04T04:38:25.256Z  syncedAt 2026-08-04T04:38:24.877Z
- *
- * — exact whole-month offsets landing on the sync's own time-of-day. Comparing
- * it made every row differ on every cycle, so the skip never fired once:
- * `1547 upserted, 0 unchanged` on every account.
- *
- * Only the COMPARISON drops it. The write still prefers Unipile's value
- * (ENG-787, `parsed_datetime ?? cached.sentAt ?? now`) — that contract is
- * unchanged, and a skipped row simply keeps the value it already had, which is
- * the stability ENG-787 was after.
- *
- * Every other field IS compared. Those are stable identity/content fields, and
- * a change in one is a real change that must be persisted.
- */
-export function sentInvitationChanged(
-  cached: UnipileSentInvitation,
-  candidate: UnipileSentInvitation,
-): boolean {
-  return (
-    cached.publicProfileUrl !== candidate.publicProfileUrl ||
-    cached.invitationId !== candidate.invitationId ||
-    cached.invitedUserName !== candidate.invitedUserName ||
-    cached.invitationText !== candidate.invitationText
-  );
-}
 
 /**
  * Kill-switches for the side effects of detecting a newly-accepted LinkedIn
@@ -247,114 +201,6 @@ export async function syncConnectionsForAccount(
 
   console.log(`${TAG} account=${accountId} synced ${newConnections.length} new connections (pages=${page}, fullSync=${fullSync})`);
   return newConnections;
-}
-
-/**
- * Sync PENDING sent invitations for one Unipile account into the
- * AW-UnipileSentInvitations cache, then prune rows that are no longer pending.
- *
- * Unipile's getAllInvitationsSent feed contains only invitations that are still
- * outstanding — once accepted or withdrawn they drop off. So we pull the full
- * feed, upsert each, and delete any cached row not present in the feed. A cached
- * row therefore means "we invited this person and they haven't accepted yet",
- * which the CRM uses to suppress re-inviting.
- *
- * Always paginates fully (the feed is bounded by LinkedIn's pending-invite cap).
- */
-export async function syncSentInvitationsForAccount(accountId: string): Promise<number> {
-  const toUpsert: UnipileSentInvitation[] = [];
-  const stillPendingPublicIds = new Set<string>();
-  const now = new Date().toISOString();
-  let unchanged = 0;
-
-  // Unipile occasionally omits parsed_datetime. Stamping `now` in that case would
-  // move sentAt on every ~10-min sync, so downstream consumers keyed on it (the
-  // CRM invite mirror dedupes an engagement by send time) would see the same
-  // invitation as a new one each run. Carry the first-observed value forward
-  // instead — a pending invitation's send time never legitimately changes.
-  // The whole cached row is kept, not just sentAt, so an unchanged invitation
-  // can be recognised and skipped instead of rewritten (ENG-875). Rewriting
-  // every pending invitation on every 10-minute cycle pinned a production CPU
-  // at ~93% for 85 minutes on an account with 700+ pending invites, and cost
-  // the same number of DynamoDB writes each time for no change in content.
-  const cachedByPublicId = new Map<string, UnipileSentInvitation>();
-  let cachePreloaded = false;
-  try {
-    for (const inv of await getAllSentInvitationsByAccount(accountId)) {
-      cachedByPublicId.set(inv.invitedUserPublicId, inv);
-    }
-    cachePreloaded = true;
-  } catch (err) {
-    // Non-fatal — worst case a timestamp-less invitation re-stamps to now and
-    // every row is rewritten, i.e. exactly the previous behaviour.
-    console.warn(`${TAG} could not preload cached invitations for account ${accountId}:`, err);
-  }
-
-  let cursor: string | undefined;
-  let page = 0;
-  const MAX_PAGES = 50; // 50 × 100 = 5000 pending invites — well above LinkedIn's limits
-
-  do {
-    const result = await linkedInOutreachService.listSentInvitations(accountId, cursor);
-    const items: any[] = result?.items ?? [];
-    if (items.length === 0) break;
-
-    for (const item of items) {
-      // Unipile may return the public id directly, or only a profile/public URL.
-      const publicId: string =
-        item.invited_user_public_id ||
-        item.invited_user_public_identifier ||
-        '';
-      if (!publicId) continue;
-
-      // EVERY pending invitation is recorded here, on every cycle. This set is
-      // what pruneStaleSentInvitations reconciles against, so it must stay a
-      // complete picture of the feed — narrowing the walk would delete valid
-      // rows. The full pagination is load-bearing for correctness.
-      stillPendingPublicIds.add(publicId);
-
-      const cached = cachedByPublicId.get(publicId);
-      const candidate: UnipileSentInvitation = {
-        accountId,
-        invitedUserPublicId: publicId,
-        publicProfileUrl: profileUrlFromPublicId(publicId),
-        invitationId: item.id ?? '',
-        invitedUserName: item.invited_user ?? '',
-        invitationText: item.invitation_text ?? '',
-        sentAt: item.parsed_datetime ?? cached?.sentAt ?? now,
-        syncedAt: now,
-      };
-
-      // Only the WRITE is skipped when nothing meaningful changed; the row is
-      // still counted as pending above. `syncedAt` is excluded from the
-      // comparison because it is `now` on every run and would make every row
-      // differ — it is written but never read anywhere in the codebase, so a
-      // skipped row simply keeps its previous value, which then honestly means
-      // "when this row last changed" rather than "when the cron last ran".
-      if (cached && !sentInvitationChanged(cached, candidate)) {
-        unchanged += 1;
-        continue;
-      }
-
-      toUpsert.push(candidate);
-    }
-
-    cursor = (result as any)?.cursor ?? undefined;
-    page++;
-  } while (cursor && page < MAX_PAGES);
-
-  await upsertSentInvitations(toUpsert);
-  // Reuse the rows already loaded above rather than scanning the account a
-  // second time in the same cycle. Skipped when the preload failed, so the
-  // prune falls back to reading for itself and stays correct.
-  const pruned = await pruneStaleSentInvitations(
-    accountId,
-    stillPendingPublicIds,
-    cachePreloaded ? Array.from(cachedByPublicId.values()) : undefined,
-  );
-
-  console.log(`${TAG} account=${accountId} pending invitations: ${toUpsert.length} upserted, ${unchanged} unchanged (skipped), ${pruned} pruned (pages=${page})`);
-  return toUpsert.length;
 }
 
 /**
