@@ -8792,7 +8792,7 @@ export class AgentModeService {
   // Read current user's market strategy
   public async readMarketStrategy(
     userId: string,
-    options: { competitorOffset?: number; minCompetitorsInFull?: number } = {}
+    options: { competitorOffset?: number; minCompetitorsInFull?: number; pagingHints?: boolean } = {}
   ): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
@@ -8856,7 +8856,12 @@ export class AgentModeService {
         exists: true,
         marketData: marketStrategy,
         competitorDetailStart: window.start,
-        competitorDetailEnd: window.end
+        competitorDetailEnd: window.end,
+        // Paging instructions only make sense in a tool result. A caller that
+        // embeds this in its own prompt has no read_market_strategy to call, so
+        // the offsets are noise there — and noise that can leak into generated
+        // customer copy.
+        pagingHints: options?.pagingHints !== false
       });
 
       // Return structured response — no raw marketData to keep tool result size manageable
@@ -12276,7 +12281,8 @@ export class AgentModeService {
       // received 40 competitors in full and it still must (plus, now, the names
       // of any beyond that).
       const marketStrategy = await this.readMarketStrategy(userId, {
-        minCompetitorsInFull: AgentModeService.PROMPT_EMBEDDED_COMPETITOR_DETAIL
+        minCompetitorsInFull: AgentModeService.PROMPT_EMBEDDED_COMPETITOR_DETAIL,
+        pagingHints: false
       });
 
       // Get sender information (from lead record, or default sender from CRM configuration)
@@ -22803,6 +22809,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       (typeof competitor === 'object' && competitor && competitor.name) ? competitor.name : String(competitor);
     const inWindow = (index: number) => index >= detailStart && index < detailEnd;
     const nameOnlyCount = competitors.filter((_, index) => !inWindow(index)).length;
+    const pagingHints = marketResult.pagingHints !== false;
 
     formattedSummary += `<strong>🏆 Competitors (${competitors.length} total)</strong><br>`;
     if (competitors.length > 0) {
@@ -22810,7 +22817,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (!inWindow(index)) return;
         formattedSummary += this.formatCompetitorDetailLine(competitor);
       });
-      if (nameOnlyCount > 0) {
+      if (nameOnlyCount > 0 && pagingHints) {
         // Point at the next unread page: the entries after the window, or back
         // to the start once the window has run past the end of the list.
         const nextOffset = detailEnd < competitors.length ? detailEnd : 0;
@@ -22823,6 +22830,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         competitors.forEach((competitor: any, index: number) => {
           if (inWindow(index)) return;
           formattedSummary += `• [offset ${index}] ${nameOf(competitor)}<br>`;
+        });
+      } else if (nameOnlyCount > 0) {
+        // Prompt-embedding caller: name the rest, no tool directives, no offsets.
+        formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored (names only):</strong><br>`;
+        competitors.forEach((competitor: any, index: number) => {
+          if (inWindow(index)) return;
+          formattedSummary += `• ${nameOf(competitor)}<br>`;
         });
       }
     } else {
@@ -22852,10 +22866,18 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     formattedSummary += `<br><em>💡 I'll use this market strategy information to inform marketing campaigns, content strategy, and business development decisions.</em>`;
     // Only tell the model the read is exhaustive when it actually is. With a
-    // name-only tail, a second call is the supported way to read the rest.
-    formattedSummary += nameOnlyCount > 0
-      ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above, but ${nameOnlyCount} of them are shown by name only. Nothing is missing. To read any of those in full, call read_market_strategy again with competitorOffset set to the offset shown beside the name.`
-      : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`;
+    // name-only tail, a second call is the supported way to read the rest —
+    // unless the caller has no tools to call, in which case say nothing about
+    // tools at all.
+    if (!pagingHints) {
+      formattedSummary += nameOnlyCount > 0
+        ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above; ${nameOnlyCount} of them by name only. Nothing is missing.`
+        : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete.`;
+    } else {
+      formattedSummary += nameOnlyCount > 0
+        ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above, but ${nameOnlyCount} of them are shown by name only. Nothing is missing. To read any of those in full, call read_market_strategy again with competitorOffset set to the offset shown beside the name.`
+        : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`;
+    }
 
     return formattedSummary;
   }
