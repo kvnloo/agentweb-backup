@@ -7574,9 +7574,20 @@ export const agentModeController = {
           tools: stillRequired,
         });
         if (!narrowed.authorized || narrowed.tools.length !== priorConsent.tools.length) {
-          updates.autopublishAuthorized = narrowed.authorized;
+          // Never write `true` from here. `narrowed` is derived from a read taken
+          // earlier in this handler, so writing the flag would let a rename racing a
+          // revocation put the grant BACK — the edit would be restoring permission
+          // from a snapshot the owner has already withdrawn. Only the consent endpoint
+          // grants; this path may narrow and nothing else.
+          //
+          // When the scope merely shrinks, write the smaller tool list and leave the
+          // flag alone. `updateSchedule` builds a PARTIAL SET expression, so omitting
+          // the key preserves whatever is stored — including a revocation that landed
+          // in between, which then wins on its own. Authorization requires the flag
+          // AND a non-empty scope, so a narrowed list can never re-authorize anything.
           updates.autopublishAuthorizedTools = narrowed.tools;
           if (!narrowed.authorized) {
+            updates.autopublishAuthorized = false;
             updates.autopublishAuthorizedAt = null;
             updates.autopublishAuthorizedBy = null;
           }

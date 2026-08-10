@@ -135,7 +135,34 @@ describe('ENG-827 — publish consent narrows when an edit changes the required 
     );
 
     const w = written();
-    expect(w.autopublishAuthorized).toBe(true);
+    expect(w.autopublishAuthorizedTools).toEqual(['publish_blog_article']);
+    // Greptile: NOT written as true. `narrowed` comes from a read taken earlier in
+    // the handler, so writing the flag would let this edit restore a grant that a
+    // revocation racing it had already withdrawn. Omitting the key preserves whatever
+    // is stored, and the revoke then wins on its own.
+    expect(w).not.toHaveProperty('autopublishAuthorized');
+  });
+
+  it('cannot resurrect a grant that was revoked while the edit was in flight', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(
+      existing({
+        requiredFunctionCalls: ['post_on_connected_account', 'publish_blog_article'],
+        autopublishAuthorizedTools: ['post_on_connected_account', 'publish_blog_article'],
+      }) as any
+    );
+
+    // The owner revokes between this handler's read and its write. The edit keeps
+    // part of the approved scope, which is exactly the case that used to write
+    // `autopublishAuthorized: true` back over the revocation.
+    await agentModeController.updateScheduledChat(
+      req({ requiredFunctionCalls: ['publish_blog_article'] }),
+      res()
+    );
+
+    const w = written();
+    expect(w).not.toHaveProperty('autopublishAuthorized');
+    // Authorization needs the flag AND a non-empty scope, so a narrowed list alone
+    // can never re-authorize anything.
     expect(w.autopublishAuthorizedTools).toEqual(['publish_blog_article']);
   });
 });
