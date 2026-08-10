@@ -178,7 +178,7 @@ describe('Emma API Routes', () => {
       expect(res.status).toBe(200);
       expect(mockService.generateImage).toHaveBeenCalledWith(
         'a cat', 'cat.png', '1024x1024', 'medium', [],
-        'user-123', '', undefined, undefined
+        'user-123', '', undefined, undefined, undefined, undefined
       );
     });
   });
