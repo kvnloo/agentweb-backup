@@ -1,4 +1,11 @@
-import { refuseUnauthorizedScheduledPublish } from '../utils/scheduledPublishConsentGuard';
+import {
+  refuseUnauthorizedScheduledPublish,
+  publishWithdrawnMidFlight,
+  attachPublishRevalidation,
+} from '../utils/scheduledPublishConsentGuard';
+
+jest.mock('../services/chatbotService', () => ({ chatbotDb: { getChatSession: jest.fn() } }));
+jest.mock('../services/db', () => ({ scheduleDb: { getScheduleById: jest.fn() } }));
 
 /**
  * ENG-827 (Greptile) — a revocation that lands MID-TURN must stop the publish.
@@ -289,5 +296,142 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
     expect(refusal!.success).toBe(false);
     expect(refusal!.error).toContain('could not be confirmed');
     expect(d.getChatSession).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * The mid-flight re-check, which the dispatch-time check cannot cover on its own.
+ *
+ * A handler that does slow work between admission and the irreversible act —
+ * resolving accounts, uploading a video, minutes for YouTube — would otherwise
+ * publish long after the owner switched consent off, because the decision was taken
+ * at the START of work that outlived it.
+ */
+describe('attachPublishRevalidation / publishWithdrawnMidFlight (ENG-827)', () => {
+  it('leaves a non-publishing tool\'s context untouched (same object, no hook)', () => {
+    const context = { sessionId: 'sess-1' };
+    expect(attachPublishRevalidation('read_brand_guidelines', context)).toBe(context);
+  });
+
+  it('leaves an action-scoped READ untouched — analytics must not pay for a re-check', () => {
+    const context = { sessionId: 'sess-1' };
+    expect(
+      attachPublishRevalidation('linkedin_manage_post', context, { action: 'get_analytics' })
+    ).toBe(context);
+  });
+
+  it('attaches the hook for a publishing call, preserving the original context', () => {
+    const context = { sessionId: 'sess-1', userId: 'u1' };
+    const wrapped = attachPublishRevalidation('post_on_connected_account', context);
+    expect(wrapped).not.toBe(context);
+    expect(wrapped.sessionId).toBe('sess-1');
+    expect(wrapped.userId).toBe('u1');
+    expect(typeof wrapped.assertPublishStillAuthorized).toBe('function');
+  });
+
+  it('tolerates a missing context rather than throwing at dispatch', () => {
+    const wrapped = attachPublishRevalidation('post_on_connected_account', undefined);
+    expect(typeof wrapped.assertPublishStillAuthorized).toBe('function');
+  });
+
+  it('proceeds when no hook was attached — direct service and interactive calls', async () => {
+    expect(await publishWithdrawnMidFlight(undefined)).toBeNull();
+    expect(await publishWithdrawnMidFlight({})).toBeNull();
+    expect(await publishWithdrawnMidFlight({ sessionId: 'sess-1' })).toBeNull();
+  });
+
+  it('hands back the hook\'s refusal so the handler abandons the post', async () => {
+    const refusal = { success: false as const, error: 'consent withdrawn' };
+    expect(
+      await publishWithdrawnMidFlight({ assertPublishStillAuthorized: async () => refusal })
+    ).toBe(refusal);
+  });
+
+  it('proceeds when the hook clears the call', async () => {
+    expect(
+      await publishWithdrawnMidFlight({ assertPublishStillAuthorized: async () => null })
+    ).toBeNull();
+  });
+
+  // The whole point of the pair, end to end: attach at dispatch, then INVOKE it after
+  // the owner revokes. Attaching a hook nobody calls proves nothing, and the earlier
+  // cases stub the hook rather than exercising the real one.
+  it('the attached hook REFUSES once consent is revoked while the handler works', async () => {
+    const { chatbotDb } = require('../services/chatbotService');
+    const { scheduleDb } = require('../services/db');
+    chatbotDb.getChatSession.mockResolvedValue({
+      sessionId: 'sess-1',
+      sessionType: 'scheduled',
+      pageIdentifier: 'Kevin|scheduleId:1c20ada1-0000-4000-8000-000000000001',
+      publishAdmission: { authorized: true, tools: ['twitter_manage_post'], recordedAt: 'x' },
+    });
+    // Admitted while publishing was allowed...
+    scheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: '1c20ada1-0000-4000-8000-000000000001',
+      requiredFunctionCalls: ['twitter_manage_post'],
+    });
+    const wrapped = attachPublishRevalidation(
+      'twitter_manage_post', { sessionId: 'sess-1' }, { action: 'post_thread' }
+    );
+    expect(await publishWithdrawnMidFlight(wrapped)).toBeNull();
+
+    // ...the owner switches the hold on while the upload is still running.
+    scheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: '1c20ada1-0000-4000-8000-000000000001',
+      requiredFunctionCalls: ['twitter_manage_post'],
+      requirePublishApproval: true,
+    });
+    const refusal = await publishWithdrawnMidFlight(wrapped);
+    expect(refusal).not.toBeNull();
+    expect(refusal!.error).toContain('not authorized to publish');
+  });
+});
+
+/**
+ * With no deps supplied the guard resolves its own against the real datastores. That
+ * is the wiring EVERY live dispatch uses — every other test here injects fakes, so
+ * without this the production path is the one path never exercised.
+ */
+describe('default dependency resolution (ENG-827)', () => {
+  it('reads the session and schedule through the real db modules', async () => {
+    const { chatbotDb } = require('../services/chatbotService');
+    const { scheduleDb } = require('../services/db');
+    chatbotDb.getChatSession.mockResolvedValue({
+      sessionId: 'sess-1',
+      sessionType: 'scheduled',
+      pageIdentifier: `Kevin — Daily LinkedIn Post|scheduleId:${'1c20ada1-0000-4000-8000-000000000001'}`,
+      publishAdmission: { authorized: true, tools: ['post_on_connected_account'], recordedAt: 'x' },
+    });
+    scheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: '1c20ada1-0000-4000-8000-000000000001',
+      requiredFunctionCalls: ['post_on_connected_account'],
+    });
+
+    expect(
+      await refuseUnauthorizedScheduledPublish('post_on_connected_account', { sessionId: 'sess-1' })
+    ).toBeNull();
+    expect(chatbotDb.getChatSession).toHaveBeenCalledWith('sess-1');
+    expect(scheduleDb.getScheduleById).toHaveBeenCalledWith('1c20ada1-0000-4000-8000-000000000001');
+  });
+
+  it('refuses through the real modules when the owner holds the schedule', async () => {
+    const { chatbotDb } = require('../services/chatbotService');
+    const { scheduleDb } = require('../services/db');
+    chatbotDb.getChatSession.mockResolvedValue({
+      sessionId: 'sess-1',
+      sessionType: 'scheduled',
+      pageIdentifier: 'Kevin|scheduleId:1c20ada1-0000-4000-8000-000000000001',
+      publishAdmission: { authorized: true, tools: ['post_on_connected_account'], recordedAt: 'x' },
+    });
+    scheduleDb.getScheduleById.mockResolvedValue({
+      scheduleId: '1c20ada1-0000-4000-8000-000000000001',
+      requirePublishApproval: true,
+    });
+
+    const refusal = await refuseUnauthorizedScheduledPublish(
+      'post_on_connected_account', { sessionId: 'sess-1' }
+    );
+    expect(refusal).not.toBeNull();
+    expect(refusal!.error).toContain('not authorized to publish');
   });
 });
