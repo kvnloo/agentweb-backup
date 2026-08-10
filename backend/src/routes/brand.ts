@@ -629,6 +629,16 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       // owner editing their brand concurrently loses nothing: the condition
       // fails, we abort before touching S3, and the retry sees fresh data.
       const expectedBrandUpdatedAt = ownerRecord?.brandGuidelines?.updatedAt;
+      // The token has to actually move, or the guard is decorative. updatedAt is
+      // millisecond-granular, so a write landing in the same millisecond as the
+      // value it read would leave it unchanged — and a second concurrent delete
+      // would then pass its condition against a stale attachment list and
+      // restore a reference whose object is already gone. Step past a collision.
+      const nowMs = Date.now();
+      const nextUpdatedAt =
+        new Date(nowMs).toISOString() === expectedBrandUpdatedAt
+          ? new Date(nowMs + 1).toISOString()
+          : new Date(nowMs).toISOString();
       try {
         await userDb.updateUser(
           fallbackOwnerUserId,
@@ -636,7 +646,7 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
             brandGuidelines: {
               ...ownerRecord.brandGuidelines,
               attachments: prunedOwnerAttachments,
-              updatedAt: new Date().toISOString(),
+              updatedAt: nextUpdatedAt,
             },
           } as any,
           {

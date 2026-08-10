@@ -498,6 +498,39 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     );
   });
 
+  it("advances the CAS token even when the write lands in the same millisecond", async () => {
+    // The guard is only real if the token moves. updatedAt is millisecond
+    // granular, so a write in the same millisecond as the value it read would
+    // leave it identical — and the next concurrent delete would then pass its
+    // condition against a stale attachment list, restoring a reference whose
+    // S3 object is already gone.
+    const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
+    const sameMs = new Date().toISOString();
+    jest.spyOn(Date, "now").mockReturnValue(new Date(sameMs).getTime());
+    mockDynamoGet.mockResolvedValue({ Item: editor });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "owner-u",
+      shareSettings: {
+        brandGuidelines: { editors: ["editor-u"] },
+        marketingStrategy: { editors: [] },
+      },
+    });
+    mockGetUserById.mockResolvedValue({
+      userId: "owner-u",
+      email: "owner@test.com",
+      brandGuidelines: { ...ownBrand, updatedAt: sameMs },
+    });
+
+    const res = await del(editor, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(200);
+    const written = mockUpdateUser.mock.calls[0][1].brandGuidelines.updatedAt;
+    expect(written).not.toBe(sameMs);
+    expect(new Date(written).getTime()).toBeGreaterThan(new Date(sameMs).getTime());
+    (Date.now as jest.Mock).mockRestore();
+  });
+
   it("refuses a foreign key even on an un-copied org", async () => {
     const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
     mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
