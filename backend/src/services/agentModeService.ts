@@ -3885,12 +3885,21 @@ export class AgentModeService {
         // for the summary. Blanking responseMessage.content too keeps the debris out
         // of the persisted transcript AND out of the history sent on the retry (this
         // runs before the message is appended to `messages` below).
-        if (isUnusableSynthesis(responseContent)) {
+        const residueDroppedThisTurn = isUnusableSynthesis(responseContent);
+        if (residueDroppedThisTurn) {
           console.warn(`AgentMode: Discarding unusable final synthesis ${JSON.stringify(responseContent.trim())} in session ${sessionId} — treating as an empty turn`);
           synthesisResidueDropped = true;
           responseContent = '';
           responseMessage.content = '';
         }
+
+        // ENG-1054: did THIS turn produce usable text? `content` below is a sticky
+        // cross-turn accumulator — any earlier turn that narrated alongside its tool
+        // calls (the common case, and the shape of the production session) leaves it
+        // non-empty for the rest of the run. So it cannot answer "did the turn we are
+        // about to terminate on actually answer?", and gating the ENG-1054 remedies on
+        // it would silently disarm both. They gate on this per-turn flag instead.
+        const turnHadUsableText = responseContent.trim().length > 0;
 
         // Update content with LLM's response
         if (responseContent) {
@@ -3959,7 +3968,11 @@ export class AgentModeService {
           const termination = computeTermination({
             finishReason,
             stopReason,
-            content,
+            // ENG-1054: present THIS turn's (already-blanked) text when the turn's
+            // whole answer was residue. Passing the sticky accumulator would make a
+            // residue-only final turn look answered — the ladder would return
+            // final_response and the bounded synthesis retry would never fire.
+            content: residueDroppedThisTurn ? '' : content,
             toolCallsSoFar: toolCalls.length,
             maxTokensContinuations,
             maxTokenContinuationsLimit: MAX_TOKEN_CONTINUATIONS,
@@ -3989,11 +4002,13 @@ export class AgentModeService {
           }
 
           // ENG-1054: the loop is terminating after a synthesis that was discarded as
-          // residue, and the bounded retry produced no usable text either. Ending here
-          // would hand the user a blank reply and, worse, erase the record of the
-          // (already-applied) actions the run executed. Report that ledger instead —
-          // tool names and outcome counts only, so it can never claim a false success.
-          if (synthesisResidueDropped && !content) {
+          // residue, and this final turn produced no usable text either. Ending here
+          // would hand the user stale narration from an earlier turn (or a blank reply)
+          // and erase the record of the (already-applied) actions the run executed.
+          // Report that ledger instead — tool names and outcome counts only, so it can
+          // never claim a false success. Gated on the per-turn flag, not on `content`:
+          // `content` still holds any earlier turn's text and would suppress this.
+          if (synthesisResidueDropped && !turnHadUsableText) {
             console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
             content = buildExecutedActionsFallback(toolCalls);
             if (responseMessage) responseMessage.content = content;
