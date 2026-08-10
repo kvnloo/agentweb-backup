@@ -1,4 +1,5 @@
 import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
+import { refuseUnauthorizedScheduledPublish } from '../../utils/scheduledPublishConsentGuard';
 
 export interface McpToolHandler {
   name: string;
@@ -100,6 +101,18 @@ export class McpToolRegistry {
     // to be remembered for each new tool is the gate that silently rots.
     if (handler.requiresUserAccount && isAnonymousUserId(context?.userId)) {
       return buildAnonymousToolRefusal(name);
+    }
+
+    // ENG-827: an unattended scheduled run may only publish while its owner's
+    // consent is live. The runner re-checks between verification attempts, but a
+    // single turn is one worker invocation that can run for minutes over many
+    // internal tool calls — so a revocation arriving mid-turn would not be seen
+    // until after the publish. Checked here, immediately before execution, there
+    // is no window left. Same placement rationale as the two refusals above.
+    const publishRefusal = await refuseUnauthorizedScheduledPublish(name, context);
+    if (publishRefusal) {
+      console.warn(`ENG-827: refused ${name} in session ${context?.sessionId} — publish consent not live.`);
+      return publishRefusal;
     }
 
     return await handler.execute(args, context);
