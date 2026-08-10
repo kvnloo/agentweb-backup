@@ -23,6 +23,7 @@ import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService'
 import { metaService } from '../services/metaService';
 import { isSmokeTestEmail } from '../utils/smokeTestLead';
 import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
+import { handleHardBounceRecipients } from '../services/emailDeliverabilityService';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -252,6 +253,9 @@ router.post('/resend', async (req: express.Request, res: express.Response) => {
         console.log(`Email bounced: ${event.data.email_id} - ${bounceReason}`);
         // Auto-flag bounced leads as do-not-contact
         const bouncedTo = Array.isArray(event.data.to) ? event.data.to : (event.data.to ? [event.data.to] : []);
+        // ENG-720: a hard bounce to an *account's own address* flags the
+        // account undeliverable so support/CS can see replies won't land.
+        void handleHardBounceRecipients(bouncedTo, event.data.bounce);
         void (async () => {
           try {
             const users = await userDb.getUsersByEmailDomain(emailDomain);
