@@ -15,6 +15,13 @@ const SCHEDULED_SESSION = {
   sessionId: 'sess-1',
   sessionType: 'scheduled',
   pageIdentifier: 'Scheduled: Kevin — Daily LinkedIn Post|scheduleId:1c20ada1-0000-4000-8000-000000000001',
+  // The authorization this run was ADMITTED under, stamped by the runner before the
+  // first turn. Live schedule state is intersected with it and can only narrow.
+  publishAdmission: {
+    authorized: true,
+    tools: ['post_on_connected_account'],
+    recordedAt: '2026-08-10T01:00:00.000Z',
+  },
 };
 
 const AUTHORIZED_SCHEDULE = {
@@ -81,6 +88,70 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
     expect(
       await refuseUnauthorizedScheduledPublish('publish_some_future_surface', { sessionId: 'sess-1' }, d)
     ).not.toBeNull();
+  });
+
+  // Greptile (security): re-reading live state closes the revocation window, but on
+  // its own it also OPENS one in the other direction — a grant landing mid-run would
+  // publish content that a draft-only run had already generated under a prompt
+  // telling it not to publish, and that the owner never saw. Rights are intersected
+  // with the admitted scope, so live state can only ever narrow them.
+  describe('a run keeps the permissions it began with', () => {
+    it('REFUSES when consent was granted AFTER this run was admitted', async () => {
+      // Admitted draft-only (no stamp — the runner writes one only when authorized),
+      // then the owner ticked the box while the run was still executing.
+      const d = deps(
+        { ...SCHEDULED_SESSION, publishAdmission: undefined },
+        AUTHORIZED_SCHEDULE
+      );
+
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'post_on_connected_account', { sessionId: 'sess-1' }, d
+      );
+
+      expect(refusal).not.toBeNull();
+      expect(refusal!.error).toContain('a run keeps the permissions it began with');
+      expect(refusal!.error).toContain('takes effect on the next run');
+      // Cheap: a run with no publishing rights is refused without a schedule read.
+      expect(d.getScheduleById).not.toHaveBeenCalled();
+    });
+
+    it('REFUSES a tool ADDED to the approved scope after admission', async () => {
+      // Admitted for post_on_connected_account only; the owner then widened the
+      // schedule's approved list. The widening is invisible to this run.
+      const d = deps(SCHEDULED_SESSION, {
+        ...AUTHORIZED_SCHEDULE,
+        requiredFunctionCalls: ['post_on_connected_account', 'publish_blog_article'],
+        autopublishAuthorizedTools: ['post_on_connected_account', 'publish_blog_article'],
+      });
+
+      expect(
+        await refuseUnauthorizedScheduledPublish('publish_blog_article', { sessionId: 'sess-1' }, d)
+      ).not.toBeNull();
+      // ...while the tool it WAS admitted for still goes through.
+      expect(
+        await refuseUnauthorizedScheduledPublish('post_on_connected_account', { sessionId: 'sess-1' }, d)
+      ).toBeNull();
+    });
+
+    it('treats a malformed admission stamp as not authorized', async () => {
+      const d = deps(
+        { ...SCHEDULED_SESSION, publishAdmission: { authorized: 'true', tools: 'post_on_connected_account' } },
+        AUTHORIZED_SCHEDULE
+      );
+      expect(
+        await refuseUnauthorizedScheduledPublish('post_on_connected_account', { sessionId: 'sess-1' }, d)
+      ).not.toBeNull();
+    });
+
+    it('treats an admission stamped with an EMPTY scope as not authorized', async () => {
+      const d = deps(
+        { ...SCHEDULED_SESSION, publishAdmission: { authorized: true, tools: [], recordedAt: 'x' } },
+        AUTHORIZED_SCHEDULE
+      );
+      expect(
+        await refuseUnauthorizedScheduledPublish('post_on_connected_account', { sessionId: 'sess-1' }, d)
+      ).not.toBeNull();
+    });
   });
 
   it('fails CLOSED when the schedule cannot be read', async () => {

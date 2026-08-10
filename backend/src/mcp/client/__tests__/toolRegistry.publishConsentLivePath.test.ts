@@ -20,6 +20,9 @@ const scheduledSession = {
   sessionId: 'sess-scheduled',
   sessionType: 'scheduled',
   pageIdentifier: `Scheduled: Kevin — Daily LinkedIn Post|scheduleId:${SCHEDULE_ID}`,
+  // ENG-827: the scope this run was ADMITTED under. The guard intersects live
+  // schedule state with it, so a mid-run grant cannot widen a draft-only run.
+  publishAdmission: { authorized: true, tools: ['post_on_connected_account'], recordedAt: '2026-08-10T01:00:00.000Z' },
 };
 
 const getChatSession = jest.fn();

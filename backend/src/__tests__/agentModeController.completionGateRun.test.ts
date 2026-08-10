@@ -24,6 +24,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    updateSessionPublishAdmission: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
   },
 }));

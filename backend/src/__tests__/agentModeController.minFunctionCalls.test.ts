@@ -24,6 +24,7 @@ jest.mock('../services/chatbotService', () => ({
     addMessagesToSession: jest.fn(),
     updateSessionTitle: jest.fn(),
     updateSessionLlmModel: jest.fn(),
+    updateSessionPublishAdmission: jest.fn(),
     getMessagesFromMessagesTable: jest.fn(),
   },
 }));
@@ -845,6 +846,89 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
             'post_on_connected_account': { actual: 1, required: 1 },
           },
           passed: true,
+        })
+      );
+    });
+
+    // ENG-827 (Greptile P1, security): the dispatch guard re-reads live schedule
+    // state, which on its own would let consent granted DURING a run widen it. It
+    // intersects that read with the scope stamped here instead, so the stamp is what
+    // makes "a run keeps the permissions it began with" enforceable at all.
+    it('STAMPS the admitted publish scope on the session before the first turn', async () => {
+      const authorized = {
+        ...publishSchedule,
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(authorized as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Published the post.',
+        toolCalls: [
+          { name: 'read_brand_guidelines', arguments: {} },
+          { name: 'post_on_connected_account', arguments: {} },
+        ],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      await runScheduledChat(authorized as any, mockUserId, true);
+
+      expect(mockChatbotDb.updateSessionPublishAdmission).toHaveBeenCalledWith(
+        expect.any(String),
+        { authorized: true, tools: ['post_on_connected_account'] }
+      );
+      // Stamped BEFORE any turn ran — a stamp written after the fact would leave the
+      // first turn's publishes ungated.
+      const stampOrder = mockChatbotDb.updateSessionPublishAdmission.mock.invocationCallOrder[0];
+      const firstTurnOrder = mockGenerateMarketingResponseWorkerService.runInWorker.mock.invocationCallOrder[0];
+      expect(stampOrder).toBeLessThan(firstTurnOrder);
+    });
+
+    it('does NOT stamp a draft-only run — an absent stamp IS the withheld state', async () => {
+      mockScheduleDb.getScheduleById.mockResolvedValue(publishSchedule as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Drafted only.',
+        toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      await runScheduledChat(publishSchedule as any, mockUserId, true);
+
+      expect(mockChatbotDb.updateSessionPublishAdmission).not.toHaveBeenCalled();
+    });
+
+    // If the stamp cannot be written, the guard will refuse the publish. Carrying on
+    // as authorized would tell the model to publish and demand the call while the
+    // guard blocked it — the prompt-versus-checker contradiction that looped the
+    // reported runs. The whole run downgrades to draft-only instead.
+    it('DOWNGRADES the run to draft-only when the admission cannot be recorded', async () => {
+      const authorized = {
+        ...publishSchedule,
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      };
+      mockScheduleDb.getScheduleById.mockResolvedValue(authorized as any);
+      mockChatbotDb.updateSessionPublishAdmission.mockRejectedValueOnce(new Error('throttled'));
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        content: 'Drafted the post; holding publication.',
+        toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
+        knowledgeBaseQueries: [],
+        sources: [],
+        responseMessages: [],
+      });
+
+      const result = await runScheduledChat(authorized as any, mockUserId, true);
+
+      // Not nudged for a publish it would not be allowed to make: passes in one turn.
+      expect(result).toEqual(
+        expect.objectContaining({
+          functionCallDetails: { 'read_brand_guidelines': { actual: 1, required: 1 } },
+          functionCallMisses: [],
+          passed: true,
+          attempt: 1,
         })
       );
     });
