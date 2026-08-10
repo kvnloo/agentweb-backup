@@ -186,6 +186,30 @@ def has_negated_pattern(step_lines):
     return any(re.match(r"^\s+- ['\"]?!", line) for line in step_lines)
 
 
+def filter_patterns(step_lines, filter_name):
+    """Return the scalar patterns belonging to one named inline filter."""
+    header = re.compile(r"^(\s*)%s:\s*$" % re.escape(filter_name))
+    start = None
+    indent = 0
+    for index, line in enumerate(step_lines):
+        match = header.match(line)
+        if match:
+            start = index + 1
+            indent = len(match.group(1))
+            break
+    if start is None:
+        return []
+
+    patterns = []
+    for line in step_lines[start:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        match = re.match(r"^\s+-\s+(['\"]?)(.+?)\1\s*$", line)
+        if match:
+            patterns.append(match.group(2))
+    return patterns
+
+
 if mode == "step":
     for sid, _s, text in filters:
         if sid == arg:
@@ -197,6 +221,14 @@ if mode == "quant":
     for sid, s, _text in filters:
         if sid == arg:
             sys.stdout.write(quantifier(s))
+            sys.exit(0)
+    sys.exit(4)
+
+if mode == "patterns":
+    filter_name = sys.argv[4] if len(sys.argv) > 4 else ""
+    for sid, s, _text in filters:
+        if sid == arg:
+            sys.stdout.write("\n".join(filter_patterns(s, filter_name)))
             sys.exit(0)
     sys.exit(4)
 
@@ -217,6 +249,10 @@ filter_step() {
 
 filter_quantifier() {
   python3 "${STEP_EXTRACTOR}" "${WORKFLOW}" quant "$1"
+}
+
+filter_patterns() {
+  python3 "${STEP_EXTRACTOR}" "${WORKFLOW}" patterns "$1" "$2"
 }
 
 # ---------------------------------------------------------------------------
@@ -339,10 +375,28 @@ else
   # deploy path is exercised by the deploy path on its own PR. Narrowing the
   # deploy decision without carrying these forward would ship the next
   # backend-staging-deploy fix unexercised.
-  assert_contains "${DEPLOY_FILTER}" "tests.yml" \
-    "a change to this workflow still deploys to staging (ENG-743)"
-  assert_contains "${DEPLOY_FILTER}" "eb-deploy.sh" \
-    "a change to eb-deploy.sh still deploys to staging (ENG-743)"
+  DEPLOY_CI_PATTERNS="$(filter_patterns filter_deploy deploy_ci)"
+  DEPLOY_CI_COUNT="$(printf '%s\n' "${DEPLOY_CI_PATTERNS}" | grep -c . || true)"
+  if [ "${DEPLOY_CI_COUNT}" -eq 1 ]; then
+    pass_test "deploy_ci uses one pattern under the EVERY quantifier"
+  else
+    fail_test "deploy_ci uses one pattern under the EVERY quantifier" \
+      "found ${DEPLOY_CI_COUNT}: separate entries require every deployment-path file to change in the same PR"
+  fi
+  assert_contains "${DEPLOY_CI_PATTERNS}" ".github/{workflows/tests.yml,scripts/eb-deploy.sh}" \
+    "one brace pattern independently matches either deploy-path file (ENG-743)"
+  if printf '%s\n' "${DEPLOY_CI_PATTERNS}" | grep -Fxq ".github/workflows/tests.yml"; then
+    fail_test "tests.yml is not a separate deploy_ci entry" \
+      "under predicate-quantifier: every, separate entries require tests.yml AND eb-deploy.sh to change together"
+  else
+    pass_test "tests.yml is not a separate deploy_ci entry"
+  fi
+  if printf '%s\n' "${DEPLOY_CI_PATTERNS}" | grep -Fxq ".github/scripts/eb-deploy.sh"; then
+    fail_test "eb-deploy.sh is not a separate deploy_ci entry" \
+      "under predicate-quantifier: every, separate entries require tests.yml AND eb-deploy.sh to change together"
+  else
+    pass_test "eb-deploy.sh is not a separate deploy_ci entry"
+  fi
 fi
 
 # --- The fail-open guard, stated generally so it also covers future filters. --
