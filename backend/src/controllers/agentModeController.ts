@@ -46,6 +46,7 @@ import {
   reconcileFalseFailureReport,
   ledgerFromSucceededFunctions,
   appendConfirmedPublishNotice,
+  collectConfirmedPublishActions,
   FalseFailureLedgerEntry,
 } from '../utils/falseFailureReport';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -114,6 +115,22 @@ const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
 // does recover on retry — so it must NOT get the system-error copy that says "retrying
 // won't help" (that copy is only true for deterministic errors). Give it its own honest
 // message: temporary, auto-retried, usually self-clearing.
+/**
+ * ENG-971: the zero-output copy above all opens with "so no results were generated"
+ * and closes with "will be retried automatically". Both are false for a run that
+ * published to production and then died before writing its summary — and the retry
+ * is worse than the wording, because it republishes. This message replaces them for
+ * that case, and the requeue is suppressed alongside it.
+ */
+function zeroAssistantPublishedMessage(actions: string[]): string {
+  return (
+    'This scheduled run stopped before it could report back — but it did not stop before doing the work: it '
+    + `${actions.join('; ')}. That is live and saved. `
+    + 'Because re-running would repeat it, this run has NOT been retried automatically. '
+    + 'Check the result, and start the schedule again yourself if something is still missing.'
+  );
+}
+
 const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
   "This scheduled run stopped before it could produce a response, so no results were generated. " +
   "It hit a temporary problem — a rate limit or a brief service hiccup — not a time or size limit. " +
@@ -3589,6 +3606,18 @@ export async function runScheduledChat(
 
     let zeroAssistantRequeuedAt: string | undefined;
     if (zeroAssistantOutput) {
+      // ENG-971: zero assistant output does NOT mean the run did nothing. A publish
+      // can land and the process die before the summary — exactly the shape of the
+      // session this issue came from, minus the closing turn. Requeuing that run
+      // REPUBLISHES it, and unlike the interactive error paths there is no human
+      // between the failure and the retry, so correcting the transcript alone would
+      // arrive far too late. Read the ledger first; it decides both the message and
+      // whether the requeue happens at all. A read failure yields no actions and
+      // every existing behaviour is preserved.
+      const publishedActions = sessionId
+        ? collectConfirmedPublishActions(await loadPublishLedger(sessionId))
+        : [];
+
       // Never leave the session silent (ENG-209). Persist a structured
       // "job incomplete" assistant message so the user sees graceful feedback
       // instead of an empty session. Done BEFORE requeue so the failed session
@@ -3600,7 +3629,9 @@ export async function runScheduledChat(
         // batches" advice that can't help — that mislabels the transcript for anyone
         // debugging it. Budget-shaped failures keep the original guidance.
         const failureClass = classifyZeroAssistantFailure(error);
-        const incompleteMessage = zeroAssistantIncompleteMessage(error);
+        const incompleteMessage = publishedActions.length > 0
+          ? zeroAssistantPublishedMessage(publishedActions)
+          : zeroAssistantIncompleteMessage(error);
         try {
           await chatbotDb.addMessageToSession(sessionId, {
             role: 'assistant',
@@ -3630,7 +3661,16 @@ export async function runScheduledChat(
         timestamp: new Date().toISOString(),
       });
 
-      if (!isTest) {
+      if (publishedActions.length > 0) {
+        // Deliberately no requeue and no retry-count bump: this run's work landed, so
+        // the schedule is left to its next natural slot rather than replaying a
+        // publish. Scoped to a CONFIRMED publish, so every other zero-output failure
+        // keeps self-healing exactly as before.
+        console.error(
+          `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
+          + `(${publishedActions.join('; ')}); NOT requeuing — a retry would repeat it.`
+        );
+      } else if (!isTest) {
         const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
         if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
           const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString();
