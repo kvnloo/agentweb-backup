@@ -424,6 +424,10 @@ export interface ReconcileInvitationsResult {
    * not the whole picture — worth checking before trusting a blind backfill.
    */
   matchedInOtherList: number;
+  /** True when the requested live refresh failed and reconciliation used cache. */
+  liveRefreshFailed?: boolean;
+  /** Newest cached row timestamp, included when live refresh falls back to cache. */
+  newestCachedSyncedAt?: string | null;
 }
 
 /**
@@ -454,12 +458,14 @@ export async function reconcileSentInvitationsToCrm(
 
   // Refresh the cache from Unipile's live sent feed first (default on) so the
   // reconciliation reflects invites sent since the last ~10-min sync cron.
+  let liveRefreshFailed = false;
   if (params.refreshFromLive !== false) {
     try {
-      const { syncSentInvitationsForAccount } = await import('../cron/linkedInConnectionSyncCron');
+      const { syncSentInvitationsForAccount } = await import('./linkedInSentInvitationsSyncService');
       await syncSentInvitationsForAccount(accountId);
     } catch (syncErr) {
       // Non-fatal: reconcile against whatever the cache already holds.
+      liveRefreshFailed = true;
       console.warn(`[reconcileSentInvitations] live refresh failed for account ${accountId} (using cache):`, syncErr);
     }
   }
@@ -481,6 +487,13 @@ export async function reconcileSentInvitationsToCrm(
   const { getAllSentInvitationsByAccount } = await import('./unipileSentInvitationsDb');
   const pending = await getAllSentInvitationsByAccount(accountId);
   result.total = pending.length;
+  if (liveRefreshFailed) {
+    result.liveRefreshFailed = true;
+    result.newestCachedSyncedAt = pending.reduce<string | null>((newest, invitation) => {
+      const syncedAt = invitation.syncedAt;
+      return syncedAt && (!newest || syncedAt > newest) ? syncedAt : newest;
+    }, null);
+  }
 
   for (const inv of pending) {
     try {
@@ -516,6 +529,9 @@ export async function reconcileSentInvitationsToCrm(
 
   console.log(
     `[reconcileSentInvitations]${params.dryRun ? ' (DRY-RUN, no writes)' : ''} account=${accountId} list=${listId} total=${result.total} created=${result.created} updated=${result.updated} (alreadyRecorded=${result.alreadyRecorded}, matchedInOtherList=${result.matchedInOtherList}) skipped=${result.skipped}`,
+    result.liveRefreshFailed
+      ? `source=cache newestCachedSyncedAt=${result.newestCachedSyncedAt ?? 'none'}`
+      : '',
   );
   return result;
 }

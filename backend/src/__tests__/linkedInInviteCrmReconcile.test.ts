@@ -11,6 +11,7 @@ const addLeadEngagement = jest.fn();
 const getLeadListsByUserId = jest.fn();
 const getAllSentInvitationsByAccount = jest.fn();
 const syncSentInvitationsForAccount = jest.fn();
+const cronSyncSentInvitationsForAccount = jest.fn();
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -28,6 +29,10 @@ jest.mock('../services/unipileSentInvitationsDb', () => ({
 }));
 
 jest.mock('../cron/linkedInConnectionSyncCron', () => ({
+  syncSentInvitationsForAccount: (...a: any[]) => cronSyncSentInvitationsForAccount(...a),
+}));
+
+jest.mock('../services/linkedInSentInvitationsSyncService', () => ({
   syncSentInvitationsForAccount: (...a: any[]) => syncSentInvitationsForAccount(...a),
 }));
 
@@ -59,6 +64,7 @@ describe('reconcileSentInvitationsToCrm', () => {
     addLeadEngagement.mockResolvedValue({});
     getLeadById.mockResolvedValue(null);
     syncSentInvitationsForAccount.mockResolvedValue(0);
+    cronSyncSentInvitationsForAccount.mockResolvedValue(0);
     getAllSentInvitationsByAccount.mockResolvedValue([]);
     getLeadListsByUserId.mockResolvedValue([]);
   });
@@ -131,7 +137,7 @@ describe('reconcileSentInvitationsToCrm', () => {
     );
   });
 
-  it('refreshes the live cache before reconciling by default, and skips the refresh when disabled', async () => {
+  it('ENG-876: refreshes through the lean sync service before reconciling', async () => {
     getAllSentInvitationsByAccount.mockResolvedValue([]);
 
     await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST });
@@ -140,6 +146,40 @@ describe('reconcileSentInvitationsToCrm', () => {
     syncSentInvitationsForAccount.mockClear();
     await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST, refreshFromLive: false });
     expect(syncSentInvitationsForAccount).not.toHaveBeenCalled();
+  });
+
+  it('ENG-876: does not reach through the cron import graph for a live refresh', async () => {
+    getAllSentInvitationsByAccount.mockResolvedValue([]);
+
+    await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST });
+    expect(cronSyncSentInvitationsForAccount).not.toHaveBeenCalled();
+  });
+
+  it('ENG-876: reports cache provenance and the newest cached timestamp after refresh failure', async () => {
+    syncSentInvitationsForAccount.mockRejectedValue(new Error('unipile down'));
+    cronSyncSentInvitationsForAccount.mockRejectedValue(new Error('unipile down'));
+    getAllSentInvitationsByAccount.mockResolvedValue([
+      invite('older', 'Older Cache', { syncedAt: '2026-07-01T00:00:00.000Z' }),
+      invite('newer', 'Newer Cache', { syncedAt: '2026-08-03T14:58:58.000Z' }),
+    ]);
+
+    const res = await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST, dryRun: true });
+    expect(res).toEqual(expect.objectContaining({
+      liveRefreshFailed: true,
+      newestCachedSyncedAt: '2026-08-03T14:58:58.000Z',
+    }));
+  });
+
+  it('ENG-876 characterization: dry-run still performs no CRM writes', async () => {
+    getAllSentInvitationsByAccount.mockResolvedValue([invite('new-person', 'New Person')]);
+
+    await reconcileSentInvitationsToCrm({
+      accountId: ACCOUNT, listId: LIST, refreshFromLive: false, dryRun: true,
+    });
+
+    expect(createLead).not.toHaveBeenCalled();
+    expect(updateLead).not.toHaveBeenCalled();
+    expect(addLeadEngagement).not.toHaveBeenCalled();
   });
 
   it('dry-run computes created/updated counts but writes nothing', async () => {
