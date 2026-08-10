@@ -45,6 +45,7 @@ import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../
 import {
   reconcileFalseFailureReport,
   ledgerFromSucceededFunctions,
+  diffSucceededFunctions,
   appendConfirmedPublishNotice,
   collectConfirmedPublishActions,
   FalseFailureLedgerEntry,
@@ -458,10 +459,15 @@ interface DiagnosisResult {
  * it with a fixed string, and that string still ends in "please send your message
  * again", which is the wrong advice after a landed publish.
  */
-async function loadPublishLedger(sessionId: string): Promise<FalseFailureLedgerEntry[]> {
+async function loadPublishLedger(
+  sessionId: string,
+  baseline?: Record<string, number> | null,
+): Promise<FalseFailureLedgerEntry[]> {
   try {
     const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
-    return ledgerFromSucceededFunctions(session?.calledFunctions || null);
+    return ledgerFromSucceededFunctions(
+      diffSucceededFunctions(baseline, session?.calledFunctions || null),
+    );
   } catch {
     return [];
   }
@@ -470,11 +476,14 @@ async function loadPublishLedger(sessionId: string): Promise<FalseFailureLedgerE
 async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
-  userMessage: string
+  userMessage: string,
+  baseline?: Record<string, number> | null
 ): Promise<DiagnosisResult> {
   try {
     const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
-    const succeededFunctions = session?.calledFunctions || null;
+    // THIS TURN's successes, not the session's lifetime total — see
+    // diffSucceededFunctions. "What was accomplished" must mean this request.
+    const succeededFunctions = diffSucceededFunctions(baseline, session?.calledFunctions || null);
     const publishLedger = ledgerFromSucceededFunctions(succeededFunctions);
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
@@ -2709,6 +2718,10 @@ export async function runScheduledChat(
   const leaseRunId: string = preGeneratedRunId || require('uuid').v4();
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let leaseAcquired = false;
+  // ENG-971: successes already on the session when THIS run started — empty for a
+  // fresh session, the abandoned run's totals when resuming one. Hoisted above the
+  // try because the zero-output requeue decision reads it from the CATCH.
+  let runStartCalledFunctions: Record<string, number> | null = null;
 
   try {
     // Guard against orphaned schedules whose owning user no longer exists.
@@ -3186,6 +3199,12 @@ export async function runScheduledChat(
       // reloads the full transcript from the DB.
       isResumeRun = true;
       sessionId = pendingResumeSessionId;
+      // ENG-971: a RESUMED session carries the abandoned run's calledFunctions. Without
+      // this baseline, that run's publish would be read as THIS run's work — and since
+      // a confirmed publish suppresses the zero-output requeue, an unrelated failure
+      // here would silently end the schedule's auto-recovery. Resume is exactly the
+      // path for runs that did real work first, so this is the common case.
+      runStartCalledFunctions = resumeSession.calledFunctions || {};
       // Credit the abandoned portion's tool calls to this run's verification,
       // preferring the executed ledger so a failed prior call keeps its error (ENG-844).
       resumePriorToolCalls = reconstructPriorToolCalls(resumeSession.messages || []);
@@ -3615,7 +3634,7 @@ export async function runScheduledChat(
       // whether the requeue happens at all. A read failure yields no actions and
       // every existing behaviour is preserved.
       const publishedActions = sessionId
-        ? collectConfirmedPublishActions(await loadPublishLedger(sessionId))
+        ? collectConfirmedPublishActions(await loadPublishLedger(sessionId, runStartCalledFunctions))
         : [];
 
       // Never leave the session silent (ENG-209). Persist a structured
@@ -4821,6 +4840,9 @@ export const agentModeController = {
     // the durable run record terminal after an error unwinds the inner finally.
     let runSurvivalRunId: string | undefined;
     let idemKeyHeld: string | undefined;
+    // ENG-971: calledFunctions is session-cumulative, so the error path needs to know
+    // where THIS turn started to tell its own successes from earlier turns'.
+    let turnStartCalledFunctions: Record<string, number> | null = null;
     try {
       const user = req.user as User;
       const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
@@ -4858,6 +4880,7 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
+      turnStartCalledFunctions = session.calledFunctions || {};
       if (session.userId !== user.userId && !user.isAdmin) {
         return res.status(403).json({ error: 'Unauthorized access to session' });
       }
@@ -5311,14 +5334,14 @@ export const agentModeController = {
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            publishLedger = await loadPublishLedger(sessionId);
+            publishLedger = await loadPublishLedger(sessionId, turnStartCalledFunctions);
             diagnosticContent = appendConfirmedPublishNotice(
               'The server restarted while processing your request. Please send your message again.',
               publishLedger,
             );
           } else {
             const userMessage = req.body?.userMessage || '';
-            const diagnosis = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+            const diagnosis = await getDiagnosticErrorMessage(error, sessionId, userMessage, turnStartCalledFunctions);
             diagnosticContent = diagnosis.message;
             publishLedger = diagnosis.publishLedger;
           }
@@ -5902,6 +5925,9 @@ export const agentModeController = {
   async generateSharedResponse(req: Request, res: Response) {
     // ENG-510: declared before the try so the catch's partial-timeout branch can read it.
     let sharedTurnStartMs = Date.now();
+    // ENG-971: see generateResponse — calledFunctions is session-cumulative, so the
+    // error path needs this turn's starting point to attribute successes correctly.
+    let turnStartCalledFunctions: Record<string, number> | null = null;
     try {
       const { shareId } = req.params;
       const { conversable } = req.query;
@@ -5916,6 +5942,7 @@ export const agentModeController = {
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
+      turnStartCalledFunctions = session.calledFunctions || {};
 
       // Check if conversable sharing is active and token matches
       if (!conversable) {
@@ -6076,14 +6103,14 @@ export const agentModeController = {
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            publishLedger = await loadPublishLedger(shareId);
+            publishLedger = await loadPublishLedger(shareId, turnStartCalledFunctions);
             diagnosticContent = appendConfirmedPublishNotice(
               'The server restarted while processing your request. Please send your message again.',
               publishLedger,
             );
           } else {
             const userMessage = req.body?.userMessage || '';
-            const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage);
+            const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage, turnStartCalledFunctions);
             diagnosticContent = diagnosis.message;
             publishLedger = diagnosis.publishLedger;
           }

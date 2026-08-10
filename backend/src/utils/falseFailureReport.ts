@@ -83,10 +83,20 @@ const CONFIRMED_PUBLISH_TOOLS: ReadonlySet<string> = new Set<string>([
 ]);
 
 /**
- * Deliberately absent: `twitter_manage_post`. It multiplexes create/delete/read
+ * Two tools were REMOVED from this set after review, and the reason matters:
+ *
+ *   `generate_landing_page` / `duplicate_landing_page` produce a DRAFT plus a
+ *   preview, not a production publish — in the ENG-971 session generate_landing_page
+ *   returned `awaitingReconnect: true` with a preview URL. Labelling that "deployed"
+ *   and telling the user not to re-run it is simply false, and re-running a draft is
+ *   cheap and harmless. Tolerable while this set only drove an appended correction;
+ *   not tolerable once it also decides whether a scheduled run is allowed to retry,
+ *   where over-reach silently disables a schedule's auto-recovery.
+ *
+ * Also deliberately absent: `twitter_manage_post`. It multiplexes create/delete/read
  * behind one name, and on the diagnosis path only the NAME survives the throw — a
  * successful delete would be announced as "posted". This guard's whole contract is
- * that it cannot claim an outcome the ledger does not show, so an ambiguous name is
+ * that it cannot claim an outcome the ledger does not show, so anything ambiguous is
  * excluded rather than guessed.
  */
 
@@ -94,8 +104,6 @@ const CONFIRMED_PUBLISH_TOOLS: ReadonlySet<string> = new Set<string>([
 const PUBLISH_ACTION_LABELS: Record<string, string> = {
   publish_landing_page_changes: 'published your landing-page changes',
   deploy_landing_page: 'deployed your landing page',
-  generate_landing_page: 'deployed your landing page',
-  duplicate_landing_page: 'deployed your landing page',
   publish_blog_article: 'published your blog article',
   post_on_connected_account: 'posted to your connected account',
   post_thread: 'posted your thread',
@@ -245,6 +253,43 @@ function isConfirmedPublish(entry: FalseFailureLedgerEntry | null | undefined): 
  * Entries carry no `result` and no `error`, which is exactly right: a name in this
  * histogram is itself the confirmation that the call succeeded.
  */
+/**
+ * The successes belonging to THIS turn, as a delta between two `calledFunctions`
+ * snapshots.
+ *
+ * `calledFunctions` accumulates for the LIFE OF THE SESSION — `incrementCalledFunctions`
+ * merges into the existing map and is never reset per turn or per run. Reading it raw
+ * therefore attributes any earlier success to the current failure, which breaks in two
+ * ways:
+ *
+ *   - Interactive: turn 1 publishes, turn 7 fails on something unrelated, and the
+ *     error message announces the turn-1 publish as though it were this request's.
+ *   - Scheduled, and far worse: an abandoned run that published is RESUMED into the
+ *     same session (`isResumeRun` → `sessionId = pendingResumeSessionId`). The
+ *     resumed run inherits that publish, so an unrelated zero-output failure would
+ *     see it and suppress the requeue — silently ending the schedule's auto-recovery.
+ *     Resume is precisely the path for runs that did real work first, so this is the
+ *     common case, not a corner.
+ *
+ * Only counts that INCREASED since the snapshot are this turn's work. A missing
+ * baseline means "nothing known to have happened before", which is correct for a
+ * fresh session and conservative everywhere else.
+ */
+export function diffSucceededFunctions(
+  before: Record<string, number> | null | undefined,
+  after: Record<string, number> | null | undefined,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!after || typeof after !== 'object') return out;
+  const baseline = before && typeof before === 'object' ? before : {};
+  for (const [name, count] of Object.entries(after)) {
+    if (!name || typeof count !== 'number') continue;
+    const prior = typeof baseline[name] === 'number' ? baseline[name] : 0;
+    if (count - prior > 0) out[name] = count - prior;
+  }
+  return out;
+}
+
 export function ledgerFromSucceededFunctions(
   calledFunctions: Record<string, number> | null | undefined,
 ): FalseFailureLedgerEntry[] {
