@@ -12,8 +12,8 @@
  * These pure helpers give the loop the same ladder for wall-clock time:
  *   normal          — plenty of budget left, behave exactly as before
  *   wrap_up         — past `wrapUpFraction` of the budget: stop starting new discovery
- *   final_synthesis — less than the synthesis reserve left: take the tools away and
- *                     make the model deliver what it already has, labelled partial
+ *   final_synthesis — less than the synthesis reserve left: stop honouring tool calls
+ *                     and make the model deliver what it already has, labelled partial
  *
  * Pure and dependency-free so it can be unit-tested without loading the agent-mode
  * monolith (same shape as `waitSecondsBudget`).
@@ -107,8 +107,9 @@ export function buildTurnTimeBudgetNudge(
     );
   }
   return (
-    `[SYSTEM WARNING] The time limit for this turn is about to be reached (~${remainingSeconds}s left) ` +
-    `and tools are now disabled. Do not call any more tools. Write your final answer NOW using ` +
+    `[SYSTEM WARNING] The time limit for this turn is about to be reached (~${remainingSeconds}s left). ` +
+    `Any tool call you make now will be DISCARDED without running, so calling one only wastes the ` +
+    `time you have left. Do not call any more tools. Write your final answer NOW using ` +
     `everything you already gathered so far, even if it is incomplete: lead with a short "Partial ` +
     `results" note stating which parts are done and which are missing, then give the actual content ` +
     `you have (lists, findings, links), and finish by telling the user they can reply "continue" to ` +

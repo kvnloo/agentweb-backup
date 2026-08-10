@@ -3497,8 +3497,9 @@ export class AgentModeService {
       // 10-minute controller cap issuing discovery calls; when the cap fires the run is
       // force-rejected and every bit of text it produced is discarded (the user gets a bare
       // "please try again" after real spend). We track the same deadline here so the loop
-      // can wrap itself up: nudge to stop new discovery at 70% of the budget, then take the
-      // tools away and force one final synthesis turn while there is still time to deliver.
+      // can wrap itself up: nudge to stop new discovery at 70% of the budget, then stop
+      // honouring tool calls and force one final synthesis turn while there is still time
+      // to deliver.
       // Unlike `generationHardCapMs` above this is NOT tied to the media switch — it guards
       // every turn. Set AGENT_MODE_GENERATION_TIMEOUT_MS=0 to disable.
       //
@@ -3594,7 +3595,7 @@ export class AgentModeService {
             console.warn(
               `AgentMode: whole-turn time budget nearly exhausted for session ${sessionId} ` +
               `(${Math.round(timeBudget.elapsedMs / 1000)}s used, ${Math.round(timeBudget.remainingMs / 1000)}s left) — ` +
-              'disabling tools and forcing a final synthesis so the work so far is delivered'
+              'no longer honouring tool calls and forcing a final synthesis so the work so far is delivered'
             );
             (messages as any[]).push({
               role: 'user',
@@ -3778,13 +3779,20 @@ export class AgentModeService {
           [ATTR_GEN_AI_PROVIDER_NAME]: providerForModel(llmModel),
           [ATTR_SESSION_ID]: sessionId,
         });
-        // ENG-907: on the forced synthesis turn the tool list is withheld entirely, so the
-        // model has no way to start more work and must answer with what it already has.
-        // (callLLM omits `tools`/`tool_choice` from the request when this is undefined.)
-        const toolsForCall = forceFinalSynthesis ? undefined : filteredToolsCache;
         try {
           response = await this.callLLM(llmModel, trimmedMessages, {
-            tools: toolsForCall,
+            // ENG-907: the forced synthesis turn keeps offering the SAME tool list. It is
+            // tempting to withhold it so the model physically cannot start more work, but
+            // that breaks the request: by this point the history is full of tool_use /
+            // tool_result blocks, and both providers we run Claude on reject a request that
+            // replays them with no tool list — Bedrock Converse fails the whole call with
+            // "The toolConfig field must be defined when using toolUse and toolResult
+            // content blocks". That would turn the partial delivery this feature exists to
+            // produce into a hard error, on exactly the model ENG-907 was reported against
+            // (anthropic.claude-opus-5). Tools stay on the wire; the loop instead DISCARDS
+            // any tool calls this turn returns (see the forceFinalSynthesis drop below), so
+            // no further work can start either way and the model is told as much.
+            tools: filteredToolsCache,
             tool_choice: 'auto',
             max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
             temperature: 0.1,
@@ -3808,7 +3816,7 @@ export class AgentModeService {
               llmModel = backup;
               backupModelUsed = true;
               response = await this.callLLM(llmModel, trimmedMessages, {
-                tools: toolsForCall,
+                tools: filteredToolsCache,
                 tool_choice: 'auto',
                 max_completion_tokens: AGENT_MODE_MAX_OUTPUT_TOKENS,
                 temperature: 0.1,
@@ -3927,6 +3935,21 @@ export class AgentModeService {
         // malformed assistant tool_calls turn with no matching tool results.
         if (finishReason === 'length' && responseMessage.tool_calls?.length) {
           console.warn(`AgentMode: Dropping ${responseMessage.tool_calls.length} truncated tool call(s) (finish_reason=length) in session ${sessionId}; routing to max-tokens continuation`);
+          delete responseMessage.tool_calls;
+        }
+
+        // ENG-907: the wall-clock budget is exhausted, so this turn is the last one that
+        // can still deliver anything. Tools had to stay on the wire (see the callLLM call
+        // above), so enforce the "no more work" half here: drop any calls the model made
+        // instead of executing them, and let the turn fall through to the terminal path
+        // with whatever text it wrote. Same reference-delete as the truncation drop above —
+        // responseMessage is already in `messages`, so this also clears the dangling
+        // tool_use that an empty-synthesis retry would otherwise replay unanswered.
+        if (forceFinalSynthesis && responseMessage.tool_calls?.length) {
+          console.warn(
+            `AgentMode: Discarding ${responseMessage.tool_calls.length} tool call(s) requested during the ` +
+            `forced final synthesis in session ${sessionId} — the turn's time budget is spent`
+          );
           delete responseMessage.tool_calls;
         }
 

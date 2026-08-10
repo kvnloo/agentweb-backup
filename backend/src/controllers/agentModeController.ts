@@ -3897,7 +3897,7 @@ export async function generateSessionResponse(
   // completion gate uses this flag (not response text) to force a synthesis turn.
   truncatedByStepBudget?: boolean;
   // ENG-907: the wall-clock counterpart — the turn ran out of time and delivered a
-  // partial answer from a forced tool-free synthesis instead of the full deliverable.
+  // partial answer from a forced synthesis turn instead of the full deliverable.
   truncatedByTimeBudget?: boolean;
 }> {
   // Clear any stale cancel from a previous request on this session
