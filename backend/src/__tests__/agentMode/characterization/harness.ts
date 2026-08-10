@@ -112,6 +112,22 @@ export async function runScenario(
   service: AgentModeService,
   scenario: HarnessScenario,
 ): Promise<BehaviorSnapshot> {
+  return (await runScenarioWithResult(service, scenario)).snapshot;
+}
+
+/**
+ * As `runScenario`, but also hands back the RAW `generateMarketingResponse` result.
+ *
+ * `BehaviorSnapshot` deliberately reduces `responseMessages` to roles and tool names
+ * and drops their content, so it cannot answer "what text was actually persisted into
+ * the transcript?" — which is exactly the claim the ENG-1054 residue guard makes. Use
+ * this when an assertion needs the persisted message bodies; use `runScenario` (the
+ * pinned contract) for everything else.
+ */
+export async function runScenarioWithResult(
+  service: AgentModeService,
+  scenario: HarnessScenario,
+): Promise<{ snapshot: BehaviorSnapshot; result: any }> {
   const callLLMSpy = jest.spyOn(service as any, 'callLLM');
   for (const turn of scenario.transcript) {
     callLLMSpy.mockResolvedValueOnce(buildLLMResponse(turn));
@@ -145,7 +161,7 @@ export async function runScenario(
     'test-session',
   );
 
-  return snapshotResult(result, callLLMSpy.mock.calls.length);
+  return { snapshot: snapshotResult(result, callLLMSpy.mock.calls.length), result };
 }
 
 /** Reduce a generateMarketingResponse result to its observable snapshot. */

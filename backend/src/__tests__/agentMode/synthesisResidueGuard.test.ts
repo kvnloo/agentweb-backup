@@ -13,7 +13,7 @@
  */
 
 import { AgentModeService } from '../../services/agentModeService';
-import { runScenario, installStandardMockDeps } from './characterization/harness';
+import { runScenario, runScenarioWithResult, installStandardMockDeps } from './characterization/harness';
 
 // Standard agentMode mock block (module-hoisted — must live in the test file).
 jest.mock('openai');
@@ -70,7 +70,10 @@ describe('AgentMode — broken-JSON final synthesis guard (ENG-1054)', () => {
   });
 
   it('never persists the residue into the transcript', async () => {
-    const snapshot = await runScenario(service, {
+    // The BehaviorSnapshot reduces responseMessages to roles/tool names and drops
+    // their content, so it cannot see residue in the transcript. Assert on the raw
+    // persisted messages — that is the claim this guard actually makes.
+    const { snapshot, result } = await runScenarioWithResult(service, {
       message: 'Pause both new campaigns.',
       transcript: [
         { tool_calls: [{ id: 'call-b1', name: 'read_brand_guidelines', arguments: '{}' }] },
@@ -79,9 +82,56 @@ describe('AgentMode — broken-JSON final synthesis guard (ENG-1054)', () => {
       ],
     });
 
-    const assistantTexts = (snapshot.responseMessageShape || []).length;
-    expect(assistantTexts).toBeGreaterThan(0);
+    const assistantTexts = (result.responseMessages ?? [])
+      .filter((m: any) => m?.role === 'assistant')
+      .map((m: any) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')));
+
+    expect(assistantTexts.length).toBeGreaterThan(0);
+    for (const persisted of assistantTexts) {
+      expect(persisted.trim()).not.toBe('}]');
+      expect(persisted.trim()).not.toBe('}');
+    }
     expect(snapshot.content).toBe('Both campaigns are paused.');
+  });
+
+  // The production shape: the first turn narrates ("I'll pause them now.") WHILE
+  // requesting tools, so the loop's sticky `content` accumulator is non-empty long
+  // before the residue-only final turn. Gating the guard on that accumulator makes
+  // it inert — the residue is blanked but the loop still terminates as if answered.
+  it('still re-asks when an earlier turn already narrated alongside its tool calls', async () => {
+    const snapshot = await runScenario(service, {
+      message: 'Pause both new campaigns, then show me the brand guidelines.',
+      transcript: [
+        {
+          content: "On it — I'll pause both campaigns now.",
+          tool_calls: [{ id: 'call-e1', name: 'read_brand_guidelines', arguments: '{}' }],
+        },
+        { content: '}]' },
+        { content: 'Both campaigns are paused. Here are your brand guidelines.' },
+      ],
+    });
+
+    expect(snapshot.content).toBe('Both campaigns are paused. Here are your brand guidelines.');
+    expect(snapshot.llmTurnsConsumed).toBe(3);
+  });
+
+  it('reports the executed-action ledger even when an earlier turn left stale narration', async () => {
+    const snapshot = await runScenario(service, {
+      message: 'Pause both new campaigns.',
+      transcript: [
+        {
+          content: "On it — I'll pause both campaigns now.",
+          tool_calls: [{ id: 'call-f1', name: 'read_brand_guidelines', arguments: '{}' }],
+        },
+        { content: '}]' },
+        { content: '}' },
+      ],
+    });
+
+    // Stale narration from turn 1 must not stand in for the lost synthesis: the
+    // user gets the truthful record of what ran instead.
+    expect(snapshot.content).not.toBe("On it — I'll pause both campaigns now.");
+    expect(snapshot.content).toContain('read_brand_guidelines');
   });
 
   it('falls back to the executed-action ledger when the retry also returns residue', async () => {
