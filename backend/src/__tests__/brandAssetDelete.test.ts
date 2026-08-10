@@ -369,16 +369,31 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     expect(ownerPrune).toBeLessThan(s3Delete);
   });
 
-  it("still reports success when only the S3 delete fails", async () => {
+  it("does not claim a clean delete when the S3 object survives", async () => {
     // Deleting the object last means a failure here leaks bytes and nothing
-    // else — both records have already stopped referencing it.
+    // else — the record has already stopped referencing it, so the request
+    // still succeeds. But the bytes remain at a URL that resolves, so the
+    // response must not call that "deleted successfully".
     mockDynamoGet.mockResolvedValue({ Item: soloUser });
     mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
+    jest.spyOn(console, "error").mockImplementation(() => {});
 
     const res = await del(soloUser, OWN_ASSET_KEY);
 
     expect(res.status).toBe(200);
     expect(mockDynamoUpdate).toHaveBeenCalled();
+    expect(res.body.objectDeleted).toBe(false);
+    expect(res.body.message).toMatch(/could not be deleted/i);
+    (console.error as jest.Mock).mockRestore();
+  });
+
+  it("reports a clean delete when the object really is gone", async () => {
+    mockDynamoGet.mockResolvedValue({ Item: soloUser });
+
+    const res = await del(soloUser, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(200);
+    expect(res.body.objectDeleted).toBe(true);
   });
 
   it("prunes from the strong-consistent owner read, not the stale GSI row", async () => {
