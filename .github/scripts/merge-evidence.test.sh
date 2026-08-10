@@ -957,6 +957,28 @@ for non_backend in \
   check "a PR touching only ${non_backend} passes with the suite skipped" 0 'PASS'
 done
 
+# Renames and the backend classifier (Greptile P1 on ENG-1003). The workflow's
+# path filter classifies on the POST-rename path, so the gate must too:
+#
+# 1. A file renamed OUT of the backend does not schedule the backend jobs.
+#    Gating on its old name would demand evidence the workflow never produced —
+#    a NO_EVIDENCE the author cannot fix by re-running anything.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${NON_BACKEND_RUNS}"
+changed_files "${d}" "$(printf 'docs/service-notes.md\tbackend/src/serviceNotes.ts')"
+run_gate "${d}"
+check 'a rename OUT of backend/ passes with the suite skipped (classified on current path)' 0 'PASS'
+
+# 2. A file renamed INTO the backend is a backend change under its current
+#    name, and the requirement still bites when the suite did not run.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${NON_BACKEND_RUNS}"
+changed_files "${d}" "$(printf 'backend/src/serviceNotes.ts\tdocs/service-notes.md')"
+run_gate "${d}"
+check 'a rename INTO backend/ still requires the backend suite' 3 'changes backend paths'
+
 # Renaming a job must fail closed rather than delete the requirement. With the
 # override pointing at a name nothing reports, the gate blocks.
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -1100,6 +1122,17 @@ green_pr "${d}" 'BEHIND'
 printf '%s\n' '{"ahead_by":3,"files":[{"filename":"partner-portal/src/AppRenamed.tsx","previous_filename":"partner-portal/src/App.tsx"}]}' >"${d}/compare.json"
 run_gate "${d}"
 check 'ENG-1003: a base rename of a file this PR edits is caught via previous_filename' 3 'partner-portal/src/App.tsx'
+
+# 6b. The PR side of the same coin: this PR renamed the file, the base edited
+#     it under the old name. The overlap only exists via the PR's
+#     previous_filename, which the current-path-only backend classifier must
+#     not have stripped from the overlap list.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+changed_files "${d}" "$(printf 'partner-portal/src/AppRenamed.tsx\tpartner-portal/src/App.tsx')"
+base_compare "${d}" 3 'partner-portal/src/App.tsx'
+run_gate "${d}"
+check 'ENG-1003: a PR rename of a file the base edits is caught via the PR previous_filename' 3 'partner-portal/src/App.tsx'
 
 # ---------------------------------------------------------------------------
 # Invariant guard — the discriminator must stay draft-gated ONLY

@@ -598,8 +598,15 @@ fi
 
 # Endpoint first, flags after: every other call in this script passes the
 # endpoint as the first argument, and the test mock dispatches on it.
-changed_files="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
-  --paginate --jq '.[] | .filename, (.previous_filename // empty)' 2>"${stderr_file}")"
+#
+# One line per file, tab-separated: current path, then the pre-rename path
+# when there is one. The two consumers below need different projections —
+# the backend classifier must see only current paths (dorny/paths-filter
+# classifies on the post-rename name, so gating on the old path of a file
+# renamed OUT of the backend demands evidence the workflow never scheduled),
+# while the base-overlap check needs both names of every file this PR touches.
+changed_files_tsv="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
+  --paginate --jq '.[] | .filename + "\t" + (.previous_filename // "")' 2>"${stderr_file}")"
 gh_exit=$?
 
 # Fail closed, and as ERROR rather than a verdict: an unreadable diff means the
@@ -608,14 +615,23 @@ gh_exit=$?
 if [ "${gh_exit}" -ne 0 ]; then
   hard_fail "GitHub API call failed (exit ${gh_exit}) reading the changed files of ${REPO}#${PR_NUMBER}, so whether the backend suite was required here cannot be established: $(tr '\n' ' ' <"${stderr_file}")"
 fi
-if [ -z "${changed_files}" ]; then
+if [ -z "${changed_files_tsv}" ]; then
   hard_fail "${REPO}#${PR_NUMBER} reports no changed files at ${head_sha}. An open PR always has at least one, so this is an unreadable diff rather than an empty one, and the backend-suite requirement cannot be evaluated."
 fi
+
+# Current paths only — what the workflow's path filter classified on.
+current_files="$(printf '%s\n' "${changed_files_tsv}" | cut -f1)"
+# Both names of every touched file — what the base-overlap check compares on.
+changed_files="$(printf '%s\n' "${changed_files_tsv}" | tr '\t' '\n' | sed '/^$/d')"
 
 # Prefix match anchored at the start of the path, via `case` rather than grep:
 # the prefixes contain `.` and `/`, and a regex would either need escaping or
 # would match `partner-portal/backend/x` as a backend change. `case` compares
 # literally except for the trailing `*`, so there is nothing to escape.
+#
+# Current paths only: a file renamed OUT of the backend no longer schedules
+# the backend jobs (the workflow classifies on the post-rename path), so
+# demanding their evidence here would be an unfixable NO_EVIDENCE.
 touches_backend=''
 while IFS= read -r file; do
   [ -n "${file}" ] || continue
@@ -628,7 +644,7 @@ while IFS= read -r file; do
         ;;
     esac
   done <<<"${BACKEND_PATHS}"
-done <<<"${changed_files}"
+done <<<"${current_files}"
 
 if [ -n "${touches_backend}" ]; then
   missing=''
