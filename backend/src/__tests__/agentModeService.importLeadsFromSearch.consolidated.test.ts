@@ -723,6 +723,44 @@ describe('AgentModeService.importLeadsFromSearch — zero-result search capabili
     expect(result.searchError).toBeUndefined();
   });
 
+  // A recurring schedule persists its cursor per (list, criteria) and resumes
+  // from it on the next run without ever passing one, so its first fetch looks
+  // cursor'd from the inside. Keying the guard off "no cursor" would exempt the
+  // repeat-schedule case the bug was actually reported from.
+  it('still reports the outage when the first fetch resumes from a persisted cursor', async () => {
+    const hash = expectedCriteriaHash({ title: 'CTO' });
+    mockGetLeadListById.mockResolvedValue({
+      listId: 'list-1',
+      leadCount: 0,
+      searchCursors: { [hash]: { cursor: 'cursor-from-yesterdays-run', lastUsedAt: '2026-08-07T17:03:00Z' } },
+    });
+    mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+    mockProbeSearchCapability.mockResolvedValue('degraded');
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
+
+    expect(mockSearchPeople).toHaveBeenCalledWith('test-account-id', expect.objectContaining({ cursor: 'cursor-from-yesterdays-run' }));
+    expect(result.searchUnavailable).toBe(true);
+    expect(result.message).toBeUndefined();
+  });
+
+  it('a resumed search that has genuinely run dry still reports a plain empty', async () => {
+    const hash = expectedCriteriaHash({ title: 'CTO' });
+    mockGetLeadListById.mockResolvedValue({
+      listId: 'list-1',
+      leadCount: 0,
+      searchCursors: { [hash]: { cursor: 'cursor-from-yesterdays-run', lastUsedAt: '2026-08-07T17:03:00Z' } },
+    });
+    mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+    mockProbeSearchCapability.mockResolvedValue('ok');
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
+
+    expect(result.success).toBe(true);
+    expect(result.searchUnavailable).toBeUndefined();
+    expect(result.message).toBe('No results found for the given search criteria.');
+  });
+
   it('does not block on an indeterminate probe', async () => {
     mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
     mockProbeSearchCapability.mockResolvedValue('unknown');
