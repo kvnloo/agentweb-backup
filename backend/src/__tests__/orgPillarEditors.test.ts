@@ -130,7 +130,11 @@ beforeEach(() => {
   mockUpdateUser.mockResolvedValue({});
   // The org fixtures carry no brand/strategy, so the owner-record fallback
   // fires; these suites care about the editor gate, not the owner's content.
-  mockGetUserById.mockResolvedValue(undefined);
+  // The owner record must still EXIST — an org whose ownerUserId resolves to
+  // nothing is not a reachable state, and the write paths now refuse to build a
+  // save baseline from a phantom-empty owner rather than persisting one over
+  // the owner's real data (covered directly in orgProfileResolver.test.ts).
+  mockGetUserById.mockResolvedValue({ userId: ADMIN_ID, email: "admin@test.com" });
   // Default dynamodb.get returns empty (no user found) — individual tests override as needed
   mockDynamoGet.mockResolvedValue({});
   // Default dynamodb.update resolves with empty attributes

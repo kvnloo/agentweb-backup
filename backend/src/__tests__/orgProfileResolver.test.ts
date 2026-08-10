@@ -149,3 +149,51 @@ describe("resolveOrgProfileField — boundary / error paths", () => {
     expect(mockUserDb.getUserById).not.toHaveBeenCalled();
   });
 });
+
+describe("resolveOrgProfileField — missing owner record", () => {
+  test("read path degrades to undefined rather than throwing", async () => {
+    // getUserById reads the eventually consistent UserIdIndex GSI, so a miss can
+    // just be lag. Throwing here would turn that blip into a 500 on /me and the
+    // settings pages; nothing is persisted on a read, so degrade and self-heal.
+    const member = { userId: MEMBER_ID, orgId: "org-1" };
+    mockUserDb.getUserById.mockResolvedValue(undefined as any);
+
+    await expect(
+      resolveOrgProfileField(member, unpopulatedOrg, "brandGuidelines")
+    ).resolves.toBeUndefined();
+  });
+
+  test("write path refuses to build a baseline from a phantom-empty owner", async () => {
+    // The caller is about to merge this and persist it as the ORG profile. Once
+    // the org record is populated the fallback stops firing for good, so a
+    // partial save over a missing owner would mask the owner's real brand
+    // permanently — the exact ENG-927 failure this resolver exists to prevent.
+    const member = { userId: MEMBER_ID, orgId: "org-1" };
+    mockUserDb.getUserById.mockResolvedValue(undefined as any);
+
+    await expect(
+      resolveOrgProfileField(member, unpopulatedOrg, "brandGuidelines", { forWrite: true })
+    ).rejects.toThrow(/owner .* not found/);
+  });
+
+  test("forWrite still resolves normally when the owner IS found", async () => {
+    const member = { userId: MEMBER_ID, orgId: "org-1" };
+    mockUserDb.getUserById.mockResolvedValue({
+      userId: OWNER_ID,
+      brandGuidelines: ownerBrand,
+    } as any);
+
+    await expect(
+      resolveOrgProfileField(member, unpopulatedOrg, "brandGuidelines", { forWrite: true })
+    ).resolves.toEqual(ownerBrand);
+  });
+
+  test("forWrite does not fire when the caller is the owner (no lookup needed)", async () => {
+    const owner = { userId: OWNER_ID, orgId: "org-1", brandGuidelines: ownerBrand };
+
+    await expect(
+      resolveOrgProfileField(owner, unpopulatedOrg, "brandGuidelines", { forWrite: true })
+    ).resolves.toEqual(ownerBrand);
+    expect(mockUserDb.getUserById).not.toHaveBeenCalled();
+  });
+});
