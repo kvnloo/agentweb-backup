@@ -164,8 +164,8 @@ export function ageDaysOf(WT) {
 // holder inside the quarantined tree could keep writing right up to rmSync — and those
 // writes would be silently destroyed. /proc is the ground truth for that on the Linux
 // runner: scan every process's fd table and cwd for paths inside the quarantined dir.
-// Any holder, or any inability to prove there is none (no /proc, unreadable entries
-// racing away are fine, but a missing table is not) → treat as live. Exported with an
+// Any holder, or a missing/unreadable proc table → treat as live. Uninspectable
+// individual pids (foreign-uid / non-dumpable) are skipped but logged. Exported with an
 // injectable proc root so tests can build a fake /proc tree.
 export function openHandleHolders(dir, procRoot = '/proc') {
   let real;
@@ -175,14 +175,44 @@ export function openHandleHolders(dir, procRoot = '/proc') {
   let pids;
   try { pids = readdirSync(procRoot).filter((n) => /^\d+$/.test(n)); } catch { return null; }
   const holders = [];
+  const unprovable = [];
+  let lastSkipCode = null;
   for (const pid of pids) {
     const base = path.join(procRoot, pid);
-    try { if (inside(readlinkSync(path.join(base, 'cwd')))) { holders.push(pid); continue; } } catch { /* process gone or not ours — its cwd can't be ours to lose */ }
-    let fds = [];
-    try { fds = readdirSync(path.join(base, 'fd')); } catch { continue; }
-    for (const fd of fds) {
-      try { if (inside(readlinkSync(path.join(base, 'fd', fd)))) { holders.push(pid); break; } } catch { /* fd closed mid-scan */ }
+    // A pid that vanished mid-scan (ENOENT/ESRCH) provably holds nothing. Any other
+    // failure (EACCES/EPERM) means the pid is live but uninspectable — a foreign-uid
+    // process, or an own-uid non-dumpable one (sshd/sd-pam post-setuid daemons are
+    // EACCES even to their owner on every Linux host). Failing the whole check closed
+    // on those would make GC permanently unable to reap anywhere; every process the
+    // runner itself spawns is same-uid and dumpable, hence readable. So: skip the pid,
+    // but LOG it — an uninspectable holder is never silently equated with "no holder".
+    const goneMidScan = (e) => e && (e.code === 'ENOENT' || e.code === 'ESRCH');
+    const skipUnprovable = (e) => {
+      if (unprovable[unprovable.length - 1] !== pid) unprovable.push(pid);
+      lastSkipCode = e.code;
+    };
+    try {
+      if (inside(readlinkSync(path.join(base, 'cwd')))) { holders.push(pid); continue; }
+    } catch (e) {
+      if (!goneMidScan(e)) { skipUnprovable(e); continue; }
     }
+    let fds = [];
+    try {
+      fds = readdirSync(path.join(base, 'fd'));
+    } catch (e) {
+      if (!goneMidScan(e)) skipUnprovable(e);
+      continue;
+    }
+    for (const fd of fds) {
+      try {
+        if (inside(readlinkSync(path.join(base, 'fd', fd)))) { holders.push(pid); break; }
+      } catch (e) {
+        if (!goneMidScan(e)) skipUnprovable(e);
+      }
+    }
+  }
+  if (unprovable.length > 0) {
+    log(`open-handle scan: skipped ${unprovable.length} uninspectable pid(s) (${lastSkipCode}): ${unprovable.join(', ')} — foreign-uid/non-dumpable; runner-spawned processes are always inspectable`);
   }
   return holders;
 }

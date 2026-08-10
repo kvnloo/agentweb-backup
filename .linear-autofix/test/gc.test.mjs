@@ -273,6 +273,35 @@ test('openHandleHolders returns null (unprovable) when the proc table is unreada
   } finally { rm(d, { recursive: true, force: true }); }
 });
 
+test('openHandleHolders skips-and-logs an uninspectable pid without reporting it as a holder', () => {
+  // EACCES on a pid (foreign-uid or non-dumpable, e.g. sshd) must not crash the scan or
+  // fail the whole check closed — that would make GC unable to reap on any real host —
+  // but it is logged, never silently equated with "no holder".
+  const d = mkdtempSync(join(tmpdir(), 'gc-fd-'));
+  try {
+    const t = makeTree(d);
+    const proc = makeProc(d, { 401: { cwd: '/' }, 402: { cwd: '/', fds: { 3: join(t, 'f.txt') } } });
+    chmodSync(join(proc, '401', 'fd'), 0o000);
+    const logged = [];
+    const orig = console.log;
+    console.log = (...a) => logged.push(a.join(' '));
+    try {
+      assert.deepEqual(openHandleHolders(t, proc), ['402'], 'readable holder still found');
+    } finally { console.log = orig; chmodSync(join(proc, '401', 'fd'), 0o755); }
+    assert.ok(logged.some((l) => l.includes('uninspectable') && l.includes('401')), 'skip must be logged with the pid');
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
+test('openHandleHolders treats a pid vanished mid-scan (ENOENT entries) as gone, not unprovable', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-fd-'));
+  try {
+    const t = makeTree(d);
+    const proc = makeProc(d, { 501: {} });
+    rm(join(proc, '501', 'fd'), { recursive: true, force: true }); // no cwd link, no fd dir → ENOENT everywhere
+    assert.deepEqual(openHandleHolders(t, proc), []);
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
 test('quarantineIfStillAged restores and keeps an aged tree with a live fd holder', () => {
   const d = mkdtempSync(join(tmpdir(), 'gc-fd-'));
   try {
