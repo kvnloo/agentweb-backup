@@ -47,10 +47,14 @@ jest.mock("aws-sdk", () => ({
 const mockGetOrgById  = jest.fn();
 const mockUpdateOrg   = jest.fn();
 const mockUpdateUser  = jest.fn();
+const mockGetUserById = jest.fn();
 
 jest.mock("../services/db", () => ({
   userDb: {
     updateUser: (...a: any[]) => mockUpdateUser(...a),
+    // An org record with no brandGuidelines/marketStrategy resolves through the
+    // owner's user record (ENG-927), so the pillar routes can read the owner.
+    getUserById: (...a: any[]) => mockGetUserById(...a),
   },
   orgDb: {
     getOrgById:  (...a: any[]) => mockGetOrgById(...a),
@@ -124,6 +128,9 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockUpdateOrg.mockResolvedValue({});
   mockUpdateUser.mockResolvedValue({});
+  // The org fixtures carry no brand/strategy, so the owner-record fallback
+  // fires; these suites care about the editor gate, not the owner's content.
+  mockGetUserById.mockResolvedValue(undefined);
   // Default dynamodb.get returns empty (no user found) — individual tests override as needed
   mockDynamoGet.mockResolvedValue({});
   // Default dynamodb.update resolves with empty attributes

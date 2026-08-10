@@ -281,6 +281,20 @@ router.post(
       let postOrg: Awaited<ReturnType<typeof orgDb.getOrgById>> | undefined;
       if (user.orgId) {
         postOrg = await orgDb.getOrgById(user.orgId);
+        // Authorize BEFORE resolving. The owner-record fallback can issue a
+        // read of another user's record, and an unauthorized caller must not
+        // trigger that — they are getting a 403 either way, so check first
+        // (this gate used to sit further down, just above the org write).
+        const allowed = canEditItem(
+          { userId: postOrg?.ownerUserId } as any,
+          { userId: user.userId, orgId: user.orgId, orgRole: user.orgRole as "owner" | "member" | undefined },
+          postOrg ?? null,
+          user.orgId,
+          "brandGuidelines",
+        );
+        if (!allowed) {
+          return res.status(403).json({ message: "Not authorized to edit brand guidelines" });
+        }
         if (postOrg) {
           existingBrandGuidelines = await resolveOrgProfileField(
             user,
@@ -371,18 +385,9 @@ router.post(
         `[BRAND DEBUG] About to update user with email: ${user.email}`
       );
 
-      // If user is in an org, save to org (admin or listed editor only); otherwise save to user
+      // If user is in an org, save to org; otherwise save to user. The
+      // admin-or-listed-editor gate ran above, before the owner-record read.
       if (user.orgId) {
-        const allowed = canEditItem(
-          { userId: postOrg?.ownerUserId } as any,
-          { userId: user.userId, orgId: user.orgId, orgRole: user.orgRole as "owner" | "member" | undefined },
-          postOrg ?? null,
-          user.orgId,
-          "brandGuidelines",
-        );
-        if (!allowed) {
-          return res.status(403).json({ message: "Not authorized to edit brand guidelines" });
-        }
         await orgDb.updateOrg(user.orgId, { brandGuidelines: brandGuidelinesData });
         console.log(`[BRAND DEBUG] Updated org ${user.orgId} brand guidelines`);
         // Onboarding v2 Phase 1: flip brand-build status to ready if we were
