@@ -62,6 +62,7 @@ describe('ChatSupport display preferences', () => {
     localStorage.clear();
     jest.clearAllMocks();
     Element.prototype.scrollIntoView = jest.fn();
+    HTMLCanvasElement.prototype.getContext = jest.fn().mockReturnValue(null);
   });
 
   it('preserves the existing open-chat behavior', async () => {
@@ -116,9 +117,29 @@ describe('ChatSupport display preferences', () => {
 
     const table = await screen.findByRole('table');
     const messageContent = screen.getByTestId('chat-message-content-0');
-    expect(getComputedStyle(messageContent).overflowX).toBe('hidden');
+    expect(getComputedStyle(messageContent).overflowX).toBe('auto');
     expect(getComputedStyle(table).display).toBe('block');
     expect(getComputedStyle(table).overflowX).toBe('auto');
     expect(getComputedStyle(table.querySelector('td') as HTMLElement).whiteSpace).toBe('nowrap');
+  });
+
+  it('keeps fixed-width assistant charts accessible with message-level horizontal scroll', async () => {
+    mockedAxiosGet.mockResolvedValueOnce({
+      data: [{
+        sessionId: 'session-with-chart',
+        userId: 'user-1',
+        messages: [{
+          role: 'assistant',
+          content: '<canvas id="trend"></canvas><script>const chartLabels = ["Jan"]; const chartData = [1];</script>',
+        }],
+        createdAt: '2026-08-10T00:00:00.000Z',
+        updatedAt: '2026-08-10T00:00:00.000Z',
+      }],
+    });
+
+    await openChat();
+
+    await waitFor(() => expect(document.querySelector('canvas')).toBeInTheDocument());
+    expect(getComputedStyle(screen.getByTestId('chat-message-content-0')).overflowX).toBe('auto');
   });
 });

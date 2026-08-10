@@ -751,7 +751,7 @@ const ChatSupport: React.FC = () => {
                         variant="body2" 
                         sx={{ 
                           whiteSpace: 'normal',
-                          overflowX: 'hidden',
+                          overflowX: 'auto',
                           fontSize: CHAT_FONT_SIZES[displayPreferences.fontSize],
                           lineHeight: 1.4,
                           fontWeight: msg.role === 'user' ? 400 : 400,
