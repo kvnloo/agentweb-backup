@@ -24727,7 +24727,14 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     sessionId: string,
     status: string = 'draft',
     author?: string,
-    categories: string[] = []
+    categories: string[] = [],
+    // ENG-827 (Greptile): the dispatcher checks consent before this method is entered,
+    // but the very first thing it does is fetch the article HTML over the network with
+    // a 30s budget. The check therefore precedes the slow part rather than the
+    // irreversible one, exactly like the YouTube upload did. Callers that publish on a
+    // schedule pass the hook so the decision is re-made against live consent at the
+    // last reachable point instead.
+    assertStillAuthorized?: () => Promise<{ error: string } | null>
   ): Promise<any> {
     try {
       console.log('AgentMode: Publishing blog article - Title:', title, 'Status:', status);
@@ -24786,6 +24793,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       }
       if (styleBlocks.length > 0) {
         bodyHtml = styleBlocks.join('\n') + '\n' + bodyHtml;
+      }
+
+      // A draft is reversible and invisible, so it is not gated — only going live is.
+      if (status === 'published') {
+        const withdrawnBeforeCms = await assertStillAuthorized?.();
+        if (withdrawnBeforeCms) {
+          console.warn('AgentMode: ENG-827 abandoning blog publish — consent was withdrawn while the article HTML was being fetched.');
+          return { success: false, message: withdrawnBeforeCms.error };
+        }
       }
 
       const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');

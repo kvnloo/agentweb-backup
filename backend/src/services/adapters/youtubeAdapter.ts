@@ -108,6 +108,24 @@ export class YouTubeAdapter implements SocialPlatformAdapter {
 
       // Update video metadata in a separate call
       const videoId = (uploadResponse.data as any).id;
+
+      // ENG-827 (Greptile): uploading is not what makes the video visible — THIS call
+      // is. The upload just moved bytes, and for a large video that can run minutes
+      // longer than the check above. So decide the privacy of the finished video from
+      // consent as it stands right now, not as it stood when the bytes started moving.
+      //
+      // On withdrawal we still send the update, forced to `private`. Returning early
+      // would leave an untitled video sitting on the channel under whatever default
+      // the API applied — and that default is public for verified projects, which is
+      // the exact outcome we are trying to prevent. Publishing privately is the only
+      // reachable state that is both safe and not a silent loss of the upload.
+      const withdrawnAfterUpload = await assertStillAuthorized?.();
+      if (withdrawnAfterUpload) {
+        console.warn(
+          `[YouTubeAdapter] ENG-827: publish consent withdrawn during upload — pinning video ${videoId} to private instead of publishing it.`
+        );
+      }
+
       const updateResponse = await axios.put(
         `${YOUTUBE_API_BASE}/videos`,
         {
@@ -117,13 +135,19 @@ export class YouTubeAdapter implements SocialPlatformAdapter {
             description: content,
             categoryId: '22',
           },
-          status: { privacyStatus: 'public' },
+          status: { privacyStatus: withdrawnAfterUpload ? 'private' : 'public' },
         },
         {
           params: { part: 'snippet,status' },
           headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         }
       );
+
+      if (withdrawnAfterUpload) {
+        throw new PublishConsentWithdrawn(
+          `${withdrawnAfterUpload.error} The video finished uploading before consent was withdrawn, so it was left PRIVATE on the channel (id ${videoId}) rather than published — make it public from YouTube Studio if you still want it live.`
+        );
+      }
 
       return updateResponse.data;
       }, userId);

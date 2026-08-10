@@ -1321,7 +1321,9 @@ mcpToolRegistry.register({
     return await agentModeService.publishBlogArticle(
       args.title, args.description, args.hero_image_url, args.blog_html_url,
       context?.userId, context?.sessionId,
-      args.status, args.author, args.categories
+      args.status, args.author, args.categories,
+      // The check above guards entry; this one rides through the HTML fetch inside.
+      context?.assertPublishStillAuthorized
     );
   }
 });
