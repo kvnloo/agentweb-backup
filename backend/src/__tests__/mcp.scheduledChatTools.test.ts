@@ -95,36 +95,43 @@ describe('Scheduled Chat MCP Tools', () => {
   // reading of a conversation, which is the same inferred-consent failure that
   // already sank three earlier signals. Keep this surface closed.
   describe('manage_scheduled_chat - publish consent is not agent-settable', () => {
-    it('exposes NO publish-consent lever at all, in either direction', () => {
+    it('exposes a REVOKE lever only — never a grant', () => {
       const def = mcpToolRegistry.getTool('manage_scheduled_chat')?.definition as any;
-      const props = Object.keys(def?.inputSchema?.properties || {});
-      // ENG-827/ENG-803: the schedule's publish setting is not model-writable EITHER
-      // WAY. A grant would let the model mint standing consent from its own reading
-      // of a conversation; a revoke would let it durably silence its own publishing
-      // and then truthfully cite the block — recreating ENG-803's reported bug at
-      // schedule level. Only the owner changes it, from the schedule form.
+      const props = def?.inputSchema?.properties || {};
+      expect(Object.keys(props)).toContain('revoke_autopublish');
+      // The grant direction must not exist under ANY spelling. A model able to turn
+      // publishing on would be manufacturing standing consent to post under the
+      // owner's name from its own reading of a conversation.
       for (const forbidden of [
-        'revoke_autopublish', 'autopublish_authorized', 'autopublishAuthorized',
-        'require_publish_approval', 'requirePublishApproval',
+        'autopublish_authorized', 'autopublishAuthorized',
+        'grant_autopublish', 'publish_without_review',
       ]) {
-        expect(props).not.toContain(forbidden);
+        expect(Object.keys(props)).not.toContain(forbidden);
       }
+      expect(props.revoke_autopublish.description).toMatch(/cannot turn it back on/i);
     });
 
-    it('never reaches a consent endpoint, whatever the model passes', async () => {
+    it('REVOKES via the dedicated endpoint, before the ordinary update', async () => {
       mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
       await mcpToolRegistry.execute('manage_scheduled_chat', {
         action: 'update',
         schedule_id: 'sc-1',
         revoke_autopublish: true,
-        autopublish_authorized: true,
       } as any, context);
 
       const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
-      expect(calls.find(c => String(c.path).includes('publish-consent'))).toBeUndefined();
       const put = calls.find(c => c.method === 'PUT');
-      expect(put.body).not.toHaveProperty('autopublishAuthorized');
-      expect(put.body).not.toHaveProperty('requirePublishApproval');
+      const consent = calls.find(c => String(c.path).endsWith('/publish-consent'));
+
+      expect(consent).toBeDefined();
+      expect(consent.method).toBe('POST');
+      expect(consent.path).toBe('/api/agent-mode/scheduled-chats/sc-1/publish-consent');
+      // Revoke-only by construction: the body can never ask to enable publishing.
+      expect(consent.body).toEqual({ authorized: false });
+
+      // ORDER matters. Revoke first, so a failure of the ordinary update leaves the
+      // schedule in the safer (not publishing) state rather than the riskier one.
+      expect(calls.indexOf(consent)).toBeLessThan(calls.indexOf(put));
     });
 
     it('does not touch consent at all when revoke_autopublish is absent or false', async () => {
@@ -149,8 +156,9 @@ describe('Scheduled Chat MCP Tools', () => {
       } as any, context);
       const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
       expect(calls[0].body.autopublishAuthorized).toBeUndefined();
-      // and nothing may reach the consent endpoint asking to enable publishing
-      const consent = calls.find(c => c.path.endsWith('/publish-consent'));
+      // Nothing may reach the consent endpoint asking to ENABLE publishing — and with
+      // revoke_autopublish false, nothing may reach it at all.
+      const consent = calls.find(c => String(c.path).endsWith('/publish-consent'));
       expect(consent).toBeUndefined();
     });
 
