@@ -79,15 +79,38 @@ const loadState = () => { try { return JSON.parse(readFileSync(statePath, 'utf8'
 // (writeChatState refreshes the cache below) or cross-process (autofix.mjs, caught by the mtime
 // change) — so callers still observe fresh state. Preserves the original {} fallback on a bad read.
 let chatStateCache = { mtimeMs: -1, data: null };
+// Incremental serialization cache (see serializeChatState). Reset whenever loadChatState replaces the
+// in-memory object from disk, since the cached per-entry strings belong to the old object graph.
+const serializedEntries = new Map(); // identifier -> JSON string of state[identifier]
+const dirtyEntries = new Set();      // identifiers whose cached string is stale (rebuild on next flush)
 const loadChatState = () => {
   try {
     const mtimeMs = statSync(chatStatePath).mtimeMs;
     if (chatStateCache.data && chatStateCache.mtimeMs === mtimeMs) return chatStateCache.data;
     const data = JSON.parse(readFileSync(chatStatePath, 'utf8'));
     chatStateCache = { mtimeMs, data };
+    serializedEntries.clear(); dirtyEntries.clear(); // new object graph → per-entry string cache is stale
     return data;
   } catch { return chatStateCache.data || {}; } // stat/read blip, or file not flushed yet → serve last good in-memory state
 };
+// Serialize the whole state object for a flush, but re-JSON.stringify only the issues marked dirty since
+// the last flush and reuse the cached string for every unchanged issue. A flush used to stringify the
+// entire ~50MB object (~350ms of blocked event loop) even when one issue changed; now it costs the few
+// ms to serialize the one changed entry + concatenate ~120 precomputed strings. Output is byte-identical
+// to JSON.stringify(state) (same key order, same values). Safe because server.mjs is the file's sole
+// writer, so the only content changes flow through writeChatState's dirty marks.
+function serializeChatState(state) {
+  const keys = Object.keys(state);
+  const parts = [];
+  for (const key of keys) {
+    let s = serializedEntries.get(key);
+    if (s === undefined || dirtyEntries.has(key)) { s = JSON.stringify(state[key]); serializedEntries.set(key, s); }
+    parts.push(JSON.stringify(key) + ':' + s);
+  }
+  dirtyEntries.clear();
+  if (serializedEntries.size > keys.length) for (const k of serializedEntries.keys()) if (!(k in state)) serializedEntries.delete(k); // drop deleted issues
+  return '{' + parts.join(',') + '}';
+}
 // Read-modify-write against a fresh read (same discipline as autofix's updateState).
 // Give every message a stable, monotonic `mid`. Edit/delete address a message by mid, NOT by array
 // position, because the .slice(-500) cap drops messages off the FRONT and would shift every index —
@@ -139,7 +162,7 @@ async function flushChatStateAsync() {
   flushing = true; flushDirty = false;
   const tmp = `${chatStatePath}.tmp.${process.pid}`;
   try {
-    const str = JSON.stringify(chatStateCache.data); // the ~350ms serialize — now at most once per window
+    const str = serializeChatState(chatStateCache.data); // incremental: re-stringifies only dirty issues
     await writeFileAsync(tmp, str);                  // I/O off the event loop (was a blocking writeFileSync)
     await renameAsync(tmp, chatStatePath);
     try { chatStateCache.mtimeMs = statSync(chatStatePath).mtimeMs; } catch { /* mtime refresh best-effort */ }
@@ -158,23 +181,26 @@ function flushChatStateSync() {
   flushDirty = false;
   try {
     const tmp = `${chatStatePath}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(chatStateCache.data));
+    writeFileSync(tmp, serializeChatState(chatStateCache.data));
     renameSync(tmp, chatStatePath);
     try { chatStateCache.mtimeMs = statSync(chatStatePath).mtimeMs; } catch { /* best-effort */ }
   } catch (e) { console.error('[chat] chat-state final flush failed:', e.message); }
 }
-function writeChatState(obj) {
+function writeChatState(obj, dirtyId) {
   // Update the read cache to the new object immediately (in-process reads see it at once; disk mtime is
   // unchanged until the flush, and loadChatState's cache-hit returns this object regardless), then queue
-  // the expensive serialize+write to run asynchronously and coalesced.
+  // the expensive serialize+write to run asynchronously and coalesced. dirtyId names the one issue whose
+  // content changed so the flush re-serializes only it; a call without an id (unknown scope) forces a
+  // full rebuild of the serialize cache to stay correct.
   chatStateCache = { mtimeMs: chatStateCache.mtimeMs, data: obj };
+  if (dirtyId) dirtyEntries.add(dirtyId); else serializedEntries.clear();
   scheduleFlush();
 }
 
 function updateChatState(identifier, fn) {
   const s = loadChatState();
   s[identifier] = ensureMids(fn(s[identifier] || { identifier, cwd: null, sessions: {}, messages: [] }));
-  writeChatState(s);
+  writeChatState(s, identifier);
   return s[identifier];
 }
 
@@ -352,7 +378,7 @@ function closeChat(identifier) {
     const s = loadState();
     for (const [uuid, e] of Object.entries(s)) if ((e.identifier || '').toUpperCase() === identifier.toUpperCase()) delete s[uuid];
     writeFileSync(statePath, JSON.stringify(s, null, 2));
-    const cs = loadChatState(); delete cs[identifier]; writeChatState(cs);
+    const cs = loadChatState(); delete cs[identifier]; writeChatState(cs, identifier); // removed key → serializeChatState drops it
     log(`closed standalone chat ${identifier} (removed worktree + branch ${branch})`);
     return { code: 200, body: { closed: true } };
   } finally { releaseLock(lockPath); }
