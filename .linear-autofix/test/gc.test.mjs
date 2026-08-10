@@ -125,3 +125,49 @@ test('exact threshold age is kept — strictly older than N days removes', () =>
   const d = decideWorktree({ ...base, resolved: false, ageDays: 14 });
   assert.equal(d.action, 'keep');
 });
+
+// Greptile P1 (2026-08-10, second review): the age scan races with live writers.
+// ageDaysOf must fail safe (null → keep) on any raced stat error, and a fresh
+// write must never be misread as an old tree.
+import { ageDaysOf, scanNewestMtime } from '../gc.mjs';
+import { mkdtempSync, mkdirSync, writeFileSync as wf, utimesSync, chmodSync, rmSync as rm } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+test('ageDaysOf reports the age of a genuinely old tree', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-age-'));
+  try {
+    wf(join(d, 'f.txt'), 'x');
+    const old = (Date.now() - 30 * 86400000) / 1000;
+    utimesSync(join(d, 'f.txt'), old, old);
+    utimesSync(d, old, old);
+    const age = ageDaysOf(d);
+    assert.ok(age >= 29 && age <= 31, `expected ~30, got ${age}`);
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
+test('ageDaysOf is 0 for a tree with a fresh nested write', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-age-'));
+  try {
+    mkdirSync(join(d, 'sub'));
+    wf(join(d, 'sub', 'f.txt'), 'x');
+    const old = (Date.now() - 30 * 86400000) / 1000;
+    utimesSync(d, old, old); // top-level looks idle; nested file is fresh
+    assert.equal(ageDaysOf(d), 0);
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
+test('a scan error anywhere fails safe to null (age unknown → keep)', () => {
+  if (process.getuid && process.getuid() === 0) return; // root ignores modes
+  const d = mkdtempSync(join(tmpdir(), 'gc-age-'));
+  try {
+    mkdirSync(join(d, 'sub'));
+    wf(join(d, 'sub', 'f.txt'), 'x');
+    chmodSync(join(d, 'sub'), 0o000); // readdir fails mid-scan, like a raced mutation
+    assert.equal(scanNewestMtime(d), null);
+    assert.equal(ageDaysOf(d), null);
+  } finally {
+    chmodSync(join(d, 'sub'), 0o755);
+    rm(d, { recursive: true, force: true });
+  }
+});

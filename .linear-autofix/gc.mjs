@@ -110,7 +110,7 @@ function prCountsForBranch(branch) {
 // active scratch dir as idle. Caps the walk; hitting the cap returns null (age unknown →
 // caller keeps) so a huge tree can never be aged out on partial evidence.
 const AGE_SCAN_MAX_ENTRIES = 20000;
-function ageDaysOf(WT) {
+export function scanNewestMtime(WT) {
   try {
     let newest = statSync(WT).mtimeMs;
     let visited = 0;
@@ -124,11 +124,26 @@ function ageDaysOf(WT) {
           const st = statSync(p);
           if (st.mtimeMs > newest) newest = st.mtimeMs;
           if (ent.isDirectory() && !ent.isSymbolicLink()) stack.push(p);
-        } catch { /* raced deletion — ignore */ }
+        } catch {
+          // A raced stat means something is mutating the tree right now —
+          // that IS activity. Age unknown → caller keeps.
+          return null;
+        }
       }
     }
-    return Math.floor((Date.now() - newest) / 86400000);
+    return newest;
   } catch { return null; }
+}
+// The scan races with live writers: a write landing in an already-visited path is
+// invisible to a single pass. Two passes bound that window — a write during pass 1
+// is visible to pass 2 (which starts after it), so age only counts when both
+// passes agree the tree is old. Any unknown → keep.
+export function ageDaysOf(WT) {
+  const first = scanNewestMtime(WT);
+  if (first === null) return null;
+  const second = scanNewestMtime(WT);
+  if (second === null) return null;
+  return Math.floor((Date.now() - Math.max(first, second)) / 86400000);
 }
 
 function removeWorktree(id) {
