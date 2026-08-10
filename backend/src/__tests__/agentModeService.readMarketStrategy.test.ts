@@ -120,3 +120,100 @@ describe('AgentModeService.readMarketStrategy competitor visibility (ENG-945)', 
     expect(res.formattedContent).toContain('Tenasol');
   });
 });
+
+// ENG-945 follow-up: name-only is bounded, not lossy — but a caller that needs
+// the description of an entry past the detail window must be able to get it.
+// `competitorOffset` slides the full-detail window over the stored list.
+describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)', () => {
+  let svc: AgentModeService;
+  beforeEach(() => {
+    svc = new AgentModeService();
+    jest.clearAllMocks();
+  });
+
+  it('returns full descriptions for the tail when the window is moved past the first page', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+
+    const res = await svc.readMarketStrategy('u1', { competitorOffset: 40 });
+
+    expect(res.competitorDetailOffset).toBe(40);
+    expect(res.competitorsWithFullDetail).toBe(9);
+    // The tail now carries its descriptions...
+    expect(res.formattedContent).toContain('Description for Comp49');
+    expect(res.formattedContent).toContain('Description for Comp41');
+    // ...and the first page is still fully accounted for, by name.
+    expect(res.formattedContent).toContain('Comp1');
+    expect(res.formattedContent).not.toContain('Description for Comp1<');
+  });
+
+  it('tells the caller which offset to ask for next instead of forbidding a second read', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.formattedContent).toMatch(/competitorOffset/);
+    expect(res.formattedContent).toContain('[offset 40]');
+    expect(res.formattedContent).not.toMatch(/do not call read_market_strategy again/i);
+  });
+
+  // ── Invalid / boundary inputs ────────────────────────────────────────────
+  it('clamps a negative offset to the start of the list', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+
+    const res = await svc.readMarketStrategy('u1', { competitorOffset: -5 });
+
+    expect(res.competitorDetailOffset).toBe(0);
+    expect(res.competitorsWithFullDetail).toBe(40);
+  });
+
+  it('clamps an offset past the end of the list so the window is never silently empty', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+
+    const res = await svc.readMarketStrategy('u1', { competitorOffset: 500 });
+
+    expect(res.competitorDetailOffset).toBe(48);
+    expect(res.competitorsWithFullDetail).toBe(1);
+    expect(res.formattedContent).toContain('Description for Comp49');
+  });
+
+  it('ignores a non-numeric offset rather than rendering an empty window', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+
+    const res = await svc.readMarketStrategy('u1', { competitorOffset: 'forty' as any });
+
+    expect(res.competitorDetailOffset).toBe(0);
+    expect(res.competitorsWithFullDetail).toBe(40);
+  });
+
+  it('leaves the small-strategy response untouched — no offsets, no notice', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(12)) });
+
+    const res = await svc.readMarketStrategy('u1', { competitorOffset: 0 });
+
+    expect(res.competitorDetailOffset).toBe(0);
+    expect(res.competitorsWithFullDetail).toBe(12);
+    expect(res.formattedContent).not.toMatch(/\[offset /);
+    expect(res.formattedContent).not.toMatch(/competitorOffset/);
+    expect(res.formattedContent).toContain('Description for Comp12');
+  });
+
+  it('pages the org strategy the same way it pages a personal one', async () => {
+    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', orgId: 'o1' });
+    orgDb.getOrgById.mockResolvedValue({ orgId: 'o1', marketStrategy: marketStrategyWith(makeCompetitors(49, 'OrgComp')) });
+
+    const res = await svc.readMarketStrategy('u1', { competitorOffset: 40 });
+
+    expect(res.competitorDetailOffset).toBe(40);
+    expect(res.formattedContent).toContain('Description for OrgComp49');
+  });
+
+  it('exposes competitorOffset on the tool schema so the model can actually ask for it', async () => {
+    require('../emma/tools');
+    const { emmaToolRegistry } = require('../emma/registry');
+    const schema = emmaToolRegistry.getTool('read_market_strategy')?.definition.inputSchema as any;
+
+    expect(schema.properties.competitorOffset).toBeDefined();
+    expect(schema.properties.competitorOffset.type).toBe('number');
+    expect(schema.required).not.toContain('competitorOffset');
+  });
+});
