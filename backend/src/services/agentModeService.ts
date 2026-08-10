@@ -28815,7 +28815,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   }
 
   // Post on connected account helper
-  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string): Promise<any> {
+  async postOnConnectedAccount(userId: string, accountId: string | undefined, content: string, mediaUrls: string[] = [], platform?: string, toolContext?: any): Promise<any> {
     console.log('[AgentMode] postOnConnectedAccount called:', {
       userId,
       accountId,
@@ -28881,6 +28881,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // The adapter handles token refresh internally before making API calls.
       console.log('[AgentMode] Getting adapter for platform:', account.platform);
       const adapter = socialPlatformService.getAdapter(account.platform);
+
+      // ENG-827: LAST MOMENT before the post becomes real and un-makeable. Everything
+      // above — resolving accounts across the org, and inside createPost the media
+      // download and (for YouTube) the video upload — can take minutes, all of it on a
+      // decision taken before that work began. Re-read the owner's consent here, so a
+      // revocation that lands while this call is in flight still stops the post rather
+      // than being noticed only after it is public. Absent hook (interactive session,
+      // direct service call) → nothing changes.
+      const withdrawnMidFlight = await toolContext?.assertPublishStillAuthorized?.();
+      if (withdrawnMidFlight) {
+        console.warn(`[AgentMode] ENG-827: abandoning post on ${account.platform} — publish consent was withdrawn while this call was in flight.`);
+        return { success: false, message: withdrawnMidFlight.error };
+      }
+
       console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
       const result = await adapter.createPost(account, content, mediaUrls, ownerUserId);
 

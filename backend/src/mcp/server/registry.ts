@@ -1,5 +1,5 @@
 import { isAnonymousUserId, buildAnonymousToolRefusal } from '../anonymousToolAccess';
-import { refuseUnauthorizedScheduledPublish } from '../../utils/scheduledPublishConsentGuard';
+import { refuseUnauthorizedScheduledPublish, attachPublishRevalidation } from '../../utils/scheduledPublishConsentGuard';
 
 export interface McpToolHandler {
   name: string;
@@ -115,7 +115,10 @@ export class McpToolRegistry {
       return publishRefusal;
     }
 
-    return await handler.execute(args, context);
+    // A publishing handler may do minutes of work (media download, video upload)
+    // between being admitted here and actually committing the post, so admission
+    // alone is not enough — hand it a re-validation to run at its last moment.
+    return await handler.execute(args, attachPublishRevalidation(name, context));
   }
 }
 

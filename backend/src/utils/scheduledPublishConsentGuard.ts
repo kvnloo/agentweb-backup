@@ -45,6 +45,31 @@ async function defaultDeps(): Promise<ScheduledPublishGuardDeps> {
 }
 
 /**
+ * Name of the last-moment re-validation the dispatcher hangs on a publishing tool's
+ * context. A handler that does slow work between being admitted and committing the
+ * irreversible act — resolving accounts, downloading media, uploading a video, which
+ * for YouTube is minutes — calls this immediately before it commits, and abandons the
+ * post if it returns a refusal.
+ *
+ * The dispatch-time check alone would admit such a call and then let it publish long
+ * after the owner switched consent off, because the decision was made at the START of
+ * work that outlives it. Handlers that commit immediately need nothing extra; the
+ * dispatch check already covers them, and covers every publishing tool by prefix.
+ */
+export type AssertPublishStillAuthorized = () => Promise<ScheduledPublishRefusal | null>;
+
+/**
+ * Returns the context to hand the handler: for a publishing tool, the same context
+ * plus the re-validation hook; for anything else, the context untouched.
+ */
+export function attachPublishRevalidation(toolName: string, context: any): any {
+  if (!isPublishName(toolName)) return context;
+  const assertPublishStillAuthorized: AssertPublishStillAuthorized = () =>
+    refuseUnauthorizedScheduledPublish(toolName, context);
+  return { ...(context ?? {}), assertPublishStillAuthorized };
+}
+
+/**
  * One retry, no backoff. This sits directly in front of a user-visible tool call,
  * so the budget is "absorb a dropped connection", not "ride out an outage" —
  * during a real outage the refusal is the correct answer anyway.

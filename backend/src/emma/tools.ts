@@ -4325,7 +4325,9 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform);
+    // ENG-827: the context carries `assertPublishStillAuthorized`, which the handler
+    // runs immediately before the post becomes real — see postOnConnectedAccount.
+    return await agentModeService.postOnConnectedAccount(context?.userId, args.account_id, args.content, args.media_urls, args.platform, context);
   }
 });
 
