@@ -9012,7 +9012,11 @@ export class AgentModeService {
       // ENG-945, so paging can't silently shrink an unrelated prompt.
       const requestedMin = Number(options?.minCompetitorsInFull);
       const minInFull = Number.isFinite(requestedMin) && requestedMin > 0 ? Math.floor(requestedMin) : 1;
-      const window = this.resolveCompetitorDetailWindow(competitors, competitorDetailOffset, minInFull);
+      // Competitor sections get the room the overview and ICP leave, not a fixed
+      // slice on top of them (ENG-945 / Greptile: per-section budgets do not
+      // compose into a bound on the whole response).
+      const budgets = this.competitorCharBudgets(marketStrategy);
+      const window = this.resolveCompetitorDetailWindow(competitors, competitorDetailOffset, minInFull, budgets.detail);
 
       // Format the market strategy for LLM consumption
       const formattedContent = this.formatMarketStrategy({
@@ -9020,6 +9024,7 @@ export class AgentModeService {
         marketData: marketStrategy,
         competitorDetailStart: window.start,
         competitorDetailEnd: window.end,
+        nameIndexCharBudget: budgets.nameIndex,
         // Paging instructions only make sense in a tool result. A caller that
         // embeds this in its own prompt has no read_market_strategy to call, so
         // the offsets are noise there — and noise that can leak into generated
@@ -22926,6 +22931,61 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // bounded, never silent.
   private static readonly COMPETITOR_NAME_INDEX_CHAR_BUDGET = 3000;
 
+  // Aggregate target for the whole formatted response, sized under the
+  // 20,000-char in-context cap with headroom for the notice and closing note.
+  private static readonly RESPONSE_CHAR_TARGET = 18500;
+  private static readonly RESPONSE_FIXED_CHROME = 900;
+  private static readonly MIN_COMPETITOR_DETAIL_CHARS = 1200;
+  private static readonly MIN_COMPETITOR_NAME_INDEX_CHARS = 400;
+
+  // Rendered separately from formatMarketStrategy so its true cost can be
+  // measured BEFORE the competitor budgets are allocated (ENG-945 / Greptile):
+  // the overview and ICP share the same response, so competitor sections must
+  // fit the room those leave rather than spending a fixed budget on top.
+  private formatIcpSection(icp: any): string {
+    let out = `<strong>🎯 Ideal Customer Profile (ICP)</strong><br>`;
+    if (Array.isArray(icp) && icp.length > 0) {
+      icp.forEach((entry: any) => {
+        if (typeof entry === 'object' && entry && entry.title) {
+          out += `• <strong>${entry.title}:</strong> ${entry.description || 'No description provided'}<br>`;
+          if (entry.valueProposition) out += `  <em>Value Proposition:</em> ${entry.valueProposition}<br>`;
+          if (Array.isArray(entry.buyerPersonas) && entry.buyerPersonas.length > 0) {
+            out += `  <em>Buyer Personas:</em> ${entry.buyerPersonas.join(', ')}<br>`;
+          }
+        } else {
+          out += `• ${entry}<br>`;
+        }
+      });
+    } else {
+      out += `• No ideal customer profiles defined yet<br>`;
+    }
+    return out;
+  }
+
+  /**
+   * Room left for competitor detail + the name index once the parts of the
+   * response we do NOT control (business overview, ICP, headers, closing note)
+   * have taken their share of the in-context cap. Never returns less than
+   * MIN, so a pathological ICP degrades the competitor sections instead of
+   * emptying them.
+   */
+  private competitorCharBudgets(marketData: any): { detail: number; nameIndex: number } {
+    const fixed =
+      String(marketData?.businessOverview || '').length +
+      this.formatIcpSection(marketData?.icp).length +
+      AgentModeService.RESPONSE_FIXED_CHROME;
+    const room = AgentModeService.RESPONSE_CHAR_TARGET - fixed;
+    const detail = Math.max(
+      AgentModeService.MIN_COMPETITOR_DETAIL_CHARS,
+      Math.min(AgentModeService.COMPETITOR_DETAIL_CHAR_BUDGET, Math.floor(room * 0.7)),
+    );
+    const nameIndex = Math.max(
+      AgentModeService.MIN_COMPETITOR_NAME_INDEX_CHARS,
+      Math.min(AgentModeService.COMPETITOR_NAME_INDEX_CHAR_BUDGET, room - detail),
+    );
+    return { detail, nameIndex };
+  }
+
   private formatCompetitorDetailLine(competitor: any): string {
     if (typeof competitor === 'object' && competitor && competitor.name) {
       return `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
@@ -22943,7 +23003,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
    * same silent-nothing failure mode the budget exists to prevent — and
    * non-tool callers raise it to preserve their pre-ENG-945 coverage.
    */
-  private resolveCompetitorDetailWindow(competitors: any[], offset: number, minEntries: number = 1): { start: number; end: number } {
+  private resolveCompetitorDetailWindow(
+    competitors: any[],
+    offset: number,
+    minEntries: number = 1,
+    charBudget: number = AgentModeService.COMPETITOR_DETAIL_CHAR_BUDGET,
+  ): { start: number; end: number } {
     const start = Math.min(Math.max(Math.floor(offset) || 0, 0), Math.max(0, competitors.length - 1));
     const floor = Math.max(1, Math.floor(minEntries) || 1);
     let used = 0;
@@ -22951,7 +23016,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     while (end < competitors.length) {
       const cost = this.formatCompetitorDetailLine(competitors[end]).length;
       const withinFloor = end - start < floor;
-      if (!withinFloor && used + cost > AgentModeService.COMPETITOR_DETAIL_CHAR_BUDGET) break;
+      if (!withinFloor && used + cost > charBudget) break;
       used += cost;
       end++;
     }
@@ -22989,6 +23054,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const inWindow = (index: number) => index >= detailStart && index < detailEnd;
     const nameOnlyCount = competitors.filter((_, index) => !inWindow(index)).length;
     const pagingHints = marketResult.pagingHints !== false;
+    const nameIndexBudget = typeof marketResult.nameIndexCharBudget === 'number'
+      ? marketResult.nameIndexCharBudget
+      : AgentModeService.COMPETITOR_NAME_INDEX_CHAR_BUDGET;
 
     formattedSummary += `<strong>🏆 Competitors (${competitors.length} total)</strong><br>`;
     if (competitors.length > 0) {
@@ -23009,7 +23077,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         let listed = 0;
         for (const entry of nameOnly) {
           const cost = (pagingHints ? `• [offset ${entry.index}] ${entry.name}<br>` : `• ${entry.name}<br>`).length;
-          if (listed > 0 && indexChars + cost > AgentModeService.COMPETITOR_NAME_INDEX_CHAR_BUDGET) break;
+          if (listed > 0 && indexChars + cost > nameIndexBudget) break;
           indexChars += cost;
           listed++;
         }
@@ -23050,24 +23118,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     formattedSummary += `<br>`;
 
     // Ideal Customer Profile (ICP) Section (matches UI structure)
-    formattedSummary += `<strong>🎯 Ideal Customer Profile (ICP)</strong><br>`;
-    if (marketData.icp && marketData.icp.length > 0) {
-      marketData.icp.forEach((icp: any, index: number) => {
-        if (typeof icp === 'object' && icp.title) {
-          formattedSummary += `• <strong>${icp.title}:</strong> ${icp.description || 'No description provided'}<br>`;
-          if (icp.valueProposition) {
-            formattedSummary += `  <em>Value Proposition:</em> ${icp.valueProposition}<br>`;
-          }
-          if (icp.buyerPersonas && Array.isArray(icp.buyerPersonas) && icp.buyerPersonas.length > 0) {
-            formattedSummary += `  <em>Buyer Personas:</em> ${icp.buyerPersonas.join(', ')}<br>`;
-          }
-        } else {
-          formattedSummary += `• ${icp}<br>`;
-        }
-      });
-    } else {
-      formattedSummary += `• No ideal customer profiles defined yet<br>`;
-    }
+    formattedSummary += this.formatIcpSection(marketData.icp);
 
     formattedSummary += `<br><em>💡 I'll use this market strategy information to inform marketing campaigns, content strategy, and business development decisions.</em>`;
     // Only tell the model the read is exhaustive when it actually is. With a
