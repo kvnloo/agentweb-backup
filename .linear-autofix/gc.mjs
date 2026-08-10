@@ -30,10 +30,13 @@ const wtPathOf = (WT, repo) => (repo.mount === '.' ? WT : path.join(WT, repo.mou
 const gitIn = (cwd, args) => spawnSync('git', args, { cwd, encoding: 'utf8' });
 
 // Pure reap decision — unit-tested in test/gc.test.mjs against the ENG-1017 contract.
-// prCounts: { open, merged } aggregated across repos, or null when the lookup failed
-// (gh missing / network error) — null MUST fail safe to keep, never to remove.
+// prCounts: { open, merged, closedUnmerged } aggregated across repos, or null when the
+// lookup failed (gh missing / network error) — null MUST fail safe to keep, never to remove.
+// lookupFailed: the Linear lookup errored for a reason other than "not found" (network,
+// auth, DNS) — indistinguishable from unresolvable by absence alone, so it MUST keep.
 export function decideWorktree({
   resolved,
+  lookupFailed,
   issueStateType,
   issueStateName,
   prCounts,
@@ -41,14 +44,23 @@ export function decideWorktree({
   unresolvedMaxAgeDays,
   doneTypes,
 }) {
+  if (lookupFailed) {
+    return { action: 'keep', reason: 'Linear lookup failed (transient?) — keeping until it resolves' };
+  }
   if (resolved) {
     if (doneTypes.includes(issueStateType)) {
       return { action: 'remove', reason: `issue is "${issueStateName}" (${issueStateType})` };
     }
-    if (issueStateType === 'started' && prCounts && prCounts.open === 0 && prCounts.merged > 0) {
+    if (
+      issueStateType === 'started' &&
+      prCounts &&
+      prCounts.open === 0 &&
+      prCounts.merged > 0 &&
+      (prCounts.closedUnmerged ?? 0) === 0
+    ) {
       return {
         action: 'remove',
-        reason: `linked PR merged (${prCounts.merged} merged, 0 open) — issue "${issueStateName}" awaits closure only`,
+        reason: `linked PR merged (${prCounts.merged} merged, 0 open, 0 closed-unmerged) — issue "${issueStateName}" awaits closure only`,
       };
     }
     return { action: 'keep', reason: `issue still "${issueStateName}" (${issueStateType}), no merged-PR evidence` };
@@ -67,30 +79,56 @@ function branchOf(WT) {
   return r.status === 0 ? r.stdout.trim() : null;
 }
 
-// PR counts for a branch across all configured repos via gh. Returns null on any
-// failure so the caller keeps the worktree instead of guessing.
+// PR counts for a branch across all configured repos via gh. Counts closed-but-unmerged
+// PRs separately: a branch with one merged and one closed-without-merge PR is NOT fully
+// delivered and must be kept. Returns null on any failure so the caller keeps the
+// worktree instead of guessing.
 function prCountsForBranch(branch) {
   let open = 0;
   let merged = 0;
+  let closedUnmerged = 0;
   for (const repo of config.repos) {
-    for (const [state, bump] of [['open', () => open++], ['merged', () => merged++]]) {
-      const r = spawnSync(
-        'gh',
-        ['pr', 'list', '--head', branch, '--state', state, '--json', 'number'],
-        { cwd: repoRootOf(repo), encoding: 'utf8' },
-      );
-      if (r.status !== 0 || r.error) return null;
-      let prs;
-      try { prs = JSON.parse(r.stdout); } catch { return null; }
-      for (let i = 0; i < prs.length; i++) bump();
+    const r = spawnSync(
+      'gh',
+      ['pr', 'list', '--head', branch, '--state', 'all', '--json', 'state'],
+      { cwd: repoRootOf(repo), encoding: 'utf8' },
+    );
+    if (r.status !== 0 || r.error) return null;
+    let prs;
+    try { prs = JSON.parse(r.stdout); } catch { return null; }
+    for (const pr of prs) {
+      if (pr.state === 'OPEN') open++;
+      else if (pr.state === 'MERGED') merged++;
+      else closedUnmerged++;
     }
   }
-  return { open, merged };
+  return { open, merged, closedUnmerged };
 }
 
+// Newest mtime anywhere under WT, not just the top-level dir — a write to a nested file
+// does not bump the parent directory's mtime, so top-level mtime alone can misread an
+// active scratch dir as idle. Caps the walk; hitting the cap returns null (age unknown →
+// caller keeps) so a huge tree can never be aged out on partial evidence.
+const AGE_SCAN_MAX_ENTRIES = 20000;
 function ageDaysOf(WT) {
-  try { return Math.floor((Date.now() - statSync(WT).mtimeMs) / 86400000); }
-  catch { return null; }
+  try {
+    let newest = statSync(WT).mtimeMs;
+    let visited = 0;
+    const stack = [WT];
+    while (stack.length) {
+      const dir = stack.pop();
+      for (const ent of readdirSync(dir, { withFileTypes: true })) {
+        if (++visited > AGE_SCAN_MAX_ENTRIES) return null;
+        const p = path.join(dir, ent.name);
+        try {
+          const st = statSync(p);
+          if (st.mtimeMs > newest) newest = st.mtimeMs;
+          if (ent.isDirectory() && !ent.isSymbolicLink()) stack.push(p);
+        } catch { /* raced deletion — ignore */ }
+      }
+    }
+    return Math.floor((Date.now() - newest) / 86400000);
+  } catch { return null; }
 }
 
 function removeWorktree(id) {
@@ -128,12 +166,17 @@ async function main() {
       prCounts = branch ? prCountsForBranch(branch) : null;
     }
 
+    // resolveIssue throws "Issue X not found" for a definitive miss and other messages
+    // for transient failures (network/auth/DNS). Only the definitive miss may age out.
+    const lookupFailed = !!resolveError && !/not found/i.test(resolveError.message);
+
     const decision = decideWorktree({
       resolved: !!issue,
+      lookupFailed,
       issueStateType: issue?.state?.type,
       issueStateName: issue?.state?.name,
       prCounts,
-      ageDays: issue ? null : ageDaysOf(WT),
+      ageDays: issue || lookupFailed ? null : ageDaysOf(WT),
       unresolvedMaxAgeDays: UNRESOLVED_MAX_AGE_DAYS,
       doneTypes: DONE_TYPES,
     });

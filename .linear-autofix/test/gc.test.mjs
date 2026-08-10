@@ -20,10 +20,31 @@ test('issue in Verifying (started) with merged PR and no open PR is removed', ()
     resolved: true,
     issueStateType: 'started',
     issueStateName: 'Verifying',
-    prCounts: { open: 0, merged: 1 },
+    prCounts: { open: 0, merged: 1, closedUnmerged: 0 },
   });
   assert.equal(d.action, 'remove');
   assert.match(d.reason, /merged/i);
+});
+
+// Greptile P1 (2026-08-10): a closed-without-merge PR alongside a merged one means not
+// all associated work was merged — the worktree must be kept.
+test('merged PR plus a closed-unmerged PR is kept', () => {
+  const d = decideWorktree({
+    ...base,
+    resolved: true,
+    issueStateType: 'started',
+    issueStateName: 'Verifying',
+    prCounts: { open: 0, merged: 1, closedUnmerged: 1 },
+  });
+  assert.equal(d.action, 'keep');
+});
+
+// Greptile P1 (2026-08-10): a transient Linear failure (network/auth/DNS) must never be
+// treated as "unresolvable identifier" and aged out — it fails safe to keep.
+test('transient Linear lookup failure keeps the worktree even past the age threshold', () => {
+  const d = decideWorktree({ ...base, resolved: false, lookupFailed: true, ageDays: 365 });
+  assert.equal(d.action, 'keep');
+  assert.match(d.reason, /lookup failed/i);
 });
 
 test('done-type issue is still removed (existing behavior preserved)', () => {
