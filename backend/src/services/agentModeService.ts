@@ -8972,7 +8972,15 @@ export class AgentModeService {
   }
 
   // Read current user's market strategy
-  public async readMarketStrategy(userId: string): Promise<any> {
+  public async readMarketStrategy(
+    userId: string,
+    options: {
+      competitorOffset?: number;
+      minCompetitorsInFull?: number;
+      pagingHints?: boolean;
+      competitorNames?: string[];
+    } = {}
+  ): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -9002,17 +9010,64 @@ export class AgentModeService {
         };
       }
 
-      // Cap competitors at 40
-      const MAX_COMPETITORS = 40;
-      if (marketStrategy.competitors && marketStrategy.competitors.length > MAX_COMPETITORS) {
-        console.log(`AgentMode: Capping competitors from ${marketStrategy.competitors.length} to ${MAX_COMPETITORS}`);
-        marketStrategy.competitors = marketStrategy.competitors.slice(0, MAX_COMPETITORS);
-      }
+      // Bound the size of the tool result WITHOUT hiding entries (ENG-945).
+      // This used to slice the competitor list down to 40 and drop the rest
+      // silently, so a caller that wrote 49 competitors read back 40 and
+      // concluded the write had discarded records. Now the first
+      // COMPETITOR_DETAIL_LIMIT competitors are rendered in full and the
+      // remainder are listed by name only — every stored competitor is still
+      // visible, and the true count is reported alongside.
+      const competitors: any[] = Array.isArray(marketStrategy.competitors) ? marketStrategy.competitors : [];
+      const competitorCount = competitors.length;
+
+      // `competitorOffset` slides the detail window over the stored list, so a
+      // caller that needs the description of a name-only entry can fetch it
+      // instead of being stuck with a partial record. Clamped into range: an
+      // out-of-range offset lands on the last entry rather than rendering an
+      // empty window, because a silently empty result is the failure mode this
+      // whole ticket was about.
+      const requestedOffset = Number(options?.competitorOffset);
+      const competitorDetailOffset = Number.isFinite(requestedOffset)
+        ? Math.min(Math.max(Math.floor(requestedOffset), 0), Math.max(0, competitorCount - 1))
+        : 0;
+      // The character budget protects the TOOL result's context window. Callers
+      // that embed formattedContent in their own prompt instead (the CRM email
+      // drafter) pass minCompetitorsInFull to keep the coverage they had before
+      // ENG-945, so paging can't silently shrink an unrelated prompt.
+      const requestedMin = Number(options?.minCompetitorsInFull);
+      const minInFull = Number.isFinite(requestedMin) && requestedMin > 0 ? Math.floor(requestedMin) : 1;
+      // Competitor sections get the room the overview and ICP leave, not a fixed
+      // slice on top of them (ENG-945 / Greptile: per-section budgets do not
+      // compose into a bound on the whole response).
+      // Membership check (ENG-945): the name index is bounded, so on a large
+      // roster it cannot show every name. A caller deciding whether to ADD a
+      // competitor must still be able to find out if it already exists — that
+      // is the contract this whole ticket is about. Answer it directly instead
+      // of making them page the list.
+      const competitorLookup = this.lookupCompetitors(competitors, options?.competitorNames);
+      // Dropping part of the REQUEST silently is the same failure as dropping
+      // part of the data: unanswered names would read as "not stored" and get
+      // re-added. Report the shortfall instead (ENG-945).
+      const competitorNamesNotChecked = Array.isArray(options?.competitorNames)
+        ? Math.max(0, options!.competitorNames!.length - AgentModeService.COMPETITOR_LOOKUP_MAX)
+        : 0;
+      const budgets = this.competitorCharBudgets(marketStrategy);
+      const window = this.resolveCompetitorDetailWindow(competitors, competitorDetailOffset, minInFull, budgets.detail);
 
       // Format the market strategy for LLM consumption
       const formattedContent = this.formatMarketStrategy({
         exists: true,
-        marketData: marketStrategy
+        marketData: marketStrategy,
+        competitorDetailStart: window.start,
+        competitorDetailEnd: window.end,
+        nameIndexCharBudget: budgets.nameIndex,
+        competitorLookup,
+        competitorNamesNotChecked,
+        // Paging instructions only make sense in a tool result. A caller that
+        // embeds this in its own prompt has no read_market_strategy to call, so
+        // the offsets are noise there — and noise that can leak into generated
+        // customer copy.
+        pagingHints: options?.pagingHints !== false
       });
 
       // Return structured response — no raw marketData to keep tool result size manageable
@@ -9020,6 +9075,12 @@ export class AgentModeService {
         success: true,
         message: `Market strategy retrieved successfully`,
         exists: true,
+        totalCompetitors: competitorCount,
+        ...(competitorLookup ? { competitorLookup, competitorNamesNotChecked } : {}),
+        competitorDetailOffset: window.start,
+        competitorsWithFullDetail: window.end - window.start,
+        // Explicit next page, so paging never depends on the model doing arithmetic.
+        nextCompetitorOffset: window.end < competitorCount ? window.end : null,
         createdAt: marketStrategy.createdAt,
         updatedAt: marketStrategy.updatedAt,
         formattedContent
@@ -12422,8 +12483,14 @@ export class AgentModeService {
       // Get brand guidelines
       const brandGuidelines = await this.readBrandGuidelines(userId);
 
-      // Get market strategy
-      const marketStrategy = await this.readMarketStrategy(userId);
+      // Get market strategy. This prompt embeds formattedContent wholesale, so
+      // it is NOT bounded by the tool-result page budget — before ENG-945 it
+      // received 40 competitors in full and it still must (plus, now, the names
+      // of any beyond that).
+      const marketStrategy = await this.readMarketStrategy(userId, {
+        minCompetitorsInFull: AgentModeService.PROMPT_EMBEDDED_COMPETITOR_DETAIL,
+        pagingHints: false
+      });
 
       // Get sender information (from lead record, or default sender from CRM configuration)
       // Pass list.userId so org members use the list owner's sender config
@@ -22884,6 +22951,192 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return formattedSummary;
   }
 
+  // How many characters of competitor descriptions one read_market_strategy page
+  // may render. This is a CHARACTER budget rather than a fixed entry count on
+  // purpose (ENG-945): competitor descriptions on real accounts run from ~60 to
+  // ~2,100 chars, so any fixed count either wastes the page or overflows it.
+  // A tool result over 20,000 chars is offloaded to S3 and only its first 20,000
+  // chars stay in the model's context, so an oversized page pushes its own
+  // competitor list out of context — the failure this ticket is about. 8,000
+  // leaves room for the business overview, the ICP section (8,000+ on some
+  // accounts), the name index and the closing notes, and still keeps the whole
+  // response inline.
+  private static readonly COMPETITOR_DETAIL_CHAR_BUDGET = 8000;
+
+  // Coverage guaranteed to callers that embed formattedContent directly in their
+  // own prompt rather than returning it as a tool result. 40 is exactly what
+  // readMarketStrategy rendered in full before ENG-945, so those prompts are
+  // unchanged by the introduction of paging.
+  private static readonly PROMPT_EMBEDDED_COMPETITOR_DETAIL = 40;
+
+  // Ceiling on the name-only index. Without one it grows with the roster and can
+  // push the very tail it exists to expose past the 20,000-char in-context cap
+  // (and it is embedded verbatim in the CRM email prompt). Anything beyond this
+  // is still counted, still in the stated total, and still reachable by offset —
+  // bounded, never silent.
+  private static readonly COMPETITOR_NAME_INDEX_CHAR_BUDGET = 3000;
+
+  // Aggregate target for the whole formatted response, sized under the
+  // 20,000-char in-context cap with headroom for the notice and closing note.
+  private static readonly RESPONSE_CHAR_TARGET = 18500;
+  private static readonly RESPONSE_FIXED_CHROME = 900;
+  private static readonly MIN_COMPETITOR_DETAIL_CHARS = 1200;
+  private static readonly MIN_COMPETITOR_NAME_INDEX_CHARS = 400;
+  // Per-field ceiling. Names and descriptions are unbounded on write, so one
+  // record could otherwise dominate the whole response.
+  private static readonly COMPETITOR_FIELD_MAX_CHARS = 3000;
+  // Hard ceiling for a TOOL response, under the 20,000-char in-context cap.
+  // Callers that embed the text in their own prompt are not clamped — they have
+  // no transport cap, and clamping them would undo the ENG-945 non-regression.
+  private static readonly RESPONSE_HARD_CAP = 19000;
+  private static readonly BUSINESS_OVERVIEW_MAX_CHARS = 2500;
+  private static readonly ICP_SECTION_MAX_CHARS = 6000;
+  private static readonly COMPETITOR_LOOKUP_MAX = 50;
+  private static readonly LOOKUP_NAME_MAX_CHARS = 120;
+  private static readonly LOOKUP_BLOCK_MAX_CHARS = 3000;
+
+  // Rendered separately from formatMarketStrategy so its true cost can be
+  // measured BEFORE the competitor budgets are allocated (ENG-945 / Greptile):
+  // the overview and ICP share the same response, so competitor sections must
+  // fit the room those leave rather than spending a fixed budget on top.
+  private formatIcpSection(icp: any): string {
+    let out = `<strong>🎯 Ideal Customer Profile (ICP)</strong><br>`;
+    if (Array.isArray(icp) && icp.length > 0) {
+      icp.forEach((entry: any) => {
+        if (typeof entry === 'object' && entry && entry.title) {
+          out += `• <strong>${entry.title}:</strong> ${entry.description || 'No description provided'}<br>`;
+          if (entry.valueProposition) out += `  <em>Value Proposition:</em> ${entry.valueProposition}<br>`;
+          if (Array.isArray(entry.buyerPersonas) && entry.buyerPersonas.length > 0) {
+            out += `  <em>Buyer Personas:</em> ${entry.buyerPersonas.join(', ')}<br>`;
+          }
+        } else {
+          out += `• ${entry}<br>`;
+        }
+      });
+    } else {
+      out += `• No ideal customer profiles defined yet<br>`;
+    }
+    return out;
+  }
+
+  /**
+   * Room left for competitor detail + the name index once the parts of the
+   * response we do NOT control (business overview, ICP, headers, closing note)
+   * have taken their share of the in-context cap. Never returns less than
+   * MIN, so a pathological ICP degrades the competitor sections instead of
+   * emptying them.
+   */
+  private competitorCharBudgets(marketData: any): { detail: number; nameIndex: number } {
+    const fixed =
+      String(marketData?.businessOverview || '').length +
+      this.formatIcpSection(marketData?.icp).length +
+      AgentModeService.RESPONSE_FIXED_CHROME;
+    const room = AgentModeService.RESPONSE_CHAR_TARGET - fixed;
+    const detail = Math.max(
+      AgentModeService.MIN_COMPETITOR_DETAIL_CHARS,
+      Math.min(AgentModeService.COMPETITOR_DETAIL_CHAR_BUDGET, Math.floor(room * 0.7)),
+    );
+    const nameIndex = Math.max(
+      AgentModeService.MIN_COMPETITOR_NAME_INDEX_CHARS,
+      Math.min(AgentModeService.COMPETITOR_NAME_INDEX_CHAR_BUDGET, room - detail),
+    );
+    return { detail, nameIndex };
+  }
+
+  /**
+   * Cut `text` to `allowed` characters, ALWAYS saying how much was removed.
+   * ENG-945's rule is "never hide silently", not "never bound" — an explicit
+   * marker is what separates this from the bug this ticket fixed.
+   */
+  private truncateWithNotice(text: string, allowed: number): string {
+    if (text.length <= allowed) return text;
+    if (allowed <= 0) return '';
+    const marker = (n: number) => ` …<em>[truncated — ${n} characters omitted; open the Market Strategy page to read the full text]</em>`;
+    const full = marker(text.length);
+    // The marker itself must fit inside the allowance, or the "hard" bound
+    // would be breached by the very notice that announces the cut.
+    if (full.length >= allowed) {
+      const short = '…[truncated]';
+      return short.length <= allowed ? short : text.slice(0, allowed);
+    }
+    // marker(text.length) is an upper bound on marker(text.length - keep) — the
+    // omitted count can only have fewer digits — so the result never exceeds
+    // `allowed`.
+    const keep = allowed - full.length;
+    return text.slice(0, keep) + marker(text.length - keep);
+  }
+
+  /**
+   * "Is this competitor already stored?" — answered directly, so a bounded name
+   * index can never leave a caller guessing (ENG-945). Matching mirrors
+   * updateMarketStrategy's merge-by-name, loosened to ignore case and padding so
+   * a near-miss does not read as "not stored" and cause a duplicate.
+   */
+  private lookupCompetitors(
+    competitors: any[],
+    names?: string[],
+  ): Array<{ name: string; stored: boolean; offset: number | null }> | undefined {
+    if (!Array.isArray(names) || names.length === 0) return undefined;
+    const norm = (v: any) => String(v ?? '').trim().toLowerCase();
+    const byName = new Map<string, number>();
+    competitors.forEach((competitor: any, index: number) => {
+      const key = norm(typeof competitor === 'object' && competitor ? competitor.name : competitor);
+      if (key && !byName.has(key)) byName.set(key, index);
+    });
+    return names
+      .slice(0, AgentModeService.COMPETITOR_LOOKUP_MAX)
+      .map((requested) => {
+        const offset = byName.get(norm(requested));
+        return {
+          name: String(requested),
+          stored: offset !== undefined,
+          offset: offset === undefined ? null : offset,
+        };
+      });
+  }
+
+  private formatCompetitorDetailLine(competitor: any): string {
+    if (typeof competitor === 'object' && competitor && competitor.name) {
+      const name = this.truncateWithNotice(String(competitor.name), AgentModeService.COMPETITOR_FIELD_MAX_CHARS);
+      const description = this.truncateWithNotice(
+        String(competitor.description || 'No description provided'),
+        AgentModeService.COMPETITOR_FIELD_MAX_CHARS,
+      );
+      return `• <strong>${name}:</strong> ${description}<br>`;
+    }
+    return `• ${this.truncateWithNotice(String(competitor), AgentModeService.COMPETITOR_FIELD_MAX_CHARS)}<br>`;
+  }
+
+  /**
+   * Fill a page of full-detail competitors starting at `offset`, stopping when
+   * the character budget is spent.
+   *
+   * `minEntries` is a floor the budget cannot undercut: the first `minEntries`
+   * are always rendered in full, however long they are. It defaults to 1 so a
+   * single oversized description can still be read — an empty page would be the
+   * same silent-nothing failure mode the budget exists to prevent — and
+   * non-tool callers raise it to preserve their pre-ENG-945 coverage.
+   */
+  private resolveCompetitorDetailWindow(
+    competitors: any[],
+    offset: number,
+    minEntries: number = 1,
+    charBudget: number = AgentModeService.COMPETITOR_DETAIL_CHAR_BUDGET,
+  ): { start: number; end: number } {
+    const start = Math.min(Math.max(Math.floor(offset) || 0, 0), Math.max(0, competitors.length - 1));
+    const floor = Math.max(1, Math.floor(minEntries) || 1);
+    let used = 0;
+    let end = start;
+    while (end < competitors.length) {
+      const cost = this.formatCompetitorDetailLine(competitors[end]).length;
+      const withinFloor = end - start < floor;
+      if (!withinFloor && used + cost > charBudget) break;
+      used += cost;
+      end++;
+    }
+    return { start, end };
+  }
+
   // Helper function to format market strategy for AI analysis
   private formatMarketStrategy(marketResult: any): string {
     if (!marketResult.exists) {
@@ -22894,53 +23147,175 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     let formattedSummary = `<strong>📊 Market Strategy Retrieved</strong><br>`;
     formattedSummary += `I've successfully retrieved your market strategy. Here's what I found:<br><br>`;
 
-    // Business Overview Section (matches UI structure)
+    // Rendered FIRST, deliberately: this is the answer to "should I add this
+    // competitor?", so it must sit ahead of everything the response clamp can
+    // trim (ENG-945).
+    const lookup: Array<{ name: string; stored: boolean; offset: number | null }> | undefined =
+      marketResult.competitorLookup;
+    if (lookup && lookup.length > 0) {
+      formattedSummary += `<strong>🔎 Competitor check — already stored?</strong><br>`;
+      // Names are unbounded on write AND in the request, so the block is bounded
+      // by characters as well as by entry count — otherwise the answer could
+      // swallow the response it is rendered in front of.
+      let lookupChars = 0;
+      let rendered = 0;
+      for (const entry of lookup) {
+        const name = this.truncateWithNotice(String(entry.name), AgentModeService.LOOKUP_NAME_MAX_CHARS);
+        const line = entry.stored
+          ? `• <strong>${name}</strong>: ALREADY STORED at offset ${entry.offset} — do NOT add it again.<br>`
+          : `• <strong>${name}</strong>: not stored — safe to add.<br>`;
+        if (rendered > 0 && lookupChars + line.length > AgentModeService.LOOKUP_BLOCK_MAX_CHARS) break;
+        formattedSummary += line;
+        lookupChars += line.length;
+        rendered++;
+      }
+      if (rendered < lookup.length) {
+        formattedSummary += `<strong>⚠️ ${lookup.length - rendered} further answer(s) omitted here</strong> — re-ask about those names in a smaller batch; do NOT assume they are absent.<br>`;
+      }
+      const notChecked: number = marketResult.competitorNamesNotChecked || 0;
+      if (notChecked > 0) {
+        formattedSummary += `<strong>⚠️ ${notChecked} further requested name(s) were NOT checked</strong> (only ${AgentModeService.COMPETITOR_LOOKUP_MAX} names are checked per call). Do NOT assume those are absent — call read_market_strategy again with the remaining names before adding any of them.<br>`;
+      }
+      formattedSummary += `<br>`;
+    }
+
+    // Business Overview Section (matches UI structure). Bounded on the tool path
+    // only — see RESPONSE_HARD_CAP.
+    const clamp = marketResult.pagingHints !== false;
     formattedSummary += `<strong>🏢 Business Overview</strong><br>`;
     if (marketData.businessOverview) {
-      formattedSummary += `${marketData.businessOverview}<br><br>`;
+      const overview = clamp
+        ? this.truncateWithNotice(String(marketData.businessOverview), AgentModeService.BUSINESS_OVERVIEW_MAX_CHARS)
+        : String(marketData.businessOverview);
+      formattedSummary += `${overview}<br><br>`;
     } else {
       formattedSummary += `No business overview provided yet.<br><br>`;
     }
 
     // Competitors Section (matches UI structure)
-    formattedSummary += `<strong>🏆 Competitors</strong><br>`;
-    if (marketData.competitors && marketData.competitors.length > 0) {
-      marketData.competitors.forEach((competitor: any, index: number) => {
-        if (typeof competitor === 'object' && competitor.name) {
-          formattedSummary += `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
-        } else {
-          formattedSummary += `• ${competitor}<br>`;
-        }
+    // ENG-945: entries outside the [competitorDetailStart, competitorDetailEnd)
+    // window are rendered by name only rather than dropped, so the reader always
+    // sees the complete roster. With no window supplied the whole list is
+    // rendered in full, which is what non-tool callers get.
+    const competitors: any[] = Array.isArray(marketData.competitors) ? marketData.competitors : [];
+    const detailStart = typeof marketResult.competitorDetailStart === 'number' ? marketResult.competitorDetailStart : 0;
+    const detailEnd = typeof marketResult.competitorDetailEnd === 'number' ? marketResult.competitorDetailEnd : competitors.length;
+    const nameOf = (competitor: any) =>
+      (typeof competitor === 'object' && competitor && competitor.name) ? competitor.name : String(competitor);
+    const inWindow = (index: number) => index >= detailStart && index < detailEnd;
+    const nameOnlyCount = competitors.filter((_, index) => !inWindow(index)).length;
+    // How many stored competitors this response could not even name. Tracked so
+    // the closing note cannot claim completeness the body does not deliver.
+    let unnamedCount = 0;
+    const pagingHints = marketResult.pagingHints !== false;
+    const nameIndexBudget = typeof marketResult.nameIndexCharBudget === 'number'
+      ? marketResult.nameIndexCharBudget
+      : AgentModeService.COMPETITOR_NAME_INDEX_CHAR_BUDGET;
+
+    formattedSummary += `<strong>🏆 Competitors (${competitors.length} total)</strong><br>`;
+    if (competitors.length > 0) {
+      competitors.forEach((competitor: any, index: number) => {
+        if (!inWindow(index)) return;
+        formattedSummary += this.formatCompetitorDetailLine(competitor);
       });
+      if (nameOnlyCount > 0) {
+        // The name index is bounded too, or a large enough roster would push the
+        // tail out of the response it is meant to make visible. Bounded is fine;
+        // SILENT is not — anything not listed is still counted, still included in
+        // the stated total, and still reachable by offset.
+        const nameOnly: Array<{ index: number; name: string }> = [];
+        competitors.forEach((competitor: any, index: number) => {
+          if (!inWindow(index)) nameOnly.push({ index, name: nameOf(competitor) });
+        });
+        let indexChars = 0;
+        let listed = 0;
+        for (const entry of nameOnly) {
+          const cost = (pagingHints ? `• [offset ${entry.index}] ${entry.name}<br>` : `• ${entry.name}<br>`).length;
+          // Strict: a single pathological name must not blow the index. Competitor
+          // names are unbounded on write, so admitting the first entry regardless
+          // of size would let one record overflow the whole response. The index
+          // may end up empty — the remainder line below then accounts for
+          // everyone, so nobody is hidden either way.
+          if (indexChars + cost > nameIndexBudget) break;
+          indexChars += cost;
+          listed++;
+        }
+        const unlisted = nameOnly.slice(listed);
+        unnamedCount = unlisted.length;
+
+        if (pagingHints) {
+          // Lead with the random-access affordance, not the next page: every entry
+          // below carries its own offset, so any single competitor is one call
+          // away. Teaching "next page" first would have the model walk the list in
+          // order to reach entry 48 (ENG-945).
+          // With a strict cap the index can be empty, so the worked example must
+          // fall back to the first unlisted entry rather than indexing off the end.
+          const exampleOffset = listed > 0 ? nameOnly[listed - 1].index : nameOnly[0].index;
+          // Only advertise a next page when one actually exists — otherwise the
+          // prose contradicts nextCompetitorOffset: null and restarts the reader.
+          const walkHint = detailEnd < competitors.length
+            ? ` To walk the entire list in order instead, use the nextCompetitorOffset value returned with each page (currently ${detailEnd}).`
+            : '';
+          formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read any one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside that name — you can jump straight to the entry you want, there is no need to page through in order (e.g. <code>competitorOffset: ${exampleOffset}</code> reads the entry marked [offset ${exampleOffset}]).${walkHint}<br>`;
+          nameOnly.slice(0, listed).forEach(e => {
+            formattedSummary += `• [offset ${e.index}] ${e.name}<br>`;
+          });
+          if (unlisted.length > 0) {
+            formattedSummary += `<strong>…and ${unlisted.length} more stored competitor(s) not named in this response</strong> (the account holds ${competitors.length} in total — none have been deleted). Read them with <code>competitorOffset: ${unlisted[0].index}</code> and onwards. To check whether a specific competitor is among them BEFORE adding it, call read_market_strategy with <code>competitorNames: ["Name A", "Name B"]</code> — it answers stored/not-stored for each.<br>`;
+          }
+        } else {
+          // Prompt-embedding caller: name the rest, no tool directives, no offsets.
+          formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored (names only):</strong><br>`;
+          nameOnly.slice(0, listed).forEach(e => {
+            formattedSummary += `• ${e.name}<br>`;
+          });
+          if (unlisted.length > 0) {
+            formattedSummary += `<strong>…and ${unlisted.length} more stored competitor(s) not named here</strong> (the account holds ${competitors.length} in total — none have been deleted).<br>`;
+          }
+        }
+      }
     } else {
       formattedSummary += `• No competitors identified yet<br>`;
     }
     formattedSummary += `<br>`;
 
     // Ideal Customer Profile (ICP) Section (matches UI structure)
-    formattedSummary += `<strong>🎯 Ideal Customer Profile (ICP)</strong><br>`;
-    if (marketData.icp && marketData.icp.length > 0) {
-      marketData.icp.forEach((icp: any, index: number) => {
-        if (typeof icp === 'object' && icp.title) {
-          formattedSummary += `• <strong>${icp.title}:</strong> ${icp.description || 'No description provided'}<br>`;
-          if (icp.valueProposition) {
-            formattedSummary += `  <em>Value Proposition:</em> ${icp.valueProposition}<br>`;
-          }
-          if (icp.buyerPersonas && Array.isArray(icp.buyerPersonas) && icp.buyerPersonas.length > 0) {
-            formattedSummary += `  <em>Buyer Personas:</em> ${icp.buyerPersonas.join(', ')}<br>`;
-          }
-        } else {
-          formattedSummary += `• ${icp}<br>`;
-        }
-      });
-    } else {
-      formattedSummary += `• No ideal customer profiles defined yet<br>`;
-    }
+    const icpSection = this.formatIcpSection(marketData.icp);
+    formattedSummary += clamp
+      ? this.truncateWithNotice(icpSection, AgentModeService.ICP_SECTION_MAX_CHARS)
+      : icpSection;
 
     formattedSummary += `<br><em>💡 I'll use this market strategy information to inform marketing campaigns, content strategy, and business development decisions.</em>`;
-    formattedSummary += `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`;
+    // Only tell the model the read is exhaustive when it actually is. With a
+    // name-only tail, a second call is the supported way to read the rest —
+    // unless the caller has no tools to call, in which case say nothing about
+    // tools at all.
+    // The note must describe what the body actually delivered. Claiming "every
+    // competitor is listed above" while the index omitted some is the same
+    // false-completeness signal ENG-945 was filed for.
+    const closingNote = unnamedCount > 0
+      ? (pagingHints
+        ? `<br><br><strong>⚠️ Note:</strong> This account stores ${competitors.length} competitors. ${unnamedCount} of them are NOT named anywhere in this response — nothing has been deleted, this response is simply size-bounded. Do NOT conclude a competitor is absent because it does not appear here: call read_market_strategy with competitorNames: ["Name"] to check a specific one, or competitorOffset to page through the rest.`
+        // Prompt-embedded caller: state the shortfall, but never name a tool it
+        // cannot call — the same rule the rest of this path follows.
+        : `<br><br><strong>⚠️ Note:</strong> This account stores ${competitors.length} competitors. ${unnamedCount} of them are NOT named anywhere in this response — nothing has been deleted, this response is simply size-bounded. Do not conclude a competitor is absent because it does not appear here.`)
+      : !pagingHints
+        ? (nameOnlyCount > 0
+          ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above; ${nameOnlyCount} of them by name only. Nothing is missing.`
+          : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete.`)
+        : (nameOnlyCount > 0
+          ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above, but ${nameOnlyCount} of them are shown by name only. Nothing is missing. To read any of those in full, call read_market_strategy again with competitorOffset set to the offset shown beside the name.`
+          : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`);
 
-    return formattedSummary;
+    if (!clamp) return formattedSummary + closingNote;
+
+    // Final guarantee. Every section above is individually bounded, but the only
+    // way to PROVE the tool result fits the transport's in-context cap is to
+    // clamp the assembled string — while reserving the closing note, because the
+    // "nothing is missing" guidance is exactly what must never be the thing that
+    // gets cut (that would be ENG-945 all over again).
+    const room = AgentModeService.RESPONSE_HARD_CAP - closingNote.length;
+    return this.truncateWithNotice(formattedSummary, room) + closingNote;
   }
 
   // Helper function to format market strategy update feedback for AI analysis
