@@ -1,5 +1,9 @@
 import { isPublishName } from './hardeningGaps';
-import { resolveSchedulePublishAuthorization } from './schedulePublishAuthorization';
+import {
+  resolveSchedulePublishAuthorization,
+  narrowPublishAuthorization,
+  SchedulePublishAuthorization,
+} from './schedulePublishAuthorization';
 
 /**
  * ENG-827 — enforcing publish consent at the moment a publish tool RUNS.
@@ -98,6 +102,31 @@ async function readSessionWithOneRetry(
   }
 }
 
+/**
+ * The authorization this run was ADMITTED under, read back from the session the
+ * scheduled runner stamped before its first turn.
+ *
+ * A run keeps the permissions it started with. Live schedule state is still read on
+ * every publish so a revocation bites immediately, but it is intersected with this —
+ * so consent granted while the run is in flight cannot reach into it. Without the
+ * intersection, an owner ticking the box mid-run would publish content that a
+ * draft-only run had already generated under a prompt telling it not to publish:
+ * the owner never saw that content, and never approved a run that produced it.
+ *
+ * A missing or malformed stamp is NOT authorized, like every other ambiguous case
+ * here. The runner writes it only for runs admitted as authorized, so absent is the
+ * ordinary state of every draft-only run, and the correct answer for both a session
+ * that predates this field and a run whose stamp could not be written.
+ */
+function readAdmittedAuthorization(session: any): SchedulePublishAuthorization {
+  const admission = session?.publishAdmission;
+  if (!admission || admission.authorized !== true) return { authorized: false, tools: [] };
+  const tools = Array.isArray(admission.tools)
+    ? admission.tools.filter((tool: unknown): tool is string => typeof tool === 'string')
+    : [];
+  return { authorized: tools.length > 0, tools };
+}
+
 function refuse(toolName: string, detail: string): ScheduledPublishRefusal {
   return {
     success: false,
@@ -166,9 +195,20 @@ export async function refuseUnauthorizedScheduledPublish(
     return refuse(toolName, 'This run could not be matched to a schedule, so no owner authorization could be confirmed.');
   }
 
-  let authorization;
+  // What this run was admitted with. Read BEFORE the schedule so a run that never
+  // carried publishing rights is refused without a second storage read at all.
+  const admitted = readAdmittedAuthorization(session);
+  if (!admitted.authorized) {
+    return refuse(
+      toolName,
+      'This run started without permission to publish, and a run keeps the permissions it began with. ' +
+      'If publishing has since been enabled for this schedule, it takes effect on the next run.'
+    );
+  }
+
+  let latest;
   try {
-    authorization = resolveSchedulePublishAuthorization(await resolved.getScheduleById(scheduleId));
+    latest = resolveSchedulePublishAuthorization(await resolved.getScheduleById(scheduleId));
   } catch (scheduleReadError) {
     console.error(
       `ENG-827: could not read schedule ${scheduleId} to check publish consent for ${toolName}; ` +
@@ -176,6 +216,11 @@ export async function refuseUnauthorizedScheduledPublish(
     );
     return refuse(toolName, 'The schedule\'s publishing permission could not be read, and an unconfirmed permission is treated as withheld.');
   }
+
+  // Live state can only ever REMOVE rights from here: `narrowPublishAuthorization` is
+  // the same monotonic intersection the turn loop applies, so a revocation stops this
+  // publish immediately while a mid-run grant is invisible to this run.
+  const authorization = narrowPublishAuthorization(admitted, latest);
 
   if (!authorization.authorized || !authorization.tools.includes(toolName)) {
     return refuse(

@@ -3118,7 +3118,35 @@ export async function runScheduledChat(
     // the prompt prohibits: the original contradiction, reintroduced by partial
     // scope. `tools` is empty when unauthorized, so this still drops every publish
     // requirement in that case.
-    const publishAuthorization = resolveSchedulePublishAuthorization(schedule);
+    let publishAuthorization = resolveSchedulePublishAuthorization(schedule);
+    // ENG-827: stamp the admitted authorization on the session before the first turn.
+    //
+    // The dispatch-time guard re-reads the schedule so a revocation stops an in-flight
+    // publish, but a re-read on its own would also let a grant made DURING the run
+    // widen it — publishing content a draft-only run had already generated under a
+    // prompt telling it not to. The guard intersects live state with this stamp
+    // instead, so a run keeps the permissions it began with and consent can only ever
+    // narrow. Only an authorized run is stamped: the guard reads an absent stamp as
+    // not authorized, which is exactly right for every draft-only run, and costs the
+    // 897 schedules that have never granted consent no extra write at all.
+    //
+    // If the stamp cannot be written we downgrade THIS value rather than carry on,
+    // because it is the one the prompt and the required-function filter below are both
+    // derived from. Proceeding would tell the model to publish and demand the call
+    // while the guard refused it — the exact prompt-versus-checker contradiction that
+    // produced the reported nudge loop. Downgrading costs a draft; the alternative
+    // costs a burned run.
+    if (publishAuthorization.authorized) {
+      try {
+        await chatbotDb.updateSessionPublishAdmission(sessionId, publishAuthorization);
+      } catch (admissionWriteError) {
+        console.error(
+          `AgentMode: could not record the publish admission for session ${sessionId} on schedule ` +
+          `${schedule.scheduleId}; running draft-only (fail-closed):`, admissionWriteError
+        );
+        publishAuthorization = narrowPublishAuthorization(publishAuthorization, null);
+      }
+    }
     // ENG-827: the authorization this run is CURRENTLY operating under. Starts at the
     // admitted value and is narrowed — never widened — by each mid-run re-check, so it
     // also ends up holding the final state the run's record must be reported against.
