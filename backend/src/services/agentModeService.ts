@@ -9045,6 +9045,12 @@ export class AgentModeService {
       // is the contract this whole ticket is about. Answer it directly instead
       // of making them page the list.
       const competitorLookup = this.lookupCompetitors(competitors, options?.competitorNames);
+      // Dropping part of the REQUEST silently is the same failure as dropping
+      // part of the data: unanswered names would read as "not stored" and get
+      // re-added. Report the shortfall instead (ENG-945).
+      const competitorNamesNotChecked = Array.isArray(options?.competitorNames)
+        ? Math.max(0, options!.competitorNames!.length - AgentModeService.COMPETITOR_LOOKUP_MAX)
+        : 0;
       const budgets = this.competitorCharBudgets(marketStrategy);
       const window = this.resolveCompetitorDetailWindow(competitors, competitorDetailOffset, minInFull, budgets.detail);
 
@@ -9056,6 +9062,7 @@ export class AgentModeService {
         competitorDetailEnd: window.end,
         nameIndexCharBudget: budgets.nameIndex,
         competitorLookup,
+        competitorNamesNotChecked,
         // Paging instructions only make sense in a tool result. A caller that
         // embeds this in its own prompt has no read_market_strategy to call, so
         // the offsets are noise there — and noise that can leak into generated
@@ -9069,7 +9076,7 @@ export class AgentModeService {
         message: `Market strategy retrieved successfully`,
         exists: true,
         totalCompetitors: competitorCount,
-        ...(competitorLookup ? { competitorLookup } : {}),
+        ...(competitorLookup ? { competitorLookup, competitorNamesNotChecked } : {}),
         competitorDetailOffset: window.start,
         competitorsWithFullDetail: window.end - window.start,
         // Explicit next page, so paging never depends on the model doing arithmetic.
@@ -23150,6 +23157,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           ? `• <strong>${entry.name}</strong>: ALREADY STORED at offset ${entry.offset} — do NOT add it again.<br>`
           : `• <strong>${entry.name}</strong>: not stored — safe to add.<br>`;
       });
+      const notChecked: number = marketResult.competitorNamesNotChecked || 0;
+      if (notChecked > 0) {
+        formattedSummary += `<strong>⚠️ ${notChecked} further requested name(s) were NOT checked</strong> (only ${AgentModeService.COMPETITOR_LOOKUP_MAX} names are checked per call). Do NOT assume those are absent — call read_market_strategy again with the remaining names before adding any of them.<br>`;
+      }
       formattedSummary += `<br>`;
     }
 
