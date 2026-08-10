@@ -27,6 +27,10 @@ const readJson = (file: string): any => {
   return JSON.parse(fs.readFileSync(full, 'utf8'));
 };
 
+const readRepoFile = (file: string): string => {
+  return fs.readFileSync(path.resolve(backendRoot, '..', file), 'utf8');
+};
+
 const TEST_EXCLUDE_GLOBS = ['src/**/__tests__/**', 'src/**/*.test.ts'];
 
 describe('ENG-1059 build/typecheck tsconfig split', () => {
@@ -77,6 +81,17 @@ describe('ENG-1059 build/typecheck tsconfig split', () => {
       const typecheck: string = readJson('package.json').scripts.typecheck;
       expect(typecheck).toContain('--noEmit');
       expect(typecheck).not.toContain('tsconfig.build.json');
+    });
+  });
+
+  describe('cloud test-environment build', () => {
+    it('copies the deploy tsconfig before npm run build', () => {
+      const dockerfile = readRepoFile('test-env/Dockerfile.backend');
+      const configCopy = dockerfile.indexOf('COPY backend/tsconfig.build.json ./');
+      const build = dockerfile.indexOf('npm run build');
+
+      expect(configCopy).toBeGreaterThanOrEqual(0);
+      expect(build).toBeGreaterThan(configCopy);
     });
   });
 
