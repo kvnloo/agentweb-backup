@@ -329,6 +329,19 @@ describe('AgentModeService - search_knowledge_base', () => {
       expect(result.results[0].content.length).toBeLessThan(longContent.length);
     });
 
+    it('does not crash when an individual Vertex result has null/undefined content (malformed upstream response)', async () => {
+      mockSearchPlatformKnowledgeBase.mockResolvedValue([
+        { id: 'kb-1', content: null, metadata: { source: 'public-knowledge-base' } },
+        { id: 'kb-2', content: undefined, metadata: { source: 'public-knowledge-base' } },
+      ] as any);
+
+      const result = await (agentModeService as any).searchKnowledgeBase('test query', 5, 'user-123');
+
+      expect(result.success).toBe(true);
+      expect(result.results[0].content).toBeNull();
+      expect(result.results[1].content).toBeUndefined();
+    });
+
     it('should not truncate Vertex result content at exactly 5000 chars', async () => {
       const boundaryContent = 'x'.repeat(5000);
       mockSearchPlatformKnowledgeBase.mockResolvedValue([

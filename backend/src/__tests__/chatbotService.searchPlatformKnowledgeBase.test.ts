@@ -92,6 +92,30 @@ describe('searchPlatformKnowledgeBase — content length capping', () => {
     expect(results[0].content.length).toBeLessThan(longContent.length);
   });
 
+  it('excludes a segment with empty content instead of crashing the truncation check (malformed Vertex response)', async () => {
+    const malformedSegment = {
+      document: {
+        derivedStructData: {
+          fields: {
+            extractive_segments: {
+              listValue: {
+                values: [{ structValue: { fields: { content: { stringValue: '' } } } }],
+              },
+            },
+          },
+        },
+      },
+    };
+    searchMock
+      .mockImplementationOnce(async () => [[malformedSegment, vertexResult('valid content')]])
+      .mockImplementationOnce(async () => [[]]);
+
+    const results = await searchPlatformKnowledgeBase('test query', 5, 'user-123');
+
+    expect(results).toHaveLength(1);
+    expect(results[0].content).toBe('valid content');
+  });
+
   it('does not truncate content at exactly 5000 chars', async () => {
     const boundaryContent = 'x'.repeat(5000);
     searchMock
