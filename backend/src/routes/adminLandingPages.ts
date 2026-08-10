@@ -165,20 +165,42 @@ router.post("/:id/org-share", async (req: Request, res: Response) => {
       resolved.push(user);
     }
 
-    const settings = org.shareSettings
-      ? JSON.parse(JSON.stringify(org.shareSettings))
-      : defaultShareSettings();
-    const lp = settings.landingPages ?? { enabled: false, editors: [] };
-    lp.enabled = enable;
-    const before = new Set<string>(lp.editors ?? []);
-    const granted = resolved
-      .map((m) => m.userId)
-      // Org owner already has full authority; listing them is redundant noise.
-      .filter((uid) => uid !== org.ownerUserId);
-    lp.editors = [...new Set([...(lp.editors ?? []), ...granted])];
-    settings.landingPages = lp;
+    // Read-modify-write guarded on updatedAt: an overlapping sharing request
+    // (or departed-member cleanup) fails the conditional write, and we re-read
+    // and re-apply this grant on top of the fresh document instead of
+    // clobbering it (last-writer-wins loses the other writer's changes).
+    const MAX_SHARE_WRITE_ATTEMPTS = 5;
+    let settings: any;
+    let lp: { enabled: boolean; editors: string[] };
+    let before: Set<string>;
+    let granted: string[];
+    let currentOrg = org;
+    for (let attempt = 0; ; attempt++) {
+      settings = currentOrg.shareSettings
+        ? JSON.parse(JSON.stringify(currentOrg.shareSettings))
+        : defaultShareSettings();
+      lp = settings.landingPages ?? { enabled: false, editors: [] };
+      lp.enabled = enable;
+      before = new Set<string>(lp.editors ?? []);
+      granted = resolved
+        .map((m) => m.userId)
+        // Org owner already has full authority; listing them is redundant noise.
+        .filter((uid) => uid !== currentOrg.ownerUserId);
+      lp.editors = [...new Set([...(lp.editors ?? []), ...granted])];
+      settings.landingPages = lp;
 
-    await orgDb.updateShareSettings(ownerOrgId, settings);
+      try {
+        await orgDb.updateShareSettings(ownerOrgId, settings, currentOrg.updatedAt);
+        break;
+      } catch (writeError: any) {
+        if (writeError?.code !== "ConditionalCheckFailedException" || attempt >= MAX_SHARE_WRITE_ATTEMPTS - 1) {
+          throw writeError;
+        }
+        const reread = await orgDb.getOrgById(ownerOrgId);
+        if (!reread) return res.status(404).json({ message: "Owner organization not found" });
+        currentOrg = reread;
+      }
+    }
 
     const actor = (req as AuthenticatedRequest).user;
     recordAdminAudit({
@@ -199,7 +221,7 @@ router.post("/:id/org-share", async (req: Request, res: Response) => {
         email: m.email ?? null,
         // Compute against the settings just written, not a re-read (avoids
         // returning a stale pre-mutation view under eventual consistency).
-        ...(await memberAccess(page, m, ownerOrgId, { ...org, shareSettings: settings })),
+        ...(await memberAccess(page, m, ownerOrgId, { ...currentOrg, shareSettings: settings })),
       }))
     );
 

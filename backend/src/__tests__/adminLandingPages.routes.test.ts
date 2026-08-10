@@ -289,6 +289,57 @@ describe("POST /:id/org-share", () => {
     expect(mockUpdateShareSettings).not.toHaveBeenCalled();
   });
 
+  it("re-reads and re-applies the grant when a concurrent writer changed shareSettings", async () => {
+    // First write loses the optimistic-concurrency race; the re-read returns a
+    // document where a concurrent request granted an analytics editor. The
+    // retry must preserve that grant while still applying ours.
+    const concurrentlyChanged = {
+      ...JSON.parse(JSON.stringify(baseOrg)),
+      updatedAt: "2026-08-10T15:00:00.000Z",
+      shareSettings: {
+        ...JSON.parse(JSON.stringify(baseOrg.shareSettings)),
+        analytics: { enabled: true, editors: ["concurrent-editor"] },
+      },
+    };
+    mockGetOrgById
+      .mockResolvedValueOnce(JSON.parse(JSON.stringify(baseOrg)))
+      .mockResolvedValueOnce(concurrentlyChanged);
+    const conditionalFailure = Object.assign(new Error("conditional check failed"), {
+      code: "ConditionalCheckFailedException",
+    });
+    mockUpdateShareSettings
+      .mockRejectedValueOnce(conditionalFailure)
+      .mockResolvedValueOnce(undefined);
+
+    const app = makeApp(admin);
+    const res = await request(app)
+      .post("/api/admin/landing-pages/page-1/org-share")
+      .send({ memberEmails: ["hugo@rankai.ai"] });
+    expect(res.status).toBe(200);
+
+    expect(mockUpdateShareSettings).toHaveBeenCalledTimes(2);
+    const [, retriedSettings, expectedUpdatedAt] = mockUpdateShareSettings.mock.calls[1];
+    // Concurrent writer's change survives the retry…
+    expect(retriedSettings.analytics.editors).toContain("concurrent-editor");
+    // …and our grant is applied on top of the fresh document.
+    expect(retriedSettings.landingPages.editors).toContain(memberId);
+    expect(expectedUpdatedAt).toBe("2026-08-10T15:00:00.000Z");
+  });
+
+  it("fails loudly when the conditional write keeps losing the race", async () => {
+    const conditionalFailure = Object.assign(new Error("conditional check failed"), {
+      code: "ConditionalCheckFailedException",
+    });
+    mockUpdateShareSettings.mockRejectedValue(conditionalFailure);
+    const app = makeApp(admin);
+    const res = await request(app)
+      .post("/api/admin/landing-pages/page-1/org-share")
+      .send({ memberEmails: ["hugo@rankai.ai"] });
+    expect(res.status).toBe(500);
+    expect(mockUpdateShareSettings).toHaveBeenCalledTimes(5);
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
+  });
+
   it("requires at least one member", async () => {
     const app = makeApp(admin);
     const res = await request(app).post("/api/admin/landing-pages/page-1/org-share").send({});

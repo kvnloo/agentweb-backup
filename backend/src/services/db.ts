@@ -9295,14 +9295,21 @@ export const orgDb = {
     throw new Error(`removeDomainJoinRequest: exceeded ${MAX_ATTEMPTS} retry attempts for org ${orgId}`);
   },
 
-  async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
+  async updateShareSettings(orgId: string, settings: OrgShareSettings, expectedUpdatedAt?: string): Promise<void> {
     await dynamodb.update({
       TableName: ORGS_TABLE,
       Key: { orgId },
       UpdateExpression: "SET shareSettings = :s, updatedAt = :u",
+      // Optional optimistic-concurrency guard: callers doing a read-modify-write
+      // pass the updatedAt they read so an overlapping writer surfaces as a
+      // ConditionalCheckFailedException instead of a silent last-writer-wins.
+      ...(expectedUpdatedAt !== undefined
+        ? { ConditionExpression: "updatedAt = :expected" }
+        : {}),
       ExpressionAttributeValues: {
         ":s": settings,
         ":u": new Date().toISOString(),
+        ...(expectedUpdatedAt !== undefined ? { ":expected": expectedUpdatedAt } : {}),
       },
     }).promise();
   },
