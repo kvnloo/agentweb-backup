@@ -13,6 +13,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
+import { isPublishConsentWithdrawn } from '../utils/publishConsentWithdrawn';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
@@ -29264,7 +29265,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       const withdrawnNow = await publishWithdrawnMidFlight(toolContext);
       if (withdrawnNow) return withdrawnNow;
 
-      const result = await adapter.createRepost(account, postUrn, commentary, userId);
+      const result = await adapter.createRepost(
+        account, postUrn, commentary, userId,
+        toolContext?.assertPublishStillAuthorized
+      );
 
       return {
         success: true,
@@ -29363,7 +29367,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         if (withdrawnNow) return withdrawnNow;
 
         console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');
-        const result = await adapter.createComment(account, postUrn, commentText, userId, parentCommentUrn);
+        const result = await adapter.createComment(
+          account, postUrn, commentText, userId, parentCommentUrn,
+          toolContext?.assertPublishStillAuthorized
+        );
 
         return {
           success: true,
@@ -30574,9 +30581,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'reply': {
           if (!text) throw new Error('text is required for reply');
           if (!in_reply_to_tweet_id) throw new Error('in_reply_to_tweet_id is required for reply');
+          // ENG-827: the hook goes down so the check also covers the client resolution
+          // and any token refresh inside the call — the last work before the write.
           const result = await twitterService.postTweet(ownerUserId, account_id, text, {
             inReplyToTweetId: in_reply_to_tweet_id,
-          });
+          }, toolContext?.assertPublishStillAuthorized);
           await logCrm('twitter.tweet.sent', result.id, result.text);
           return { success: true, data: result };
         }
@@ -30616,7 +30625,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'quote-tweet': {
           if (!text) throw new Error('text is required for quote_tweet');
           if (!tweet_id) throw new Error('tweet_id is required for quote_tweet');
-          const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id);
+          const result = await twitterService.quoteTweet(ownerUserId, account_id, text, tweet_id, toolContext?.assertPublishStillAuthorized);
           await logCrm('twitter.tweet.sent', result.id, result.text);
           return { success: true, data: result };
         }
@@ -30641,7 +30650,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
         case 'retweet': {
           if (!tweet_id) throw new Error('tweet_id is required for retweet');
-          const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id);
+          const result = await twitterService.retweetTweet(ownerUserId, account_id, tweet_id, toolContext?.assertPublishStillAuthorized);
           return { success: true, data: result };
         }
 
@@ -30693,6 +30702,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }
     } catch (error) {
+      // ENG-827: a write abandoned because the owner withdrew consent is a deliberate
+      // stop, not an X failure. Reporting it as "Twitter action failed" would invite a
+      // retry of the very thing the owner just said no to.
+      if (isPublishConsentWithdrawn(error)) {
+        console.warn('[AgentMode] ENG-827: twitter_manage_post stopped — publish consent was withdrawn before the write.');
+        return { success: false, error: error.message };
+      }
       // Surface X's real ApiResponseError payload (title/detail/errors) instead of
       // collapsing to a bare "Request failed with code 403" — see describeXApiError.
       const errorMessage = describeXApiError(error);

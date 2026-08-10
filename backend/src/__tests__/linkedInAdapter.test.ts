@@ -105,6 +105,9 @@ describe('LinkedInAdapter', () => {
         'test-access-token',
         'urn:li:person:abc123',
         'Hello LinkedIn!',
+        undefined,
+        // ENG-827: the consent re-check is handed down so linkedInService can run it
+        // at the request itself, after the link-preview work. Absent here (no hook).
         undefined
       );
       expect(result).toEqual({
@@ -124,6 +127,7 @@ describe('LinkedInAdapter', () => {
         'test-org-token',
         'urn:li:organization:123456',
         'Company announcement',
+        undefined,
         undefined
       );
       expect(result.success).toBe(true);
@@ -149,7 +153,8 @@ describe('LinkedInAdapter', () => {
         'test-org-token',
         'urn:li:organization:123456',
         'Post with image',
-        ['urn:li:image:123']
+        ['urn:li:image:123'],
+        undefined
       );
       expect(result.success).toBe(true);
     });

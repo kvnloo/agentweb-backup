@@ -791,7 +791,10 @@ describe('AgentModeService - Social Media Tools', () => {
         mockLinkedInAccount,
         'urn:li:share:orig999',
         undefined,
-        'user-123'
+        'user-123',
+        // ENG-827: the consent re-check, run inside the adapter after the token
+        // refresh. Undefined here — this is not a scheduled run.
+        undefined
       );
     });
 
@@ -811,7 +814,8 @@ describe('AgentModeService - Social Media Tools', () => {
         mockLinkedInAccount,
         'urn:li:share:orig999',
         'Great post!',
-        'user-123'
+        'user-123',
+        undefined
       );
     });
 

@@ -238,7 +238,7 @@ describe('AgentModeService.twitterManagePost', () => {
   // ── Happy paths ──
   it('reply calls postTweet with inReplyToTweetId option', async () => {
     const res = await service.twitterManagePost('u', { action: 'reply', text: 'yo', in_reply_to_tweet_id: '555' });
-    expect(mockPostTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'yo', { inReplyToTweetId: '555' });
+    expect(mockPostTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'yo', { inReplyToTweetId: '555' }, undefined);
     expect(res.success).toBe(true);
   });
 
@@ -281,7 +281,8 @@ describe('AgentModeService.twitterManagePost', () => {
 
   it('quote_tweet calls quoteTweet with text and tweet_id', async () => {
     const res = await service.twitterManagePost('u', { action: 'quote_tweet', text: 'nice tweet!', tweet_id: 'tw42' });
-    expect(mockQuoteTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'nice tweet!', 'tw42');
+    // ENG-827: the trailing arg is the consent re-check, undefined outside a scheduled run.
+    expect(mockQuoteTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'nice tweet!', 'tw42', undefined);
     expect(res.success).toBe(true);
     expect(res.data.id).toBe('qt1');
   });
@@ -309,7 +310,7 @@ describe('AgentModeService.twitterManagePost', () => {
 
   it('retweet calls retweetTweet with tweet_id', async () => {
     const res = await service.twitterManagePost('u', { action: 'retweet', tweet_id: 'tw42' });
-    expect(mockRetweetTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42');
+    expect(mockRetweetTweet).toHaveBeenCalledWith(OWNER, 'tw1', 'tw42', undefined);
     expect(res.success).toBe(true);
     expect(res.data.retweeted).toBe(true);
   });

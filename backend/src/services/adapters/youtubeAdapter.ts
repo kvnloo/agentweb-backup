@@ -2,17 +2,10 @@ import axios from 'axios';
 import { ConnectedAccount, YouTubeConfig, updateAccountTokens } from '../connectedAccountsDb';
 import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
 import { getYouTubeConfig } from '../../config/integrations';
+import { PublishConsentWithdrawn, isPublishConsentWithdrawn } from '../../utils/publishConsentWithdrawn';
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 const YOUTUBE_UPLOAD_URL = 'https://www.googleapis.com/upload/youtube/v3/videos';
-
-/**
- * ENG-827: thrown when consent is withdrawn between fetching the video and uploading
- * it. A sentinel rather than a bare Error so createPost can turn it back into an
- * ordinary refusal — the run was stopped on purpose and did nothing wrong, so it must
- * not surface as a YouTube failure the model might retry.
- */
-class PublishConsentWithdrawn extends Error {}
 
 function isYouTubeChannel(config: any): config is YouTubeConfig {
   return config.account_type === 'channel';
@@ -135,7 +128,7 @@ export class YouTubeAdapter implements SocialPlatformAdapter {
       return updateResponse.data;
       }, userId);
     } catch (error) {
-      if (error instanceof PublishConsentWithdrawn) {
+      if (isPublishConsentWithdrawn(error)) {
         return { success: false, message: error.message };
       }
       throw error;

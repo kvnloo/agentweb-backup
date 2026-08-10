@@ -87,7 +87,7 @@ export interface SocialPlatformAdapter {
    * @param commentText - The comment text
    * @param userId - Optional user ID for token refresh capability
    */
-  createComment?(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string): Promise<PostResult>;
+  createComment?(account: ConnectedAccount, postUrn: string, commentText: string, userId?: string, parentCommentUrn?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult>;
 
   /**
    * Repost (reshare) an existing post
@@ -96,7 +96,7 @@ export interface SocialPlatformAdapter {
    * @param commentary - Optional text to add alongside the repost
    * @param userId - Optional user ID for token refresh capability
    */
-  createRepost?(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string): Promise<PostResult>;
+  createRepost?(account: ConnectedAccount, originalPostUrn: string, commentary?: string, userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult>;
 
   /**
    * React to a post (like, praise, etc.)
