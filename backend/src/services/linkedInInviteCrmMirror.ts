@@ -491,7 +491,8 @@ export async function reconcileSentInvitationsToCrm(
     result.liveRefreshFailed = true;
     result.newestCachedSyncedAt = pending.reduce<string | null>((newest, invitation) => {
       const syncedAt = invitation.syncedAt;
-      return syncedAt && (!newest || syncedAt > newest) ? syncedAt : newest;
+      if (!syncedAt || Number.isNaN(Date.parse(syncedAt))) return newest;
+      return !newest || syncedAt > newest ? syncedAt : newest;
     }, null);
   }
 

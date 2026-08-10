@@ -170,6 +170,40 @@ describe('reconcileSentInvitationsToCrm', () => {
     }));
   });
 
+  it('ENG-876: reports no cached timestamp when refresh fails against an empty cache', async () => {
+    syncSentInvitationsForAccount.mockRejectedValue(new Error('unipile down'));
+    getAllSentInvitationsByAccount.mockResolvedValue([]);
+
+    const res = await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST, dryRun: true });
+    expect(res).toEqual(expect.objectContaining({
+      liveRefreshFailed: true,
+      newestCachedSyncedAt: null,
+    }));
+  });
+
+  it('ENG-876: ignores missing, empty, and malformed cache timestamps', async () => {
+    syncSentInvitationsForAccount.mockRejectedValue(new Error('unipile down'));
+    getAllSentInvitationsByAccount.mockResolvedValue([
+      invite('missing', 'Missing Timestamp', { syncedAt: undefined }),
+      invite('empty', 'Empty Timestamp', { syncedAt: '' }),
+      invite('malformed', 'Malformed Timestamp', { syncedAt: 'not-a-timestamp' }),
+    ]);
+
+    const res = await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST, dryRun: true });
+    expect(res.newestCachedSyncedAt).toBeNull();
+  });
+
+  it('ENG-876: chooses the newest valid timestamp when invalid cache rows are mixed in', async () => {
+    syncSentInvitationsForAccount.mockRejectedValue(new Error('unipile down'));
+    getAllSentInvitationsByAccount.mockResolvedValue([
+      invite('valid', 'Valid Timestamp', { syncedAt: '2026-08-03T14:58:58.000Z' }),
+      invite('malformed', 'Malformed Timestamp', { syncedAt: 'not-a-timestamp' }),
+    ]);
+
+    const res = await reconcileSentInvitationsToCrm({ accountId: ACCOUNT, listId: LIST, dryRun: true });
+    expect(res.newestCachedSyncedAt).toBe('2026-08-03T14:58:58.000Z');
+  });
+
   it('ENG-876 characterization: dry-run still performs no CRM writes', async () => {
     getAllSentInvitationsByAccount.mockResolvedValue([invite('new-person', 'New Person')]);
 
