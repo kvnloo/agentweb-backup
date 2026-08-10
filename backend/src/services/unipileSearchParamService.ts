@@ -269,35 +269,27 @@ export class UnipileSearchParamService {
     // to every other account as a settled "no such entity", and a healthy
     // account reading it never calls the API to find out otherwise.
     //
-    // So confirm the empty before sharing it. Only a definite 'degraded' skips
-    // the write: an indeterminate probe proves nothing (ENG-281's rule), and
-    // treating it as degraded would drop legitimate negatives whenever the probe
-    // itself is flaky. Nothing is written on the skip, so the next caller for
-    // these keywords simply asks the API again.
+    // So publish an empty only when the probe positively confirms the account
+    // CAN search. 'degraded' is an outage empty. 'unknown' — a probe that timed
+    // out or errored — cannot be shown to be either, and the two outcomes are
+    // not symmetric: declining to cache costs one extra API call on the next
+    // lookup for these keywords, while caching a wrong negative strips a filter
+    // from every account's searches for the rest of the TTL.
+    //
+    // This is NOT the caller-facing rule. An indeterminate probe must never fail
+    // a request (ENG-281), and it doesn't here: the caller gets the ordinary
+    // empty result whatever the probe says. Only the shared write is withheld.
+    let cacheable = true;
     if (isEmpty && this.deps.probeSearchCapability) {
       const capability = await this.deps.probeSearchCapability(accountId);
-      if (capability === 'degraded') {
+      cacheable = capability === 'ok';
+      if (!cacheable) {
         enrichLog.warn({
           event: 'unipile_param_negative_cache_skipped',
           type: input.type,
           normalizedKeywords,
-          reason: 'account people-search degraded',
+          capability,
         });
-        return this.finalize(
-          {
-            canonicalId: key.canonicalId,
-            fieldGroup: key.sk,
-            cacheType: 'unipile_search_param',
-            rawData: null,
-            status: 'not_found',
-            expiresAt: 0,
-            fetchedAt: new Date().toISOString(),
-          },
-          false,
-          'api',
-          input,
-          normalizedKeywords,
-        );
       }
     }
 
@@ -310,8 +302,10 @@ export class UnipileSearchParamService {
       expiresAt: Math.floor(Date.now() / 1000) + (isEmpty ? TTL_NEGATIVE_SECONDS : TTL_HIT_SECONDS),
       fetchedAt: new Date().toISOString(),
     };
-    await this.writeRow(row, key);
-    memSet(memKey, row);
+    if (cacheable) {
+      await this.writeRow(row, key);
+      memSet(memKey, row);
+    }
 
     return this.finalize(row, false, 'api', input, normalizedKeywords);
   }

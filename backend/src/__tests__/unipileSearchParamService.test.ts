@@ -194,15 +194,36 @@ describe('UnipileSearchParamService.resolve', () => {
       expect(stored.status).toBe('not_found');
     });
 
-    it('still caches the empty when the probe is indeterminate', async () => {
+    // Only a probe that positively confirms the account can search makes an empty
+    // safe to publish. A probe that timed out leaves the outage empty reachable,
+    // and the outcomes aren't symmetric: not caching costs one API call, caching
+    // a wrong negative strips a filter from every account for the whole TTL.
+    it('does not cache the empty when the probe is indeterminate', async () => {
       const http = makeHttp({ searchParameters: jest.fn().mockResolvedValue({ items: [] }) });
       const store = makeStore();
       const probe = jest.fn().mockResolvedValue('unknown');
       const svc = makeService(http, store, probe);
 
-      await svc.resolve('acct-flaky', { type: 'COMPANY', keywords: 'NonexistentCo' });
+      const result = await svc.resolve('acct-flaky', { type: 'COMPANY', keywords: 'NonexistentCo' });
 
-      expect(Array.from(store._items.values())[0]).toBeDefined();
+      expect(store.put).not.toHaveBeenCalled();
+      expect(store._items.size).toBe(0);
+      // The caller is NOT failed on an indeterminate probe — only the write is withheld.
+      expect(result.candidates).toEqual([]);
+      expect(result.source).toBe('api');
+    });
+
+    it('does not seed the process cache when the write is withheld', async () => {
+      const http = makeHttp({ searchParameters: jest.fn().mockResolvedValue({ items: [] }) });
+      const store = makeStore();
+      const probe = jest.fn().mockResolvedValue('degraded');
+      const svc = makeService(http, store, probe);
+
+      await svc.resolve('acct-degraded', { type: 'COMPANY', keywords: 'NonexistentCo' });
+      await svc.resolve('acct-degraded', { type: 'COMPANY', keywords: 'NonexistentCo' });
+
+      // A memoized empty would re-poison reads for the process lifetime.
+      expect(http.searchParameters).toHaveBeenCalledTimes(2);
     });
 
     it('never probes on a non-empty result', async () => {
