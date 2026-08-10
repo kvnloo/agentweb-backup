@@ -198,13 +198,21 @@ router.post("/:id/org-share", async (req: Request, res: Response) => {
         }
         const reread = await orgDb.getOrgById(ownerOrgId);
         if (!reread) return res.status(404).json({ message: "Owner organization not found" });
-        // The conflicting writer may have removed a member we validated
-        // before the first attempt (departed-member cleanup). Re-applying the
-        // grant from the stale resolved list would silently restore their
-        // editor entry, so revalidate membership against the fresh org.
-        const freshMembers = (await orgDb.getOrgMembers(ownerOrgId)) as UserRecordLike[];
-        const freshMemberIds = new Set(freshMembers.map((m) => m.userId));
-        const departed = resolved.filter((m) => !freshMemberIds.has(m.userId));
+        // OrgIdIndex is eventually consistent, so it cannot prove that a user
+        // still belongs to this org after a concurrent departure. Revalidate
+        // every target through the email primary key's strongly consistent
+        // read before restoring their editor grant on the retry.
+        const currentMembers = await Promise.all(
+          resolved.map((m) =>
+            m.email
+              ? userDb.getUserByEmailConsistent(m.email)
+              : Promise.resolve(undefined),
+          ),
+        );
+        const departed = resolved.filter((m, index) => {
+          const current = currentMembers[index] as UserRecordLike | undefined;
+          return !current || current.userId !== m.userId || current.orgId !== ownerOrgId;
+        });
         if (departed.length > 0) {
           return res.status(409).json({
             message: `Organization membership changed concurrently — no longer members: ${departed

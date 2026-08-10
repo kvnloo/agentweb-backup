@@ -9301,7 +9301,11 @@ export const orgDb = {
   // that has no updatedAt yet). An overlapping writer then surfaces as a
   // ConditionalCheckFailedException instead of a silent last-writer-wins
   // that erases the other writer's grants.
-  async updateShareSettings(orgId: string, settings: OrgShareSettings, expectedUpdatedAt: string | undefined): Promise<void> {
+  async updateShareSettings(
+    orgId: string,
+    settings: OrgShareSettings,
+    expectedUpdatedAt: string | undefined,
+  ): Promise<string> {
     const nowMs = Date.now();
     const expectedMs = expectedUpdatedAt === undefined ? Number.NaN : Date.parse(expectedUpdatedAt);
     // `updatedAt` is the compare-and-swap revision for this whole-document
@@ -9325,6 +9329,7 @@ export const orgDb = {
         ...(expectedUpdatedAt !== undefined ? { ":expected": expectedUpdatedAt } : {}),
       },
     }).promise();
+    return nextUpdatedAt;
   },
 
   async pruneEditorListsForUser(orgId: string, removedUserId: string): Promise<void> {

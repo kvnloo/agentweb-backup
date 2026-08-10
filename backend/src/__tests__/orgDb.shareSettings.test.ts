@@ -73,7 +73,7 @@ describe("updateShareSettings", () => {
     jest.useFakeTimers().setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
     mockUpdate.mockResolvedValueOnce({});
 
-    await orgDb.updateShareSettings(
+    const writtenRevision = await orgDb.updateShareSettings(
       "org-1",
       { brandGuidelines: { editors: [] } } as any,
       expectedUpdatedAt,
@@ -81,6 +81,7 @@ describe("updateShareSettings", () => {
 
     const args = mockUpdate.mock.calls[0][0];
     expect(args.ExpressionAttributeValues[":u"]).toBe(nextUpdatedAt);
+    expect(writtenRevision).toBe(nextUpdatedAt);
   });
 });
 

@@ -93,6 +93,7 @@ jest.mock("../services/v0Service", () => ({
 
 const mockGetUserById = jest.fn();
 const mockGetUserByEmail = jest.fn();
+const mockGetUserByEmailConsistent = jest.fn();
 const mockGetOrgById = jest.fn();
 const mockGetOrgMembers = jest.fn();
 const mockUpdateShareSettings = jest.fn();
@@ -100,6 +101,7 @@ jest.mock("../services/db", () => ({
   userDb: {
     getUserById: (...a: any[]) => mockGetUserById(...a),
     getUserByEmail: (...a: any[]) => mockGetUserByEmail(...a),
+    getUserByEmailConsistent: (...a: any[]) => mockGetUserByEmailConsistent(...a),
   },
   orgDb: {
     getOrgById: (...a: any[]) => mockGetOrgById(...a),
@@ -140,6 +142,9 @@ beforeEach(() => {
     ({ [ownerId]: ownerUser, [memberId]: memberUser, [outsiderId]: outsiderUser } as any)[id] ?? null
   );
   mockGetUserByEmail.mockImplementation(async (email: string) =>
+    [ownerUser, memberUser, outsiderUser].find((u) => u.email === email.toLowerCase()) ?? null
+  );
+  mockGetUserByEmailConsistent.mockImplementation(async (email: string) =>
     [ownerUser, memberUser, outsiderUser].find((u) => u.email === email.toLowerCase()) ?? null
   );
   mockGetOrgById.mockResolvedValue(JSON.parse(JSON.stringify(baseOrg)));
@@ -336,10 +341,13 @@ describe("POST /:id/org-share", () => {
         ...JSON.parse(JSON.stringify(baseOrg)),
         updatedAt: "2026-08-10T15:00:00.000Z",
       });
-    mockGetOrgMembers
-      .mockResolvedValueOnce([ownerUser, memberUser])
-      // Fresh membership after the conflict: the member departed.
-      .mockResolvedValueOnce([ownerUser]);
+    // The OrgIdIndex can still return a stale member after departure. The
+    // retry must fail closed using a strongly consistent primary-key read.
+    mockGetOrgMembers.mockResolvedValue([ownerUser, memberUser]);
+    mockGetUserByEmailConsistent.mockResolvedValueOnce({
+      ...memberUser,
+      orgId: "org-other",
+    });
     mockUpdateShareSettings.mockRejectedValueOnce(
       Object.assign(new Error("conditional check failed"), { code: "ConditionalCheckFailedException" })
     );
@@ -349,6 +357,7 @@ describe("POST /:id/org-share", () => {
       .post("/api/admin/landing-pages/page-1/org-share")
       .send({ memberEmails: ["hugo@rankai.ai"] });
     expect(res.status).toBe(409);
+    expect(mockGetUserByEmailConsistent).toHaveBeenCalledWith(memberUser.email);
     expect(mockUpdateShareSettings).toHaveBeenCalledTimes(1);
     expect(mockRecordAdminAudit).not.toHaveBeenCalled();
   });

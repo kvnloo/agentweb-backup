@@ -13,7 +13,16 @@ router.get("/", async (req, res) => {
     if (!user?.orgId) return res.status(404).json({ message: "No org" });
     const org = await orgDb.getOrgById(user.orgId);
     if (!org) return res.status(404).json({ message: "Org not found" });
-    return res.json({ shareSettings: org.shareSettings ?? null });
+    // Keep the revision inside the settings snapshot. The deployed portal
+    // preserves unknown fields when it merges the response into local state,
+    // so it will return this token on save without a coordinated frontend
+    // release. The PATCH strips it before persistence.
+    return res.json({
+      shareSettings: {
+        ...(org.shareSettings ?? {}),
+        _revision: org.updatedAt ?? null,
+      },
+    });
   } catch (e) {
     console.error("Error fetching org share-settings:", e);
     return res.status(500).json({ message: "Failed to fetch share-settings" });
@@ -45,9 +54,25 @@ router.patch("/", async (req, res) => {
       return res.status(403).json({ message: "Org owners and admins only" });
     }
 
+    // This route replaces the complete shareSettings document. Bind the write
+    // to the revision the client actually read; using the fresh route read
+    // above would let a stale client snapshot pass the compare-and-swap guard.
+    const incomingWithRevision = req.body?.shareSettings;
+    if (!incomingWithRevision || typeof incomingWithRevision !== "object") {
+      return res.status(400).json({ message: "shareSettings is required" });
+    }
+    if (!("_revision" in incomingWithRevision)) {
+      return res.status(428).json({
+        message: "A share-settings revision is required — reload and try again",
+      });
+    }
+    const { _revision: expectedUpdatedAt, ...incoming } = incomingWithRevision;
+    if (expectedUpdatedAt !== null && typeof expectedUpdatedAt !== "string") {
+      return res.status(400).json({ message: "shareSettings._revision must be a string or null" });
+    }
+
     // Back-fill `analytics` from the org's existing settings when an older client
     // omits it, so the not-yet-deployed customer portal keeps working.
-    const incoming = req.body?.shareSettings;
     if (incoming && typeof incoming === "object" && incoming.analytics === undefined) {
       incoming.analytics = org?.shareSettings?.analytics ?? { enabled: false, editors: [] };
     }
@@ -72,7 +97,14 @@ router.patch("/", async (req, res) => {
     // erase the concurrent writer's change, so surface 409 and let the
     // client re-read and resubmit against fresh state.
     try {
-      await orgDb.updateShareSettings(user.orgId, validated, org?.updatedAt);
+      const nextRevision = await orgDb.updateShareSettings(
+        user.orgId,
+        validated,
+        expectedUpdatedAt === null ? undefined : expectedUpdatedAt,
+      );
+      return res.json({
+        shareSettings: { ...validated, _revision: nextRevision },
+      });
     } catch (writeError: any) {
       if (writeError?.code === "ConditionalCheckFailedException") {
         return res.status(409).json({
@@ -81,7 +113,6 @@ router.patch("/", async (req, res) => {
       }
       throw writeError;
     }
-    return res.json({ shareSettings: validated });
   } catch (e) {
     console.error("Error updating org share-settings:", e);
     return res.status(500).json({ message: "Failed to update share-settings" });
