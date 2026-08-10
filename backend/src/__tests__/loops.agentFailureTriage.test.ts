@@ -242,6 +242,23 @@ describe('ENG-820 — mixed classes and non-tool proposals', () => {
     expect(p.directive).not.toContain('TypeError');
   });
 
+  it('quotes a message from the dominant ERROR CLASS within the cohort', async () => {
+    // Same failureType, mixed error classes, minority class first. The
+    // directive names the dominant error class, so the quoted evidence must
+    // come from that class — not whichever message arrived first.
+    const events = [
+      ...toolEvents('cohort_tool', 30, 2, 'config', 'scope_missing', 'pages_manage not granted'),
+      ...toolEvents('cohort_tool', 0, 12, 'config', 'auth', 'token expired — reconnect account'),
+    ];
+
+    const proposals = await rules().evaluate(events, WINDOW);
+    const p: any = payloads(proposals).find((x: any) => x.toolName === 'cohort_tool');
+
+    expect(p.topErrorClass).toBe('auth');
+    expect(p.directive).toContain('token expired');
+    expect(p.directive).not.toContain('pages_manage');
+  });
+
   it('omits the quote entirely rather than borrowing one from another class', async () => {
     // If the dominant class has no message of its own, quoting a different
     // class's message would be worse than saying nothing.

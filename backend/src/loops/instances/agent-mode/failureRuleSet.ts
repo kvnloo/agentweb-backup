@@ -83,10 +83,12 @@ interface ToolStats {
   errorClasses: Map<string, number>;
   failureTypes: Map<string, number>;
   /**
-   * A representative error message PER failure class. Keyed by class on purpose
-   * (ENG-820 review): a tool with mixed classes would otherwise quote whichever
-   * message arrived first, so a `config` directive could cite a `bug` message
-   * and send the operator to reconnect an account over a TypeError.
+   * A representative error message PER (failure class, error class) pair — see
+   * msgKey (ENG-820 review): the directive names the dominant error class of
+   * its cohort, so the quoted message must come from that same error class.
+   * Keying by failure class alone still let a `config` directive dominated by
+   * `auth` quote whichever message arrived first, e.g. one from a minority
+   * `scope_missing` failure.
    */
   messagesByType: Map<string, string>;
   /**
@@ -221,9 +223,11 @@ export class AgentFailureRuleSet
         const ft = strDim(e.dimensions?.failureType) || '';
         if (ft) stats.failureTypes.set(ft, (stats.failureTypes.get(ft) ?? 0) + 1);
         const em = strDim(e.dimensions?.errorMessage) || '';
-        // Store under this event's OWN class, so the directive can quote a
-        // message that actually belongs to the class it is advising on.
-        if (em && !stats.messagesByType.has(ft)) stats.messagesByType.set(ft, em);
+        // Store under this event's OWN (failure class, error class) pair, so
+        // the directive can quote a message that actually belongs to both the
+        // failure class AND the error class it is advising on.
+        const mk = msgKey(ft, ec);
+        if (em && !stats.messagesByType.has(mk)) stats.messagesByType.set(mk, em);
         const perType = stats.errorClassesByType.get(ft) ?? new Map<string, number>();
         perType.set(ec, (perType.get(ec) ?? 0) + 1);
         stats.errorClassesByType.set(ft, perType);
@@ -346,7 +350,7 @@ export class AgentFailureRuleSet
             topErrorClass,
             actionableTypes.get(failureType) ?? actionableFailures,
             denom,
-            stats.messagesByType.get(failureType) ?? '',
+            stats.messagesByType.get(msgKey(failureType, topErrorClass)) ?? '',
             this.minFailureRate,
           ) + alsoNote,
         },
@@ -404,6 +408,14 @@ function strDim(v: string | number | boolean | null | undefined): string | undef
  * produce the same directive. Neither cohort is lost either way — the loser is
  * named and given its own secondary action.
  */
+/**
+ * Composite map key for a (failureType, errorClass) pair. NUL (\u0000) cannot appear
+ * in either dimension value, so the key is unambiguous.
+ */
+function msgKey(failureType: string, errorClass: string): string {
+  return `${failureType}\u0000${errorClass}`;
+}
+
 function dominantKey(counts: Map<string, number>): string {
   let best = 'UnknownError';
   let bestN = -1;
