@@ -129,14 +129,17 @@ function configHasSecretPlaceholders(config: McpServerConfig): boolean {
 function resolveUserSecrets(env: Record<string, string>, userSecrets: Record<string, string>): Record<string, string> {
   const resolved: Record<string, string> = {};
   for (const [key, value] of Object.entries(env)) {
-    resolved[key] = value.replace(/\{\{(\w+)\}\}/g, (match, varName) => {
-      const secret = userSecrets[varName];
-      if (secret !== undefined) return secret;
-      console.warn(`MCP: Unresolved secret placeholder {{${varName}}}`);
-      return match; // Leave unresolved placeholder as-is
-    });
+    resolved[key] = resolveUserSecretPlaceholders(value, userSecrets);
   }
   return resolved;
+}
+
+function resolveUserSecretPlaceholders(value: string, userSecrets: Record<string, string>): string {
+  return value.replace(/\{\{(\w+)\}\}/g, (_match, varName) => {
+    const secret = userSecrets[varName];
+    if (secret !== undefined) return secret;
+    throw new Error(`MCP: Required user secret "${varName}" is not configured`);
+  });
 }
 
 /**
@@ -154,7 +157,9 @@ function getTransportType(config: McpServerConfig): "sse" | "stdio" | "streamabl
 // Session-based client pool entry
 interface SessionClientPool {
   clients: Map<string, Client>;
+  pendingClients: Map<string, Promise<Client>>;
   lastActivity: number;
+  released: boolean;
 }
 
 // Circuit breaker state for a server
@@ -269,9 +274,62 @@ export class McpClientService {
   }
 
   /**
+   * Connect a client with one bounded timeout path. On every failure the SDK
+   * client owns and closes its transport, so callers cannot retain a half-open
+   * HTTP stream or stdio subprocess.
+   */
+  private async connectClient(
+    client: Client,
+    transport: Transport,
+    timeoutMs: number,
+    timeoutMessage: string,
+  ): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      });
+      await Promise.race([
+        client.connect(transport, { timeout: timeoutMs }),
+        timeout,
+      ]);
+    } catch (error) {
+      await this.closeClient(client);
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  private async closeClient(client: Client): Promise<void> {
+    try {
+      await client.close();
+    } catch (error) {
+      // Preserve the original lifecycle error while making cleanup failures visible.
+      console.error('MCP: Failed to close client during lifecycle cleanup:', error);
+    }
+  }
+
+  private async evictSessionClient(poolKey: string, serverName: string, expectedClient?: Client): Promise<void> {
+    const pool = this.sessionClientPools.get(poolKey);
+    const client = pool?.clients.get(serverName);
+    if (!pool || !client || (expectedClient && client !== expectedClient)) return;
+
+    pool.clients.delete(serverName);
+    try {
+      await client.close();
+    } catch (error) {
+      console.error(`[MCP-SESSION] Error closing evicted client for ${serverName}:`, error);
+    }
+  }
+
+  /**
    * Initialize MCP clients and discover tools
    */
   async initialize(): Promise<void> {
+    if (!this.cleanupInterval) {
+      this.startSessionCleanup();
+    }
     try {
       // 1. Load Internal Config (from code)
       // Skip servers marked isInternal: true — they connect back to ourselves
@@ -380,44 +438,58 @@ export class McpClientService {
   }
 
   /**
-   * Update last activity timestamp for a session
-   */
-  private touchSession(sessionId: string) {
-    const pool = this.sessionClientPools.get(sessionId);
-    if (pool) {
-      pool.lastActivity = Date.now();
-    }
-  }
-
-  /**
    * Get or create a client for a specific chat session.
    * Uses userId as pool key so the same user shares MCP clients (e.g. browser)
    * across chat sessions, avoiding "browser in use" lock conflicts.
    * Different users still get separate clients for security isolation.
    */
   private async getSessionClient(serverName: string, chatSessionId: string, userId?: string): Promise<Client> {
-    const needsUserSecrets = this.serversWithSecretPlaceholders.has(serverName);
     // Pool by userId so same user shares one browser/MCP process across sessions.
     // Fall back to chatSessionId if userId not available.
     const poolKey = userId || chatSessionId;
 
-    // Touch session to update last activity
-    this.touchSession(poolKey);
-
     // Get or create session pool
-    if (!this.sessionClientPools.has(poolKey)) {
+    let sessionPool = this.sessionClientPools.get(poolKey);
+    if (!sessionPool || sessionPool.released) {
       console.log(`[MCP-SESSION] Creating new client pool for session: ${poolKey.substring(0, 8)}`);
-      this.sessionClientPools.set(poolKey, {
+      sessionPool = {
         clients: new Map(),
-        lastActivity: Date.now()
-      });
+        pendingClients: new Map(),
+        lastActivity: Date.now(),
+        released: false,
+      };
+      this.sessionClientPools.set(poolKey, sessionPool);
     }
-
-    const sessionPool = this.sessionClientPools.get(poolKey)!;
+    sessionPool.lastActivity = Date.now();
 
     // Check if client already exists for this session
     if (sessionPool.clients.has(serverName)) {
       return sessionPool.clients.get(serverName)!;
+    }
+
+    const pendingClient = sessionPool.pendingClients.get(serverName);
+    if (pendingClient) return pendingClient;
+
+    const creation = this.createSessionClient(serverName, poolKey, userId, sessionPool);
+    sessionPool.pendingClients.set(serverName, creation);
+    try {
+      return await creation;
+    } finally {
+      if (sessionPool.pendingClients.get(serverName) === creation) {
+        sessionPool.pendingClients.delete(serverName);
+      }
+    }
+  }
+
+  private async createSessionClient(
+    serverName: string,
+    poolKey: string,
+    userId: string | undefined,
+    sessionPool: SessionClientPool,
+  ): Promise<Client> {
+    const needsUserSecrets = this.serversWithSecretPlaceholders.has(serverName);
+    if (needsUserSecrets && !userId) {
+      throw new Error(`MCP: User identity is required for server "${serverName}"`);
     }
 
     // Circuit breaker: fail fast if the server has timed out too many times recently
@@ -476,9 +548,7 @@ export class McpClientService {
       }
       // Resolve accessToken placeholders (use the decrypted value which contains {{...}})
       if (hasAccessTokenPlaceholder) {
-        const resolvedToken = accessTokenToCheck.replace(
-          /\{\{(\w+)\}\}/g, (match, varName) => decryptedSecrets[varName] ?? match
-        );
+        const resolvedToken = resolveUserSecretPlaceholders(accessTokenToCheck, decryptedSecrets);
         configForTransport = { ...configForTransport, accessToken: resolvedToken } as McpServerConfig;
       }
     }
@@ -497,16 +567,10 @@ export class McpClientService {
     // Add timeout to connection — stdio subprocesses (e.g. Playwright) need more time to start
     const transportType = getTransportType(serverConfig.config);
     const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
-    const connectPromise = client.connect(transport);
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Connection timeout for ${serverName}`)), connectTimeoutMs)
-    );
-
     transport.onclose = () => {
       console.warn(`[MCP-SESSION] Transport for ${serverName} (session ${poolKey.substring(0, 8)}) closed`);
-      // Fix 4: Evict the dead client so the next tool call triggers a fresh reconnect
       const pool = this.sessionClientPools.get(poolKey);
-      if (pool?.clients.has(serverName)) {
+      if (pool?.clients.get(serverName) === client) {
         pool.clients.delete(serverName);
         console.warn(`[MCP-SESSION] Evicted dead client for "${serverName}" from pool after transport close`);
       }
@@ -524,7 +588,12 @@ export class McpClientService {
     };
 
     try {
-      await Promise.race([connectPromise, timeoutPromise]);
+      await this.connectClient(
+        client,
+        transport,
+        connectTimeoutMs,
+        `Connection timeout for ${serverName}`,
+      );
     } catch (connectError) {
       // Fix 3: Don't trigger circuit breaker for stdio servers — each spawn is independent
       if (transportType !== 'stdio') {
@@ -575,6 +644,7 @@ export class McpClientService {
               const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
               let lastError: unknown;
               for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                let sessionClient: Client | undefined;
                 try {
                   const toolArgs = { ...args };
                   if (isInternal) {
@@ -584,7 +654,7 @@ export class McpClientService {
                       llmModel: context.llmModel
                     });
                   }
-                  const sessionClient = await this.getSessionClient(serverName, context.sessionId, context.userId);
+                  sessionClient = await this.getSessionClient(serverName, context.sessionId, context.userId);
                   const clientTransport = (sessionClient as any)._transport;
                   const mcpSessionId = clientTransport?.sessionId || 'NO_SESSION_ID';
                   console.log(JSON.stringify(buildMcpToolTelemetry({
@@ -614,11 +684,8 @@ export class McpClientService {
                   lastError = error;
                   // Evict dead client from session pool so the next call reconnects
                   if (isConnectionError(error)) {
-                    const execPool = this.sessionClientPools.get(context.userId || context.sessionId);
-                    if (execPool?.clients.has(serverName)) {
-                      console.warn(`[MCP-SESSION] Evicting dead client for "${serverName}" from pool due to connection error`);
-                      execPool.clients.delete(serverName);
-                    }
+                    console.warn(`[MCP-SESSION] Evicting dead client for "${serverName}" from pool due to connection error`);
+                    await this.evictSessionClient(context.userId || context.sessionId, serverName, sessionClient);
                   }
                   if (attempt < maxAttempts) {
                     console.warn(JSON.stringify(buildMcpToolTelemetry({
@@ -654,7 +721,14 @@ export class McpClientService {
         console.log(`[MCP-SESSION] Discovered tools for secret-placeholder server "${serverName}"`);
       } catch (error) {
         console.error(`[MCP-SESSION] Failed to discover tools for "${serverName}":`, error);
+        await this.closeClient(client);
+        throw error;
       }
+    }
+
+    if (sessionPool.released) {
+      await this.closeClient(client);
+      throw new Error(`MCP: Client pool "${poolKey}" was released while connecting to "${serverName}"`);
     }
 
     // Store in session pool
@@ -673,6 +747,8 @@ export class McpClientService {
       return;
     }
 
+    sessionPool.released = true;
+    this.sessionClientPools.delete(chatSessionId);
     console.log(`[MCP-SESSION] Releasing ${sessionPool.clients.size} client(s) for session: ${chatSessionId.substring(0, 8)}`);
 
     for (const [serverName, client] of sessionPool.clients.entries()) {
@@ -683,7 +759,9 @@ export class McpClientService {
       }
     }
 
-    this.sessionClientPools.delete(chatSessionId);
+    await Promise.allSettled(sessionPool.pendingClients.values());
+    sessionPool.pendingClients.clear();
+    sessionPool.clients.clear();
   }
 
   /**
@@ -1104,11 +1182,6 @@ export class McpClientService {
 
     // Stdio subprocesses (e.g. Playwright) need more time to start than HTTP servers
     const connectTimeoutMs = transportType === 'stdio' ? 45000 : 15000;
-    const connectPromise = client.connect(transport);
-    const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`Connection timeout for ${name}`)), connectTimeoutMs)
-    );
-
     transport.onclose = () => console.warn(`MCP: Transport for ${name} closed`);
     transport.onerror = (err: any) => {
       // Suppress expected errors during shutdown/reload
@@ -1123,7 +1196,12 @@ export class McpClientService {
       console.error(`MCP: Transport error for ${name}:`, err);
     };
 
-    await Promise.race([connectPromise, timeoutPromise]);
+    await this.connectClient(
+      client,
+      transport,
+      connectTimeoutMs,
+      `Connection timeout for ${name}`,
+    );
 
     // CRITICAL FIX: For StreamableHTTP, ensure session is established before proceeding
     if (transportType === 'streamable-http') {
@@ -1138,10 +1216,12 @@ export class McpClientService {
       }
     }
 
-    this.clients.set(name, client);
-
     // Discover tools
-    const response = await client.listTools();
+    const response = await client.listTools().catch(async error => {
+      await this.closeClient(client);
+      throw error;
+    });
+    this.clients.set(name, client);
     const isInternal = 'isInternal' in config ? config.isInternal : false;
     
     for (const tool of response.tools) {
@@ -1163,6 +1243,7 @@ export class McpClientService {
           const maxAttempts = isBrowserTool(originalToolName) ? BROWSER_TOOL_MAX_RETRIES + 1 : 1;
           let lastError: unknown;
           for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            let sessionClient: Client | undefined;
             try {
               // Conditionally inject technical parameters if server is internal
               const toolArgs = { ...args };
@@ -1176,7 +1257,7 @@ export class McpClientService {
 
               // CRITICAL FIX: Get session-specific client instead of using shared client
               // This ensures each chat session has its own isolated MCP connection
-              const sessionClient = await this.getSessionClient(name, context.sessionId, context.userId);
+              sessionClient = await this.getSessionClient(name, context.sessionId, context.userId);
 
               // Log MCP tool call with structured reliability telemetry (ENG-107)
               const clientTransport = (sessionClient as any)._transport;
@@ -1219,11 +1300,8 @@ export class McpClientService {
               lastError = error;
               // Evict dead client from session pool so the next call reconnects
               if (isConnectionError(error)) {
-                const execPool = this.sessionClientPools.get(context.userId || context.sessionId);
-                if (execPool?.clients.has(name)) {
-                  console.warn(`[MCP-SESSION] Evicting dead client for "${name}" from pool due to connection error`);
-                  execPool.clients.delete(name);
-                }
+                console.warn(`[MCP-SESSION] Evicting dead client for "${name}" from pool due to connection error`);
+                await this.evictSessionClient(context.userId || context.sessionId, name, sessionClient);
               }
               if (attempt < maxAttempts) {
                 console.warn(JSON.stringify(buildMcpToolTelemetry({
@@ -1325,13 +1403,10 @@ export class McpClientService {
       { capabilities: {} }
     );
 
-    let connectTimer: NodeJS.Timeout | undefined;
+    let connected = false;
     try {
-      const connectPromise = client.connect(transport);
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        connectTimer = setTimeout(() => reject(new Error("MCP connection timeout")), 60000);
-      });
-      await Promise.race([connectPromise, timeoutPromise]);
+      await this.connectClient(client, transport, 60000, "MCP connection timeout");
+      connected = true;
 
       return await client.callTool(
         { name: toolName, arguments: args },
@@ -1339,8 +1414,7 @@ export class McpClientService {
         { timeout: options?.timeoutMs ?? 3600000 }
       );
     } finally {
-      if (connectTimer) clearTimeout(connectTimer); // don't leave a 60s timer pending on success
-      await client.close().catch(() => {});
+      if (connected) await this.closeClient(client);
     }
   }
 
@@ -1367,14 +1441,10 @@ export class McpClientService {
       { capabilities: {} }
     );
 
-    let connectTimer: NodeJS.Timeout | undefined;
+    let connected = false;
     try {
-      const connectPromise = client.connect(transport);
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        connectTimer = setTimeout(() => reject(new Error("MCP connection timeout")), 60000);
-      });
-      await Promise.race([connectPromise, timeoutPromise]);
-      if (connectTimer) clearTimeout(connectTimer); // connected — cancel the pending timeout
+      await this.connectClient(client, transport, 60000, "MCP connection timeout");
+      connected = true;
 
       // Hard-abort wrapper: a half-aborted streamable-HTTP stream can leave the
       // SDK's callTool pending past its own `timeout`, hanging until the caller's
@@ -1405,8 +1475,7 @@ export class McpClientService {
 
       return await fn(callTool);
     } finally {
-      if (connectTimer) clearTimeout(connectTimer); // also covers the connect-throw path
-      await client.close().catch(() => {});
+      if (connected) await this.closeClient(client);
     }
   }
 
@@ -1446,5 +1515,8 @@ export class McpClientService {
     }
     this.clients.clear();
     this.mcpTools = [];
+    this.serverConfigs.clear();
+    this.serversWithSecretPlaceholders.clear();
+    this.serverCircuits.clear();
   }
 }
