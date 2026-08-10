@@ -594,34 +594,31 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       updatedAt: new Date().toISOString(),
     };
 
-    if (isOrgLevel) {
-      // The attachments came from the org OWNER's record, so prune that source
-      // BEFORE promoting the pruned copy onto the org. Order is the whole point:
-      // this write is the one most likely to fail (a second record, a second
-      // table call), and doing it first means a failure aborts the request with
-      // nothing destroyed and a clean retry. Pruning it afterwards can only ever
-      // fail in the one direction that matters — owner still pointing at an
-      // object we have already deleted, a dead reference that resurfaces the
-      // moment the org is deleted (that clears orgId and sends reads back to the
-      // user record). Deliberately uncaught: it is part of the delete, not tidy-up.
-      if (fallbackOwnerUserId) {
-        const ownerRecord: any =
-          fallbackOwnerUserId === user.userId ? user : await userDb.getUserById(fallbackOwnerUserId);
-        const ownerAttachments: any[] = ownerRecord?.brandGuidelines?.attachments || [];
-        const prunedOwnerAttachments = ownerAttachments.filter((attachment: any) =>
-          isValidKey ? attachment.key !== key : attachment.url !== urlFallback
-        );
-        if (prunedOwnerAttachments.length !== ownerAttachments.length) {
-          await userDb.updateUser(fallbackOwnerUserId, {
-            brandGuidelines: {
-              ...ownerRecord.brandGuidelines,
-              attachments: prunedOwnerAttachments,
-              updatedAt: new Date().toISOString(),
-            },
-          });
-        }
-      }
-
+    if (fallbackOwnerUserId) {
+      // The attachments live on the OWNER's record, not the org's, so prune them
+      // there — and only there. Writing the pruned copy to the org as well would
+      // take two coordinated writes with no transaction between them, and would
+      // also promote the owner's whole brand onto the org as a side effect of
+      // deleting one asset: the org record would become populated, reads would
+      // stop falling back, and the owner's later brandData edits would silently
+      // stop reaching the org. Deleting an asset must not fork the brand. One
+      // write to the record that actually holds the data leaves nothing to
+      // coordinate and keeps the org un-copied, exactly as it was.
+      const ownerRecord: any =
+        fallbackOwnerUserId === user.userId ? user : await userDb.getUserById(fallbackOwnerUserId);
+      const ownerAttachments: any[] = ownerRecord?.brandGuidelines?.attachments || [];
+      const prunedOwnerAttachments = ownerAttachments.filter((attachment: any) =>
+        isValidKey ? attachment.key !== key : attachment.url !== urlFallback
+      );
+      await userDb.updateUser(fallbackOwnerUserId, {
+        brandGuidelines: {
+          ...ownerRecord.brandGuidelines,
+          attachments: prunedOwnerAttachments,
+          updatedAt: new Date().toISOString(),
+        },
+      });
+      console.log(`[BRAND DEBUG] Successfully pruned owner source attachments after asset deletion`);
+    } else if (isOrgLevel) {
       await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedBrandGuidelines });
       console.log(`[BRAND DEBUG] Successfully updated org brand guidelines after asset deletion`);
     } else {
