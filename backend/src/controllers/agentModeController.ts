@@ -7439,18 +7439,19 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
-        // ENG-803: owner opt-out from unattended publishing. Partial-update safe — an
-        // update that omits the field must never silently set or clear it.
-        requirePublishApproval: requirePublishApproval !== undefined
-          ? (requirePublishApproval === true)
-          : ((existingSchedule as any).requirePublishApproval || false),
-        // ENG-827: publish consent is NOT written here AT ALL. updateSchedule builds a
-        // partial SET expression, so omitting these fields leaves the stored values
-        // untouched — which is the only safe way to "preserve" them. Copying them
-        // forward from `existingSchedule` would be a read-modify-write: a revocation
-        // landing between this handler's read and its write would be silently
-        // resurrected, re-enabling publishing after the owner turned it off. Consent
-        // changes only through POST .../publish-consent.
+        // ENG-803/ENG-827 (Greptile): the publish opt-out is written ONLY when this
+        // request actually carries it. Copying it forward from `existingSchedule` is a
+        // read-modify-write, and this field decides whether an unattended run may post
+        // publicly: an owner who switches the hold ON between this handler's read and
+        // its write would have it silently overwritten back to OFF by an unrelated
+        // update — a rename or a cadence change re-enabling publishing they had just
+        // stopped. `updateSchedule` builds a PARTIAL SET expression, so omitting the
+        // key leaves the stored value untouched, which is the only race-free way to
+        // preserve it. Every other field here is last-writer-wins and recoverable;
+        // this one authorizes an irreversible public post, so it is not.
+        ...(requirePublishApproval !== undefined
+          ? { requirePublishApproval: requirePublishApproval === true }
+          : {}),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
