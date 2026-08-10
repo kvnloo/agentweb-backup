@@ -435,6 +435,21 @@ interface DiagnosisResult {
   publishLedger: FalseFailureLedgerEntry[];
 }
 
+/**
+ * The publish/deploy calls a session is confirmed to have completed. Used on the
+ * error branches that never reach the diagnosis agent — a worker shutdown replaces
+ * it with a fixed string, and that string still ends in "please send your message
+ * again", which is the wrong advice after a landed publish.
+ */
+async function loadPublishLedger(sessionId: string): Promise<FalseFailureLedgerEntry[]> {
+  try {
+    const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
+    return ledgerFromSucceededFunctions(session?.calledFunctions || null);
+  } catch {
+    return [];
+  }
+}
+
 async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
@@ -5256,7 +5271,11 @@ export const agentModeController = {
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+            publishLedger = await loadPublishLedger(sessionId);
+            diagnosticContent = appendConfirmedPublishNotice(
+              'The server restarted while processing your request. Please send your message again.',
+              publishLedger,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(error, sessionId, userMessage);
@@ -6017,7 +6036,11 @@ export const agentModeController = {
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
+            publishLedger = await loadPublishLedger(shareId);
+            diagnosticContent = appendConfirmedPublishNotice(
+              'The server restarted while processing your request. Please send your message again.',
+              publishLedger,
+            );
           } else {
             const userMessage = req.body?.userMessage || '';
             const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage);
