@@ -34,6 +34,18 @@ export interface AgentFailureProposalPayload {
   invocations: number;
   failureRate: number;
   topErrorClass: string;
+  /**
+   * The decision-layer class this tool's failures cluster into (ENG-820).
+   * Recorded on every agent_tool_failed event and previously ignored by this
+   * policy, which is why 35% of dispatches were not handler bugs.
+   */
+  failureType: string;
+  /**
+   * Other actionable classes present on this tool, as "<n> <class>" strings.
+   * The dominant class drives the remedy; naming the rest keeps a minority
+   * cohort visible instead of silently folded into another class's count.
+   */
+  otherActionableClasses?: string;
   directive: string;
 }
 
@@ -69,6 +81,96 @@ interface ToolStats {
   invocations: number;
   failures: number;
   errorClasses: Map<string, number>;
+  failureTypes: Map<string, number>;
+  /**
+   * A representative error message PER (failure class, error class) pair — see
+   * msgKey (ENG-820 review): the directive names the dominant error class of
+   * its cohort, so the quoted message must come from that same error class.
+   * Keying by failure class alone still let a `config` directive dominated by
+   * `auth` quote whichever message arrived first, e.g. one from a minority
+   * `scope_missing` failure.
+   */
+  messagesByType: Map<string, string>;
+  /**
+   * Error classes counted PER failure class. `errorClasses` above stays global
+   * for the unclassified fallback, but the directive must cite an error class
+   * from the same cohort it is advising on — otherwise a config-dominant tool
+   * reports the error class of its handful of bug failures, and the operator
+   * is told to reconnect an account on the evidence of a TypeError.
+   */
+  errorClassesByType: Map<string, Map<string, number>>;
+}
+
+/**
+ * Failure classes that are NOT a handler defect, so they must never be dispatched
+ * as "investigate the handler" (ENG-820).
+ *   by_design            — the tool worked as intended (policy block, empty result)
+ *   model_uninstalled_tool — the model called a tool it does not have; registry/prompt
+ * Both were measured at 23 of 217 failures in the Jul 28 – Aug 1 window.
+ */
+const NON_DISPATCHABLE_FAILURE_TYPES = new Set(['by_design', 'model_uninstalled_tool']);
+
+/**
+ * A one-line action for a secondary cohort (ENG-820 review round 7).
+ *
+ * A tool with 10 config + 8 bug failures gets ONE proposal, because
+ * `sourceRuleId` is the cooldown key and splitting it orphans history
+ * (see ENG-937). But the minority cohort must still receive an ACTION, not just
+ * a mention — otherwise resolving the account closes the dispatch and the 8
+ * recurring handler bugs are never worked.
+ */
+function secondaryAction(failureType: string, toolName: string, count: number): string {
+  if (failureType === 'config') {
+    return `${count} configuration/credential failure(s) — reconnect or re-authorise the account for "${toolName}", or top up its balance.`;
+  }
+  if (failureType === 'schema_reject') {
+    return `${count} schema rejection(s) — reconcile "${toolName}"'s declared JSON schema with what the handler accepts.`;
+  }
+  const label = failureType || 'unclassified';
+  return `${count} ${label} failure(s) — investigate the "${toolName}" handler and add a regression test.`;
+}
+
+/**
+ * Directive per failure class. The whole defect was appending one sentence —
+ * "Investigate the handler + propose a robustness fix" — to every cluster
+ * regardless of what the system already knew about it.
+ */
+function directiveFor(
+  failureType: string,
+  toolName: string,
+  topErrorClass: string,
+  failures: number,
+  denom: number,
+  sampleMessage: string,
+  minFailureRate: number,
+): string {
+  const pct = `${Math.round((failures / (denom || 1)) * 100)}%`;
+  const sample = sampleMessage ? ` Representative failure: "${sampleMessage.slice(0, 160)}".` : '';
+  if (failureType === 'config') {
+    // Not a code change. Someone has to reconnect an account, grant a scope, or
+    // top up a balance — and they need to know which.
+    return (
+      `NOT a handler bug — "${toolName}" failed ${failures}/${denom} (${pct}) with configuration/credential errors.` +
+      `${sample} Resolve the account itself: reconnect or re-authorise the connected account, grant the missing ` +
+      `scope, or top up the depleted balance for "${toolName}". No code change is expected; if the account is ` +
+      `healthy and this persists, reclassify it.`
+    );
+  }
+  if (failureType === 'schema_reject') {
+    // The handler is fine; the declared contract and what the model sends disagree.
+    return (
+      `Contract mismatch, not a handler defect — "${toolName}" rejected ${failures}/${denom} (${pct}) of calls at ` +
+      `validation.${sample} Compare the declared JSON schema against what the handler actually accepts and make ` +
+      `them agree, then add a regression test for the argument shape the model is really sending.`
+    );
+  }
+  return (
+    `Investigate why agent-mode tool "${toolName}" is throwing ${topErrorClass} ` +
+    `at a ${pct} rate.${sample} Reproduce with a failing case, harden the ` +
+    `handler (input validation, retries/backoff, or clearer error surfaced to the model), and ` +
+    `add a regression test. Target: drive the tool success rate back above ` +
+    `${((1 - minFailureRate) * 100).toFixed(0)}%.`
+  );
 }
 
 export class AgentFailureRuleSet
@@ -108,6 +210,9 @@ export class AgentFailureRuleSet
         invocations: 0,
         failures: 0,
         errorClasses: new Map<string, number>(),
+        failureTypes: new Map<string, number>(),
+        messagesByType: new Map<string, string>(),
+        errorClassesByType: new Map<string, Map<string, number>>(),
       };
       if (e.eventType === EVT_TOOL_INVOKED) {
         stats.invocations++;
@@ -115,6 +220,17 @@ export class AgentFailureRuleSet
         stats.failures++;
         const ec = strDim(e.dimensions?.errorClass) ?? 'UnknownError';
         stats.errorClasses.set(ec, (stats.errorClasses.get(ec) ?? 0) + 1);
+        const ft = strDim(e.dimensions?.failureType) || '';
+        if (ft) stats.failureTypes.set(ft, (stats.failureTypes.get(ft) ?? 0) + 1);
+        const em = strDim(e.dimensions?.errorMessage) || '';
+        // Store under this event's OWN (failure class, error class) pair, so
+        // the directive can quote a message that actually belongs to both the
+        // failure class AND the error class it is advising on.
+        const mk = msgKey(ft, ec);
+        if (em && !stats.messagesByType.has(mk)) stats.messagesByType.set(mk, em);
+        const perType = stats.errorClassesByType.get(ft) ?? new Map<string, number>();
+        perType.set(ec, (perType.get(ec) ?? 0) + 1);
+        stats.errorClassesByType.set(ft, perType);
       }
       byTool.set(toolName, stats);
     }
@@ -147,40 +263,101 @@ export class AgentFailureRuleSet
       });
     }
     for (const stats of byTool.values()) {
-      // Denominator is invocations; when only failures were recorded (no
-      // matching invoked events in window), treat failures as the denominator
-      // so a fully-broken tool still trips the rate gate.
-      const denom = stats.invocations > 0 ? stats.invocations : stats.failures;
-      const failureRate = denom > 0 ? stats.failures / denom : 0;
+      // ENG-820: exclude non-actionable FAILURES, not the tools that have them.
+      // Dropping a tool because its dominant class is non-dispatchable would
+      // hide a recurring `bug` cohort behind a larger `by_design` one.
+      const actionableTypes = new Map<string, number>();
+      let excludedNonActionable = 0;
+      for (const [ft, n] of stats.failureTypes) {
+        if (NON_DISPATCHABLE_FAILURE_TYPES.has(ft)) excludedNonActionable += n;
+        else actionableTypes.set(ft, n);
+      }
+      // Failures with no recorded class (pre-backfill) are actionable and form
+      // their own cohort: failing the other way would hide real bugs.
+      const classified = Array.from(stats.failureTypes.values()).reduce((a, b) => a + b, 0);
+      const unclassified = Math.max(0, stats.failures - classified);
+      if (unclassified > 0) actionableTypes.set('', (actionableTypes.get('') ?? 0) + unclassified);
+      const actionableFailures = Array.from(actionableTypes.values()).reduce((a, b) => a + b, 0);
 
-      if (stats.failures < this.minFailures) continue;
+      if (actionableFailures === 0) continue;
+
+      // ONE proposal per tool, under the tool-level identity.
+      //
+      // A per-class proposal would describe each cohort exactly, and an earlier
+      // revision of this change did that — but `sourceRuleId` is the cooldown
+      // key (CooldownRuleSet matches it exactly against persisted learning
+      // records), so class-qualifying it orphans every historical record and
+      // re-dispatches tools that are deliberately on cooldown. That is a
+      // persistence-semantics change, not a digest change, and it belongs in
+      // its own issue with a migration. Tracked as ENG-937.
+      //
+      // The dominant actionable class drives the remedy, and every OTHER
+      // actionable class is named in the hypothesis so no cohort is silently
+      // dropped — which is the substance of what per-class dispatch would buy.
+      const denom = stats.invocations > 0 ? stats.invocations : actionableFailures;
+      const failureRate = denom > 0 ? actionableFailures / denom : 0;
+
+      if (actionableFailures < this.minFailures) continue;
       if (failureRate < this.minFailureRate) continue;
 
-      const topErrorClass = dominantKey(stats.errorClasses);
+      const failureType = dominantKey(actionableTypes);
+      const handlerBug = failureType !== 'config' && failureType !== 'schema_reject';
+      // Cite an error class from the SAME cohort as the chosen class. Falls back
+      // to the global aggregate only for unclassified failures, where global IS
+      // the cohort.
+      const cohort = stats.errorClassesByType.get(failureType);
+      const topErrorClass = cohort && cohort.size > 0
+        ? dominantKey(cohort)
+        : dominantKey(stats.errorClasses);
+      const otherEntries = Array.from(actionableTypes.entries())
+        .filter(([ft]) => ft !== failureType)
+        .sort((a, b) => b[1] - a[1]);
+      const otherClasses = otherEntries.map(([ft, n]) => `${n} ${ft || 'unclassified'}`);
+      // Every remaining cohort gets its OWN instruction, so completing the
+      // primary remedy cannot close out work that was never dispatched.
+      const alsoNote = otherEntries.length > 0
+        ? ` This tool ALSO has other failure classes needing separate action: `
+          + otherEntries.map(([ft, n]) => secondaryAction(ft, stats.toolName, n)).join(' ')
+          + ` Do not close this out after the first remedy alone.`
+        : '';
+
       proposals.push({
         proposalId: asMutationId(`agent-mode:tool-failure:${stats.toolName}`),
         sourceRuleId: `tool-failure:${stats.toolName}`,
         hypothesis:
-          `Tool \`${stats.toolName}\` failed ${stats.failures}/${denom} times ` +
-          `(${(failureRate * 100).toFixed(0)}%) this window, dominated by ${topErrorClass}. ` +
-          `Investigate the handler + propose a robustness fix.`,
+          `Tool \`${stats.toolName}\` failed ${actionableFailures}/${denom} times ` +
+          `(${(failureRate * 100).toFixed(0)}%) this window, dominated by ${topErrorClass}` +
+          `${failureType ? ` [${failureType}]` : ''}` +
+          `${excludedNonActionable > 0 ? ` (+${excludedNonActionable} non-actionable excluded)` : ''}. ` +
+          (handlerBug
+            ? `Investigate the handler + propose a robustness fix.`
+            : failureType === 'config'
+              ? `Configuration/credential issue — resolve the account, not the code.`
+              : `Declared schema and handler disagree — fix the contract.`)
+          + alsoNote,
         kind: 'code_change',
         payload: {
           toolName: stats.toolName,
-          failures: stats.failures,
+          failures: actionableFailures,
           invocations: stats.invocations,
           failureRate,
           topErrorClass,
-          directive:
-            `Investigate why agent-mode tool "${stats.toolName}" is throwing ${topErrorClass} ` +
-            `at a ${(failureRate * 100).toFixed(0)}% rate. Reproduce with a failing case, harden the ` +
-            `handler (input validation, retries/backoff, or clearer error surfaced to the model), and ` +
-            `add a regression test. Target: drive the tool success rate back above ` +
-            `${((1 - this.minFailureRate) * 100).toFixed(0)}%.`,
+          failureType,
+          otherActionableClasses: otherClasses.join(', '),
+          directive: directiveFor(
+            failureType,
+            stats.toolName,
+            topErrorClass,
+            actionableTypes.get(failureType) ?? actionableFailures,
+            denom,
+            stats.messagesByType.get(msgKey(failureType, topErrorClass)) ?? '',
+            this.minFailureRate,
+          ) + alsoNote,
         },
         triggeringStats: {
           toolName: stats.toolName,
-          failures: stats.failures,
+          failures: actionableFailures,
+          excludedNonActionable,
           invocations: stats.invocations,
           failureRatePct: Math.round(failureRate * 100),
           topErrorClass,
@@ -188,14 +365,29 @@ export class AgentFailureRuleSet
       });
     }
 
-    // Worst failure rate first (tool proposals only — the claim-mismatch
-    // proposal has no failure rate and sorts first as the highest-signal
-    // truthfulness pattern) — the orchestrator caps proposals per cycle, so
-    // the highest-signal fixes survive the cap.
+    // ENG-820: rank by failure COUNT, not rate. Impact is volume x rate, and
+    // ranking by rate alone hid the single largest source of failures in the
+    // window (save_memory, 33 failures at 33%) behind a tool with 6 failures at
+    // 100%. Rate remains the admission gate above; it is no longer the order.
+    //
+    // Count and rate can both tie, and when they do the order decided which
+    // tools survived the orchestrator's cap — on arrival order, i.e. nothing.
+    // The remaining keys (failure class, then tool name) are arbitrary but
+    // stable, so the same window always ranks the same way.
     proposals.sort((a, b) => {
+      const countA = 'failures' in a.payload ? a.payload.failures : Infinity;
+      const countB = 'failures' in b.payload ? b.payload.failures : Infinity;
+      if (countA !== countB) return countB - countA;
       const rateA = 'failureRate' in a.payload ? a.payload.failureRate : Infinity;
       const rateB = 'failureRate' in b.payload ? b.payload.failureRate : Infinity;
-      return rateB - rateA;
+      if (rateA !== rateB) return rateB - rateA;
+      const typeA = 'failureType' in a.payload ? String(a.payload.failureType ?? '') : '';
+      const typeB = 'failureType' in b.payload ? String(b.payload.failureType ?? '') : '';
+      if (typeA !== typeB) return typeA < typeB ? -1 : 1;
+      const toolA = 'toolName' in a.payload ? String(a.payload.toolName ?? '') : '';
+      const toolB = 'toolName' in b.payload ? String(b.payload.toolName ?? '') : '';
+      if (toolA !== toolB) return toolA < toolB ? -1 : 1;
+      return 0;
     });
     return proposals;
   }
@@ -205,11 +397,30 @@ function strDim(v: string | number | boolean | null | undefined): string | undef
   return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
 
+/**
+ * The highest-count key, with a deterministic tie-break.
+ *
+ * Without the tie-break, a 9-config vs 9-bug tool resolves to whichever class
+ * this Map happened to see first — i.e. DynamoDB event arrival order — and the
+ * operator instruction flips between "reconnect the account" and "investigate
+ * the handler" across runs on identical data. Lexical order is arbitrary but
+ * stable, which is the property that matters: the same window must always
+ * produce the same directive. Neither cohort is lost either way — the loser is
+ * named and given its own secondary action.
+ */
+/**
+ * Composite map key for a (failureType, errorClass) pair. NUL (\u0000) cannot appear
+ * in either dimension value, so the key is unambiguous.
+ */
+function msgKey(failureType: string, errorClass: string): string {
+  return `${failureType}\u0000${errorClass}`;
+}
+
 function dominantKey(counts: Map<string, number>): string {
   let best = 'UnknownError';
   let bestN = -1;
   for (const [k, n] of counts) {
-    if (n > bestN) {
+    if (n > bestN || (n === bestN && k < best)) {
       bestN = n;
       best = k;
     }
