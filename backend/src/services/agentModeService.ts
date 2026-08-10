@@ -31331,9 +31331,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         // ENG-975: breaking here with nothing imported reports "No results found
         // for the given search criteria." — which is also exactly what a schedule
         // whose account has lost people-search capability produces, making a
-        // silent no-op look like an honest empty. Only the FIRST fetch is
-        // ambiguous; a later page running dry is normal exhaustion.
-        if (iterationCount === 1 && !lastFetchCursor
+        // silent no-op look like an honest empty. Only the FIRST fetch of this
+        // call is ambiguous; a later page running dry is normal exhaustion.
+        //
+        // That first fetch is ambiguous even when it resumes from a cursor. A
+        // recurring schedule persists its cursor per (list, criteria) and picks
+        // it up on the next run without the caller ever passing one, so keying
+        // off "no cursor" would exempt precisely the repeat-schedule case this
+        // bug was reported from. The probe settles it either way: an exhausted
+        // search on a healthy account answers 'ok' and still reports the plain
+        // empty, at the cost of one broad query per account per 10 minutes.
+        if (iterationCount === 1
           && await linkedInOutreachService.probeSearchCapability(accountId) === 'degraded') {
           searchUnavailable = true;
           searchError = LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE;
