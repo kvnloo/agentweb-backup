@@ -52,8 +52,7 @@ describe('ENG-827 — dispatch refuses an unauthorized scheduled publish', () =>
     getScheduleById.mockResolvedValue({
       scheduleId: SCHEDULE_ID,
       requiredFunctionCalls: ['post_on_connected_account'],
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account'],
+      // The owner withdrew the grant after this run was admitted.
       autopublishAuthorized: false,
       autopublishAuthorizedTools: [],
     });
@@ -119,10 +118,8 @@ describe('ENG-827 — dispatch refuses an unauthorized scheduled publish', () =>
       getScheduleById.mockResolvedValue({
         scheduleId: SCHEDULE_ID,
         requiredFunctionCalls: ['post_on_connected_account'],
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account'],
         autopublishAuthorized: false,
-      autopublishAuthorizedTools: [],
+        autopublishAuthorizedTools: [],
       });
       recheck = await context.assertPublishStillAuthorized();
       return { success: true };
