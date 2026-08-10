@@ -176,6 +176,9 @@
   #empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--dim); }
   /* Loader shown in the conversation area while an issue's detail is being fetched (open/refresh). */
   .convoloader { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--dim); font-size: 13px; }
+  .loadearlier { display: flex; justify-content: center; margin: 4px 0 12px; }
+  .loadearlier button { background: var(--panel2); color: var(--dim); border: 1px solid var(--border); border-radius: 999px; padding: 5px 14px; font-size: 12px; cursor: pointer; }
+  .loadearlier button:hover { color: var(--text); border-color: var(--accent); }
   .convoloader .spin { width: 26px; height: 26px; border: 3px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 
   #chat { flex: 1; overflow-y: auto; padding: 18px 20px; display: flex; flex-direction: column; gap: 12px; }
@@ -709,7 +712,7 @@ function stampStats(bubbleEl, tok, cost) {
   bubbleEl.appendChild(el);
 }
 
-const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', lastTokens: null, lastCost: null, lastMs: null, compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {}, drafts: {}, filter: { assignee: [], state: [], priority: [] }, previews: [], previewCap: 0 };
+const S = { issues: [], sel: null, detail: null, showAll: false, search: '', busy: false, es: null, curBubble: null, editing: null, deleting: null, stick: true, picker: null, lastEsc: 0, slash: null, cmd: null, mergePhase: null, lastResult: '', lastTokens: null, lastCost: null, lastMs: null, compacting: false, lastSent: '', escArmed: 0, escText: '', queue: [], queuePaused: false, attachments: [], collapsed: {}, drafts: {}, filter: { assignee: [], state: [], priority: [] }, previews: [], previewCap: 0, renderFrom: null };
 try { S.collapsed = JSON.parse(localStorage.getItem('secCollapsed')) || {}; } catch { /* private mode */ }
 try { const f = JSON.parse(localStorage.getItem('sideFilter')); if (f) S.filter = { assignee: f.assignee || [], state: f.state || [], priority: f.priority || [] }; } catch { /* private mode */ }
 const COMMANDS = [
@@ -934,7 +937,7 @@ $('searchClear').onclick = () => { S.search = ''; $('search').value = ''; $('sea
 // ---------- selection / detail ----------
 async function select(id) {
   saveDraft(); // stash the unsent composer text under the issue we're leaving
-  S.sel = id; S.curBubble = null; S.stick = true;
+  S.sel = id; S.curBubble = null; S.stick = true; S.renderFrom = null; // fresh open → render only the tail window
   S.scrollToSel = true; // scroll the sidebar list to this issue once it's rendered (open/refresh)
   S.queue = []; S.queuePaused = false; renderQueue(); // queued messages belong to the previously open issue
   S.attachments = []; renderAttachments();
@@ -1296,11 +1299,38 @@ function appendLimitWarn(afterEl) {
   el.innerHTML = `⚠ Your Claude ${esc(info.label)} usage is at <b>${pct}%</b>${esc(reset)}. Turns may start failing once it reaches 100%.`;
   afterEl.insertAdjacentElement('afterend', el);
 }
-function renderAll(d) {
+const RENDER_WINDOW = 30; // messages built into the DOM on a fresh open; older ones load on demand
+// A long transcript (100+ messages, assistant replies 60-80KB each) takes seconds to markdown-render
+// all at once, freezing the tab on every refresh. So we only build DOM for the tail; the FULL array
+// stays in S.detail.chat.messages, so edit/delete (which key on the true index i) and SSE are
+// unaffected. "Load earlier" reveals the previous chunk without re-fetching.
+function addLoadEarlier(hidden) {
+  const el = document.createElement('div');
+  el.className = 'loadearlier';
+  const chunk = Math.min(RENDER_WINDOW, hidden);
+  const btn = document.createElement('button');
+  btn.textContent = `⬆ Load ${chunk} earlier ${chunk === 1 ? 'message' : 'messages'} (${hidden} hidden)`;
+  btn.onclick = () => {
+    const before = chatEl().scrollHeight;
+    S.renderFrom = Math.max(0, hidden - RENDER_WINDOW);
+    renderAll(S.detail, true); // keepScroll: don't snap to bottom — anchor on what the reader was viewing
+    chatEl().scrollTop = chatEl().scrollHeight - before; // land where the old top was
+    S.stick = false;
+  };
+  el.appendChild(btn);
+  chatEl().appendChild(el);
+}
+function renderAll(d, keepScroll) {
   chatEl().innerHTML = '';
   renderPipeline(d);
+  const msgs = d.chat?.messages || [];
+  const total = msgs.length;
+  let from = S.renderFrom != null ? Math.max(0, Math.min(S.renderFrom, total)) : Math.max(0, total - RENDER_WINDOW);
+  if (from >= total && total > 0) from = Math.max(0, total - RENDER_WINDOW); // stale window after edit/delete → fall back to tail
+  if (from > 0) addLoadEarlier(from);
   let lastAsst = null;
-  (d.chat?.messages || []).forEach((m, i) => {
+  msgs.forEach((m, i) => {
+    if (i < from) return; // older than the window — kept in memory, not in the DOM
     if (m.role === 'compact') { addCompactCard(m); return; }
     if (m.role === 'user') { const el = addUser(m.text, i, m.attachments); stampTime(el, m.at); }
     else {
@@ -1320,7 +1350,7 @@ function renderAll(d) {
   });
   appendCtxWarn(lastAsst);   // end the newest agent reply with a compact nudge when context is high
   appendLimitWarn(lastAsst); // …and an account-limit heads-up when any subscription limit is ≥90%
-  scrollBottom();
+  if (!keepScroll) scrollBottom();
 }
 
 // After a turn ends, pull the authoritative message list so edit indices, the ✏️ buttons, and the
