@@ -49,10 +49,11 @@ function makeStore(): jest.Mocked<UnipileSearchParamCacheStore> & { _items: Map<
   } as any;
 }
 
-function makeService(http?: any, store?: any) {
+function makeService(http?: any, store?: any, probeSearchCapability?: any) {
   return new UnipileSearchParamService({
     http: http ?? makeHttp(),
     store: store ?? makeStore(),
+    ...(probeSearchCapability ? { probeSearchCapability } : {}),
   });
 }
 
@@ -139,6 +140,91 @@ describe('UnipileSearchParamService.resolve', () => {
     expect(ttlSeconds).toBeGreaterThan(3600 - 60);
     expect(ttlSeconds).toBeLessThan(3600 + 60);
     expect(stored.status).toBe('not_found');
+  });
+
+  // ENG-975 follow-up: the cache key is (type, keywords) with NO account in it,
+  // which is right for a hit — a LinkedIn entity id is global — but wrong for an
+  // empty produced by an account that cannot search at all. Left unguarded, one
+  // degraded account writes a `not_found` that every other account, healthy or
+  // not, then reads as settled truth for the rest of the TTL.
+  describe('negative caching during an account-scoped search outage', () => {
+    it('does not write a negative row when the account cannot search', async () => {
+      const http = makeHttp({ searchParameters: jest.fn().mockResolvedValue({ items: [] }) });
+      const store = makeStore();
+      const probe = jest.fn().mockResolvedValue('degraded');
+      const svc = makeService(http, store, probe);
+
+      const result = await svc.resolve('acct-degraded', { type: 'INDUSTRY', keywords: 'hospital health care' });
+
+      expect(result.candidates).toEqual([]);
+      expect(probe).toHaveBeenCalledWith('acct-degraded');
+      expect(store.put).not.toHaveBeenCalled();
+      expect(store._items.size).toBe(0);
+    });
+
+    it('does not let a degraded account poison a healthy one', async () => {
+      const http = makeHttp({
+        searchParameters: jest.fn()
+          .mockResolvedValueOnce({ items: [] })
+          .mockResolvedValueOnce({ items: [{ id: '14', title: 'Hospital & Health Care' }] }),
+      });
+      const store = makeStore();
+      const probe = jest.fn(async (accountId: string) => (accountId === 'acct-degraded' ? 'degraded' : 'ok'));
+      const svc = makeService(http, store, probe);
+
+      await svc.resolve('acct-degraded', { type: 'INDUSTRY', keywords: 'hospital health care' });
+      const healthy = await svc.resolve('acct-healthy', { type: 'INDUSTRY', keywords: 'hospital health care' });
+
+      // The second account must reach the API rather than inherit the outage empty.
+      expect(http.searchParameters).toHaveBeenCalledTimes(2);
+      expect(healthy.fromCache).toBe(false);
+      expect(healthy.candidates).toEqual([{ id: '14', title: 'Hospital & Health Care', subtitle: undefined }]);
+    });
+
+    it('still caches a genuine no-match from a healthy account', async () => {
+      const http = makeHttp({ searchParameters: jest.fn().mockResolvedValue({ items: [] }) });
+      const store = makeStore();
+      const probe = jest.fn().mockResolvedValue('ok');
+      const svc = makeService(http, store, probe);
+
+      await svc.resolve('acct-ok', { type: 'COMPANY', keywords: 'NonexistentCo' });
+
+      const stored = Array.from(store._items.values())[0] as any;
+      expect(stored.status).toBe('not_found');
+    });
+
+    it('still caches the empty when the probe is indeterminate', async () => {
+      const http = makeHttp({ searchParameters: jest.fn().mockResolvedValue({ items: [] }) });
+      const store = makeStore();
+      const probe = jest.fn().mockResolvedValue('unknown');
+      const svc = makeService(http, store, probe);
+
+      await svc.resolve('acct-flaky', { type: 'COMPANY', keywords: 'NonexistentCo' });
+
+      expect(Array.from(store._items.values())[0]).toBeDefined();
+    });
+
+    it('never probes on a non-empty result', async () => {
+      const http = makeHttp({
+        searchParameters: jest.fn().mockResolvedValue({ items: [{ id: '1', title: 'X' }] }),
+      });
+      const probe = jest.fn();
+      const svc = makeService(http, makeStore(), probe);
+
+      await svc.resolve('acct1', { type: 'COMPANY', keywords: 'X' });
+
+      expect(probe).not.toHaveBeenCalled();
+    });
+
+    it('caches the empty as before when no probe is wired', async () => {
+      const http = makeHttp({ searchParameters: jest.fn().mockResolvedValue({ items: [] }) });
+      const store = makeStore();
+      const svc = makeService(http, store);
+
+      await svc.resolve('acct1', { type: 'COMPANY', keywords: 'NonexistentCo' });
+
+      expect(Array.from(store._items.values())[0]).toBeDefined();
+    });
   });
 
   it('caches a successful result with 30d TTL', async () => {
