@@ -1372,6 +1372,11 @@ async function refreshDetail(id) {
 // ---------- SSE ----------
 let reconnects = 0;
 function openEvents(id) {
+  // Close any stream we already hold before opening a new one — otherwise we can end up with TWO live
+  // EventSources and every event renders twice. That happens in open()'s await gap: it nulls S.es, then
+  // `await fetch(detail)`, then calls openEvents — and during that await the issues-list poll can call
+  // ensureStream() (S.es is null) and open a stream, which this openEvents would then orphan.
+  if (S.es) { try { S.es.close(); } catch { /* already dead */ } }
   reconnects = 0;
   const es = new EventSource(`/api/issues/${id}/events`);
   S.es = es;
