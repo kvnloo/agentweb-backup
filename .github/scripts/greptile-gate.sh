@@ -58,6 +58,53 @@
 #                                    timeout-minutes so the gate fails loudly
 #                                    instead of being killed by the runner)
 #   GREPTILE_GATE_POLL_SECONDS       default 20
+#   GREPTILE_OVERRIDE_DENIED_ACCOUNTS
+#                                    space-separated logins that may never
+#                                    override (default: agentwebdeployer)
+#
+# The human override (ENG-1063)
+# -----------------------------
+# Measured 2026-07-27..08-10 on this repo: 35 gate failures to 32 passes, and
+# NONE of them an outage — ten of fourteen sampled were 4/5. A 4/5 whose
+# findings are all P2 is a judgement call, and there was no way to make it.
+# `enforce_admins` is on, and the only admins are harshmoney123 and
+# agentwebdeployer, so the Argusoft team (push) had no lever at all; loosening
+# branch protection would have handed a bypass to the swarm, which shares
+# harshmoney123, and to the *test* checks as well.
+#
+# So the override lives here, in the gate, where it can be scoped exactly:
+#
+#     /greptile-override <head-sha-prefix> <reason>
+#
+# posted as a PR comment. GitHub auto-merge is untouched and still fires only
+# on a genuinely green required check, so "auto-merge needs 5/5, a human may
+# decide otherwise" falls out without changing branch protection at all.
+#
+# What makes it a control rather than a formality:
+#   - pinned to the head SHA, so blessing commit A cannot carry onto commit B;
+#   - refused outright on automation-authored PRs, because the swarm commits as
+#     harshmoney123 and "who posted it" therefore proves nothing;
+#   - a human account that is an org member or repository collaborator;
+#   - a written reason, which is the entire audit value of the mechanism;
+#   - invalid overrides are logged and IGNORED, never fatal — quoting the
+#     syntax in a review thread must not be able to fail a passing PR.
+#
+# Authorization uses `author_association`, which GitHub already includes on
+# every comment, and NOT `GET /collaborators/{login}/permission`. That endpoint
+# needs push access, and this workflow's token is deliberately
+# `contents: read` — so the permission call 403s and every override would fail
+# closed forever, a feature dead on arrival. Verified against live comments on
+# #2290/#2300/#2310/#2315/#2318: the Argusoft team and Harsha all comment as
+# MEMBER. Be precise about what this proves: org membership plus repository
+# collaboration, not a repo write bit. In this org that set is the seven people
+# in `orgs/AgentWebPro/members` minus the denied machine accounts, which is the
+# intended audience. If the org ever grows past the point where every member is
+# trusted to merge backend code, this check needs a real permission lookup and
+# the token scope to make it — do not quietly widen the trusted set instead.
+#
+# It deliberately does NOT rescue an unparseable verdict: that means this script
+# cannot read what it is looking at, which is a gate defect to fix, not a review
+# finding a human can accept.
 
 set -uo pipefail
 
@@ -67,6 +114,15 @@ HEAD_SHA="${HEAD_SHA:?HEAD_SHA must be set}"
 MIN_SCORE="${GREPTILE_GATE_MIN_SCORE:-5}"
 TIMEOUT_SECONDS="${GREPTILE_GATE_TIMEOUT_SECONDS:-1200}"
 POLL_SECONDS="${GREPTILE_GATE_POLL_SECONDS:-20}"
+
+OVERRIDE_MARKER='/greptile-override'
+# 6 hex characters collide often enough in a repo this size to prove nothing
+# about which head the human was looking at.
+OVERRIDE_MIN_SHA_CHARS=7
+OVERRIDE_MIN_REASON_CHARS=12
+# Shared machine accounts authenticate as ordinary Users, so `user.type` does
+# not catch them and an explicit list is the only thing that does.
+OVERRIDE_DENIED_ACCOUNTS="${GREPTILE_OVERRIDE_DENIED_ACCOUNTS:-agentwebdeployer}"
 
 log() { printf 'greptile-gate: %s\n' "$*"; }
 
@@ -120,6 +176,183 @@ if ! printf '%s' "${head_sha}" | grep -qE '^[0-9a-f]{40}$'; then
   # would sit pending until timeout for entirely the wrong reason.
   fail "HEAD_SHA is not a full 40-character commit SHA: '${HEAD_SHA}'"
 fi
+
+# --- the human override (ENG-1063) -----------------------------------------
+#
+# Set by evaluate_override on every poll, because a human may post the comment
+# while we are already waiting.
+override_ok=''
+override_login=''
+override_reason=''
+
+# PR metadata and permission lookups are cached: they cost an API call each and
+# neither the head branch nor a collaborator's role changes mid-run. Nothing is
+# fetched at all unless an override candidate actually appears, so the ordinary
+# path — the overwhelming majority of runs — makes exactly the same API calls it
+# made before this feature existed.
+pr_meta_state=''
+pr_head_ref=''
+pr_body=''
+
+fetch_pr_meta() {
+  # Only success is cached. A transient blip must not disable the override for
+  # the rest of the run: an override is a rare, deliberate act, and retrying
+  # costs one call per poll and only when someone actually posted one.
+  [ "${pr_meta_state}" = 'ok' ] && return 0
+
+  local json
+  if ! json="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" 2>/dev/null)" || [ -z "${json}" ]; then
+    return 1
+  fi
+
+  if ! pr_head_ref="$(printf '%s' "${json}" | jq -r '.head.ref // ""' 2>/dev/null)"; then
+    return 1
+  fi
+  pr_body="$(printf '%s' "${json}" | jq -r '.body // ""' 2>/dev/null)"
+  pr_meta_state='ok'
+  return 0
+}
+
+# Echoes the reason this PR counts as machine-authored, or nothing.
+#
+# Two independent signals, because either alone is trivially defeated by
+# accident: a branch renamed by hand still carries its attribution block, and a
+# PR body rewritten by hand still sits on a swarm/* branch.
+pr_automation_signal() {
+  if ! fetch_pr_meta; then
+    printf 'the PR metadata could not be read, so it cannot be shown to be human-authored'
+    return 0
+  fi
+  case "${pr_head_ref}" in
+    swarm/*|autofix/*)
+      printf 'its head branch %s is an automation branch' "${pr_head_ref}"
+      return 0
+      ;;
+  esac
+  if printf '%s' "${pr_body}" | grep -qiE '^[[:space:]]*Execution-Actor:[[:space:]]*[^[:space:]]'; then
+    printf 'the PR body carries an Execution-Actor attribution line'
+    return 0
+  fi
+  return 0
+}
+
+# evaluate_override <comments-json>
+#
+# Sets override_ok / override_login / override_reason. Every rejection path logs
+# why and leaves override_ok empty; none of them is fatal, so a stray marker in
+# prose can never turn a passing PR red.
+evaluate_override() {
+  override_ok=''
+  override_login=''
+  override_reason=''
+
+  local candidate login type assoc line rest sha_token reason signal
+
+  # The newest comment carrying a line that BEGINS with the marker. Requiring
+  # line-start is what keeps "we could use /greptile-override here" inert.
+  if ! candidate="$(printf '%s' "$1" | jq -r '
+      [ .[]
+        | { login: (.user.login // ""),
+            type:  (.user.type  // ""),
+            assoc: (.author_association // ""),
+            line:  ((.body // "")
+                     | gsub("\r"; "")
+                     | split("\n")
+                     | map(select(test("^[ \t]*/greptile-override([ \t]|$)")))
+                     | last) }
+        | select(.line != null)
+      ] | last // empty
+      | [ .login, .type, .assoc, .line ] | @tsv
+    ' 2>/dev/null)"; then
+    return 0
+  fi
+  [ -z "${candidate}" ] && return 0
+
+  login="$(printf '%s' "${candidate}" | cut -f1)"
+  type="$(printf '%s' "${candidate}" | cut -f2)"
+  assoc="$(printf '%s' "${candidate}" | cut -f3)"
+  line="$(printf '%s' "${candidate}" | cut -f4-)"
+
+  # Automation first: on a machine-authored PR the answer is no regardless of
+  # who commented, so there is no reason to inspect the comment further.
+  signal="$(pr_automation_signal)"
+  if [ -n "${signal}" ]; then
+    log "override ignored: this PR is automation-authored — ${signal}. Automated work earns its ${MIN_SCORE}/5 or it does not merge."
+    return 0
+  fi
+
+  if [ "${type}" != 'User' ]; then
+    log "override ignored: ${login} is not a human account (user.type=${type:-unknown})."
+    return 0
+  fi
+
+  case " ${OVERRIDE_DENIED_ACCOUNTS} " in
+    *" ${login} "*)
+      log "override ignored: ${login} is a known automation account and may never authorize an override, whatever its repository role."
+      return 0
+      ;;
+  esac
+
+  rest="${line#"${line%%[![:space:]]*}"}"
+  rest="${rest#"${OVERRIDE_MARKER}"}"
+  sha_token="$(printf '%s' "${rest}" | awk '{print $1}')"
+  reason="$(printf '%s' "${rest}" \
+    | sed -E 's/^[[:space:]]*[^[:space:]]+[[:space:]]*//' \
+    | sed -E 's/[[:space:]]+$//')"
+
+  if [ -z "${sha_token}" ]; then
+    log "override ignored: ${login} named no commit. The form is '${OVERRIDE_MARKER} <head-sha> <reason>'; the current head is ${head_sha}."
+    return 0
+  fi
+
+  if ! printf '%s' "${sha_token}" | grep -qE "^[0-9a-fA-F]{${OVERRIDE_MIN_SHA_CHARS},40}$"; then
+    log "override ignored: '${sha_token}' is not a commit SHA — an override must name at least ${OVERRIDE_MIN_SHA_CHARS} hex characters of the head it applies to. The current head is ${head_sha}."
+    return 0
+  fi
+
+  sha_token="$(printf '%s' "${sha_token}" | tr '[:upper:]' '[:lower:]')"
+  case "${head_sha}" in
+    "${sha_token}"*) : ;;
+    *)
+      log "override ignored: it names ${sha_token}, which does not match the current head ${head_sha}. An override is pinned to the commit it was written for, so pushing new code retires it."
+      return 0
+      ;;
+  esac
+
+  if [ -z "${reason}" ]; then
+    log "override ignored: no reason was given. The reason is the record of why these findings were accepted; without it the override is not auditable."
+    return 0
+  fi
+
+  if [ "${#reason}" -lt "${OVERRIDE_MIN_REASON_CHARS}" ]; then
+    log "override ignored: the reason '${reason}' is shorter than ${OVERRIDE_MIN_REASON_CHARS} characters. Say what is being accepted and why."
+    return 0
+  fi
+
+  # Fails closed on anything unrecognised, including an absent field: an
+  # override is only as good as the proof its author was entitled to make it.
+  case "${assoc}" in
+    OWNER|MEMBER|COLLABORATOR) : ;;
+    *)
+      log "override ignored: ${login} is not an org member or repository collaborator (author_association=${assoc:-absent})."
+      return 0
+      ;;
+  esac
+
+  override_ok='yes'
+  override_login="${login}"
+  override_reason="${reason}"
+  return 0
+}
+
+# accept_override <what-is-being-overridden>
+accept_override() {
+  printf '::warning::greptile-gate: OVERRIDE ACCEPTED by %s on head %s — %s\n' \
+    "${override_login}" "${head_sha}" "$1"
+  log "OVERRIDE ACCEPTED — ${override_login} authorized this merge on head ${head_sha}: $1."
+  log "OVERRIDE ACCEPTED — reason given: ${override_reason}"
+  exit 0
+}
 
 log "requiring Greptile ${MIN_SCORE}/5 on head ${head_sha} of ${REPO}#${PR_NUMBER}"
 
@@ -190,6 +423,10 @@ while :; do
       fail "unparseable response from repos/${REPO}/issues/${PR_NUMBER}/comments — expected a JSON array of comments"
     fi
 
+    # Re-read every poll: a human may post the override while we are waiting,
+    # and may equally push a new commit that retires one already posted.
+    evaluate_override "${comments_json}"
+
     if [ -z "${body}" ]; then
       last_state="no Greptile review comment found on the pull request yet"
       # Keep last_body in step with last_state, so the timeout dump never shows
@@ -258,8 +495,13 @@ while :; do
           fi
 
           if [ "${score}" -lt "${MIN_SCORE}" ]; then
+            # The case ENG-1063 exists for: a landed verdict below the bar that
+            # a human with write access has explicitly decided to accept.
+            if [ -n "${override_ok}" ]; then
+              accept_override "overriding Greptile's ${score}/5"
+            fi
             surface 'Greptile comment body (raw)' "${body}"
-            fail "Greptile scored ${score}/5 on the current head ${head_sha} (required: ${MIN_SCORE}/5). Address the findings and push; Greptile rewrites the same comment in place and this gate re-reads it."
+            fail "Greptile scored ${score}/5 on the current head ${head_sha} (required: ${MIN_SCORE}/5). Address the findings and push; Greptile rewrites the same comment in place and this gate re-reads it. To accept the findings instead, comment: ${OVERRIDE_MARKER} ${head_sha} <why you are accepting them>"
           fi
 
           log "PASS — Greptile scored ${score}/5 on the current head ${head_sha}."
@@ -267,6 +509,14 @@ while :; do
         fi
       fi
     fi
+  fi
+
+  # Reaching here means no verdict for this head was observed — pending, stale,
+  # or Greptile down. An override covers this too, deliberately: a gate that can
+  # only forgive a landed verdict leaves the team hard-blocked on exactly the
+  # days Greptile never answers.
+  if [ -n "${override_ok}" ]; then
+    accept_override "no Greptile verdict had landed for this head"
   fi
 
   if [ "$(date +%s)" -ge "${deadline}" ]; then
