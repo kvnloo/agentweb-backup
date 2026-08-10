@@ -5922,6 +5922,9 @@ export const crmDb = {
     enrichmentMetadata?: Record<string, any>;
     /** ISO timestamp set when a LinkedIn connection invite is manually sent from the CRM. */
     linkedInInviteSentAt?: string | null;
+    /** ENG-1026: pre-send identity cross-check stamp (ISO date + verified canonical URL). */
+    linkedinIdentityVerifiedAt?: string | null;
+    linkedinIdentityVerifiedUrl?: string | null;
     /** CRM-internal bookkeeping (findReason, freshUntil, scheduledRunAt,
      *  icpSource). Sidecar map distinct from customFields so it does NOT
      *  leak into CSV exports, email-template variables, or the
@@ -6088,6 +6091,18 @@ export const crmDb = {
           expressionAttributeValues[':companyLinkedin'] = trimmedCompanyLinkedin;
         } else {
           removeExpressions.push('companyLinkedin');
+        }
+      }
+
+      // ENG-1026: verified-identity stamp fields
+      for (const field of ['linkedinIdentityVerifiedAt', 'linkedinIdentityVerifiedUrl'] as const) {
+        if (updates[field] !== undefined) {
+          if (updates[field] === null) {
+            removeExpressions.push(field);
+          } else {
+            setExpressions.push(`${field} = :${field}`);
+            expressionAttributeValues[`:${field}`] = updates[field];
+          }
         }
       }
 

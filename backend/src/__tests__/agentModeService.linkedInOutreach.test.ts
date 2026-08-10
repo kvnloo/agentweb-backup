@@ -24,6 +24,7 @@ jest.mock('../services/connectedAccountsDb', () => ({
 
 // Mock linkedInOutreachService
 const mockSendMessage = jest.fn();
+const mockGetLinkedInProfile = jest.fn();
 const mockSendInMail = jest.fn();
 const mockSendInvitation = jest.fn();
 const mockGetMessagesWithContact = jest.fn();
@@ -38,6 +39,7 @@ const mockClearStatusCache = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     sendMessage: (...args: any[]) => mockSendMessage(...args),
+    getLinkedInProfile: (...args: any[]) => mockGetLinkedInProfile(...args),
     sendInMail: (...args: any[]) => mockSendInMail(...args),
     sendInvitation: (...args: any[]) => mockSendInvitation(...args),
     getMessagesWithContact: (...args: any[]) => mockGetMessagesWithContact(...args),
@@ -64,12 +66,14 @@ jest.mock('../services/emailEventsDb', () => ({
 
 // Mock crmDb
 const mockGetLeadById = jest.fn();
+const mockUpdateLead = jest.fn().mockResolvedValue(undefined);
 const mockUpdateLeadLinkedInSyncAt = jest.fn().mockResolvedValue(undefined);
 const mockGetLeadListById = jest.fn();
 const mockCanOrgMemberAccessList = jest.fn();
 jest.mock('../services/db', () => ({
   crmDb: {
     getLeadById: (...args: any[]) => mockGetLeadById(...args),
+    updateLead: (...args: any[]) => mockUpdateLead(...args),
     updateLeadLinkedInSyncAt: (...args: any[]) => mockUpdateLeadLinkedInSyncAt(...args),
     getLeadListById: (...args: any[]) => mockGetLeadListById(...args),
     canOrgMemberAccessList: (...args: any[]) => mockCanOrgMemberAccessList(...args),
@@ -1496,5 +1500,120 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(errorContent).toContain('⚠️ Tool Error');
       expect(errorContent).not.toContain('Do NOT report this as a success');
     });
+  });
+});
+
+// ─── ENG-1026: identity cross-check before agent-tool sends ──────────────────
+
+describe('AgentModeService - LinkedIn identity cross-check (ENG-1026)', () => {
+  let service: AgentModeService;
+
+  const mismatchProfile = {
+    first_name: 'Florence',
+    last_name: 'Su',
+    headline: 'Technical Program Manager at Snowflake',
+    work_experience: [{ position: 'TPM', company: 'Snowflake', current: true }],
+  };
+
+  const vivianLead = {
+    leadId: 'lead_test456',
+    listId: 'list_test123',
+    firstName: 'Florence',
+    lastName: 'Su',
+    company: 'Vivian Health',
+    linkedin: 'https://www.linkedin.com/in/florencesu/',
+    linkedinMessageSyncAt: new Date().toISOString(),
+  };
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    mockGetAccountsByUserIdIncludingOrgShared.mockResolvedValue([
+      { platform: 'unipile', account_id: 'test-account-id' },
+    ]);
+    mockIsAccountConnected.mockResolvedValue(true);
+    mockProbeAccountSession.mockResolvedValue('connected');
+    mockGetSentInvitationByProfileUrlAndAccount.mockResolvedValue(null);
+    // Earlier suites set persistent implementations (e.g. a rejected duplicate
+    // check) that clearAllMocks() does not remove — re-assert clean defaults.
+    mockGetEventsByEmailDomainAndLeadEmail.mockResolvedValue([]);
+    mockAddLinkedInMessageEvent.mockResolvedValue(undefined);
+    mockUpdateLeadLinkedInSyncAt.mockResolvedValue(undefined);
+    mockUpdateLead.mockResolvedValue(undefined);
+  });
+
+  it('send-message with lead context refuses on identity mismatch with a structured error', async () => {
+    mockGetLeadById.mockResolvedValue(vivianLead);
+    mockGetLinkedInProfile.mockResolvedValue(mismatchProfile);
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'send-message',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/florencesu/',
+      message: 'Hi Florence!',
+      list_id: 'list_test123',
+      lead_id: 'lead_test456',
+    });
+
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    expect(result.code).toBe('linkedin_identity_mismatch');
+    expect(result.details).toEqual(expect.objectContaining({ leadCompany: 'Vivian Health' }));
+  });
+
+  it('send-invite with lead context refuses on identity mismatch', async () => {
+    mockGetLeadById.mockResolvedValue(vivianLead);
+    mockGetLinkedInProfile.mockResolvedValue(mismatchProfile);
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'send-invite',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/florencesu/',
+      message: 'Hi Florence!',
+      list_id: 'list_test123',
+      lead_id: 'lead_test456',
+    });
+
+    expect(mockSendInvitation).not.toHaveBeenCalled();
+    expect(result.success).toBe(false);
+    expect(result.code).toBe('linkedin_identity_mismatch');
+  });
+
+  it('send-message without lead context is unchanged (no fetch, no block)', async () => {
+    mockSendMessage.mockResolvedValue({ id: 'msg-1' });
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'send-message',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/whoever/',
+      message: 'Hello!',
+    });
+    expect(result.success).toBe(true);
+    expect(mockGetLinkedInProfile).not.toHaveBeenCalled();
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('send-message stamps the lead on a successful cross-check', async () => {
+    mockGetLeadById.mockResolvedValue(vivianLead);
+    mockGetLinkedInProfile.mockResolvedValue({
+      first_name: 'Florence',
+      last_name: 'Su',
+      work_experience: [{ position: 'VP Performance Marketing', company: 'Vivian Health', current: true }],
+    });
+    mockSendMessage.mockResolvedValue({ id: 'msg-1' });
+
+    const result = await service.linkedinOutreach('user-1', {
+      action: 'send-message',
+      account_id: 'test-account-id',
+      profile_url: 'https://www.linkedin.com/in/florencesu/',
+      message: 'Hi Florence!',
+      list_id: 'list_test123',
+      lead_id: 'lead_test456',
+    });
+
+    expect(result.success).toBe(true);
+    expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    expect(mockUpdateLead).toHaveBeenCalledWith('list_test123', 'lead_test456', expect.objectContaining({
+      linkedinIdentityVerifiedAt: expect.any(String),
+    }));
   });
 });

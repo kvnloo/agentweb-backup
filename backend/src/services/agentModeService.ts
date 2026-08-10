@@ -29924,6 +29924,33 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         case 'send-invite': {
           if (!target) throw new Error('Either profile_url or provider_id is required for send-invite');
 
+          // ENG-1026: when the model passes CRM lead context, cross-check the live
+          // profile's identity against the lead before spending an invite on the
+          // wrong person. Positive mismatch → structured refusal; no lead context
+          // or unverifiable → unchanged behavior.
+          if (args.list_id && args.lead_id && isUrl && profile_url) {
+            const { crmDb: identityCrmDb } = await import('./db');
+            const identityLead = await identityCrmDb.getLeadById(args.list_id, args.lead_id).catch(() => null);
+            if (identityLead) {
+              const { verifyLinkedInIdentityForSend } = await import('./linkedInIdentityCheck');
+              const identity = await verifyLinkedInIdentityForSend({
+                lead: identityLead as any,
+                listId: args.list_id,
+                leadId: args.lead_id,
+                profileUrl: profile_url,
+                accountId: account_id,
+              });
+              if (!identity.allowed) {
+                return {
+                  success: false,
+                  error: identity.refusal.message,
+                  code: identity.refusal.code,
+                  details: identity.refusal.details,
+                };
+              }
+            }
+          }
+
           // ENG-182: cross-check the account's PENDING sent-invitation cache before
           // spending a run's invite quota. A profile with an OUTSTANDING (sent but
           // not-yet-accepted) invite is NOT a 1st-degree connection, so it slips past
@@ -30139,6 +30166,30 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
                     alreadySentAt: duplicateEvent.createdAt,
                   };
                 }
+              }
+            }
+          }
+
+          // ENG-1026: with CRM lead context, cross-check the live profile's identity
+          // against the lead before sending. Positive mismatch → structured refusal.
+          if (sendLead && sendListId && sendLeadId) {
+            const identityUrl = (isUrl && profile_url) || (sendLead.linkedin as string | undefined)?.trim();
+            if (identityUrl) {
+              const { verifyLinkedInIdentityForSend } = await import('./linkedInIdentityCheck');
+              const identity = await verifyLinkedInIdentityForSend({
+                lead: sendLead as any,
+                listId: sendListId,
+                leadId: sendLeadId,
+                profileUrl: identityUrl,
+                accountId: account_id,
+              });
+              if (!identity.allowed) {
+                return {
+                  success: false,
+                  error: identity.refusal.message,
+                  code: identity.refusal.code,
+                  details: identity.refusal.details,
+                };
               }
             }
           }
