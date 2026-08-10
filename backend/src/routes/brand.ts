@@ -604,19 +604,57 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       // stop reaching the org. Deleting an asset must not fork the brand. One
       // write to the record that actually holds the data leaves nothing to
       // coordinate and keeps the org un-copied, exactly as it was.
-      const ownerRecord: any =
-        fallbackOwnerUserId === user.userId ? user : await userDb.getUserById(fallbackOwnerUserId);
+      // Re-read the owner strong-consistently. `getUserById` goes through the
+      // eventually consistent UserIdIndex GSI, which can hand back a row from
+      // before a just-landed brand edit; this write replaces the whole
+      // brandGuidelines value, so a stale snapshot would silently roll that
+      // edit back. (The caller-is-owner branch already holds a ConsistentRead.)
+      let ownerRecord: any;
+      if (fallbackOwnerUserId === user.userId) {
+        ownerRecord = user;
+      } else {
+        const indexed: any = await userDb.getUserById(fallbackOwnerUserId);
+        ownerRecord = indexed?.email
+          ? (await userDb.getUserByEmailConsistent(indexed.email)) ?? indexed
+          : indexed;
+      }
       const ownerAttachments: any[] = ownerRecord?.brandGuidelines?.attachments || [];
       const prunedOwnerAttachments = ownerAttachments.filter((attachment: any) =>
         isValidKey ? attachment.key !== key : attachment.url !== urlFallback
       );
-      await userDb.updateUser(fallbackOwnerUserId, {
-        brandGuidelines: {
-          ...ownerRecord.brandGuidelines,
-          attachments: prunedOwnerAttachments,
-          updatedAt: new Date().toISOString(),
-        },
-      });
+
+      // A consistent read still leaves the read-modify-write window itself, so
+      // guard the write on the brand not having moved since we read it. An
+      // owner editing their brand concurrently loses nothing: the condition
+      // fails, we abort before touching S3, and the retry sees fresh data.
+      const expectedBrandUpdatedAt = ownerRecord?.brandGuidelines?.updatedAt;
+      try {
+        await userDb.updateUser(
+          fallbackOwnerUserId,
+          {
+            brandGuidelines: {
+              ...ownerRecord.brandGuidelines,
+              attachments: prunedOwnerAttachments,
+              updatedAt: new Date().toISOString(),
+            },
+          } as any,
+          {
+            condition: expectedBrandUpdatedAt
+              ? {
+                  expression: "brandGuidelines.updatedAt = :expectedBrandUpdatedAt",
+                  values: { ":expectedBrandUpdatedAt": expectedBrandUpdatedAt },
+                }
+              : { expression: "attribute_not_exists(brandGuidelines.updatedAt)" },
+          }
+        );
+      } catch (casError: any) {
+        if (casError?.code === "ConditionalCheckFailedException") {
+          return res.status(409).json({
+            error: "Brand guidelines changed while deleting this asset. Please refresh and try again.",
+          });
+        }
+        throw casError;
+      }
       console.log(`[BRAND DEBUG] Successfully pruned owner source attachments after asset deletion`);
     } else if (isOrgLevel) {
       await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedBrandGuidelines });
