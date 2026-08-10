@@ -1106,60 +1106,55 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Invariant guard — the two halves of ENG-915 must stay in step
+# Invariant guard — test execution stays DECOUPLED from the Greptile gate
 # ---------------------------------------------------------------------------
 #
-# The requirement above is only sound while the workflow really does gate the
-# backend suite on the Greptile result, and only reaches the right jobs while
-# the names match. Both are edits somebody makes in tests.yml, in a PR that
-# never opens this file, so assert them from here.
+# ENG-1039 reversed ENG-915's ordering: the Greptile check failed 61% of the
+# time over 2026-08-01..10 and every failure skipped the backend suite (303
+# skipped executions), destroying the run's test evidence and forcing a full
+# ~31-min re-run. Test evidence must be produced independently of whether the
+# reviewer check answered. The merge gate is unchanged — `greptile-review`
+# remains required and fail-closed — but re-serializing the test jobs behind
+# it is a regression. Assert the workflow here so the coupling cannot creep
+# back in a PR that never opens this file.
 
 GATE_SH="${SCRIPT_DIR}/merge-evidence.sh"
 
 for job_key in backend-tests-a backend-tests-b; do
-  # The condition is a `>-` block scalar, so collect every line of it rather
-  # than the `if:` line alone — reading only the first line would find the
-  # folding indicator and silently assert nothing.
-  JOB_IF="$(awk -v job="  ${job_key}:" '
+  # Collect the job's whole header (needs + the `>-` if block scalar) so a
+  # dependency reintroduced in either field is caught.
+  # Comment lines are dropped: they legitimately narrate the ENG-1039 history
+  # and would otherwise trip the substring check below.
+  JOB_HEADER="$(awk -v job="  ${job_key}:" '
     $0 == job            { in_job = 1; next }
     in_job && /^  [a-z]/ { exit }
-    in_job && /^    if:/ { sub(/^    if: */, ""); collecting = 1; print; next }
-    collecting && /^      / { print; next }
-    collecting           { exit }
+    in_job && /^    steps:/ { exit }
+    in_job && /^ *#/     { next }
+    in_job               { print }
   ' "${WORKFLOW}" | tr '\n' ' ')"
 
   TESTS_RUN=$((TESTS_RUN + 1))
-  if printf '%s' "${JOB_IF}" | grep -qF "needs.greptile-review.result == 'success'"; then
-    printf "ok    invariant: %s is gated on the Greptile result (ENG-915)\n" "${job_key}"
-  else
+  if printf '%s' "${JOB_HEADER}" | grep -q "greptile"; then
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    printf "FAIL  invariant: %s must require needs.greptile-review.result == 'success'.\n" "${job_key}"
-    printf "      Found: '%s'\n" "${JOB_IF}"
-    printf "      Without it the suite runs on every ready-flip again (ENG-915 AC1), and the\n"
-    printf "      backend-suite requirement in merge-evidence.sh is enforcing an ordering that\n"
-    printf "      no longer exists.\n"
+    printf "FAIL  invariant: %s references greptile-review in needs/if.\n" "${job_key}"
+    printf "      Found: '%s'\n" "${JOB_HEADER}"
+    printf "      ENG-1039 decoupled test execution from the reviewer check: a 61%%-flaky\n"
+    printf "      Greptile poll was deciding whether test evidence exists. Do not\n"
+    printf "      re-serialize the suite behind it.\n"
+  else
+    printf "ok    invariant: %s runs independently of the Greptile gate (ENG-1039)\n" "${job_key}"
   fi
 
-  # The outage bypass must stay narrowed to `unavailable`. Widening it to any
-  # non-success result — or to `always()` without a result check — would let a
-  # REFUSED 3/5 run the suite, which is AC1 deleted.
+  # The suite must still be draft-gated and path-gated — decoupling from the
+  # reviewer check must not turn into running on every draft push.
   TESTS_RUN=$((TESTS_RUN + 1))
-  if printf '%s' "${JOB_IF}" | grep -qF "needs.greptile-review.outputs.verdict == 'unavailable'"; then
-    if printf '%s' "${JOB_IF}" | grep -qE "verdict != 'pass'|result != 'success'|result != 'failure'"; then
-      TESTS_FAILED=$((TESTS_FAILED + 1))
-      printf "FAIL  invariant: %s bypasses the gate on a NEGATED condition.\n" "${job_key}"
-      printf "      Found: '%s'\n" "${JOB_IF}"
-      printf "      The bypass must name 'unavailable' positively; a negation lets a refused\n"
-      printf "      3/5 through and deletes ENG-915 AC1.\n"
-    else
-      printf "ok    invariant: %s bypasses only on the 'unavailable' verdict\n" "${job_key}"
-    fi
+  if printf '%s' "${JOB_HEADER}" | grep -qF "github.event.pull_request.draft == false" \
+     && printf '%s' "${JOB_HEADER}" | grep -qF "needs.detect-changes.outputs.backend == 'true'"; then
+    printf "ok    invariant: %s keeps the draft and backend-path gates\n" "${job_key}"
   else
     TESTS_FAILED=$((TESTS_FAILED + 1))
-    printf "FAIL  invariant: %s has lost the Greptile-outage bypass.\n" "${job_key}"
-    printf "      Found: '%s'\n" "${JOB_IF}"
-    printf "      Without it a Greptile outage costs every PR its test feedback, not just\n"
-    printf "      its merge.\n"
+    printf "FAIL  invariant: %s must keep the draft gate and backend path filter.\n" "${job_key}"
+    printf "      Found: '%s'\n" "${JOB_HEADER}"
   fi
 done
 

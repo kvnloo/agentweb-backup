@@ -31,6 +31,7 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner }}
       workflows: ${{ steps.filter.outputs.workflows }}
+      ebconfig: ${{ steps.filter.outputs.ebconfig }}
     steps:
       # ENG-729: shallow. This workflow only ever runs on `pull_request`, and on
       # that event dorny/paths-filter reads the changed-file list from the
@@ -74,64 +75,51 @@ jobs:
               - 'partner-portal/**'
             workflows:
               - '.github/**'
+            # ENG-1039: the EB config-conflict job classifies only
+            # `.platform/*` and `.ebextensions/*.config` paths (see
+            # eb-config-conflict.sh), yet it ran on every PR — 397 runs /
+            # 480 min in 2026-08-01..10 with no path filter at all. Gate it on
+            # the only paths that can produce a hit, plus its own script and
+            # this workflow (whatever gates merges has to gate its own
+            # changes — ENG-743).
+            ebconfig:
+              - '**/.ebextensions/**'
+              - '**/.platform/**'
+              - '.github/scripts/eb-config-conflict.sh'
+              - '.github/workflows/tests.yml'
 
   # Job A: heavy agentMode files (~150 files, ~half the test time)
   backend-tests-a:
     name: Backend tests (agentMode)
-    needs: [detect-changes, greptile-review]
+    needs: [detect-changes]
     # Skip the heavy suite while the PR is a draft: intermediate pushes to a
     # draft (e.g. the autofix pipeline's re-fix/revise commits) shouldn't burn
     # ~26 runner-min they can't gate a merge with. Flipping the PR to Ready
     # fires `ready_for_review` (see triggers) → one authoritative full run.
     #
-    # ENG-915: and hold it behind the Greptile gate. Both used to fire together
-    # on `ready_for_review`, so a review returning below 5/5 burned a complete
-    # sharded run whose result the fix-up push invalidated seconds later —
-    # measured at 212 of 1424 sampled runner-minutes (15%) over 2026-07-21..08-05,
-    # with the gate returning non-success on 15 of 50 completed runs.
+    # ENG-1039: DECOUPLED from the Greptile gate, reversing ENG-915's ordering.
+    # ENG-915 serialized these jobs behind `greptile-review` to save the
+    # runner-minutes a below-5/5 review invalidated. Measured 2026-08-01..10,
+    # the coupling cost more than it saved: the Greptile check failed 61% of
+    # the time (247 failures / 160 successes, 947 min billed on failed polls),
+    # and every failure skipped the test jobs entirely — 303 skipped
+    # executions. Each skip destroyed the run's test evidence, so authors
+    # re-pushed to recover, costing a whole fresh ~31-min backend pair plus
+    # another Greptile poll. A flaky *reviewer* check was deciding whether
+    # *test* evidence exists.
     #
-    # The second saving is larger and less obvious. 42 of the 96 sampled
-    # backend-test jobs ended `cancelled` — 340 runner-minutes, 24% of the
-    # total — because a PR averages 6.6 runs and `cancel-in-progress` kills the
-    # superseded one only once the next push arrives, by which point the tests
-    # have been running for minutes. Waiting on `needs` costs no runner time,
-    # so a push landing inside the gate's ~2 min window now cancels these jobs
-    # before they have consumed anything. Same six lines, both savings.
+    # The merge gate is unchanged: `greptile-review` remains a required check
+    # and still fails on anything but a true 5/5 (ENG-754/757 fail-closed
+    # shape intact). Only the execution ordering is gone — tests now produce
+    # evidence independently of whether Greptile answered.
     #
-    # The cost of serialising is the gate's own runtime, which is ~2 min in
-    # practice; the 20 minutes in greptile-gate.sh is its TIMEOUT, not its
-    # latency. `backend-staging-deploy` below has been gated this way since
-    # ENG-743, so this only extends an existing ordering to the jobs that
-    # actually dominate the bill.
-    #
-    # The outage bypass. Holding the suite behind a third party would otherwise
-    # mean a Greptile outage costs every PR in both repos its test feedback, so
-    # `unavailable` — the deadline passing with no landed Greptile verdict for
-    # ANY commit on this PR — lets the suite run anyway.
-    #
-    # This is not a conditional pass, and that distinction is the whole safety
-    # argument. `greptile-review` still FAILS on `unavailable`, so merge
-    # evidence is bit-for-bit what it was: nothing becomes mergeable that was
-    # not mergeable before, and the ENG-754/757 fail-closed shape is intact.
-    # The bypass decides one thing only — whether tests execute — so the worst
-    # case if it ever fires wrongly is runner minutes, never a bad merge.
-    #
-    # It cannot fire on a review Greptile actually scored: every path that
-    # observes a verdict for this head exits before the deadline is consulted,
-    # and a landed verdict for any OTHER commit is treated as proof of life and
-    # explicitly refused the `unavailable` label. See greptile-gate.sh.
-    #
-    # This makes a `skipped` here ambiguous — path filter, draft, or a gate that
-    # did not pass — so merge-evidence.sh no longer infers the reason. It demands
-    # a positive `success` from these two jobs whenever the diff touches the
-    # backend paths (ENG-915 acceptance criterion 4). Renaming either job means
+    # A `skipped` here is still ambiguous — path filter or draft — so
+    # merge-evidence.sh keeps demanding a positive `success` from these two
+    # jobs whenever the diff touches backend paths. Renaming either job means
     # updating MERGE_EVIDENCE_BACKEND_JOBS there.
     if: >-
-      !cancelled()
-      && needs.detect-changes.outputs.backend == 'true'
+      needs.detect-changes.outputs.backend == 'true'
       && github.event.pull_request.draft == false
-      && (needs.greptile-review.result == 'success'
-          || needs.greptile-review.outputs.verdict == 'unavailable')
     runs-on: ubuntu-latest
     # Distinct group from backend-tests-b so the two still run in parallel; a
     # newer commit on the same PR cancels this job's superseded run.
@@ -183,16 +171,13 @@ jobs:
   # Job B: everything else + coverage reporting
   backend-tests-b:
     name: Backend tests (all other + coverage)
-    needs: [detect-changes, greptile-review]
-    # Same draft and Greptile gates as backend-tests-a (see above): drafts skip
-    # the heavy suite, and a review below 5/5 stops it before it starts; the run
-    # happens once the PR is Ready and the gate has passed on this head.
+    needs: [detect-changes]
+    # Same gates as backend-tests-a (see above): drafts skip the heavy suite;
+    # per ENG-1039 the suite is no longer held behind the Greptile gate — test
+    # evidence is produced independently of the reviewer check.
     if: >-
-      !cancelled()
-      && needs.detect-changes.outputs.backend == 'true'
+      needs.detect-changes.outputs.backend == 'true'
       && github.event.pull_request.draft == false
-      && (needs.greptile-review.result == 'success'
-          || needs.greptile-review.outputs.verdict == 'unavailable')
     runs-on: ubuntu-latest
     # Distinct group from backend-tests-a so the two still run in parallel; a
     # newer commit on the same PR cancels this job's superseded run.
@@ -346,7 +331,11 @@ jobs:
   # filter: the files it guards are under `backend/`, not `.github/`.
   eb-config-conflict:
     name: EB resource/instance config conflict
-    if: github.event_name == 'pull_request'
+    needs: detect-changes
+    # ENG-1039: gated on the `ebconfig` filter — the classifier only reacts to
+    # `.platform/*` and `.ebextensions/*.config` paths, so PRs touching neither
+    # cannot produce a hit and were paying 397 runs / 480 min for nothing.
+    if: needs.detect-changes.outputs.ebconfig == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
@@ -395,18 +384,25 @@ jobs:
     needs: detect-changes
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    # The script's own deadline is 20 minutes, leaving 5 minutes of runner
-    # budget so the gate fails with a diagnosable message instead of being
-    # killed mid-poll — the ENG-734 shape of a step timeout undercutting the
-    # budget it is supposed to contain.
-    timeout-minutes: 25
+    # ENG-1039: the poll deadline is 10 minutes (GREPTILE_GATE_TIMEOUT_SECONDS
+    # below), down from 20. Greptile reviews land in ~2 min when it answers at
+    # all, and failed polls billed 947 runner-minutes over 2026-08-01..10 —
+    # most of the timeout window was buying nothing. A false timeout is also
+    # far cheaper than it used to be: since the test jobs no longer wait on
+    # this gate (see backend-tests-a), a timeout re-runs only this ~free poll
+    # on the next push, never a 31-min test pair. The 2-minute headroom keeps
+    # the ENG-734 shape: the script's deadline stays under the job timeout so
+    # the gate fails with a diagnosable message instead of being killed
+    # mid-poll.
+    timeout-minutes: 12
     # A newer commit on the same PR cancels this superseded Greptile-wait job.
     concurrency:
       group: ${{ github.workflow }}-greptile-review-${{ github.ref }}
       cancel-in-progress: true
     # `verdict` is pass | refused | unavailable. The job still FAILS on anything
-    # but pass — this output only lets the test jobs tell "Greptile said no"
-    # from "Greptile never answered". Nothing downstream may treat it as a pass.
+    # but pass. Since ENG-1039 nothing downstream consumes this output (the
+    # test jobs no longer wait on this gate); it is kept for the job log and
+    # any future consumer. Nothing may ever treat a non-pass as a pass.
     outputs:
       verdict: ${{ steps.gate.outputs.verdict }}
     steps:
@@ -423,6 +419,8 @@ jobs:
       - name: Require a true Greptile 5/5 on this head
         id: gate
         env:
+          # ENG-1039 fail-fast: see the job comment above.
+          GREPTILE_GATE_TIMEOUT_SECONDS: '600'
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
