@@ -942,6 +942,89 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(retryAt).toBeLessThanOrEqual(Date.now() + 16 * 60 * 1000);
     });
 
+    /**
+     * ENG-971. Zero assistant output does NOT mean the run did nothing — a publish
+     * can land and the process die before the summary. Auto-retrying that run
+     * REPUBLISHES it, and unlike the interactive paths no human sees the transcript
+     * between the failure and the retry, so a warning in the message would arrive
+     * far too late. The requeue itself has to be suppressed.
+     */
+    describe('zero output AFTER a confirmed publish (ENG-971)', () => {
+      const zeroOutput = {
+        content: '', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [],
+      };
+
+      const runWithLedger = async (calledFunctions: Record<string, number>) => {
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions,
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+        return runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+      };
+
+      it('does NOT requeue when the ledger confirms a publish', async () => {
+        await runWithLedger({ publish_landing_page_changes: 1, get_deployment_status: 2 });
+
+        const requeue = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1
+        );
+        expect(requeue).toBeUndefined();
+      });
+
+      it('tells the user what went live and that it will not be retried', async () => {
+        await runWithLedger({ publish_landing_page_changes: 1 });
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note).toBeDefined();
+        expect(note![1].content).toContain('published your landing-page changes');
+        expect(note![1].content).toMatch(/not been retried|will not be retried/i);
+        // The old copy is now false for this case and must be gone.
+        expect(note![1].content).not.toContain('no results were generated');
+        expect(note![1].content).not.toContain('will be retried automatically');
+      });
+
+      // FAIL case: the ordinary zero-output run is untouched. Suppressing the requeue
+      // for every failure would silently stop schedules from self-healing.
+      it('still requeues a zero-output run that published nothing', async () => {
+        await runWithLedger({ get_leads: 3, you_search_web: 1 });
+
+        const requeue = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1
+        );
+        expect(requeue).toBeDefined();
+        expect(requeue![1]).toEqual(
+          expect.objectContaining({ status: 'active', nextRunTime: expect.any(String) })
+        );
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note![1].content).toContain('will be retried automatically');
+      });
+
+      it('still requeues when the session read fails (no ledger, old behaviour)', async () => {
+        (mockChatbotDb.getChatSession as jest.Mock).mockRejectedValue(new Error('DynamoDB timeout'));
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        expect(
+          mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantRetryCount === 1)
+        ).toBeDefined();
+      });
+    });
+
     // ENG-826 #1: proactively notify the owner once the automatic retries are exhausted.
     const zeroOutputWorkerResponse = {
       content: '', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [],
