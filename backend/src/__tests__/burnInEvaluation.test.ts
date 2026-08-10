@@ -846,4 +846,38 @@ describe('evaluateBurnIn — production window alignment (ENG-938)', () => {
     expect(a.verdict).toBe('clean');
     expect(a.passesClosureCheck4).toBe(true);
   });
+
+  // Exact-boundary case: a release instant that lands exactly on the producer's
+  // closing grid, so a window starts at precisely `releaseAt`. That window
+  // contains no pre-release runs, so it IS the first window of the burn-in
+  // period and the `>=` walkback is meant to reach it.
+  const GRID_RELEASE = new Date('2026-07-29T23:59:59.999Z');
+
+  it('anchors the period on a window that starts exactly at the release instant', () => {
+    const a = evaluateBurnIn({
+      snapshots: [...snapshots, ...completed('2026-07-30')],
+      releaseAt: GRID_RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.reason).not.toMatch(/missing the snapshot window/i);
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+  });
+
+  it('fails closed when the window starting exactly at the release instant produced no row', () => {
+    // `snapshots` has no 07-30 row, so the earliest surviving window starts at
+    // exactly releaseAt + 24h. The slot before it is fully post-release and was
+    // never written — genuinely unread evidence, not an off-by-one. Crediting
+    // the remaining days here would return `clean` for a period one day short.
+    const a = evaluateBurnIn({
+      snapshots,
+      releaseAt: GRID_RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.verdict).toBe('insufficient_data');
+    expect(a.passesClosureCheck4).toBe(false);
+    expect(a.reason).toMatch(/missing the snapshot window/i);
+  });
 });
