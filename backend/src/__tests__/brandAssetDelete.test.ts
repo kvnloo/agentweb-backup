@@ -282,6 +282,76 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 
+  it("aborts without destroying anything when the owner's source prune fails", async () => {
+    // Greptile P1: this used to be caught and warned. The S3 object and the org
+    // reference were already gone by then, so the endpoint reported success and
+    // left the owner pointing at a destroyed object. Pruning the source FIRST
+    // turns the only likely failure into a clean, fully retryable abort.
+    const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
+    mockDynamoGet.mockResolvedValue({ Item: editor });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "owner-u",
+      shareSettings: {
+        brandGuidelines: { editors: ["editor-u"] },
+        marketingStrategy: { editors: [] },
+      },
+    });
+    mockGetUserById.mockResolvedValue({
+      userId: "owner-u",
+      email: "owner@test.com",
+      brandGuidelines: ownBrand,
+    });
+    mockUpdateUser.mockRejectedValue(new Error("ProvisionedThroughputExceeded"));
+
+    const res = await del(editor, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(500);
+    // Nothing destroyed: the object still exists and the org still resolves to
+    // the owner's untouched list, so a retry sees exactly the pre-request state.
+    expect(mockS3Delete).not.toHaveBeenCalled();
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
+  });
+
+  it("orders the writes source → org → S3 so no record outlives its object", async () => {
+    const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
+    mockDynamoGet.mockResolvedValue({ Item: editor });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "owner-u",
+      shareSettings: {
+        brandGuidelines: { editors: ["editor-u"] },
+        marketingStrategy: { editors: [] },
+      },
+    });
+    mockGetUserById.mockResolvedValue({
+      userId: "owner-u",
+      email: "owner@test.com",
+      brandGuidelines: ownBrand,
+    });
+
+    const res = await del(editor, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(200);
+    const [ownerPrune] = mockUpdateUser.mock.invocationCallOrder;
+    const [orgWrite] = mockUpdateOrg.mock.invocationCallOrder;
+    const [s3Delete] = mockS3Delete.mock.invocationCallOrder;
+    expect(ownerPrune).toBeLessThan(orgWrite);
+    expect(orgWrite).toBeLessThan(s3Delete);
+  });
+
+  it("still reports success when only the S3 delete fails", async () => {
+    // Deleting the object last means a failure here leaks bytes and nothing
+    // else — both records have already stopped referencing it.
+    mockDynamoGet.mockResolvedValue({ Item: soloUser });
+    mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
+
+    const res = await del(soloUser, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(200);
+    expect(mockDynamoUpdate).toHaveBeenCalled();
+  });
+
   it("refuses a foreign key even on an un-copied org", async () => {
     const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
     mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
