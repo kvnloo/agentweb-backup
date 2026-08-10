@@ -173,11 +173,11 @@ router.post('/attach-knowledge-base-files', async (req: Request, res: Response) 
 router.post('/generate-image', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const { prompt, filename, size, quality, input_images, session_id, image_model, logo_image } = req.body;
+    const { prompt, filename, size, quality, input_images, session_id, image_model, logo_image, category } = req.body;
     const result = await svc.generateImage(
       prompt, filename, size || '1024x1024', quality || 'medium',
       input_images || [], userId(req), session_id || '',
-      image_model, logo_image
+      image_model, logo_image, undefined, category
     );
     res.json(result);
   } catch (err: any) {
