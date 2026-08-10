@@ -599,6 +599,88 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(res.formattedContent.length).toBeGreaterThan(IN_CONTEXT_CAP);
   });
 
+  // Greptile 4/5: bounding the name index means a huge roster can no longer show
+  // every name, so a caller cannot tell whether a specific competitor is already
+  // stored — which is the ENG-945 contract itself ("do not add them again").
+  // The answer is a membership check, not a longer list.
+  it('answers whether specific competitors are already stored', async () => {
+    const competitors = makeCompetitors(400, 'Bulk', 300);
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(competitors)));
+
+    const res = await svc.readMarketStrategy('u1', {
+      competitorNames: ['Bulk399', 'Totally New Co'],
+    } as any);
+
+    const lookup = res.competitorLookup;
+    expect(lookup).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'Bulk399', stored: true, offset: 398 }),
+      expect.objectContaining({ name: 'Totally New Co', stored: false }),
+    ]));
+  });
+
+  it('answers for a competitor the bounded name index could not list', async () => {
+    const competitors = makeCompetitors(400, 'Bulk', 300);
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(competitors)));
+
+    const plain = await svc.readMarketStrategy('u1');
+    expect(plain.formattedContent).not.toContain('Bulk400');   // beyond the index
+
+    const res = await svc.readMarketStrategy('u1', { competitorNames: ['Bulk400'] } as any);
+    expect(res.competitorLookup[0]).toMatchObject({ name: 'Bulk400', stored: true, offset: 399 });
+    expect(res.formattedContent).toContain('Bulk400');
+  });
+
+  it('matches names case- and whitespace-insensitively', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(5))));
+
+    const res = await svc.readMarketStrategy('u1', { competitorNames: ['  cOmP3 '] } as any);
+
+    expect(res.competitorLookup[0]).toMatchObject({ stored: true, offset: 2 });
+  });
+
+  it('keeps the membership answer inside the response even when everything else is clamped', async () => {
+    const competitors = makeCompetitors(400, 'Bulk', 9000);
+    const strategy: any = marketStrategyWith(competitors, 30000);
+    strategy.businessOverview = 'O'.repeat(30000);
+    userDb.getUserById.mockResolvedValue(asUser(strategy));
+
+    const res = await svc.readMarketStrategy('u1', { competitorNames: ['Bulk377'] } as any);
+
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+    expect(res.formattedContent).toContain('Bulk377');
+    expect(res.competitorLookup[0]).toMatchObject({ stored: true });
+  });
+
+  it('bounds how many names it will check', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(10))));
+
+    const res = await svc.readMarketStrategy('u1', {
+      competitorNames: Array.from({ length: 500 }, (_, i) => `Q${i}`),
+    } as any);
+
+    expect(res.competitorLookup.length).toBeLessThanOrEqual(50);
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+  });
+
+  it('is absent entirely when no names are asked about', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(5))));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.competitorLookup).toBeUndefined();
+    expect(res.formattedContent).not.toMatch(/already stored/i);
+  });
+
+  it('exposes competitorNames on the tool schema', async () => {
+    require('../emma/tools');
+    const { emmaToolRegistry } = require('../emma/registry');
+    const schema = emmaToolRegistry.getTool('read_market_strategy')?.definition.inputSchema as any;
+
+    expect(schema.properties.competitorNames).toBeDefined();
+    expect(schema.properties.competitorNames.type).toBe('array');
+    expect(schema.required).not.toContain('competitorNames');
+  });
+
   it('exposes competitorOffset on the tool schema so the model can actually ask for it', async () => {
     require('../emma/tools');
     const { emmaToolRegistry } = require('../emma/registry');
