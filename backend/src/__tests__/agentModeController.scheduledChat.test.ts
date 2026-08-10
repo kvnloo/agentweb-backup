@@ -1023,6 +1023,49 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
       });
 
+      // The message must follow the OUTCOME, not the intent. If the requeue write
+      // fails there is no resume, and promising one would be the same false-success
+      // reporting this whole issue is about.
+      it('does not promise a resume when the requeue write fails', async () => {
+        const balanced = [
+          { role: 'system', content: 'automated run' },
+          { role: 'user', content: 'Publish the five vertical landers.' },
+          { role: 'assistant', content: 'Publishing the first.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+          { role: 'tool', tool_call_id: 'p1', content: '{"success":true}' },
+        ];
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(balanced);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions: { publish_landing_page_changes: 1 },
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+        (mockScheduleDb.updateSchedule as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note).toBeDefined();
+        expect(note![1].content).not.toMatch(/pick up where this run left off/i);
+        expect(note![1].content).toMatch(/NOT been retried automatically/i);
+      });
+
+      // Nothing may claim an action we cannot confirm — the owner alert is
+      // best-effort, skipped for test runs, and sent AFTER this text is composed.
+      it('never claims the owner was notified', async () => {
+        await runWithLedger({ publish_landing_page_changes: 1 });
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note![1].content).not.toMatch(/owner has been notified/i);
+      });
+
       // Not safely continuable: stopping is right, but it must not be SILENT.
       it('notifies the owner when a published run cannot be safely continued', async () => {
         await runWithLedger({ publish_landing_page_changes: 1 });
