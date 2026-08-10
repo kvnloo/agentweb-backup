@@ -731,6 +731,19 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(res.formattedContent).toMatch(/Every competitor stored on this account is listed above/);
   });
 
+  // The tool description is a contract the model reads. Promising that every
+  // competitor is named — while the index is deliberately bounded — is exactly
+  // the false-completeness signal ENG-945 exists to remove.
+  it('does not promise in its description that every competitor is named', async () => {
+    require('../emma/tools');
+    const { emmaToolRegistry } = require('../emma/registry');
+    const description: string = emmaToolRegistry.getTool('read_market_strategy')?.definition.description;
+
+    expect(description).not.toMatch(/every stored competitor is always listed/i);
+    expect(description).toMatch(/NEVER conclude a competitor is absent/i);
+    expect(description).toMatch(/competitorNames/);
+  });
+
   it('exposes competitorNames on the tool schema', async () => {
     require('../emma/tools');
     const { emmaToolRegistry } = require('../emma/registry');
