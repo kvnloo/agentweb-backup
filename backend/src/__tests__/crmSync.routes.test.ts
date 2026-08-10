@@ -457,6 +457,64 @@ describe('Org-aware access control on CRM sync routes', () => {
     expect(res.body.configured).toBe(false);
   });
 
+  // Greptile P1 (ENG-1049 follow-up): GET /config is read-authorized (any
+  // same-org member when crm.enabled), but the webhookSecret backfill it
+  // triggers is a write — must independently require owner/org-owner/editor,
+  // or a plain reader could mutate another member's sync config just by
+  // viewing it.
+  describe('webhookSecret backfill only fires for a privileged caller', () => {
+    const legacyConfig = {
+      configured: true,
+      provider: 'hubspot',
+      accountId: 'acc-1',
+      contactFieldMapping: [],
+      dealFieldMapping: [],
+      customFieldMapping: [],
+      // No webhookSecret — simulates a config created before that feature existed.
+    };
+
+    beforeEach(() => {
+      crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
+      externalCrmSyncService.getConfig.mockResolvedValue(legacyConfig);
+      externalCrmSyncService.isAccountConnected.mockResolvedValue(true);
+    });
+
+    it('does not backfill for a same-org member who is not the owner and not a CRM editor', async () => {
+      setSameOrgUsers();
+      orgDb.getOrgById.mockResolvedValue(orgWithCrm());
+
+      await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+
+      expect(externalCrmSyncService.ensureWebhookSecret).not.toHaveBeenCalled();
+    });
+
+    it('backfills for a listed crm.editor', async () => {
+      setSameOrgUsers();
+      orgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: ['user-1'] } } }));
+
+      await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+
+      expect(externalCrmSyncService.ensureWebhookSecret).toHaveBeenCalledWith('user-1', 'list-1', 'hubspot', legacyConfig);
+    });
+
+    it('backfills for the org owner', async () => {
+      setSameOrgUsers();
+      orgDb.getOrgById.mockResolvedValue(orgWithCrm({ ownerUserId: 'user-1' }));
+
+      await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+
+      expect(externalCrmSyncService.ensureWebhookSecret).toHaveBeenCalledWith('user-1', 'list-1', 'hubspot', legacyConfig);
+    });
+
+    it('backfills for the list owner themself', async () => {
+      crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
+
+      await request(app).get('/api/crm-sync/config/list-1/hubspot').expect(200);
+
+      expect(externalCrmSyncService.ensureWebhookSecret).toHaveBeenCalledWith('user-1', 'list-1', 'hubspot', legacyConfig);
+    });
+  });
+
   it('denies a user who is not the owner and not in the same org', async () => {
     crmDb.getLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'owner-2' });
     userDb.getUserById.mockImplementation((id: string) =>

@@ -106,9 +106,17 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
 
     // Lazily backfill webhookSecret for configs created before this feature was added.
     // Non-fatal: if the write fails the config is still returned without a webhookUrl.
+    // This route is read-authorized (any same-org member when crm.enabled, per
+    // verifyListOwnership's destructive:false above) — but the backfill itself is a
+    // write, so it must independently require owner/org-owner/crm.editor, or a plain
+    // reader could cause another member's sync config to be mutated just by viewing
+    // it (Greptile P1, ENG-1049 follow-up).
     if (!config.webhookSecret) {
       try {
-        await externalCrmSyncService.ensureWebhookSecret(userId, listId, provider, config);
+        const list = await crmDb.getLeadListById(listId);
+        if (list && (await canDestructiveCrmList(userId, list as any))) {
+          await externalCrmSyncService.ensureWebhookSecret(userId, listId, provider, config);
+        }
       } catch (backfillErr: any) {
         console.warn(`[CrmSync] ensureWebhookSecret failed for list ${listId}/${provider}: ${backfillErr.message}`);
       }
