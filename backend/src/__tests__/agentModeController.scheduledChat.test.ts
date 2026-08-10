@@ -1039,7 +1039,11 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           calledFunctions: { publish_landing_page_changes: 1 },
         } as any);
         mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
-        (mockScheduleDb.updateSchedule as jest.Mock).mockRejectedValueOnce(new Error('DynamoDB throttled'));
+        // Fail every resume-marker attempt so the retry budget is exhausted.
+        (mockScheduleDb.updateSchedule as jest.Mock)
+          .mockRejectedValueOnce(new Error('DynamoDB throttled'))
+          .mockRejectedValueOnce(new Error('DynamoDB throttled'))
+          .mockRejectedValueOnce(new Error('DynamoDB throttled'));
 
         await runScheduledChat(
           { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
@@ -1053,10 +1057,19 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(note).toBeDefined();
         expect(note![1].content).not.toMatch(/pick up where this run left off/i);
         expect(note![1].content).toMatch(/NOT been retried automatically/i);
-        // Greptile P1: a failed marker write leaves the schedule active with no
-        // resume marker, so its next fire could repeat the publish. That must not
-        // be silent just because we took the resume branch.
         expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalled();
+        // The marker write is retried before giving up...
+        const markerAttempts = mockScheduleDb.updateSchedule.mock.calls.filter(
+          (c: any[]) => c[1]?.pendingResumeSessionId !== undefined
+        );
+        expect(markerAttempts.length).toBe(3);
+        // ...and when it will not persist, the schedule is PAUSED, because only
+        // persisted state can stop the next ordinary fire repeating the publish.
+        const paused = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.status === 'paused'
+        );
+        expect(paused).toBeDefined();
+        expect(note![1].content).toMatch(/paused this schedule/i);
       });
 
       // Nothing may claim an action we cannot confirm — the owner alert is
@@ -1078,6 +1091,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantRetryCount === 1)
         ).toBeUndefined();
         expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalled();
+        // An email cannot stop a cron: the schedule itself must be pausable state,
+        // or its next ordinary fire repeats the publish.
+        const paused = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.status === 'paused'
+        );
+        expect(paused).toBeDefined();
       });
 
       it('tells the user what went live and that it will not be retried', async () => {

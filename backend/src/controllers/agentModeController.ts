@@ -123,7 +123,7 @@ const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
  * is worse than the wording, because it republishes. This message replaces them for
  * that case, and the requeue is suppressed alongside it.
  */
-function zeroAssistantPublishedMessage(actions: string[], willResume: boolean): string {
+function zeroAssistantPublishedMessage(actions: string[], willResume: boolean, paused = false): string {
   // No action names means the run's ledger could not be read (Greptile P1). Say that
   // plainly rather than inventing a list or, worse, implying nothing happened — the
   // whole point of this branch is that something may well have gone out.
@@ -143,7 +143,12 @@ function zeroAssistantPublishedMessage(actions: string[], willResume: boolean): 
     : landed
       + 'The rest of this run could not be continued safely, and re-running it from the start '
       + 'would repeat what already went out — so it has NOT been retried automatically. '
-      + 'Check whether anything is still outstanding.';
+      + (paused
+        // Saying this only when the pause actually persisted: an email cannot stop a
+        // cron, so the schedule is what had to change, and the user must know it did.
+        ? 'I have paused this schedule so its next run cannot repeat that work — '
+          + 'review what is outstanding, then resume the schedule when you are ready.'
+        : 'Check whether anything is still outstanding.');
 }
 
 const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
@@ -3772,31 +3777,37 @@ export async function runScheduledChat(
       });
 
       let publishedRunDidResume = false;
+      let publishedRunPaused = false;
       if (mayHavePublished) {
         if (willResumePublishedRun) {
           // Requeue AS A RESUME: same session, continued from its last settled step.
+          // Retried, because this single write is what stands between a recoverable
+          // blip and having to pause the customer's schedule below.
           const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(zeroOutputNextRetryCount)).toISOString();
-          zeroAssistantRequeuedAt = retryAt;
-          try {
-            await scheduleDb.updateSchedule(schedule.scheduleId, {
-              status: 'active',
-              nextRunTime: retryAt,
-              zeroAssistantRetryCount: zeroOutputNextRetryCount,
-              lastZeroAssistantOutputAt: new Date().toISOString(),
-              lastZeroAssistantOutputSessionId: sessionId || '',
-              pendingResumeSessionId: sessionId || '',
-              updatedAt: new Date().toISOString(),
-            });
-            publishedRunDidResume = true;
-            console.error(
-              `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
-              + `(${publishedActions.join('; ')}); requeued as a RESUME so the rest completes without repeating it.`
-            );
-          } catch (requeueError) {
-            // The resume did NOT happen — drop the marker so neither the run result
-            // nor the transcript claims one.
-            zeroAssistantRequeuedAt = undefined;
-            console.error(`Failed to requeue-as-resume zero-output scheduled chat ${schedule.scheduleId}:`, requeueError);
+          for (let attempt = 1; attempt <= 3 && !publishedRunDidResume; attempt++) {
+            try {
+              await scheduleDb.updateSchedule(schedule.scheduleId, {
+                status: 'active',
+                nextRunTime: retryAt,
+                zeroAssistantRetryCount: zeroOutputNextRetryCount,
+                lastZeroAssistantOutputAt: new Date().toISOString(),
+                lastZeroAssistantOutputSessionId: sessionId || '',
+                pendingResumeSessionId: sessionId || '',
+                updatedAt: new Date().toISOString(),
+              });
+              publishedRunDidResume = true;
+              zeroAssistantRequeuedAt = retryAt;
+              console.error(
+                `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
+                + `(${publishedActions.join('; ')}); requeued as a RESUME so the rest completes without repeating it.`
+              );
+            } catch (requeueError) {
+              console.error(
+                `Failed to requeue-as-resume zero-output scheduled chat ${schedule.scheduleId} `
+                + `(attempt ${attempt}/3):`,
+                requeueError
+              );
+            }
           }
         } else {
           // Cannot continue safely and must not restart.
@@ -3804,6 +3815,37 @@ export async function runScheduledChat(
             `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
             + `(${publishedActions.join('; ')}) and is not safely resumable; NOT requeuing.`
           );
+        }
+
+        // The run published and is NOT being continued — either it could not be
+        // resumed, or the resume marker would not persist. Leaving the schedule
+        // ACTIVE means its next ordinary fire starts a fresh session and repeats
+        // work that already went out, and an owner email cannot stop a cron: only
+        // persisted state can. So pause the schedule. Deliberately a last resort —
+        // it stops a customer's recurring workflow — which is why the marker write
+        // above is retried first, and why nothing pauses on an ordinary failure.
+        if (!publishedRunDidResume && !isTest) {
+          zeroAssistantRequeuedAt = undefined;
+          try {
+            await scheduleDb.updateSchedule(schedule.scheduleId, {
+              status: 'paused',
+              lastZeroAssistantOutputAt: new Date().toISOString(),
+              lastZeroAssistantOutputSessionId: sessionId || '',
+              updatedAt: new Date().toISOString(),
+            });
+            publishedRunPaused = true;
+            console.error(
+              `Scheduled chat ${schedule.scheduleId} PAUSED: it published `
+              + `(${publishedActions.join('; ') || 'outcome unreadable'}) and cannot be continued, `
+              + `so its next fire would repeat that work.`
+            );
+          } catch (pauseError) {
+            console.error(
+              `CRITICAL: failed to pause schedule ${schedule.scheduleId} after a published, `
+              + `non-resumable run — its next fire may repeat completed work:`,
+              pauseError
+            );
+          }
         }
 
         // Keyed on what ACTUALLY happened, not on which branch we took (Greptile P1).
@@ -3823,7 +3865,7 @@ export async function runScheduledChat(
           try {
             await chatbotDb.addMessageToSession(sessionId, {
               role: 'assistant',
-              content: zeroAssistantPublishedMessage(publishedActions, publishedRunDidResume),
+              content: zeroAssistantPublishedMessage(publishedActions, publishedRunDidResume, publishedRunPaused),
               timestamp: new Date().toISOString(),
               metadata: {
                 timestamp: new Date().toISOString(),
