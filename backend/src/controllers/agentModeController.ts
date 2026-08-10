@@ -1688,6 +1688,40 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
   }
 }
 
+/**
+ * ENG-803: resolve the publish authorization that is true RIGHT NOW.
+ *
+ * A scheduled run lives for minutes, and the owner can flip "Require approval before
+ * publishing" while it is in flight. The prompt builder
+ * (agentModeService.resolveScheduledPublishAuthorized) and the dispatch guard
+ * (blockedByScheduledPublishApproval) both re-read the record at the moment they act,
+ * so a snapshot taken when the worker loaded the schedule can disagree with both
+ * (Greptile review #30). The disagreement is not cosmetic: with a stale `false`, an
+ * owner who has just AUTHORIZED publishing gets a run whose model-authored
+ * `PUBLISH WITHHELD` marker is still believed, suppressing the corrective
+ * continuation — ENG-803's original "finished without posting" failure, rebuilt out
+ * of a cache. So this reads the record, exactly like the other two consumers, and
+ * feeds the same pure `resolvePublishAuthorized`.
+ *
+ * A READ FAILURE RETURNS undefined, NOT false. `false` is the one value that makes
+ * the marker believable, so inventing it from a DynamoDB blip would let an unverified
+ * model-authored sentence end the run. `undefined` withholds the exemption instead:
+ * the run spends one more bounded continuation, and any genuinely unauthorized
+ * publish it then attempts is still refused by the dispatch guard, which does its own
+ * independent read. The two layers fail in opposite directions on purpose.
+ */
+async function resolveLivePublishAuthorized(scheduleId: string): Promise<boolean | undefined> {
+  try {
+    return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId) as any);
+  } catch (error) {
+    console.error(
+      `AgentMode ENG-803: could not re-read schedule ${scheduleId} to verify a publish-withheld marker; refusing the exemption rather than trusting model-authored text:`,
+      error
+    );
+    return undefined;
+  }
+}
+
 // Async classifier used at the completion-gate decision points. Identical to the
 // sync classifier except the 'confirmation' case also consults the LLM judge when
 // the regex misses — so an unanticipated halt phrasing still triggers the
@@ -1696,10 +1730,16 @@ export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}, publishAuthorized?: boolean): Promise<ScheduledContinuationReason | null> {
+}, resolvePublishAuthorizedNow?: () => Promise<boolean | undefined>): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
+  // ENG-803: resolve authorization LAZILY — only a turn that actually emitted the
+  // marker can be exempted, so a turn without one must not pay for a schedule read.
+  // Absent resolver (callers with no schedule) stays `undefined`, which never exempts.
+  const publishAuthorized = scheduledRunWithheldPublish(content)
+    ? await resolvePublishAuthorizedNow?.()
+    : undefined;
   // ENG-803: same withhold exemption as the sync classifier above — and it must be
   // checked BEFORE the LLM judge, which would otherwise be asked to rule on text
   // that is deliberately shaped like a deferral.
@@ -1781,11 +1821,13 @@ export async function runVerifiedChat(
     // rather than dropped into a void no one will ever action. Fail-safe default
     // means a NEW headless caller is covered automatically (no drift).
     parkNotifiable?: boolean;
-    // ENG-803: this run's resolved publish authorization, read from the schedule
-    // record by the caller. Used ONLY to decide whether the model's
-    // publish-withheld marker may be believed — see withholdIsGenuine. Undefined
-    // for callers with no schedule, which never honour the marker.
-    publishAuthorized?: boolean;
+    // ENG-803: reads this run's publish authorization AS IT IS NOW. Used ONLY to
+    // decide whether the model's publish-withheld marker may be believed — see
+    // withholdIsGenuine. Deliberately a resolver rather than a value: the owner can
+    // change the setting mid-run, and a snapshot would disagree with the prompt
+    // builder and the dispatch guard, which both re-read it (Greptile review #30).
+    // Undefined for callers with no schedule, which never honour the marker.
+    publishAuthorized?: () => Promise<boolean | undefined>;
     // ENG-657: tool calls already made in a PRIOR (abandoned) portion of this
     // session that this run is RESUMING. Seeded into the run's accumulated tool
     // calls so keyword/required-function verification counts the whole task, not
@@ -3200,9 +3242,11 @@ export async function runScheduledChat(
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
       fullAutonomy: schedule.fullAutonomy === true,
-      // ENG-803: the same decision the system prompt was built from, so the
-      // publish-withheld marker is believed ONLY on a run that genuinely withheld.
-      publishAuthorized: resolvePublishAuthorized(schedule as any),
+      // ENG-803: re-read at the moment the marker is evaluated, so the continuation
+      // classifier uses the SAME live decision as the prompt builder and the dispatch
+      // guard. A snapshot taken here would go stale the moment the owner toggles the
+      // setting mid-run (Greptile review #30).
+      publishAuthorized: () => resolveLivePublishAuthorized(schedule.scheduleId),
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,
