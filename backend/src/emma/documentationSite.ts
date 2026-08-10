@@ -53,25 +53,31 @@ let docsCorpusRequest: Promise<DocumentationPage[]> | null = null;
 export interface DocsIntegration {
   slug: string;
   name: string;
+  url: string;
 }
 
-/**
- * Integration setup guides published under /integrations/<slug> on the docs
- * site. Keep slugs in sync with the docs.agentweb.pro URL structure.
- */
-export const DOCS_INTEGRATIONS: DocsIntegration[] = [
-  { slug: 'meta', name: 'Meta Ads' },
-  { slug: 'gmail', name: 'Gmail' },
-  { slug: 'hubspot', name: 'HubSpot' },
-  { slug: 'clickup', name: 'ClickUp' },
-  { slug: 'google-drive', name: 'Google Drive' },
-  { slug: 'slack', name: 'Slack' },
-  { slug: 'linkedin', name: 'LinkedIn' },
-];
+const INTEGRATION_PATH = new RegExp(`^${DOCS_SITE_BASE_URL}/integrations/([a-z0-9-]+)/?$`);
 
-/** Build the canonical deep link for an integration guide. */
-export function integrationDocUrl(slug: string): string {
-  return `${DOCS_SITE_BASE_URL}/integrations/${slug}`;
+/**
+ * Derive the integration guides Emma may link to from the published corpus.
+ *
+ * This list is NOT maintained here. A hand-written copy drifted from the docs
+ * site: it advertised a guide that had been removed (a dead link Emma handed
+ * to clients) while omitting live ones, which made Emma report real, paid
+ * channels as unsupported. The corpus is the only source of truth (ENG-1029).
+ */
+export function integrationsFromPages(pages: DocumentationPage[]): DocsIntegration[] {
+  return pages
+    .map((page) => ({ page, match: INTEGRATION_PATH.exec(page.url) }))
+    .filter((entry): entry is { page: DocumentationPage; match: RegExpExecArray } => entry.match !== null)
+    .map(({ page, match }) => ({ slug: match[1], name: page.title, url: page.url }))
+    .sort((left, right) => left.slug.localeCompare(right.slug));
+}
+
+/** Drop the cached corpus so the next read re-fetches it. */
+export function resetDocumentationCache(): void {
+  docsCorpusCache = null;
+  docsCorpusRequest = null;
 }
 
 function tokenize(value: string): string[] {
@@ -177,7 +183,7 @@ export async function searchDocumentation(
 ): Promise<{ content: string; results: DocumentationSearchResult[] }> {
   const queryTokens = tokenize(query);
   if (queryTokens.length === 0) {
-    return { content: buildDocumentationReference().trim(), results: [] };
+    return { content: (await getDocumentationReference()).trim(), results: [] };
   }
 
   const pages = await fetchDocumentationCorpus();
@@ -205,20 +211,38 @@ export async function searchDocumentation(
 }
 
 /**
- * Small static fallback used for broad/no-query requests and outages.
+ * Reference block used for broad/no-query requests and outages.
+ *
+ * Pass the integrations derived from the live corpus. With none — the only
+ * honest state during a docs outage, when the deep links would be unreachable
+ * anyway — it emits no link list and says so, rather than asserting a list it
+ * cannot verify.
  */
-export function buildDocumentationReference(): string {
-  const integrationLines = DOCS_INTEGRATIONS.map(
-    (i) => `- ${i.name}: ${integrationDocUrl(i.slug)}`
-  );
+export function buildDocumentationReference(integrations: DocsIntegration[] = []): string {
+  const header = ['', '---', '## AgentWeb Documentation Site'];
+
+  if (integrations.length === 0) {
+    return [
+      ...header,
+      `The canonical product documentation lives at ${DOCS_SITE_BASE_URL}/. The integration guide index is unavailable right now, so there are no deep links to give this turn — point the client at ${DOCS_SITE_BASE_URL}/ and do not invent a docs URL. Do not conclude from this reply that an integration is unsupported: the index could not be read, which is not the same as an integration being absent from it.`,
+    ].join('\n');
+  }
 
   return [
-    '',
-    '---',
-    '## AgentWeb Documentation Site',
+    ...header,
     `The canonical product documentation lives at ${DOCS_SITE_BASE_URL}/. When a client asks how to set up, connect, or use an integration, return the specific integration guide deep link below. Only return the deep links listed here — do not invent a docs URL for an integration that isn't listed. If a client asks about an integration that isn't listed, tell them it isn't a supported integration yet and offer the relevant workaround instead of guessing a link.`,
     '',
     '### Integration guides',
-    ...integrationLines,
+    ...integrations.map((i) => `- ${i.name}: ${i.url}`),
   ].join('\n');
+}
+
+/**
+ * The reference block built from the live corpus. Throws if the corpus cannot
+ * be read, so the caller reaches its explicit outage path instead of silently
+ * serving an empty list as though the docs site published nothing.
+ */
+export async function getDocumentationReference(): Promise<string> {
+  const pages = await fetchDocumentationCorpus();
+  return buildDocumentationReference(integrationsFromPages(pages));
 }
