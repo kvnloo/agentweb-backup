@@ -8827,10 +8827,10 @@ export class AgentModeService {
       // COMPETITOR_DETAIL_LIMIT competitors are rendered in full and the
       // remainder are listed by name only — every stored competitor is still
       // visible, and the true count is reported alongside.
-      const COMPETITOR_DETAIL_LIMIT = 40;
-      const competitorCount = Array.isArray(marketStrategy.competitors) ? marketStrategy.competitors.length : 0;
+      const competitors: any[] = Array.isArray(marketStrategy.competitors) ? marketStrategy.competitors : [];
+      const competitorCount = competitors.length;
 
-      // `competitorOffset` slides that detail window over the stored list, so a
+      // `competitorOffset` slides the detail window over the stored list, so a
       // caller that needs the description of a name-only entry can fetch it
       // instead of being stuck with a partial record. Clamped into range: an
       // out-of-range offset lands on the last entry rather than rendering an
@@ -8840,13 +8840,14 @@ export class AgentModeService {
       const competitorDetailOffset = Number.isFinite(requestedOffset)
         ? Math.min(Math.max(Math.floor(requestedOffset), 0), Math.max(0, competitorCount - 1))
         : 0;
+      const window = this.resolveCompetitorDetailWindow(competitors, competitorDetailOffset);
 
       // Format the market strategy for LLM consumption
       const formattedContent = this.formatMarketStrategy({
         exists: true,
         marketData: marketStrategy,
-        competitorDetailLimit: COMPETITOR_DETAIL_LIMIT,
-        competitorDetailOffset
+        competitorDetailStart: window.start,
+        competitorDetailEnd: window.end
       });
 
       // Return structured response — no raw marketData to keep tool result size manageable
@@ -8855,8 +8856,10 @@ export class AgentModeService {
         message: `Market strategy retrieved successfully`,
         exists: true,
         totalCompetitors: competitorCount,
-        competitorDetailOffset,
-        competitorsWithFullDetail: Math.max(0, Math.min(competitorCount - competitorDetailOffset, COMPETITOR_DETAIL_LIMIT)),
+        competitorDetailOffset: window.start,
+        competitorsWithFullDetail: window.end - window.start,
+        // Explicit next page, so paging never depends on the model doing arithmetic.
+        nextCompetitorOffset: window.end < competitorCount ? window.end : null,
         createdAt: marketStrategy.createdAt,
         updatedAt: marketStrategy.updatedAt,
         formattedContent
@@ -22706,6 +22709,44 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return formattedSummary;
   }
 
+  // How many characters of competitor descriptions one read_market_strategy page
+  // may render. This is a CHARACTER budget rather than a fixed entry count on
+  // purpose (ENG-945): competitor descriptions on real accounts run from ~60 to
+  // ~2,100 chars, so any fixed count either wastes the page or overflows it.
+  // A tool result over 20,000 chars is offloaded to S3 and only its first 20,000
+  // chars stay in the model's context, so an oversized page pushes its own
+  // competitor list out of context — the failure this ticket is about. 8,000
+  // leaves room for the business overview, the ICP section (8,000+ on some
+  // accounts), the name index and the closing notes, and still keeps the whole
+  // response inline.
+  private static readonly COMPETITOR_DETAIL_CHAR_BUDGET = 8000;
+
+  private formatCompetitorDetailLine(competitor: any): string {
+    if (typeof competitor === 'object' && competitor && competitor.name) {
+      return `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
+    }
+    return `• ${competitor}<br>`;
+  }
+
+  /**
+   * Fill a page of full-detail competitors starting at `offset`, stopping when
+   * the character budget is spent. Always yields at least one entry so a single
+   * oversized description can still be read — an empty page would be the same
+   * silent-nothing failure mode the budget exists to prevent.
+   */
+  private resolveCompetitorDetailWindow(competitors: any[], offset: number): { start: number; end: number } {
+    const start = Math.min(Math.max(Math.floor(offset) || 0, 0), Math.max(0, competitors.length - 1));
+    let used = 0;
+    let end = start;
+    while (end < competitors.length) {
+      const cost = this.formatCompetitorDetailLine(competitors[end]).length;
+      if (end > start && used + cost > AgentModeService.COMPETITOR_DETAIL_CHAR_BUDGET) break;
+      used += cost;
+      end++;
+    }
+    return { start, end };
+  }
+
   // Helper function to format market strategy for AI analysis
   private formatMarketStrategy(marketResult: any): string {
     if (!marketResult.exists) {
@@ -22728,34 +22769,25 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // ENG-945: entries past `competitorDetailLimit` are rendered by name only
     // rather than dropped, so the reader always sees the complete roster.
     const competitors: any[] = Array.isArray(marketData.competitors) ? marketData.competitors : [];
-    const detailLimit = typeof marketResult.competitorDetailLimit === 'number'
-      ? marketResult.competitorDetailLimit
-      : competitors.length;
-    const detailOffset = typeof marketResult.competitorDetailOffset === 'number'
-      ? marketResult.competitorDetailOffset
-      : 0;
-    const detailEnd = detailOffset + detailLimit;
+    const detailStart = typeof marketResult.competitorDetailStart === 'number' ? marketResult.competitorDetailStart : 0;
+    const detailEnd = typeof marketResult.competitorDetailEnd === 'number' ? marketResult.competitorDetailEnd : competitors.length;
     const nameOf = (competitor: any) =>
       (typeof competitor === 'object' && competitor && competitor.name) ? competitor.name : String(competitor);
-    const inWindow = (index: number) => index >= detailOffset && index < detailEnd;
+    const inWindow = (index: number) => index >= detailStart && index < detailEnd;
     const nameOnlyCount = competitors.filter((_, index) => !inWindow(index)).length;
 
     formattedSummary += `<strong>🏆 Competitors (${competitors.length} total)</strong><br>`;
     if (competitors.length > 0) {
       competitors.forEach((competitor: any, index: number) => {
         if (!inWindow(index)) return;
-        if (typeof competitor === 'object' && competitor.name) {
-          formattedSummary += `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
-        } else {
-          formattedSummary += `• ${competitor}<br>`;
-        }
+        formattedSummary += this.formatCompetitorDetailLine(competitor);
       });
       if (nameOnlyCount > 0) {
         // Point at the next unread page: the entries after the window, or back
         // to the start once the window has run past the end of the list.
         const nextOffset = detailEnd < competitors.length ? detailEnd : 0;
-        const nextCount = Math.min(detailLimit, competitors.length - nextOffset);
-        formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside it (e.g. <code>competitorOffset: ${nextOffset}</code> returns the next ${nextCount} in full):<br>`;
+        const nextWindow = this.resolveCompetitorDetailWindow(competitors, nextOffset);
+        formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside it (e.g. <code>competitorOffset: ${nextOffset}</code> returns the next ${nextWindow.end - nextWindow.start} in full):<br>`;
         competitors.forEach((competitor: any, index: number) => {
           if (inWindow(index)) return;
           formattedSummary += `• [offset ${index}] ${nameOf(competitor)}<br>`;
