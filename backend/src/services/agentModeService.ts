@@ -22919,6 +22919,13 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // unchanged by the introduction of paging.
   private static readonly PROMPT_EMBEDDED_COMPETITOR_DETAIL = 40;
 
+  // Ceiling on the name-only index. Without one it grows with the roster and can
+  // push the very tail it exists to expose past the 20,000-char in-context cap
+  // (and it is embedded verbatim in the CRM email prompt). Anything beyond this
+  // is still counted, still in the stated total, and still reachable by offset —
+  // bounded, never silent.
+  private static readonly COMPETITOR_NAME_INDEX_CHAR_BUDGET = 3000;
+
   private formatCompetitorDetailLine(competitor: any): string {
     if (typeof competitor === 'object' && competitor && competitor.name) {
       return `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
@@ -22989,27 +22996,53 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         if (!inWindow(index)) return;
         formattedSummary += this.formatCompetitorDetailLine(competitor);
       });
-      if (nameOnlyCount > 0 && pagingHints) {
-        // Point at the next unread page: the entries after the window, or back
-        // to the start once the window has run past the end of the list.
-        const nextOffset = detailEnd < competitors.length ? detailEnd : 0;
-        // Lead with the random-access affordance, not the next page: every entry
-        // below carries its own offset, so any single competitor is one call
-        // away. Teaching "next page" first would have the model walk the list in
-        // order to reach entry 48 (ENG-945).
-        const lastNameOnly = competitors.length - 1 >= detailEnd ? competitors.length - 1 : 0;
-        formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read any one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside that name — you can jump straight to the entry you want, there is no need to page through in order (e.g. <code>competitorOffset: ${lastNameOnly}</code> reads the entry marked [offset ${lastNameOnly}]). To walk the entire list in order instead, use the nextCompetitorOffset value returned with each page (currently ${nextOffset}):<br>`;
+      if (nameOnlyCount > 0) {
+        // The name index is bounded too, or a large enough roster would push the
+        // tail out of the response it is meant to make visible. Bounded is fine;
+        // SILENT is not — anything not listed is still counted, still included in
+        // the stated total, and still reachable by offset.
+        const nameOnly: Array<{ index: number; name: string }> = [];
         competitors.forEach((competitor: any, index: number) => {
-          if (inWindow(index)) return;
-          formattedSummary += `• [offset ${index}] ${nameOf(competitor)}<br>`;
+          if (!inWindow(index)) nameOnly.push({ index, name: nameOf(competitor) });
         });
-      } else if (nameOnlyCount > 0) {
-        // Prompt-embedding caller: name the rest, no tool directives, no offsets.
-        formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored (names only):</strong><br>`;
-        competitors.forEach((competitor: any, index: number) => {
-          if (inWindow(index)) return;
-          formattedSummary += `• ${nameOf(competitor)}<br>`;
-        });
+        let indexChars = 0;
+        let listed = 0;
+        for (const entry of nameOnly) {
+          const cost = (pagingHints ? `• [offset ${entry.index}] ${entry.name}<br>` : `• ${entry.name}<br>`).length;
+          if (listed > 0 && indexChars + cost > AgentModeService.COMPETITOR_NAME_INDEX_CHAR_BUDGET) break;
+          indexChars += cost;
+          listed++;
+        }
+        const unlisted = nameOnly.slice(listed);
+
+        if (pagingHints) {
+          // Lead with the random-access affordance, not the next page: every entry
+          // below carries its own offset, so any single competitor is one call
+          // away. Teaching "next page" first would have the model walk the list in
+          // order to reach entry 48 (ENG-945).
+          const lastListed = nameOnly[listed - 1];
+          // Only advertise a next page when one actually exists — otherwise the
+          // prose contradicts nextCompetitorOffset: null and restarts the reader.
+          const walkHint = detailEnd < competitors.length
+            ? ` To walk the entire list in order instead, use the nextCompetitorOffset value returned with each page (currently ${detailEnd}).`
+            : '';
+          formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read any one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside that name — you can jump straight to the entry you want, there is no need to page through in order (e.g. <code>competitorOffset: ${lastListed.index}</code> reads the entry marked [offset ${lastListed.index}]).${walkHint}<br>`;
+          nameOnly.slice(0, listed).forEach(e => {
+            formattedSummary += `• [offset ${e.index}] ${e.name}<br>`;
+          });
+          if (unlisted.length > 0) {
+            formattedSummary += `<strong>…and ${unlisted.length} more stored competitor(s) not named in this response</strong> (the account holds ${competitors.length} in total — none have been deleted). Read them with <code>competitorOffset: ${unlisted[0].index}</code> and onwards.<br>`;
+          }
+        } else {
+          // Prompt-embedding caller: name the rest, no tool directives, no offsets.
+          formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored (names only):</strong><br>`;
+          nameOnly.slice(0, listed).forEach(e => {
+            formattedSummary += `• ${e.name}<br>`;
+          });
+          if (unlisted.length > 0) {
+            formattedSummary += `<strong>…and ${unlisted.length} more stored competitor(s) not named here</strong> (the account holds ${competitors.length} in total — none have been deleted).<br>`;
+          }
+        }
       }
     } else {
       formattedSummary += `• No competitors identified yet<br>`;
