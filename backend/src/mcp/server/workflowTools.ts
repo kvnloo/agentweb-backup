@@ -72,8 +72,9 @@ mcpToolRegistry.register({
       'Give Emma a marketing goal in plain language and she plans and executes it end to end — campaigns, content, research, outreach. ' +
       'Use this when none of the more specific emma_* tools fits the request. ' +
       'Starts a new task unless you pass task_id to continue an existing one. ' +
-      'Usually returns the finished result directly (status "complete"). If status is "running" Emma detached into ' +
-      'a longer build — re-read the session with emma_get_session. If it is "awaiting_input", reply with emma_answer_question.',
+      'Usually returns the finished result directly (status "complete"). If status is "running" or "unconfirmed", '  +
+      're-read the session with emma_get_session — "unconfirmed" means the result is real but we could not verify '  +
+      'Emma is not waiting on you. Answer with emma_answer_question when status is "awaiting_input".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -150,7 +151,19 @@ mcpToolRegistry.register({
       }
     }
 
-    const status = pending ? 'awaiting_input' : stillBuilding ? 'running' : 'complete';
+    // `complete` is a TERMINAL status in this contract: a caller reading it is
+    // told, in the tool description, that polling adds nothing. Reporting it
+    // when the confirming read failed sends that caller away from work that may
+    // still be blocked on their answer — the exact failure this confirmation
+    // step exists to prevent. An unconfirmed turn gets its own non-terminal
+    // status so the contract and the flag cannot disagree.
+    const status = pending
+      ? 'awaiting_input'
+      : stillBuilding
+        ? 'running'
+        : confirmationFailed
+          ? 'unconfirmed'
+          : 'complete';
 
     return jsonResult({
       task_id: taskId,

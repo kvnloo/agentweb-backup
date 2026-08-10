@@ -1,5 +1,6 @@
 import { userDb, orgDb, User } from "./db";
 import { getSubscriptionTypeConfig, getUserSubscriptionType } from "./subscriptionService";
+import { inheritsOrgBilling } from "./orgAuthz";
 
 export interface TokenUsageStatus {
   allowed: boolean;
@@ -30,10 +31,17 @@ export interface TokenUsageStatus {
  */
 export async function resolveBillingUserId(userId: string): Promise<string> {
   const user = await userDb.getUserById(userId);
-  if (!user || !user.orgId || user.orgRole !== "member") return userId;
+  if (!user || !user.orgId) return userId;
 
   const org = await orgDb.getOrgById(user.orgId);
   if (!org) return userId;
+
+  // Anchored on the billing root, not on a role. The previous test was
+  // `user.orgRole !== "member"`, which treated "member" as a synonym for "not the
+  // owner". With admins (or a second owner) that is false: they are not "member",
+  // so usage stopped landing on the org counter and started burning their own
+  // quota — silently. Everyone except the billing root pools onto it.
+  if (!inheritsOrgBilling({ userId, orgId: user.orgId }, org)) return userId;
 
   return org.ownerUserId;
 }
