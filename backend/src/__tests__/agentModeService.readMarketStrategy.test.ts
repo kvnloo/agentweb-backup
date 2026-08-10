@@ -662,6 +662,30 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
   });
 
+  // Silently ignoring part of the REQUEST is the same class of bug as silently
+  // ignoring part of the data — a caller that asked about 500 names and was
+  // answered for 50 would treat the other 450 as "not stored" and re-add them.
+  it('says how many requested names it did not check', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(10))));
+
+    const res = await svc.readMarketStrategy('u1', {
+      competitorNames: Array.from({ length: 500 }, (_, i) => `Q${i}`),
+    } as any);
+
+    expect(res.competitorNamesNotChecked).toBe(450);
+    expect(res.formattedContent).toContain('450');
+    expect(res.formattedContent).toMatch(/not checked/i);
+  });
+
+  it('reports nothing unchecked when every requested name fits', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(10))));
+
+    const res = await svc.readMarketStrategy('u1', { competitorNames: ['Comp1', 'Nope'] } as any);
+
+    expect(res.competitorNamesNotChecked).toBe(0);
+    expect(res.formattedContent).not.toMatch(/not checked/i);
+  });
+
   it('is absent entirely when no names are asked about', async () => {
     userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(5))));
 
