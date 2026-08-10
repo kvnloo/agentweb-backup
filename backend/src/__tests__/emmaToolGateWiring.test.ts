@@ -139,7 +139,8 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
       prompt: 'sharpen it',
       filename: 'ad.png',
       imageModel: 'gemini-3-pro-image-preview', // avoids getImageApiDefaultModel lookup
-      inputImages: ['https://cdn.example.com/a.png']
+      inputImages: ['https://cdn.example.com/a.png'],
+      category: 'ad'
     }, ctx);
 
     expect(result.awaitingUserConfirmation).toBe(true);
@@ -157,7 +158,8 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
 
     await emmaToolRegistry.execute('generate_image', {
       prompt: 'flat vector ad illustration',
-      filename: 'ad.png'
+      filename: 'ad.png',
+      category: 'ad'
       // no imageModel → the tool must pass undefined through, NOT the admin default,
       // so generateImage can tell this was a system default and fail over on a timeout.
     }, ctx);
