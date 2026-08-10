@@ -706,6 +706,67 @@ describe('AgentModeService.importLeadsFromSearch — anonymized search results',
     expect(result.anonymizedSkipped).toBe(2);
   });
 
+  // LinkedIn does not always spell the placeholder "LinkedIn Member": it also
+  // renders "Anonymous LinkedIn Member" / "LinkedIn User", and localizes the
+  // whole string to the viewer's interface language. Matching only the en-US
+  // wording would re-open ENG-1002 for every non-English connected account.
+  it.each([
+    ['Anonymous LinkedIn Member', 'the anonymous English wording'],
+    ['LinkedIn User', 'the "user" English wording'],
+    ['Miembro de LinkedIn', 'Spanish'],
+    ['LinkedIn Mitglied', 'German'],
+    ['Membre LinkedIn', 'French'],
+    ['领英会员', 'Chinese'],
+  ])('drops the unlinkable placeholder "%s" (%s)', async (placeholderName) => {
+    mockSearchPeople.mockResolvedValueOnce({
+      items: [{ name: placeholderName, headline: 'Regional Property Manager' }, makeItem(2)],
+      cursor: null,
+    });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(1, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    const written = mockBatchCreateLeads.mock.calls[0][1];
+    expect(written).toHaveLength(1);
+    expect(written[0].linkedin).toBe('https://www.linkedin.com/in/lead-2');
+    expect(result.anonymizedSkipped).toBe(1);
+  });
+
+  // The widened rule keys off the brand token, so it must not swallow real
+  // people who put a LinkedIn badge in their name field — they are linkable.
+  it('keeps a real person whose own name carries a LinkedIn badge', async () => {
+    mockSearchPeople.mockResolvedValueOnce({
+      items: [{ name: 'Jane Doe | LinkedIn Top Voice', public_identifier: 'jane-doe', headline: 'CTO at Acme' }],
+      cursor: null,
+    });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(1, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    const written = mockBatchCreateLeads.mock.calls[0][1];
+    expect(written).toHaveLength(1);
+    expect(written[0].firstName).toBe('Jane');
+    expect(result.anonymizedSkipped).toBe(0);
+  });
+
+  // A named, unlinkable hit that is NOT a placeholder stays importable — the
+  // widened rule must not quietly become "drop everything without a URL".
+  it('keeps a named result that has no profile URL and no brand token', async () => {
+    mockSearchPeople.mockResolvedValueOnce({
+      items: [{ name: 'Amy Foley', headline: 'Regional Property Manager' }],
+      cursor: null,
+    });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(1, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 5 });
+
+    const written = mockBatchCreateLeads.mock.calls[0][1];
+    expect(written).toHaveLength(1);
+    expect(written[0].firstName).toBe('Amy');
+    expect(written[0].linkedin).toBeUndefined();
+    expect(result.anonymizedSkipped).toBe(0);
+  });
+
   it('drops results that have neither a name nor a profile URL', async () => {
     mockSearchPeople.mockResolvedValueOnce({
       items: [{ headline: 'Property Manager', location: 'Houston, TX' }, makeItem(2)],

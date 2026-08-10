@@ -105,6 +105,25 @@ describe("saveOutreachProspects", () => {
     expect(leadsArg[0].notes).toBe("Hi Jane");
   });
 
+  // ENG-1002: the preview already filters these out, but this write is driven
+  // by whatever the client posts back — a stale bundle must not be able to
+  // create nameless, un-dedupable placeholder leads.
+  it("never persists LinkedIn's anonymized placeholder prospects", async () => {
+    const res = await saveOutreachProspects("user-1", {
+      icpId: "icp-1",
+      icpLabel: "K-5 program directors",
+      prospects: [
+        prospect({ id: "anon1", name: "LinkedIn Member", linkedin_url: "" }),
+        prospect(),
+        prospect({ id: "anon2", name: "Miembro de LinkedIn", linkedin_url: "" }),
+      ],
+    });
+    expect(res).toEqual({ ok: true, leadListId: "list_123" });
+    const [, leadsArg] = crmDb.batchCreateLeads.mock.calls[0];
+    expect(leadsArg).toHaveLength(1);
+    expect(leadsArg[0].firstName).toBe("Jane");
+  });
+
   it("falls back to icpId for the list name when no label is given", async () => {
     await saveOutreachProspects("user-1", {
       icpId: "icp-77",
