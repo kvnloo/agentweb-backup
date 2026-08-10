@@ -22992,6 +22992,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static readonly BUSINESS_OVERVIEW_MAX_CHARS = 2500;
   private static readonly ICP_SECTION_MAX_CHARS = 6000;
   private static readonly COMPETITOR_LOOKUP_MAX = 50;
+  private static readonly LOOKUP_NAME_MAX_CHARS = 120;
+  private static readonly LOOKUP_BLOCK_MAX_CHARS = 3000;
 
   // Rendered separately from formatMarketStrategy so its true cost can be
   // measured BEFORE the competitor budgets are allocated (ENG-945 / Greptile):
@@ -23152,11 +23154,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       marketResult.competitorLookup;
     if (lookup && lookup.length > 0) {
       formattedSummary += `<strong>🔎 Competitor check — already stored?</strong><br>`;
-      lookup.forEach((entry) => {
-        formattedSummary += entry.stored
-          ? `• <strong>${entry.name}</strong>: ALREADY STORED at offset ${entry.offset} — do NOT add it again.<br>`
-          : `• <strong>${entry.name}</strong>: not stored — safe to add.<br>`;
-      });
+      // Names are unbounded on write AND in the request, so the block is bounded
+      // by characters as well as by entry count — otherwise the answer could
+      // swallow the response it is rendered in front of.
+      let lookupChars = 0;
+      let rendered = 0;
+      for (const entry of lookup) {
+        const name = this.truncateWithNotice(String(entry.name), AgentModeService.LOOKUP_NAME_MAX_CHARS);
+        const line = entry.stored
+          ? `• <strong>${name}</strong>: ALREADY STORED at offset ${entry.offset} — do NOT add it again.<br>`
+          : `• <strong>${name}</strong>: not stored — safe to add.<br>`;
+        if (rendered > 0 && lookupChars + line.length > AgentModeService.LOOKUP_BLOCK_MAX_CHARS) break;
+        formattedSummary += line;
+        lookupChars += line.length;
+        rendered++;
+      }
+      if (rendered < lookup.length) {
+        formattedSummary += `<strong>⚠️ ${lookup.length - rendered} further answer(s) omitted here</strong> — re-ask about those names in a smaller batch; do NOT assume they are absent.<br>`;
+      }
       const notChecked: number = marketResult.competitorNamesNotChecked || 0;
       if (notChecked > 0) {
         formattedSummary += `<strong>⚠️ ${notChecked} further requested name(s) were NOT checked</strong> (only ${AgentModeService.COMPETITOR_LOOKUP_MAX} names are checked per call). Do NOT assume those are absent — call read_market_strategy again with the remaining names before adding any of them.<br>`;
@@ -23189,6 +23204,9 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       (typeof competitor === 'object' && competitor && competitor.name) ? competitor.name : String(competitor);
     const inWindow = (index: number) => index >= detailStart && index < detailEnd;
     const nameOnlyCount = competitors.filter((_, index) => !inWindow(index)).length;
+    // How many stored competitors this response could not even name. Tracked so
+    // the closing note cannot claim completeness the body does not deliver.
+    let unnamedCount = 0;
     const pagingHints = marketResult.pagingHints !== false;
     const nameIndexBudget = typeof marketResult.nameIndexCharBudget === 'number'
       ? marketResult.nameIndexCharBudget
@@ -23223,6 +23241,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           listed++;
         }
         const unlisted = nameOnly.slice(listed);
+        unnamedCount = unlisted.length;
 
         if (pagingHints) {
           // Lead with the random-access affordance, not the next page: every entry
@@ -23271,13 +23290,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     // name-only tail, a second call is the supported way to read the rest —
     // unless the caller has no tools to call, in which case say nothing about
     // tools at all.
-    const closingNote = !pagingHints
-      ? (nameOnlyCount > 0
-        ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above; ${nameOnlyCount} of them by name only. Nothing is missing.`
-        : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete.`)
-      : (nameOnlyCount > 0
-        ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above, but ${nameOnlyCount} of them are shown by name only. Nothing is missing. To read any of those in full, call read_market_strategy again with competitorOffset set to the offset shown beside the name.`
-        : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`);
+    // The note must describe what the body actually delivered. Claiming "every
+    // competitor is listed above" while the index omitted some is the same
+    // false-completeness signal ENG-945 was filed for.
+    const closingNote = unnamedCount > 0
+      ? (pagingHints
+        ? `<br><br><strong>⚠️ Note:</strong> This account stores ${competitors.length} competitors. ${unnamedCount} of them are NOT named anywhere in this response — nothing has been deleted, this response is simply size-bounded. Do NOT conclude a competitor is absent because it does not appear here: call read_market_strategy with competitorNames: ["Name"] to check a specific one, or competitorOffset to page through the rest.`
+        // Prompt-embedded caller: state the shortfall, but never name a tool it
+        // cannot call — the same rule the rest of this path follows.
+        : `<br><br><strong>⚠️ Note:</strong> This account stores ${competitors.length} competitors. ${unnamedCount} of them are NOT named anywhere in this response — nothing has been deleted, this response is simply size-bounded. Do not conclude a competitor is absent because it does not appear here.`)
+      : !pagingHints
+        ? (nameOnlyCount > 0
+          ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above; ${nameOnlyCount} of them by name only. Nothing is missing.`
+          : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete.`)
+        : (nameOnlyCount > 0
+          ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above, but ${nameOnlyCount} of them are shown by name only. Nothing is missing. To read any of those in full, call read_market_strategy again with competitorOffset set to the offset shown beside the name.`
+          : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`);
 
     if (!clamp) return formattedSummary + closingNote;
 
