@@ -199,14 +199,35 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     expect(mockS3Delete).toHaveBeenCalledWith(
       expect.objectContaining({ Key: OWN_ASSET_KEY })
     );
-    expect(mockUpdateOrg).toHaveBeenCalledWith(
-      "org-1",
+    // The pruned list is written to the record that holds it — the owner's —
+    // not promoted onto the org.
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      "me",
       expect.objectContaining({
         brandGuidelines: expect.objectContaining({
           attachments: [expect.objectContaining({ key: OWN_LOGO_KEY })],
         }),
       })
     );
+  });
+
+  it("does NOT promote the owner's brand onto the org when deleting an asset", async () => {
+    // Writing the pruned copy to the org would populate a record that was
+    // deliberately empty: reads would stop falling back, so the owner's later
+    // brandData edits would silently stop reaching the org. Deleting one asset
+    // must not fork the brand.
+    const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "me",
+      shareSettings: { brandGuidelines: { editors: [] }, marketingStrategy: { editors: [] } },
+    });
+
+    const res = await del(orgUser, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
   });
 
   it("prunes the OWNER's source record too, so no dangling reference survives", async () => {
@@ -283,10 +304,10 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
   });
 
   it("aborts without destroying anything when the owner's source prune fails", async () => {
-    // Greptile P1: this used to be caught and warned. The S3 object and the org
-    // reference were already gone by then, so the endpoint reported success and
-    // left the owner pointing at a destroyed object. Pruning the source FIRST
-    // turns the only likely failure into a clean, fully retryable abort.
+    // Greptile P1: this used to be caught and warned. The S3 object was already
+    // gone by then, so the endpoint reported success and left the owner pointing
+    // at a destroyed object. The record write now happens first and uncaught, so
+    // the only likely failure is a clean, fully retryable abort.
     const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
     mockDynamoGet.mockResolvedValue({ Item: editor });
     mockGetOrgById.mockResolvedValue({
@@ -313,7 +334,7 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     expect(mockUpdateOrg).not.toHaveBeenCalled();
   });
 
-  it("orders the writes source → org → S3 so no record outlives its object", async () => {
+  it("orders the record write before the S3 delete, so no record outlives its object", async () => {
     const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
     mockDynamoGet.mockResolvedValue({ Item: editor });
     mockGetOrgById.mockResolvedValue({
@@ -333,11 +354,12 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     const res = await del(editor, OWN_ASSET_KEY);
 
     expect(res.status).toBe(200);
+    // Exactly one record write, and it lands before the object is destroyed.
+    expect(mockUpdateUser).toHaveBeenCalledTimes(1);
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
     const [ownerPrune] = mockUpdateUser.mock.invocationCallOrder;
-    const [orgWrite] = mockUpdateOrg.mock.invocationCallOrder;
     const [s3Delete] = mockS3Delete.mock.invocationCallOrder;
-    expect(ownerPrune).toBeLessThan(orgWrite);
-    expect(orgWrite).toBeLessThan(s3Delete);
+    expect(ownerPrune).toBeLessThan(s3Delete);
   });
 
   it("still reports success when only the S3 delete fails", async () => {
