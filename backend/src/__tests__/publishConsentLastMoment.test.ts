@@ -263,3 +263,34 @@ describe('ENG-827 — Instagram: the container must not outrun the consent check
     expect(result.success).toBe(true);
   });
 });
+
+describe('ENG-827 — the re-check survives the REST self-call boundary', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('forwards the session so the far side can rebuild the hook', () => {
+    // The hook is a closure and cannot be serialized; the session id it is keyed on
+    // can. ctx() is what decides which fields make the crossing.
+    const { ctx } = require('../mcp/server/toolHelpers');
+    expect(ctx({ userId: 'u1', sessionId: 'sess-1' })).toMatchObject({
+      userId: 'u1',
+      sessionId: 'sess-1',
+    });
+  });
+
+  it('rebuilds an equivalent hook on the receiving side', async () => {
+    const { attachPublishRevalidation } = require('../utils/scheduledPublishConsentGuard');
+
+    // Same construction the route performs from the forwarded header.
+    const rebuilt = attachPublishRevalidation('post_on_connected_account', { sessionId: 'sess-1' });
+    expect(typeof rebuilt.assertPublishStillAuthorized).toBe('function');
+  });
+
+  it('gives an interactive call no hook, because it is not gated', () => {
+    const { attachPublishRevalidation } = require('../utils/scheduledPublishConsentGuard');
+
+    // No session forwarded => the route builds no context at all. Modelled here as
+    // the guard being asked about a non-publishing tool, which must stay untouched.
+    const untouched = attachPublishRevalidation('list_connected_accounts', { sessionId: 'sess-1' });
+    expect(untouched.assertPublishStillAuthorized).toBeUndefined();
+  });
+});

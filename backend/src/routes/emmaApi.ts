@@ -8,6 +8,7 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
+import { attachPublishRevalidation } from '../utils/scheduledPublishConsentGuard';
 
 const router = Router();
 
@@ -295,10 +296,34 @@ router.post('/linkedin-outreach', async (req: Request, res: Response) => {
   }
 });
 
+/**
+ * ENG-827: rebuild the scheduled run's publish re-check on the far side of a self-call.
+ *
+ * The hook is a closure, so it cannot cross an HTTP boundary — only the session id it
+ * is keyed on can. `attachPublishRevalidation` remakes the identical hook here, which
+ * means the adapters re-read live consent immediately before the write no matter which
+ * side of the boundary the tool call started on.
+ */
+function buildScheduledPublishContext(req: Request): any {
+  const sessionId = req.header('X-AgentWeb-Session');
+  if (!sessionId) return undefined;
+  return attachPublishRevalidation('post_on_connected_account', { sessionId });
+}
+
 router.post('/post-on-account', async (req: Request, res: Response) => {
   try {
     const svc = await getAgentModeService();
-    const result = await svc.postOnConnectedAccount(userId(req), req.body.account_id, req.body.content, req.body.media_urls || []);
+    // ENG-827 (Greptile, security): the caller checked consent before making this
+    // self-call, but the irreversible work — media upload, Instagram's container,
+    // YouTube's transfer — happens here, minutes later. Rebuild the run's re-check
+    // hook from the session it forwarded so the adapters bind the write to consent
+    // as it stands at the write. No session header means an ordinary interactive
+    // call, which is not gated and gets no hook.
+    const toolContext = buildScheduledPublishContext(req);
+    const result = await svc.postOnConnectedAccount(
+      userId(req), req.body.account_id, req.body.content, req.body.media_urls || [],
+      undefined, toolContext
+    );
     res.json(result);
   } catch (err: any) {
     res.status(500).json({ message: err.message });
