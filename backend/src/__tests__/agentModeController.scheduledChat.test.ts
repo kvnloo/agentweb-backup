@@ -1053,6 +1053,10 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(note).toBeDefined();
         expect(note![1].content).not.toMatch(/pick up where this run left off/i);
         expect(note![1].content).toMatch(/NOT been retried automatically/i);
+        // Greptile P1: a failed marker write leaves the schedule active with no
+        // resume marker, so its next fire could repeat the publish. That must not
+        // be silent just because we took the resume branch.
+        expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalled();
       });
 
       // Nothing may claim an action we cannot confirm — the owner alert is

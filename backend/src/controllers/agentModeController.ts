@@ -3799,19 +3799,24 @@ export async function runScheduledChat(
             console.error(`Failed to requeue-as-resume zero-output scheduled chat ${schedule.scheduleId}:`, requeueError);
           }
         } else {
-          // Cannot continue safely and must not restart. Stopping here is the least-bad
-          // option, but it would otherwise be SILENT — the owner is told so a part-done
-          // run cannot masquerade as a finished one.
+          // Cannot continue safely and must not restart.
           console.error(
             `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
-            + `(${publishedActions.join('; ')}) and is not safely resumable; NOT requeuing — notifying owner.`
+            + `(${publishedActions.join('; ')}) and is not safely resumable; NOT requeuing.`
           );
-          if (!isTest) {
-            await notifyScheduleOwnerOfFailure(schedule, userId, {
-              failedAttempts: zeroOutputNextRetryCount,
-              failureClass: classifyZeroAssistantFailure(error),
-            });
-          }
+        }
+
+        // Keyed on what ACTUALLY happened, not on which branch we took (Greptile P1).
+        // A resume marker that failed to persist leaves the schedule active with no
+        // marker, so its next ordinary fire starts a FRESH session and can repeat the
+        // publish. That path used to only log. Whenever the run did not actually
+        // resume — unresumable transcript OR failed marker write — the work may
+        // already have gone out and nothing will continue it, so the owner is told.
+        if (!publishedRunDidResume && !isTest) {
+          await notifyScheduleOwnerOfFailure(schedule, userId, {
+            failedAttempts: zeroOutputNextRetryCount,
+            failureClass: classifyZeroAssistantFailure(error),
+          });
         }
         // Outcome settled — now the transcript can state it truthfully.
         if (sessionId) {
