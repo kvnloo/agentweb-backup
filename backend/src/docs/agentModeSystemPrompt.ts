@@ -742,16 +742,13 @@ COMPLETION GATE (before final output):
 SURFACE GAPS AS ACTIONABLE ITEMS:
 - In your final report, surface every blocked or skipped item as a clear, actionable item the user can act on (e.g. "Connect Harsha's LinkedIn so we can research his guests next run"). Never bury or omit a gap — make the remaining action explicit.${publishAuthorization === 'unknown'
   ? ''
-  : publishAuthorization === 'authorized'
+  : publishAuthorization === 'authorized' && authorizedPublishTools && authorizedPublishTools.length > 0
   ? `
 
 PUBLISH AUTHORIZATION — this schedule is PRE-AUTHORIZED to publish (CRITICAL):
-- The owner has not required approval before publishing on this schedule, so publishing IS authorized for this run. That standing setting IS the human approval — the "review with the user and get explicit approval before publishing" gate that the social tools mention is therefore ALREADY SATISFIED. Do NOT seek additional sign-off and do NOT withhold the publish because no human is present.
-- When the task's goal is to publish (e.g. post the approved content to a connected LinkedIn / X / Instagram / YouTube account), you MUST call the publishing tool that performs it. Drafting the content or saving it to the knowledge base alone is NOT completion — the run only succeeds once the post is actually published.${authorizedPublishTools && authorizedPublishTools.length > 0
-  ? `
-- This schedule specifically requires ${authorizedPublishTools.join(' and ')}, so that call in particular must happen.`
-  : ''}
-- The authorization does not waive any NON-publishing limit: volume caps, spend, and destructive operations are governed by their own rules and are unaffected.
+- The owner explicitly authorized unattended publishing for this schedule and approved ${authorizedPublishTools.join(' and ')} for it. That standing consent IS the human approval — the "review with the user and get explicit approval before publishing" gate that the social tools mention is therefore ALREADY SATISFIED for this run. Do NOT seek additional sign-off and do NOT withhold the publish because no human is present.
+- When the task's goal is to publish (e.g. post the approved content to a connected LinkedIn / X / Instagram / YouTube account), you MUST call ${authorizedPublishTools.join(' / ')} to actually publish it. Drafting the content or saving it to the knowledge base alone is NOT completion — the run only succeeds once the post is actually published.
+- The authorization covers ONLY ${authorizedPublishTools.join(' and ')}. Any OTHER publishing tool is NOT authorized by it — draft and notify for those instead. It also does not waive any non-publishing limit: volume caps, spend, and destructive operations are governed by their own rules and are unaffected.
 - Treat a required-tool nudge to call the publishing tool as the authorized instruction it is and execute it; declining an authorized publish on safety/approval grounds is the exact failure this authorization exists to prevent.`
   : `
 

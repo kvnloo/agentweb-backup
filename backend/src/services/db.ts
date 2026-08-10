@@ -3067,13 +3067,20 @@ export const scheduleDb = {
       // my behalf". Settable ONLY by the owner — deliberately absent from the
       // manage_scheduled_chat MCP allowlist so the model can neither grant itself
       // publishing authority nor silence its own publishing. Default off (= publish).
-      // ENG-827 reads this SAME field — it is the one and only unattended-publish
-      // consent signal. ENG-827 briefly carried an opt-IN twin (`autopublishAuthorized`),
-      // which collided head-on: both gates sat on the dispatch path, so a publish had
-      // to satisfy an opt-out AND an opt-in that no existing row could have, denying
-      // every schedule in production. Verified on the preview, then removed. Do not
-      // reintroduce a second field — extend this one.
+      // ENG-803: owner's explicit hold. Outranks any grant below — an owner who asked
+      // to review stays reviewing.
       requirePublishApproval?: boolean;
+      // ENG-827: AFFIRMATIVE consent to publish unattended to a live connected account
+      // without the owner seeing the content first. Absence is NOT consent. Settable
+      // only by the owner (portal checkbox / owner-only endpoint); the MCP surface can
+      // REVOKE it but never grant it.
+      autopublishAuthorized?: boolean;
+      // ENG-827: the publish tools the owner approved when consenting. Consent is bound
+      // to THIS list, so a later edit to requiredFunctionCalls cannot re-scope it onto a
+      // tool they never saw. An empty list authorizes nothing.
+      autopublishAuthorizedTools?: string[];
+      autopublishAuthorizedAt?: string | null;
+      autopublishAuthorizedBy?: string | null;
       promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;

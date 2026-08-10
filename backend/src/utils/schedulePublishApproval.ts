@@ -103,10 +103,21 @@ export interface SchedulePublishApprovalInput {
 export function resolvePublishAuthorized(
   schedule?: SchedulePublishApprovalInput | null
 ): boolean {
-  // No record => we cannot confirm the owner's choice => do not take the
-  // irreversible action. See the two-absences note above.
-  if (!schedule) return false;
-  return schedule.requirePublishApproval !== true;
+  // ENG-827: ONE resolver for both gates. This check runs in executeTool and the
+  // registry guard runs immediately after, so two independent readings of the same
+  // setting could — and did — disagree: one ordering the model to publish while the
+  // other refused it. Delegating removes that possibility by construction.
+  //
+  // NOTE THE POLARITY CHANGE from ENG-803 as originally shipped. Absence of an opt-out
+  // no longer means authorized; publishing now requires the owner's affirmative,
+  // tool-scoped consent. The reasoning is in schedulePublishAuthorization.ts, along with
+  // the migration that MUST run before this deploys — without it, every schedule that
+  // publishes today stops.
+  //
+  // A missing record still resolves to false, for ENG-803's original reason: absence of
+  // a RECORD is not absence of an answer, and withholding is the recoverable error.
+  const { resolveSchedulePublishAuthorization } = require('./schedulePublishAuthorization');
+  return resolveSchedulePublishAuthorization(schedule).authorized === true;
 }
 
 /**

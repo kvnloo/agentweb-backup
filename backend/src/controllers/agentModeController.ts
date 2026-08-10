@@ -7994,13 +7994,8 @@ export const agentModeController = {
       const { scheduleId } = req.params;
       const { authorized } = req.body || {};
 
-      if (authorized !== false) {
-        return res.status(403).json({
-          error:
-            'This endpoint can only REVOKE unattended publishing (send { "authorized": false }). ' +
-            'Turning it back on is done by the owner on the schedule form — it means posts go out ' +
-            'without anyone seeing them first, so it is not grantable through the API.',
-        });
+      if (typeof authorized !== 'boolean') {
+        return res.status(400).json({ error: 'Invalid body: `authorized` must be a boolean' });
       }
 
       const schedule = await scheduleDb.getScheduleById(scheduleId);
@@ -8008,26 +8003,56 @@ export const agentModeController = {
         return res.status(404).json({ error: 'Scheduled chat not found' });
       }
 
-      // Written on its own, never as part of a larger body: a partial SET expression
-      // touching this key alone cannot be clobbered by a concurrent generic update.
+      // GRANTING is the owner's decision and nobody else's. A delegated admin session
+      // acts as the customer everywhere else in this API, but it must not be able to
+      // hand out this one — the whole point is that a specific human accepted that
+      // posts go out unseen under their name. Revoking stays open to delegation: it
+      // only ever makes a schedule safer.
+      if (authorized && (req as any).delegateInfo?.isDelegated) {
+        return res.status(403).json({
+          error:
+            'Unattended publishing can only be enabled by the account owner themselves, not from a ' +
+            'delegated session. Ask them to turn on "Publish without my review" on the schedule.',
+        });
+      }
+
+      // Consent is bound to the tools the owner could see when they gave it, so a grant
+      // needs a designated publishing tool. Without one the scope is unknown, and an
+      // unknown scope would either authorize nothing (a silent no-op that looks like it
+      // worked) or everything (a mandate they never gave).
+      const approvedTools = getRequiredPublishTools(schedule.requiredFunctionCalls);
+      if (authorized && approvedTools.length === 0) {
+        return res.status(400).json({
+          error:
+            'This schedule does not require a publishing tool, so there is nothing to authorize. ' +
+            'Add the publishing tool this schedule should use (e.g. post_on_connected_account) to its ' +
+            'required functions first — consent is recorded against the specific tool it covers.',
+        });
+      }
+
       await scheduleDb.updateSchedule(scheduleId, {
-        requirePublishApproval: true,
+        autopublishAuthorized: authorized,
+        autopublishAuthorizedTools: authorized ? approvedTools : [],
+        autopublishAuthorizedAt: authorized ? new Date().toISOString() : null,
+        autopublishAuthorizedBy: authorized ? user.userId : null,
         updatedAt: new Date().toISOString(),
       } as any);
 
       console.log(
-        `AgentMode: ENG-827 publish consent REVOKED for schedule ${scheduleId} by user ${user.userId}.`
+        `AgentMode: ENG-827 publish consent ${authorized ? 'GRANTED' : 'REVOKED'} for schedule ` +
+        `${scheduleId} by user ${user.userId}${authorized ? ` (tools: ${approvedTools.join(', ')})` : ''}.`
       );
 
       res.json({
-        requirePublishApproval: true,
-        message:
-          'This schedule will now draft content and tell you what is waiting, instead of publishing ' +
-          'to your connected accounts. Turn it back on from the schedule form when you want it to publish again.',
+        autopublishAuthorized: authorized,
+        autopublishAuthorizedTools: authorized ? approvedTools : [],
+        message: authorized
+          ? 'This schedule will now publish to your connected accounts without showing you the content first.'
+          : 'This schedule will now draft content and tell you what is waiting, instead of publishing.',
       });
     } catch (error) {
-      console.error('AgentMode: Revoke scheduled chat publish consent error:', error);
-      res.status(500).json({ error: 'Failed to revoke publish consent' });
+      console.error('AgentMode: Set scheduled chat publish consent error:', error);
+      res.status(500).json({ error: 'Failed to update publish consent' });
     }
   },
 
