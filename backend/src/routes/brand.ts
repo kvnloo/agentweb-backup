@@ -679,6 +679,7 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     // Delete the S3 object LAST, once every record has stopped pointing at it.
     // A failure here leaks bytes; a failure with this ordering reversed strands
     // a reference to a key that no longer resolves, which is what the UI renders.
+    let objectDeleted = true;
     if (s3Key) {
       try {
         await s3
@@ -688,12 +689,29 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
           })
           .promise();
       } catch (s3Error) {
-        console.warn("Failed to delete from S3:", s3Error);
-        // The records are already updated — a stale object is not worth failing on.
+        // Still not worth failing the request on — the reference is already
+        // gone, which is what the caller asked for, and re-adding it would be
+        // worse. But do not call this a clean delete: the bytes survive at a
+        // URL that still resolves, so someone holding that link can keep
+        // fetching an asset the UI reports as deleted. Say so instead of
+        // warning into a log nobody reads.
+        objectDeleted = false;
+        console.error(
+          `[BRAND] Asset dereferenced but its S3 object survives and stays retrievable: ${s3Key}`,
+          s3Error
+        );
       }
     }
 
-    res.json({ message: "Asset deleted successfully" });
+    res.json(
+      objectDeleted
+        ? { message: "Asset deleted successfully", objectDeleted: true }
+        : {
+            message:
+              "Asset removed from your brand guidelines, but the stored file could not be deleted and may still be reachable by direct link.",
+            objectDeleted: false,
+          }
+    );
   } catch (error) {
     console.error("[BRAND DEBUG] Error deleting brand asset:", error);
     res.status(500).json({ error: "Failed to delete brand asset" });
