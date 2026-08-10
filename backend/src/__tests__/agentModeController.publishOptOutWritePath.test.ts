@@ -194,41 +194,45 @@ describe('updateScheduledChat keeps the publish-approval setting partial-update 
     );
   });
 
-  it('preserves an existing approval requirement when an unrelated edit omits it', async () => {
-    // e.g. renaming the schedule must not silently start publishing.
+  // ENG-827 (Greptile): an omitting update must write NOTHING for this key.
+  //
+  // It previously copied the value forward from `existingSchedule`, which reads as
+  // "preserve" but is a read-modify-write. This field decides whether an unattended
+  // run may post publicly, so the race is not academic: an owner who switches the
+  // hold ON between this handler's read and its write has it silently reverted to OFF
+  // by an unrelated edit — a rename re-enabling publishing they had just stopped.
+  // `updateSchedule` builds a PARTIAL SET expression, so omitting the key is what
+  // actually preserves the stored value, race and all.
+  it('writes NO publish key at all when an unrelated edit omits it', async () => {
     mockScheduleDb.getScheduleById.mockResolvedValue(existingSchedule(true) as never);
 
     await agentModeController.updateScheduledChat(updateReq({}), mockRes());
 
-    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
-      SCHEDULE_ID,
-      expect.objectContaining({ requirePublishApproval: true })
-    );
+    const written = mockScheduleDb.updateSchedule.mock.calls[0][1] as Record<string, unknown>;
+    expect('requirePublishApproval' in written).toBe(false);
   });
 
-  it('does not invent an approval requirement when an unrelated edit omits it', async () => {
+  it('writes no publish key for a schedule that currently publishes either', async () => {
+    // Same rule in the other direction: absence of the key is the answer regardless
+    // of the stored value, so no read is ever echoed back.
     mockScheduleDb.getScheduleById.mockResolvedValue(existingSchedule(false) as never);
 
     await agentModeController.updateScheduledChat(updateReq({}), mockRes());
 
-    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
-      SCHEDULE_ID,
-      expect.objectContaining({ requirePublishApproval: false })
-    );
+    const written = mockScheduleDb.updateSchedule.mock.calls[0][1] as Record<string, unknown>;
+    expect('requirePublishApproval' in written).toBe(false);
   });
 
-  it('leaves a legacy schedule that predates the field PUBLISHING', async () => {
-    // Every schedule created before this PR: the attribute simply is not there.
-    // It must resolve to false (publish), which is what those schedules do today.
+  it('leaves a legacy schedule that predates the field untouched', async () => {
+    // Every schedule created before ENG-803: the attribute simply is not there, and
+    // an unrelated edit must not materialize it.
     const legacy = { ...existingSchedule(false) } as Record<string, unknown>;
     delete legacy.requirePublishApproval;
     mockScheduleDb.getScheduleById.mockResolvedValue(legacy as never);
 
     await agentModeController.updateScheduledChat(updateReq({}), mockRes());
 
-    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
-      SCHEDULE_ID,
-      expect.objectContaining({ requirePublishApproval: false })
-    );
+    const written = mockScheduleDb.updateSchedule.mock.calls[0][1] as Record<string, unknown>;
+    expect('requirePublishApproval' in written).toBe(false);
   });
 });
