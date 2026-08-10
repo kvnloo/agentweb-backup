@@ -171,3 +171,46 @@ test('a scan error anywhere fails safe to null (age unknown → keep)', () => {
     rm(d, { recursive: true, force: true });
   }
 });
+
+// Greptile P1 (2026-08-10, third review): a write landing AFTER the age scan but before
+// rmSync was silently destroyed — the scan and the removal were not atomic. The fix is a
+// quarantine rename (atomic barrier: post-rename writers fail loudly with ENOENT) plus an
+// age re-check on the quarantined tree; any write inside the scan→rename window bumps
+// mtime and the dir is restored untouched.
+import { quarantineIfStillAged } from '../gc.mjs';
+import { existsSync as ex, renameSync } from 'node:fs';
+
+test('quarantineIfStillAged removes-eligible old tree: renamed to quarantine, path returned', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-q-'));
+  const t = join(d, 'wt');
+  mkdirSync(t);
+  try {
+    wf(join(t, 'f.txt'), 'x');
+    const old = (Date.now() - 30 * 86400000) / 1000;
+    utimesSync(join(t, 'f.txt'), old, old);
+    utimesSync(t, old, old);
+    const q = quarantineIfStillAged(t, 14);
+    assert.ok(q && q !== t, 'expected a quarantine path');
+    assert.ok(!ex(t), 'original path must be gone (atomic barrier)');
+    assert.ok(ex(q), 'quarantined tree must exist for deletion');
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
+test('quarantineIfStillAged restores and keeps a tree that turned fresh after the first scan', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-q-'));
+  const t = join(d, 'wt');
+  mkdirSync(t);
+  try {
+    wf(join(t, 'f.txt'), 'x'); // fresh write — simulates a writer racing the earlier scan
+    const q = quarantineIfStillAged(t, 14);
+    assert.equal(q, null, 'fresh tree must not be reaped');
+    assert.ok(ex(t), 'tree must be restored to its original path');
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
+test('quarantineIfStillAged fails safe to keep when the rename itself races (dir gone)', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-q-'));
+  try {
+    assert.equal(quarantineIfStillAged(join(d, 'never-existed'), 14), null);
+  } finally { rm(d, { recursive: true, force: true }); }
+});

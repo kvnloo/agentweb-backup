@@ -10,7 +10,7 @@
 //     `gcUnresolvedMaxAgeDays` (scratch dirs like `tsc-heap` otherwise leak forever).
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, rmSync, statSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
@@ -138,16 +138,40 @@ export function scanNewestMtime(WT) {
 // invisible to a single pass. Two passes bound that window — a write during pass 1
 // is visible to pass 2 (which starts after it), so age only counts when both
 // passes agree the tree is old. Any unknown → keep.
-export function ageDaysOf(WT) {
+export function newestStableMtime(WT) {
   const first = scanNewestMtime(WT);
   if (first === null) return null;
   const second = scanNewestMtime(WT);
   if (second === null) return null;
-  return Math.floor((Date.now() - Math.max(first, second)) / 86400000);
+  return Math.max(first, second);
+}
+export function ageDaysOf(WT) {
+  const newest = newestStableMtime(WT);
+  if (newest === null) return null;
+  // An mtime can land marginally ahead of Date.now() (filesystem timestamp
+  // rounding) — a negative age is just "fresh", never propagate it below 0.
+  return Math.max(0, Math.floor((Date.now() - newest) / 86400000));
 }
 
-function removeWorktree(id) {
-  const WT = path.join(worktreesDir, id);
+// The age scan and the removal are not atomic: a write landing after the last scan pass
+// but before rmSync would be silently destroyed. renameSync is the atomic barrier — once
+// the dir is quarantined, a writer using the original path fails loudly with ENOENT
+// instead of writing into a tree mid-deletion. Re-checking age on the quarantined tree
+// closes the scan→rename window: any write in that window bumps an mtime, the re-check
+// sees it, and the dir is restored untouched. Returns the quarantine path to delete, or
+// null to keep (tree restored, or rename itself raced → nothing to do).
+export function quarantineIfStillAged(WT, minAgeDays) {
+  const q = `${WT}.gc-quarantine`;
+  try { renameSync(WT, q); } catch { return null; }
+  const age = ageDaysOf(q);
+  if (age === null || age <= minAgeDays) {
+    try { renameSync(q, WT); } catch (e) { console.error('[gc] restore from quarantine failed:', q, e.message); }
+    return null;
+  }
+  return q;
+}
+
+function removeWorktree(id, WT = path.join(worktreesDir, id)) {
   // Stop any running preview for this bug first (services hold files open).
   spawnSync('node', [previewScript, 'down', id], { stdio: 'ignore' });
   // Find the branch (from the root worktree) so we can delete it from each repo.
@@ -185,20 +209,38 @@ async function main() {
     // for transient failures (network/auth/DNS). Only the definitive miss may age out.
     const lookupFailed = !!resolveError && !/not found/i.test(resolveError.message);
 
+    // For an age-based reap, remember the mtime the age was computed FROM so the
+    // final pre-removal check below can prove nothing wrote to the tree since.
+    const ageBased = !issue && !lookupFailed;
+    const baselineMtime = ageBased ? newestStableMtime(WT) : null;
+
     const decision = decideWorktree({
       resolved: !!issue,
       lookupFailed,
       issueStateType: issue?.state?.type,
       issueStateName: issue?.state?.name,
       prCounts,
-      ageDays: issue || lookupFailed ? null : ageDaysOf(WT),
+      ageDays:
+        baselineMtime === null ? null : Math.floor((Date.now() - baselineMtime) / 86400000),
       unresolvedMaxAgeDays: UNRESOLVED_MAX_AGE_DAYS,
       doneTypes: DONE_TYPES,
     });
 
     if (decision.action === 'remove') {
+      let target = WT;
+      if (ageBased) {
+        // A re-scan alone still leaves a scan→rm window. Quarantine-rename is the
+        // atomic barrier: post-rename writers fail loudly with ENOENT, and the age
+        // re-check on the quarantined tree catches any write that landed before it.
+        const q = quarantineIfStillAged(WT, UNRESOLVED_MAX_AGE_DAYS);
+        if (!q) {
+          log(`${id}: activity detected at removal time (quarantine re-check) → keep`);
+          continue;
+        }
+        target = q;
+      }
       log(`${id}: ${decision.reason} → removing worktree`);
-      removeWorktree(id);
+      removeWorktree(id, target);
       for (const k of Object.keys(state)) if (state[k].identifier === id) delete state[k];
       removed++;
     } else {
