@@ -30,6 +30,9 @@ import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoa
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+// ENG-1002: the anonymized-hit rule lives in one place so the import tool and
+// the outreach-onboarding prospect preview cannot drift apart.
+import { isAnonymizedSearchLead } from '../utils/anonymizedLinkedInLead';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -873,23 +876,6 @@ function buildFindReason(filters: {
   return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
 }
 
-/**
- * ENG-1002: LinkedIn anonymizes out-of-network people-search hits — the result
- * comes back named "LinkedIn Member" with no resolvable public identifier.
- * Mapped naively, that becomes a CRM lead with firstName="LinkedIn",
- * lastName="Member", no email and no profile URL: useless for outreach, and
- * (having neither an email nor a LinkedIn URL) invisible to batchCreateLeads'
- * dedup, so a recurring search re-creates it on every run.
- *
- * Returns true for such a result, plus for any hit that carries neither a name
- * nor a profile URL — same reasoning, nothing to persist and nothing to dedup
- * on. A hit with a real name is kept even when it has no URL.
- */
-function isAnonymizedSearchLead(lead: { firstName?: string; lastName?: string; linkedin?: string }): boolean {
-  const fullName = `${lead.firstName ?? ''} ${lead.lastName ?? ''}`.trim().replace(/\s+/g, ' ');
-  if (/^linkedin\s+member$/i.test(fullName)) return true;
-  return !fullName && !lead.linkedin;
-}
 
 /**
  * ENG-182: extract a LinkedIn public identifier from a profile URL, e.g.
