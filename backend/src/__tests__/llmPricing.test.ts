@@ -169,6 +169,10 @@ describe('llmPricing', () => {
   });
 
   describe('getModelPrice', () => {
+    it('returns null for gemini-3-pro-preview — retired 2026-03-09, removed from the registry by ENG-744 (ENG-750)', () => {
+      expect(getModelPrice('gemini-3-pro-preview')).toBeNull();
+    });
+
     it('returns the price entry for a known model', () => {
       const price = getModelPrice('anthropic.claude-sonnet-4-6');
       expect(price).not.toBeNull();
