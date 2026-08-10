@@ -7,6 +7,7 @@
 import {
   __resetUnipileSearchParamServiceForTesting,
   UnipileSearchParamService,
+  NEGATIVE_CACHE_EPOCH_MS,
   type UnipileSearchParamHttpClient,
   type UnipileSearchParamCacheStore,
 } from '../services/unipileSearchParamService';
@@ -214,6 +215,86 @@ describe('UnipileSearchParamService.resolve', () => {
       await svc.resolve('acct1', { type: 'COMPANY', keywords: 'X' });
 
       expect(probe).not.toHaveBeenCalled();
+    });
+
+    // The write-side guard only protects rows written from now on. Rows already
+    // in the table were written with the OLD 24h negative TTL, during the very
+    // outage this PR is about — so on deploy day the cache still holds up to a
+    // day of outage empties that every account reads as settled truth. A cache
+    // hit returns before the write guard can run, so they have to be ignored on
+    // READ, once, rather than waited out.
+    it('ignores a negative row written before the guard existed and re-resolves it', async () => {
+      const http = makeHttp({
+        searchParameters: jest.fn().mockResolvedValue({ items: [{ id: '14', title: 'Hospital & Health Care' }] }),
+      });
+      const store = makeStore();
+      store.get = jest.fn().mockResolvedValue({
+        canonicalId: 'x', fieldGroup: 'y', cacheType: 'unipile_search_param',
+        rawData: null, status: 'not_found',
+        expiresAt: Math.floor(Date.now() / 1000) + 86400,
+        fetchedAt: new Date(NEGATIVE_CACHE_EPOCH_MS - 60_000).toISOString(),
+      });
+      const svc = makeService(http, store, jest.fn().mockResolvedValue('ok'));
+
+      const result = await svc.resolve('acct-healthy', { type: 'INDUSTRY', keywords: 'hospital health care' });
+
+      expect(http.searchParameters).toHaveBeenCalledTimes(1);
+      expect(result.fromCache).toBe(false);
+      expect(result.candidates).toEqual([{ id: '14', title: 'Hospital & Health Care', subtitle: undefined }]);
+    });
+
+    it('still trusts a negative row written after the guard existed', async () => {
+      const http = makeHttp({ searchParameters: jest.fn() });
+      const store = makeStore();
+      store.get = jest.fn().mockResolvedValue({
+        canonicalId: 'x', fieldGroup: 'y', cacheType: 'unipile_search_param',
+        rawData: null, status: 'not_found',
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+        fetchedAt: new Date(NEGATIVE_CACHE_EPOCH_MS + 60_000).toISOString(),
+      });
+      const svc = makeService(http, store);
+
+      const result = await svc.resolve('acct1', { type: 'COMPANY', keywords: 'NonexistentCo' });
+
+      expect(http.searchParameters).not.toHaveBeenCalled();
+      expect(result.fromCache).toBe(true);
+      expect(result.candidates).toEqual([]);
+    });
+
+    // Only negatives are suspect. A hit is a global LinkedIn entity id and stays
+    // valid for its full 30 days — re-resolving those would throw away the cache.
+    it('still trusts a successful row written before the guard existed', async () => {
+      const http = makeHttp({ searchParameters: jest.fn() });
+      const store = makeStore();
+      store.get = jest.fn().mockResolvedValue({
+        canonicalId: 'x', fieldGroup: 'y', cacheType: 'unipile_search_param',
+        rawData: { candidates: [{ id: '1441', title: 'Microsoft' }] }, status: 'hit',
+        expiresAt: Math.floor(Date.now() / 1000) + 30 * 86400,
+        fetchedAt: new Date(NEGATIVE_CACHE_EPOCH_MS - 86_400_000).toISOString(),
+      });
+      const svc = makeService(http, store);
+
+      const result = await svc.resolve('acct1', { type: 'COMPANY', keywords: 'Microsoft' });
+
+      expect(http.searchParameters).not.toHaveBeenCalled();
+      expect(result.fromCache).toBe(true);
+      expect(result.candidates).toHaveLength(1);
+    });
+
+    it('treats a negative row with no usable timestamp as pre-guard', async () => {
+      const http = makeHttp({ searchParameters: jest.fn().mockResolvedValue({ items: [] }) });
+      const store = makeStore();
+      store.get = jest.fn().mockResolvedValue({
+        canonicalId: 'x', fieldGroup: 'y', cacheType: 'unipile_search_param',
+        rawData: null, status: 'not_found',
+        expiresAt: Math.floor(Date.now() / 1000) + 86400,
+        fetchedAt: 'not-a-date',
+      });
+      const svc = makeService(http, store, jest.fn().mockResolvedValue('ok'));
+
+      await svc.resolve('acct1', { type: 'COMPANY', keywords: 'NonexistentCo' });
+
+      expect(http.searchParameters).toHaveBeenCalledTimes(1);
     });
 
     it('caches the empty as before when no probe is wired', async () => {
