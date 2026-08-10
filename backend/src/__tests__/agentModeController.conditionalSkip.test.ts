@@ -254,6 +254,18 @@ describe('scheduledRunSignalsConditionalSkip', () => {
     const tableClean = tableFailure.replace('<td>Failed</td><td>1</td>', '<td>Failed</td><td>0</td>');
     expect(scheduledRunSignalsConditionalSkip(tableClean, { now: THURSDAY, toolCalls: [], instruction })).toBe(true);
 
+    // ...and PUNCTUATION between the label and its own count must not smuggle the
+    // failure past the lookahead (Greptile P1): "Succeeded 0 Failed, 1" binds the 1
+    // to "Failed" exactly as the whitespace form does.
+    [',', ';', ' |', ' -', ':', ' —'].forEach((sep) => {
+      const punctuated = `Today is a non-publishing day per the Mon/Wed/Fri cadence. Skipping. Succeeded 0 Failed${sep} 1`;
+      expect([sep, scheduledRunSignalsConditionalSkip(punctuated, { now: THURSDAY, toolCalls: [], instruction })]).toEqual([sep, false]);
+      // The same shape with a ZERO count stays a clean skip — the widened separator
+      // class must not turn every punctuated ledger into a veto.
+      const clean = punctuated.replace(/1$/, '0');
+      expect([sep, scheduledRunSignalsConditionalSkip(clean, { now: THURSDAY, toolCalls: [], instruction })]).toEqual([sep, true]);
+    });
+
     // Asserted failures worded as skips are still rejected regardless of ledger shape.
     ['The post failed to publish.', 'auth failed.', 'I could not access LinkedIn.'].forEach((tail) =>
       expect(scheduledRunSignalsConditionalSkip(`Non-publishing day, skipped. ${tail}`, { now: THURSDAY, toolCalls: [], instruction })).toBe(false)
