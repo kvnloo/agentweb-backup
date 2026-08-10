@@ -463,6 +463,44 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(res.formattedContent).toContain('400');
   });
 
+  // Greptile P1 (round 2): per-section budgets do not compose into a total bound.
+  // A large business overview or ICP eats the same 20,000-char response, so the
+  // competitor sections must shrink to fit the room that is actually left rather
+  // than spending a fixed budget on top of it.
+  it('shrinks the competitor sections when the ICP consumes the response budget', async () => {
+    const small = marketStrategyWith(makeCompetitors(49), 200);
+    const huge = marketStrategyWith(makeCompetitors(49), 14000);
+
+    userDb.getUserById.mockResolvedValue(asUser(small));
+    const withSmallIcp = await svc.readMarketStrategy('u1');
+    userDb.getUserById.mockResolvedValue(asUser(huge));
+    const withHugeIcp = await svc.readMarketStrategy('u1');
+
+    expect(withHugeIcp.competitorsWithFullDetail)
+      .toBeLessThan(withSmallIcp.competitorsWithFullDetail);
+    // Still never empty, and the truth about the roster survives.
+    expect(withHugeIcp.competitorsWithFullDetail).toBeGreaterThan(0);
+    expect(withHugeIcp.totalCompetitors).toBe(49);
+    expect(withHugeIcp.formattedContent).toContain('49 total');
+  });
+
+  it('keeps the whole tool response within the context cap when it can', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(200, 'Many', 900), 6000)));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+    expect(res.totalCompetitors).toBe(200);
+  });
+
+  it('does not let the aggregate bound starve the prompt-embedded floor', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49), 14000)));
+
+    const res = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 40, pagingHints: false } as any);
+
+    expect(res.competitorsWithFullDetail).toBe(40);
+  });
+
   it('exposes competitorOffset on the tool schema so the model can actually ask for it', async () => {
     require('../emma/tools');
     const { emmaToolRegistry } = require('../emma/registry');
