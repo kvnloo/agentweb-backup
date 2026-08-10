@@ -124,9 +124,14 @@ const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
  * that case, and the requeue is suppressed alongside it.
  */
 function zeroAssistantPublishedMessage(actions: string[], willResume: boolean): string {
-  const landed =
-    'This scheduled run stopped before it could report back — but it did not stop before doing the work: it '
-    + `${actions.join('; ')}. That is live and saved. `;
+  // No action names means the run's ledger could not be read (Greptile P1). Say that
+  // plainly rather than inventing a list or, worse, implying nothing happened — the
+  // whole point of this branch is that something may well have gone out.
+  const landed = actions.length > 0
+    ? 'This scheduled run stopped before it could report back — but it did not stop before doing the work: it '
+      + `${actions.join('; ')}. That is live and saved. `
+    : 'This scheduled run stopped before it could report back, and I could not confirm how far it got — '
+      + 'some of its work may already have gone out. ';
   return willResume
     // Resuming continues the same session from its last settled step, so the rest of
     // the task finishes without repeating what already went out.
@@ -471,14 +476,19 @@ interface DiagnosisResult {
 async function loadPublishLedger(
   sessionId: string,
   baseline?: Record<string, number> | null,
-): Promise<FalseFailureLedgerEntry[]> {
+): Promise<FalseFailureLedgerEntry[] | null> {
   try {
-    const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
+    const session = await chatbotDb.getChatSession(sessionId);
     return ledgerFromSucceededFunctions(
       diffSucceededFunctions(baseline, session?.calledFunctions || null),
     );
   } catch {
-    return [];
+    // NULL means UNKNOWN, and that is deliberately not the same as "nothing was
+    // published" (Greptile P1). Collapsing the two let a failed read on the
+    // scheduled path restart a run from scratch and repeat a production publish.
+    // Callers that only annotate a message may treat null as empty; the caller that
+    // decides whether to RE-RUN work must not.
+    return null;
   }
 }
 
@@ -3674,9 +3684,17 @@ export async function runScheduledChat(
       // arrive far too late. Read the ledger first; it decides both the message and
       // whether the requeue happens at all. A read failure yields no actions and
       // every existing behaviour is preserved.
-      const publishedActions = sessionId
-        ? collectConfirmedPublishActions(await loadPublishLedger(sessionId, runStartCalledFunctions))
+      const publishLedgerForRun = sessionId
+        ? await loadPublishLedger(sessionId, runStartCalledFunctions)
         : [];
+      // A read failure is UNKNOWN, not "nothing happened" (Greptile P1). Restarting
+      // the task from scratch on an unknown can repeat a production publish, so an
+      // unknown is handled exactly like a confirmed one: never restart, prefer resume.
+      const publishLedgerUnknown = publishLedgerForRun === null;
+      const publishedActions = publishLedgerForRun
+        ? collectConfirmedPublishActions(publishLedgerForRun)
+        : [];
+      const mayHavePublished = publishedActions.length > 0 || publishLedgerUnknown;
 
       // Work landed this run, so there are three options and only one is good.
       // A blind requeue restarts from scratch and REPUBLISHES it. Simply not
@@ -3689,7 +3707,7 @@ export async function runScheduledChat(
       const zeroOutputNextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
       let willResumePublishedRun = false;
       if (
-        publishedActions.length > 0
+        mayHavePublished
         && !isTest
         && sessionId
         && zeroOutputNextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES
@@ -3721,7 +3739,7 @@ export async function runScheduledChat(
         // outcome knows which is true — the resume wording would be a lie if the
         // requeue write then failed. This is the very failure class this issue is
         // about, so the message must never run ahead of the fact.
-        const incompleteMessage = publishedActions.length > 0
+        const incompleteMessage = mayHavePublished
           ? null
           : zeroAssistantIncompleteMessage(error);
         if (incompleteMessage) try {
@@ -3754,7 +3772,7 @@ export async function runScheduledChat(
       });
 
       let publishedRunDidResume = false;
-      if (publishedActions.length > 0) {
+      if (mayHavePublished) {
         if (willResumePublishedRun) {
           // Requeue AS A RESUME: same session, continued from its last settled step.
           const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(zeroOutputNextRetryCount)).toISOString();
@@ -5433,7 +5451,7 @@ export const agentModeController = {
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            publishLedger = await loadPublishLedger(sessionId, turnStartCalledFunctions);
+            publishLedger = (await loadPublishLedger(sessionId, turnStartCalledFunctions)) || [];
             diagnosticContent = appendConfirmedPublishNotice(
               'The server restarted while processing your request. Please send your message again.',
               publishLedger,
@@ -6202,7 +6220,7 @@ export const agentModeController = {
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
         if (!(error instanceof Error && isContextLimitError(error))) {
           if (error instanceof Error && isWorkerShutdownError(error)) {
-            publishLedger = await loadPublishLedger(shareId, turnStartCalledFunctions);
+            publishLedger = (await loadPublishLedger(shareId, turnStartCalledFunctions)) || [];
             diagnosticContent = appendConfirmedPublishNotice(
               'The server restarted while processing your request. Please send your message again.',
               publishLedger,

@@ -1154,8 +1154,12 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         expect(requeue).toBeDefined();
       });
 
-      it('still requeues when the session read fails (no ledger, old behaviour)', async () => {
+      // Greptile P1. A FAILED ledger read is UNKNOWN, not "nothing was published".
+      // This test previously asserted the old behaviour — restart from scratch — which
+      // is exactly how a completed production publish would get repeated.
+      it('does not restart from scratch when the ledger read fails', async () => {
         (mockChatbotDb.getChatSession as jest.Mock).mockRejectedValue(new Error('DynamoDB timeout'));
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
         mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
 
         await runScheduledChat(
@@ -1164,9 +1168,31 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           false
         );
 
-        expect(
-          mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantRetryCount === 1)
-        ).toBeDefined();
+        // No fresh-start requeue…
+        const restart = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1 && !c[1]?.pendingResumeSessionId
+        );
+        expect(restart).toBeUndefined();
+        // …and the owner is told, so an unknown outcome is never silent.
+        expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalled();
+      });
+
+      it('says it could not confirm progress rather than naming work it never read', async () => {
+        (mockChatbotDb.getChatSession as jest.Mock).mockRejectedValue(new Error('DynamoDB timeout'));
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note![1].content).toMatch(/could not confirm how far it got/i);
+        expect(note![1].content).not.toMatch(/no results were generated/i);
       });
     });
 
