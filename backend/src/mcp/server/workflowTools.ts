@@ -72,9 +72,9 @@ mcpToolRegistry.register({
       'Give Emma a marketing goal in plain language and she plans and executes it end to end — campaigns, content, research, outreach. ' +
       'Use this when none of the more specific emma_* tools fits the request. ' +
       'Starts a new task unless you pass task_id to continue an existing one. ' +
-      'Usually returns the finished result directly (status "complete"). Poll emma_get_task_result ' +
-      'when status is "running" or "unconfirmed" — "unconfirmed" means the result is real but we could ' +
-      'not verify Emma is not waiting on you. Answer with emma_answer_question when status is "awaiting_input".',
+      'Usually returns the finished result directly (status "complete"). If status is "running" or "unconfirmed", ' +
+      'call emma_get_session with session_id set to the returned task_id — "unconfirmed" means the result is real but we could not verify ' +
+      'Emma is not waiting on you. Answer with emma_answer_question when status is "awaiting_input".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -177,98 +177,15 @@ mcpToolRegistry.register({
       next: pending
         ? 'Emma is waiting on an answer. Use emma_answer_question — a plain message abandons the question.'
         : stillBuilding
-          ? 'Emma detached into a longer build. Poll emma_get_task_result with this task_id.'
+          ? 'Emma detached into a longer build. Call emma_get_session with session_id set to this task_id — a session showing no activity is not proof it finished (ENG-1015).'
           : confirmationFailed
-            ? 'The result above is real, but the follow-up check failed, so it is unconfirmed — Emma may be awaiting an answer. Call emma_get_task_result to see.'
+            ? 'The result above is real, but the follow-up check failed, so it is unconfirmed — Emma may be awaiting an answer. Call emma_get_session with session_id set to this task_id to check.'
             : undefined,
     });
   },
 });
 
-// ─── 2. Collect the result ──────────────────────────────────────────────────
-
-mcpToolRegistry.register({
-  name: 'emma_get_task_result',
-  requiresUserAccount: true,
-  definition: {
-    name: 'emma_get_task_result',
-    description:
-      'Check on an Emma task that is still running and get its latest output. ' +
-      'Needed when emma_run_marketing_task returned status "running" or "unconfirmed" — a "complete" ' +
-      'status already carries a verified finished result, so polling it adds nothing.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        task_id: { type: 'string', description: 'The task_id from emma_run_marketing_task.' },
-      },
-      required: ['task_id'],
-    },
-  },
-  execute: async (args: any, context: any) => {
-    const data: any = await mcpFetch({
-      method: 'GET',
-      path: `/api/agent-mode/session/${args?.task_id}`,
-      context: ctx(context),
-    });
-
-    const messages = Array.isArray(data?.messages) ? data.messages : [];
-    const last = messages.length ? messages[messages.length - 1] : undefined;
-
-    // A ChatSession has NO top-level `status` field, so reading one would report
-    // "unknown" forever. Derive it from what the session actually carries, in
-    // this order:
-    //   1. a pendingUserQuestion means Emma is blocked on the caller
-    //   2. hasActiveProgress means an agent iteration is still running — this
-    //      MUST outrank the transcript, because a multi-iteration run emits
-    //      intermediate assistant messages, and treating one as "idle" makes a
-    //      client stop polling while Emma is still working
-    //   3. only then does the last speaker tell us whether she has replied
-    const pending = data?.pendingUserQuestion;
-    const active = data?.hasActiveProgress === true;
-
-    // Only two states can be PROVEN, and we refuse to assert the third.
-    //
-    //   awaiting_input  pendingUserQuestion is persisted on the session, so it
-    //                   is true regardless of which instance answers the poll.
-    //   running         hasActiveProgress is true on THIS instance.
-    //
-    // Absence of progress is NOT proof of completion: `progressStore` is an
-    // in-process Map (utils/sseProgress.ts), so a poll served by a different
-    // instance than the one running the task sees false while work continues.
-    // Calling that "finished" would make a client stop polling mid-run, so the
-    // response says plainly that completion is unconfirmed and how to check.
-    //
-    // A durable terminal status DOES exist — `markRunTerminal` writes it to the
-    // `AW-AgentRuns` table (services/agentMode/runStore.ts) — but no REST route
-    // exposes it, so a tool that reaches the backend over mcpFetch cannot read
-    // it. Exposing it is the fix that makes a detached run confirmable; see
-    // ENG-1015. Until then this path is honestly unconfirmed
-    // rather than falsely terminal. The common case does not depend on it:
-    // emma_run_marketing_task confirms completion at submission, because
-    // /api/agent-mode/generate is synchronous unless it detaches.
-    const status = pending ? 'awaiting_input' : active ? 'running' : 'idle';
-    const completionConfirmed = pending || active ? true : false;
-
-    return jsonResult({
-      task_id: args?.task_id,
-      status,
-      // Machine-readable honesty: `idle` never means "provably done".
-      completion_confirmed: completionConfirmed,
-      latest_output: last?.content ?? null,
-      message_count: messages.length,
-      // Surfaced deliberately: a blocking question answered with a plain message
-      // is abandoned rather than answered, so the caller needs to see it.
-      awaiting_question: pending ?? null,
-      next: pending
-        ? 'Emma is waiting on an answer. Use emma_answer_question — a plain message abandons the question.'
-        : status === 'idle'
-          ? 'No active iteration was observed, but progress tracking is per-instance so this is not proof the task finished. If the output looks incomplete, poll again: a higher message_count means it was still running.'
-          : undefined,
-    });
-  },
-});
-
-// ─── 3. Live web research ───────────────────────────────────────────────────
+// ─── 2. Live web research ───────────────────────────────────────────────────
 
 mcpToolRegistry.register({
   name: 'emma_research',
@@ -303,7 +220,7 @@ mcpToolRegistry.register({
   },
 });
 
-// ─── 4. Account status ──────────────────────────────────────────────────────
+// ─── 3. Account status ──────────────────────────────────────────────────────
 
 mcpToolRegistry.register({
   name: 'emma_get_account_status',
@@ -326,7 +243,7 @@ mcpToolRegistry.register({
   },
 });
 
-// ─── 5. What Emma knows about this company ──────────────────────────────────
+// ─── 4. What Emma knows about this company ──────────────────────────────────
 
 mcpToolRegistry.register({
   name: 'emma_get_brand_profile',
@@ -366,7 +283,7 @@ mcpToolRegistry.register({
   },
 });
 
-// ─── 6. Build a targeted lead list ──────────────────────────────────────────
+// ─── 5. Build a targeted lead list ──────────────────────────────────────────
 
 mcpToolRegistry.register({
   name: 'emma_find_leads',
@@ -405,7 +322,6 @@ mcpToolRegistry.register({
 /** Names registered by this layer — exported so tests can assert the set. */
 export const WORKFLOW_TOOL_NAMES = [
   'emma_run_marketing_task',
-  'emma_get_task_result',
   'emma_research',
   'emma_get_account_status',
   'emma_get_brand_profile',
