@@ -91,6 +91,14 @@ export interface UnipileSearchParamCacheStore {
 export interface UnipileSearchParamServiceDeps {
   http: UnipileSearchParamHttpClient;
   store: UnipileSearchParamCacheStore;
+  /**
+   * ENG-975 people-search capability canary, injected rather than imported so
+   * this file stays free of the Unipile SDK. Consulted only when the API
+   * returns an empty candidate list, to decide whether that empty is a fact
+   * about the query or an artifact of an account that cannot search at all.
+   * Optional: with no probe wired, negative caching behaves as it always has.
+   */
+  probeSearchCapability?: (accountId: string) => Promise<'ok' | 'degraded' | 'unknown'>;
 }
 
 // ─── TTLs ────────────────────────────────────────────────────────────────────
@@ -212,6 +220,46 @@ export class UnipileSearchParamService {
     });
     const candidates = normalizeCandidates(apiResp);
     const isEmpty = candidates.length === 0;
+
+    // ENG-975: the cache key is (type, keywords) with no account in it. That is
+    // correct for a hit — a LinkedIn entity id is global, so every account that
+    // resolves 'hospital health care' deserves the same id — but it makes an
+    // empty dangerous. When an account has lost people-search capability this
+    // endpoint empties too, so caching THAT empty publishes one account's outage
+    // to every other account as a settled "no such entity", and a healthy
+    // account reading it never calls the API to find out otherwise.
+    //
+    // So confirm the empty before sharing it. Only a definite 'degraded' skips
+    // the write: an indeterminate probe proves nothing (ENG-281's rule), and
+    // treating it as degraded would drop legitimate negatives whenever the probe
+    // itself is flaky. Nothing is written on the skip, so the next caller for
+    // these keywords simply asks the API again.
+    if (isEmpty && this.deps.probeSearchCapability) {
+      const capability = await this.deps.probeSearchCapability(accountId);
+      if (capability === 'degraded') {
+        enrichLog.warn({
+          event: 'unipile_param_negative_cache_skipped',
+          type: input.type,
+          normalizedKeywords,
+          reason: 'account people-search degraded',
+        });
+        return this.finalize(
+          {
+            canonicalId: key.canonicalId,
+            fieldGroup: key.sk,
+            cacheType: 'unipile_search_param',
+            rawData: null,
+            status: 'not_found',
+            expiresAt: 0,
+            fetchedAt: new Date().toISOString(),
+          },
+          false,
+          'api',
+          input,
+          normalizedKeywords,
+        );
+      }
+    }
 
     const row: UnipileSearchParamCacheRow = {
       canonicalId: key.canonicalId,
