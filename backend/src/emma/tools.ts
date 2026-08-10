@@ -1948,13 +1948,13 @@ emmaToolRegistry.register({
   requiresUserAccount: true,
   definition: {
     name: 'read_market_strategy',
-    description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set. Every stored competitor is always listed, but full descriptions are returned one page at a time; competitors outside the current page appear by name with a bracketed offset. Entries shown by name only are NOT missing — never re-add them. To read their descriptions, call again with competitorOffset (the response returns nextCompetitorOffset for the next page).',
+    description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set. The response is size-bounded: full competitor descriptions come one page at a time, further competitors are listed by name with a bracketed offset where space allows, and on a very large roster some stored competitors are NOT named at all (the response says how many). totalCompetitors is always the true stored count. NEVER conclude a competitor is absent because it does not appear in the response — before adding any competitor, verify with competitorNames, which answers stored/not-stored regardless of what this page shows. Use competitorOffset (or the returned nextCompetitorOffset) to read further descriptions.',
     inputSchema: {
       type: 'object',
       properties: {
         competitorOffset: {
           type: 'number',
-          description: 'Optional 0-based index of the first competitor to return with its full description. As many competitors as fit the page budget are returned in full from there; the rest are returned by name. Defaults to 0. Pass the offset printed in brackets beside a name-only competitor to read that entry in full, or the nextCompetitorOffset value from a previous response to read the next page.'
+          description: 'Optional 0-based index of the first competitor to return with its full description. As many competitors as fit the page budget are returned in full from there; further ones are listed by name where space allows. Defaults to 0. Pass the offset printed in brackets beside a name-only competitor to read that entry in full, or the nextCompetitorOffset value from a previous response to read the next page.'
         },
         competitorNames: {
           type: 'array',
