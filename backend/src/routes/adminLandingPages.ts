@@ -198,6 +198,20 @@ router.post("/:id/org-share", async (req: Request, res: Response) => {
         }
         const reread = await orgDb.getOrgById(ownerOrgId);
         if (!reread) return res.status(404).json({ message: "Owner organization not found" });
+        // The conflicting writer may have removed a member we validated
+        // before the first attempt (departed-member cleanup). Re-applying the
+        // grant from the stale resolved list would silently restore their
+        // editor entry, so revalidate membership against the fresh org.
+        const freshMembers = (await orgDb.getOrgMembers(ownerOrgId)) as UserRecordLike[];
+        const freshMemberIds = new Set(freshMembers.map((m) => m.userId));
+        const departed = resolved.filter((m) => !freshMemberIds.has(m.userId));
+        if (departed.length > 0) {
+          return res.status(409).json({
+            message: `Organization membership changed concurrently — no longer members: ${departed
+              .map((m) => m.email ?? m.userId)
+              .join(", ")}`,
+          });
+        }
         currentOrg = reread;
       }
     }

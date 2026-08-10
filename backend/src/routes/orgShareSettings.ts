@@ -67,29 +67,21 @@ router.patch("/", async (req, res) => {
 
     // Guarded write: this route replaces the whole shareSettings document
     // from client input, so an overlapping writer (grant, cleanup) must fail
-    // the conditional write rather than be silently overwritten. On conflict,
-    // re-read and re-apply the analytics back-fill against the fresh state.
-    const MAX_ATTEMPTS = 5;
-    let toWrite = validated;
-    let currentOrg = org;
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await orgDb.updateShareSettings(user.orgId, toWrite, currentOrg?.updatedAt);
-        break;
-      } catch (writeError: any) {
-        if (writeError?.code !== "ConditionalCheckFailedException" || attempt >= MAX_ATTEMPTS - 1) {
-          throw writeError;
-        }
-        currentOrg = await orgDb.getOrgById(user.orgId);
-        if (incoming && typeof incoming === "object" && req.body?.shareSettings?.analytics === undefined) {
-          toWrite = {
-            ...toWrite,
-            analytics: currentOrg?.shareSettings?.analytics ?? { enabled: false, editors: [] },
-          };
-        }
+    // the conditional write rather than be silently overwritten. A conflict
+    // means the client's snapshot is stale — retrying it server-side would
+    // erase the concurrent writer's change, so surface 409 and let the
+    // client re-read and resubmit against fresh state.
+    try {
+      await orgDb.updateShareSettings(user.orgId, validated, org?.updatedAt);
+    } catch (writeError: any) {
+      if (writeError?.code === "ConditionalCheckFailedException") {
+        return res.status(409).json({
+          message: "Share settings were changed by another request — reload and try again",
+        });
       }
+      throw writeError;
     }
-    return res.json({ shareSettings: toWrite });
+    return res.json({ shareSettings: validated });
   } catch (e) {
     console.error("Error updating org share-settings:", e);
     return res.status(500).json({ message: "Failed to update share-settings" });

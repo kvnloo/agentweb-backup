@@ -84,6 +84,22 @@ describe("PATCH /api/orgs/me/share-settings", () => {
     expect(mockUpdateShareSettings).toHaveBeenCalledWith("org-1", expect.any(Object), undefined);
   });
 
+  it("returns 409 on a concurrent-write conflict without retrying the stale document", async () => {
+    mockGetUserById.mockResolvedValueOnce({ userId: "u-1", orgId: "org-1", orgRole: "owner" });
+    mockGetOrgById.mockResolvedValueOnce({ orgId: "org-1", updatedAt: "2026-08-10T15:00:00.000Z" });
+    mockGetOrgMembers.mockResolvedValueOnce([{ userId: "u-1" }, { userId: "u-2" }]);
+    mockUpdateShareSettings.mockRejectedValueOnce(
+      Object.assign(new Error("conditional check failed"), { code: "ConditionalCheckFailedException" })
+    );
+
+    const res = await request(makeApp("u-1"))
+      .patch("/api/orgs/me/share-settings").send(validBody);
+    expect(res.status).toBe(409);
+    // Blind-retrying the client's stale full document would erase the
+    // concurrent writer's change — the write must happen exactly once.
+    expect(mockUpdateShareSettings).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects editors who are not org members with 400", async () => {
     mockGetUserById.mockResolvedValueOnce({ userId: "u-1", orgId: "org-1", orgRole: "owner" });
     mockGetOrgById.mockResolvedValueOnce({ orgId: "org-1" });

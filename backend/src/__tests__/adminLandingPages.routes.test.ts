@@ -326,6 +326,33 @@ describe("POST /:id/org-share", () => {
     expect(expectedUpdatedAt).toBe("2026-08-10T15:00:00.000Z");
   });
 
+  it("409s when the retried grant targets a member removed by the concurrent writer", async () => {
+    // Departed-member cleanup wins the race: the re-read org no longer lists
+    // the target member. Re-applying the stale grant would silently restore
+    // their editor entry, so the route must fail closed instead.
+    mockGetOrgById
+      .mockResolvedValueOnce(JSON.parse(JSON.stringify(baseOrg)))
+      .mockResolvedValueOnce({
+        ...JSON.parse(JSON.stringify(baseOrg)),
+        updatedAt: "2026-08-10T15:00:00.000Z",
+      });
+    mockGetOrgMembers
+      .mockResolvedValueOnce([ownerUser, memberUser])
+      // Fresh membership after the conflict: the member departed.
+      .mockResolvedValueOnce([ownerUser]);
+    mockUpdateShareSettings.mockRejectedValueOnce(
+      Object.assign(new Error("conditional check failed"), { code: "ConditionalCheckFailedException" })
+    );
+
+    const app = makeApp(admin);
+    const res = await request(app)
+      .post("/api/admin/landing-pages/page-1/org-share")
+      .send({ memberEmails: ["hugo@rankai.ai"] });
+    expect(res.status).toBe(409);
+    expect(mockUpdateShareSettings).toHaveBeenCalledTimes(1);
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
+  });
+
   it("fails loudly when the conditional write keeps losing the race", async () => {
     const conditionalFailure = Object.assign(new Error("conditional check failed"), {
       code: "ConditionalCheckFailedException",
