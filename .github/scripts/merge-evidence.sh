@@ -599,7 +599,7 @@ fi
 # Endpoint first, flags after: every other call in this script passes the
 # endpoint as the first argument, and the test mock dispatches on it.
 changed_files="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
-  --paginate --jq '.[].filename' 2>"${stderr_file}")"
+  --paginate --jq '.[] | .filename, (.previous_filename // empty)' 2>"${stderr_file}")"
 gh_exit=$?
 
 # Fail closed, and as ERROR rather than a verdict: an unreadable diff means the
@@ -701,14 +701,20 @@ fi
 # less. Turning `strict` off is a separate, human decision (ENG-1003); this block
 # is what makes that decision safe to take rather than a silent loss of a gate.
 
-if [ "${pr_merge_state}" = "BEHIND" ]; then
+# The comparison runs UNCONDITIONALLY, not only when mergeStateStatus reads
+# BEHIND. mergeStateStatus reports one dominant state: a PR that is behind AND
+# awaiting a required review reports BLOCKED, not BEHIND, and gating the
+# comparison on the displayed state would let that PR's stale evidence through.
+# `ahead_by` from the compare endpoint is the ground truth for "did the base
+# move"; the displayed state is not consulted at all.
+{
   # GitHub's compare endpoint returns at most this many file entries. A list at
   # the cap may be truncated, and a truncated list cannot prove the ABSENCE of
   # an overlap — which is the only thing this section is allowed to conclude.
   COMPARE_FILE_CAP=300
 
   if [ -z "${base_ref}" ]; then
-    hard_fail "${REPO}#${PR_NUMBER} is BEHIND its base but \`gh pr view\` returned no baseRefName, so the base it is behind cannot be identified and the staleness of the evidence cannot be evaluated."
+    hard_fail "${REPO}#${PR_NUMBER}: \`gh pr view\` returned no baseRefName, so the base cannot be identified and the staleness of the evidence cannot be evaluated."
   fi
 
   # Three dots: GitHub computes the merge base of head and base, then diffs the
@@ -741,12 +747,20 @@ if [ "${pr_merge_state}" = "BEHIND" ]; then
       ;;
   esac
 
+  if [ "${base_ahead}" -eq 0 ]; then
+    log "the base ${base_ref} has not moved since this PR's merge base, so the run at ${head_sha} describes the merge that would land."
+  else
+
   if [ "${base_file_count}" -ge "${COMPARE_FILE_CAP}" ]; then
     verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} is ${base_ahead} commit(s) behind ${base_ref}, and the comparison returned ${base_file_count} files — at or above GitHub's ${COMPARE_FILE_CAP}-file cap, so the list may be truncated and cannot prove this PR's diff is untouched by it. Sync the branch and let CI re-run against the current base."
     exit 3
   fi
 
-  base_files="$(printf '%s' "${compare_json}" | jq -r '(.files // [])[] | .filename' 2>/dev/null)"
+  # Both the current and the pre-rename path participate: a rename on the base
+  # is an edit to the logical file under both names, and matching only the
+  # post-rename path would let "base renamed a file this PR edits under its old
+  # name" through as a false non-overlap.
+  base_files="$(printf '%s' "${compare_json}" | jq -r '(.files // [])[] | .filename, (.previous_filename // empty)' 2>/dev/null)"
   jq_exit=$?
   if [ "${jq_exit}" -ne 0 ]; then
     surface 'compare response (raw)' "${compare_json}"
@@ -774,7 +788,9 @@ if [ "${pr_merge_state}" = "BEHIND" ]; then
   fi
 
   log "base has moved ${base_ahead} commit(s) ahead (${base_file_count} file(s) changed on ${base_ref}), but none of them are files this PR touches, so the run at ${head_sha} still describes the merge that would land."
-fi
+
+  fi
+}
 
 # Acceptance criterion 5: the run is known real, so remaining skips are path
 # filters working correctly. Name them, and label them, so the distinction is

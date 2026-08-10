@@ -1067,14 +1067,39 @@ base_compare "${d}" 400 "$(seq 1 300 | sed 's|^|unrelated/f|; s|$|.ts|')"
 run_gate "${d}"
 check 'ENG-1003: a truncated base file list cannot prove no overlap, so NO_EVIDENCE' 3 'truncat'
 
-# 5. The regression guard for everything else in this file: a PR that is not
-#    behind must not pay for any of the above. No compare call, same verdict as
-#    before ENG-1003 existed.
+# 5. The freshness check keys on `ahead_by`, never on the displayed merge
+#    state: mergeStateStatus reports one dominant state, so a PR that is behind
+#    AND awaiting a required review reads BLOCKED, not BEHIND. A gate that
+#    trusted the label would false-PASS exactly this fixture.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BLOCKED'
+base_compare "${d}" 12 'partner-portal/src/App.tsx'
+run_gate "${d}"
+check 'ENG-1003: a behind base hidden under BLOCKED still fails freshness' 3 'partner-portal/src/App.tsx'
+
+# 5b. A genuinely current PR (compare says the base has not moved) passes, and
+#     an unreadable comparison is now an ERROR for every PR, not only BEHIND
+#     ones — the comparison is the evidence, so its absence fails closed.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'CLEAN'
+base_compare "${d}" 0 ''
+run_gate "${d}"
+check 'ENG-1003: a current base (ahead_by 0) still PASSes' 0 'VERDICT: PASS'
+
 d="$(new_fixture_dir)"
 green_pr "${d}" 'CLEAN'
 printf '9\n' >"${d}/compare_exit"
 run_gate "${d}"
-check 'ENG-1003: a current PR never consults the base comparison at all' 0 'VERDICT: PASS'
+check 'ENG-1003: an unreadable comparison fails closed even when the state reads CLEAN' 4 'ERROR'
+
+# 6. Renames participate under both paths: the base renamed the file this PR
+#    edits, so the overlap only exists via `previous_filename`. Filename-only
+#    projection would false-PASS this.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+printf '%s\n' '{"ahead_by":3,"files":[{"filename":"partner-portal/src/AppRenamed.tsx","previous_filename":"partner-portal/src/App.tsx"}]}' >"${d}/compare.json"
+run_gate "${d}"
+check 'ENG-1003: a base rename of a file this PR edits is caught via previous_filename' 3 'partner-portal/src/App.tsx'
 
 # ---------------------------------------------------------------------------
 # Invariant guard — the discriminator must stay draft-gated ONLY
