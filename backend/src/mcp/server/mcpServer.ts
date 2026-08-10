@@ -18,6 +18,7 @@ import {
   createMcpSessionStore,
 } from './mcpSessionStore';
 import { rehydrateAndServe } from './mcpSessionRehydration';
+import { isAnonymousDiscoveryEnabled, isAnonymouslyPermitted, newAnonymousUserId } from "./anonymousTransport";
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -53,6 +54,18 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
 
   // No token provided at all
   if (!authHeader) {
+    // ENG-984 lazy auth: a stranger may discover the surface before signing up.
+    // Only discovery methods (and, once one ships, an explicitly allowlisted
+    // demo tool) get through — everything else falls to the 401 below, which
+    // carries the WWW-Authenticate challenge a client turns into a Connect card.
+    if (isAnonymousDiscoveryEnabled() && isAnonymouslyPermitted(req.body)) {
+      (req as any)._agentApiUserId = newAnonymousUserId();
+      (req as any)._mcpIsInternal = false;
+      (req as any)._mcpAuthMethod = 'anonymous';
+      (req as any)._mcpClientType = classifyMcpClient({ userAgent: req.get('user-agent') });
+      return next();
+    }
+
     console.error("[MCP] Access denied: Missing Authorization header");
     setMcpAuthChallenge(res, baseUrl);
     return res.status(401).json({
