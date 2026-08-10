@@ -20,6 +20,12 @@ export interface MetaAdsAdSetParams {
   lifetime_budget?: number; // Budget in CENTS (e.g., 5000 = $50.00). Caller must convert.
   start_time?: string;
   end_time?: string;
+  adset_schedule?: Array<{
+    start_minute: number;
+    end_minute: number;
+    days: number[];
+  }>;
+  pacing_type?: ['day_parting'];
   billing_event: string;
   optimization_goal: string;
   bid_strategy?: string;
@@ -1053,6 +1059,10 @@ export class MetaService {
       // Scheduling
       if (params.start_time !== undefined) adSetParams[AdSet.Fields.start_time] = params.start_time;
       if (params.end_time !== undefined) adSetParams[AdSet.Fields.end_time] = params.end_time;
+      // Literal keys are intentional: these fields are accepted by Meta's API but are not
+      // guaranteed to be present on every version of the SDK's AdSet.Fields enum.
+      if (params.adset_schedule !== undefined) adSetParams['adset_schedule'] = params.adset_schedule;
+      if (params.pacing_type !== undefined) adSetParams['pacing_type'] = params.pacing_type;
       if (params.promoted_object !== undefined) adSetParams[AdSet.Fields.promoted_object] = params.promoted_object;
       // Conversion location (ENG-415). Literal key — Meta accepts 'destination_type' directly and it
       // is not guaranteed to exist on the SDK's AdSet.Fields enum across versions. Emitted only when

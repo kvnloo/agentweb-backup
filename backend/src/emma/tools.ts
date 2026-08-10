@@ -954,7 +954,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
                         Optional but WRITABLE on create: bid_strategy (LOWEST_COST_WITHOUT_CAP | LOWEST_COST_WITH_BID_CAP | COST_CAP) and bid_amount.
                         Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
                         bid_amount is REQUIRED for LOWEST_COST_WITH_BID_CAP and COST_CAP, and must be OMITTED for LOWEST_COST_WITHOUT_CAP.
-                        NOT SUPPORTED: dayparting / ad scheduling (adset_schedule, pacing_type). A request for scheduled delivery is REJECTED, not silently ignored — tell the user it must be set in Ads Manager after creation. start_time/end_time are the flight window, not dayparting.
+                        Dayparting: pass adset_schedule with lifetime_budget and end_time. The system sends pacing_type=['day_parting'] automatically. Dayparting cannot use daily_budget or Advantage Campaign Budget. start_time/end_time are the flight window, not the recurring schedule.
   AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
   AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.
@@ -1108,6 +1108,28 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             },
             start_time: { type: "string", description: "ISO 8601 start datetime." },
             end_time: { type: "string", description: "ISO 8601 end datetime. Required with lifetime_budget." },
+            adset_schedule: {
+              type: "array",
+              minItems: 1,
+              items: {
+                type: "object",
+                properties: {
+                  start_minute: { type: "number", description: "Start minute after midnight in the ad account time zone." },
+                  end_minute: { type: "number", description: "End minute after midnight in the ad account time zone." },
+                  days: { type: "array", minItems: 1, items: { type: "number" }, description: "Meta weekday numbers on which this interval runs." }
+                },
+                required: ["start_minute", "end_minute", "days"],
+                additionalProperties: false
+              },
+              description: "Recurring delivery intervals. Requires lifetime_budget and end_time; incompatible with daily_budget and Advantage Campaign Budget."
+            },
+            pacing_type: {
+              type: "array",
+              minItems: 1,
+              maxItems: 1,
+              items: { type: "string", enum: ["day_parting"] },
+              description: "Dayparting pacing mode. The handler sets ['day_parting'] automatically whenever adset_schedule is present."
+            },
             promoted_object: { type: "object", description: "Promoted object (e.g., { page_id: 'ID' } or { pixel_id: 'ID', custom_event_type: 'PURCHASE' })." },
             destination_type: { type: "string", description: "Conversion location for the ad set. Defaults to 'WEBSITE' for website traffic/conversion goals (LINK_CLICKS, LANDING_PAGE_VIEWS, OFFSITE_CONVERSIONS, VALUE) so the ad-level Destination is explicitly set. Pass explicitly for other destinations: 'ON_AD' (instant lead forms), 'MESSENGER', 'APP'." },
 

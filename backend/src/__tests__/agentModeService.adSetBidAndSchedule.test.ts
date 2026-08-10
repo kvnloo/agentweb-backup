@@ -94,52 +94,96 @@ describe('ENG-838 — ad set bid strategy and dayparting must not silently defau
     (metaService.createAdSet as jest.Mock).mockResolvedValue({ id: 'adset_new', name: 'Ad Set' });
   });
 
-  describe('B — dayparting fails loud instead of shipping a 24/7 ad set', () => {
-    it('rejects an adset_schedule request and does not create the ad set', async () => {
+  describe('B — dayparting requires a lifetime budget and reaches Meta intact', () => {
+    const schedule = [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }];
+
+    it('sends the exact schedule and day_parting pacing for a lifetime-budget ad set', async () => {
       const result = await service.createMetaAdsAdSet('user123', {
         ...baseAdSetParams,
-        adset_schedule: [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }]
+        daily_budget: undefined,
+        lifetime_budget: 100,
+        end_time: '2026-09-08T17:00:00.000Z',
+        adset_schedule: schedule
+      });
+
+      expect(result.success).toBe(true);
+      expect(metaService.createAdSet).toHaveBeenCalledWith(
+        '123456789',
+        'mock-access-token',
+        expect.objectContaining({
+          lifetime_budget: 10000,
+          adset_schedule: schedule,
+          pacing_type: ['day_parting']
+        })
+      );
+    });
+
+    it('rejects dayparting with a daily budget and never creates an ad set', async () => {
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...baseAdSetParams,
+        end_time: '2026-09-08T17:00:00.000Z',
+        adset_schedule: schedule
       });
 
       expect(result.success).toBe(false);
-      expect(String(result.error)).toMatch(/dayparting|adset_schedule/i);
-      expect(String(result.error)).toMatch(/not supported/i);
-      // The critical assertion: nothing reached Meta. A silently-24/7 ad set is
-      // worse than no ad set, because it spends money against a schedule the
-      // caller did not choose.
+      expect(String(result.error)).toMatch(/lifetime[_ -]?budget/i);
       expect(metaService.createAdSet).not.toHaveBeenCalled();
     });
 
-    it('rejects dayparting before touching credentials, so no Meta call is made and no auth error masks it', async () => {
-      // The account is NOT connected, so getMetaCredentials would throw its own
-      // auth error. A rejection knowable from the arguments alone must not depend
-      // on account state, and must not cost a token refresh against Meta for a
-      // request we are certain to reject.
-      (userDb.getUserById as jest.Mock).mockResolvedValue({ id: 'user123', connected_accounts: [] });
-
+    it('rejects dayparting without a budget and never creates an ad set', async () => {
       const result = await service.createMetaAdsAdSet('user123', {
         ...baseAdSetParams,
-        adset_schedule: [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }]
+        daily_budget: undefined,
+        end_time: '2026-09-08T17:00:00.000Z',
+        adset_schedule: schedule
       });
 
       expect(result.success).toBe(false);
-      // The dayparting answer, not "Meta Ads account is not connected".
-      expect(String(result.error)).toMatch(/dayparting|adset_schedule/i);
-      expect(String(result.error)).not.toMatch(/not connected/i);
-      // And nothing downstream ran at all.
-      expect(metaService.getCampaign).not.toHaveBeenCalled();
+      expect(String(result.error)).toMatch(/lifetime[_ -]?budget/i);
       expect(metaService.createAdSet).not.toHaveBeenCalled();
     });
 
-    it('rejects a pacing_type day_parting request and does not create the ad set', async () => {
+    it('rejects dayparting without end_time', async () => {
       const result = await service.createMetaAdsAdSet('user123', {
         ...baseAdSetParams,
-        pacing_type: ['day_parting']
+        daily_budget: undefined,
+        lifetime_budget: 100,
+        adset_schedule: schedule
       });
 
       expect(result.success).toBe(false);
-      expect(String(result.error)).toMatch(/dayparting|pacing_type/i);
+      expect(String(result.error)).toMatch(/end_time/i);
       expect(metaService.createAdSet).not.toHaveBeenCalled();
+    });
+
+    it('rejects dayparting on an Advantage Campaign Budget campaign', async () => {
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({
+        id: 'camp_123',
+        objective: 'OUTCOME_TRAFFIC',
+        lifetime_budget: '100000'
+      });
+
+      const result = await service.createMetaAdsAdSet('user123', {
+        ...baseAdSetParams,
+        daily_budget: undefined,
+        lifetime_budget: 100,
+        end_time: '2026-09-08T17:00:00.000Z',
+        adset_schedule: schedule
+      });
+
+      expect(result.success).toBe(false);
+      expect(String(result.error)).toMatch(/lifetime[_ -]?budget/i);
+      expect(String(result.error)).toMatch(/advantage campaign budget/i);
+      expect(metaService.createAdSet).not.toHaveBeenCalled();
+    });
+
+    it('preserves the existing payload when no schedule is provided', async () => {
+      const result = await service.createMetaAdsAdSet('user123', { ...baseAdSetParams });
+
+      expect(result.success).toBe(true);
+      const payload = (metaService.createAdSet as jest.Mock).mock.calls[0][2];
+      expect(payload).not.toHaveProperty('adset_schedule');
+      expect(payload).not.toHaveProperty('pacing_type');
     });
   });
 
@@ -190,8 +234,10 @@ describe('ENG-838 — ad set bid strategy and dayparting must not silently defau
       // and never sets it, which is precisely how the silent default lands.
       expect(block).toMatch(/bid_strategy/);
       expect(block).toMatch(/bid_amount/);
-      // And it must know dayparting will be rejected rather than quietly dropped.
-      expect(block).toMatch(/adset_schedule|dayparting/i);
+      expect(block).toMatch(/adset_schedule/);
+      expect(block).toMatch(/pacing_type/);
+      expect(block).toMatch(/lifetime[_ -]?budget/i);
+      expect(block).not.toMatch(/NOT SUPPORTED: dayparting/i);
     });
   });
 });

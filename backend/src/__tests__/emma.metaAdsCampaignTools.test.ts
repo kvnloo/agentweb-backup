@@ -143,3 +143,26 @@ describe('Meta Ads Emma Tools - get_meta_ads_metrics', () => {
     );
   });
 });
+
+describe('Meta Ads Emma Tools - dayparting contract', () => {
+  it('exposes a constrained dayparting schedule and pacing schema on AD_SET CREATE', () => {
+    const tool = emmaToolRegistry.getTool('call_meta_marketing_api');
+    if (!tool) throw new Error('Tool call_meta_marketing_api not found');
+    const properties = tool.definition.inputSchema.properties.params.properties;
+
+    expect(properties.adset_schedule).toEqual(expect.objectContaining({
+      type: 'array',
+      minItems: 1,
+    }));
+    expect(properties.adset_schedule.items.required).toEqual([
+      'start_minute',
+      'end_minute',
+      'days',
+    ]);
+    expect(properties.pacing_type.items.enum).toEqual(['day_parting']);
+    expect(properties.pacing_type).toEqual(expect.objectContaining({
+      minItems: 1,
+      maxItems: 1,
+    }));
+  });
+});

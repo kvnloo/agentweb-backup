@@ -80,6 +80,8 @@ AdSet.Fields = {
     bid_amount: 'bid_amount',
     start_time: 'start_time',
     end_time: 'end_time',
+    adset_schedule: 'adset_schedule',
+    pacing_type: 'pacing_type',
     promoted_object: 'promoted_object',
 };
 
@@ -276,6 +278,31 @@ describe('MetaService', () => {
 
             const payload = mockCreateAdSet.mock.calls[0][1];
             expect(payload).not.toHaveProperty('destination_type');
+        });
+
+        it('forwards dayparting schedule and pacing to the Meta payload unchanged (ENG-842)', async () => {
+            const mockCreateAdSet = jest.fn().mockResolvedValue({ _data: { id: 'adset_schedule' } });
+            (AdAccount as unknown as jest.Mock).mockImplementation(() => ({
+                createAdSet: mockCreateAdSet,
+            }));
+            const schedule = [{ start_minute: 540, end_minute: 1020, days: [1, 2, 3, 4, 5] }];
+
+            await service.createAdSet(mockAdAccountId, mockAccessToken, {
+                name: 'Scheduled AS',
+                campaign_id: 'c1',
+                billing_event: 'IMPRESSIONS',
+                optimization_goal: 'REACH',
+                targeting: { geo_locations: { countries: ['US'] } },
+                lifetime_budget: 10000,
+                end_time: '2026-09-08T17:00:00.000Z',
+                adset_schedule: schedule,
+                pacing_type: ['day_parting'],
+            });
+
+            expect(mockCreateAdSet.mock.calls[0][1]).toEqual(expect.objectContaining({
+                adset_schedule: schedule,
+                pacing_type: ['day_parting'],
+            }));
         });
 
         it('should update an ad set', async () => {

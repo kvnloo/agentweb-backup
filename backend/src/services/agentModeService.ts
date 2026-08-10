@@ -15746,29 +15746,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async createMetaAdsAdSet(userId: string, args: any): Promise<any> {
     try {
-      // ENG-838: dayparting is not implemented. `MetaAdsAdSetParams` has no
-      // `adset_schedule` and nothing in this codebase ever sends one, so a
-      // scheduled-delivery request used to be dropped in silence and the ad set
-      // shipped 24/7. That is how Open Future Forum spent $1,000 for 2 sign-ups
-      // on 3am impressions. Fail loudly instead: a caller who asked for a
-      // schedule must not receive an always-on ad set and a success message.
-      // Note `start_time`/`end_time` are the flight window, not dayparting, and
-      // stay supported.
-      //
-      // This runs BEFORE getMetaCredentials deliberately. Credential resolution
-      // can refresh a token against Meta and can throw its own auth error, so
-      // resolving first would both make a network call for a request we are
-      // certain to reject and mask a deterministic "not supported" answer behind
-      // an unrelated credential failure. A rejection that is knowable from the
-      // arguments alone should never depend on account state.
-      if (args.adset_schedule !== undefined || args.pacing_type !== undefined) {
-        const requested = args.adset_schedule !== undefined ? 'adset_schedule' : 'pacing_type';
-        throw new Error(
-          `Dayparting is not supported yet, so "${requested}" cannot be honored and this ad set was NOT created. ` +
-          `Creating it anyway would deliver 24/7 against a schedule you did not choose. ` +
-          `Either remove ${requested} and accept continuous delivery, or set the schedule manually in Ads Manager after creation. ` +
-          `Tracked as ENG-838.`
-        );
+      const hasDayparting = args.adset_schedule !== undefined;
+
+      // Reject invalid money/schedule combinations before credential resolution. Besides being
+      // cheaper, this prevents an unrelated auth error from masking a deterministic contract error.
+      if (args.pacing_type !== undefined && !hasDayparting) {
+        throw new Error('pacing_type requires adset_schedule; dayparting cannot run without a schedule.');
+      }
+      if (hasDayparting) {
+        if (!Array.isArray(args.adset_schedule) || args.adset_schedule.length === 0) {
+          throw new Error('adset_schedule must contain at least one dayparting interval.');
+        }
+        if (args.daily_budget !== undefined || args.lifetime_budget === undefined) {
+          throw new Error('Dayparting requires a lifetime_budget and cannot be combined with daily_budget.');
+        }
+        if (!args.end_time) {
+          throw new Error('end_time is required when using dayparting with a lifetime_budget.');
+        }
       }
 
       const { accountId, accessToken } = await this.getMetaCredentials(userId, args.account_id);
@@ -15779,6 +15773,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const campaign = await metaService.getCampaign(accountId, accessToken, args.campaign_id);
       const objective = args.campaign_objective || campaign.objective;
       const campaignHasBudget = !!(campaign.daily_budget || campaign.lifetime_budget);
+
+      if (hasDayparting && campaignHasBudget) {
+        throw new Error(
+          'Dayparting requires an ad-set lifetime_budget and is not compatible with Advantage Campaign Budget.'
+        );
+      }
 
       // 1. Budget Validation — depends on whether campaign has ACB/CBO
       const dailyBudget = args.daily_budget;
@@ -15945,6 +15945,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         bid_amount: toCents(args.bid_amount),
         bid_strategy: strategy // Ensure we use the resolved strategy
       };
+      if (hasDayparting) {
+        // Meta ignores adset_schedule unless pacing_type explicitly opts into day_parting.
+        normalizedParams.pacing_type = ['day_parting'];
+      }
 
       const adSet = await metaService.createAdSet(accountId, accessToken, normalizedParams);
 
