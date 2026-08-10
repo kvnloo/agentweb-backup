@@ -1,6 +1,6 @@
 import { linkedInService } from '../linkedInService';
 import { ConnectedAccount, LinkedInConfig, updateAccountTokens } from '../connectedAccountsDb';
-import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics } from './socialPlatformTypes';
+import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
 import { getLinkedInConfig } from '../../config/integrations';
 
 /**
@@ -75,7 +75,7 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
     }
   }
 
-  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult> {
+  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
     const config = account.config as LinkedInConfig;
     const authorUrn = account.account_id; // Expecting strict URN format stored in DB
 
@@ -100,6 +100,17 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
             failedImageUploads.push({ url, error: errorMsg });
           }
         }
+      }
+
+      // ENG-827: the image uploads above are network round-trips that can take a
+      // while, and the dispatcher's consent check ran BEFORE this method was entered.
+      // Re-check here — the last point at which nothing is public yet. An owner who
+      // revoked during the upload stops the post; an already-uploaded image is an
+      // unreferenced asset, not a publication.
+      const withdrawn = await assertStillAuthorized?.();
+      if (withdrawn) {
+        console.warn('[LinkedInAdapter] ENG-827: abandoning post — publish consent was withdrawn during media upload.');
+        return { success: false, message: withdrawn.error };
       }
 
       // Create post (with or without images)

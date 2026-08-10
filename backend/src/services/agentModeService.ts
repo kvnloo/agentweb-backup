@@ -29130,7 +29130,22 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
 
       console.log('[AgentMode] Calling adapter.createPost (adapter will handle token refresh if needed)...');
-      const result = await adapter.createPost(account, content, mediaUrls, ownerUserId);
+      // ENG-827 (Greptile): the check above is the last moment before ENTERING the
+      // adapter, not before the post becomes real. LinkedIn uploads images and YouTube
+      // downloads then uploads an entire video INSIDE createPost — minutes, on a
+      // decision taken before that work began. Hand the same re-check down so those
+      // adapters can run it immediately before their irreversible request; adapters
+      // that commit straight away (X) need nothing and ignore it.
+      const result = await adapter.createPost(
+        account, content, mediaUrls, ownerUserId,
+        toolContext?.assertPublishStillAuthorized
+      );
+
+      // An adapter that abandoned the post on a withdrawn consent reports it as a
+      // refusal, not a platform failure — the run was stopped deliberately.
+      if (result.success === false) {
+        return { success: false, message: result.message };
+      }
 
       return {
         success: true,
