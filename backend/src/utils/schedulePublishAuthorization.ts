@@ -1,4 +1,5 @@
 import { isPublishName } from './hardeningGaps';
+import { resolvePublishAuthorized, SchedulePublishApprovalInput } from './schedulePublishApproval';
 
 /**
  * ENG-827 — resolving the unattended publish gate.
@@ -10,56 +11,53 @@ import { isPublishName } from './hardeningGaps';
  * to refusing — while the deterministic required-function checker nudges it up to
  * `maxAttempts` (20) times. That is the loop that burned the reported runs.
  *
- * Authorization comes from EXACTLY ONE signal: `autopublishAuthorized`, the dedicated
- * per-schedule consent flag. Its checkbox states in plain words that the run will
- * publish to the live connected account without showing the owner the content first,
- * that posts go live automatically, and that they cannot be un-published. Ticking it
- * is informed consent. Nothing else grants it.
+ * THE SIGNAL IS ENG-803's `requirePublishApproval`, AND ONLY THAT.
+ * ---------------------------------------------------------------
+ * This module originally carried its own opt-IN flag (`autopublishAuthorized`) at the
+ * OPPOSITE polarity. ENG-803 (PR #2260) shipped first, so both gates ended up on the
+ * same dispatch path — `executeTool` runs ENG-803's check and then dispatches through
+ * the tool registry, where this module's guard runs. A publish had to satisfy BOTH,
+ * and because the opt-in flag's only writer was a route that never shipped, the
+ * conjunction was DENY for every schedule in existence. That was verified on the
+ * preview, not merely reasoned about: a default-shaped schedule was told to publish by
+ * ENG-803's live directive and then mechanically refused here, producing a burned run
+ * worse than the bug this ticket reports.
  *
- * Three other signals were tried and each was rejected for the SAME reason — a control
- * whose own wording does not tell the owner that publishing-without-review is what
- * they are agreeing to cannot serve as consent for it:
+ * Two contradictory owner controls cannot both be right, so this one yields. Consent
+ * is now read through `resolvePublishAuthorized` — the single, already-live resolver —
+ * which means:
  *
- *  - `requiredFunctionCalls` naming a publish tool. That picker is a VERIFICATION
- *    control ("this run only counts as successful if it called X") and its UI carries
- *    no approval-waiver language. 5 of the 8 production schedules requiring a publish
- *    tool — including the ACTIVE "LUCAS — LinkedIn Thought Leadership" — would
- *    otherwise have started publishing unreviewed.
+ *  - absence means AUTHORIZED, preserving what scheduled runs have always done. No
+ *    backfill, no migration, and no existing schedule changes behaviour.
+ *  - the owner's control is the OPT-OUT ("Require approval before publishing"). It is
+ *    human-writable only: it is absent from the `manage_scheduled_chat` MCP allowlist,
+ *    so Emma can neither grant herself publishing rights nor silence her own.
+ *  - a schedule that cannot be READ AT ALL still resolves to withheld, because that is
+ *    the recoverable error. Absence of a field is not absence of an answer.
  *
- *  - Approval-waiver wording in the schedule's prompt. Intent inferred from prose is
- *    not consent: the wording is unscoped, so a waiver written about a different step
- *    ("do not ask for approval when generating images") would authorize a live post.
- *    A prose matcher can always be narrowed and will always have another hole.
+ * The rejected-signal list that survives from ENG-827's own review rounds is unchanged
+ * and is restated in schedulePublishApproval.ts: prompt prose, `requiredFunctionCalls`,
+ * and `fullAutonomy` are each NOT consent. Do not reinstate any of them here.
  *
- *  - `fullAutonomy`. It reads "if Emma needs a decision mid-run, she'll proceed with
- *    her recommended option instead of pausing to ask you" — it governs how a blocking
- *    AskUserQuestion is ANSWERED (see ENG-396/ENG-517), not whether a live write may
- *    happen. An owner ticking it consented to Emma picking between options, not to
- *    Emma posting content they never saw. It remains in force for question handling
- *    and is deliberately irrelevant here.
+ * WHAT THIS MODULE STILL ADDS OVER ENG-803's CHECK — none of it is redundant:
  *
- * Everything is fail-closed: an unreadable schedule, a malformed field, or anything
- * short of an explicit true resolves to NOT authorized — the reversible
- * draft-and-notify outcome.
- *
- * Authorization is still reported PER-TOOL: `tools` lists only the publish tools the
- * owner designated, so the directive names exactly those and the required-function
- * checker filters in lockstep.
+ *  - `filterRequiredFunctionsToAuthorizedScope`, so the deterministic checker cannot
+ *    nudge for a publish tool the prompt forbids. That contradiction is what looped
+ *    the reported runs ~21 times; ENG-803 does not touch the checker.
+ *  - admission stamping plus `narrowPublishAuthorization`, so a run keeps the
+ *    permissions it began with: revocation bites mid-run, a mid-run GRANT cannot widen
+ *    a draft-only run into a publishing one.
+ *  - action-scoped classification, so a scheduled analytics read through
+ *    `twitter_manage_post` is not gated while a thread post through the same tool is.
+ *  - enforcement on the MCP registry and client tool-registry paths, which
+ *    `executeTool`'s check alone does not cover.
  */
 
-export interface SchedulePublishAuthorizationInput {
+export interface SchedulePublishAuthorizationInput extends SchedulePublishApprovalInput {
   /**
-   * The ONLY consent signal — the owner ticked "Publish without my review", whose
-   * copy spells out that posts go live unseen and cannot be un-published.
+   * The schedule's current requirements. Bounds what the required-function checker may
+   * nudge for; NEVER grants consent — see the rejected-signal note above.
    */
-  autopublishAuthorized?: boolean;
-  /**
-   * The publish tools the owner could see when they consented, recorded at grant
-   * time. Consent is bound to THIS list: it is not a standing licence that follows
-   * whatever the schedule later requires.
-   */
-  autopublishAuthorizedTools?: string[];
-  /** The schedule's current requirements — narrows scope, never grants consent. */
   requiredFunctionCalls?: string[];
 }
 
@@ -137,7 +135,11 @@ export function getRequiredPublishTools(requiredFunctionCalls?: string[]): strin
 export interface SchedulePublishAuthorization {
   /** True when this schedule carries standing owner authorization to publish unattended. */
   authorized: boolean;
-  /** The exact publish tools the owner required, in declaration order (de-duplicated). */
+  /**
+   * The publish tools this schedule REQUIRES and that the checker may therefore nudge
+   * for, in declaration order (de-duplicated). This is a nudge scope, not the set of
+   * tools publishing is limited to — see the note in `resolveSchedulePublishAuthorization`.
+   */
   tools: string[];
 }
 
@@ -145,49 +147,34 @@ const UNAUTHORIZED: SchedulePublishAuthorization = { authorized: false, tools: [
 
 /**
  * Resolve a schedule's standing publish authorization. Safe on a missing/partial
- * schedule (a failed lookup must never break a run) and defaults, in every
- * ambiguous case, to NOT authorized — the reversible draft-and-notify outcome.
+ * schedule (a failed lookup must never break a run) and defaults, when the schedule
+ * cannot be read at all, to NOT authorized — the reversible draft-and-notify outcome.
+ *
+ * `authorized` DOES NOT DEPEND ON `tools`, and that is deliberate. An earlier version
+ * required a designated publish tool for consent to mean anything, which reads as the
+ * safer rule but is wrong under this polarity: most publishing schedules never name a
+ * publish tool in `requiredFunctionCalls` at all — they just tell Emma to post in the
+ * prompt. Measured on the live table, only 4 of the 25 active publishing-shaped
+ * schedules require one outright. Gating on a non-empty tool list would have refused
+ * the other 21, which is the same deny-by-construction failure this reconciliation
+ * exists to remove, just applied to a subset.
+ *
+ * So the grant is schedule-wide, exactly as ENG-803 already enforces it at
+ * `executeTool`, and `tools` carries only the narrower question of what the
+ * deterministic checker is allowed to demand.
  */
 export function resolveSchedulePublishAuthorization(
   schedule: SchedulePublishAuthorizationInput | null | undefined
 ): SchedulePublishAuthorization {
   if (!schedule) return UNAUTHORIZED;
 
-  const requiredPublishTools = getRequiredPublishTools(schedule.requiredFunctionCalls);
+  // One resolver, shared with ENG-803's `executeTool` gate. Two independent readings
+  // of the same owner setting is precisely how the polarity collision arose, so the
+  // boolean is never recomputed here.
+  const authorized = resolvePublishAuthorized(schedule);
+  if (!authorized) return UNAUTHORIZED;
 
-  // Consent is bound to the scope it was granted for. `autopublishAuthorizedTools`
-  // is the list the owner could see when they ticked the box; anything the schedule
-  // requires LATER is outside what they approved. Without this, editing
-  // requiredFunctionCalls after a grant would silently re-scope standing consent
-  // onto tools the owner never saw — e.g. a consent for post_on_connected_account
-  // quietly becoming one for publish_landing_page_changes.
-  //
-  // An approved list is REQUIRED for a grant to mean anything: consent recorded
-  // without one has unknown scope, so it authorizes nothing (fail-closed).
-  const approved = Array.isArray(schedule.autopublishAuthorizedTools)
-    ? schedule.autopublishAuthorizedTools.filter((t): t is string => typeof t === 'string')
-    : [];
-  const tools = requiredPublishTools.filter(t => approved.includes(t));
-
-  // CONSENT and SCOPE are separate, and BOTH are required.
-  //
-  // Consent is the one flag the owner deliberately set for THIS purpose — never
-  // inferred from the required-function picker, from prompt wording, or from
-  // fullAutonomy (which governs how blocking questions are answered, not whether a
-  // live write may happen). Strict === true so a truthy string/number from a
-  // loosely-typed caller cannot grant publishing rights.
-  //
-  // Scope is `tools`. Consent with an EMPTY scope authorizes nothing: the owner
-  // consented to unattended publishing but designated no tool to do it with, so
-  // there is no specific irreversible action to approve. Authorizing that would
-  // turn an empty scope into a licence to reach for any live-publishing tool —
-  // an unscoped mandate the owner never granted. Requiring a designated tool keeps
-  // every authorization concrete and enumerable. Note this does NOT make the
-  // required-function picker a consent signal: it cannot authorize anything on its
-  // own, it only bounds what an already-granted consent covers.
-  const authorized = schedule.autopublishAuthorized === true && tools.length > 0;
-
-  return { authorized, tools };
+  return { authorized: true, tools: getRequiredPublishTools(schedule.requiredFunctionCalls) };
 }
 
 /**
@@ -250,9 +237,12 @@ export function narrowPublishAuthorization(
   latest: SchedulePublishAuthorization | null | undefined
 ): SchedulePublishAuthorization {
   if (!latest) return UNAUTHORIZED;
-  const tools = admitted.tools.filter(tool => latest.tools.includes(tool));
+  // `authorized` is independent of `tools` for the reason given in
+  // resolveSchedulePublishAuthorization: a schedule that names no publish tool still
+  // publishes. Intersecting the nudge scope stays monotonic either way.
+  const authorized = admitted.authorized && latest.authorized;
   return {
-    authorized: admitted.authorized && latest.authorized && tools.length > 0,
-    tools: admitted.authorized && latest.authorized ? tools : []
+    authorized,
+    tools: authorized ? admitted.tools.filter(tool => latest.tools.includes(tool)) : []
   };
 }

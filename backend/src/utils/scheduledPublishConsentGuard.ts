@@ -123,13 +123,17 @@ async function readSessionWithOneRetry(
  * ordinary state of every draft-only run, and the correct answer for both a session
  * that predates this field and a run whose stamp could not be written.
  */
-function readAdmittedAuthorization(session: any): SchedulePublishAuthorization {
+export function readAdmittedAuthorization(session: any): SchedulePublishAuthorization {
   const admission = session?.publishAdmission;
   if (!admission || admission.authorized !== true) return { authorized: false, tools: [] };
   const tools = Array.isArray(admission.tools)
     ? admission.tools.filter((tool: unknown): tool is string => typeof tool === 'string')
     : [];
-  return { authorized: tools.length > 0, tools };
+  // `authorized` does NOT depend on `tools` — a stamped run with an empty nudge scope
+  // is the ordinary shape of a schedule that publishes from its prompt without naming
+  // a publish tool (21 of the 25 active publishing schedules). Gating on the list here
+  // would refuse exactly those runs.
+  return { authorized: true, tools };
 }
 
 function refuse(toolName: string, detail: string): ScheduledPublishRefusal {
@@ -240,12 +244,15 @@ export async function refuseUnauthorizedScheduledPublish(
   // publish immediately while a mid-run grant is invisible to this run.
   const authorization = narrowPublishAuthorization(admitted, latest);
 
-  if (!authorization.authorized || !authorization.tools.includes(toolName)) {
+  // Gate on the boolean ALONE. `tools` is the required-function nudge scope, not a
+  // whitelist of what may publish: most publishing schedules name no publish tool at
+  // all and simply instruct Emma to post, so requiring membership here would refuse
+  // the majority of live publishing schedules — the deny-by-construction failure this
+  // module was reconciled to remove.
+  if (!authorization.authorized) {
     return refuse(
       toolName,
-      authorization.tools.length > 0
-        ? `The owner authorized only: ${authorization.tools.join(', ')}.`
-        : 'The owner has not enabled "Publish without my review" for this schedule (or has just switched it off).'
+      'The owner turned on "Require approval before publishing" for this schedule (or has just switched it on).'
     );
   }
 

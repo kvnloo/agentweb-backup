@@ -3067,28 +3067,13 @@ export const scheduleDb = {
       // my behalf". Settable ONLY by the owner — deliberately absent from the
       // manage_scheduled_chat MCP allowlist so the model can neither grant itself
       // publishing authority nor silence its own publishing. Default off (= publish).
+      // ENG-827 reads this SAME field — it is the one and only unattended-publish
+      // consent signal. ENG-827 briefly carried an opt-IN twin (`autopublishAuthorized`),
+      // which collided head-on: both gates sat on the dispatch path, so a publish had
+      // to satisfy an opt-out AND an opt-in that no existing row could have, denying
+      // every schedule in production. Verified on the preview, then removed. Do not
+      // reintroduce a second field — extend this one.
       requirePublishApproval?: boolean;
-      // ENG-827: opt-in authorization to PUBLISH to a live connected account during
-      // an unattended scheduled run, without showing the owner the content first.
-      // Its own consent control precisely because the required-function picker is a
-      // verification control, not a waiver. Default off.
-      //
-      // UNRECONCILED POLARITY COLLISION — DO NOT SHIP BOTH GATES AS THEY STAND.
-      // requirePublishApproval (ENG-803, merged) is an opt-OUT: absent => AUTHORIZED.
-      // autopublishAuthorized (ENG-827, this branch) is an opt-IN: absent => DENIED.
-      // Both are enforced at tool dispatch — ENG-803 in AgentModeService.executeTool,
-      // ENG-827 in the toolRegistry it then dispatches through — so a scheduled
-      // publish must satisfy BOTH, and the conjunction is DENY for every schedule
-      // that predates this branch (autopublishAuthorized is written only by the
-      // unshipped /publish-consent route, so no existing row can have it). Worse,
-      // ENG-803's directive is the one that actually reaches the model, so the run is
-      // ORDERED to publish and then mechanically refused.
-      // The two fields must be reconciled into one decision before this merges.
-      autopublishAuthorized?: boolean;
-      // ENG-827: the publish tools the owner could see when they consented. Consent
-      // is bound to THIS list, so a later edit to requiredFunctionCalls cannot
-      // silently re-scope it onto tools they never approved.
-      autopublishAuthorizedTools?: string[];
       promptRevisions: Array<{ startingMessage: string; updatedAt: string }>;
       updatedAt: string;
       emailCampaignTaskId: string;

@@ -498,7 +498,6 @@ mcpToolRegistry.register({
         email_notifications: { type: 'array', items: { type: 'string' }, description: 'Email addresses for notifications (optional for create/update but strongly recommended — without it, the user gets no automatic notification when a run completes; if provided, must be non-empty)' },
         daily_digest: { type: 'boolean', description: 'Send daily digest instead of per-run emails (create/update, hourly only)' },
         self_improve: { type: 'boolean', description: 'When true, after each run a reflection turn reviews the result and may automatically refine starting_message so future runs do better. Off by default (create/update).' },
-        revoke_autopublish: { type: 'boolean', description: 'Set true to REVOKE this schedule\'s permission to publish to the user\'s live connected accounts unattended, so future runs draft the content for approval instead. Revoking is always safe and always allowed. You CANNOT grant this permission — granting it means posts go live without the user ever seeing them, so it must be done by the user themselves via the "Publish without my review" checkbox on the schedule. If a user asks you to enable automatic posting, point them at that checkbox; never claim you have enabled it (update only).' },
         run_count: { type: 'number', description: 'Number of runs (-1 for unlimited, create/update)' },
         variables: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, description: { type: 'string' } }, required: ['name'] }, description: 'Variable definitions for the starting message (create/update)' },
         variable_values: { type: 'object', description: 'Initial variable values (create/update)' },
@@ -555,26 +554,17 @@ mcpToolRegistry.register({
         if (args.variable_values !== undefined) body.variableValues = args.variable_values;
         if (args.llm_model !== undefined) body.llmModel = args.llm_model;
 
-        // ENG-827: consent changes do NOT travel on the generic update body — that
-        // route deliberately preserves the stored value so no broad update can grant
-        // publishing, which means a revoke sent there would be silently dropped.
-        // Route it to the dedicated consent endpoint, and do it BEFORE the ordinary
-        // update: if the update then fails, the schedule is already in the SAFER
-        // state (not publishing). Revoking after would leave consent enabled
-        // whenever the second call failed. The agent may only ever REVOKE
-        // (`authorized: false`); no argument here can produce a grant.
-        let publishConsent: any;
-        if (args.revoke_autopublish === true) {
-          publishConsent = await mcpFetch({
-            method: 'POST',
-            path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/publish-consent`,
-            context: c,
-            body: { authorized: false },
-          });
-        }
-
+        // ENG-827/ENG-803: the schedule's unattended-publish setting is NOT reachable
+        // from here, in either direction, and is deliberately absent from this
+        // allowlist. The model can neither grant itself publishing authority nor
+        // silence its own publishing — one able to switch the hold on could durably
+        // recreate ENG-803's reported bug (a run that quietly stops posting) at the
+        // schedule level, which is worse than the single-run refusal it replaces. Only
+        // the owner changes it, from the schedule form. A source-scanning test in
+        // schedulePublishApproval.mcpGuard.test.ts enforces this, so do not name the
+        // field here — the field name itself is what that guard greps for.
         const data = await mcpFetch({ method: 'PUT', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}`, context: c, body });
-        return jsonResult(publishConsent ? { ...(data as any), publishConsent } : data);
+        return jsonResult(data);
       }
       case 'toggle': {
         const data = await mcpFetch({ method: 'PATCH', path: `/api/agent-mode/scheduled-chats/${args.schedule_id}/toggle`, context: c, body: { status: args.status } });

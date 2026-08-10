@@ -4425,38 +4425,14 @@ export async function generateSessionResponse(
           } catch (adminLookupError) {
             console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
           }
-          // ENG-827: resolve the owner's standing publish authorization for this
-          // schedule — primarily the publish tools they designated as required at
-          // schedule-creation time (see resolveSchedulePublishAuthorization). A
-          // prompt-enrichment lookup must never break the run.
-          //
-          // PREFERRED PATH (Greptile P1): a scheduled run threads the authorization it
-          // was ADMITTED under down from runScheduledChat, which resolved it once from
-          // the same schedule snapshot it used to build the required-function list. Use
-          // it verbatim — then the prompt and the checker are the same decision by
-          // construction, not two reads that happen to agree.
-          //
-          // FALLBACK (no override — interactive route, or a run entered directly): read
-          // the schedule for this turn. A schedule we READ that withholds authorization
-          // → 'withheld' (draft & notify). A schedule we could NOT read → 'unknown',
-          // which emits no publish block at all, so a throttled read can never assert a
-          // prohibition against a tool a checker might still require.
-          let publishAuthorization: 'authorized' | 'withheld' | 'unknown' = 'withheld';
-          let authorizedPublishTools: string[] = [];
-          if (publishAuthorizationOverride) {
-            publishAuthorization = publishAuthorizationOverride.authorized ? 'authorized' : 'withheld';
-            authorizedPublishTools = publishAuthorizationOverride.tools;
-          } else if (scheduleIdMatch) {
-            try {
-              const auth = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleIdMatch));
-              publishAuthorization = auth.authorized ? 'authorized' : 'withheld';
-              authorizedPublishTools = auth.tools;
-            } catch (scheduleLookupError) {
-              publishAuthorization = 'unknown';
-              console.error(`AgentMode: failed to resolve publish authorization for scheduled session ${session.sessionId}; omitting the publish directive for this turn rather than asserting a prohibition:`, scheduleLookupError);
-            }
-          }
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, publishAuthorization, authorizedPublishTools);
+          // ENG-827: the unattended directive WITHOUT its publish block. This system
+          // prompt is stored as the session's first message, and buildMarketingContext
+          // slices that message off before the model ever sees it — so a publish
+          // decision stated here would be a decision nobody reads. The publish block is
+          // emitted by AgentModeService instead, appended after the conversation where
+          // it is both delivered and salient. Verified on the preview: the copy written
+          // here had no effect on the run's behaviour.
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, 'unknown', []);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
@@ -7265,11 +7241,6 @@ export const agentModeController = {
         // and absent from the manage_scheduled_chat MCP allowlist, so only a human
         // can set it.
         requirePublishApproval: requirePublishApproval === true,
-        // ENG-827: a new schedule NEVER starts with unattended publish consent. It is
-        // granted only through POST .../publish-consent, which enforces the
-        // owner-only boundary that a generic create/update body cannot.
-        autopublishAuthorized: false,
-        autopublishAuthorizedTools: [],
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -7994,85 +7965,6 @@ export const agentModeController = {
     }
   },
 
-  /**
-   * POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
-   *
-   * ENG-827: the owner-facing grant/revoke path for unattended publish consent.
-   *
-   * Consent to publish to a live connected account without the owner seeing the
-   * content first is the one irreversible permission on a schedule, so it gets its
-   * own endpoint instead of riding on the generic update. That makes the boundary
-   * explicit and enforceable rather than implicit in a field on a big PUT body:
-   *
-   *   - the caller must be the schedule's OWNER. A delegated admin session acts as
-   *     the customer everywhere else, but it must not be able to hand out this
-   *     permission on their behalf — the whole point is that a specific human
-   *     accepted that posts go out unseen.
-   *   - granting requires the schedule to actually designate a publishing tool.
-   *     Consent with no scope authorizes nothing (see
-   *     resolveSchedulePublishAuthorization), so accepting it would silently do
-   *     nothing while looking like it worked.
-   *   - every grant records who consented and when, so it is auditable later.
-   *
-   * REVOKING is always allowed — it only ever makes runs safer.
-   */
-  async setScheduledChatPublishConsent(req: Request, res: Response) {
-    try {
-      const user = req.user as User;
-      const { scheduleId } = req.params;
-      const { authorized } = req.body;
-
-      if (typeof authorized !== 'boolean') {
-        return res.status(400).json({ error: 'Invalid body: `authorized` must be a boolean' });
-      }
-
-      const schedule = await scheduleDb.getScheduleById(scheduleId);
-      if (!schedule || schedule.userId !== user.userId) {
-        return res.status(404).json({ error: 'Scheduled chat not found' });
-      }
-
-      // Only the owner may GRANT. A delegated admin can still revoke (safer state).
-      const delegated = (req as any).delegateInfo?.isDelegated === true;
-      if (authorized && delegated) {
-        return res.status(403).json({
-          error:
-            'Publishing without review can only be enabled by the account owner, not from a delegated session. Ask the owner to turn on "Publish without my review" on this schedule.',
-        });
-      }
-
-      // The scope the owner is consenting to RIGHT NOW. Recorded alongside the flag
-      // so a later edit to requiredFunctionCalls cannot silently re-scope the
-      // consent onto publishing tools they never saw.
-      const approvedTools = getRequiredPublishTools((schedule as any).requiredFunctionCalls);
-      if (authorized) {
-        if (approvedTools.length === 0) {
-          return res.status(400).json({
-            error:
-              'This schedule does not require a publishing tool, so enabling unattended publishing would have no effect. Add the publishing tool (e.g. post_on_connected_account) to the schedule\'s required functions first.',
-          });
-        }
-      }
-
-      await scheduleDb.updateSchedule(scheduleId, {
-        autopublishAuthorized: authorized,
-        // Bind the consent to exactly what was on screen when it was given.
-        autopublishAuthorizedTools: authorized ? approvedTools : [],
-        autopublishAuthorizedAt: authorized ? new Date().toISOString() : null,
-        autopublishAuthorizedBy: authorized ? user.userId : null,
-        updatedAt: new Date().toISOString(),
-      } as any);
-
-      res.json({
-        autopublishAuthorized: authorized,
-        message: authorized
-          ? 'This schedule will now publish to your connected accounts without showing you the content first.'
-          : 'This schedule will now draft content and notify you for approval instead of publishing.',
-      });
-    } catch (error) {
-      console.error('AgentMode: Set scheduled chat publish consent error:', error);
-      res.status(500).json({ error: 'Failed to update publish consent' });
-    }
-  },
 
   async toggleScheduledChatStatus(req: Request, res: Response) {
     try {
