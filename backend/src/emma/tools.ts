@@ -736,7 +736,7 @@ For CRM logging of sent tweets, optionally pass list_id, lead_id and lead_email.
     if (!context?.userId) {
       throw new Error("Missing user context");
     }
-    return await agentModeService.twitterManagePost(context.userId, args);
+    return await agentModeService.twitterManagePost(context.userId, args, context);
   }
 });
 
@@ -4379,7 +4379,7 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args: any, context?: any) => {
-    return await agentModeService.linkedinManagePost(context?.userId, args);
+    return await agentModeService.linkedinManagePost(context?.userId, args, context);
   }
 });
 

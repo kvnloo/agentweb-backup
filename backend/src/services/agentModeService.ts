@@ -12,6 +12,7 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
+import { publishWithdrawnMidFlight } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
@@ -28926,9 +28927,17 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     parent_comment_urn?: string;
     reaction_type?: string;
     post_ids?: string[];
-  }): Promise<any> {
+  }, toolContext?: any): Promise<any> {
     const { action, account_id } = args;
     console.log('[AgentMode] linkedinManagePost called:', { userId, action, account_id });
+
+    // ENG-827: last-moment publish-consent re-check. A repost or comment is a public
+    // write under the owner's name, so a consent withdrawn after dispatch admitted
+    // this call must still stop it. Self-scoping: the dispatcher attaches the hook
+    // only for a call it classified as publishing, so an analytics or comment-list
+    // read reaches this line with nothing to run.
+    const withdrawn = await publishWithdrawnMidFlight(toolContext);
+    if (withdrawn) return withdrawn;
 
     const requirePostUrn = (a: string) =>
       !args.post_urn ? { success: false, message: `post_urn is required for action=${a}` } : null;
@@ -30162,11 +30171,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
   // Public entry: bind the acting user into the X metering context so every X
   // call this dispatch makes attributes the shadow ledger to the ACTING user and
   // bills the account owner (ENG-664 Option B, matching the LLM rail).
-  async twitterManagePost(userId: string, args: any): Promise<any> {
-    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args));
+  async twitterManagePost(userId: string, args: any, toolContext?: any): Promise<any> {
+    return runWithXActingUser(userId, () => this._twitterManagePostImpl(userId, args, toolContext));
   }
 
-  private async _twitterManagePostImpl(userId: string, args: any): Promise<any> {
+  private async _twitterManagePostImpl(userId: string, args: any, toolContext?: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
     const { text, in_reply_to_tweet_id, tweet_id, tweet_ids, handle, recipient_handle, tweets, list_id, lead_id, lead_email, query, max_results } = args;
@@ -30200,6 +30209,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
     const ownerUserId = account.userId;
     account_id = account.account_id;
+
+    // ENG-827: last-moment publish-consent re-check, after the account resolution
+    // above (which scans every account shared with the owner's org) and immediately
+    // before the switch — every publishing branch writes on its first statement, so
+    // there is no window left after this point. Self-scoping: the dispatcher attaches
+    // the hook only for a call it classified as publishing, so a metrics or list read
+    // reaches this line with nothing to run and pays nothing.
+    const withdrawnBeforeTweet = await publishWithdrawnMidFlight(toolContext);
+    if (withdrawnBeforeTweet) return withdrawnBeforeTweet;
 
     // Best-effort CRM logging — never fails the action.
     const logCrm = async (
