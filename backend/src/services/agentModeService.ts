@@ -22786,8 +22786,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         // Point at the next unread page: the entries after the window, or back
         // to the start once the window has run past the end of the list.
         const nextOffset = detailEnd < competitors.length ? detailEnd : 0;
-        const nextWindow = this.resolveCompetitorDetailWindow(competitors, nextOffset);
-        formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside it (e.g. <code>competitorOffset: ${nextOffset}</code> returns the next ${nextWindow.end - nextWindow.start} in full):<br>`;
+        // Lead with the random-access affordance, not the next page: every entry
+        // below carries its own offset, so any single competitor is one call
+        // away. Teaching "next page" first would have the model walk the list in
+        // order to reach entry 48 (ENG-945).
+        const lastNameOnly = competitors.length - 1 >= detailEnd ? competitors.length - 1 : 0;
+        formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read any one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside that name — you can jump straight to the entry you want, there is no need to page through in order (e.g. <code>competitorOffset: ${lastNameOnly}</code> reads the entry marked [offset ${lastNameOnly}]). To walk the entire list in order instead, use the nextCompetitorOffset value returned with each page (currently ${nextOffset}):<br>`;
         competitors.forEach((competitor: any, index: number) => {
           if (inWindow(index)) return;
           formattedSummary += `• [offset ${index}] ${nameOf(competitor)}<br>`;
