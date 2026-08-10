@@ -1112,6 +1112,44 @@ describe('AgentModeController - Error Handling', () => {
       expect(errorCall![1].metadata!.isDiagnosticMessage).toBeUndefined();
     });
 
+    // A deploy restarts the box mid-run often enough that this is not a corner case
+    // (ENG-657). "Please send your message again" after a landed publish is the same
+    // double-deploy advice as the generic fallback, so it earns the same notice.
+    it('adds the true outcome to the server-restart message after a confirmed publish', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'prior message' }],
+        calledFunctions: { publish_landing_page_changes: 1 },
+      } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(
+        new Error('Worker shutdown')
+      );
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toContain('server restarted');
+      expect(errorCall![1].content).toContain('published your landing-page changes');
+      expect(errorCall![1].content).toContain('do NOT re-run it');
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBe(true);
+    });
+
+    it('leaves the server-restart message bare when the run published nothing', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'prior message' }],
+        calledFunctions: { get_leads: 1 },
+      } as any);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(
+        new Error('Worker shutdown')
+      );
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toBe(
+        'The server restarted while processing your request. Please send your message again.'
+      );
+    });
+
     it('leaves the generic fallback bare when the run published nothing', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue({
         ...mockSession,
