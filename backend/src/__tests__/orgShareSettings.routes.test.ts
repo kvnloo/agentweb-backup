@@ -81,7 +81,7 @@ describe("PATCH /api/orgs/me/share-settings", () => {
     const res = await request(makeApp("u-1"))
       .patch("/api/orgs/me/share-settings").send(validBody);
     expect(res.status).toBe(200);
-    expect(mockUpdateShareSettings).toHaveBeenCalledWith("org-1", expect.any(Object));
+    expect(mockUpdateShareSettings).toHaveBeenCalledWith("org-1", expect.any(Object), undefined);
   });
 
   it("rejects editors who are not org members with 400", async () => {

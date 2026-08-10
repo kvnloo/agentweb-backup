@@ -9295,17 +9295,21 @@ export const orgDb = {
     throw new Error(`removeDomainJoinRequest: exceeded ${MAX_ATTEMPTS} retry attempts for org ${orgId}`);
   },
 
-  async updateShareSettings(orgId: string, settings: OrgShareSettings, expectedUpdatedAt?: string): Promise<void> {
+  // Optimistic-concurrency guard is MANDATORY: every caller does a
+  // read-modify-write of the whole shareSettings document, so every caller
+  // must pass the updatedAt it read (or `undefined` for a legacy org record
+  // that has no updatedAt yet). An overlapping writer then surfaces as a
+  // ConditionalCheckFailedException instead of a silent last-writer-wins
+  // that erases the other writer's grants.
+  async updateShareSettings(orgId: string, settings: OrgShareSettings, expectedUpdatedAt: string | undefined): Promise<void> {
     await dynamodb.update({
       TableName: ORGS_TABLE,
       Key: { orgId },
       UpdateExpression: "SET shareSettings = :s, updatedAt = :u",
-      // Optional optimistic-concurrency guard: callers doing a read-modify-write
-      // pass the updatedAt they read so an overlapping writer surfaces as a
-      // ConditionalCheckFailedException instead of a silent last-writer-wins.
-      ...(expectedUpdatedAt !== undefined
-        ? { ConditionExpression: "updatedAt = :expected" }
-        : {}),
+      ConditionExpression:
+        expectedUpdatedAt !== undefined
+          ? "updatedAt = :expected"
+          : "attribute_not_exists(updatedAt)",
       ExpressionAttributeValues: {
         ":s": settings,
         ":u": new Date().toISOString(),
@@ -9315,25 +9319,37 @@ export const orgDb = {
   },
 
   async pruneEditorListsForUser(orgId: string, removedUserId: string): Promise<void> {
-    const got = await dynamodb.get({
-      TableName: ORGS_TABLE,
-      Key: { orgId },
-    }).promise();
-    const org = got.Item as Organization | undefined;
-    if (!org?.shareSettings) return;
-    const ss = org.shareSettings;
-    const strip = (arr: string[]) => arr.filter((uid) => uid !== removedUserId);
-    const next: OrgShareSettings = {
-      knowledgeBase:     { ...ss.knowledgeBase,     editors: strip(ss.knowledgeBase.editors) },
-      htmlTemplates:     { ...ss.htmlTemplates,     editors: strip(ss.htmlTemplates.editors) },
-      landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
-      workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
-      skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
-      analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
-      brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
-      marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
-    };
-    await this.updateShareSettings(orgId, next);
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const got = await dynamodb.get({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+      }).promise();
+      const org = got.Item as Organization | undefined;
+      if (!org?.shareSettings) return;
+      const ss = org.shareSettings;
+      const strip = (arr: string[]) => arr.filter((uid) => uid !== removedUserId);
+      const next: OrgShareSettings = {
+        knowledgeBase:     { ...ss.knowledgeBase,     editors: strip(ss.knowledgeBase.editors) },
+        htmlTemplates:     { ...ss.htmlTemplates,     editors: strip(ss.htmlTemplates.editors) },
+        landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
+        workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
+        skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
+        analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
+        brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
+        marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
+      };
+      try {
+        await this.updateShareSettings(orgId, next, org.updatedAt);
+        return;
+      } catch (error: any) {
+        if (error.code === "ConditionalCheckFailedException") {
+          continue; // Org changed concurrently — re-read and retry.
+        }
+        throw error;
+      }
+    }
+    throw new Error(`pruneEditorListsForUser: exceeded ${MAX_ATTEMPTS} retry attempts for org ${orgId}`);
   },
 
 

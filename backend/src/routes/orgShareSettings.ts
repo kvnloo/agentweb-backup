@@ -65,8 +65,31 @@ router.patch("/", async (req, res) => {
       }
     }
 
-    await orgDb.updateShareSettings(user.orgId, validated);
-    return res.json({ shareSettings: validated });
+    // Guarded write: this route replaces the whole shareSettings document
+    // from client input, so an overlapping writer (grant, cleanup) must fail
+    // the conditional write rather than be silently overwritten. On conflict,
+    // re-read and re-apply the analytics back-fill against the fresh state.
+    const MAX_ATTEMPTS = 5;
+    let toWrite = validated;
+    let currentOrg = org;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await orgDb.updateShareSettings(user.orgId, toWrite, currentOrg?.updatedAt);
+        break;
+      } catch (writeError: any) {
+        if (writeError?.code !== "ConditionalCheckFailedException" || attempt >= MAX_ATTEMPTS - 1) {
+          throw writeError;
+        }
+        currentOrg = await orgDb.getOrgById(user.orgId);
+        if (incoming && typeof incoming === "object" && req.body?.shareSettings?.analytics === undefined) {
+          toWrite = {
+            ...toWrite,
+            analytics: currentOrg?.shareSettings?.analytics ?? { enabled: false, editors: [] },
+          };
+        }
+      }
+    }
+    return res.json({ shareSettings: toWrite });
   } catch (e) {
     console.error("Error updating org share-settings:", e);
     return res.status(500).json({ message: "Failed to update share-settings" });
