@@ -16,10 +16,15 @@ jest.mock('../utils/secretsManager', () => ({
 
 const mockSearchPeople = jest.fn();
 const mockResolveAccountId = jest.fn();
+// Default 'ok' (the account CAN search) survives jest.clearAllMocks(), which
+// clears calls but not implementations — so the ENG-975 guard stays out of the
+// way of every pre-existing "legitimately empty page" expectation below.
+const mockProbeSearchCapability = jest.fn().mockResolvedValue('ok');
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     searchPeople: (...args: any[]) => mockSearchPeople(...args),
     resolveAccountId: (...args: any[]) => mockResolveAccountId(...args),
+    probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
   },
 }));
 
@@ -667,5 +672,109 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     expect(mockDeleteLead).toHaveBeenCalledWith('list-1', 'p2-2');
     expect(mockDeleteLead).toHaveBeenCalledWith('list-1', 'p2-3');
     expect(enqueueSpy).toHaveBeenCalledWith('user-1', 'list-1', ['p1-1', 'p1-2', 'p1-3', 'p2-1']);
+  });
+});
+
+// ─── ENG-975: an account that cannot search at all ───────────────────────────
+//
+// The find-leads loop breaks on `items.length === 0` and, with nothing
+// imported, returns `success: true` with "No results found for the given
+// search criteria." That is indistinguishable from the account having lost its
+// people-search capability entirely — the reported "Daily LinkedIn Lead Finder
+// — Lead search failed" run produced exactly that: a schedule that is a silent
+// no-op looks like a schedule that simply found nobody.
+
+describe('AgentModeService.importLeadsFromSearch — zero-result search capability guard (ENG-975)', () => {
+  let service: AgentModeService;
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    service = new AgentModeService();
+    mockResolveAccountId.mockResolvedValue('test-account-id');
+    mockGetLeadListById.mockResolvedValue({ leadCount: 0 });
+    mockProbeSearchCapability.mockResolvedValue('ok');
+  });
+
+  it('reports a search error instead of "no results" when the account cannot search', async () => {
+    mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+    mockProbeSearchCapability.mockResolvedValue('degraded');
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
+
+    expect(mockProbeSearchCapability).toHaveBeenCalledWith('test-account-id');
+    expect(result.searchUnavailable).toBe(true);
+    expect(result.searchError).toMatch(/is not "no one matches your filters"/i);
+    expect(result.message).toBeUndefined();
+  });
+
+  it('keeps the plain "no results" message when the account can still search', async () => {
+    mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+    mockProbeSearchCapability.mockResolvedValue('ok');
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
+
+    expect(result.success).toBe(true);
+    expect(result.searchError).toBeUndefined();
+    expect(result.message).toBe('No results found for the given search criteria.');
+  });
+
+  it('does not raise a false alarm when a later page simply runs out', async () => {
+    mockSearchPeople
+      .mockResolvedValueOnce({ items: [makeItem(1)], cursor: 'c2' })
+      .mockResolvedValueOnce({ items: [], cursor: null });
+    mockBatchCreateLeads.mockResolvedValueOnce(batchResult(1, 0, 'p1'));
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO', limit: 10 });
+
+    expect(mockProbeSearchCapability).not.toHaveBeenCalled();
+    expect(result.searchError).toBeUndefined();
+  });
+
+  // A recurring schedule persists its cursor per (list, criteria) and resumes
+  // from it on the next run without ever passing one, so its first fetch looks
+  // cursor'd from the inside. Keying the guard off "no cursor" would exempt the
+  // repeat-schedule case the bug was actually reported from.
+  it('still reports the outage when the first fetch resumes from a persisted cursor', async () => {
+    const hash = expectedCriteriaHash({ title: 'CTO' });
+    mockGetLeadListById.mockResolvedValue({
+      listId: 'list-1',
+      leadCount: 0,
+      searchCursors: { [hash]: { cursor: 'cursor-from-yesterdays-run', lastUsedAt: '2026-08-07T17:03:00Z' } },
+    });
+    mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+    mockProbeSearchCapability.mockResolvedValue('degraded');
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
+
+    expect(mockSearchPeople).toHaveBeenCalledWith('test-account-id', expect.objectContaining({ cursor: 'cursor-from-yesterdays-run' }));
+    expect(result.searchUnavailable).toBe(true);
+    expect(result.message).toBeUndefined();
+  });
+
+  it('a resumed search that has genuinely run dry still reports a plain empty', async () => {
+    const hash = expectedCriteriaHash({ title: 'CTO' });
+    mockGetLeadListById.mockResolvedValue({
+      listId: 'list-1',
+      leadCount: 0,
+      searchCursors: { [hash]: { cursor: 'cursor-from-yesterdays-run', lastUsedAt: '2026-08-07T17:03:00Z' } },
+    });
+    mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+    mockProbeSearchCapability.mockResolvedValue('ok');
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
+
+    expect(result.success).toBe(true);
+    expect(result.searchUnavailable).toBeUndefined();
+    expect(result.message).toBe('No results found for the given search criteria.');
+  });
+
+  it('does not block on an indeterminate probe', async () => {
+    mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+    mockProbeSearchCapability.mockResolvedValue('unknown');
+
+    const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
+
+    expect(result.success).toBe(true);
+    expect(result.searchError).toBeUndefined();
   });
 });

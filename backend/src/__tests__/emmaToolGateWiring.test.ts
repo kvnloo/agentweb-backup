@@ -139,7 +139,8 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
       prompt: 'sharpen it',
       filename: 'ad.png',
       imageModel: 'gemini-3-pro-image-preview', // avoids getImageApiDefaultModel lookup
-      inputImages: ['https://cdn.example.com/a.png']
+      inputImages: ['https://cdn.example.com/a.png'],
+      category: 'ad'
     }, ctx);
 
     expect(result.awaitingUserConfirmation).toBe(true);
@@ -157,7 +158,8 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
 
     await emmaToolRegistry.execute('generate_image', {
       prompt: 'flat vector ad illustration',
-      filename: 'ad.png'
+      filename: 'ad.png',
+      category: 'ad'
       // no imageModel → the tool must pass undefined through, NOT the admin default,
       // so generateImage can tell this was a system default and fail over on a timeout.
     }, ctx);
@@ -175,5 +177,35 @@ describe('emma tool handlers wire args into the confirmation gate', () => {
     const modelEnum: string[] = def?.inputSchema?.properties?.imageModel?.enum ?? [];
     expect(modelEnum).toContain('gemini-3.1-flash-image'); // GA id selectable
     expect(modelEnum).not.toContain('gemini-3.1-flash-image-preview'); // preview dropped from the menu
+  });
+
+  // ─── category declaration (ENG-343) ──────────────────────────────────
+  // The service-level guard fails visibly on a missing category, but only the
+  // schema makes the model actually send one. Drop `required` and every image
+  // generation starts failing at the guard instead of being categorized, so the
+  // schema and the arg wiring are both part of the contract.
+  it('generate_image: schema requires category and constrains it to the two use cases', () => {
+    const def: any = emmaToolRegistry.getTool('generate_image')?.definition;
+    expect(def?.inputSchema?.required).toContain('category');
+    expect(def?.inputSchema?.properties?.category?.enum).toEqual(['ad', 'organic_post']);
+  });
+
+  it('generate_image: threads the declared category through to the service', async () => {
+    const genSpy = jest
+      .spyOn(agentModeService as any, 'generateImage')
+      .mockResolvedValue({ success: true, imageUrl: 'https://cdn.example.com/x.png' });
+
+    await emmaToolRegistry.execute('generate_image', {
+      prompt: 'flat vector ad illustration',
+      filename: 'ad.png',
+      imageModel: 'gemini-3-pro-image-preview',
+      category: 'organic_post'
+    }, ctx);
+
+    expect(genSpy).toHaveBeenCalledTimes(1);
+    // 11th positional arg (index 10) is category — the eval-queue declaration.
+    expect(genSpy.mock.calls[0][10]).toBe('organic_post');
+
+    genSpy.mockRestore();
   });
 });

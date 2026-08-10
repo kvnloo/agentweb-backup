@@ -175,7 +175,7 @@ trap 'rm -f "${stderr_file}"' EXIT
 # ---------------------------------------------------------------------------
 
 pr_json="$(gh pr view "${PR_NUMBER}" --repo "${REPO}" \
-  --json number,state,isDraft,mergeable,mergeStateStatus,headRefOid \
+  --json number,state,isDraft,mergeable,headRefOid,baseRefName \
   2>"${stderr_file}")"
 gh_exit=$?
 
@@ -183,8 +183,12 @@ if [ "${gh_exit}" -ne 0 ]; then
   hard_fail "GitHub API call failed (exit ${gh_exit}) reading ${REPO}#${PR_NUMBER}: $(tr '\n' ' ' <"${stderr_file}")"
 fi
 
+# ENG-1003: the freshness compare in section 8 now runs unconditionally, so
+# mergeStateStatus is no longer fetched — GitHub reports only one dominant
+# state and gating on BEHIND missed PRs that were behind AND something else.
 parsed="$(printf '%s' "${pr_json}" | jq -r '
-    [ (.state // ""), (.isDraft | tostring), (.mergeable // ""), (.headRefOid // "") ]
+    [ (.state // ""), (.isDraft | tostring), (.mergeable // ""), (.headRefOid // ""),
+      (.baseRefName // "") ]
     | join("\u001f")' 2>/dev/null)"
 jq_exit=$?
 
@@ -193,7 +197,7 @@ if [ "${jq_exit}" -ne 0 ] || [ -z "${parsed}" ]; then
   hard_fail "unparseable response from \`gh pr view ${PR_NUMBER}\` — expected a JSON object with state/isDraft/mergeable/headRefOid"
 fi
 
-IFS="${SEP}" read -r pr_state pr_draft pr_mergeable head_sha <<<"${parsed}"
+IFS="${SEP}" read -r pr_state pr_draft pr_mergeable head_sha base_ref <<<"${parsed}"
 
 if [ -z "${pr_state}" ] || [ -z "${pr_mergeable}" ]; then
   surface 'gh pr view response (raw)' "${pr_json}"
@@ -594,8 +598,15 @@ fi
 
 # Endpoint first, flags after: every other call in this script passes the
 # endpoint as the first argument, and the test mock dispatches on it.
-changed_files="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
-  --paginate --jq '.[].filename' 2>"${stderr_file}")"
+#
+# One line per file, tab-separated: current path, then the pre-rename path
+# when there is one. The two consumers below need different projections —
+# the backend classifier must see only current paths (dorny/paths-filter
+# classifies on the post-rename name, so gating on the old path of a file
+# renamed OUT of the backend demands evidence the workflow never scheduled),
+# while the base-overlap check needs both names of every file this PR touches.
+changed_files_tsv="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/files?per_page=100" \
+  --paginate --jq '.[] | .filename + "\t" + (.previous_filename // "")' 2>"${stderr_file}")"
 gh_exit=$?
 
 # Fail closed, and as ERROR rather than a verdict: an unreadable diff means the
@@ -604,14 +615,23 @@ gh_exit=$?
 if [ "${gh_exit}" -ne 0 ]; then
   hard_fail "GitHub API call failed (exit ${gh_exit}) reading the changed files of ${REPO}#${PR_NUMBER}, so whether the backend suite was required here cannot be established: $(tr '\n' ' ' <"${stderr_file}")"
 fi
-if [ -z "${changed_files}" ]; then
+if [ -z "${changed_files_tsv}" ]; then
   hard_fail "${REPO}#${PR_NUMBER} reports no changed files at ${head_sha}. An open PR always has at least one, so this is an unreadable diff rather than an empty one, and the backend-suite requirement cannot be evaluated."
 fi
+
+# Current paths only — what the workflow's path filter classified on.
+current_files="$(printf '%s\n' "${changed_files_tsv}" | cut -f1)"
+# Both names of every touched file — what the base-overlap check compares on.
+changed_files="$(printf '%s\n' "${changed_files_tsv}" | tr '\t' '\n' | sed '/^$/d')"
 
 # Prefix match anchored at the start of the path, via `case` rather than grep:
 # the prefixes contain `.` and `/`, and a regex would either need escaping or
 # would match `partner-portal/backend/x` as a backend change. `case` compares
 # literally except for the trailing `*`, so there is nothing to escape.
+#
+# Current paths only: a file renamed OUT of the backend no longer schedules
+# the backend jobs (the workflow classifies on the post-rename path), so
+# demanding their evidence here would be an unfixable NO_EVIDENCE.
 touches_backend=''
 while IFS= read -r file; do
   [ -n "${file}" ] || continue
@@ -624,7 +644,7 @@ while IFS= read -r file; do
         ;;
     esac
   done <<<"${BACKEND_PATHS}"
-done <<<"${changed_files}"
+done <<<"${current_files}"
 
 if [ -n "${touches_backend}" ]; then
   missing=''
@@ -666,6 +686,127 @@ if [ -n "${touches_backend}" ]; then
     exit 3
   fi
 fi
+
+# ---------------------------------------------------------------------------
+# 8. The evidence must describe the merge that would actually happen (ENG-1003)
+# ---------------------------------------------------------------------------
+#
+# Everything above proves a real run executed at this head and nothing failed.
+# That is a statement about the PR's code, not about the merge: on a
+# `pull_request` event `actions/checkout` resolves `github.ref` to
+# `refs/pull/N/merge`, so the suite tested this branch merged into whatever the
+# base was WHEN THE RUN STARTED. Commits that landed on the base afterwards were
+# never part of the measurement.
+#
+# Until now this gate said nothing about that. The freshness property was
+# enforced only by GitHub's `strict` branch protection, which buys it by
+# invalidating every open PR on every merge and charging each one a full ~34
+# runner-minute revalidation — 25 of agentweb's 35 open PRs sat BEHIND with zero
+# CLEAN when ENG-1003 was filed, and draining them serially costs ~11 hours.
+#
+# The property is cheaper to check than to enforce by brute force. A base commit
+# only invalidates this PR's green suite if it touched a file this PR also
+# touches; otherwise the tested merge result is still the merge that would land.
+#
+# Scope, stated honestly: this proves FILE-LEVEL independence, not semantic
+# independence. Two PRs can break each other while editing different files. That
+# is a real gap — but it is a gap `strict` does not close either, because
+# `strict` only forces the branch to be current, and the two REQUIRED contexts
+# here (`Detect changed projects`, `Require Greptile Review`) do not run the test
+# suite at all. So this is strictly more evidence than the repo has today, not
+# less. Turning `strict` off is a separate, human decision (ENG-1003); this block
+# is what makes that decision safe to take rather than a silent loss of a gate.
+
+# The comparison runs UNCONDITIONALLY, not only when mergeStateStatus reads
+# BEHIND. mergeStateStatus reports one dominant state: a PR that is behind AND
+# awaiting a required review reports BLOCKED, not BEHIND, and gating the
+# comparison on the displayed state would let that PR's stale evidence through.
+# `ahead_by` from the compare endpoint is the ground truth for "did the base
+# move"; the displayed state is not consulted at all.
+{
+  # GitHub's compare endpoint returns at most this many file entries. A list at
+  # the cap may be truncated, and a truncated list cannot prove the ABSENCE of
+  # an overlap — which is the only thing this section is allowed to conclude.
+  COMPARE_FILE_CAP=300
+
+  if [ -z "${base_ref}" ]; then
+    hard_fail "${REPO}#${PR_NUMBER}: \`gh pr view\` returned no baseRefName, so the base cannot be identified and the staleness of the evidence cannot be evaluated."
+  fi
+
+  # Three dots: GitHub computes the merge base of head and base, then diffs the
+  # merge base to the base head. `.files` is therefore exactly what landed on the
+  # base while this PR was open — not this PR's own diff inverted.
+  compare_json="$(gh api "repos/${REPO}/compare/${head_sha}...${base_ref}" 2>"${stderr_file}")"
+  gh_exit=$?
+
+  if [ "${gh_exit}" -ne 0 ]; then
+    hard_fail "GitHub API call failed (exit ${gh_exit}) comparing ${head_sha} against ${base_ref} for ${REPO}#${PR_NUMBER}, so whether the base moved under the tested merge cannot be established: $(tr '\n' ' ' <"${stderr_file}")"
+  fi
+
+  base_meta="$(printf '%s' "${compare_json}" | jq -r '
+      ((.ahead_by // 0) | tostring), ((.files // []) | length | tostring)' 2>/dev/null)"
+  jq_exit=$?
+  if [ "${jq_exit}" -ne 0 ] || [ -z "${base_meta}" ]; then
+    surface 'compare response (raw)' "${compare_json}"
+    hard_fail "unparseable response comparing ${head_sha} against ${base_ref} — expected a JSON object with ahead_by and files."
+  fi
+
+  base_ahead="$(printf '%s\n' "${base_meta}" | sed -n '1p')"
+  base_file_count="$(printf '%s\n' "${base_meta}" | sed -n '2p')"
+
+  # Non-numeric here would make the `-ge` below error and evaluate FALSE, which
+  # is the pass direction. Refuse to guess rather than fail open.
+  case "${base_ahead}${base_file_count}" in
+    ''|*[!0-9]*)
+      surface 'compare response (raw)' "${compare_json}"
+      hard_fail "the comparison of ${head_sha} against ${base_ref} returned a non-numeric ahead_by/file count ('${base_ahead}'/'${base_file_count}'), so overlap cannot be evaluated."
+      ;;
+  esac
+
+  if [ "${base_ahead}" -eq 0 ]; then
+    log "the base ${base_ref} has not moved since this PR's merge base, so the run at ${head_sha} describes the merge that would land."
+  else
+
+  if [ "${base_file_count}" -ge "${COMPARE_FILE_CAP}" ]; then
+    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} is ${base_ahead} commit(s) behind ${base_ref}, and the comparison returned ${base_file_count} files — at or above GitHub's ${COMPARE_FILE_CAP}-file cap, so the list may be truncated and cannot prove this PR's diff is untouched by it. Sync the branch and let CI re-run against the current base."
+    exit 3
+  fi
+
+  # Both the current and the pre-rename path participate: a rename on the base
+  # is an edit to the logical file under both names, and matching only the
+  # post-rename path would let "base renamed a file this PR edits under its old
+  # name" through as a false non-overlap.
+  base_files="$(printf '%s' "${compare_json}" | jq -r '(.files // [])[] | .filename, (.previous_filename // empty)' 2>/dev/null)"
+  jq_exit=$?
+  if [ "${jq_exit}" -ne 0 ]; then
+    surface 'compare response (raw)' "${compare_json}"
+    hard_fail "unparseable file list comparing ${head_sha} against ${base_ref}."
+  fi
+
+  # Exact path equality, not a prefix match: this is asking "did the base edit a
+  # file this PR also edits", and `src/a.ts` must not be read as matching
+  # `src/a.ts.snap`.
+  base_overlap=''
+  while IFS= read -r base_file; do
+    [ -n "${base_file}" ] || continue
+    while IFS= read -r pr_file; do
+      [ -n "${pr_file}" ] || continue
+      if [ "${base_file}" = "${pr_file}" ]; then
+        base_overlap="${base_file}"
+        break 2
+      fi
+    done <<<"${changed_files}"
+  done <<<"${base_files}"
+
+  if [ -n "${base_overlap}" ]; then
+    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} is ${base_ahead} commit(s) behind ${base_ref}, and one of those commits changed '${base_overlap}', which this PR also changes. The green run at head ${head_sha} tested a merge result that no longer exists, so it is not evidence for the merge that would happen now. Sync the branch and let CI re-run."
+    exit 3
+  fi
+
+  log "base has moved ${base_ahead} commit(s) ahead (${base_file_count} file(s) changed on ${base_ref}), but none of them are files this PR touches, so the run at ${head_sha} still describes the merge that would land."
+
+  fi
+}
 
 # Acceptance criterion 5: the run is known real, so remaining skips are path
 # filters working correctly. Name them, and label them, so the distinction is
