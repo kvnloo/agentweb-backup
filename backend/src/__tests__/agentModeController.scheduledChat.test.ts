@@ -3114,6 +3114,9 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     // filtering assertions compare the full response, so mirror that added field.
     const withHealth = (s: any) => ({
       ...s,
+      // ENG-827: consent is always on the wire as a boolean, never an absent key —
+      // see agentModeController.scheduledChatConsentShape.test.ts for why.
+      autopublishAuthorized: s.autopublishAuthorized === true,
       runHealth: { lastRunStatus: null, lastRunAt: null, consecutiveFailures: 0 },
     });
 
