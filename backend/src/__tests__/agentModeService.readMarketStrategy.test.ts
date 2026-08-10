@@ -695,6 +695,42 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(res.formattedContent).not.toMatch(/already stored/i);
   });
 
+  // Greptile 3/5 (a): the lookup caps the NUMBER of names but each name is
+  // unbounded in length, so the block it renders first could swallow the
+  // response it sits in front of.
+  it('bounds the lookup block however long the requested names are', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(10))));
+
+    const res = await svc.readMarketStrategy('u1', {
+      competitorNames: Array.from({ length: 50 }, (_, i) => 'Z'.repeat(4000) + i),
+    } as any);
+
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+    expect(res.formattedContent).toContain('Competitors');
+  });
+
+  // Greptile 3/5 (b): the closing note claimed every competitor was listed even
+  // when the bounded index had omitted some — guidance contradicting the body.
+  it('does not claim everything is listed when the index omitted names', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(400, 'Bulk', 300))));
+
+    const res = await svc.readMarketStrategy('u1');
+    const listedByName = (res.formattedContent.match(/• \[offset \d+\]/g) || []).length;
+
+    expect(res.competitorsWithFullDetail + listedByName).toBeLessThan(400); // some omitted
+    expect(res.formattedContent).not.toMatch(/Every competitor stored on this account is listed above/);
+    expect(res.formattedContent).toMatch(/not named in this response/i);
+    expect(res.formattedContent).toMatch(/competitorNames/);
+  });
+
+  it('still claims completeness when nothing was omitted', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.formattedContent).toMatch(/Every competitor stored on this account is listed above/);
+  });
+
   it('exposes competitorNames on the tool schema', async () => {
     require('../emma/tools');
     const { emmaToolRegistry } = require('../emma/registry');
