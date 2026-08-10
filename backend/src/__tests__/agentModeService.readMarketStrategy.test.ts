@@ -214,6 +214,33 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(res.formattedContent).not.toContain('<strong>Comp1:</strong>');
   });
 
+  // The name index on page 1 is a random-access directory, not a breadcrumb:
+  // reaching competitor 48 must cost ONE more call, not one call per page.
+  it('makes any competitor reachable in a single further call from the first page', async () => {
+    const competitors = makeCompetitors(49);
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(competitors)));
+
+    const first = await svc.readMarketStrategy('u1');
+    // The first page must advertise an offset for every entry it did not detail.
+    for (let i = first.competitorsWithFullDetail; i < 49; i++) {
+      expect(first.formattedContent).toContain(`[offset ${i}] ${competitors[i].name}`);
+    }
+
+    // Jump straight to the 48th record using the offset printed on page 1.
+    const jumped = await svc.readMarketStrategy('u1', { competitorOffset: 47 });
+    expect(jumped.formattedContent).toContain('<strong>Comp48:</strong>');
+    expect(jumped.competitorDetailOffset).toBe(47);
+  });
+
+  it('teaches random access rather than sequential paging', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.formattedContent).toMatch(/no need to page through in order/i);
+    expect(res.formattedContent).toMatch(/jump straight to the entry you want/i);
+  });
+
   it('tells the caller which offset to ask for next instead of forbidding a second read', async () => {
     userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
 
