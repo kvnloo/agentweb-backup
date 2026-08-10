@@ -62,6 +62,15 @@ export type AssertPublishStillAuthorized = () => Promise<ScheduledPublishRefusal
  * Returns the context to hand the handler: for a publishing tool, the same context
  * plus the re-validation hook; for anything else, the context untouched.
  */
+/**
+ * Runs the hook if the dispatcher attached one. Returns a refusal to hand back in
+ * place of committing, or null to proceed. Safe on any context — a handler reached
+ * outside tool dispatch (direct service call, interactive route) simply proceeds.
+ */
+export async function publishWithdrawnMidFlight(context: any): Promise<ScheduledPublishRefusal | null> {
+  return (await context?.assertPublishStillAuthorized?.()) ?? null;
+}
+
 export function attachPublishRevalidation(toolName: string, context: any): any {
   if (!isPublishName(toolName)) return context;
   const assertPublishStillAuthorized: AssertPublishStillAuthorized = () =>

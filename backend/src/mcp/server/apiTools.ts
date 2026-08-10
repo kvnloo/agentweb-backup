@@ -17,6 +17,7 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 // ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
 // share them instead of keeping a second copy. Behaviour unchanged.
 import { ctx, jsonResult } from './toolHelpers';
+import { publishWithdrawnMidFlight } from '../../utils/scheduledPublishConsentGuard';
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -1310,6 +1311,9 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // ENG-827: last moment before the article goes live on the CMS.
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return { success: false, message: withdrawn.error };
     const { agentModeService } = await import('../../services/agentModeService');
     return await agentModeService.publishBlogArticle(
       args.title, args.description, args.hero_image_url, args.blog_html_url,
@@ -1358,6 +1362,9 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // ENG-827: last in-process moment before this becomes a live post.
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST', path: '/api/emma/post-on-account', context: ctx(context),
       body: { account_id: args.account_id, content: args.content, media_urls: args.media_urls || [] }
@@ -1746,6 +1753,9 @@ mcpToolRegistry.register({
     }
   },
   execute: async (args: any, context: any) => {
+    // ENG-827: last in-process moment before the deployment goes live.
+    const withdrawn = await publishWithdrawnMidFlight(context);
+    if (withdrawn) return jsonResult({ success: false, message: withdrawn.error });
     const data = await mcpFetch({
       method: 'POST',
       path: `/api/landing-pages/v0/generated/${args.page_id}/publish`,
