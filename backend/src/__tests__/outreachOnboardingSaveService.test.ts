@@ -117,6 +117,7 @@ describe("saveOutreachProspects", () => {
         prospect(),
         prospect({ id: "anon2", name: "Miembro de LinkedIn", linkedin_url: "" }),
       ],
+      drafts: {},
     });
     expect(res).toEqual({ ok: true, leadListId: "list_123" });
     const [, leadsArg] = crmDb.batchCreateLeads.mock.calls[0];
