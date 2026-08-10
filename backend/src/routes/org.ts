@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, orgDb, Organization } from "../services/db";
 import { defaultShareSettings } from "../services/orgShareService";
+import { callerCan, can, roleOf } from "../services/orgAuthz";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
@@ -80,8 +81,157 @@ function buildOrgMarketStrategyForCopy(user: any): MarketStrategy | undefined {
 // All org routes require authentication
 router.use(authenticateToken);
 
-function isOrgOwner(user: any, org: Organization): boolean {
-  return org.ownerUserId === user.userId || user.orgRole === "owner";
+// Read and write authority over org connected accounts are separate questions, so
+// they get separate predicates rather than one shared `isOrgOwner`. They resolve
+// the same way today (both owner+admin) but splitting them is what makes a
+// read-only oversight role expressible later without decomposing either route.
+function canSeeAllOrgAccounts(user: any, org: Organization): boolean {
+  return can({ userId: user.userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:accounts:read");
+}
+
+function canManageOrgAccounts(user: any, org: Organization): boolean {
+  return can({ userId: user.userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:accounts:manage");
+}
+
+/**
+ * The last-one-out invariant: an org must always retain at least one owner.
+ *
+ * Enforced on every verb that can take an owner away — remove, leave, and
+ * demote. Better Auth shipped the first two and not the third, and a demote
+ * orphaned an org (better-auth#3651); the demote path is the one that gets
+ * missed, so it is guarded here explicitly.
+ *
+ * Counted from the live GSI-backed member list rather than a denormalized
+ * counter. Org membership is capped by nothing now, but orgs are small and this
+ * runs only on the three membership-mutating verbs, so a Query is the right
+ * trade against maintaining another counter — that is exactly the apparatus the
+ * seat cap left behind.
+ *
+ * `losingUserId` is the member about to stop being an owner. Returns true when
+ * at least one OTHER owner would remain.
+ */
+/**
+ * Validate the last-owner invariant AND claim the right to act on it.
+ *
+ * `anotherOwnerRemains` is a read. Between it and the write, another departure
+ * can pass the same read and both proceed, leaving the org with no owner —
+ * the invariant is over the member items, so no single conditional write can
+ * express it (Greptile, #2297).
+ *
+ * So the org item is the serialization point: read its epoch with the roster,
+ * then claim that epoch conditionally. The loser of a race gets `false` and
+ * refuses, rather than acting on a roster the winner has already invalidated.
+ *
+ * Callers that are NOT removing an owner skip this entirely — it only guards
+ * owner loss.
+ */
+async function claimOwnerLoss(org: Organization, losingUserId: string): Promise<boolean> {
+  if (!(await anotherOwnerRemains(org, losingUserId))) return false;
+  // Claim on the epoch from the org snapshot this decision was made against —
+  // not a fresher read. That is the point of optimistic concurrency: if
+  // anything moved since we loaded it, the condition fails and we refuse
+  // rather than acting on a roster that may already be stale.
+  return orgDb.claimOwnerChange(org.orgId, org.ownerEpoch ?? 0);
+}
+
+async function anotherOwnerRemains(org: Organization, losingUserId: string): Promise<boolean> {
+  const members = await orgDb.getOrgMembers(org.orgId);
+  return members.some(
+    (m) => m.userId !== losingUserId && roleOf({ userId: m.userId, orgId: m.orgId, orgRole: m.orgRole }, org) === "owner"
+  );
+}
+
+/**
+ * Move the billing root off a departing member.
+ *
+ * `Organization.ownerUserId` is written in exactly one place — org creation —
+ * and nothing has ever moved it. That was survivable only because the primary
+ * owner could not leave: the old leave route blocked on
+ * `ownerUserId === userId` and pointed at a transfer route nobody built.
+ *
+ * ENG-954 removed that block, which is correct — an owner must be able to
+ * leave — but the block was standing in for this. Without it, promote-then-
+ * leave (the succession path this design commits to, and the one the demote
+ * error tells people to use) leaves `ownerUserId` pointing at an ex-member.
+ * The org stays administrable, because the remaining owners hold authority by
+ * role; but billing does not. `resolveBillingUserId` follows the pointer, so
+ * the org's tier and pooled quota resolve to someone who has left, and follow
+ * THEIR subscription from then on.
+ *
+ * So departure carries the pointer with it. That IS the transfer, performed at
+ * the only moment it is unambiguous. Callers must have already established
+ * that another owner remains — every caller here is behind that guard, and
+ * this returns false rather than guessing if that is somehow untrue.
+ */
+/** Stripe's own convention for "this subscription is entitling", used throughout stripeService. */
+function hasLiveSubscription(u: { subscription_status?: string } | null | undefined): boolean {
+  return u?.subscription_status === "active" || u?.subscription_status === "trialing";
+}
+
+/**
+ * Whether the billing root can be released from this org without silently
+ * ending its plan.
+ *
+ * Moving `ownerUserId` moves who the org bills THROUGH. It cannot move the
+ * money: the subscription and the card belong to that person's Stripe
+ * customer, and Stripe has no way to reassign a subscription to a different
+ * customer. So if they are paying, handing the pointer to someone with no
+ * subscription drops the whole org to Free — no error, no webhook, exactly the
+ * silent-downgrade trap this PR set out to close.
+ *
+ * Free orgs hop freely. Paying orgs stop and say so.
+ */
+export async function billingRootMayDepart(
+  org: Organization,
+  departingUserId: string,
+): Promise<{ ok: true } | { ok: false; error: string; code: "BILLING_OWNER_HAS_SUBSCRIPTION" }> {
+  if (org.ownerUserId !== departingUserId) return { ok: true };
+  const departing = await userDb.getUserById(departingUserId);
+  if (!hasLiveSubscription(departing)) return { ok: true };
+  return {
+    ok: false,
+    code: "BILLING_OWNER_HAS_SUBSCRIPTION",
+    error:
+      "This member's card pays for the organization, and a card cannot be handed to someone else. Have another owner start their own subscription first — then this member can be removed and billing moves to them. If you're stuck, contact support and we can switch it for you.",
+  };
+}
+
+export async function reassignBillingRootOnDeparture(
+  org: Organization,
+  departingUserId: string,
+  /**
+   * The owner performing the removal. They take billing, which is the rule
+   * Harsha asked for and the least surprising one: the person who decided the
+   * billing owner should go is the person who inherits it, and they find out
+   * by seeing the badge land on their own row. Absent on `leave`, where nobody
+   * is acting on anyone — that falls back to a deterministic pick.
+   */
+  actingUserId?: string,
+): Promise<boolean> {
+  if (org.ownerUserId !== departingUserId) return true; // not the billing root
+  const members = await orgDb.getOrgMembers(org.orgId);
+  // `roleOf`, not the raw column — deliberately the SAME predicate the
+  // last-owner guards use to admit the departure.
+  //
+  // They used to disagree: the guards ask roleOf (which unions ownerUserId),
+  // this asked `m.orgRole === "owner"`. A member who is an owner by union but
+  // not by column satisfied the guard and then could not be selected here, so
+  // this returned false and the caller got a 409 — AFTER the asset transfers
+  // had already run on the removal route. Two predicates for one question is
+  // what made that reachable (Greptile, #2297).
+  const owners = members.filter(
+    (m) => m.userId !== departingUserId &&
+      roleOf({ userId: m.userId, orgId: m.orgId, orgRole: m.orgRole }, org) === "owner");
+  const successor =
+    owners.find((m) => m.userId === actingUserId) ??
+    // Deterministic, so a retry picks the same successor as the first attempt.
+    owners.sort((a, b) => a.userId.localeCompare(b.userId))[0];
+  if (!successor) return false;
+  await orgDb.updateOrg(org.orgId, { ownerUserId: successor.userId });
+  console.log(
+    `[org] billing root moved ${departingUserId} -> ${successor.userId} on departure from ${org.orgId}`,
+  );
+  return true;
 }
 
 // Domain always derived server-side from the acting user's own email — never
@@ -138,6 +288,11 @@ function projectOrgForMemberResponse(org: any): Record<string, any> {
     orgId: org.orgId,
     name: org.name,
     ownerUserId: org.ownerUserId,
+    // Still projected even though ENG-954 deletes the seat cap that wrote
+    // them, because ENG-953's AC4 pins their presence. They resolve to
+    // undefined and JSON drops them, so no client sees a stale cap; removing
+    // the keys is a follow-up for whoever owns that contract, not something to
+    // take unilaterally out of another PR's acceptance criteria.
     maxMembers: org.maxMembers,
     memberCount: org.memberCount,
     createdAt: org.createdAt,
@@ -228,11 +383,9 @@ router.post("/", async (req: Request, res: Response) => {
       orgId: uuidv4(),
       name: name.trim(),
       ownerUserId: userId,
-      maxMembers: orgDb.ORG_MAX_MEMBERS,
       // The owner is the org's first member. Seeded directly (no transaction
       // needed — this org doesn't exist in the table until this exact call,
       // so there's no concurrent joiner to race against).
-      memberCount: 1,
       pendingInvites: [],
       // Seed sharing defaults at creation so the toggle UI and member-fanout
       // gating agree from day one (skills + work plans shared org-wide by
@@ -273,18 +426,52 @@ router.get("/me", async (req: Request, res: Response) => {
 
     // Get members (without sensitive data)
     const members = await orgDb.getOrgMembers(user.orgId);
+    // EFFECTIVE role, not the stored column. `roleOf` unions `ownerUserId`, so
+    // the billing root holds owner authority whatever their stored `orgRole`
+    // says — and that divergence is reachable: another owner can demote them,
+    // which changes the column and nothing else.
+    //
+    // Reporting the raw column then makes the roster contradict the authority
+    // on the same screen: the row renders "Member" while `capabilities` for
+    // that same user returns `canDeleteOrg`. Worse, a client gating a control
+    // on `orgRole !== "owner"` offers an admin a remove button the server then
+    // 403s, because `roleOf` disagrees with what the client was told.
+    //
+    // Found by a live run against real DynamoDB (ENG-954); every mocked test
+    // seeded the two fields in agreement, so none of them could see it.
     const safeMembers = members.map((m) => ({
       userId: m.userId,
       email: m.email,
       displayName: m.displayName,
-      orgRole: m.orgRole,
+      orgRole: roleOf({ userId: m.userId, orgId: m.orgId, orgRole: m.orgRole }, org),
     }));
 
+    // ENG-953: this used to spread the whole Organization record, which carries
+    // org-level `connected_accounts` (with unredacted config) and the encrypted
+    // per-org `secrets` map — handed to every member, not just owners. The
+    // sanitizer two hundred lines below was already applied to the sibling
+    // connected-accounts routes and simply never to this one.
+    //
+    // An explicit allowlist rather than a denylist, so a future Organization
+    // field is absent here until someone deliberately adds it.
+    const callerRole = roleOf({ userId, orgId: user.orgId, orgRole: user.orgRole }, org);
     return res.json({
       success: true,
       data: {
-        ...projectOrgForMemberResponse(org),
+...projectOrgForMemberResponse(org),
         members: safeMembers,
+        // Server-computed capabilities. Clients must gate on these rather than
+        // comparing orgRole themselves — that comparison is exactly what has to
+        // be updated in every UI each time a role is added, and it is why the
+        // portal would silently render an admin as a plain member.
+        callerRole,
+        capabilities: {
+          canManageOrg: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:configure"),
+          canManageMembers: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:members:manage"),
+          canManageContent: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:content:manage"),
+          canSeeAllAccounts: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:accounts:read"),
+          canDeleteOrg: can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:delete"),
+        },
       },
     });
   } catch (error) {
@@ -303,8 +490,8 @@ router.put("/:orgId", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can update the organization" });
+    if (!(await callerCan(userId, org, "org:configure"))) {
+      return res.status(403).json({ error: "Only org owners and admins can update the organization" });
     }
 
     // Allow updating org-level profile fields
@@ -367,15 +554,8 @@ router.post("/:orgId/invite", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can invite members" });
-    }
-
-    // Check member count
-    const memberCount = await orgDb.getOrgMemberCount(orgId);
-    const pendingCount = (org.pendingInvites || []).length;
-    if (memberCount + pendingCount >= org.maxMembers) {
-      return res.status(400).json({ error: `Organization has reached the maximum of ${org.maxMembers} members (including pending invites)` });
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can invite members" });
     }
 
     // Check if user already in this org
@@ -486,29 +666,23 @@ router.post("/accept-invite", async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Invalid or expired invitation" });
     }
 
-    // Add user to org first — atomic (memberCount increment + orgId write in
-    // one transaction, see joinOrgWithCapacityCheck) so two concurrent
-    // accepts/approvals can never both squeeze into the last slot. We
+    // Add user to org first — the conditional write in joinOrg rejects a user
+    // who already belongs to an org, so two concurrent accepts/approvals for the
+    // same person resolve to exactly one membership. We
     // intentionally do NOT snapshot the owner's subscription tier onto the
     // member here — the org's effective tier is resolved dynamically from
     // the owner at read time (getUserSubscriptionType), which keeps members
     // in sync with owner up/downgrades and auto-revokes entitlements when
     // they leave. See ENG-288.
-    const joinResult = await userDb.joinOrgWithCapacityCheck(userId, orgId, "member", org.maxMembers);
-    if (joinResult === "org_full") {
-      return res.status(400).json({ error: "Organization is full" });
-    }
+    const joinResult = await userDb.joinOrg(userId, orgId, "member");
     if (joinResult === "already_in_org") {
       return res.status(400).json({ error: "You are already in an organization. Leave your current org first." });
-    }
-    if (joinResult === "not_migrated") {
-      return res.status(409).json({ error: "This organization is not yet ready to accept members. Please try again shortly." });
     }
 
     // Only remove the invite once the join actually succeeded — removing it
     // first would silently drop the invite if the atomic join lost the race.
-    // (joinOrgWithCapacityCheck's transaction already cleared pendingOrgInvite
-    // on the user as part of the atomic write.)
+    // (joinOrg's conditional write already cleared pendingOrgInvite on the user
+    // as part of the same update.)
     const updatedInvites = [...pendingInvites];
     updatedInvites.splice(inviteIndex, 1);
     await orgDb.updateOrg(orgId, { pendingInvites: updatedInvites });
@@ -531,8 +705,8 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can approve domain-join requests" });
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can approve domain-join requests" });
     }
 
     const pendingRequests = org.pendingDomainJoinRequests || [];
@@ -541,13 +715,11 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
       return res.status(400).json({ error: "Invalid or unknown domain-join request" });
     }
 
-    // Cheap early exit — the authoritative check is the atomic transaction
-    // below (joinOrgWithCapacityCheck), which closes both: (1) the same user
-    // joining twice if the domain matched multiple orgs and another owner
-    // approved first, and (2) two different users both squeezing into the
-    // last slot when the org is nearly full. Neither race is closeable by a
-    // separate read-then-write, however early — see the function's doc
-    // comment.
+    // Cheap early exit — the authoritative check is the conditional write in
+    // joinOrg below, which closes the real race: the same user joining twice if
+    // the domain matched multiple orgs and another owner approved first. That
+    // race is not closeable by a separate read-then-write, however early — see
+    // the function's doc comment.
     const targetUser = await userDb.getUserById(requestEntry.userId);
     if (!targetUser) {
       return res.status(404).json({ error: "The requesting user no longer exists" });
@@ -559,17 +731,9 @@ router.post("/:orgId/domain-requests/:requestToken/approve", async (req: Request
     // Only remove the request from this org's pending list once the join
     // actually succeeds — removing it first would silently drop the request
     // if the atomic join loses the race, with no way to retry.
-    const joinResult = await userDb.joinOrgWithCapacityCheck(requestEntry.userId, orgId, "member", org.maxMembers);
-    if (joinResult === "org_full") {
-      return res.status(400).json({
-        error: `Organization has reached the maximum of ${org.maxMembers} members. Upgrade to add more.`,
-      });
-    }
+    const joinResult = await userDb.joinOrg(requestEntry.userId, orgId, "member");
     if (joinResult === "already_in_org") {
       return res.status(400).json({ error: "This user is already in an organization" });
-    }
-    if (joinResult === "not_migrated") {
-      return res.status(409).json({ error: "This organization is not yet ready to accept members. Please try again shortly." });
     }
 
     // Same non-snapshotting join mechanics as accept-invite (see ENG-288) —
@@ -596,8 +760,8 @@ router.post("/:orgId/domain-requests/:requestToken/reject", async (req: Request,
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can reject domain-join requests" });
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can reject domain-join requests" });
     }
 
     const removed = await orgDb.removeDomainJoinRequest(orgId, requestToken);
@@ -623,8 +787,8 @@ router.delete("/:orgId/invite/:email", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can cancel invites" });
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can cancel invites" });
     }
 
     const pendingInvites = org.pendingInvites || [];
@@ -650,6 +814,82 @@ router.delete("/:orgId/invite/:email", async (req: Request, res: Response) => {
   }
 });
 
+// Change a member's role. This is the whole of succession: there is no
+// transfer-ownership primitive, because no system surveyed has one — you promote
+// someone, then leave. Guarded by the last-one-out invariant so a demote can
+// never orphan the org.
+router.patch("/:orgId/members/:memberId/role", async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+    const { orgId, memberId } = req.params;
+    const { role } = req.body ?? {};
+
+    if (role !== "owner" && role !== "admin" && role !== "member") {
+      return res.status(400).json({ error: "role must be one of: owner, admin, member" });
+    }
+
+    const org = await orgDb.getOrgById(orgId);
+    if (!org) return res.status(404).json({ error: "Organization not found" });
+
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can change member roles" });
+    }
+
+    const member = await userDb.getUserById(memberId);
+    if (!member || member.orgId !== orgId) {
+      return res.status(404).json({ error: "Member not found in this organization" });
+    }
+
+    const caller = await userDb.getUserById(userId);
+    const callerRole = roleOf({ userId, orgId, orgRole: caller?.orgRole }, org);
+    const currentRole = roleOf({ userId: memberId, orgId, orgRole: member.orgRole }, org);
+
+    // Only an owner may mint or remove another owner. An admin promoting someone
+    // to owner would be a self-service privilege escalation: admins cannot delete
+    // the org, owners can, so admin->owner->delete would route around the one
+    // authority admins are deliberately denied.
+    if ((role === "owner" || currentRole === "owner") && callerRole !== "owner") {
+      return res.status(403).json({ error: "Only an owner can grant or revoke owner" });
+    }
+
+    if (currentRole === role) {
+      return res.json({ success: true, message: `Member is already ${role}`, role });
+    }
+
+    // Demoting the billing root is a no-op that reports success. `roleOf`
+    // unions `ownerUserId`, so this writes the column and moves no authority:
+    // they remain an owner, the roster still says owner, and nothing the
+    // caller wanted actually happened. Observed live on the test env — the
+    // request returned 200 twice while the target kept `canDeleteOrg`.
+    //
+    // Refuse it and say why, rather than succeeding at nothing. Succession is
+    // still available: promote someone else, then this user leaves, which
+    // moves the billing root with them.
+    if (memberId === org.ownerUserId && role !== "owner") {
+      return res.status(409).json({
+        error: "This member owns the organization's billing, so changing their role here would not actually change anything. To hand the organization over, make someone else an owner first — billing moves to them automatically when this member leaves or is removed.",
+      });
+    }
+
+    // Demoting the last owner orphans the org. This is the path Better Auth
+    // missed (better-auth#3651) — remove and leave were guarded, changeRole was
+    // not.
+    if (currentRole === "owner" && !(await claimOwnerLoss(org, memberId))) {
+      return res.status(409).json({
+        error: "Cannot demote the only owner. Promote another member to owner first.",
+      });
+    }
+
+    await userDb.updateUser(memberId, { orgRole: role });
+    return res.json({ success: true, message: `Member role set to ${role}`, role });
+  } catch (error) {
+    console.error("Error changing member role:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // Remove member (owner only)
 router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) => {
   try {
@@ -661,8 +901,8 @@ router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) =
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can remove members" });
+    if (!(await callerCan(userId, org, "org:members:manage"))) {
+      return res.status(403).json({ error: "Only org owners and admins can remove members" });
     }
 
     if (memberId === userId) {
@@ -674,6 +914,31 @@ router.delete("/:orgId/members/:memberId", async (req: Request, res: Response) =
       return res.status(404).json({ error: "Member not found in this organization" });
     }
 
+    if (roleOf({ userId: memberId, orgId, orgRole: member.orgRole }, org) === "owner") {
+      // Removing an owner revokes their ownership, so it answers to the same
+      // authority as demoting one. Without this an admin — who is 403'd by the
+      // role route above for exactly this reason — could reach the same end by
+      // deleting the owner outright, which is the strictly larger action.
+      const caller = await userDb.getUserById(userId);
+      if (roleOf({ userId, orgId, orgRole: caller?.orgRole }, org) !== "owner") {
+        return res.status(403).json({ error: "Only an owner can remove an owner" });
+      }
+      if (!(await claimOwnerLoss(org, memberId))) {
+        return res.status(409).json({
+          error: "Cannot remove the only owner. Promote another member to owner first.",
+        });
+      }
+    }
+
+    const mayGo = await billingRootMayDepart(org, memberId);
+    if (!mayGo.ok) {
+      return res.status(409).json({ error: mayGo.error, code: mayGo.code });
+    }
+    if (!(await reassignBillingRootOnDeparture(org, memberId, userId))) {
+      return res.status(409).json({
+        error: "Cannot remove the only owner. Promote another member to owner first.",
+      });
+    }
     await userDb.clearOrgMembership(memberId);
     return res.json({ success: true, message: "Member removed" });
   } catch (error) {
@@ -693,15 +958,34 @@ router.post("/:orgId/leave", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId === userId) {
-      return res.status(400).json({ error: "The owner cannot leave the organization. Transfer ownership or delete the org." });
-    }
-
     const user = await userDb.getUserById(userId);
     if (!user || user.orgId !== orgId) {
       return res.status(400).json({ error: "You are not a member of this organization" });
     }
 
+    // Owners may leave — as long as they are not the last one. This used to
+    // block on `ownerUserId === userId` and point at a transfer-ownership route
+    // that was never built, which made the primary owner permanently unable to
+    // leave their own org.
+    if (roleOf({ userId, orgId, orgRole: user.orgRole }, org) === "owner" && !(await claimOwnerLoss(org, userId))) {
+      return res.status(409).json({
+        error: "You are the only owner. Promote another member to owner before leaving.",
+      });
+    }
+
+    const mayLeave = await billingRootMayDepart(org, userId);
+    if (!mayLeave.ok) {
+      return res.status(409).json({
+        code: mayLeave.code,
+        error:
+          "Your card pays for this organization, and a card cannot be handed to someone else. Have another owner start their own subscription first — then you can leave and billing moves to them. If you're stuck, contact support and we can switch it for you.",
+      });
+    }
+    if (!(await reassignBillingRootOnDeparture(org, userId))) {
+      return res.status(409).json({
+        error: "You are the only owner. Promote another member to owner before leaving.",
+      });
+    }
     await userDb.clearOrgMembership(userId);
     return res.json({ success: true, message: "Left the organization" });
   } catch (error) {
@@ -721,8 +1005,8 @@ router.delete("/:orgId", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can delete the organization" });
+    if (!(await callerCan(userId, org, "org:delete"))) {
+      return res.status(403).json({ error: "Only org owners can delete the organization" });
     }
 
     // Remove all members from the org
@@ -773,7 +1057,7 @@ router.get("/:orgId/connected-accounts", async (req: Request, res: Response) => 
       }
     }
 
-    const ownerCanManageOrgAccounts = isOrgOwner(user, org);
+    const ownerCanManageOrgAccounts = canSeeAllOrgAccounts(user, org);
 
     // Member personal accounts. Members only see accounts explicitly shared with the org.
     // Org owners see all member-connected accounts so they can decide what becomes an
@@ -823,7 +1107,7 @@ router.patch("/connected-accounts/:platform/:accountId/share", async (req: Reque
       return res.status(404).json({ error: "Organization not found" });
     }
 
-    const requesterIsOwner = isOrgOwner(user, org);
+    const requesterIsOwner = canManageOrgAccounts(user, org);
     let accountOwner = user;
     let accounts = user.connected_accounts || [];
     let idx = accounts.findIndex(
@@ -885,8 +1169,8 @@ router.post("/:orgId/copy-profile", async (req: Request, res: Response) => {
     const org = await orgDb.getOrgById(orgId);
     if (!org) return res.status(404).json({ error: "Organization not found" });
 
-    if (org.ownerUserId !== userId) {
-      return res.status(403).json({ error: "Only the org owner can copy profile data" });
+    if (!(await callerCan(userId, org, "org:configure"))) {
+      return res.status(403).json({ error: "Only org owners and admins can copy profile data" });
     }
 
     const user = await userDb.getUserById(userId);
