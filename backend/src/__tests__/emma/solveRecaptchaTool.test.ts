@@ -105,11 +105,43 @@ describe('solve_captcha validation', () => {
   });
 });
 
+/**
+ * Drives a pending promise to completion under fake timers.
+ *
+ * `solve_captcha` waits a real 15s before its first 2captcha poll (and up to 8s
+ * more when the site-key probe hangs). Sleeping that for real cost ~98s of CI
+ * wall-clock per run — ~11% of the backend test job — while asserting nothing.
+ * Advancing a fake clock exercises exactly the same wait/poll path in ~0s.
+ *
+ * The loop advances in 1s slices rather than jumping straight to the deadline so
+ * that sequential waits (probe timeout, then initial wait, then a poll interval)
+ * each get their turn, and settles as soon as the promise does.
+ */
+async function settleWithFakeTimers<T>(promise: Promise<T>): Promise<T> {
+  let settled = false;
+  const tracked = promise.then(
+    (value) => { settled = true; return { ok: true as const, value }; },
+    (error) => { settled = true; return { ok: false as const, error }; }
+  );
+
+  for (let i = 0; i < 200 && !settled; i++) {
+    await jest.advanceTimersByTimeAsync(1000);
+  }
+
+  const outcome = await tracked;
+  if (outcome.ok) return outcome.value;
+  throw outcome.error;
+}
+
 describe('solve_captcha live site-key verification', () => {
-  jest.setTimeout(20000); // real 15s 2captcha initial-wait for recaptcha_v2 runs unmocked
   const originalFetch = global.fetch;
 
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
   afterEach(() => {
+    jest.useRealTimers();
     global.fetch = originalFetch;
     jest.clearAllMocks();
   });
@@ -134,26 +166,26 @@ describe('solve_captcha live site-key verification', () => {
       service: { toolRegistry: { getAllTools: () => [{ name: 'playwright_browser_run_code' }] }, executeTool }
     };
 
-    const result = await tool.execute(
+    const result = await settleWithFakeTimers(tool.execute(
       { captcha_type: 'recaptcha_v2', site_key: 'FALLBACK_KEY', page_url: 'https://rankai.ai/signin', invisible: true },
       ctx
-    );
+    ));
 
     expect(result.success).toBe(true);
     const submitCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes('/in.php'));
     const submittedUrl = new URL(submitCall![0]);
     expect(submittedUrl.searchParams.get('googlekey')).toBe('FALLBACK_KEY');
-  }, 30000);
+  });
 
   it('falls back to the caller-provided site_key when the live page cannot be probed for any key (no dataKey/iframeKey found)', async () => {
     const fetchMock = mockTwoCaptchaFetch();
     global.fetch = fetchMock as any;
     const ctx = buildRunCodeContext({ dataKey: null, iframeKey: null });
 
-    const result = await tool.execute(
+    const result = await settleWithFakeTimers(tool.execute(
       { captcha_type: 'recaptcha_v2', site_key: 'STALE_PROMPT_KEY', page_url: 'https://rankai.ai/signin', invisible: true },
       ctx
-    );
+    ));
 
     expect(result.success).toBe(true);
     const submitCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes('/in.php'));
@@ -167,10 +199,10 @@ describe('solve_captcha live site-key verification', () => {
     global.fetch = fetchMock as any;
     const ctx = buildRunCodeContext({ dataKey: 'LIVE_KEY_FROM_DOM', iframeKey: null });
 
-    const result = await tool.execute(
+    const result = await settleWithFakeTimers(tool.execute(
       { captcha_type: 'recaptcha_v2', site_key: 'STALE_PROMPT_KEY', page_url: 'https://rankai.ai/signin', invisible: true },
       ctx
-    );
+    ));
 
     expect(result.success).toBe(true);
     const submitCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes('/in.php'));
@@ -185,10 +217,10 @@ describe('solve_captcha live site-key verification', () => {
     global.fetch = fetchMock as any;
     const ctx = buildRunCodeContext({ dataKey: null, iframeKey: 'LIVE_KEY_FROM_IFRAME' });
 
-    const result = await tool.execute(
+    const result = await settleWithFakeTimers(tool.execute(
       { captcha_type: 'recaptcha_v2', site_key: 'STALE_PROMPT_KEY', page_url: 'https://rankai.ai/signin', invisible: true },
       ctx
-    );
+    ));
 
     expect(result.success).toBe(true);
     const submitCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes('/in.php'));
@@ -201,10 +233,10 @@ describe('solve_captcha live site-key verification', () => {
     global.fetch = fetchMock as any;
     const ctx = buildRunCodeContext({ dataKey: 'MATCHING_KEY', iframeKey: null });
 
-    await tool.execute(
+    await settleWithFakeTimers(tool.execute(
       { captcha_type: 'recaptcha_v2', site_key: 'MATCHING_KEY', page_url: 'https://rankai.ai/signin', invisible: true },
       ctx
-    );
+    ));
 
     const submitCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes('/in.php'));
     const submittedUrl = new URL(submitCall![0]);
@@ -227,14 +259,42 @@ describe('solve_captcha live site-key verification', () => {
       service: { toolRegistry: { getAllTools: () => [{ name: 'playwright_browser_run_code' }] }, executeTool }
     };
 
-    const result = await tool.execute(
+    const result = await settleWithFakeTimers(tool.execute(
       { captcha_type: 'recaptcha_v2', site_key: 'FALLBACK_KEY', page_url: 'https://rankai.ai/signin', invisible: true },
       ctx
-    );
+    ));
 
     expect(result.success).toBe(true);
     const submitCall = fetchMock.mock.calls.find(([url]: [string]) => url.includes('/in.php'));
     const submittedUrl = new URL(submitCall![0]);
     expect(submittedUrl.searchParams.get('googlekey')).toBe('FALLBACK_KEY');
+  });
+
+  // Anti-vacuity guard for the fake-timer conversion above. Swapping real sleeps
+  // for a fake clock is only legitimate if the wait is still *there* — this fails
+  // if anyone later "speeds the suite up" by shortening or removing the 15s
+  // 2captcha initial wait in the product code, which would start the first poll
+  // before a solution can plausibly exist.
+  it('still honours the 15s 2captcha initial wait before the first result poll', async () => {
+    const fetchMock = mockTwoCaptchaFetch();
+    global.fetch = fetchMock as any;
+    const ctx = buildRunCodeContext({ dataKey: 'MATCHING_KEY', iframeKey: null });
+
+    const pending = tool.execute(
+      { captcha_type: 'recaptcha_v2', site_key: 'MATCHING_KEY', page_url: 'https://rankai.ai/signin', invisible: true },
+      ctx
+    );
+    let settled = false;
+    const tracked = pending.then(() => { settled = true; }, () => { settled = true; });
+
+    const polled = () => fetchMock.mock.calls.some(([url]: [string]) => url.includes('/res.php'));
+
+    await jest.advanceTimersByTimeAsync(14000);
+    expect(polled()).toBe(false);
+    expect(settled).toBe(false);
+
+    await jest.advanceTimersByTimeAsync(2000);
+    await tracked;
+    expect(polled()).toBe(true);
   });
 });
