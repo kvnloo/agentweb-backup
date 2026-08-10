@@ -406,10 +406,22 @@ export function setupMcpServer(
         // internal caller; external sessions require a matching authenticated user.
         const reqUserId = (req as any)._agentApiUserId as string | undefined;
         const reqIsInternal = (req as any)._mcpIsInternal === true;
+        // Anonymous discovery sessions (ENG-984) are owned by a per-request
+        // `anon_` id, so an exact-match check can never succeed once a follow-up
+        // request lands on a different instance (each request mints a fresh id).
+        // An anon-owned session may be rehydrated by any anonymous-permitted
+        // request: the middleware has already confined it to discovery methods,
+        // which grant nothing a brand-new anonymous session wouldn't. Real user
+        // sessions still require an exact principal match (IDOR guard).
+        const reqIsAnonymous = (req as any)._mcpAuthMethod === 'anonymous';
+        const rehydratedIsAnonymous =
+          !!rehydrated?.agentUserId && rehydrated.agentUserId.startsWith('anon_');
         const samePrincipal = rehydrated
           ? rehydrated.isInternal
             ? reqIsInternal
-            : !!rehydrated.agentUserId && rehydrated.agentUserId === reqUserId
+            : rehydratedIsAnonymous
+              ? reqIsAnonymous
+              : !!rehydrated.agentUserId && rehydrated.agentUserId === reqUserId
           : false;
 
         if (rehydrated && samePrincipal) {
