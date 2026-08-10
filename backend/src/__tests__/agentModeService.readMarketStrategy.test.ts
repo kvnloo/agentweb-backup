@@ -15,19 +15,38 @@ jest.mock('../services/db', () => ({
 const userDb = require('../services/db').userDb;
 const orgDb = require('../services/db').orgDb;
 
-const makeCompetitors = (n: number, prefix = 'Comp') =>
+// A tool result over this many characters is offloaded to S3 and only its first
+// 20,000 chars stay in the model's context (TOOL_RESPONSE_S3_THRESHOLD /
+// S3_IN_MEMORY_CAP in agentMode/core/toolDispatch). A read_market_strategy page
+// that exceeds it pushes its own competitor list out of context.
+const IN_CONTEXT_CAP = 20000;
+
+// Real competitor descriptions on the reporting account run 57–2,107 chars
+// (mean 1,106). The fixtures use realistic sizes on purpose: with toy 60-char
+// descriptions a character budget is never exercised and the paging tests below
+// would pass against an implementation that pages badly.
+const DESC_CHARS = 1000;
+
+const makeCompetitors = (n: number, prefix = 'Comp', descChars = DESC_CHARS) =>
   Array.from({ length: n }, (_, i) => ({
     name: `${prefix}${i + 1}`,
-    description: `Description for ${prefix}${i + 1}`,
+    description: `Description for ${prefix}${i + 1}. `.padEnd(descChars, 'x'),
   }));
 
-const marketStrategyWith = (competitors: any[]) => ({
+const marketStrategyWith = (competitors: any[], icpChars = 200) => ({
   businessOverview: 'We do X',
   competitors,
-  icp: [{ title: 'ICP1', description: 'd', valueProposition: 'v', buyerPersonas: ['p'] }],
+  icp: [{
+    title: 'ICP1',
+    description: 'd'.padEnd(icpChars, 'd'),
+    valueProposition: 'v',
+    buyerPersonas: ['p'],
+  }],
   createdAt: '2026-01-01T00:00:00.000Z',
   updatedAt: '2026-02-01T00:00:00.000Z',
 });
+
+const asUser = (marketStrategy: any) => ({ userId: 'u1', email: 'u@x.com', marketStrategy });
 
 // ENG-945: read_market_strategy used to silently slice the competitor list to
 // the first 40 entries. Callers (Emma / scheduled agents) read that truncated
@@ -41,9 +60,9 @@ describe('AgentModeService.readMarketStrategy competitor visibility (ENG-945)', 
     jest.clearAllMocks();
   });
 
-  it('never hides stored competitors: every name beyond the detail limit is still listed', async () => {
+  it('never hides stored competitors: every name beyond the detail window is still listed', async () => {
     const competitors = makeCompetitors(49);
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(competitors) });
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(competitors)));
 
     const res = await svc.readMarketStrategy('u1');
 
@@ -54,17 +73,17 @@ describe('AgentModeService.readMarketStrategy competitor visibility (ENG-945)', 
   });
 
   it('reports the true stored competitor count, not the number rendered in full', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
 
     const res = await svc.readMarketStrategy('u1');
 
     expect(res.totalCompetitors).toBe(49);
-    expect(res.competitorsWithFullDetail).toBe(40);
-    expect(res.formattedContent).toContain('49');
+    expect(res.competitorsWithFullDetail).toBeLessThan(49);
+    expect(res.formattedContent).toContain('49 total');
   });
 
   it('states explicitly that the name-only entries exist so they are not re-added or reported missing', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
 
     const res = await svc.readMarketStrategy('u1');
 
@@ -74,7 +93,7 @@ describe('AgentModeService.readMarketStrategy competitor visibility (ENG-945)', 
 
   it('does not mutate the stored market strategy while rendering', async () => {
     const strategy = marketStrategyWith(makeCompetitors(49));
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: strategy });
+    userDb.getUserById.mockResolvedValue(asUser(strategy));
 
     await svc.readMarketStrategy('u1');
 
@@ -93,19 +112,21 @@ describe('AgentModeService.readMarketStrategy competitor visibility (ENG-945)', 
   });
 
   // Happy path: nothing changes for the common (small) case.
-  it('renders every competitor with its description and no truncation notice when at or below the limit', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(40)) });
+  it('renders every competitor with its description and no truncation notice when the whole list fits', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(5))));
 
     const res = await svc.readMarketStrategy('u1');
 
-    expect(res.totalCompetitors).toBe(40);
-    expect(res.formattedContent).toContain('Description for Comp40');
+    expect(res.totalCompetitors).toBe(5);
+    expect(res.competitorsWithFullDetail).toBe(5);
+    expect(res.nextCompetitorOffset).toBeNull();
+    expect(res.formattedContent).toContain('Description for Comp5');
     expect(res.formattedContent).not.toMatch(/name only/i);
   });
 
-  it('a competitor added past the limit is visible on the next read (write/read round-trip)', async () => {
+  it('a competitor added past the detail window is visible on the next read (write/read round-trip)', async () => {
     const existing = makeCompetitors(45);
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(existing) });
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(existing)));
     userDb.updateUser.mockResolvedValue({});
 
     const write = await svc.updateMarketStrategy({ competitors: [{ name: 'Tenasol', description: 'NEW ENTRY' }] }, 'u1');
@@ -113,7 +134,7 @@ describe('AgentModeService.readMarketStrategy competitor visibility (ENG-945)', 
     expect(write.addedEntries).toContain('Competitor: Tenasol');
 
     const written = userDb.updateUser.mock.calls[0][1].marketStrategy;
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: written });
+    userDb.getUserById.mockResolvedValue(asUser(written));
 
     const res = await svc.readMarketStrategy('u1');
     expect(res.totalCompetitors).toBe(46);
@@ -122,8 +143,8 @@ describe('AgentModeService.readMarketStrategy competitor visibility (ENG-945)', 
 });
 
 // ENG-945 follow-up: name-only is bounded, not lossy — but a caller that needs
-// the description of an entry past the detail window must be able to get it.
-// `competitorOffset` slides the full-detail window over the stored list.
+// the description of an entry past the detail window must be able to get it,
+// and each page must actually fit the context window it is sized for.
 describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)', () => {
   let svc: AgentModeService;
   beforeEach(() => {
@@ -131,70 +152,128 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     jest.clearAllMocks();
   });
 
+  it('keeps a page inside the in-context window even with a large ICP section', async () => {
+    // 8,000-char ICP matches the reporting account, whose ICP section alone was
+    // 8,044 chars — the overhead that made a 40-entry page overflow.
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49), 8000)));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+  });
+
+  it('every page stays inside the in-context window while paging the whole list', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
+
+    let offset: number | null = 0;
+    let pages = 0;
+    while (offset !== null && pages < 50) {
+      const res: any = await svc.readMarketStrategy('u1', { competitorOffset: offset });
+      expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+      expect(res.competitorsWithFullDetail).toBeGreaterThan(0);
+      offset = res.nextCompetitorOffset;
+      pages++;
+    }
+    expect(offset).toBeNull();
+    expect(pages).toBeGreaterThan(1);
+  });
+
+  it('following nextCompetitorOffset yields every competitor description exactly once', async () => {
+    const competitors = makeCompetitors(49);
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(competitors)));
+
+    const seen = new Set<string>();
+    let offset: number | null = 0;
+    while (offset !== null) {
+      const res: any = await svc.readMarketStrategy('u1', { competitorOffset: offset });
+      for (const c of competitors) {
+        // A full-detail line carries the description; a name-only line does not.
+        if (res.formattedContent.includes(`<strong>${c.name}:</strong>`)) seen.add(c.name);
+      }
+      offset = res.nextCompetitorOffset;
+    }
+
+    expect(seen.size).toBe(49);
+  });
+
   it('returns full descriptions for the tail when the window is moved past the first page', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
 
     const res = await svc.readMarketStrategy('u1', { competitorOffset: 40 });
 
     expect(res.competitorDetailOffset).toBe(40);
-    expect(res.competitorsWithFullDetail).toBe(9);
-    // The tail now carries its descriptions...
-    expect(res.formattedContent).toContain('Description for Comp49');
-    expect(res.formattedContent).toContain('Description for Comp41');
-    // ...and the first page is still fully accounted for, by name.
-    expect(res.formattedContent).toContain('Comp1');
-    expect(res.formattedContent).not.toContain('Description for Comp1<');
+    expect(res.competitorsWithFullDetail).toBeGreaterThan(0);
+    // The page starts exactly where it was asked to and runs as far as the
+    // character budget allows — every entry in it carries its description.
+    const last = res.competitorDetailOffset + res.competitorsWithFullDetail;
+    for (let i = 40; i < last; i++) {
+      expect(res.formattedContent).toContain(`<strong>Comp${i + 1}:</strong>`);
+    }
+    // ...and the first page is still fully accounted for, by name only.
+    expect(res.formattedContent).toContain('[offset 0] Comp1');
+    expect(res.formattedContent).not.toContain('<strong>Comp1:</strong>');
   });
 
   it('tells the caller which offset to ask for next instead of forbidding a second read', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
 
     const res = await svc.readMarketStrategy('u1');
 
     expect(res.formattedContent).toMatch(/competitorOffset/);
-    expect(res.formattedContent).toContain('[offset 40]');
+    expect(res.formattedContent).toContain(`[offset ${res.nextCompetitorOffset}]`);
     expect(res.formattedContent).not.toMatch(/do not call read_market_strategy again/i);
   });
 
   // ── Invalid / boundary inputs ────────────────────────────────────────────
   it('clamps a negative offset to the start of the list', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
 
     const res = await svc.readMarketStrategy('u1', { competitorOffset: -5 });
 
     expect(res.competitorDetailOffset).toBe(0);
-    expect(res.competitorsWithFullDetail).toBe(40);
+    expect(res.formattedContent).toContain('<strong>Comp1:</strong>');
   });
 
   it('clamps an offset past the end of the list so the window is never silently empty', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
 
     const res = await svc.readMarketStrategy('u1', { competitorOffset: 500 });
 
     expect(res.competitorDetailOffset).toBe(48);
     expect(res.competitorsWithFullDetail).toBe(1);
-    expect(res.formattedContent).toContain('Description for Comp49');
+    expect(res.nextCompetitorOffset).toBeNull();
+    expect(res.formattedContent).toContain('<strong>Comp49:</strong>');
   });
 
   it('ignores a non-numeric offset rather than rendering an empty window', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(49)) });
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
 
     const res = await svc.readMarketStrategy('u1', { competitorOffset: 'forty' as any });
 
     expect(res.competitorDetailOffset).toBe(0);
-    expect(res.competitorsWithFullDetail).toBe(40);
+    expect(res.competitorsWithFullDetail).toBeGreaterThan(0);
   });
 
-  it('leaves the small-strategy response untouched — no offsets, no notice', async () => {
-    userDb.getUserById.mockResolvedValue({ userId: 'u1', email: 'u@x.com', marketStrategy: marketStrategyWith(makeCompetitors(12)) });
+  it('still returns a single competitor whose description alone blows the page budget', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(3, 'Huge', 30000))));
 
-    const res = await svc.readMarketStrategy('u1', { competitorOffset: 0 });
+    const res = await svc.readMarketStrategy('u1');
 
-    expect(res.competitorDetailOffset).toBe(0);
-    expect(res.competitorsWithFullDetail).toBe(12);
-    expect(res.formattedContent).not.toMatch(/\[offset /);
-    expect(res.formattedContent).not.toMatch(/competitorOffset/);
-    expect(res.formattedContent).toContain('Description for Comp12');
+    expect(res.competitorsWithFullDetail).toBe(1);
+    expect(res.nextCompetitorOffset).toBe(1);
+    expect(res.formattedContent).toContain('<strong>Huge1:</strong>');
+    expect(res.formattedContent).toContain('[offset 1] Huge2');
+  });
+
+  it('sizes the page by characters, not by a fixed count: short descriptions get more per page', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(60, 'Short', 60))));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    // 60 short entries fit comfortably; a fixed 40-entry page would have
+    // needlessly demoted 20 of them to name-only.
+    expect(res.competitorsWithFullDetail).toBe(60);
+    expect(res.nextCompetitorOffset).toBeNull();
   });
 
   it('pages the org strategy the same way it pages a personal one', async () => {
@@ -204,7 +283,9 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     const res = await svc.readMarketStrategy('u1', { competitorOffset: 40 });
 
     expect(res.competitorDetailOffset).toBe(40);
-    expect(res.formattedContent).toContain('Description for OrgComp49');
+    expect(res.competitorsWithFullDetail).toBeGreaterThan(0);
+    expect(res.formattedContent).toContain('<strong>OrgComp41:</strong>');
+    expect(res.formattedContent).toContain('[offset 0] OrgComp1');
   });
 
   it('exposes competitorOffset on the tool schema so the model can actually ask for it', async () => {
