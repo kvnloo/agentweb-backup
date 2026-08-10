@@ -16,6 +16,7 @@ import {
   collectConfirmedPublishActions,
   assertsUnsavedInterruption,
   isBookkeepingTool,
+  ledgerFromSucceededFunctions,
   BOOKKEEPING_TOOLS,
 } from '../utils/falseFailureReport';
 
@@ -206,6 +207,63 @@ describe('falseFailureReport', () => {
       expect(reconcileFalseFailureReport('', ENG971_LEDGER)).toBe('');
       expect(reconcileFalseFailureReport('   ', ENG971_LEDGER)).toBe('   ');
       expect(reconcileFalseFailureReport(undefined as any, ENG971_LEDGER)).toBe(undefined);
+    });
+  });
+
+  // The in-loop ledger (toolCalls[]) does not exist on the error path: when the turn
+  // THROWS — a 600s generation timeout in the production session — the controller only
+  // has the persisted session. `calledFunctions` there is the successful-call histogram
+  // (toolDispatch flushes successes and failures to separate counters, per iteration),
+  // which is exactly the ledger this guard needs.
+  describe('ledgerFromSucceededFunctions', () => {
+    it('turns the session success histogram into ledger entries', () => {
+      expect(
+        ledgerFromSucceededFunctions({ publish_landing_page_changes: 1, get_deployment_status: 2 }),
+      ).toEqual([
+        { name: 'publish_landing_page_changes' },
+        { name: 'get_deployment_status' },
+      ]);
+    });
+
+    it('drops tools whose success count is zero or negative', () => {
+      expect(
+        ledgerFromSucceededFunctions({ publish_landing_page_changes: 0, generate_landing_page: -1 }),
+      ).toEqual([]);
+    });
+
+    it('returns an empty ledger for missing or malformed input', () => {
+      expect(ledgerFromSucceededFunctions(null)).toEqual([]);
+      expect(ledgerFromSucceededFunctions(undefined)).toEqual([]);
+      expect(ledgerFromSucceededFunctions({} as any)).toEqual([]);
+      expect(ledgerFromSucceededFunctions({ publish_landing_page_changes: 'yes' } as any)).toEqual([]);
+    });
+
+    it('feeds the guard the production session 7b4895fd shape', () => {
+      // Successes flushed before the 600s timeout threw: the publish DID land.
+      const ledger = ledgerFromSucceededFunctions({
+        publish_landing_page_changes: 1,
+        generate_landing_page: 1,
+        get_deployment_status: 2,
+        save_memory: 1,
+      });
+
+      expect(collectConfirmedPublishActions(ledger)).toEqual([
+        'published your landing-page changes',
+        'deployed your landing page',
+      ]);
+      expect(
+        reconcileFalseFailureReport(
+          'The system timed out while attempting to update the shared /api/capture route, '
+          + 'so your changes were not saved. Please try your request again.',
+          ledger,
+        ),
+      ).toContain('do NOT re-run it');
+    });
+
+    it('stays silent for a run whose successes include no publish', () => {
+      const ledger = ledgerFromSucceededFunctions({ get_leads: 5, you_search_web: 2 });
+      expect(collectConfirmedPublishActions(ledger)).toEqual([]);
+      expect(reconcileFalseFailureReport(FALSE_FAILURE_TEXT, ledger)).toBe(FALSE_FAILURE_TEXT);
     });
   });
 });

@@ -971,6 +971,141 @@ describe('AgentModeController - Error Handling', () => {
     });
   });
 
+  /**
+   * ENG-971. In the production session the false-failure sentence came from HERE —
+   * the diagnosis agent on the error path — not from the model's closing narrative.
+   * The turn hit the 600s generation timeout three minutes AFTER
+   * publish_landing_page_changes had already landed and been verified live, so every
+   * truthful-reporting guard inside generateMarketingResponse's success path was
+   * bypassed. The diagnosis agent, handed only the error and failedFunctions, wrote
+   * "The system timed out while attempting to update the shared /api/capture route,
+   * so your changes were not saved. Please try your request again."
+   */
+  describe('generateResponse - false-failure guard on the diagnosis path (ENG-971)', () => {
+    const PROD_FALSE_FAILURE =
+      'The system timed out while attempting to update the shared /api/capture route, '
+      + 'so your changes were not saved. Please try your request again, and I will pick up '
+      + 'where the process left off.';
+
+    const generationTimeout = () => {
+      const err: any = new Error(
+        `Generation timed out after 600000ms for session ${mockSessionId}.`
+      );
+      err.isGenerationTimeout = true;
+      return err;
+    };
+
+    const runTurn = async () => {
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Go ahead. Fix the shared /api/capture route.',
+          llmModel: 'gpt-5-chat-2',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      return mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call) => call[1]?.metadata?.isErrorMessage === true
+      );
+    };
+
+    it('passes the run\'s successful calls to the diagnosis agent, not just the failures', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        calledFunctions: { publish_landing_page_changes: 1, get_deployment_status: 2 },
+        failedFunctions: { save_memory: 1, coding_agent: 1 },
+      } as any);
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue('diagnosed');
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
+
+      await runTurn();
+
+      expect(mockAgentModeService.generateDiagnosticMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          succeededFunctions: { publish_landing_page_changes: 1, get_deployment_status: 2 },
+          failedFunctions: { save_memory: 1, coding_agent: 1 },
+        })
+      );
+    });
+
+    it('appends the true outcome when the diagnosis claims unsaved work after a confirmed publish', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        calledFunctions: { publish_landing_page_changes: 1, generate_landing_page: 1, save_memory: 1 },
+        failedFunctions: { save_memory: 1, coding_agent: 1 },
+      } as any);
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(PROD_FALSE_FAILURE);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
+
+      const errorCall = await runTurn();
+
+      expect(errorCall).toBeDefined();
+      // Append-only: the diagnosis text survives verbatim, the truth follows it.
+      expect(errorCall![1].content).toContain(PROD_FALSE_FAILURE);
+      expect(errorCall![1].content).toContain('published your landing-page changes');
+      expect(errorCall![1].content).toContain('do NOT re-run it');
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBe(true);
+    });
+
+    it('leaves the diagnosis untouched when the run published nothing', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        calledFunctions: { you_search_web: 3, get_leads: 1 },
+        failedFunctions: { you_search_web: 1 },
+      } as any);
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(PROD_FALSE_FAILURE);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toBe(PROD_FALSE_FAILURE);
+    });
+
+    it('leaves a truthful diagnosis untouched even after a confirmed publish', async () => {
+      const truthful =
+        'Your landing page is published and live. The run was cut short before I could save a memory note.';
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        calledFunctions: { publish_landing_page_changes: 1 },
+        failedFunctions: { save_memory: 1 },
+      } as any);
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(truthful);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toBe(truthful);
+    });
+
+    it('does not correct the generic fallback when the diagnosis agent is unavailable', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        calledFunctions: { publish_landing_page_changes: 1 },
+      } as any);
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(null);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toContain('I encountered an error processing your request');
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBeUndefined();
+    });
+  });
+
   describe('generateResponse - context limit auto-report to Linear', () => {
     const contextError = new Error('The request exceeded the maximum context length');
 
