@@ -25,6 +25,16 @@
  * Like the ENG-736 reconciler it only ever APPENDS — it never removes or rewrites the
  * model's own text — so it cannot invent an outcome the ledger does not show (a run
  * with no confirmed publish produces no correction at all).
+ *
+ * WHERE IT HAS TO RUN. Pulling the production session showed the false-failure
+ * sentence was NOT the model's closing narrative: the turn hit the 600s generation
+ * timeout (`GENERATION_TIMEOUT_MS`) three minutes AFTER the publish had landed and
+ * been verified live, and the message was written by the DIAGNOSIS AGENT in
+ * agentModeController's catch block. A thrown turn never reaches the seam in
+ * `generateMarketingResponse` where the finalize guard and the ENG-736 reconciler
+ * live, so the guard is wired on BOTH paths: the loop edge (model-composed close)
+ * and the diagnosis path (`ledgerFromSucceededFunctions` supplies the ledger there,
+ * since `toolCalls[]` does not survive the throw).
  */
 
 /** A tool-ledger entry (agentMode toolCalls[]): { name, result, error }. */
@@ -153,6 +163,29 @@ function isConfirmedPublish(entry: FalseFailureLedgerEntry | null | undefined): 
     if (typeof r.buildStatus === 'string' && r.buildStatus !== 'success') return false;
   }
   return true;
+}
+
+/**
+ * Build a ledger from a session's `calledFunctions` histogram.
+ *
+ * The in-loop ledger (`toolCalls[]`) only exists on the path where the turn RETURNS.
+ * When the turn THROWS — the 600s generation timeout that produced the ENG-971
+ * session — the controller's catch has nothing but the persisted session. That
+ * session already carries an accurate success ledger: `toolDispatch` flushes
+ * successful and failed calls to SEPARATE counters (`incrementCalledFunctions` /
+ * `incrementFailedFunctions`) after every iteration, so `calledFunctions` is the
+ * histogram of calls that SUCCEEDED, durable at the moment of the throw.
+ *
+ * Entries carry no `result` and no `error`, which is exactly right: a name in this
+ * histogram is itself the confirmation that the call succeeded.
+ */
+export function ledgerFromSucceededFunctions(
+  calledFunctions: Record<string, number> | null | undefined,
+): FalseFailureLedgerEntry[] {
+  if (!calledFunctions || typeof calledFunctions !== 'object') return [];
+  return Object.entries(calledFunctions)
+    .filter(([name, count]) => !!name && typeof count === 'number' && count > 0)
+    .map(([name]) => ({ name }));
 }
 
 /** Plain-language labels of every publish/deploy confirmed this run, de-duplicated. */

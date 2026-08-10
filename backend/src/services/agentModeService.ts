@@ -841,6 +841,14 @@ export interface DiagnosisContext {
   userMessage: string;
   workPlanSummary: string | null;
   failedFunctions: Record<string, number> | null;
+  /**
+   * ENG-971: the calls that SUCCEEDED before the turn died (session.calledFunctions).
+   * Without it the diagnosis agent sees a failure-only view of the run and answers
+   * "be specific about what was accomplished" by asserting nothing was — which is how
+   * a 600s timeout AFTER a landed production publish became "your changes were not
+   * saved. Please try your request again." Optional so older callers still compile.
+   */
+  succeededFunctions?: Record<string, number> | null;
 }
 
 /**
@@ -14360,7 +14368,18 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    */
   async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
     try {
-      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.`;
+      // ENG-971: the truthfulness rules exist because this agent wrote "the system
+      // timed out ... so your changes were not saved. Please try your request again"
+      // for a run whose production publish had already landed and been verified. It
+      // is told what succeeded (below) and forbidden from turning an interruption
+      // into a claim of lost work.
+      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.
+
+TRUTHFULNESS RULES (these override tone):
+- The "Succeeded operations" list is what actually happened. Anything on it completed — say so, and name it.
+- An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
+- Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
+- Do not attribute a failure to an operation that appears in the succeeded list.`;
 
       const parts: string[] = [
         `Error type: ${context.errorType}`,
@@ -14371,6 +14390,9 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
         parts.push(`Work plan status:\n${context.workPlanSummary}`);
       } else {
         parts.push('No work plan.');
+      }
+      if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
+        parts.push(`Succeeded operations (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);

@@ -42,6 +42,7 @@ import { MarketingActionCarrier, normalizeMarketingActions } from '../services/m
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
+import { reconcileFalseFailureReport, ledgerFromSucceededFunctions } from '../utils/falseFailureReport';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
@@ -403,6 +404,20 @@ function buildWorkPlanSummary(session: any): string | null {
 /**
  * Invoke the diagnosis agent to produce a context-aware error message.
  * Returns null if diagnosis fails — caller should fall back to the generic message.
+ *
+ * ENG-971: this is where the production false-failure report was written. The turn
+ * hit GENERATION_TIMEOUT_MS three minutes AFTER publish_landing_page_changes had
+ * landed and been verified live, so none of the truthful-reporting guards inside
+ * generateMarketingResponse (finalize guard, ENG-736 landing reconciler, ENG-971
+ * false-failure guard) ran — a thrown turn never reaches that seam. The diagnosis
+ * agent was handed only the error and `failedFunctions`, and turned "be specific
+ * about what was accomplished" into "your changes were not saved. Please try your
+ * request again", risking a re-run of a production deploy that had already landed.
+ *
+ * Two fixes, both here: the agent is now given the run's SUCCESS ledger
+ * (`calledFunctions`, which toolDispatch flushes per iteration and is therefore
+ * durable at the moment of the throw), and its output goes through the same
+ * deterministic, append-only guard the loop edge uses.
  */
 async function getDiagnosticErrorMessage(
   error: unknown,
@@ -411,14 +426,18 @@ async function getDiagnosticErrorMessage(
 ): Promise<string | null> {
   try {
     const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
+    const succeededFunctions = session?.calledFunctions || null;
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
       userMessage: userMessage || '',
       workPlanSummary: buildWorkPlanSummary(session),
       failedFunctions: session?.failedFunctions || null,
+      succeededFunctions,
     };
-    return await agentModeService.generateDiagnosticMessage(context);
+    const message = await agentModeService.generateDiagnosticMessage(context);
+    if (!message) return message;
+    return reconcileFalseFailureReport(message, ledgerFromSucceededFunctions(succeededFunctions));
   } catch {
     return null;
   }
