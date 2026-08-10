@@ -15,6 +15,21 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 WEB_AGENT = REPO_ROOT / "web_agent.py"
 
 
+class _StubSecretsManager:
+    """Stand-in for secrets_manager.py in this lightweight exec() sandbox.
+
+    get_azure_image_endpoint() (ENG-389) routes through secrets_manager
+    (env var first, GCP Secret Manager fallback in prod) rather than a bare
+    os.getenv, so real code needs this symbol available. This stub mirrors
+    just the env-var-first half - these tests only ever exercise the env
+    var being set or unset, never the GCP fallback, so that's a faithful
+    match without needing the real google-cloud-secretmanager import here."""
+
+    @staticmethod
+    def get_azure_image_endpoint():
+        return os.getenv("AZURE_IMAGE_ENDPOINT")
+
+
 def _load_endpoint_helper():
     """Load get_azure_image_endpoint without importing web_agent's heavy deps."""
     src = WEB_AGENT.read_text()
@@ -25,7 +40,11 @@ def _load_endpoint_helper():
     )
     if not match:
         raise AssertionError("get_azure_image_endpoint helper not found in web_agent.py")
-    ns = {"os": os, "Optional": __import__("typing").Optional}
+    ns = {
+        "os": os,
+        "Optional": __import__("typing").Optional,
+        "secrets_manager": _StubSecretsManager(),
+    }
     exec(compile(match.group(0), str(WEB_AGENT), "exec"), ns)
     return ns["get_azure_image_endpoint"], ns["AZURE_IMAGE_ENDPOINT_ENV"]
 
