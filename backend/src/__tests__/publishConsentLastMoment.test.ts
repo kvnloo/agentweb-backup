@@ -170,6 +170,39 @@ describe('ENG-827 — blog: the article fetch must not outrun the consent check'
     expect(result.message).toMatch(/no longer authorized/i);
   });
 
+  it('carries the hook all the way to the CMS write, not just to the publisher', async () => {
+    // Greptile: the entry check is above the Payload probe, the user lookup and each
+    // publisher's own secrets fetch — all network work. The axios write below is where
+    // the article becomes public and there is nothing under it, so that is where the
+    // last check has to sit.
+    const axios = require('axios');
+    const secretsManager = require('../utils/secretsManager');
+    const { PayloadBlogPublisher } = require('../services/blogPublishers');
+    // Configure the publisher so it gets PAST its own secrets fetch and would
+    // otherwise write — otherwise this test passes for the wrong reason.
+    jest.spyOn(secretsManager, 'getSecret').mockResolvedValue(
+      JSON.stringify({ PAYLOAD_PUBLISH_ENDPOINT: 'https://cms.example.com/publish', PAYLOAD_PUBLISH_SECRET: 'sek' })
+    );
+    const post = jest.spyOn(axios, 'post').mockResolvedValue({ data: { id: 'a1' } });
+
+    // Consent holds -> it writes. Establishes the test would catch a missing guard.
+    await new PayloadBlogPublisher().publish(
+      { title: 'T', slug: 't', bodyHtml: '<p/>', status: 'published', categories: [] } as any,
+      { userId: 'u1', sessionId: 's1', assertStillAuthorized: async () => null } as any
+    );
+    expect(post).toHaveBeenCalledTimes(1);
+
+    // Consent withdrawn during all that network work -> no write at all.
+    post.mockClear();
+    await expect(
+      new PayloadBlogPublisher().publish(
+        { title: 'T', slug: 't', bodyHtml: '<p/>', status: 'published', categories: [] } as any,
+        { userId: 'u1', sessionId: 's1', assertStillAuthorized: async () => ({ error: 'This run is no longer authorized to publish.' }) } as any
+      )
+    ).rejects.toMatchObject({ isPublishConsentWithdrawn: true });
+    expect(post).not.toHaveBeenCalled();
+  });
+
   it('does not gate a draft, which is reversible and invisible', async () => {
     const axios = require('axios');
     const { agentModeService } = require('../services/agentModeService');

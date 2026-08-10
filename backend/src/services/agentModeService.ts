@@ -24817,9 +24817,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           status: status === 'published' ? 'published' : 'draft',
           publishedAt: new Date().toISOString(),
         },
-        { userId, sessionId }
+        // ENG-827: the check above guards entry to the publisher; this rides all the
+        // way down to the CMS write itself, past the Payload probe, the user lookup
+        // and each publisher's secrets fetch.
+        { userId, sessionId, assertStillAuthorized: status === 'published' ? assertStillAuthorized : undefined }
       );
     } catch (error: any) {
+      // ENG-827: a deliberate stop is not a CMS failure; reporting it as one would
+      // send the run down the retry path.
+      if (isPublishConsentWithdrawn(error)) {
+        return { success: false, message: error.message };
+      }
       console.error('AgentMode: Error publishing blog article:', error);
 
       // Extract detailed error information for better user feedback
