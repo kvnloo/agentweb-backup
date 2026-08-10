@@ -4833,9 +4833,14 @@ emmaToolRegistry.register({
         confirm: {
           type: 'boolean',
           description: 'EDITING existing images only (when inputImages is set): on the first call, omit (or false) — the tool returns the source image(s) it will edit and asks the user to confirm. Set true ONLY after the user has seen those images and approved. Ignored for text-to-image (no inputImages), which never needs confirmation.'
+        },
+        category: {
+          type: 'string',
+          enum: ['ad', 'organic_post'],
+          description: "REQUIRED use-case declaration for the human eval queue: 'ad' when the image is a paid ad creative (Meta/Google/LinkedIn ads, retargeting creatives), 'organic_post' when it is organic social/content imagery (feed posts, blog headers, non-paid content). Reviewer feedback differs entirely between the two, so declare it from the request's context — never guess randomly; if the user's intent is genuinely unclear, ask them which use case the image is for before generating."
         }
       },
-      required: ['prompt', 'filename']
+      required: ['prompt', 'filename', 'category']
     }
   },
   execute: async (args: any, context?: any) => {
@@ -4855,7 +4860,8 @@ emmaToolRegistry.register({
       context?.sessionId,
       args.imageModel,
       args.logo_image,
-      args.confirm
+      args.confirm,
+      args.category
     );
   }
 });

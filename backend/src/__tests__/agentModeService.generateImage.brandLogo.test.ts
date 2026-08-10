@@ -44,6 +44,7 @@ describe('AgentModeService.generateImage — persisted brand-logo gate (ENG-326)
       'gemini-3-pro-image-preview',
       logoImage,
       inputImages.length > 0 ? true : undefined,
+      'ad',
     );
 
   beforeEach(() => {

@@ -21,6 +21,8 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
+import { resolvePublishAuthorized } from '../utils/schedulePublishApproval';
+import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -1568,15 +1570,59 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 // write-back now"). Budget truncation comes next (also a hard state signal); a
 // confirmation halt takes precedence over a plain unfinished-work admission so
 // the continuation message can be tailored to "proceed best-effort".
+// ENG-803: the terminal marker a publish-withheld run is instructed to end on (see
+// the approval-required branch of getScheduledSessionOverride).
+//
+// Without this the fix would loop the very runs it protects. A withheld run
+// correctly ends by saying its drafts are saved and nothing was posted — wording
+// that the confirmation detector reads as "awaiting … approval", i.e. a run halting
+// for a human answer. It would then be nudged to continue, on a schedule whose owner
+// asked it NOT to publish, which is the ~21-turn nudge loop this whole area exists to
+// avoid. The marker is emitted only on the withheld branch, so it distinguishes a
+// deliberate, complete withhold from a genuine mid-run halt.
+const PUBLISH_WITHHELD_MARKER = /PUBLISH WITHHELD:\s*this schedule requires approval before publishing/i;
+
+// NOTE: this matches MODEL-AUTHORED text, so on its own it proves nothing. Callers
+// must confirm the run was actually withheld before honouring it — see the
+// publishAuthorized parameter on the classifiers below (Greptile review #20).
+export function scheduledRunWithheldPublish(content?: string): boolean {
+  if (!content || typeof content !== 'string') return false;
+  return PUBLISH_WITHHELD_MARKER.test(content);
+}
+
+/**
+ * ENG-803: may this run's publish-withheld marker be honoured?
+ *
+ * The marker is text the MODEL wrote, so trusting it alone re-opens the exact hole
+ * this ticket is about (Greptile review #20): an AUTHORIZED run that simply does not
+ * want to post can emit the sentence, suppress its own corrective continuation, and
+ * finish "successfully" having published nothing. That is the fabricated publishing
+ * constraint again, except this time the platform hands it a machine-readable way to
+ * escape the nudge.
+ *
+ * So the marker is only honoured when the schedule ACTUALLY withheld authorization —
+ * an explicit `false` resolved from the record. `undefined` (a caller with no
+ * schedule to read) deliberately does NOT exempt: the two failure modes are not
+ * symmetric. Refusing the exemption costs a genuinely-withheld run one extra
+ * continuation, bounded by completionGateMaxContinuations; granting it on an unknown
+ * lets any run talk its way out of a mandated publish.
+ */
+function withholdIsGenuine(content: string, publishAuthorized?: boolean): boolean {
+  return publishAuthorized === false && scheduledRunWithheldPublish(content);
+}
+
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}): ScheduledContinuationReason | null {
+}, publishAuthorized?: boolean): ScheduledContinuationReason | null {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
-  if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
+  // ENG-803: a deliberate publish-withhold is a COMPLETE terminal state, not a halt
+  // awaiting an answer. Suppress only 'confirmation' — a withheld run can still be
+  // genuinely truncated or leave other work unfinished, and those must still continue.
+  if (!withholdIsGenuine(content, publishAuthorized) && scheduledRunAwaitsConfirmation(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
@@ -1642,6 +1688,40 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
   }
 }
 
+/**
+ * ENG-803: resolve the publish authorization that is true RIGHT NOW.
+ *
+ * A scheduled run lives for minutes, and the owner can flip "Require approval before
+ * publishing" while it is in flight. The prompt builder
+ * (agentModeService.resolveScheduledPublishAuthorized) and the dispatch guard
+ * (blockedByScheduledPublishApproval) both re-read the record at the moment they act,
+ * so a snapshot taken when the worker loaded the schedule can disagree with both
+ * (Greptile review #30). The disagreement is not cosmetic: with a stale `false`, an
+ * owner who has just AUTHORIZED publishing gets a run whose model-authored
+ * `PUBLISH WITHHELD` marker is still believed, suppressing the corrective
+ * continuation — ENG-803's original "finished without posting" failure, rebuilt out
+ * of a cache. So this reads the record, exactly like the other two consumers, and
+ * feeds the same pure `resolvePublishAuthorized`.
+ *
+ * A READ FAILURE RETURNS undefined, NOT false. `false` is the one value that makes
+ * the marker believable, so inventing it from a DynamoDB blip would let an unverified
+ * model-authored sentence end the run. `undefined` withholds the exemption instead:
+ * the run spends one more bounded continuation, and any genuinely unauthorized
+ * publish it then attempts is still refused by the dispatch guard, which does its own
+ * independent read. The two layers fail in opposite directions on purpose.
+ */
+async function resolveLivePublishAuthorized(scheduleId: string): Promise<boolean | undefined> {
+  try {
+    return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId) as any);
+  } catch (error) {
+    console.error(
+      `AgentMode ENG-803: could not re-read schedule ${scheduleId} to verify a publish-withheld marker; refusing the exemption rather than trusting model-authored text:`,
+      error
+    );
+    return undefined;
+  }
+}
+
 // Async classifier used at the completion-gate decision points. Identical to the
 // sync classifier except the 'confirmation' case also consults the LLM judge when
 // the regex misses — so an unanticipated halt phrasing still triggers the
@@ -1650,11 +1730,20 @@ export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}): Promise<ScheduledContinuationReason | null> {
+}, resolvePublishAuthorizedNow?: () => Promise<boolean | undefined>): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
-  if (await scheduledTurnDefersToUser(content)) return 'confirmation';
+  // ENG-803: resolve authorization LAZILY — only a turn that actually emitted the
+  // marker can be exempted, so a turn without one must not pay for a schedule read.
+  // Absent resolver (callers with no schedule) stays `undefined`, which never exempts.
+  const publishAuthorized = scheduledRunWithheldPublish(content)
+    ? await resolvePublishAuthorizedNow?.()
+    : undefined;
+  // ENG-803: same withhold exemption as the sync classifier above — and it must be
+  // checked BEFORE the LLM judge, which would otherwise be asked to rule on text
+  // that is deliberately shaped like a deferral.
+  if (!withholdIsGenuine(content, publishAuthorized) && await scheduledTurnDefersToUser(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
@@ -1732,6 +1821,13 @@ export async function runVerifiedChat(
     // rather than dropped into a void no one will ever action. Fail-safe default
     // means a NEW headless caller is covered automatically (no drift).
     parkNotifiable?: boolean;
+    // ENG-803: reads this run's publish authorization AS IT IS NOW. Used ONLY to
+    // decide whether the model's publish-withheld marker may be believed — see
+    // withholdIsGenuine. Deliberately a resolver rather than a value: the owner can
+    // change the setting mid-run, and a snapshot would disagree with the prompt
+    // builder and the dispatch guard, which both re-read it (Greptile review #30).
+    // Undefined for callers with no schedule, which never honour the marker.
+    publishAuthorized?: () => Promise<boolean | undefined>;
     // ENG-657: tool calls already made in a PRIOR (abandoned) portion of this
     // session that this run is RESUMING. Seeded into the run's accumulated tool
     // calls so keyword/required-function verification counts the whole task, not
@@ -1763,7 +1859,8 @@ export async function runVerifiedChat(
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
-    parkNotifiable = false
+    parkNotifiable = false,
+    publishAuthorized
   } = params;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
@@ -2093,7 +2190,7 @@ export async function runVerifiedChat(
         const continuationReason = await classifyScheduledContinuationAsync({
           ...continuationResponse,
           toolCalls: allToolCalls,
-        });
+        }, publishAuthorized);
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -2348,7 +2445,7 @@ export async function runVerifiedChat(
             // (name + arguments + result), not just this turn's — an earlier attempt
             // may hold the unmatched, still-uncommitted preview.
             toolCalls: allToolCalls,
-          })
+          }, publishAuthorized)
         : null;
       if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
@@ -3145,6 +3242,11 @@ export async function runScheduledChat(
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
       fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-803: re-read at the moment the marker is evaluated, so the continuation
+      // classifier uses the SAME live decision as the prompt builder and the dispatch
+      // guard. A snapshot taken here would go stale the moment the owner toggles the
+      // setting mid-run (Greptile review #30).
+      publishAuthorized: () => resolveLivePublishAuthorized(schedule.scheduleId),
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,
@@ -3222,7 +3324,24 @@ export async function runScheduledChat(
 
     // Generate a 2-3 word summary and update the session title
     try {
-      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content);
+      // ENG-803: ground the title suffix in the tools that actually ran, so a run
+      // that posted nothing cannot be titled "Replies queued".
+      //
+      // SUCCEEDED, not merely ATTEMPTED (Greptile review #19). The ledger keeps
+      // failed and preflight-rejected calls too, so passing every name through would
+      // hand the summarizer a `twitter_manage_post` entry for a call that errored —
+      // and it would faithfully title the run "Replies Posted". That is precisely
+      // ENG-803's false-success title, re-created by the fix meant to prevent it.
+      //
+      // A call counts only when it has no top-level `error` (the repo-wide failure
+      // marker — see countFailedToolCalls) and its result did not report
+      // success:false, which is how preflight rejections come back while still
+      // looking like a completed call.
+      const succeededToolNames = (result.toolCalls || [])
+        .filter(toolCallSucceeded)
+        .map((call: any) => call?.name)
+        .filter(Boolean);
+      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content, succeededToolNames);
       if (summary) {
         generatedSummary = summary;
         const summaryTitle = `${sessionTitle} — ${summary}`;
@@ -6822,6 +6941,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
+        requirePublishApproval,
         timezone
       } = req.body;
 
@@ -6902,6 +7022,13 @@ export const agentModeController = {
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
         fullAutonomy: fullAutonomy === true,
+        // ENG-803: owner opt-OUT that holds this schedule's runs at the publish step.
+        // Default false = publish, which is what scheduled runs have always done, so
+        // no existing schedule changes behaviour. Kept distinct from fullAutonomy
+        // (consent to decide unaided is a different question from consent to post)
+        // and absent from the manage_scheduled_chat MCP allowlist, so only a human
+        // can set it.
+        requirePublishApproval: requirePublishApproval === true,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -7027,6 +7154,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
+        requirePublishApproval,
         timezone
       } = req.body;
 
@@ -7099,6 +7227,11 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
+        // ENG-803: owner opt-out from unattended publishing. Partial-update safe — an
+        // update that omits the field must never silently set or clear it.
+        requirePublishApproval: requirePublishApproval !== undefined
+          ? (requirePublishApproval === true)
+          : ((existingSchedule as any).requirePublishApproval || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),

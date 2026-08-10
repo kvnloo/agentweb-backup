@@ -27,7 +27,9 @@ import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
-import { taskDb, taskTemplateDb, accountMemoryDb, userDb } from './db';
+import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
+import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -3067,6 +3069,47 @@ export class AgentModeService {
     );
   }
 
+  /**
+   * ENG-803: does this scheduled run's schedule allow it to publish externally?
+   *
+   * The default lives in the FIELD, not in this lookup. A schedule we read that has
+   * no `requirePublishApproval` is authorized (every existing row, so nothing
+   * changes behaviour) — but a schedule we could not read AT ALL is not, because an
+   * owner who did set it would otherwise be overridden by a transient DynamoDB blip
+   * and a public post cannot be taken back (Greptile review #16). Withholding is the
+   * recoverable error: the run still does the work, saves the drafts, and tells the
+   * owner what is waiting.
+   *
+   * Every scheduled session is stamped `"<title>|scheduleId:<id>"` by
+   * runScheduledChat — which is also the path a "Test run" takes — so a scheduled
+   * session with no parseable id is an unverifiable state, and is withheld for the
+   * same reason.
+   *
+   * Non-scheduled sessions short-circuit to true and never reach a lookup; the value
+   * is only ever consumed by getScheduledSessionOverride, which self-guards on
+   * sessionType and emits nothing for them.
+   */
+  private async resolveScheduledPublishAuthorized(currentSession: any): Promise<boolean> {
+    if (currentSession?.sessionType !== 'scheduled') return true;
+    const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
+    if (!scheduleId) {
+      console.warn(
+        `AgentMode: scheduled session ${currentSession?.sessionId} has no parseable scheduleId; withholding publish authorization rather than assuming it.`
+      );
+      return false;
+    }
+    try {
+      // resolvePublishAuthorized returns false for a null/deleted schedule too.
+      return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId));
+    } catch (error) {
+      console.error(
+        `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding publish authorization for this turn rather than publishing unverified:`,
+        error
+      );
+      return false;
+    }
+  }
+
   private getVisionFallbackModel(primaryModel: string): string | undefined {
     const fallbackOrder = ['anthropic.claude-opus-4-8', 'gemini-3-flash-preview', 'gpt-5.4-nano'];
     return fallbackOrder.find((model) => model !== primaryModel && this.llmModels[model]?.supportsVision === true);
@@ -3206,7 +3249,16 @@ export class AgentModeService {
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
-      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType);
+      // ENG-803: resolve this scheduled run's publish authorization from the schedule
+      // record so the directive states a DECISION rather than leaving one for the
+      // model to guess — guessing is what produced the fabricated "X publishing gate".
+      // Resolved here rather than in the controller so ENG-803 stays clear of the
+      // regions ENG-827 (PR #2263) rewrites. Never derived from the schedule's prompt
+      // text. This is the UNATTENDED run path, so it always passes a resolved
+      // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
+      // deliberately passes nothing (see the tri-state note on the override).
+      const publishAuthorized = await this.resolveScheduledPublishAuthorized(currentSession);
+      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];
@@ -4197,7 +4249,9 @@ export class AgentModeService {
             // 'deferred' (non-backing) rather than 'success'.
             status: tc.error !== undefined
               ? 'error'
-              : (tc.duplicateOf || (tc.result && (tc.result as any).deferred === true) ? 'deferred' : 'success'),
+              // ENG-803: shared with the title-evidence filter so the two cannot
+              // drift — they encode the same "never executed, cannot back a claim".
+              : (toolCallNeverExecuted(tc) ? 'deferred' : 'success'),
             result: tc.result,
           }));
           const guardOutcome = await runFinalizeGuard({
@@ -7105,6 +7159,109 @@ export class AgentModeService {
     );
   }
 
+  /**
+   * ENG-803: ENFORCE the owner's publish-approval setting at dispatch, not just in
+   * the prompt (Greptile review #21).
+   *
+   * A directive is guidance; this ticket is literally a report of a model reasoning
+   * its way around instructions. So the setting an owner ticks has to be a real
+   * boundary: if the schedule requires approval, the publishing call does not
+   * execute, whatever the model decided.
+   *
+   * The refusal is returned as a normal tool error on purpose. It gives the model a
+   * REAL, quotable failure — satisfying the directive's "reason (2): a tool call you
+   * ACTUALLY made returned an error" — so the run reports an accurate blocker
+   * instead of inventing one. That is the same ticket's other half.
+   *
+   * FAILS CLOSED for scheduled runs (Greptile review #22). An earlier revision
+   * allowed the call when a lookup threw, reasoning that a blip should not stop
+   * publishing — but that let a transient DynamoDB error publish irreversibly past
+   * an owner's explicit setting, and it contradicted the same asymmetry argument
+   * this fix already applies at the prompt layer: when the answer cannot be
+   * verified, take the RECOVERABLE outcome. A blocked publish saves the drafts and
+   * retries next run; a published post cannot be withdrawn.
+   *
+   * A session we can read that is NOT scheduled returns immediately, so the attended
+   * paths that share this dispatcher (the Emma sidebar via chatbotService, and
+   * liveVoiceService) are unaffected — there is no owner schedule setting to apply
+   * to them, and a human is present.
+   */
+  private static publishApprovalBlock(toolName: string, reason: 'required' | 'unverifiable') {
+    const detail =
+      reason === 'required'
+        ? `this schedule has "Require approval before publishing" turned ON, so ${toolName} cannot publish on the owner's behalf in an unattended run.`
+        : `${toolName} cannot publish in this unattended run because its schedule's publish-approval setting could not be verified, and publishing is irreversible.`;
+    return {
+      success: false as const,
+      error:
+        `Blocked: ${detail} ` +
+        `This is an account-level setting on the schedule — it is NOT a platform, X/Twitter, LinkedIn, API, or credential limit. ` +
+        `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`,
+      publishApprovalRequired: true as const,
+    };
+  }
+
+  private async blockedByScheduledPublishApproval(
+    toolName: string,
+    args: any,
+    sessionId: string
+  ): Promise<{ success: false; error: string; publishApprovalRequired: true } | null> {
+    if (!sessionId || !isExternalContentPublish(toolName, args)) return null;
+
+    let session: any;
+    try {
+      session = await chatbotDb.getChatSession(sessionId);
+    } catch (firstError) {
+      // One retry absorbs a single throttled read before we resort to blocking.
+      try {
+        session = await chatbotDb.getChatSession(sessionId);
+      } catch (retryError) {
+        console.error(
+          `AgentMode ENG-803: could not read session ${sessionId} to verify publish approval for ${toolName}; blocking rather than publishing unverified:`,
+          retryError
+        );
+        return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+      }
+    }
+
+    // A NULL session is unverifiable, not attended: deleting a scheduled session
+    // does not cancel its in-flight worker, so the worker runs on and its lookup
+    // starts returning null (Greptile review #23).
+    const sessionClass = classifySessionForPublishGate(session);
+    if (sessionClass === 'unverifiable') {
+      console.warn(
+        `AgentMode ENG-803: session ${sessionId} not found while verifying publish approval for ${toolName}; blocking rather than assuming it was attended.`
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+    // Attended / non-scheduled sessions have no owner schedule setting to enforce.
+    if (sessionClass === 'allow') return null;
+
+    const scheduleId = extractScheduleId(session?.pageIdentifier);
+    if (!scheduleId) {
+      console.warn(
+        `AgentMode ENG-803: scheduled session ${sessionId} has no parseable scheduleId; blocking ${toolName} rather than assuming approval.`
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+
+    try {
+      // resolvePublishAuthorized also returns false for a missing/deleted schedule.
+      if (resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId))) return null;
+    } catch (scheduleError) {
+      console.error(
+        `AgentMode ENG-803: could not read schedule ${scheduleId} to verify publish approval for ${toolName}; blocking rather than publishing unverified:`,
+        scheduleError
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+
+    console.warn(
+      `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} requires approval before publishing.`
+    );
+    return AgentModeService.publishApprovalBlock(toolName, 'required');
+  }
+
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
@@ -7148,6 +7305,12 @@ export class AgentModeService {
         policy: policyDecision,
       };
     }
+
+    // ENG-803: the owner's publish-approval setting is enforced HERE, so it holds
+    // even if the model ignores the directive. Checked after arg repair so the
+    // action is read from the same args the tool would have run with.
+    const publishApprovalBlock = await this.blockedByScheduledPublishApproval(toolName, preparedArgs, sessionId);
+    if (publishApprovalBlock) return publishApprovalBlock;
 
     // In mock mode, only session-state tools (install_skills) execute for real
     // because they modify DynamoDB session state with no external side effects
@@ -14276,16 +14439,25 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
-  async generateScheduledChatSummary(startingMessage: string, response: string): Promise<string | null> {
+  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[]): Promise<string | null> {
     try {
+      // ENG-803: the summary becomes the run's title suffix, so it must describe
+      // what the run DID, not what its prose claimed. Previously this saw only the
+      // request and the response text, which let a run that posted nothing be
+      // titled "Replies queued". Ground it in the tools that actually SUCCEEDED —
+      // the caller filters out errored and preflight-rejected calls, because a
+      // failed twitter_manage_post is evidence that nothing was posted, not
+      // evidence that something was (Greptile review #19).
+      const succeeded = Array.from(new Set((succeededToolNames || []).filter(Boolean))).slice(0, 40);
+      const evidence = succeeded.length > 0 ? succeeded.join(', ') : 'none';
       const response_ = await this.callLLM(DIAGNOSIS_MODEL, [
         {
           role: 'system',
-          content: `You are a task summarizer. Given a user's request and the agent's response, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). Return ONLY the summary, nothing else.`
+          content: `You are a task summarizer. Given a user's request, the agent's response, and the list of tools that ran SUCCESSFULLY, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). The summary must reflect that list, not the response's claims. The list contains ONLY calls that succeeded — a tool that was attempted and failed is absent from it, so treat it as not having happened. If no tool that posts, publishes, or sends appears in the list, do NOT use words like "Posted", "Published", "Sent", or "Queued" — describe what actually happened instead (e.g. "Drafts Prepared", "Nothing Posted", "Posting Failed"). Return ONLY the summary, nothing else.`
         },
         {
           role: 'user',
-          content: `Request: ${startingMessage.slice(0, 300)}\n\nResult: ${response.slice(0, 500)}`
+          content: `Request: ${startingMessage.slice(0, 300)}\n\nTools that ran SUCCESSFULLY (failed calls are excluded): ${evidence}\n\nResult: ${response.slice(0, 500)}`
         }
       ], {
         max_completion_tokens: 20,
@@ -23380,8 +23552,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     sessionId: string,
     imageModel?: string,
     logoImage?: string,
-    confirm?: boolean
+    confirm?: boolean,
+    category?: string
   ): Promise<any> {
+    // ENG-343: the producing flow must self-declare the eval use case — Matt's
+    // review feedback differs entirely between ads and organic posts, and a
+    // prompt-text classifier was explicitly ruled out. Missing/invalid input
+    // fails visibly (recorded decision 2026-07-27 on ENG-343) so the caller gets
+    // fixed instead of a falsely categorized candidate reaching the eval queue.
+    if (category !== 'ad' && category !== 'organic_post') {
+      return {
+        success: false,
+        error: 'invalid_category',
+        message:
+          `generate_image requires category: 'ad' | 'organic_post' (got ${JSON.stringify(category)}). ` +
+          `Declare the use case: 'ad' for paid ad creatives, 'organic_post' for organic social content.`
+      };
+    }
+
     // Human-in-the-loop gate for image EDITING (inputImages present). Editing the
     // wrong source images is the wrong-set mistake from the satisfaction incident,
     // so before regenerating/editing existing images we surface the exact source
@@ -23601,6 +23789,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           reviewType: 'creative_image',
           userId,
           sessionId,
+          category,
           artifactUrl: result.imageUrl,
           originalRequest: prompt,
           outputSummary:
