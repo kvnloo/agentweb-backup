@@ -59,7 +59,7 @@ export class ToolRegistry {
     // session dispatches through, and `registerTools()` copies handlers here as
     // `{name, definition, execute}`, so a check placed only in McpToolRegistry
     // never runs for a real run. Same trap as ENG-822 above; same remedy.
-    const publishRefusal = await refuseUnauthorizedScheduledPublish(toolName, context);
+    const publishRefusal = await refuseUnauthorizedScheduledPublish(toolName, context, undefined, args);
     if (publishRefusal) {
       console.warn(`ENG-827: refused ${toolName} in session ${context?.sessionId} — publish consent not live.`);
       return publishRefusal;
@@ -68,7 +68,7 @@ export class ToolRegistry {
     // Admission is not enough on its own: a publishing handler can spend minutes
     // downloading media or uploading video before it commits. Hand it the
     // re-validation to run at its last moment.
-    return await tool.execute(args, attachPublishRevalidation(toolName, context));
+    return await tool.execute(args, attachPublishRevalidation(toolName, context, args));
   }
 
   getAllTools(): AgentTool[] {

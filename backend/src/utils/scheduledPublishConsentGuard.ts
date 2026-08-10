@@ -1,7 +1,7 @@
-import { isPublishName } from './hardeningGaps';
 import {
   resolveSchedulePublishAuthorization,
   narrowPublishAuthorization,
+  isPublishCall,
   SchedulePublishAuthorization,
 } from './schedulePublishAuthorization';
 
@@ -23,8 +23,10 @@ import {
  * This lives in the central dispatcher rather than inside each publishing tool for
  * the same reason as the anonymous-account and external-MCP refusals it sits with:
  * a gate that must be remembered for every new publishing tool is a gate that
- * silently rots. `isPublishName` also matches future `publish_*` / `post_on_*`
- * tools by prefix, so a new one is covered on the day it is added.
+ * silently rots. `isPublishCall` also matches future `publish_*` / `post_on_*` tools
+ * by prefix, so a new one is covered on the day it is added, and classifies the two
+ * mixed-action tools (`twitter_manage_post`, `linkedin_manage_post`) per action so a
+ * thread or repost is gated while an analytics read is not.
  */
 
 export interface ScheduledPublishRefusal {
@@ -75,10 +77,12 @@ export async function publishWithdrawnMidFlight(context: any): Promise<Scheduled
   return (await context?.assertPublishStillAuthorized?.()) ?? null;
 }
 
-export function attachPublishRevalidation(toolName: string, context: any): any {
-  if (!isPublishName(toolName)) return context;
+export function attachPublishRevalidation(toolName: string, context: any, args?: any): any {
+  if (!isPublishCall(toolName, args)) return context;
+  // Capture the ARGS the call was admitted with, so the last-moment re-check
+  // classifies the same call the same way an action-scoped tool was admitted under.
   const assertPublishStillAuthorized: AssertPublishStillAuthorized = () =>
-    refuseUnauthorizedScheduledPublish(toolName, context);
+    refuseUnauthorizedScheduledPublish(toolName, context, undefined, args);
   return { ...(context ?? {}), assertPublishStillAuthorized };
 }
 
@@ -152,9 +156,14 @@ function refuse(toolName: string, detail: string): ScheduledPublishRefusal {
 export async function refuseUnauthorizedScheduledPublish(
   toolName: string,
   context: any,
-  deps?: ScheduledPublishGuardDeps
+  deps?: ScheduledPublishGuardDeps,
+  args?: any
 ): Promise<ScheduledPublishRefusal | null> {
-  if (!isPublishName(toolName)) return null;
+  // Two tools publish only on SOME of their actions (an X thread, a LinkedIn
+  // repost) and read on the rest, so the classification takes the call's args:
+  // gating the whole tool would refuse a scheduled analytics read, and gating
+  // none of it would leave a public post reachable without consent.
+  if (!isPublishCall(toolName, args)) return null;
   const sessionId = context?.sessionId;
   if (!sessionId || typeof sessionId !== 'string') return null;
 

@@ -109,7 +109,7 @@ export class McpToolRegistry {
     // internal tool calls — so a revocation arriving mid-turn would not be seen
     // until after the publish. Checked here, immediately before execution, there
     // is no window left. Same placement rationale as the two refusals above.
-    const publishRefusal = await refuseUnauthorizedScheduledPublish(name, context);
+    const publishRefusal = await refuseUnauthorizedScheduledPublish(name, context, undefined, args);
     if (publishRefusal) {
       console.warn(`ENG-827: refused ${name} in session ${context?.sessionId} — publish consent not live.`);
       return publishRefusal;
@@ -118,7 +118,7 @@ export class McpToolRegistry {
     // A publishing handler may do minutes of work (media download, video upload)
     // between being admitted here and actually committing the post, so admission
     // alone is not enough — hand it a re-validation to run at its last moment.
-    return await handler.execute(args, attachPublishRevalidation(name, context));
+    return await handler.execute(args, attachPublishRevalidation(name, context, args));
   }
 }
 

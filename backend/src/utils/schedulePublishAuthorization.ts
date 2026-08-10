@@ -63,11 +63,74 @@ export interface SchedulePublishAuthorizationInput {
   requiredFunctionCalls?: string[];
 }
 
+/**
+ * Tools whose publishing power depends on WHICH action is invoked.
+ *
+ * `isPublishName` classifies by tool name, which is exactly right for the tools that
+ * do one thing — but two tools carry a mixed set of actions behind a single name, and
+ * both can write publicly under the owner's identity:
+ *
+ *  - `twitter_manage_post` posts a multi-tweet THREAD, replies, quote-tweets and
+ *    retweets; it also fetches metrics and lists repliers.
+ *  - `linkedin_manage_post` reposts and comments; it also lists comments and pulls
+ *    analytics.
+ *
+ * Gating the whole tool would refuse a scheduled analytics read, which nothing in this
+ * ticket justifies. Not gating it at all leaves a public post reachable from an
+ * unattended run that the owner never authorized — the exact hole this module exists
+ * to close. So the decision is per ACTION, and `nonPublishing` is the enumerated side:
+ * anything not on it — including an action added to the tool later, or a call that
+ * names no action at all — is treated as publishing and gated. A drift-guard test
+ * asserts these lists together cover the tool's declared action enum, so a new action
+ * is classified deliberately rather than inheriting the fail-closed default by
+ * accident.
+ *
+ * Deletes, likes and reactions sit on the `nonPublishing` side on purpose. They are
+ * not publications of content — they carry volume/destructive risk that the SAFETY &
+ * VOLUME LIMITS block governs, and a delete is the REMEDY for a bad post, so refusing
+ * it for want of publishing consent would be backwards.
+ */
+export const ACTION_SCOPED_PUBLISH_TOOLS: Record<string, { publishing: string[]; nonPublishing: string[] }> = {
+  twitter_manage_post: {
+    publishing: ['post_thread', 'reply', 'quote_tweet', 'retweet'],
+    nonPublishing: [
+      'delete_tweet', 'like', 'unlike', 'unretweet',
+      'get_tweet_metrics', 'list_replies', 'get_retweeters', 'get_liking_users', 'get_quote_tweets',
+    ],
+  },
+  linkedin_manage_post: {
+    publishing: ['repost', 'comment'],
+    nonPublishing: ['react', 'list_comments', 'get_analytics'],
+  },
+};
+
+/**
+ * True for any tool that can publish publicly — by name, or by holding at least one
+ * publishing action. This is the classification CONSENT SCOPE is built from, so an
+ * owner can authorize a thread-posting schedule at all.
+ */
+export function isPublishCapableTool(name: string): boolean {
+  return isPublishName(name) || Object.prototype.hasOwnProperty.call(ACTION_SCOPED_PUBLISH_TOOLS, name);
+}
+
+/**
+ * True when THIS call would publish. Name-classified tools always do; an
+ * action-scoped tool does unless the call names one of its enumerated
+ * non-publishing actions (fail-closed on an unknown or missing action).
+ */
+export function isPublishCall(name: string, args?: any): boolean {
+  if (isPublishName(name)) return true;
+  const spec = ACTION_SCOPED_PUBLISH_TOOLS[name];
+  if (!spec) return false;
+  const action = typeof args?.action === 'string' ? args.action : '';
+  return !spec.nonPublishing.includes(action);
+}
+
 /** The publish tools a schedule currently requires, de-duplicated in order. */
 export function getRequiredPublishTools(requiredFunctionCalls?: string[]): string[] {
   const required = Array.isArray(requiredFunctionCalls) ? requiredFunctionCalls : [];
   return Array.from(
-    new Set(required.filter((name): name is string => typeof name === 'string' && isPublishName(name)))
+    new Set(required.filter((name): name is string => typeof name === 'string' && isPublishCapableTool(name)))
   );
 }
 
@@ -148,7 +211,7 @@ export function filterRequiredFunctionsToAuthorizedScope(
   authorization: SchedulePublishAuthorization
 ): string[] {
   const required = Array.isArray(requiredFunctionCalls) ? requiredFunctionCalls : [];
-  return required.filter(name => !isPublishName(name) || authorization.tools.includes(name));
+  return required.filter(name => !isPublishCapableTool(name) || authorization.tools.includes(name));
 }
 
 /**
