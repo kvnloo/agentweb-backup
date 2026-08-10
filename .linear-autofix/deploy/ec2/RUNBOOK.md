@@ -172,12 +172,25 @@ API calls work. To be sure, make these true, in order:
 1. **Reach the ports.** Two supported ways, in preference order:
    - **SSM port forwarding — needs no inbound rule at all.** Preferred; survives IP changes,
      is IAM-scoped, and is audited per person in CloudTrail:
+     **Forward the API port too, in its own session** — the page and its API calls are on
+     two different ports, and a portal-only tunnel renders a page whose every request fails:
      ```bash
+     # session 1 — the portal you want (5174 customer, or 5173 partner)
      aws ssm start-session --region us-west-2 --target <instance-id> \
        --document-name AWS-StartPortForwardingSession \
-       --parameters '{"portNumber":["5174"],"localPortNumber":["15174"]}'
-     # then browse http://<BUG-ID>.127.0.0.1.nip.io:15174/
+       --parameters '{"portNumber":["5174"],"localPortNumber":["5174"]}'
+
+     # session 2 — the backend API that portal calls
+     aws ssm start-session --region us-west-2 --target <instance-id> \
+       --document-name AWS-StartPortForwardingSession \
+       --parameters '{"portNumber":["3001"],"localPortNumber":["3001"]}'
+
+     # then browse http://<BUG-ID>.127.0.0.1.nip.io:5174/
      ```
+     **Keep the local port numbers identical to the remote ones.** `VITE_API_URL` and the
+     portal URLs are baked at `preview up` time from `PREVIEW_IP` (default `127.0.0.1`) and
+     the fixed ports — so a preview born with the default `PREVIEW_IP` matches these tunnels
+     exactly, and remapping to e.g. `15174` silently breaks the baked URLs.
      Requires the `session-manager-plugin` locally and `ssm:StartSession` on the instance.
    - **Open the ports to your `/32`:** `provision.sh` with `OPEN_PREVIEW_PORT=true`, or later
      `bash .linear-autofix/deploy/ec2/allow-ip.sh <your-ip> OPEN_PREVIEW_PORT=true`.
@@ -198,6 +211,8 @@ API calls work. To be sure, make these true, in order:
    echo 'PREVIEW_IP=<instance-public-ip>' >> ~/agentweb/.linear-autofix/.env
    ```
    (`run.sh` sources `.env`, so every cron-born preview embeds the public IP.)
+   **This step is for the `/32` path only.** On the SSM path, leave `PREVIEW_IP` at its
+   `127.0.0.1` default — that is exactly what makes the tunnels above resolve.
 3. **Use a stable IP.** A default public IP changes on stop/start, breaking both the SG rules
    and `PREVIEW_IP`. Allocate an **Elastic IP** and associate it if you'll rely on the URLs.
 
