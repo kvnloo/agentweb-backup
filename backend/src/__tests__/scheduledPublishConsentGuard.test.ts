@@ -232,6 +232,28 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
     ).not.toBeNull();
   });
 
+  // The schedule NAME is owner-supplied text that sits IN FRONT of the authoritative
+  // id in `"<name>|scheduleId:<id>"`. An unanchored parser takes the FIRST match, so
+  // a name containing `scheduleId:<other>` silently resolves this run's consent
+  // against a DIFFERENT schedule's record. Non-vacuous: with the previous
+  // `/scheduleId:([a-f0-9-]+)/` this read the decoy id and looked up the wrong row.
+  it('resolves consent against the STAMPED schedule, not one named in the title', async () => {
+    const spoofed = {
+      ...SCHEDULED_SESSION,
+      pageIdentifier:
+        'Evil scheduleId:deadbeef-0000-4000-8000-00000000dead' +
+        '|scheduleId:1c20ada1-0000-4000-8000-000000000001',
+    };
+    const d = deps(spoofed, AUTHORIZED_SCHEDULE);
+
+    expect(
+      await refuseUnauthorizedScheduledPublish('post_on_connected_account', { sessionId: 'sess-1' }, d)
+    ).toBeNull();
+    // Assert the OUTCOME that matters: which record the decision was read from.
+    expect(d.getScheduleById).toHaveBeenCalledWith('1c20ada1-0000-4000-8000-000000000001');
+    expect(d.getScheduleById).not.toHaveBeenCalledWith('deadbeef-0000-4000-8000-00000000dead');
+  });
+
   describe('does not touch the interactive path', () => {
     it('allows a publish in an interactive session without reading any schedule', async () => {
       // A human is in the conversation and approves there and then.
