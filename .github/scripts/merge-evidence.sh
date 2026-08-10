@@ -175,7 +175,7 @@ trap 'rm -f "${stderr_file}"' EXIT
 # ---------------------------------------------------------------------------
 
 pr_json="$(gh pr view "${PR_NUMBER}" --repo "${REPO}" \
-  --json number,state,isDraft,mergeable,mergeStateStatus,headRefOid \
+  --json number,state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefName \
   2>"${stderr_file}")"
 gh_exit=$?
 
@@ -183,8 +183,12 @@ if [ "${gh_exit}" -ne 0 ]; then
   hard_fail "GitHub API call failed (exit ${gh_exit}) reading ${REPO}#${PR_NUMBER}: $(tr '\n' ' ' <"${stderr_file}")"
 fi
 
+# `mergeStateStatus` was already requested here and then thrown away. ENG-1003
+# reads it: BEHIND is GitHub's own statement that the base moved under this PR,
+# so the staleness check in section 8 costs no extra API call on a current PR.
 parsed="$(printf '%s' "${pr_json}" | jq -r '
-    [ (.state // ""), (.isDraft | tostring), (.mergeable // ""), (.headRefOid // "") ]
+    [ (.state // ""), (.isDraft | tostring), (.mergeable // ""), (.headRefOid // ""),
+      (.mergeStateStatus // ""), (.baseRefName // "") ]
     | join("\u001f")' 2>/dev/null)"
 jq_exit=$?
 
@@ -193,7 +197,7 @@ if [ "${jq_exit}" -ne 0 ] || [ -z "${parsed}" ]; then
   hard_fail "unparseable response from \`gh pr view ${PR_NUMBER}\` — expected a JSON object with state/isDraft/mergeable/headRefOid"
 fi
 
-IFS="${SEP}" read -r pr_state pr_draft pr_mergeable head_sha <<<"${parsed}"
+IFS="${SEP}" read -r pr_state pr_draft pr_mergeable head_sha pr_merge_state base_ref <<<"${parsed}"
 
 if [ -z "${pr_state}" ] || [ -z "${pr_mergeable}" ]; then
   surface 'gh pr view response (raw)' "${pr_json}"
@@ -665,6 +669,111 @@ if [ -n "${touches_backend}" ]; then
     verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} changes backend paths (e.g. ${touches_backend}), but the backend suite did not execute against head ${head_sha}: ${missing}. Those jobs are gated on '${DRAFT_JOB}' as well as the path filter (ENG-915), so a skip here is not proof the path filter excluded them — it is the absence of the measurement this gate exists to require. Re-run the workflow at this head once the Greptile gate passes. If a job was renamed, set MERGE_EVIDENCE_BACKEND_JOBS."
     exit 3
   fi
+fi
+
+# ---------------------------------------------------------------------------
+# 8. The evidence must describe the merge that would actually happen (ENG-1003)
+# ---------------------------------------------------------------------------
+#
+# Everything above proves a real run executed at this head and nothing failed.
+# That is a statement about the PR's code, not about the merge: on a
+# `pull_request` event `actions/checkout` resolves `github.ref` to
+# `refs/pull/N/merge`, so the suite tested this branch merged into whatever the
+# base was WHEN THE RUN STARTED. Commits that landed on the base afterwards were
+# never part of the measurement.
+#
+# Until now this gate said nothing about that. The freshness property was
+# enforced only by GitHub's `strict` branch protection, which buys it by
+# invalidating every open PR on every merge and charging each one a full ~34
+# runner-minute revalidation — 25 of agentweb's 35 open PRs sat BEHIND with zero
+# CLEAN when ENG-1003 was filed, and draining them serially costs ~11 hours.
+#
+# The property is cheaper to check than to enforce by brute force. A base commit
+# only invalidates this PR's green suite if it touched a file this PR also
+# touches; otherwise the tested merge result is still the merge that would land.
+#
+# Scope, stated honestly: this proves FILE-LEVEL independence, not semantic
+# independence. Two PRs can break each other while editing different files. That
+# is a real gap — but it is a gap `strict` does not close either, because
+# `strict` only forces the branch to be current, and the two REQUIRED contexts
+# here (`Detect changed projects`, `Require Greptile Review`) do not run the test
+# suite at all. So this is strictly more evidence than the repo has today, not
+# less. Turning `strict` off is a separate, human decision (ENG-1003); this block
+# is what makes that decision safe to take rather than a silent loss of a gate.
+
+if [ "${pr_merge_state}" = "BEHIND" ]; then
+  # GitHub's compare endpoint returns at most this many file entries. A list at
+  # the cap may be truncated, and a truncated list cannot prove the ABSENCE of
+  # an overlap — which is the only thing this section is allowed to conclude.
+  COMPARE_FILE_CAP=300
+
+  if [ -z "${base_ref}" ]; then
+    hard_fail "${REPO}#${PR_NUMBER} is BEHIND its base but \`gh pr view\` returned no baseRefName, so the base it is behind cannot be identified and the staleness of the evidence cannot be evaluated."
+  fi
+
+  # Three dots: GitHub computes the merge base of head and base, then diffs the
+  # merge base to the base head. `.files` is therefore exactly what landed on the
+  # base while this PR was open — not this PR's own diff inverted.
+  compare_json="$(gh api "repos/${REPO}/compare/${head_sha}...${base_ref}" 2>"${stderr_file}")"
+  gh_exit=$?
+
+  if [ "${gh_exit}" -ne 0 ]; then
+    hard_fail "GitHub API call failed (exit ${gh_exit}) comparing ${head_sha} against ${base_ref} for ${REPO}#${PR_NUMBER}, so whether the base moved under the tested merge cannot be established: $(tr '\n' ' ' <"${stderr_file}")"
+  fi
+
+  base_meta="$(printf '%s' "${compare_json}" | jq -r '
+      ((.ahead_by // 0) | tostring), ((.files // []) | length | tostring)' 2>/dev/null)"
+  jq_exit=$?
+  if [ "${jq_exit}" -ne 0 ] || [ -z "${base_meta}" ]; then
+    surface 'compare response (raw)' "${compare_json}"
+    hard_fail "unparseable response comparing ${head_sha} against ${base_ref} — expected a JSON object with ahead_by and files."
+  fi
+
+  base_ahead="$(printf '%s\n' "${base_meta}" | sed -n '1p')"
+  base_file_count="$(printf '%s\n' "${base_meta}" | sed -n '2p')"
+
+  # Non-numeric here would make the `-ge` below error and evaluate FALSE, which
+  # is the pass direction. Refuse to guess rather than fail open.
+  case "${base_ahead}${base_file_count}" in
+    ''|*[!0-9]*)
+      surface 'compare response (raw)' "${compare_json}"
+      hard_fail "the comparison of ${head_sha} against ${base_ref} returned a non-numeric ahead_by/file count ('${base_ahead}'/'${base_file_count}'), so overlap cannot be evaluated."
+      ;;
+  esac
+
+  if [ "${base_file_count}" -ge "${COMPARE_FILE_CAP}" ]; then
+    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} is ${base_ahead} commit(s) behind ${base_ref}, and the comparison returned ${base_file_count} files — at or above GitHub's ${COMPARE_FILE_CAP}-file cap, so the list may be truncated and cannot prove this PR's diff is untouched by it. Sync the branch and let CI re-run against the current base."
+    exit 3
+  fi
+
+  base_files="$(printf '%s' "${compare_json}" | jq -r '(.files // [])[] | .filename' 2>/dev/null)"
+  jq_exit=$?
+  if [ "${jq_exit}" -ne 0 ]; then
+    surface 'compare response (raw)' "${compare_json}"
+    hard_fail "unparseable file list comparing ${head_sha} against ${base_ref}."
+  fi
+
+  # Exact path equality, not a prefix match: this is asking "did the base edit a
+  # file this PR also edits", and `src/a.ts` must not be read as matching
+  # `src/a.ts.snap`.
+  base_overlap=''
+  while IFS= read -r base_file; do
+    [ -n "${base_file}" ] || continue
+    while IFS= read -r pr_file; do
+      [ -n "${pr_file}" ] || continue
+      if [ "${base_file}" = "${pr_file}" ]; then
+        base_overlap="${base_file}"
+        break 2
+      fi
+    done <<<"${changed_files}"
+  done <<<"${base_files}"
+
+  if [ -n "${base_overlap}" ]; then
+    verdict 'NO_EVIDENCE' "${REPO}#${PR_NUMBER} is ${base_ahead} commit(s) behind ${base_ref}, and one of those commits changed '${base_overlap}', which this PR also changes. The green run at head ${head_sha} tested a merge result that no longer exists, so it is not evidence for the merge that would happen now. Sync the branch and let CI re-run."
+    exit 3
+  fi
+
+  log "base has moved ${base_ahead} commit(s) ahead (${base_file_count} file(s) changed on ${base_ref}), but none of them are files this PR touches, so the run at ${head_sha} still describes the merge that would land."
 fi
 
 # Acceptance criterion 5: the run is known real, so remaining skips are path
