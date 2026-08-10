@@ -1,7 +1,12 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
-import { canAccessCrmList, canDestructiveCrmList } from '../services/crmAccessControl';
+import {
+  canAccessCrmList,
+  canDestructiveCrmList,
+  CRM_EDITOR_REQUIRED_MESSAGE,
+  CRM_SHARING_DISABLED_MESSAGE,
+} from '../services/crmAccessControl';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { leadListAlertService } from '../services/leadListAlertService';
@@ -804,7 +809,7 @@ router.get('/leads/:leadId/enrichment', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     const lead = await crmDb.getLeadById(listId, leadId);
@@ -1181,7 +1186,7 @@ router.get('/lists/:listId', async (req: Request, res: Response) => {
 
     // Verify ownership
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     res.json(list);
@@ -1213,7 +1218,7 @@ router.get('/lists/:listId/metrics', async (req: Request, res: Response) => {
     }
 
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     // Resolve the owner userId (org member lists use list.userId, not authReq.user.userId)
@@ -1371,7 +1376,7 @@ router.put('/lists/:listId', async (req: Request, res: Response) => {
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const updates: {
@@ -1558,7 +1563,7 @@ router.get('/lists/:listId/enrichment-config', async (req: Request, res: Respons
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     const result = await svcGetEnrichmentConfig({ listId, userId }, enrichmentConfigDeps);
@@ -1585,7 +1590,7 @@ router.put('/lists/:listId/enrichment-config', async (req: Request, res: Respons
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const config = req.body;
@@ -1623,7 +1628,7 @@ router.post('/lists/:listId/enrichment-config/suggest-types', async (req: Reques
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     const fields = Array.isArray(req.body?.fields) ? req.body.fields : [];
@@ -1657,7 +1662,7 @@ router.post('/lists/:listId/leads/enrich-v3', async (req: Request, res: Response
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const mode = (req.query.mode === 'preview' ? 'preview' : 'enrich') as 'preview' | 'enrich';
@@ -1728,7 +1733,7 @@ router.delete('/lists/:listId', async (req: Request, res: Response) => {
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     await crmDb.deleteLeadList(listId);
@@ -1773,7 +1778,7 @@ router.get('/lists/:listId/leads', async (req: Request, res: Response) => {
     }
 
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     // HubSpot connection drives the sync-status filter + per-lead resolution.
@@ -1998,7 +2003,7 @@ router.post('/lists/:listId/leads', async (req: Request, res: Response) => {
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     // Stamp an initial per-lead sync status when this list is connected to
@@ -2048,7 +2053,7 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
 
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canDestructiveCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
+    if (!(await canDestructiveCrmList(userId, list))) return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
 
     // Normalize Unipile search result shape → CRM lead shape
     const normalizedLeads = leads.map((lead: any) => {
@@ -2151,7 +2156,7 @@ router.post('/lists/:listId/leads/find', async (req: Request, res: Response) => 
 
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canDestructiveCrmList(userId, list))) return res.status(403).json({ message: 'Access denied' });
+    if (!(await canDestructiveCrmList(userId, list))) return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
 
     const { agentModeService } = await import('../services/agentModeService');
     const result = await agentModeService.importLeadsFromSearch(userId, {
@@ -2360,7 +2365,7 @@ router.get('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     }
 
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     const lead = await crmDb.getLeadById(listId, leadId);
@@ -2413,7 +2418,7 @@ router.put('/lists/:listId/leads/bulk-contact-status', async (req: Request, res:
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     let updated = 0;
@@ -2487,7 +2492,7 @@ router.delete('/lists/:listId/leads/bulk-delete', async (req: Request, res: Resp
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     let deleted = 0;
@@ -2533,7 +2538,7 @@ router.put('/lists/:listId/leads/:leadId', async (req: Request, res: Response) =
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     if (updates?.selectedSenderId !== undefined) {
@@ -2622,7 +2627,7 @@ router.delete('/lists/:listId/leads/:leadId', async (req: Request, res: Response
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     await crmDb.deleteLead(listId, leadId);
@@ -2654,7 +2659,7 @@ router.post(
       const list = await crmDb.getLeadListById(listId);
       if (!list) return res.status(404).json({ message: 'Lead list not found' });
       if (!(await canAccessCrmList(userId, list))) {
-        return res.status(403).json({ message: 'Access denied' });
+        return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
       }
 
       if (!req.file) {
@@ -2881,7 +2886,7 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     if (!req.file) {
@@ -3004,7 +3009,7 @@ router.post('/lists/:listId/leads/export', async (req: Request, res: Response) =
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     // Fetch all leads by paginating
@@ -3118,7 +3123,7 @@ router.get('/lists/:listId/export-history', async (req: Request, res: Response) 
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     res.json({ history: list.csvExportHistory || [] });
@@ -3152,7 +3157,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     if (!req.file) {
@@ -3561,7 +3566,7 @@ router.post('/lists/:listId/leads/match-icps', async (req: Request, res: Respons
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     // Helper function to emit progress
@@ -3825,7 +3830,7 @@ router.post('/lists/:listId/leads/enrich-web', async (req: Request, res: Respons
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     if (mode === 'suggest') {
@@ -4027,7 +4032,7 @@ router.post('/lists/:listId/leads/enrich-tech-stack', async (req: Request, res: 
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
@@ -4104,7 +4109,7 @@ router.get('/lists/:listId/leads/:leadId/engagements', async (req: Request, res:
     }
 
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     const result = await crmDb.getLeadEngagements(listId, leadId, userId);
@@ -4136,7 +4141,7 @@ router.post('/lists/:listId/leads/:leadId/sync-linkedin-messages', async (req: R
     }
 
     if (!(await canDestructiveCrmList(userId, list as any))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const lead = await crmDb.getLeadById(listId, leadId);
@@ -4781,7 +4786,7 @@ router.post('/lists/:listId/leads/:leadId/engagements', async (req: Request, res
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const engagement = {
@@ -4841,7 +4846,7 @@ router.put('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: Requ
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const engagement = {
@@ -4880,7 +4885,7 @@ router.delete('/lists/:listId/leads/:leadId/engagements/:eventId', async (req: R
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const updatedLead = await crmDb.deleteLeadEngagement(listId, leadId, eventId);
@@ -5291,7 +5296,7 @@ router.post('/lists/:listId/leads/:leadId/send-email', async (req: Request, res:
     // Verify the lead belongs to the user's list
     const list = await crmDb.getLeadListById(listId);
     if (!list || !(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     // ENG-266 Part 3: route through the sender's real provider. If senderId/senderEmail
@@ -5367,7 +5372,7 @@ router.post('/lists/:listId/leads/:leadId/reply-email', async (req: Request, res
     // Verify the lead belongs to the user's list
     const list = await crmDb.getLeadListById(listId);
     if (!list || !(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     // ENG-266 Part 3: route through the sender's real provider, same fallback as send-email.
@@ -5431,7 +5436,7 @@ router.put('/lists/:listId/public-access', async (req: Request, res: Response) =
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const updatedList = await crmDb.updateLeadList(listId, {
@@ -5492,7 +5497,7 @@ router.put('/lists/:listId/auto-draft', async (req: Request, res: Response) => {
     }
 
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const updatedList = await crmDb.updateLeadList(listId, {
@@ -5659,7 +5664,7 @@ router.post('/lists/:listId/group-email/preview', async (req: Request, res: Resp
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     let leads = await fetchAllLeadsForGroupEmail(listId);
@@ -5734,7 +5739,7 @@ router.post('/lists/:listId/group-email/prepare', async (req: Request, res: Resp
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     // Extract all variables from subject + htmlContent
@@ -5833,7 +5838,7 @@ router.post('/lists/:listId/group-email/send', async (req: Request, res: Respons
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     let leads = await fetchAllLeadsForGroupEmail(listId);
@@ -5988,7 +5993,7 @@ router.post('/lists/:listId/group-email/test', async (req: Request, res: Respons
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -6082,7 +6087,7 @@ router.post('/lists/:listId/group-email/load-from-url', async (req: Request, res
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canDestructiveCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     if (!url || typeof url !== 'string') {
@@ -6217,7 +6222,7 @@ router.post('/lists/:listId/analyze', async (req: Request, res: Response) => {
       return res.status(404).json({ message: 'Lead list not found' });
     }
     if (!(await canAccessCrmList(userId, list))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     // Check cache
@@ -6515,7 +6520,7 @@ router.get('/lists/:listId/enrichment-history', async (req: Request, res: Respon
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canAccessCrmList(userId, list as any))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_SHARING_DISABLED_MESSAGE });
     }
 
     const { jobs } = await crmDb.getEnrichmentJobsByListId(listId, undefined, undefined, 10);
@@ -6539,7 +6544,7 @@ router.post('/lists/:listId/enrichment-jobs/:jobId/revert', async (req: Request,
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canDestructiveCrmList(userId, list as any))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const { CrmEnrichmentService } = await import('../services/crmEnrichmentService');
@@ -6580,7 +6585,7 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/verify', async (req: Req
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canDestructiveCrmList(userId, list as any))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
     const lead: any = await crmDb.getLeadById(listId, leadId);
     if (!lead) return res.status(404).json({ message: 'Lead not found' });
@@ -6625,7 +6630,7 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/reject', async (req: Req
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canDestructiveCrmList(userId, list as any))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
     const lead: any = await crmDb.getLeadById(listId, leadId);
     if (!lead) return res.status(404).json({ message: 'Lead not found' });
@@ -6672,7 +6677,7 @@ router.post('/lists/:listId/leads/:leadId/fields/:field/refresh', async (req: Re
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
     if (!(await canDestructiveCrmList(userId, list as any))) {
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
     const lead: any = await crmDb.getLeadById(listId, leadId);
     if (!lead) return res.status(404).json({ message: 'Lead not found' });

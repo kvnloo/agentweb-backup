@@ -19,7 +19,7 @@
 import express, { Request, Response, Router } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
 import { crmDb } from '../services/db';
-import { canDestructiveCrmList } from '../services/crmAccessControl';
+import { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } from '../services/crmAccessControl';
 import { getApolloService, isApolloServiceReady } from '../services/apolloService';
 import { ApolloQuotaExceededError } from '../services/apolloQuota';
 import { applyApolloMatchToLead } from '../services/applyApolloMatchToLead';
@@ -257,7 +257,7 @@ router.post('/lists/:listId/leads/enrich-with-apollo', async (req: Request, res:
     }
     if (!(await canDestructiveCrmList(userId, list as any))) {
       bulkEnrichInFlight.delete(lockKey);
-      return res.status(403).json({ message: 'Access denied' });
+      return res.status(403).json({ message: CRM_EDITOR_REQUIRED_MESSAGE });
     }
 
     const opts: ApolloBulkOptions = {

@@ -1,7 +1,12 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
 import { crmDb } from '../services/db';
-import { canAccessCrmList, canDestructiveCrmList } from '../services/crmAccessControl';
+import {
+  canAccessCrmList,
+  canDestructiveCrmList,
+  CRM_EDITOR_REQUIRED_MESSAGE,
+  CRM_SHARING_DISABLED_MESSAGE,
+} from '../services/crmAccessControl';
 import {
   externalCrmSyncService,
 } from '../services/externalCrmSyncService';
@@ -30,7 +35,13 @@ async function verifyListOwnership(
   const allowed = destructive
     ? await canDestructiveCrmList(userId, list as any)
     : await canAccessCrmList(userId, list as any);
-  if (!allowed) return { ok: false, status: 403, error: 'Access denied' };
+  if (!allowed) {
+    return {
+      ok: false,
+      status: 403,
+      error: destructive ? CRM_EDITOR_REQUIRED_MESSAGE : CRM_SHARING_DISABLED_MESSAGE,
+    };
+  }
 
   return { ok: true };
 }

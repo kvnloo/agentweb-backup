@@ -500,7 +500,7 @@ describe('Org-aware access control on CRM sync routes', () => {
       .expect(403);
 
     expect(externalCrmSyncService.saveConfig).not.toHaveBeenCalled();
-    expect(res.body.error).toMatch(/access denied/i);
+    expect(res.body.error).toMatch(/CRM editor/i);
   });
 
   it('allows a listed crm.editor to save config for another member\'s list', async () => {
