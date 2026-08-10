@@ -8974,7 +8974,12 @@ export class AgentModeService {
   // Read current user's market strategy
   public async readMarketStrategy(
     userId: string,
-    options: { competitorOffset?: number; minCompetitorsInFull?: number; pagingHints?: boolean } = {}
+    options: {
+      competitorOffset?: number;
+      minCompetitorsInFull?: number;
+      pagingHints?: boolean;
+      competitorNames?: string[];
+    } = {}
   ): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
@@ -9034,6 +9039,12 @@ export class AgentModeService {
       // Competitor sections get the room the overview and ICP leave, not a fixed
       // slice on top of them (ENG-945 / Greptile: per-section budgets do not
       // compose into a bound on the whole response).
+      // Membership check (ENG-945): the name index is bounded, so on a large
+      // roster it cannot show every name. A caller deciding whether to ADD a
+      // competitor must still be able to find out if it already exists — that
+      // is the contract this whole ticket is about. Answer it directly instead
+      // of making them page the list.
+      const competitorLookup = this.lookupCompetitors(competitors, options?.competitorNames);
       const budgets = this.competitorCharBudgets(marketStrategy);
       const window = this.resolveCompetitorDetailWindow(competitors, competitorDetailOffset, minInFull, budgets.detail);
 
@@ -9044,6 +9055,7 @@ export class AgentModeService {
         competitorDetailStart: window.start,
         competitorDetailEnd: window.end,
         nameIndexCharBudget: budgets.nameIndex,
+        competitorLookup,
         // Paging instructions only make sense in a tool result. A caller that
         // embeds this in its own prompt has no read_market_strategy to call, so
         // the offsets are noise there — and noise that can leak into generated
@@ -9057,6 +9069,7 @@ export class AgentModeService {
         message: `Market strategy retrieved successfully`,
         exists: true,
         totalCompetitors: competitorCount,
+        ...(competitorLookup ? { competitorLookup } : {}),
         competitorDetailOffset: window.start,
         competitorsWithFullDetail: window.end - window.start,
         // Explicit next page, so paging never depends on the model doing arithmetic.
@@ -22971,6 +22984,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   private static readonly RESPONSE_HARD_CAP = 19000;
   private static readonly BUSINESS_OVERVIEW_MAX_CHARS = 2500;
   private static readonly ICP_SECTION_MAX_CHARS = 6000;
+  private static readonly COMPETITOR_LOOKUP_MAX = 50;
 
   // Rendered separately from formatMarketStrategy so its true cost can be
   // measured BEFORE the competitor budgets are allocated (ENG-945 / Greptile):
@@ -23043,6 +23057,35 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return text.slice(0, keep) + marker(text.length - keep);
   }
 
+  /**
+   * "Is this competitor already stored?" — answered directly, so a bounded name
+   * index can never leave a caller guessing (ENG-945). Matching mirrors
+   * updateMarketStrategy's merge-by-name, loosened to ignore case and padding so
+   * a near-miss does not read as "not stored" and cause a duplicate.
+   */
+  private lookupCompetitors(
+    competitors: any[],
+    names?: string[],
+  ): Array<{ name: string; stored: boolean; offset: number | null }> | undefined {
+    if (!Array.isArray(names) || names.length === 0) return undefined;
+    const norm = (v: any) => String(v ?? '').trim().toLowerCase();
+    const byName = new Map<string, number>();
+    competitors.forEach((competitor: any, index: number) => {
+      const key = norm(typeof competitor === 'object' && competitor ? competitor.name : competitor);
+      if (key && !byName.has(key)) byName.set(key, index);
+    });
+    return names
+      .slice(0, AgentModeService.COMPETITOR_LOOKUP_MAX)
+      .map((requested) => {
+        const offset = byName.get(norm(requested));
+        return {
+          name: String(requested),
+          stored: offset !== undefined,
+          offset: offset === undefined ? null : offset,
+        };
+      });
+  }
+
   private formatCompetitorDetailLine(competitor: any): string {
     if (typeof competitor === 'object' && competitor && competitor.name) {
       const name = this.truncateWithNotice(String(competitor.name), AgentModeService.COMPETITOR_FIELD_MAX_CHARS);
@@ -23094,6 +23137,21 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const { marketData } = marketResult;
     let formattedSummary = `<strong>📊 Market Strategy Retrieved</strong><br>`;
     formattedSummary += `I've successfully retrieved your market strategy. Here's what I found:<br><br>`;
+
+    // Rendered FIRST, deliberately: this is the answer to "should I add this
+    // competitor?", so it must sit ahead of everything the response clamp can
+    // trim (ENG-945).
+    const lookup: Array<{ name: string; stored: boolean; offset: number | null }> | undefined =
+      marketResult.competitorLookup;
+    if (lookup && lookup.length > 0) {
+      formattedSummary += `<strong>🔎 Competitor check — already stored?</strong><br>`;
+      lookup.forEach((entry) => {
+        formattedSummary += entry.stored
+          ? `• <strong>${entry.name}</strong>: ALREADY STORED at offset ${entry.offset} — do NOT add it again.<br>`
+          : `• <strong>${entry.name}</strong>: not stored — safe to add.<br>`;
+      });
+      formattedSummary += `<br>`;
+    }
 
     // Business Overview Section (matches UI structure). Bounded on the tool path
     // only — see RESPONSE_HARD_CAP.
@@ -23173,7 +23231,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
             formattedSummary += `• [offset ${e.index}] ${e.name}<br>`;
           });
           if (unlisted.length > 0) {
-            formattedSummary += `<strong>…and ${unlisted.length} more stored competitor(s) not named in this response</strong> (the account holds ${competitors.length} in total — none have been deleted). Read them with <code>competitorOffset: ${unlisted[0].index}</code> and onwards.<br>`;
+            formattedSummary += `<strong>…and ${unlisted.length} more stored competitor(s) not named in this response</strong> (the account holds ${competitors.length} in total — none have been deleted). Read them with <code>competitorOffset: ${unlisted[0].index}</code> and onwards. To check whether a specific competitor is among them BEFORE adding it, call read_market_strategy with <code>competitorNames: ["Name A", "Name B"]</code> — it answers stored/not-stored for each.<br>`;
           }
         } else {
           // Prompt-embedding caller: name the rest, no tool directives, no offsets.

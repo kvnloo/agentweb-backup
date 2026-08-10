@@ -1955,13 +1955,21 @@ emmaToolRegistry.register({
         competitorOffset: {
           type: 'number',
           description: 'Optional 0-based index of the first competitor to return with its full description. As many competitors as fit the page budget are returned in full from there; the rest are returned by name. Defaults to 0. Pass the offset printed in brackets beside a name-only competitor to read that entry in full, or the nextCompetitorOffset value from a previous response to read the next page.'
+        },
+        competitorNames: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional. Names to check against the stored competitor list. The response answers stored/not-stored for each (with its offset when stored), regardless of whether that competitor appears in this page. ALWAYS use this before adding competitors to a large market strategy — it is the reliable way to avoid re-adding one that already exists. Up to 50 names per call.'
         }
       },
       required: []
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.readMarketStrategy(context?.userId, { competitorOffset: args?.competitorOffset });
+    return await agentModeService.readMarketStrategy(context?.userId, {
+      competitorOffset: args?.competitorOffset,
+      competitorNames: args?.competitorNames,
+    });
   }
 });
 
