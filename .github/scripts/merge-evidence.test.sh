@@ -96,6 +96,19 @@ if [ "$sub" = "api" ]; then
       # Cases that mean to exercise the new rule set files.txt explicitly.
       emit_file files.txt files_exit 'partner-portal/src/App.tsx'
       ;;
+    *compare/*)
+      # ENG-1003: what the base branch gained since this PR diverged. Emitted
+      # as raw JSON, not a projected list, because the gate reads two things
+      # from it — the file list AND `ahead_by` — and a single `--jq` could only
+      # project one of them.
+      #
+      # The default is an EMPTY file list, which the gate reads as "the base
+      # moved but changed nothing this PR touches". Cases that mean to exercise
+      # the overlap rule set compare.json explicitly. This default is only ever
+      # consulted when mergeStateStatus is BEHIND, and every fixture written
+      # before ENG-1003 is CLEAN, so it cannot alter their verdicts.
+      emit_file compare.json compare_exit '{"ahead_by":0,"files":[]}'
+      ;;
     *)
       emit_file checkruns.json checkruns_exit '{"total_count":0,"check_runs":[]}'
       ;;
@@ -119,13 +132,28 @@ new_fixture_dir() {
   mktemp -d "${WORKDIR}/fixture.XXXXXX"
 }
 
-# pr_view <dir> <mergeable> [isDraft] [state] [headSha]
+# pr_view <dir> <mergeable> [isDraft] [state] [headSha] [mergeStateStatus] [baseRefName]
+#
+# The two trailing parameters are ENG-1003's and default to today's behaviour
+# (CLEAN against main), so every fixture written before it keeps its verdict.
 pr_view() {
   local dir="$1" mergeable="$2" draft="${3:-false}" state="${4:-OPEN}" sha="${5:-${HEAD}}"
+  local merge_state="${6:-CLEAN}" base_ref="${7:-main}"
   cat >"${dir}/pr_view.json" <<EOF
 {"number":2231,"state":"${state}","isDraft":${draft},"mergeable":"${mergeable}",
- "mergeStateStatus":"CLEAN","headRefOid":"${sha}"}
+ "mergeStateStatus":"${merge_state}","headRefOid":"${sha}","baseRefName":"${base_ref}"}
 EOF
+}
+
+# base_compare <dir> <ahead_by> <newline-separated paths the base gained>
+# The `repos/{repo}/compare/{head}...{base}` body: `.files` is the diff from the
+# merge base to the base branch head, i.e. exactly what landed on main while
+# this PR was open (ENG-1003).
+base_compare() {
+  local dir="$1" ahead="$2" files="$3" json
+  json="$(printf '%s\n' "${files}" | jq -R '{filename: .}' | jq -s \
+    --argjson ahead "${ahead}" '{ahead_by: $ahead, files: [.[] | select(.filename != "")]}')"
+  printf '%s\n' "${json}" >"${dir}/compare.json"
 }
 
 # checkruns <dir> <json array of {name,status,conclusion}>
@@ -929,6 +957,28 @@ for non_backend in \
   check "a PR touching only ${non_backend} passes with the suite skipped" 0 'PASS'
 done
 
+# Renames and the backend classifier (Greptile P1 on ENG-1003). The workflow's
+# path filter classifies on the POST-rename path, so the gate must too:
+#
+# 1. A file renamed OUT of the backend does not schedule the backend jobs.
+#    Gating on its old name would demand evidence the workflow never produced —
+#    a NO_EVIDENCE the author cannot fix by re-running anything.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${NON_BACKEND_RUNS}"
+changed_files "${d}" "$(printf 'docs/service-notes.md\tbackend/src/serviceNotes.ts')"
+run_gate "${d}"
+check 'a rename OUT of backend/ passes with the suite skipped (classified on current path)' 0 'PASS'
+
+# 2. A file renamed INTO the backend is a backend change under its current
+#    name, and the requirement still bites when the suite did not run.
+d="$(new_fixture_dir)"
+pr_view "${d}" 'MERGEABLE'
+checkruns "${d}" "${NON_BACKEND_RUNS}"
+changed_files "${d}" "$(printf 'backend/src/serviceNotes.ts\tdocs/service-notes.md')"
+run_gate "${d}"
+check 'a rename INTO backend/ still requires the backend suite' 3 'changes backend paths'
+
 # Renaming a job must fail closed rather than delete the requirement. With the
 # override pointing at a name nothing reports, the gate blocks.
 TESTS_RUN=$((TESTS_RUN + 1))
@@ -957,6 +1007,132 @@ checkruns "${d}" "${HEALTHY_RUNS}"
 changed_files "${d}" ''
 run_gate "${d}"
 check 'an empty changed-files list is ERROR, never a pass' 4 'ERROR'
+
+# ---------------------------------------------------------------------------
+# ENG-1003: the evidence must describe the merge that would actually happen
+# ---------------------------------------------------------------------------
+#
+# Everything above establishes that a real run executed at this head and nothing
+# failed. That is a statement about the PR's own code. It is NOT a statement
+# about the merge, because `refs/pull/N/merge` — what the suite actually checks
+# out on a `pull_request` event — was built against whatever `main` was when the
+# run started. Commits that land on `main` afterwards are outside the evidence.
+#
+# Today nothing in this gate notices that. The freshness property is enforced
+# only by GitHub's `strict` branch-protection flag, which pays for it by forcing
+# a full ~34-runner-minute revalidation of EVERY open PR after EVERY merge —
+# 25 of agentweb's 35 open PRs were BEHIND with 0 CLEAN when ENG-1003 was filed.
+#
+# So the property moves here, where it can be checked precisely and for free:
+# a base that moved only matters if it moved a file this PR also touches.
+# Overlap is the thing that can invalidate a green suite; everything else is
+# GitHub being conservative because it cannot read a diff.
+#
+# This is strictly a TIGHTENING. Before this block the gate passed a PR whose
+# tested merge base was hundreds of commits stale without comment.
+
+GREEN_HEAD='321fbdd6f2b93d13d6216aa10b15747dad8bb64c'
+GREEN_WF='[
+  {"id":11,"name":"Tests","workflow_id":111,"run_number":5,"status":"completed","conclusion":"success","check_suite_id":100}
+]'
+
+# A PR that is green at its head, touching one non-backend file, in the given
+# mergeStateStatus. Section 7 is not exercised (the file is not a backend path),
+# so every verdict below is attributable to the staleness rule alone.
+green_pr() {
+  local dir="$1" merge_state="$2"
+  pr_view "${dir}" 'MERGEABLE' false OPEN "${GREEN_HEAD}" "${merge_state}" 'main'
+  checkruns "${dir}" "${COMPLETED_GREEN_RUN}"
+  workflowruns "${dir}" "${GREEN_WF}"
+  changed_files "${dir}" 'partner-portal/src/App.tsx'
+}
+
+# 1. The case the rule exists for: main moved a file this PR also edits, so the
+#    green suite was run against a merge result that no longer exists.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 12 'partner-portal/src/App.tsx
+backend/src/services/db.ts'
+run_gate "${d}"
+check 'ENG-1003: a stale base that moved a file this PR touches is NO_EVIDENCE' 3 'partner-portal/src/App.tsx'
+
+# 2. The saving. The base moved, but nowhere near this PR's diff, so the tested
+#    merge result is still the one that would land. This is the verdict that
+#    makes turning `strict` off safe rather than reckless.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 12 'docs/README.md
+customer-portal/src/Other.tsx'
+run_gate "${d}"
+check 'ENG-1003: a stale base with no overlapping file still PASSes' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 12 'docs/README.md'
+run_gate "${d}"
+check 'ENG-1003: the non-overlapping pass says the base moved and why it is safe' 0 'base has moved 12 commit'
+
+# 3. Fail closed when the comparison itself cannot be read. A gate that cannot
+#    see the base must not certify freshness.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+printf '7\n' >"${d}/compare_exit"
+run_gate "${d}"
+check 'ENG-1003: an unreadable base comparison is ERROR, never a pass' 4 'ERROR'
+
+# 4. GitHub's compare endpoint caps `files` at 300. A truncated list cannot
+#    prove the ABSENCE of an overlap, and this PR's files are deliberately
+#    absent from it — so without the cap check this fixture would false-PASS.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+base_compare "${d}" 400 "$(seq 1 300 | sed 's|^|unrelated/f|; s|$|.ts|')"
+run_gate "${d}"
+check 'ENG-1003: a truncated base file list cannot prove no overlap, so NO_EVIDENCE' 3 'truncat'
+
+# 5. The freshness check keys on `ahead_by`, never on the displayed merge
+#    state: mergeStateStatus reports one dominant state, so a PR that is behind
+#    AND awaiting a required review reads BLOCKED, not BEHIND. A gate that
+#    trusted the label would false-PASS exactly this fixture.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BLOCKED'
+base_compare "${d}" 12 'partner-portal/src/App.tsx'
+run_gate "${d}"
+check 'ENG-1003: a behind base hidden under BLOCKED still fails freshness' 3 'partner-portal/src/App.tsx'
+
+# 5b. A genuinely current PR (compare says the base has not moved) passes, and
+#     an unreadable comparison is now an ERROR for every PR, not only BEHIND
+#     ones — the comparison is the evidence, so its absence fails closed.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'CLEAN'
+base_compare "${d}" 0 ''
+run_gate "${d}"
+check 'ENG-1003: a current base (ahead_by 0) still PASSes' 0 'VERDICT: PASS'
+
+d="$(new_fixture_dir)"
+green_pr "${d}" 'CLEAN'
+printf '9\n' >"${d}/compare_exit"
+run_gate "${d}"
+check 'ENG-1003: an unreadable comparison fails closed even when the state reads CLEAN' 4 'ERROR'
+
+# 6. Renames participate under both paths: the base renamed the file this PR
+#    edits, so the overlap only exists via `previous_filename`. Filename-only
+#    projection would false-PASS this.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+printf '%s\n' '{"ahead_by":3,"files":[{"filename":"partner-portal/src/AppRenamed.tsx","previous_filename":"partner-portal/src/App.tsx"}]}' >"${d}/compare.json"
+run_gate "${d}"
+check 'ENG-1003: a base rename of a file this PR edits is caught via previous_filename' 3 'partner-portal/src/App.tsx'
+
+# 6b. The PR side of the same coin: this PR renamed the file, the base edited
+#     it under the old name. The overlap only exists via the PR's
+#     previous_filename, which the current-path-only backend classifier must
+#     not have stripped from the overlap list.
+d="$(new_fixture_dir)"
+green_pr "${d}" 'BEHIND'
+changed_files "${d}" "$(printf 'partner-portal/src/AppRenamed.tsx\tpartner-portal/src/App.tsx')"
+base_compare "${d}" 3 'partner-portal/src/App.tsx'
+run_gate "${d}"
+check 'ENG-1003: a PR rename of a file the base edits is caught via the PR previous_filename' 3 'partner-portal/src/App.tsx'
 
 # ---------------------------------------------------------------------------
 # Invariant guard — the discriminator must stay draft-gated ONLY
