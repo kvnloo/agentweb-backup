@@ -135,7 +135,7 @@ describe('ENG-982: one call completes the job', () => {
     expect(body.next).toBeUndefined();
   });
 
-  it('emma_run_marketing_task only asks the caller to poll when the run actually detached', async () => {
+  it('emma_run_marketing_task reports a detached run as unconfirmed and points somewhere real', async () => {
     mockMcpFetch
       .mockResolvedValueOnce({ sessionId: 'task-42' })
       .mockResolvedValueOnce({ content: 'still building…', stillBuilding: true });
@@ -145,7 +145,12 @@ describe('ENG-982: one call completes the job', () => {
 
     expect(body.status).toBe('running');
     expect(body.completion_confirmed).toBe(false);
-    expect(body.next).toMatch(/emma_get_task_result/);
+    // Points at emma_get_session, which exists. A dedicated polling tool was
+    // deliberately NOT shipped in this tranche: the only case it would serve is
+    // the detached run, and that is exactly the case no signal can confirm
+    // until ENG-1015 exposes the durable run status.
+    expect(body.next).toMatch(/emma_get_session/);
+    expect(body.next).toMatch(/ENG-1015/);
   });
 
   it('emma_run_marketing_task confirms a blocking question against the SESSION, not the generate reply', async () => {
@@ -200,78 +205,10 @@ describe('ENG-982: one call completes the job', () => {
     expect(body.next).toMatch(/unconfirmed/);
   });
 
-  it('emma_get_task_result reports awaiting_input when Emma is blocked on a question', async () => {
-    mockMcpFetch.mockResolvedValueOnce({
-      messages: [{ role: 'assistant', content: 'which audience?' }],
-      pendingUserQuestion: { question: 'which audience?' },
-    });
 
-    const res: any = await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER);
-    const body = JSON.parse(res.content[0].text);
 
-    expect(body.status).toBe('awaiting_input');
-    expect(body.awaiting_question).toEqual({ question: 'which audience?' });
-    expect(body.next).toMatch(/emma_answer_question/);
-  });
 
-  it('emma_get_task_result never claims completion it cannot prove', async () => {
-    // progressStore is an in-process Map, so a poll served by a different
-    // instance than the one running the task sees no progress while work
-    // continues. Reporting that as a confirmed finish would make a client stop
-    // polling mid-run, so `idle` is always completion_confirmed: false.
-    mockMcpFetch.mockResolvedValueOnce({ messages: [{ role: 'assistant', content: 'done' }] });
-    const body = JSON.parse(
-      (await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER) as any).content[0].text
-    );
 
-    expect(body.status).toBe('idle');
-    expect(body.completion_confirmed).toBe(false);
-    expect(body.latest_output).toBe('done');
-    expect(body.next).toMatch(/not proof the task finished/);
-  });
-
-  it('emma_get_task_result marks the two states it CAN prove as confirmed', async () => {
-    mockMcpFetch.mockResolvedValueOnce({ messages: [], hasActiveProgress: true });
-    let body = JSON.parse(
-      (await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER) as any).content[0].text
-    );
-    expect(body.status).toBe('running');
-    expect(body.completion_confirmed).toBe(true);
-
-    jest.clearAllMocks();
-    mockMcpFetch.mockResolvedValueOnce({ messages: [], pendingUserQuestion: { question: 'q?' } });
-    body = JSON.parse(
-      (await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER) as any).content[0].text
-    );
-    expect(body.status).toBe('awaiting_input');
-    expect(body.completion_confirmed).toBe(true);
-  });
-
-  it('emma_get_task_result keeps polling while an iteration is active, even after an assistant message', async () => {
-    // A multi-iteration run emits intermediate assistant messages. Reading only
-    // the last speaker would call that "idle" and the client would stop polling
-    // while Emma is still working, so hasActiveProgress outranks the transcript.
-    mockMcpFetch.mockResolvedValueOnce({
-      messages: [{ role: 'assistant', content: 'working on step 2...' }],
-      hasActiveProgress: true,
-    });
-
-    const res: any = await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER);
-    expect(JSON.parse(res.content[0].text).status).toBe('running');
-  });
-
-  it('emma_get_task_result still reports a blocking question ahead of active progress', async () => {
-    // If Emma is waiting on the caller, that is the actionable fact regardless
-    // of what the progress flag says.
-    mockMcpFetch.mockResolvedValueOnce({
-      messages: [{ role: 'assistant', content: 'which audience?' }],
-      pendingUserQuestion: { question: 'which audience?' },
-      hasActiveProgress: true,
-    });
-
-    const res: any = await tool('emma_get_task_result').execute({ task_id: 't1' }, CALLER);
-    expect(JSON.parse(res.content[0].text).status).toBe('awaiting_input');
-  });
 
   it('emma_get_brand_profile collapses three lookups into one call', async () => {
     mockMcpFetch
