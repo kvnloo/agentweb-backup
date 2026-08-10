@@ -184,3 +184,82 @@ describe('ENG-827 — blog: the article fetch must not outrun the consent check'
     expect(assertStillAuthorized).not.toHaveBeenCalled();
   });
 });
+
+describe('ENG-827 — X: a single tweet is guarded like a thread', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('forwards the hook the adapter used to drop on the floor', async () => {
+    const { TwitterAdapter } = require('../services/adapters/twitterAdapter');
+    const { twitterService } = require('../services/twitterService');
+
+    const postTweet = jest
+      .spyOn(twitterService, 'postTweet')
+      .mockResolvedValue({ id: '1', text: 'hi' } as any);
+
+    const hook = jest.fn(async () => null);
+    await new TwitterAdapter().createPost(
+      { account_id: 'x-1', platform: 'twitter', userId: 'owner-1', config: {} } as any,
+      'hello', undefined, 'user-1', hook
+    );
+
+    // Threads were already guarded; a lone tweet was decided only at dispatch,
+    // because the adapter's signature had nowhere to put the callback.
+    expect(postTweet).toHaveBeenCalledTimes(1);
+    expect(postTweet.mock.calls[0][4]).toBe(hook);
+  });
+});
+
+describe('ENG-827 — Instagram: the container must not outrun the consent check', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  const IG_ACCOUNT = {
+    account_id: 'ig-1',
+    platform: 'instagram',
+    config: { account_type: 'instagram_business', instagram_account_id: 'ig-1', access_token: 'tok' },
+  } as any;
+
+  it('does not publish a container built before consent was withdrawn', async () => {
+    const axios = require('axios');
+    const { InstagramAdapter } = require('../services/adapters/instagramAdapter');
+
+    let revoked = false;
+    // Container creation is the slow part — upload, then transcode. The owner
+    // revokes while it runs, after the dispatcher already said yes.
+    const post = jest.spyOn(axios, 'post').mockImplementation(async (url: any) => {
+      if (String(url).includes('/media_publish')) return { data: { id: 'post-1' } } as any;
+      revoked = true;
+      return { data: { id: 'container-1' } } as any;
+    });
+
+    const result = await new InstagramAdapter().createPost(
+      IG_ACCOUNT, 'caption', ['https://example.com/a.jpg'], 'user-1',
+      async () => (revoked ? { error: 'This run is no longer authorized to publish.' } : null)
+    );
+
+    // The container exists and nobody can see it. media_publish is what makes it
+    // public, and it must never have been called.
+    const publishCalls = post.mock.calls.filter((c: any[]) => String(c[0]).includes('/media_publish'));
+    expect(publishCalls).toHaveLength(0);
+    expect(result.success).toBe(false);
+    expect(result.message).toMatch(/no longer authorized/i);
+  });
+
+  it('publishes normally when consent holds', async () => {
+    const axios = require('axios');
+    const { InstagramAdapter } = require('../services/adapters/instagramAdapter');
+
+    const post = jest.spyOn(axios, 'post').mockImplementation(async (url: any) =>
+      String(url).includes('/media_publish')
+        ? ({ data: { id: 'post-1' } } as any)
+        : ({ data: { id: 'container-1' } } as any)
+    );
+    jest.spyOn(axios, 'get').mockResolvedValue({ data: { permalink: 'https://instagram.com/p/x' } });
+
+    const result = await new InstagramAdapter().createPost(
+      IG_ACCOUNT, 'caption', ['https://example.com/a.jpg'], 'user-1', async () => null
+    );
+
+    expect(post.mock.calls.filter((c: any[]) => String(c[0]).includes('/media_publish'))).toHaveLength(1);
+    expect(result.success).toBe(true);
+  });
+});
