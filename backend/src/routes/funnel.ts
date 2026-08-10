@@ -5,6 +5,7 @@ import AWS from "aws-sdk";
 import { v4 as uuidv4 } from "uuid";
 import { userDb, orgDb } from "../services/db";
 import { isFeatureEffectivelyEnabled, canEditItem, canViewItem, listOrgVisibleItems } from "../services/orgShareService";
+import { can } from "../services/orgAuthz";
 
 const router = express.Router();
 const dynamodb = new AWS.DynamoDB.DocumentClient({ region: process.env.AWS_REGION || "us-west-2" });
@@ -319,7 +320,7 @@ router.delete("/:configId", async (req, res) => {
     if ("error" in resolved) {
       return res.status(resolved.error.status).json({ success: false, message: resolved.error.message });
     }
-    if (resolved.ownerUserId !== callerId && resolved.caller?.orgRole !== "owner") {
+    if (resolved.ownerUserId !== callerId && !can(resolved.caller, resolved.org, "org:content:manage")) {
       return res.status(403).json({ success: false, message: "Only the funnel owner or org owner can delete this funnel" });
     }
 

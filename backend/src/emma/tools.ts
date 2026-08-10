@@ -4829,9 +4829,14 @@ emmaToolRegistry.register({
         confirm: {
           type: 'boolean',
           description: 'EDITING existing images only (when inputImages is set): on the first call, omit (or false) — the tool returns the source image(s) it will edit and asks the user to confirm. Set true ONLY after the user has seen those images and approved. Ignored for text-to-image (no inputImages), which never needs confirmation.'
+        },
+        category: {
+          type: 'string',
+          enum: ['ad', 'organic_post'],
+          description: "REQUIRED use-case declaration for the human eval queue: 'ad' when the image is a paid ad creative (Meta/Google/LinkedIn ads, retargeting creatives), 'organic_post' when it is organic social/content imagery (feed posts, blog headers, non-paid content). Reviewer feedback differs entirely between the two, so declare it from the request's context — never guess randomly; if the user's intent is genuinely unclear, ask them which use case the image is for before generating."
         }
       },
-      required: ['prompt', 'filename']
+      required: ['prompt', 'filename', 'category']
     }
   },
   execute: async (args: any, context?: any) => {
@@ -4851,7 +4856,8 @@ emmaToolRegistry.register({
       context?.sessionId,
       args.imageModel,
       args.logo_image,
-      args.confirm
+      args.confirm,
+      args.category
     );
   }
 });
@@ -6547,8 +6553,8 @@ emmaToolRegistry.register({
     if (!org) {
       return { success: false, message: 'Organization not found.' };
     }
-    if (org.ownerUserId !== userId) {
-      return { success: false, message: 'Only the org owner can delete org memories.' };
+    if (!can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:configure")) {
+      return { success: false, message: 'Only org owners and admins can delete org memories.' };
     }
 
     await orgMemoryDb.deleteMemory(user.orgId, args.memoryId);
@@ -6929,6 +6935,7 @@ output_fields: one entry per field to populate, each with a snake_case "name", a
 // Ensure apiTools has registered its tools before we try to bridge them.
 import '../mcp/server/apiTools';
 import { mcpToolRegistry } from '../mcp/server/registry';
+import { can } from "../services/orgAuthz";
 
 // Also register get_visual_context in mcpToolRegistry (after the import above, which is needed
 // for mcpToolRegistry to be available).

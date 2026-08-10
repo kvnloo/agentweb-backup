@@ -15,6 +15,22 @@ jest.mock('../middleware/auth', () => ({
   AuthenticatedRequest: jest.fn(),
 }));
 
+// ENG-973 put a token-quota gate in front of this router. This suite covers
+// handler behaviour, not the gate, so the meter is stubbed as "under allowance".
+// Gate behaviour itself is covered by emmaApiTokenBudget.test.ts.
+jest.mock('../services/tokenUsageService', () => ({
+  checkTokenUsage: jest.fn().mockResolvedValue({
+    allowed: true,
+    warning: false,
+    used: 0,
+    allowance: null,
+    bonus: 0,
+    effectiveAllowance: null,
+    percentUsed: 0,
+    month: '2026-08',
+  }),
+}));
+
 // Mock agentModeService
 const mockService = {
   youSearchWeb: jest.fn(),
@@ -160,11 +176,36 @@ describe('Emma API Routes', () => {
         .send({ prompt: 'a cat', filename: 'cat.png', size: '1024x1024' });
 
       expect(res.status).toBe(200);
+      // ENG-343 widened the signature with (confirm, category). A request that
+      // declares no category threads `undefined` through unchanged — the route
+      // must NOT invent a default, because the service guard is what turns a
+      // missing declaration into a visible failure (decision comment point 3).
       expect(mockService.generateImage).toHaveBeenCalledWith(
         'a cat', 'cat.png', '1024x1024', 'medium', [],
-        'user-123', '', undefined, undefined
+        'user-123', '', undefined, undefined, undefined, undefined
       );
     });
+
+    // ENG-343: the MCP `generate_image` tool reaches the service over this HTTP
+    // route, so a declared category has to survive the hop. Pin the VALUE, not
+    // just the arity — an assertion that only counted arguments would still pass
+    // if the route silently dropped the field.
+    it.each(['ad', 'organic_post'])(
+      'threads a declared category=%s through to the service',
+      async (category) => {
+        mockService.generateImage.mockResolvedValue({ url: 'https://s3/image.png' });
+
+        const res = await request(app)
+          .post('/api/emma/generate-image')
+          .send({ prompt: 'a cat', filename: 'cat.png', category });
+
+        expect(res.status).toBe(200);
+        expect(mockService.generateImage).toHaveBeenCalledWith(
+          'a cat', 'cat.png', '1024x1024', 'medium', [],
+          'user-123', '', undefined, undefined, undefined, category
+        );
+      }
+    );
   });
 
   describe('POST /api/emma/save-file', () => {
