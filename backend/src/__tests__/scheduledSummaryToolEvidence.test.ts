@@ -13,15 +13,13 @@
  * the thing that decides whether a title can lie.
  */
 
-// Mirrors the filter in agentModeController.runScheduledChat. A call counts only
-// when it has no top-level `error` (the repo-wide failure marker, per
-// countFailedToolCalls) and its result did not report success:false — which is how
-// a preflight rejection comes back while still looking like a completed call.
+// Bound to the REAL predicate, not a copy. An earlier version of this file mirrored
+// the filter locally, and that is precisely how the deferred-call bug (review #27)
+// slipped through: the rule existed in two places and only one was updated.
+import { toolCallSucceeded } from '../utils/toolCallOutcome';
+
 const succeededNames = (toolCalls: any[]): string[] =>
-  (toolCalls || [])
-    .filter((call: any) => call && !('error' in call) && call?.result?.success !== false)
-    .map((call: any) => call?.name)
-    .filter(Boolean);
+  (toolCalls || []).filter(toolCallSucceeded).map((call: any) => call?.name).filter(Boolean);
 
 describe('scheduled title evidence — only successful calls count (ENG-803)', () => {
   it('excludes a publish tool that errored, so the title cannot claim it posted', () => {

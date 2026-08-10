@@ -22,6 +22,7 @@ import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } fro
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { resolvePublishAuthorized } from '../utils/schedulePublishApproval';
+import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -3191,7 +3192,7 @@ export async function runScheduledChat(
       // success:false, which is how preflight rejections come back while still
       // looking like a completed call.
       const succeededToolNames = (result.toolCalls || [])
-        .filter((call: any) => call && !('error' in call) && call?.result?.success !== false)
+        .filter(toolCallSucceeded)
         .map((call: any) => call?.name)
         .filter(Boolean);
       const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content, succeededToolNames);

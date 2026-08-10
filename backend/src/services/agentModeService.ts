@@ -29,6 +29,7 @@ import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWor
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
+import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -4248,7 +4249,9 @@ export class AgentModeService {
             // 'deferred' (non-backing) rather than 'success'.
             status: tc.error !== undefined
               ? 'error'
-              : (tc.duplicateOf || (tc.result && (tc.result as any).deferred === true) ? 'deferred' : 'success'),
+              // ENG-803: shared with the title-evidence filter so the two cannot
+              // drift — they encode the same "never executed, cannot back a claim".
+              : (toolCallNeverExecuted(tc) ? 'deferred' : 'success'),
             result: tc.result,
           }));
           const guardOutcome = await runFinalizeGuard({
