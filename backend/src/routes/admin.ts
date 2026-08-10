@@ -1253,11 +1253,17 @@ router.get("/slack/channel-info", async (req, res) => {
       return res.status(400).json({ message: "channelId query param required" });
     }
     const { getSlackChannelInfo } = await import("../services/slackService");
-    const info = await getSlackChannelInfo(channelId.trim());
+    const configuredChannelId = channelId.trim();
+    const info = await getSlackChannelInfo(configuredChannelId);
     if (!info) {
-      return res.status(404).json({ message: "Channel not found or bot not a member" });
+      return res.json({
+        channelId: configuredChannelId,
+        displayName: configuredChannelId,
+        resolved: false,
+        message: "Channel not found or bot not a member",
+      });
     }
-    res.json(info);
+    res.json({ ...info, channelId: configuredChannelId, resolved: true });
   } catch (error: any) {
     console.error("Error fetching Slack channel info:", error);
     res.status(500).json({ message: "Error fetching channel info", details: error.message });
