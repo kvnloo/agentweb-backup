@@ -173,6 +173,23 @@ describe('llmPricing', () => {
       expect(getModelPrice('gemini-3-pro-preview')).toBeNull();
     });
 
+    it('does not resolve the retired id through alias canonicalization or a dated-suffix variant (ENG-750)', () => {
+      // Boundary: a dated snapshot of the retired model must not normalize onto
+      // some other model's live price entry.
+      expect(getModelPrice('gemini-3-pro-preview-2026-03-09')).toBeNull();
+    });
+
+    it('returns null for unknown and empty model ids instead of throwing (ENG-750)', () => {
+      expect(getModelPrice('totally-unknown-model')).toBeNull();
+      expect(getModelPrice('')).toBeNull();
+    });
+
+    it('still prices the neighboring live Gemini entries after the removal (ENG-750)', () => {
+      // Success path: the deletion must not clip adjacent registry rows.
+      expect(getModelPrice('gemini-3.1-flash-live-preview')).not.toBeNull();
+      expect(getModelPrice('deep-research-preview-04-2026')).not.toBeNull();
+    });
+
     it('returns the price entry for a known model', () => {
       const price = getModelPrice('anthropic.claude-sonnet-4-6');
       expect(price).not.toBeNull();
