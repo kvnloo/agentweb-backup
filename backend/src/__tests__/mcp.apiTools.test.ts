@@ -395,6 +395,30 @@ describe('apiTools', () => {
     });
   });
 
+  // ─── generate_image category declaration (ENG-343) ───────────────────
+  // The service guard makes a missing category fail visibly, but the guard alone
+  // only converts a silent miscategorization into a hard failure — it cannot make
+  // the model supply the value. `required` is what actually gets the category
+  // declared. If it is dropped here, the model stops sending it and EVERY image
+  // generation fails at the guard, so this schema is load-bearing, not cosmetic.
+  // `generate_image` is `internal: true`, so it is absent from getToolDefinitions()
+  // — read it via getTool() or this assertion silently tests nothing.
+  describe('generate_image category declaration (ENG-343)', () => {
+    const schema = () => mcpToolRegistry.getTool('generate_image')!.definition.inputSchema;
+
+    it('requires category so the model must declare the eval use case', () => {
+      expect(schema().required).toContain('category');
+    });
+
+    it('constrains category to exactly the two reviewable use cases', () => {
+      expect(schema().properties.category.enum).toEqual(['ad', 'organic_post']);
+    });
+
+    it('does not offer uncategorized as a producible value', () => {
+      expect(schema().properties.category.enum).not.toContain('uncategorized');
+    });
+  });
+
   // ─── Emma delegation capability discovery (ENG-257) ──────────────────
   // External MCP clients (e.g. Claude) only see these tool descriptions, and
   // there is no ads/marketing execution tool in the external set — that work

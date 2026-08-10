@@ -49,6 +49,10 @@ export function initUnipileSearchParamServiceFromEnv(): void {
   const svc = new UnipileSearchParamService({
     http: buildHttpClient(),
     store: buildCacheStore(),
+    // ENG-975: lets the service tell a real "no such entity" from an empty
+    // produced by an account that has lost people-search, so one account's
+    // outage is never written into this account-independent cache.
+    probeSearchCapability: (accountId) => linkedInOutreachService.probeSearchCapability(accountId),
   });
   initUnipileSearchParamService(svc);
 }
