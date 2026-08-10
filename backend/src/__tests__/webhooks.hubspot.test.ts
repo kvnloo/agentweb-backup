@@ -85,6 +85,24 @@ jest.mock('../services/hubspotService', () => ({
   },
 }));
 
+// asyncJobQueue (ENG-524 fast-follow): defaults to 'enqueued' so every existing test
+// below exercises the same inline-processing path it always did — the queue is a
+// crash-safety net, not a behavior change to the common case. Without this explicit
+// mock the real module would attempt a genuine (doomed-to-fail-open) AWS call on
+// every test; queue-specific behavior gets its own describe block further down.
+const mockEnqueueJob = jest.fn();
+const mockMarkJobComplete = jest.fn();
+const mockMarkJobFailed = jest.fn();
+const mockRegisterProcessor = jest.fn();
+const mockStartHeartbeat = jest.fn((..._args: any[]) => jest.fn());
+jest.mock('../services/asyncJobQueue', () => ({
+  enqueueJob: (...a: any[]) => mockEnqueueJob(...a),
+  markJobComplete: (...a: any[]) => mockMarkJobComplete(...a),
+  markJobFailed: (...a: any[]) => mockMarkJobFailed(...a),
+  registerProcessor: (...a: any[]) => mockRegisterProcessor(...a),
+  startHeartbeat: (...a: any[]) => mockStartHeartbeat(...a),
+}));
+
 const CLIENT_SECRET = 'test-client-secret';
 const MANAGED_APP_ID = 42057552;
 jest.mock('../config/integrations', () => ({
@@ -144,6 +162,9 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     mockGetDealContactAssociations.mockResolvedValue([]);
     // Default: webhookEnabled not set (treated as true)
     mockGetSyncConfig.mockResolvedValue(null);
+    mockEnqueueJob.mockResolvedValue('enqueued');
+    mockMarkJobComplete.mockResolvedValue(undefined);
+    mockMarkJobFailed.mockResolvedValue(undefined);
   });
 
   // ── Invalid inputs ──────────────────────────────────────────────────────────
@@ -583,6 +604,119 @@ describe('POST /api/webhooks/hubspot — HubSpot shared OAuth webhook', () => {
     await flushPromises();
     expect(mockUpdateLead).not.toHaveBeenCalled();
   });
+
+  describe('async job queue integration (ENG-524 fast-follow, Greptile P1)', () => {
+    it('enqueues before processing, with a hash of the raw body as the dedupe key', async () => {
+      const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '1' }];
+      const expectedDedupeKey = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
+
+      await request(app)
+        .post('/api/webhooks/hubspot')
+        .set('x-hubspot-signature', makeSignature(body))
+        .send(body);
+      await flushPromises();
+
+      expect(mockEnqueueJob).toHaveBeenCalledWith(
+        'hubspot_webhook',
+        expectedDedupeKey,
+        expect.objectContaining({ changesByObjectId: expect.objectContaining({ '1': expect.objectContaining({ isCreation: true }) }) }),
+        { claimImmediately: true },
+      );
+    });
+
+    it('marks the job complete after successful inline processing when it was actually enqueued', async () => {
+      const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '1' }];
+      const expectedDedupeKey = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
+
+      await request(app)
+        .post('/api/webhooks/hubspot')
+        .set('x-hubspot-signature', makeSignature(body))
+        .send(body);
+      await flushPromises();
+
+      expect(mockMarkJobComplete).toHaveBeenCalledWith('hubspot_webhook', expectedDedupeKey);
+    });
+
+    // Greptile P1 on #2291: without a heartbeat, inline processing slower than
+    // the poller's stale threshold is indistinguishable from an abandoned claim.
+    it('starts a heartbeat for the claim while processing, and stops it once processing settles', async () => {
+      const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '1' }];
+      const expectedDedupeKey = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
+
+      await request(app)
+        .post('/api/webhooks/hubspot')
+        .set('x-hubspot-signature', makeSignature(body))
+        .send(body);
+      await flushPromises();
+
+      expect(mockStartHeartbeat).toHaveBeenCalledWith('hubspot_webhook', expectedDedupeKey);
+      const stopFn = mockStartHeartbeat.mock.results[0].value;
+      expect(stopFn).toHaveBeenCalled();
+    });
+
+    it('does not start a heartbeat when the queue is unavailable (nothing was claimed)', async () => {
+      mockEnqueueJob.mockResolvedValue('unavailable');
+      const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '1' }];
+
+      await request(app)
+        .post('/api/webhooks/hubspot')
+        .set('x-hubspot-signature', makeSignature(body))
+        .send(body);
+      await flushPromises();
+
+      expect(mockStartHeartbeat).not.toHaveBeenCalled();
+    });
+
+    it('skips processing entirely when enqueueJob reports a duplicate', async () => {
+      mockEnqueueJob.mockResolvedValue('duplicate');
+      const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '1' }];
+
+      await request(app)
+        .post('/api/webhooks/hubspot')
+        .set('x-hubspot-signature', makeSignature(body))
+        .send(body);
+      await flushPromises();
+
+      expect(mockCreateLead).not.toHaveBeenCalled();
+      expect(mockMarkJobComplete).not.toHaveBeenCalled();
+    });
+
+    it('still processes inline when enqueueJob reports "unavailable" (queue/table not provisioned yet)', async () => {
+      mockEnqueueJob.mockResolvedValue('unavailable');
+      const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '1' }];
+      mockGetLeadByEmail.mockResolvedValue(null);
+      mockGetContactById.mockResolvedValue({ email: 'new@example.com' });
+
+      await request(app)
+        .post('/api/webhooks/hubspot')
+        .set('x-hubspot-signature', makeSignature(body))
+        .send(body);
+      await flushPromises();
+
+      expect(mockCreateLead).toHaveBeenCalled();
+      // No durable record was ever created for this delivery, so there's nothing to
+      // mark complete — matches the exact fire-and-forget behavior from before the
+      // queue existed.
+      expect(mockMarkJobComplete).not.toHaveBeenCalled();
+    });
+
+    it('marks the job failed (for the poller to retry) when processing throws and the job was enqueued', async () => {
+      const body = [{ subscriptionType: 'contact.creation', portalId: PORTAL_ID, objectId: '1' }];
+      const expectedDedupeKey = crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
+      // Needs a resolvable email so processing gets past the "no email" early-continue
+      // and actually reaches (and throws from) getLeadListsByUserId below.
+      mockGetContactById.mockResolvedValue({ email: 'alice@example.com' });
+      mockGetLeadListsByUserId.mockRejectedValue(new Error('dynamo down'));
+
+      await request(app)
+        .post('/api/webhooks/hubspot')
+        .set('x-hubspot-signature', makeSignature(body))
+        .send(body);
+      await flushPromises();
+
+      expect(mockMarkJobFailed).toHaveBeenCalledWith('hubspot_webhook', expectedDedupeKey, expect.any(Error));
+    });
+  });
 });
 
 describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
@@ -601,6 +735,9 @@ describe('POST /api/webhooks/hubspot — deal.propertyChange', () => {
     mockGetContactById.mockResolvedValue({});
     // Deal handler requires non-null syncConfig (checks !syncConfig) for processing
     mockGetSyncConfig.mockResolvedValue({ webhookEnabled: true });
+    mockEnqueueJob.mockResolvedValue('enqueued');
+    mockMarkJobComplete.mockResolvedValue(undefined);
+    mockMarkJobFailed.mockResolvedValue(undefined);
   });
 
   it('deal.propertyChange: syncs amount → dealValue to the associated contact lead', async () => {

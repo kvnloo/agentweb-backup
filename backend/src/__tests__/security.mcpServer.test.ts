@@ -196,23 +196,110 @@ describe('MCP Server Security', () => {
       expect(all).toHaveLength(2);
     });
 
-    it('external client should still be able to execute internal tools by name (registry does not block execute)', async () => {
-      // The registry.execute() does not gate on internal flag — the protection
-      // is at the ListTools level (tools are hidden, not blocked).
-      // This is intentional: if a tool name is known, it can be called.
-      // The real defense is that external clients never discover internal tool names.
+    // ENG-974 replaced the test that used to live here. It asserted that an
+    // external client CAN execute internal tools by name, on the rationale that
+    // "the real defense is that external clients never discover internal tool
+    // names". The hidden names include `send_email` and `generate_image`, so the
+    // secret was guessable and the defence was obscurity.
+    //
+    // Harsha's decision (2026-08-08) was to enforce on the OUTBOUND-ACTION subset
+    // only. The two tests below pin both halves of that scope, so the boundary is
+    // visible in the suite rather than living in someone's memory.
+
+    it('ENG-974: an external client CANNOT execute an outbound-action tool by name', async () => {
       const registry = new McpToolRegistry();
       const mockFn = jest.fn().mockResolvedValue({ ok: true });
       registry.register({
-        name: 'hidden_tool',
-        definition: { name: 'hidden_tool' },
+        name: 'send_email',
+        definition: { name: 'send_email' },
+        execute: mockFn,
+        internal: true,
+        internalOnly: true,
+      });
+
+      await expect(
+        registry.execute(
+          'send_email',
+          { to: 'victim@example.com' },
+          { externalMcp: true, isInternal: false }
+        )
+      ).rejects.toThrow(/not available to external clients/i);
+
+      // The point of the fix: the outbound action must not happen.
+      expect(mockFn).not.toHaveBeenCalled();
+    });
+
+    it('ENG-974: Emma internally can still execute outbound-action tools', async () => {
+      const registry = new McpToolRegistry();
+      const mockFn = jest.fn().mockResolvedValue({ ok: true });
+      registry.register({
+        name: 'send_email',
+        definition: { name: 'send_email' },
+        execute: mockFn,
+        internal: true,
+        internalOnly: true,
+      });
+
+      // This context is copied from agentModeService.ts:7180 — Emma's own tool
+      // dispatch. It carries NO `isInternal` and NO `externalMcp`. Gating on
+      // `isInternal !== true` would therefore have broken Emma's own send_email
+      // and install_skills; `externalMcp` is the field that actually means
+      // "an external MCP client is calling" (mcpServerCore.ts:112).
+      const emmaContext = { userId: 'user-1', sessionId: 'sess-1', llmModel: 'x', service: {} };
+      const result = await registry.execute('send_email', { to: 'a@b.com' }, emmaContext);
+
+      expect(result).toEqual({ ok: true });
+      expect(mockFn).toHaveBeenCalled();
+    });
+
+    it('ENG-974: mcpServerCore marks external sessions, so the gate above can see them', async () => {
+      // The enforcement keys on `externalMcp`. If the dispatcher ever stopped
+      // setting it, the gate would silently fail open — so pin it here.
+      createMcpServer('test-server', {
+        agentUserId: 'external-user',
+        isInternal: false,
+      } as McpSessionContext);
+      expect(callToolHandler).not.toBeNull();
+
+      const spy = jest.spyOn(mcpToolRegistry, 'execute').mockResolvedValue({ ok: true } as any);
+
+      await callToolHandler!({ params: { name: 'some_tool', arguments: {} } } as any);
+
+      expect(spy).toHaveBeenCalledWith(
+        'some_tool',
+        expect.anything(),
+        expect.objectContaining({ externalMcp: true })
+      );
+      spy.mockRestore();
+    });
+
+    it('ENG-974: a merely-hidden tool is still callable by name — deliberate, scoped', async () => {
+      // NOT a bug and NOT an oversight. Cost-driven internal tools (generate_image,
+      // the searches, save_file) stay callable because ENG-973 bounds them by
+      // metering the /api/emma/* routes they self-call. If that ever stops being
+      // true, this test is the thing that should change.
+      const registry = new McpToolRegistry();
+      const mockFn = jest.fn().mockResolvedValue({ ok: true });
+      registry.register({
+        name: 'hidden_but_metered_tool',
+        definition: { name: 'hidden_but_metered_tool' },
         execute: mockFn,
         internal: true,
       });
 
-      const result = await registry.execute('hidden_tool', { foo: 'bar' });
+      const result = await registry.execute('hidden_but_metered_tool', { foo: 'bar' }, { isInternal: false });
       expect(result).toEqual({ ok: true });
-      expect(mockFn).toHaveBeenCalledWith({ foo: 'bar' }, undefined);
+      expect(mockFn).toHaveBeenCalled();
+    });
+
+    it('ENG-974: the four outbound-action tools are actually marked in the real registry', () => {
+      // Guards against the enforcement being real but never applied to anything.
+      const OUTBOUND = ['send_email', 'publish_blog_article', 'create_blog_article', 'install_skills'];
+      for (const name of OUTBOUND) {
+        const tool = mcpToolRegistry.getTool(name);
+        expect(tool).toBeDefined();
+        expect(tool!.internalOnly).toBe(true);
+      }
     });
   });
 

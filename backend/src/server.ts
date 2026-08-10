@@ -656,6 +656,23 @@ createTestAccount().then(async () => {
         console.error('[dripWorker] Failed to initialize:', error);
       }
 
+      // Async job queue poller (ENG-524 fast-follow) — crash-safety net for any
+      // webhook receiver's fire-and-forget processing (Calendly, HubSpot). Enqueueing
+      // fails open, so this poller finding nothing to do (table not provisioned yet,
+      // or simply empty) is completely normal, not an error.
+      try {
+        const { pollAndProcessOnce } = await import('./services/asyncJobQueue');
+        const QUEUE_POLL_INTERVAL_MS = 30 * 1000;
+        setInterval(() => {
+          if (!isCronEnabled()) return;
+          cronJobRegistry.track('AsyncJobQueuePoller', pollAndProcessOnce())
+            .catch(e => console.error('[AsyncJobQueuePoller] Error:', e));
+        }, QUEUE_POLL_INTERVAL_MS);
+        console.log('[AsyncJobQueuePoller] Initialized — polling every 30 seconds');
+      } catch (error) {
+        console.error('[AsyncJobQueuePoller] Failed to initialize:', error);
+      }
+
       // ENG-324: Scheduled-run reconciler — crash-safe backstop for the drain.
       // Recovers scheduled runs whose process died mid-flight (SIGTERM past the
       // 10-min drain ceiling, SIGKILL, OOM) by requeuing any in-flight lease whose

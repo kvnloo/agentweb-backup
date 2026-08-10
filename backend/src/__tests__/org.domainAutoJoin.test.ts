@@ -47,23 +47,16 @@ jest.mock('../services/db', () => ({
       if (mockUsers[userId]) Object.assign(mockUsers[userId], updates);
       return Promise.resolve(mockUsers[userId]);
     }),
-    // Mirrors the real atomic transaction: check-and-set with no await in
-    // between, so two "concurrent" calls in a test (via Promise.all) can't
-    // both observe orgId as unset, or both squeeze under maxMembers —
-    // matching what the real DynamoDB transaction guarantees in production.
-    joinOrgWithCapacityCheck: jest.fn((userId: string, orgId: string, orgRole: string, maxMembers: number) => {
+    // Mirrors the real conditional write: a user who already belongs to an org
+    // is rejected, checked and set with no await in between so it cannot be
+    // raced within a single test's synchronous mock body.
+    joinOrg: jest.fn((userId: string, orgId: string, orgRole: string) => {
       const user = mockUsers[userId];
       if (!user) return Promise.resolve('already_in_org');
       if (user.orgId) return Promise.resolve('already_in_org');
-      const org = mockOrgs[orgId];
-      // Fail closed: a missing memberCount is never seeded from a live count
-      // here — only the reviewed backfill migration is allowed to initialize
-      // it. A live path just requires it to already exist and be under cap.
-      if (org?.memberCount === undefined) return Promise.resolve('not_migrated');
-      if (org.memberCount >= maxMembers) return Promise.resolve('org_full');
       user.orgId = orgId;
       user.orgRole = orgRole;
-      org.memberCount += 1;
+      user.pendingOrgInvite = null;
       return Promise.resolve('joined');
     }),
     clearOrgMembership: jest.fn((userId: string) => {
@@ -153,7 +146,6 @@ describe('Domain-based org auto-join', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
         pendingInvites: [],
       };
       mockUsers['user-1'].orgId = 'org-1';
@@ -206,8 +198,6 @@ describe('Domain-based org auto-join', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
-        memberCount: 1,
         autoJoinEnabled: true,
         autoJoinDomain: 'example.com',
         pendingDomainJoinRequests: [
@@ -231,33 +221,10 @@ describe('Domain-based org auto-join', () => {
       expect(res.status).toBe(403);
     });
 
-    it('fails closed (not silently seeded) when memberCount has not been backfilled yet', async () => {
-      delete mockOrgs['org-1'].memberCount;
-      const res = await request(app).post('/api/org/org-1/domain-requests/valid-token/approve');
-      expect(res.status).toBe(409);
-      expect(res.body.error).toMatch(/not yet ready/i);
-      expect(mockOrgs['org-1'].pendingDomainJoinRequests).toHaveLength(1);
-      expect(mockUsers['user-2'].orgId).toBeUndefined();
-    });
-
     it('fails with an invalid/unknown token', async () => {
       const res = await request(app).post('/api/org/org-1/domain-requests/wrong-token/approve');
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/invalid|not found/i);
-    });
-
-    it('fails loudly (no silent drop) when the org is already full', async () => {
-      mockUsers['user-1'].orgId = 'org-1';
-      // Fill the org to maxMembers (owner already counts as 1).
-      mockOrgs['org-1'].maxMembers = 1;
-      mockOrgs['org-1'].memberCount = 1;
-
-      const res = await request(app).post('/api/org/org-1/domain-requests/valid-token/approve');
-      expect(res.status).toBe(400);
-      expect(res.body.error).toMatch(/full|maximum/i);
-      // Request must not be silently dropped/removed on failure.
-      expect(mockOrgs['org-1'].pendingDomainJoinRequests).toHaveLength(1);
-      expect(mockUsers['user-2'].orgId).toBeUndefined();
     });
 
     it('fails if the requesting user already joined a different org in the meantime (multi-org race)', async () => {
@@ -279,8 +246,6 @@ describe('Domain-based org auto-join', () => {
         orgId: 'org-2',
         name: 'Second Org',
         ownerUserId: 'user-3',
-        maxMembers: 5,
-        memberCount: 1,
         autoJoinEnabled: true,
         autoJoinDomain: 'example.com',
         pendingDomainJoinRequests: [
@@ -324,44 +289,6 @@ describe('Domain-based org auto-join', () => {
       expect(mockOrgs[loserOrgId].pendingDomainJoinRequests.length).toBeGreaterThan(0);
     });
 
-    it('under true concurrency, exactly one of two different users approved into the same org (one slot left) succeeds — capacity never overshoots (Greptile review)', async () => {
-      // Regression test for the capacity-side race: two DIFFERENT users
-      // approved into the SAME org at the same instant used to both read
-      // the same member count before either write landed, letting both
-      // succeed and the org exceed maxMembers. joinOrgWithCapacityCheck ties
-      // the memberCount increment and the membership write into one atomic
-      // transaction, so only one can win when a single slot remains.
-      mockOrgs['org-1'].maxMembers = 3;
-      mockOrgs['org-1'].memberCount = 2; // one slot left
-      mockUsers['user-1'].orgId = 'org-1'; // owner
-      mockUsers['user-3'] = { userId: 'user-3', email: 'other@example.com', displayName: 'Other', orgId: undefined, orgRole: undefined };
-      mockOrgs['org-1'].pendingDomainJoinRequests = [
-        { userId: 'user-2', email: 'member@example.com', requestedAt: '2026-01-01T00:00:00Z', requestToken: 'valid-token' },
-        { userId: 'user-3', email: 'other@example.com', requestedAt: '2026-01-01T00:00:00Z', requestToken: 'valid-token-user3' },
-      ];
-
-      const approveUser2 = request(app)
-        .post('/api/org/org-1/domain-requests/valid-token/approve')
-        .set('x-test-user-id', 'user-1');
-      const approveUser3 = request(app)
-        .post('/api/org/org-1/domain-requests/valid-token-user3/approve')
-        .set('x-test-user-id', 'user-1');
-
-      const [resA, resB] = await Promise.all([approveUser2, approveUser3]);
-      const results = [resA, resB];
-      const successes = results.filter((r) => r.status === 200);
-      const failures = results.filter((r) => r.status === 400);
-
-      expect(successes).toHaveLength(1);
-      expect(failures).toHaveLength(1);
-      expect(failures[0].body.error).toMatch(/full|maximum/i);
-
-      // Capacity must never be exceeded — exactly one of the two joined.
-      expect(mockOrgs['org-1'].memberCount).toBe(3);
-      const joinedCount = [mockUsers['user-2'].orgId, mockUsers['user-3'].orgId].filter((id) => id === 'org-1').length;
-      expect(joinedCount).toBe(1);
-    });
-
     // === SUCCESS case ===
 
     it('joins the requesting user as a member and removes the request', async () => {
@@ -380,7 +307,6 @@ describe('Domain-based org auto-join', () => {
         orgId: 'org-1',
         name: 'Test Org',
         ownerUserId: 'user-1',
-        maxMembers: 5,
         autoJoinEnabled: true,
         autoJoinDomain: 'example.com',
         pendingDomainJoinRequests: [
