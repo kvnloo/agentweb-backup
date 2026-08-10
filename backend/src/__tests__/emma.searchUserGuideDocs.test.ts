@@ -148,6 +148,18 @@ describe('search_user_guide with no query (ENG-1029)', () => {
 
     expect(result.content).not.toContain('integrations/slack');
   });
+
+  it('also derives the list for a query that reduces to no searchable tokens', async () => {
+    // "what about this" is all stop words, so searchDocumentation short-circuits
+    // to the reference block without ever scoring a page. That path must read
+    // the corpus too, not fall back to a remembered list.
+    const { searchDocumentation } = await import('../emma/documentationSite');
+    const result = await searchDocumentation('what about this');
+
+    expect(result.results).toEqual([]);
+    expect(result.content).toContain('https://docs.agentweb.pro/integrations/google-ads');
+    expect(result.content).not.toContain('integrations/slack');
+  });
 });
 
 describe('search_user_guide during a docs outage (ENG-1029)', () => {
@@ -155,6 +167,29 @@ describe('search_user_guide during a docs outage (ENG-1029)', () => {
     resetDocumentationCache();
     global.fetch = jest.fn().mockRejectedValue(new Error('mintlify down')) as jest.Mock;
     (getUserGuideContent as jest.Mock).mockResolvedValue('LEGACY PORTAL GUIDE BODY');
+  });
+
+  // The no-query path now depends on this fetch, so its failure modes carry
+  // more traffic than before. Both must surface, never return a silent empty.
+  it('treats a non-OK docs response as an outage, not an empty corpus', async () => {
+    global.fetch = jest.fn().mockResolvedValue({ ok: false, status: 503 }) as jest.Mock;
+
+    const result = await emmaToolRegistry.execute(TOOL, {});
+
+    expect(result.content).toContain('503');
+    expect(result.content).not.toContain('/integrations/');
+  });
+
+  it('treats an unparseable corpus as an outage rather than zero integrations', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      text: async () => 'a docs site redesign that no longer emits Source: headers',
+    }) as jest.Mock;
+
+    const result = await emmaToolRegistry.execute(TOOL, {});
+
+    expect(result.content.toLowerCase()).toContain('unreadable');
+    expect(result.content).not.toContain('/integrations/');
   });
 
   it('emits no integration deep links rather than a possibly stale list', async () => {
