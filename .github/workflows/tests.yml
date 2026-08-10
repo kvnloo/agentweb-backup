@@ -333,6 +333,12 @@ jobs:
       - name: Run eb-config-conflict.sh regression suite
         run: bash .github/scripts/eb-config-conflict.test.sh
 
+      # No script under test — this one asserts the `backend-staging-deploy`
+      # job condition in this same file, so the gate in front of the staging
+      # deploy cannot lose a clause without a red check (ENG-991).
+      - name: Run staging-deploy gate contract suite
+        run: bash .github/scripts/staging-deploy-gate.test.sh
+
   # ENG-836: prod deploys immutable, which forbids changing resource config and
   # instance config in one operation. PR #2237 did exactly that, EB accepted the
   # request then refused it, and production sat undeployable for ~29 hours while
