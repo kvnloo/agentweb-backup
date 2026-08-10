@@ -31,15 +31,20 @@ const SCHEDULED_SESSION = {
   },
 };
 
-// Absence of the opt-out IS authorization (ENG-803 polarity) — this is the shape of
-// every schedule that predates the field.
+// Affirmative, tool-scoped consent — the only shape that authorizes anything.
 const AUTHORIZED_SCHEDULE = {
   scheduleId: '1c20ada1-0000-4000-8000-000000000001',
   requiredFunctionCalls: ['post_on_connected_account'],
+  autopublishAuthorized: true,
+  autopublishAuthorizedTools: ['post_on_connected_account'],
 };
 
-/** The owner switched "Require approval before publishing" ON. */
-const WITHHELD_SCHEDULE = { ...AUTHORIZED_SCHEDULE, requirePublishApproval: true };
+/** Consent withdrawn — absence of a grant is the withheld state. */
+const WITHHELD_SCHEDULE = {
+  ...AUTHORIZED_SCHEDULE,
+  autopublishAuthorized: false,
+  autopublishAuthorizedTools: [],
+};
 
 const deps = (session: any, schedule: any) => ({
   getChatSession: jest.fn(async () => session),
@@ -70,15 +75,15 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
     expect(refusal!.error).toContain('Do NOT retry this tool in this run');
   });
 
-  // The grant is schedule-wide, so `tools` is the checker's nudge scope and NOT a
-  // dispatch whitelist. Gating dispatch on it would refuse the 21 of 25 active
-  // publishing schedules that name no publish tool at all and simply tell Emma to
-  // post — the deny-by-construction failure this module was reconciled to remove.
-  it('ALLOWS a publish tool the schedule never listed, while authorized', async () => {
-    const d = deps(SCHEDULED_SESSION, { ...AUTHORIZED_SCHEDULE, requiredFunctionCalls: [] });
-    expect(
-      await refuseUnauthorizedScheduledPublish('publish_blog_article', { sessionId: 'sess-1' }, d)
-    ).toBeNull();
+  // Consent is recorded against the tools the owner could see when they gave it, so a
+  // run authorized for one publish tool must not reach for another.
+  it('REFUSES a publish tool outside the approved scope', async () => {
+    const d = deps(SCHEDULED_SESSION, AUTHORIZED_SCHEDULE);
+    const refusal = await refuseUnauthorizedScheduledPublish(
+      'publish_blog_article', { sessionId: 'sess-1' }, d
+    );
+    expect(refusal).not.toBeNull();
+    expect(refusal!.error).toContain('post_on_connected_account');
   });
 
   it('covers a NEW publish tool by prefix, with no per-tool registration', async () => {
@@ -113,13 +118,20 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
       expect(d.getScheduleById).not.toHaveBeenCalled();
     });
 
-    it('does not widen a run that was admitted UNAUTHORIZED, however the schedule changes', async () => {
-      // The direction that still matters: a run admitted draft-only stays draft-only
-      // even after the owner switches publishing back on mid-run.
-      const d = deps({ ...SCHEDULED_SESSION, publishAdmission: undefined }, AUTHORIZED_SCHEDULE);
+    it('REFUSES a tool ADDED to the approved scope after admission', async () => {
+      // Admitted for post_on_connected_account only; the owner then widened the
+      // schedule's approved list. The widening is invisible to this run.
+      const d = deps(SCHEDULED_SESSION, {
+        ...AUTHORIZED_SCHEDULE,
+        autopublishAuthorizedTools: ['post_on_connected_account', 'publish_blog_article'],
+      });
       expect(
         await refuseUnauthorizedScheduledPublish('publish_blog_article', { sessionId: 'sess-1' }, d)
       ).not.toBeNull();
+      // ...while the tool it WAS admitted for still goes through.
+      expect(
+        await refuseUnauthorizedScheduledPublish('post_on_connected_account', { sessionId: 'sess-1' }, d)
+      ).toBeNull();
     });
 
     it('treats a malformed admission stamp as not authorized', async () => {
@@ -132,17 +144,15 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
       ).not.toBeNull();
     });
 
-    it('ALLOWS an admission stamped with an empty scope — that is a prompt-only publisher', async () => {
-      // A schedule that publishes from its prompt without naming a publish tool is
-      // stamped authorized with an empty nudge scope. Reading the empty list as
-      // "unauthorized" refused exactly those runs.
+    it('treats an admission stamped with an EMPTY scope as not authorized', async () => {
+      // Unknown scope authorizes nothing — the same rule the resolver applies.
       const d = deps(
         { ...SCHEDULED_SESSION, publishAdmission: { authorized: true, tools: [], recordedAt: 'x' } },
-        { ...AUTHORIZED_SCHEDULE, requiredFunctionCalls: [] }
+        AUTHORIZED_SCHEDULE
       );
       expect(
         await refuseUnauthorizedScheduledPublish('post_on_connected_account', { sessionId: 'sess-1' }, d)
-      ).toBeNull();
+      ).not.toBeNull();
     });
   });
 
@@ -191,7 +201,11 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
           ...SCHEDULED_SESSION,
           publishAdmission: { authorized: true, tools: ['twitter_manage_post'], recordedAt: 'x' },
         },
-        { ...AUTHORIZED_SCHEDULE, requiredFunctionCalls: ['twitter_manage_post'] }
+        {
+          ...AUTHORIZED_SCHEDULE,
+          requiredFunctionCalls: ['twitter_manage_post'],
+          autopublishAuthorizedTools: ['twitter_manage_post'],
+        }
       );
       expect(
         await refuseUnauthorizedScheduledPublish(
@@ -369,6 +383,8 @@ describe('attachPublishRevalidation / publishWithdrawnMidFlight (ENG-827)', () =
     scheduleDb.getScheduleById.mockResolvedValue({
       scheduleId: '1c20ada1-0000-4000-8000-000000000001',
       requiredFunctionCalls: ['twitter_manage_post'],
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['twitter_manage_post'],
     });
     const wrapped = attachPublishRevalidation(
       'twitter_manage_post', { sessionId: 'sess-1' }, { action: 'post_thread' }
@@ -379,7 +395,8 @@ describe('attachPublishRevalidation / publishWithdrawnMidFlight (ENG-827)', () =
     scheduleDb.getScheduleById.mockResolvedValue({
       scheduleId: '1c20ada1-0000-4000-8000-000000000001',
       requiredFunctionCalls: ['twitter_manage_post'],
-      requirePublishApproval: true,
+      autopublishAuthorized: false,
+      autopublishAuthorizedTools: [],
     });
     const refusal = await publishWithdrawnMidFlight(wrapped);
     expect(refusal).not.toBeNull();
@@ -405,6 +422,8 @@ describe('default dependency resolution (ENG-827)', () => {
     scheduleDb.getScheduleById.mockResolvedValue({
       scheduleId: '1c20ada1-0000-4000-8000-000000000001',
       requiredFunctionCalls: ['post_on_connected_account'],
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
     });
 
     expect(
@@ -425,7 +444,7 @@ describe('default dependency resolution (ENG-827)', () => {
     });
     scheduleDb.getScheduleById.mockResolvedValue({
       scheduleId: '1c20ada1-0000-4000-8000-000000000001',
-      requirePublishApproval: true,
+      autopublishAuthorized: false,
     });
 
     const refusal = await refuseUnauthorizedScheduledPublish(

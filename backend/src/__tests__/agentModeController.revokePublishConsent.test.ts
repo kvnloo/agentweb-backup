@@ -2,16 +2,19 @@ import { agentModeController } from '../controllers/agentModeController';
 import { scheduleDb } from '../services/db';
 
 /**
- * ENG-827 (Greptile) — the revoke-only publish-consent endpoint.
+ * ENG-827 — the publish-consent endpoint.
  *
- * The asymmetry IS the design, so it is what these tests pin. Revoking can only ever
- * make a schedule safer, so it is reachable by the owner and by Emma acting on their
- * instruction. Granting means posts go out that nobody has seen, so no request shape
- * reaches it — not a wrong body, not a truthy value, not a spelling variant.
+ * Consent to publish unreviewed to a live account is the one irreversible permission on
+ * a schedule, so it gets its own endpoint rather than riding on the generic update body.
+ * That makes three boundaries explicit and testable instead of implicit:
  *
- * ENG-803's objection to a model-writable hold is honoured by keeping this one
- * direction: a stray revoke is visible, durable and reversible by the owner, whereas a
- * stray grant is an irreversible public post.
+ *   - GRANTING is the OWNER's decision. A delegated admin acts as the customer
+ *     everywhere else in this API, but must not hand this one out on their behalf.
+ *   - A grant needs a DESIGNATED publishing tool, because consent is recorded against
+ *     the tool it covers. Consent with no scope would either silently do nothing or
+ *     become a mandate to use any publishing tool.
+ *   - REVOKING is always allowed, including from a delegated session — it only ever
+ *     makes a schedule safer.
  */
 
 jest.mock('../services/db', () => ({
@@ -24,8 +27,8 @@ const mockScheduleDb = scheduleDb as jest.Mocked<typeof scheduleDb>;
 const SCHEDULE_ID = 'sc-1';
 const OWNER = 'user-1';
 
-const req = (body: any, user = { userId: OWNER }) =>
-  ({ params: { scheduleId: SCHEDULE_ID }, body, user } as any);
+const req = (body: any, extra: any = {}) =>
+  ({ params: { scheduleId: SCHEDULE_ID }, body, user: { userId: OWNER }, ...extra } as any);
 
 const res = () => {
   const r: any = {};
@@ -34,59 +37,118 @@ const res = () => {
   return r;
 };
 
-describe('revokeScheduledChatPublishConsent (ENG-827)', () => {
+const PUBLISHING_SCHEDULE = {
+  scheduleId: SCHEDULE_ID,
+  userId: OWNER,
+  requiredFunctionCalls: ['read_brand_guidelines', 'post_on_connected_account'],
+};
+
+describe('scheduled-chat publish consent (ENG-827)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
-    (mockScheduleDb.getScheduleById as any).mockResolvedValue({
-      scheduleId: SCHEDULE_ID,
-      userId: OWNER,
-    });
+    (mockScheduleDb.getScheduleById as any).mockResolvedValue(PUBLISHING_SCHEDULE);
     (mockScheduleDb.updateSchedule as any).mockResolvedValue(undefined);
   });
 
-  it('REVOKES: holds the schedule at the publish step', async () => {
+  it('GRANTS, recording the approved tool and who approved it', async () => {
+    const r = res();
+    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: true }), r);
+
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+      SCHEDULE_ID,
+      expect.objectContaining({
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+        autopublishAuthorizedBy: OWNER,
+      })
+    );
+    expect(r.json).toHaveBeenCalledWith(
+      expect.objectContaining({ autopublishAuthorized: true })
+    );
+  });
+
+  it('records ONLY the publishing tools, never the whole required list', async () => {
+    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: true }), res());
+    const written = (mockScheduleDb.updateSchedule as any).mock.calls[0][1];
+    expect(written.autopublishAuthorizedTools).toEqual(['post_on_connected_account']);
+    expect(written.autopublishAuthorizedTools).not.toContain('read_brand_guidelines');
+  });
+
+  it('REVOKES, clearing the scope and the audit fields', async () => {
     const r = res();
     await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: false }), r);
 
     expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
       SCHEDULE_ID,
-      expect.objectContaining({ requirePublishApproval: true })
-    );
-    expect(r.json).toHaveBeenCalledWith(
-      expect.objectContaining({ requirePublishApproval: true })
+      expect.objectContaining({
+        autopublishAuthorized: false,
+        autopublishAuthorizedTools: [],
+        autopublishAuthorizedAt: null,
+        autopublishAuthorizedBy: null,
+      })
     );
   });
 
-  it('writes ONLY the publish key, so a concurrent update cannot clobber it', async () => {
-    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: false }), res());
-    const written = (mockScheduleDb.updateSchedule as any).mock.calls[0][1];
-    expect(Object.keys(written).sort()).toEqual(['requirePublishApproval', 'updatedAt']);
-  });
-
-  it.each([
-    ['a grant', { authorized: true }],
-    ['a truthy string', { authorized: 'false' }],
-    ['a truthy number', { authorized: 1 }],
-    ['an omitted flag', {}],
-    ['an empty body', undefined],
-  ])('REFUSES %s — publishing is never turned on here', async (_label, body) => {
+  // The boundary that matters most: an admin viewing a customer's account cannot
+  // decide, on their behalf, that the customer's posts go out unseen.
+  it('REFUSES a grant from a delegated session', async () => {
     const r = res();
-    await agentModeController.revokeScheduledChatPublishConsent(req(body), r);
+    await agentModeController.revokeScheduledChatPublishConsent(
+      req({ authorized: true }, { delegateInfo: { isDelegated: true, adminUserId: 'admin-1' } }),
+      r
+    );
 
     expect(r.status).toHaveBeenCalledWith(403);
     expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
-    // ...and it must not even look the schedule up for a request it will not honour
-    expect(mockScheduleDb.getScheduleById).not.toHaveBeenCalled();
+  });
+
+  it('ALLOWS a revoke from a delegated session — it only makes the schedule safer', async () => {
+    const r = res();
+    await agentModeController.revokeScheduledChatPublishConsent(
+      req({ authorized: false }, { delegateInfo: { isDelegated: true, adminUserId: 'admin-1' } }),
+      r
+    );
+
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(
+      SCHEDULE_ID,
+      expect.objectContaining({ autopublishAuthorized: false })
+    );
+  });
+
+  it('REFUSES a grant on a schedule that designates no publishing tool', async () => {
+    // Consent is recorded against a tool. With none named there is nothing to record,
+    // and accepting it would look like it worked while authorizing nothing.
+    (mockScheduleDb.getScheduleById as any).mockResolvedValue({
+      ...PUBLISHING_SCHEDULE,
+      requiredFunctionCalls: ['read_brand_guidelines'],
+    });
+
+    const r = res();
+    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: true }), r);
+
+    expect(r.status).toHaveBeenCalledWith(400);
+    expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a truthy string', { authorized: 'true' }],
+    ['a number', { authorized: 1 }],
+    ['an omitted flag', {}],
+  ])('REJECTS %s rather than guessing the intent', async (_label, body) => {
+    const r = res();
+    await agentModeController.revokeScheduledChatPublishConsent(req(body), r);
+    expect(r.status).toHaveBeenCalledWith(400);
+    expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
   });
 
   it('404s for a schedule belonging to someone else, without writing', async () => {
     (mockScheduleDb.getScheduleById as any).mockResolvedValue({
-      scheduleId: SCHEDULE_ID,
+      ...PUBLISHING_SCHEDULE,
       userId: 'someone-else',
     });
 
     const r = res();
-    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: false }), r);
+    await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: true }), r);
 
     expect(r.status).toHaveBeenCalledWith(404);
     expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
@@ -97,10 +159,9 @@ describe('revokeScheduledChatPublishConsent (ENG-827)', () => {
     const r = res();
     await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: false }), r);
     expect(r.status).toHaveBeenCalledWith(404);
-    expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalled();
   });
 
-  it('500s rather than reporting a revoke that did not persist', async () => {
+  it('500s rather than reporting a change that did not persist', async () => {
     (mockScheduleDb.updateSchedule as any).mockRejectedValue(new Error('throttled'));
     const r = res();
     await agentModeController.revokeScheduledChatPublishConsent(req({ authorized: false }), r);

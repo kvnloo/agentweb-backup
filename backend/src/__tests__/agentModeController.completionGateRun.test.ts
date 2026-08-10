@@ -435,6 +435,8 @@ describe('runScheduledChat — deterministic completion gate', () => {
       ...leadEngSchedule,
       scheduleId: 'sched-publish',
       requiredFunctionCalls: ['post_on_connected_account'],
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
     };
 
     beforeEach(async () => {
@@ -445,7 +447,8 @@ describe('runScheduledChat — deterministic completion gate', () => {
       // The owner revoked after admission: every mid-run re-read comes back withheld.
       mockScheduleDb.getScheduleById.mockResolvedValue({
         ...publishSchedule,
-        requirePublishApproval: true,
+        autopublishAuthorized: false,
+        autopublishAuthorizedTools: [],
       } as any);
     });
 

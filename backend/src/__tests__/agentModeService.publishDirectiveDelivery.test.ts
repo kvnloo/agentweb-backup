@@ -106,6 +106,8 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
     const messages = await capture(ADMITTED_SESSION, {
       scheduleId: SCHEDULE_ID,
       requiredFunctionCalls: ['post_on_connected_account'],
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
     });
 
     const last = messages[messages.length - 1];
@@ -123,39 +125,40 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
     expect(decisionIdx).toBeGreaterThan(lastUserIdx);
   });
 
-  // The majority case, and the one that regressed: 21 of the 25 active publishing
-  // schedules name NO publish tool and simply tell Emma to post in the prompt. The
-  // directive used to require a non-empty tool list for its authorized branch, so
-  // every one of those schedules was told it was NOT authorized and drafted instead —
-  // the reported bug, still live for most of the affected schedules.
-  it('AUTHORIZED with NO required publish tool still says PRE-AUTHORIZED', async () => {
+  // Consent is bound to the tools it was granted for, so a grant recorded with no
+  // approved tool has unknown scope and authorizes nothing. The directive must say so
+  // rather than emit an unscoped licence to reach for any publishing tool.
+  it('WITHHELD when consent names no approved publish tool', async () => {
     const messages = await capture(
       { ...ADMITTED_SESSION, publishAdmission: { authorized: true, tools: [], recordedAt: 'x' } },
-      { scheduleId: SCHEDULE_ID, requiredFunctionCalls: ['you_search_web'] }
+      {
+        scheduleId: SCHEDULE_ID,
+        requiredFunctionCalls: ['you_search_web'],
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: [],
+      }
     );
 
-    const last = messages[messages.length - 1];
-    expect(last.content).toContain('PRE-AUTHORIZED to publish');
-    expect(last.content).not.toContain('NOT pre-authorized to publish');
-    // ...and it must not invent a tool requirement the schedule never set.
-    expect(last.content).not.toContain('specifically requires');
+    expect(messages[messages.length - 1].content).toContain('NOT pre-authorized to publish');
   });
 
-  it('AUTHORIZED with a required tool names that tool as well', async () => {
+  it('AUTHORIZED names the exact tools the owner approved', async () => {
     const messages = await capture(ADMITTED_SESSION, {
       scheduleId: SCHEDULE_ID,
       requiredFunctionCalls: ['post_on_connected_account'],
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account'],
     });
     const last = messages[messages.length - 1];
     expect(last.content).toContain('PRE-AUTHORIZED to publish');
-    expect(last.content).toContain('specifically requires post_on_connected_account');
+    expect(last.content).toContain('covers ONLY post_on_connected_account');
   });
 
   it('WITHHELD: says so, on the same delivered path', async () => {
     const messages = await capture(ADMITTED_SESSION, {
       scheduleId: SCHEDULE_ID,
       requiredFunctionCalls: ['post_on_connected_account'],
-      requirePublishApproval: true,
+      // no consent recorded — absence is not consent
     });
 
     const last = messages[messages.length - 1];
@@ -169,7 +172,12 @@ describe('ENG-827 — the unattended publish directive is delivered, and deliver
     // directive must agree with the dispatch guard, which refuses on the same basis.
     const messages = await capture(
       { ...ADMITTED_SESSION, publishAdmission: undefined },
-      { scheduleId: SCHEDULE_ID, requiredFunctionCalls: ['post_on_connected_account'] }
+      {
+        scheduleId: SCHEDULE_ID,
+        requiredFunctionCalls: ['post_on_connected_account'],
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['post_on_connected_account'],
+      }
     );
 
     expect(messages[messages.length - 1].content).toContain('NOT pre-authorized to publish');
