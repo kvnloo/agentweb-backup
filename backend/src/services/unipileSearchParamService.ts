@@ -4,7 +4,7 @@
  * Read order on every call: process LRU → DynamoDB (AW-EnrichmentRawCache)
  *                           → Unipile API → write-through to both layers.
  *
- * Caches negative results (empty list, 24h) and successful candidate lists
+ * Caches negative results (empty list, 1h) and successful candidate lists
  * (30d). Errors are NOT cached — Unipile rate limits and transient failures
  * shouldn't lock out a real resolution; the next call will retry.
  *
@@ -91,12 +91,58 @@ export interface UnipileSearchParamCacheStore {
 export interface UnipileSearchParamServiceDeps {
   http: UnipileSearchParamHttpClient;
   store: UnipileSearchParamCacheStore;
+  /**
+   * ENG-975 people-search capability canary, injected rather than imported so
+   * this file stays free of the Unipile SDK. Consulted only when the API
+   * returns an empty candidate list, to decide whether that empty is a fact
+   * about the query or an artifact of an account that cannot search at all.
+   * Optional: with no probe wired, negative caching behaves as it always has.
+   */
+  probeSearchCapability?: (accountId: string) => Promise<'ok' | 'degraded' | 'unknown'>;
 }
 
 // ─── TTLs ────────────────────────────────────────────────────────────────────
 
 const TTL_HIT_SECONDS = 30 * 86400;
-const TTL_NEGATIVE_SECONDS = 24 * 3600;
+// ENG-975: an empty candidate list is not reliably a fact about the query. When
+// LinkedIn revokes an account's people-search capability, Unipile relays THIS
+// endpoint as an empty list too — the reported outage cached `candidates: []`
+// for INDUSTRY 'hospital health care', so every later search silently lost that
+// filter (falling back to weak advanced_keywords) for the rest of the TTL, long
+// after the outage cleared. One hour still absorbs the repeated-lookup traffic
+// this cache exists for while bounding how long a transient upstream condition
+// can masquerade as "no such entity".
+const TTL_NEGATIVE_SECONDS = 3600;
+
+/**
+ * ENG-975 negative-cache epoch. Rows already in the table were written under the
+ * old 24h negative TTL, with no capability guard, *during* the LinkedIn Classic
+ * Search outage that motivated this file's changes — so on deploy day the cache
+ * holds up to a day of outage empties that any account, healthy or not, reads as
+ * a settled "no such entity". The write-side guard cannot help them: a cache hit
+ * returns before it runs.
+ *
+ * So distrust negatives written before this shipped, once. Each such row costs
+ * exactly one extra API call, after which it is rewritten under the guard. HITS
+ * are exempt — a LinkedIn entity id is global and stays valid for its full 30
+ * days, and re-resolving those would throw away the cache for no benefit.
+ *
+ * This constant stops mattering once every pre-epoch row has aged out; it is
+ * deliberately a fixed instant rather than a rolling window so it cannot become
+ * a permanent negative-cache bypass.
+ */
+export const NEGATIVE_CACHE_EPOCH_MS = Date.parse('2026-08-10T00:00:00Z');
+
+/**
+ * True when `row` is a negative this process should not trust: written before
+ * the capability guard existed, or carrying no usable timestamp at all (an
+ * unreadable `fetchedAt` cannot be shown to be post-guard, so treat it as pre).
+ */
+function isPreGuardNegative(row: UnipileSearchParamCacheRow): boolean {
+  if (row.status !== 'not_found') return false;
+  const fetchedAtMs = Date.parse(row.fetchedAt ?? '');
+  return Number.isNaN(fetchedAtMs) || fetchedAtMs < NEGATIVE_CACHE_EPOCH_MS;
+}
 
 // ─── Process-local LRU (size 200, TTL 5min) ─────────────────────────────────
 //
@@ -187,12 +233,22 @@ export class UnipileSearchParamService {
 
     if (!opts.forceRefresh) {
       const memHit = memGet(memKey);
-      if (memHit) return this.finalize(memHit, true, 'cache', input, normalizedKeywords);
+      if (memHit && !isPreGuardNegative(memHit)) {
+        return this.finalize(memHit, true, 'cache', input, normalizedKeywords);
+      }
 
       const ddbHit = await this.deps.store.get(key.canonicalId, key.sk);
-      if (ddbHit) {
+      if (ddbHit && !isPreGuardNegative(ddbHit)) {
         memSet(memKey, ddbHit);
         return this.finalize(ddbHit, true, 'cache', input, normalizedKeywords);
+      }
+      if (ddbHit) {
+        enrichLog.warn({
+          event: 'unipile_param_pre_guard_negative_ignored',
+          type: input.type,
+          normalizedKeywords,
+          fetchedAt: ddbHit.fetchedAt ?? null,
+        });
       }
     }
 
@@ -205,6 +261,38 @@ export class UnipileSearchParamService {
     const candidates = normalizeCandidates(apiResp);
     const isEmpty = candidates.length === 0;
 
+    // ENG-975: the cache key is (type, keywords) with no account in it. That is
+    // correct for a hit — a LinkedIn entity id is global, so every account that
+    // resolves 'hospital health care' deserves the same id — but it makes an
+    // empty dangerous. When an account has lost people-search capability this
+    // endpoint empties too, so caching THAT empty publishes one account's outage
+    // to every other account as a settled "no such entity", and a healthy
+    // account reading it never calls the API to find out otherwise.
+    //
+    // So publish an empty only when the probe positively confirms the account
+    // CAN search. 'degraded' is an outage empty. 'unknown' — a probe that timed
+    // out or errored — cannot be shown to be either, and the two outcomes are
+    // not symmetric: declining to cache costs one extra API call on the next
+    // lookup for these keywords, while caching a wrong negative strips a filter
+    // from every account's searches for the rest of the TTL.
+    //
+    // This is NOT the caller-facing rule. An indeterminate probe must never fail
+    // a request (ENG-281), and it doesn't here: the caller gets the ordinary
+    // empty result whatever the probe says. Only the shared write is withheld.
+    let cacheable = true;
+    if (isEmpty && this.deps.probeSearchCapability) {
+      const capability = await this.deps.probeSearchCapability(accountId);
+      cacheable = capability === 'ok';
+      if (!cacheable) {
+        enrichLog.warn({
+          event: 'unipile_param_negative_cache_skipped',
+          type: input.type,
+          normalizedKeywords,
+          capability,
+        });
+      }
+    }
+
     const row: UnipileSearchParamCacheRow = {
       canonicalId: key.canonicalId,
       fieldGroup: key.sk,
@@ -214,8 +302,10 @@ export class UnipileSearchParamService {
       expiresAt: Math.floor(Date.now() / 1000) + (isEmpty ? TTL_NEGATIVE_SECONDS : TTL_HIT_SECONDS),
       fetchedAt: new Date().toISOString(),
     };
-    await this.writeRow(row, key);
-    memSet(memKey, row);
+    if (cacheable) {
+      await this.writeRow(row, key);
+      memSet(memKey, row);
+    }
 
     return this.finalize(row, false, 'api', input, normalizedKeywords);
   }
