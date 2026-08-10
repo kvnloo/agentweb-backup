@@ -208,7 +208,13 @@ async function up(bugRaw, worktreeRaw) {
       env.FRONTEND_URL = stripSlash(urls.partner);
       cmd = 'npx'; args = ['ts-node', '--transpile-only', 'src/server.ts'];
     } else {
-      env.VITE_API_URL = stripSlash(urls.api);
+      // Same-origin API: point each portal's API base at its OWN origin, not the cross-origin :3001
+      // backend host. The proxy routes /api and /socket.io on the portal ports to this bug's backend
+      // (see apiSuffixFor in proxy.mjs), so the SPA's calls are same-origin — no CORS preflight, and
+      // the request carries the ?k= gate cookie the portal page already holds. A cross-origin :3001
+      // call could never authenticate: its CORS preflight has no cookie/no ?k= so the gate 401s it,
+      // and the portal never sends credentials, so the gate cookie never reached :3001 anyway.
+      env.VITE_API_URL = stripSlash(svc.name === 'partner-portal' ? urls.partner : urls.customer);
       // `npx vite build` (not `npm run build`) so a portal build script's `tsc &&` prefix can't
       // block the preview; the deterministic tsc check in autofix.mjs covers type errors.
       // flock serializes heavy builds MACHINE-WIDE (same lock as autofix's checks): concurrent

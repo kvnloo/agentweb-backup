@@ -136,6 +136,18 @@ function getRoutes() {
 // "lin-123.192.168.29.76.nip.io:5174" -> "lin-123"
 function keyOf(host) { return (host || '').split(':')[0].split('.')[0]; }
 
+// Same-origin backend routing: the SPA is served on the portal ports (5174 customer / 5173 partner)
+// but its API + websocket traffic must reach this bug's BACKEND, not the portal's static server. So on
+// a portal port, a request whose path is a backend path (/api*, /socket.io*) is routed to the '-api'
+// route instead of the portal's. This is what makes the ?k= gate work for API calls: the portal page
+// already holds the gate cookie, and a same-origin /api call carries it (no CORS preflight, which would
+// carry no cookie and be 401'd). Non-backend paths keep the listener's own suffix (portal static app).
+function apiSuffixFor(url, suffix) {
+  const pathname = String(url || '/').split('?')[0];
+  const isBackend = pathname === '/api' || pathname.startsWith('/api/') || pathname.startsWith('/socket.io');
+  return isBackend ? '-api' : suffix;
+}
+
 function makeRequestHandler(suffix) {
   return (req, res) => {
     // A client that resets the connection mid-request must not crash the proxy.
@@ -146,7 +158,7 @@ function makeRequestHandler(suffix) {
     if (req.url === HEALTH) { res.writeHead(200, { 'content-type': 'text/plain' }).end('preview-proxy-ok'); return; }
     if (!gate(req, res)) return;                  // 401 / cookie-grant redirect — before any route lookup
     noteAccess(keyOf(req.headers.host)); // stamp "URL opened" for the eviction policy (throttled)
-    const key = keyOf(req.headers.host) + suffix;
+    const key = keyOf(req.headers.host) + apiSuffixFor(req.url, suffix); // /api* + /socket.io* → backend
     const port = getRoutes()[key];
     if (!port) { res.writeHead(502, { 'content-type': 'text/plain' }).end(`no preview route for "${key}"`); return; }
     const up = http.request(
@@ -174,7 +186,7 @@ function makeUpgradeHandler(suffix) {
       selfIps: SELF_IPS,
     });
     if (d.action === 'deny') { socket.destroy(); return; }
-    const port = getRoutes()[keyOf(req.headers.host) + suffix];
+    const port = getRoutes()[keyOf(req.headers.host) + apiSuffixFor(req.url, suffix)]; // socket.io → backend
     if (!port) { socket.destroy(); return; }
     const up = net.connect(port, '127.0.0.1', () => {
       const headers = { ...req.headers, host: `localhost:${port}` };
