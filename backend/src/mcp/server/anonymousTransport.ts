@@ -92,3 +92,27 @@ export function isAnonymouslyPermitted(body: unknown): boolean {
 export function newAnonymousUserId(): string {
   return `anon_${randomUUID()}`;
 }
+
+/**
+ * The anonymous principal for a request, STABLE across the life of a session.
+ *
+ * Minting a fresh id per request looks harmless and is not: `mcpServer` records
+ * the owning principal when a session is created and, on any later request,
+ * compares the caller against it (`ownsSession`). A per-request id never
+ * matches, so the second call in an anonymous session — or the first one served
+ * by another instance after rehydration — is rejected as not-owned and the
+ * client is told to reinitialise, forever.
+ *
+ * Deriving it from the MCP session id makes it deterministic for that session
+ * on every instance, with no shared state.
+ *
+ * It cannot be used to reach an authenticated session: those store a real
+ * account id, and `anon_<sessionId>` never equals one. And this path only runs
+ * when there is no Authorization header at all, so it can never downgrade a
+ * credentialed request.
+ */
+export function anonymousUserIdForSession(sessionId: unknown): string {
+  return typeof sessionId === 'string' && sessionId.length > 0
+    ? `anon_${sessionId}`
+    : newAnonymousUserId();
+}

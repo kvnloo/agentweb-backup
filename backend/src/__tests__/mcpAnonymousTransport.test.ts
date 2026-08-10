@@ -123,3 +123,71 @@ describe('ENG-984: the anonymous identity', () => {
     expect(newAnonymousUserId()).not.toMatch(/^[0-9a-f-]{36}$/);
   });
 });
+
+// ── Integrated route coverage (Greptile P2 on #2319) ────────────────────────
+// The tests above exercise the predicate. They would still pass if the
+// middleware never consulted it, so they cannot prove the route behaves. These
+// drive the real middleware over HTTP.
+
+import express from 'express';
+import request from 'supertest';
+
+jest.mock('../services/agentApiKeyService', () => ({ agentApiKeyService: { validateKey: jest.fn() } }));
+jest.mock('../mcp/oauth/oauthService', () => ({ mcpOAuthService: { validateAccessToken: jest.fn(), getClient: jest.fn() } }));
+
+import { validateMcpAccessToken } from '../mcp/server/mcpServer';
+
+function appWithMiddleware() {
+  const app = express();
+  app.use(express.json());
+  app.post('/mcp', validateMcpAccessToken as any, (req, res) => {
+    res.json({ ok: true, principal: (req as any)._agentApiUserId, auth: (req as any)._mcpAuthMethod });
+  });
+  return app;
+}
+
+describe('ENG-984: the route itself, not just the predicate', () => {
+  const original = process.env[MCP_ANONYMOUS_FLAG];
+  beforeEach(() => { process.env[MCP_ANONYMOUS_FLAG] = 'true'; });
+  afterEach(() => {
+    if (original === undefined) delete process.env[MCP_ANONYMOUS_FLAG];
+    else process.env[MCP_ANONYMOUS_FLAG] = original;
+  });
+
+  it('lets an unauthenticated tools/list through and tags it anonymous', async () => {
+    const res = await request(appWithMiddleware()).post('/mcp').send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+    expect(res.status).toBe(200);
+    expect(res.body.auth).toBe('anonymous');
+    expect(res.body.principal).toMatch(/^anon_/);
+  });
+
+  it('still 401s an unauthenticated tools/call, with the Connect challenge', async () => {
+    const res = await request(appWithMiddleware())
+      .post('/mcp')
+      .send({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'emma_find_leads' } });
+
+    expect(res.status).toBe(401);
+    // The header a compliant client turns into an inline Connect card — the
+    // whole point of the 401 (ENG-985 makes it a signup).
+    expect(res.headers['www-authenticate']).toMatch(/Bearer/i);
+  });
+
+  it('gives the SAME principal for every request in one session', async () => {
+    // The bug this replaces: a fresh id per request never matched the owner
+    // recorded at initialize, so the second call in a session was rejected as
+    // not-owned and the client was told to reinitialise, forever.
+    const app = appWithMiddleware();
+    const send = () =>
+      request(app).post('/mcp').set('mcp-session-id', 'sess-abc').send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+
+    const [a, b] = [await send(), await send()];
+    expect(a.body.principal).toBe(b.body.principal);
+    expect(a.body.principal).toBe('anon_sess-abc');
+  });
+
+  it('refuses everything when the flag is off, even discovery', async () => {
+    delete process.env[MCP_ANONYMOUS_FLAG];
+    const res = await request(appWithMiddleware()).post('/mcp').send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+    expect(res.status).toBe(401);
+  });
+});

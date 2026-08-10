@@ -18,7 +18,7 @@ import {
   createMcpSessionStore,
 } from './mcpSessionStore';
 import { rehydrateAndServe } from './mcpSessionRehydration';
-import { isAnonymousDiscoveryEnabled, isAnonymouslyPermitted, newAnonymousUserId } from "./anonymousTransport";
+import { anonymousUserIdForSession, isAnonymousDiscoveryEnabled, isAnonymouslyPermitted } from "./anonymousTransport";
 
 // Rate limiter for MCP requests authenticated via aw_* API keys
 const mcpRateLimiter = new RateLimiter();
@@ -48,7 +48,7 @@ interface SessionEntry {
  * 2. MCP_ACCESS_TOKEN (static env token) — for internal backend-to-backend clients
  * 3. OAuth 2.1 access tokens — for OAuth-authenticated clients
  */
-async function validateMcpAccessToken(req: Request, res: Response, next: NextFunction) {
+export async function validateMcpAccessToken(req: Request, res: Response, next: NextFunction) {
   const baseUrl = `${req.protocol}://${req.get("host")}`;
   const authHeader = req.headers.authorization;
 
@@ -59,7 +59,8 @@ async function validateMcpAccessToken(req: Request, res: Response, next: NextFun
     // demo tool) get through — everything else falls to the 401 below, which
     // carries the WWW-Authenticate challenge a client turns into a Connect card.
     if (isAnonymousDiscoveryEnabled() && isAnonymouslyPermitted(req.body)) {
-      (req as any)._agentApiUserId = newAnonymousUserId();
+      // Stable per session, not per request — see anonymousUserIdForSession.
+      (req as any)._agentApiUserId = anonymousUserIdForSession(req.headers['mcp-session-id']);
       (req as any)._mcpIsInternal = false;
       (req as any)._mcpAuthMethod = 'anonymous';
       (req as any)._mcpClientType = classifyMcpClient({ userAgent: req.get('user-agent') });
