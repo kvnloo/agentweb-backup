@@ -14,13 +14,9 @@ import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-function ctx(context: any) {
-  return { userId: context?.userId, agentUserId: context?.agentUserId, isDelegatedAccess: context?.isDelegatedAccess };
-}
-
-function jsonResult(data: unknown) {
-  return { content: [{ type: 'text' as const, text: typeof data === 'string' ? data : JSON.stringify(data, null, 2) }] };
-}
+// ENG-982: `ctx` and `jsonResult` moved to ./toolHelpers so workflowTools.ts can
+// share them instead of keeping a second copy. Behaviour unchanged.
+import { ctx, jsonResult } from './toolHelpers';
 
 function normalizeSkillQuery(value: unknown): string {
   return String(value ?? '')
@@ -1261,6 +1257,8 @@ mcpToolRegistry.register({
 mcpToolRegistry.register({
   name: 'create_blog_article',
   internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'create_blog_article',
     description: 'Create a complete blog article with content, images, and HTML file. Takes a title draft and content draft in markdown format, creates a hero image, and produces a complete HTML file uploaded to S3.',
@@ -1292,6 +1290,8 @@ mcpToolRegistry.register({
 mcpToolRegistry.register({
   name: 'publish_blog_article',
   internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'publish_blog_article',
     description: 'Publish a blog article to CMS (Basehub or Webflow). Takes title, description, hero image URL, and blog HTML URL from create_blog_article. CRITICAL: Always review with user before publishing.',
@@ -1790,6 +1790,8 @@ mcpToolRegistry.register({
 mcpToolRegistry.register({
   name: 'install_skills',
   internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'install_skills',
     description: 'Install skills by their IDs. Pass ALL skill IDs you need in a single call — do not call this tool multiple times. This makes the tools associated with the skills available for use. Use __other_skills__ to install tools that are not part of any specific skill.',
@@ -1954,6 +1956,8 @@ mcpToolRegistry.register({
 mcpToolRegistry.register({
   name: 'send_email',
   internal: true,
+  // ENG-974: outbound action — hidden AND refused for external MCP callers.
+  internalOnly: true,
   definition: {
     name: 'send_email',
     description: 'Read, search, and send emails across connected email accounts (Gmail, Outlook, etc.).',

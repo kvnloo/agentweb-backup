@@ -2,6 +2,7 @@ import express from "express";
 import { workPlanService, WorkPlan } from "../services/workPlanService";
 import { normalizeWorkPlanSteps } from "../services/workPlanSteps";
 import { userDb, orgDb } from "../services/db";
+import { can } from "../services/orgAuthz";
 import {
   canEditItem,
   isFeatureEffectivelyEnabled,
@@ -192,9 +193,12 @@ router.delete("/:planId", async (req, res) => {
     if (plan.ownerId !== userId) {
       const callerUser = await userDb.getUserById(userId);
       let allowed = false;
-      if (callerUser?.orgRole === "owner" && callerUser?.orgId && plan.ownerId) {
-        const owner = await userDb.getUserById(plan.ownerId);
-        if (owner?.orgId === callerUser.orgId) allowed = true;
+      if (callerUser?.orgId && plan.ownerId) {
+        const callerOrg = await orgDb.getOrgById(callerUser.orgId);
+        if (can({ userId, orgId: callerUser.orgId, orgRole: callerUser.orgRole }, callerOrg, "org:content:manage")) {
+          const owner = await userDb.getUserById(plan.ownerId);
+          if (owner?.orgId === callerUser.orgId) allowed = true;
+        }
       }
       if (!allowed) return res.status(403).json({ message: "Not authorized" });
     }

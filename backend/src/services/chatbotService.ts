@@ -283,6 +283,12 @@ export interface ChatSession {
       outputQuality: number;
     };
   }>;
+  // Scores retracted because the session turned out to be outside the
+  // satisfaction cohort (zero-task — ENG-830). The original score is MOVED here
+  // rather than deleted: consumers see an unscored session (which is the point),
+  // but the retraction stays fully reversible and auditable.
+  retractedSatisfactionScore?: ChatSession["satisfactionScore"] & { retractedAt?: string };
+  retractedJudgeScores?: Record<string, NonNullable<ChatSession["judgeScores"]>[string] & { retractedAt?: string }>;
   sessionSummary?: {
     summary: string;        // LLM-generated summary of what was achieved
     evaluatedAt: string;    // ISO timestamp
@@ -2465,6 +2471,159 @@ export class ChatbotDB {
     }
   }
 
+  /**
+   * Retract a previously persisted satisfaction score by ARCHIVING it.
+   *
+   * Used when a session is re-examined and turns out to be outside the
+   * satisfaction cohort altogether (e.g. a zero-task session scored before that
+   * exclusion existed — ENG-830). Scoring skips such sessions, so without an
+   * explicit retraction the stale score would linger forever and keep inflating
+   * the ≤3 cohort.
+   *
+   * The score is MOVED to `retractedSatisfactionScore` in the same atomic
+   * update, never dropped. Consumers read `satisfactionScore` and correctly see
+   * an unscored session, while the original stays recoverable — so a bulk
+   * retraction that turns out to be wrong can be undone from the archive
+   * instead of being an irreversible data loss.
+   *
+   * The write is a COMPARE-AND-SWAP against the score the caller actually read.
+   * A sweep reads the session, decides it is out of the cohort, and only then
+   * writes; an admin override or a fresh re-score can land in between, and an
+   * unconditional REMOVE would destroy it. Losing that race is a no-op, not an
+   * error — whoever wrote last owns the row, and the next sweep re-reads it.
+   */
+  async clearSessionSatisfactionScore(
+    sessionId: string,
+    previous: NonNullable<ChatSession["satisfactionScore"]>
+  ): Promise<boolean> {
+    const pin = this.pinTo("satisfactionScore", previous.evaluatedAt);
+    try {
+      await dynamodb
+        .update({
+          TableName: this.tableName,
+          Key: { sessionId },
+          UpdateExpression: "SET retractedSatisfactionScore = :prev REMOVE satisfactionScore",
+          // An admin override is human judgement and is never retracted, even
+          // if it were written after the read that selected this snapshot.
+          ConditionExpression: `${pin.expression} AND attribute_not_exists(satisfactionScore.adminOverride)`,
+          ExpressionAttributeValues: {
+            ":prev": { ...previous, retractedAt: new Date().toISOString() },
+            ...pin.values(previous),
+          },
+        })
+        .promise();
+      return true;
+    } catch (error) {
+      // Lost the race: the row still holds a score, so the caller must keep its
+      // in-memory copy rather than reporting the session as unscored.
+      if (this.isConditionalCheckFailure(error)) return false;
+      console.error("Error clearing session satisfaction score:", error);
+      throw error;
+    }
+  }
+
+  /**
+   * The compare-and-swap pin for a retraction: what must still be true of the
+   * persisted score for it to be the one the caller read.
+   *
+   * `evaluatedAt` is stamped fresh by every writer, so it identifies a specific
+   * score. Without it — a legacy row — the only honest pin is the score object
+   * itself: `attribute_exists` would survive a replacement write and let the
+   * retraction archive the wrong score.
+   */
+  private pinTo(path: string, evaluatedAt?: string) {
+    return evaluatedAt
+      ? {
+          expression: `${path}.evaluatedAt = :prevEvaluatedAt`,
+          values: (_previous: any) => ({ ":prevEvaluatedAt": evaluatedAt }),
+        }
+      : {
+          expression: `${path} = :prevSnapshot`,
+          values: (previous: any) => ({ ":prevSnapshot": previous }),
+        };
+  }
+
+  /**
+   * A retraction whose ConditionExpression failed: the row moved on between the
+   * read and the write, so there is nothing to retract. Distinct from a real
+   * persistence failure, which must still surface.
+   */
+  private isConditionalCheckFailure(error: any): boolean {
+    return (
+      error?.code === "ConditionalCheckFailedException" ||
+      error?.name === "ConditionalCheckFailedException"
+    );
+  }
+
+  /** Judge-score counterpart of clearSessionSatisfactionScore (same archive semantics). */
+  async clearSessionJudgeScore(
+    sessionId: string,
+    judgeId: string,
+    previous: NonNullable<ChatSession["judgeScores"]>[string]
+  ): Promise<boolean> {
+    const names = { "#js": "judgeScores", "#rjs": "retractedJudgeScores", "#jid": judgeId };
+    try {
+      const archived = { ...previous, retractedAt: new Date().toISOString() };
+      // Same compare-and-swap as clearSessionSatisfactionScore: only retract the
+      // judge score this caller actually read, never a replacement written since.
+      const { expression: condition, values } = this.pinTo("#js.#jid", previous.evaluatedAt);
+      const pin = values(previous);
+      try {
+        await dynamodb
+          .update({
+            TableName: this.tableName,
+            Key: { sessionId },
+            UpdateExpression: "SET #rjs.#jid = :prev REMOVE #js.#jid",
+            ConditionExpression: condition,
+            ExpressionAttributeNames: names,
+            ExpressionAttributeValues: { ":prev": archived, ...pin },
+          })
+          .promise();
+      } catch (error: any) {
+        // retractedJudgeScores map does not exist yet — create it, same pattern
+        // as updateSessionJudgeScore. A lost race is not a missing map: rethrow
+        // it so the outer catch can treat it as the no-op it is.
+        if (this.isConditionalCheckFailure(error)) throw error;
+        if (error.code !== "ValidationException") throw error;
+        try {
+          await dynamodb
+            .update({
+              TableName: this.tableName,
+              Key: { sessionId },
+              UpdateExpression: "SET #rjs = :map REMOVE #js.#jid",
+              // Whole-map assignment, so it may only run while there is no map:
+              // two first-time retractions can race into this branch together,
+              // and without the guard the loser would erase the winner's archive.
+              ConditionExpression: `attribute_not_exists(#rjs) AND ${condition}`,
+              ExpressionAttributeNames: names,
+              ExpressionAttributeValues: { ":map": { [judgeId]: archived }, ...pin },
+            })
+            .promise();
+        } catch (fallbackError: any) {
+          if (!this.isConditionalCheckFailure(fallbackError)) throw fallbackError;
+          // The map exists now (someone created it first), so the per-key write
+          // works. If instead the judge score itself moved, this retry fails its
+          // condition too and the outer catch reports the no-op.
+          await dynamodb
+            .update({
+              TableName: this.tableName,
+              Key: { sessionId },
+              UpdateExpression: "SET #rjs.#jid = :prev REMOVE #js.#jid",
+              ConditionExpression: condition,
+              ExpressionAttributeNames: names,
+              ExpressionAttributeValues: { ":prev": archived, ...pin },
+            })
+            .promise();
+        }
+      }
+      return true;
+    } catch (error) {
+      if (this.isConditionalCheckFailure(error)) return false;
+      console.error("Error clearing session judge score:", error);
+      throw error;
+    }
+  }
+
   async updateSessionSummary(
     sessionId: string,
     sessionSummary: NonNullable<ChatSession["sessionSummary"]>
@@ -3654,23 +3813,61 @@ Example of good formatting:
 
 Be helpful, concise, and accurate. If you don't know the answer, suggest the user contact support.`;
 
+// Org-role context for Emma, one variant per role.
+//
+// This replaces a single member-only addendum that (a) asserted "there is only 1
+// owner per organization; co-owner roles do not exist on this platform", which
+// ENG-954 made false, (b) claimed only the owner can edit Brand Guidelines and
+// Market Strategy, which the per-feature `editors[]` grant has been able to
+// delegate for months, and (c) was gated on `orgRole === "member"`, so an admin
+// received no org context at all — the role most likely to be asked permission
+// questions got the least information.
+const ORG_OWNER_ADDENDUM = `
+
+## Organization membership — the current user is an owner
+
+The current user is an **owner** of their organization. Be accurate about what that means:
+
+- An organization can have **multiple owners and multiple admins**. Owners can promote another member to admin or owner, and can demote them again.
+- **Owners** can do everything: manage members and roles, edit all org settings and shared content, manage billing, and delete the organization.
+- An organization must always keep at least one owner. The last owner cannot be removed, demoted, or leave until another owner is promoted.
+- To hand over an organization, promote someone else to owner first, then leave. There is no separate "transfer ownership" step.`;
+
+const ORG_ADMIN_ADDENDUM = `
+
+## Organization membership — the current user is an admin
+
+The current user is an **admin** of their organization, not an owner. Be accurate about what admins can and cannot do:
+
+- **Admins can** invite and remove members, change org settings, manage shared content across the organization, and promote members to admin.
+- **Admins cannot** delete the organization, and cannot grant or revoke the owner role — only an owner can do that.
+- An organization can have multiple owners and multiple admins.
+
+If the user wants to do something reserved to owners, explain which owner action is needed rather than implying the capability does not exist.`;
+
 const ORG_MEMBER_ADDENDUM = `
 
-## Organization membership — current user is a member (not the owner)
+## Organization membership — the current user is a member
 
-The current user is a **member** of an organization, not the owner. Be accurate about what members can and cannot do:
+The current user is a **member** of an organization, not an owner or admin. Be accurate about what members can and cannot do:
 
-- There is only **1 owner** per organization. Co-owner roles do not exist on this platform. Do NOT suggest that someone can be made a co-owner or share ownership.
-- Members **cannot** edit Brand Guidelines or Market Strategy — those pages are read-only for members. Only the owner can modify them.
-- Members can use all other platform features (tasks, schedules, marketing hub, social posts, SEO, CRM, etc.) within the organization.
+- Members can use all platform features for their own work — tasks, schedules, marketing hub, social posts, SEO, CRM — and can see whatever the organization has chosen to share.
+- Members **cannot** manage the organization: inviting or removing people, changing org settings, and changing anyone's role are reserved to owners and admins.
+- Brand Guidelines and Market Strategy are read-only for members **unless** an owner or admin has added them as an editor for that area. The same is true for the organization's knowledge base, templates and landing pages.
+- Organizations can have multiple owners and multiple admins. If the user needs broader access, the thing to ask an owner or admin for is to be made an editor, an admin, or an owner — whichever matches what they are trying to do.`;
 
-If a user asks about making someone a co-owner, giving ownership to another person, or assigning owner-level permissions, clearly explain that only one owner is supported per organization and that co-owner assignment is not a feature of this platform.`;
+function orgRoleAddendum(orgRole?: string): string {
+  if (orgRole === "owner") return ORG_OWNER_ADDENDUM;
+  if (orgRole === "admin") return ORG_ADMIN_ADDENDUM;
+  if (orgRole === "member") return ORG_MEMBER_ADDENDUM;
+  return "";
+}
 
 // Emma sidebar system prompt = Agent Mode prompt + sidebar-specific addendum.
 // Both are code-controlled in backend/src/docs/agentModeSystemPrompt.ts.
 // To update: edit that file and open a PR.
 export function getEmmaSystemContext(sessionType?: string, orgRole?: string): string {
-  const memberAddendum = orgRole === "member" ? ORG_MEMBER_ADDENDUM : "";
+  const memberAddendum = orgRoleAddendum(orgRole);
   return `${AGENT_MODE_SYSTEM_PROMPT}\n\nToday's date is ${new Date().toISOString().split("T")[0]}.\n${EMMA_SIDEBAR_ADDENDUM}${getScheduledSessionOverride(sessionType)}${memberAddendum}`;
 }
 
