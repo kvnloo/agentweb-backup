@@ -114,6 +114,36 @@ const TTL_HIT_SECONDS = 30 * 86400;
 // can masquerade as "no such entity".
 const TTL_NEGATIVE_SECONDS = 3600;
 
+/**
+ * ENG-975 negative-cache epoch. Rows already in the table were written under the
+ * old 24h negative TTL, with no capability guard, *during* the LinkedIn Classic
+ * Search outage that motivated this file's changes — so on deploy day the cache
+ * holds up to a day of outage empties that any account, healthy or not, reads as
+ * a settled "no such entity". The write-side guard cannot help them: a cache hit
+ * returns before it runs.
+ *
+ * So distrust negatives written before this shipped, once. Each such row costs
+ * exactly one extra API call, after which it is rewritten under the guard. HITS
+ * are exempt — a LinkedIn entity id is global and stays valid for its full 30
+ * days, and re-resolving those would throw away the cache for no benefit.
+ *
+ * This constant stops mattering once every pre-epoch row has aged out; it is
+ * deliberately a fixed instant rather than a rolling window so it cannot become
+ * a permanent negative-cache bypass.
+ */
+export const NEGATIVE_CACHE_EPOCH_MS = Date.parse('2026-08-10T00:00:00Z');
+
+/**
+ * True when `row` is a negative this process should not trust: written before
+ * the capability guard existed, or carrying no usable timestamp at all (an
+ * unreadable `fetchedAt` cannot be shown to be post-guard, so treat it as pre).
+ */
+function isPreGuardNegative(row: UnipileSearchParamCacheRow): boolean {
+  if (row.status !== 'not_found') return false;
+  const fetchedAtMs = Date.parse(row.fetchedAt ?? '');
+  return Number.isNaN(fetchedAtMs) || fetchedAtMs < NEGATIVE_CACHE_EPOCH_MS;
+}
+
 // ─── Process-local LRU (size 200, TTL 5min) ─────────────────────────────────
 //
 // Resolution lookups are read-heavy and the same names show up across leads
@@ -203,12 +233,22 @@ export class UnipileSearchParamService {
 
     if (!opts.forceRefresh) {
       const memHit = memGet(memKey);
-      if (memHit) return this.finalize(memHit, true, 'cache', input, normalizedKeywords);
+      if (memHit && !isPreGuardNegative(memHit)) {
+        return this.finalize(memHit, true, 'cache', input, normalizedKeywords);
+      }
 
       const ddbHit = await this.deps.store.get(key.canonicalId, key.sk);
-      if (ddbHit) {
+      if (ddbHit && !isPreGuardNegative(ddbHit)) {
         memSet(memKey, ddbHit);
         return this.finalize(ddbHit, true, 'cache', input, normalizedKeywords);
+      }
+      if (ddbHit) {
+        enrichLog.warn({
+          event: 'unipile_param_pre_guard_negative_ignored',
+          type: input.type,
+          normalizedKeywords,
+          fetchedAt: ddbHit.fetchedAt ?? null,
+        });
       }
     }
 
