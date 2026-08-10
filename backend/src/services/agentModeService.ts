@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { parse as parseCsv } from 'csv-parse/sync';
 import { providerLabel } from './crmSenderTypes';
-import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride } from '../docs/agentModeSystemPrompt';
+import { AGENT_MODE_SYSTEM_PROMPT, getScheduledSessionOverride, getUnattendedExecutionDirective } from '../docs/agentModeSystemPrompt';
 import OpenAI from 'openai';
 import { google } from 'googleapis';
 import { createHash, createHmac, randomUUID } from 'crypto';
@@ -12,7 +12,7 @@ import { chatbotDb, ChatMessage, searchPlatformKnowledgeBase } from './chatbotSe
 import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/memoryRanking';
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
-import { publishWithdrawnMidFlight } from '../utils/scheduledPublishConsentGuard';
+import { publishWithdrawnMidFlight, readAdmittedAuthorization } from '../utils/scheduledPublishConsentGuard';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
@@ -30,6 +30,7 @@ import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWor
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
+import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 import {
   applyAnswer,
@@ -3091,23 +3092,41 @@ export class AgentModeService {
    * sessionType and emits nothing for them.
    */
   private async resolveScheduledPublishAuthorized(currentSession: any): Promise<boolean> {
-    if (currentSession?.sessionType !== 'scheduled') return true;
+    return (await this.resolveScheduledPublishAuthorization(currentSession)).authorized;
+  }
+
+  /**
+   * ENG-827: the authorization THIS TURN operates under, as a tool-scoped object.
+   *
+   * Resolved exactly like the dispatch guard — the run's admission stamp intersected
+   * with the live schedule — so the directive the model reads and the refusal it would
+   * hit at dispatch cannot disagree. Deriving them separately is what produced the
+   * prompt-orders-publish / guard-refuses-publish churn this ticket is about.
+   *
+   * An absent stamp reads as NOT authorized, matching the guard exactly: that is the
+   * ordinary state of every draft-only run, and also the state of a run whose stamp
+   * could not be written (which the runner downgrades to draft-only for this reason).
+   */
+  private async resolveScheduledPublishAuthorization(currentSession: any): Promise<SchedulePublishAuthorization> {
+    if (currentSession?.sessionType !== 'scheduled') return { authorized: true, tools: [] };
     const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
     if (!scheduleId) {
       console.warn(
         `AgentMode: scheduled session ${currentSession?.sessionId} has no parseable scheduleId; withholding publish authorization rather than assuming it.`
       );
-      return false;
+      return { authorized: false, tools: [] };
     }
     try {
-      // resolvePublishAuthorized returns false for a null/deleted schedule too.
-      return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId));
+      // resolveSchedulePublishAuthorization returns unauthorized for a null/deleted
+      // schedule too, so a vanished record withholds rather than publishes.
+      const live = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleId));
+      return narrowPublishAuthorization(readAdmittedAuthorization(currentSession), live);
     } catch (error) {
       console.error(
         `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding publish authorization for this turn rather than publishing unverified:`,
         error
       );
-      return false;
+      return { authorized: false, tools: [] };
     }
   }
 
@@ -3258,7 +3277,11 @@ export class AgentModeService {
       // text. This is the UNATTENDED run path, so it always passes a resolved
       // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
       // deliberately passes nothing (see the tri-state note on the override).
-      const publishAuthorized = await this.resolveScheduledPublishAuthorized(currentSession);
+      // ENG-827: resolved ONCE per turn and reused for both the ENG-803 override below
+      // and the publish directive appended after the conversation, so a single read
+      // backs every statement the model sees about publishing.
+      const publishAuthorization = await this.resolveScheduledPublishAuthorization(currentSession);
+      const publishAuthorized = publishAuthorization.authorized;
       const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
@@ -3371,6 +3394,27 @@ export class AgentModeService {
       }
 
       messages.push(...marketingMessages);
+
+      // ENG-827: the unattended publish directive goes LAST, after the conversation.
+      //
+      // It used to be appended to the system prompt the controller stores as the
+      // session's first message — which `buildMarketingContext` slices off (startIdx=1),
+      // so the model never read it at all. Position then turned out to matter on its own:
+      // on the preview, an authorized run whose base system prompt already carried an
+      // equivalent block still opened with "Should I post this?" and only published after
+      // three checker nudges. Buried ~70k characters up, the instruction lost to the
+      // publishing tools' own "get explicit approval first" text. Placed here it is the
+      // last thing before the model answers, and it is the same authorization object the
+      // dispatch guard enforces.
+      if (currentSession?.sessionType === 'scheduled') {
+        const publishDirective = getUnattendedExecutionDirective(
+          'scheduled',
+          isAdmin,
+          publishAuthorization.authorized ? 'authorized' : 'withheld',
+          publishAuthorization.tools
+        );
+        if (publishDirective) messages.push({ role: 'system', content: publishDirective });
+      }
 
       // Cross-message loop detection: when the user repeats the same message multiple times
       // without providing requested information, stop asking and use available context tools.
