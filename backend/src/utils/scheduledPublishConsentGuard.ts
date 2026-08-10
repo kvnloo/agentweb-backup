@@ -200,7 +200,24 @@ export async function refuseUnauthorizedScheduledPublish(
     };
   }
 
-  if (session?.sessionType !== 'scheduled') return null;
+  // A read that SUCCEEDS but returns no record is not "interactive" — it is unknown,
+  // and unknown fails closed like every other ambiguous case here (Greptile, security).
+  // The retry above only covers a THROWN error; a missing key comes back as undefined
+  // rather than an exception, so without this a session deleted mid-run, or an
+  // eventually-consistent read that has not caught up, would take the interactive path
+  // and publish with no consent check at all.
+  if (!session) {
+    console.error(
+      `ENG-827: session ${sessionId} could not be found while checking publish consent for ` +
+      `${toolName}; withholding the publish (fail-closed).`
+    );
+    return refuse(
+      toolName,
+      'This run could not be identified, so no owner authorization could be confirmed.'
+    );
+  }
+
+  if (session.sessionType !== 'scheduled') return null;
 
   // Use ENG-803's ANCHORED parser rather than an unanchored search. `pageIdentifier`
   // is `"<scheduleName>|scheduleId:<id>"`, and the schedule NAME is owner-supplied
