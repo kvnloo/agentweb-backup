@@ -512,6 +512,9 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     // Determine source: org-level or user-level
     let brandGuidelines: any;
     let isOrgLevel = false;
+    // Set when the attachments came from the org OWNER's user record rather than
+    // the org record, so the same attachment can be pruned there too (below).
+    let fallbackOwnerUserId: string | undefined;
     if (user.orgId) {
       const org = await orgDb.getOrgById(user.orgId);
       const allowed = canEditItem(
@@ -530,6 +533,7 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
         // still targets the org record, which is authoritative from here on.
         brandGuidelines = await resolveOrgProfileField(user, org, "brandGuidelines");
         isOrgLevel = true;
+        if (!org.brandGuidelines && brandGuidelines) fallbackOwnerUserId = org.ownerUserId;
       }
     } else {
       brandGuidelines = user.brandGuidelines;
@@ -603,6 +607,35 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     if (isOrgLevel) {
       await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedBrandGuidelines });
       console.log(`[BRAND DEBUG] Successfully updated org brand guidelines after asset deletion`);
+
+      // The attachments came from the org owner's record, but the pruned list
+      // was just written to the ORG. Prune the source too: the S3 object is
+      // gone, so leaving the owner's record pointing at it keeps a dead
+      // reference that resurfaces the moment the org is deleted (that clears
+      // orgId and sends reads back to the user record).
+      if (fallbackOwnerUserId) {
+        try {
+          const ownerRecord: any =
+            fallbackOwnerUserId === user.userId ? user : await userDb.getUserById(fallbackOwnerUserId);
+          const ownerAttachments: any[] = ownerRecord?.brandGuidelines?.attachments || [];
+          const prunedOwnerAttachments = ownerAttachments.filter((attachment: any) =>
+            isValidKey ? attachment.key !== key : attachment.url !== urlFallback
+          );
+          if (prunedOwnerAttachments.length !== ownerAttachments.length) {
+            await userDb.updateUser(fallbackOwnerUserId, {
+              brandGuidelines: {
+                ...ownerRecord.brandGuidelines,
+                attachments: prunedOwnerAttachments,
+                updatedAt: new Date().toISOString(),
+              },
+            });
+          }
+        } catch (ownerPruneError) {
+          // The authoritative org write already succeeded — a failure to tidy
+          // the source record must not fail the delete.
+          console.warn("Failed to prune the owner's source attachments:", ownerPruneError);
+        }
+      }
     } else {
       await dynamodb
         .update({

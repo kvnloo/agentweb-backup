@@ -39,11 +39,12 @@ jest.mock("aws-sdk", () => ({
 const mockGetOrgById = jest.fn();
 const mockGetUserById = jest.fn();
 const mockUpdateOrg = jest.fn();
+const mockUpdateUser = jest.fn();
 
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: (...a: any[]) => mockGetUserById(...a),
-    updateUser: jest.fn(),
+    updateUser: (...a: any[]) => mockUpdateUser(...a),
   },
   orgDb: {
     getOrgById: (...a: any[]) => mockGetOrgById(...a),
@@ -102,6 +103,7 @@ beforeEach(() => {
   mockDynamoUpdate.mockResolvedValue({ Attributes: {} });
   mockS3Delete.mockResolvedValue({});
   mockUpdateOrg.mockResolvedValue({});
+  mockUpdateUser.mockResolvedValue({});
 });
 
 afterEach(() => {
@@ -205,6 +207,79 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
         }),
       })
     );
+  });
+
+  it("prunes the OWNER's source record too, so no dangling reference survives", async () => {
+    // The attachments came from the owner's user record (un-copied org) but the
+    // pruned list is written to the ORG. Leaving the source untouched keeps a
+    // pointer to an S3 object we just destroyed — and it resurfaces the moment
+    // the org is deleted, which clears orgId and sends reads back to the user
+    // record.
+    const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "me",
+      shareSettings: { brandGuidelines: { editors: [] }, marketingStrategy: { editors: [] } },
+    });
+
+    const res = await del(orgUser, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      "me",
+      expect.objectContaining({
+        brandGuidelines: expect.objectContaining({
+          attachments: [expect.objectContaining({ key: OWN_LOGO_KEY })],
+        }),
+      })
+    );
+  });
+
+  it("prunes a non-caller owner's source record when a member editor deletes", async () => {
+    const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
+    mockDynamoGet.mockResolvedValue({ Item: editor });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "owner-u",
+      shareSettings: {
+        brandGuidelines: { editors: ["editor-u"] },
+        marketingStrategy: { editors: [] },
+      },
+    });
+    mockGetUserById.mockResolvedValue({
+      userId: "owner-u",
+      email: "owner@test.com",
+      brandGuidelines: ownBrand,
+    });
+
+    const res = await del(editor, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      "owner-u",
+      expect.objectContaining({
+        brandGuidelines: expect.objectContaining({
+          attachments: [expect.objectContaining({ key: OWN_LOGO_KEY })],
+        }),
+      })
+    );
+  });
+
+  it("leaves the owner's record alone when the ORG record was the source", async () => {
+    const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "me",
+      brandGuidelines: ownBrand,
+      shareSettings: { brandGuidelines: { editors: [] }, marketingStrategy: { editors: [] } },
+    });
+
+    const res = await del(orgUser, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 
   it("refuses a foreign key even on an un-copied org", async () => {
