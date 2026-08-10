@@ -2,7 +2,12 @@ import {
   resolveSchedulePublishAuthorization,
   filterRequiredFunctionsToAuthorizedScope,
   narrowPublishAuthorization,
+  isPublishCall,
+  isPublishCapableTool,
+  ACTION_SCOPED_PUBLISH_TOOLS,
 } from '../utils/schedulePublishAuthorization';
+import { emmaToolRegistry } from '../emma/registry';
+import '../emma/tools';
 
 /**
  * ENG-827 — the schedule-level publish authorization signal.
@@ -377,5 +382,88 @@ describe('narrowPublishAuthorization (ENG-827 mid-run revocation)', () => {
       ['read_brand_guidelines', 'post_on_connected_account'],
       narrowed
     )).toEqual(['read_brand_guidelines']);
+  });
+});
+
+
+/**
+ * ENG-827 (Greptile, security): two tools publish under a name `isPublishName` does
+ * not match. `twitter_manage_post` posts a NEW multi-tweet thread, replies and
+ * quote-tweets; `linkedin_manage_post` reposts and comments. Both were reachable from
+ * an unattended run with no consent check at all, which is the same public write the
+ * rest of this module exists to gate — just behind a different tool name.
+ *
+ * Gating them wholesale would refuse a scheduled analytics read, so the decision is
+ * per action.
+ */
+describe('isPublishCall — action-scoped publishing tools (ENG-827)', () => {
+  it('gates the actions that write publicly', () => {
+    for (const action of ['post_thread', 'reply', 'quote_tweet', 'retweet']) {
+      expect(isPublishCall('twitter_manage_post', { action })).toBe(true);
+    }
+    for (const action of ['repost', 'comment']) {
+      expect(isPublishCall('linkedin_manage_post', { action })).toBe(true);
+    }
+  });
+
+  it('leaves reads, analytics and deletes alone', () => {
+    // A delete is the REMEDY for a bad post; refusing it for want of publishing
+    // consent would be backwards. Likes/reactions are not publications of content.
+    for (const action of ['get_tweet_metrics', 'list_replies', 'delete_tweet', 'like', 'unretweet']) {
+      expect(isPublishCall('twitter_manage_post', { action })).toBe(false);
+    }
+    for (const action of ['get_analytics', 'list_comments', 'react']) {
+      expect(isPublishCall('linkedin_manage_post', { action })).toBe(false);
+    }
+  });
+
+  it('fails CLOSED on an unknown, missing or malformed action', () => {
+    expect(isPublishCall('twitter_manage_post', { action: 'post_something_new' })).toBe(true);
+    expect(isPublishCall('twitter_manage_post', {})).toBe(true);
+    expect(isPublishCall('twitter_manage_post', undefined)).toBe(true);
+    expect(isPublishCall('linkedin_manage_post', { action: 42 })).toBe(true);
+  });
+
+  it('still classifies name-matched publish tools regardless of args', () => {
+    expect(isPublishCall('post_on_connected_account', undefined)).toBe(true);
+    expect(isPublishCall('publish_some_future_surface', { action: 'get_analytics' })).toBe(true);
+  });
+
+  it('does not touch tools with no publishing power', () => {
+    expect(isPublishCall('read_brand_guidelines', { action: 'post_thread' })).toBe(false);
+    expect(isPublishCapableTool('read_brand_guidelines')).toBe(false);
+  });
+
+  // An owner must be able to authorize a thread-posting schedule at all, so consent
+  // SCOPE has to recognise these tools too — not just the dispatch guard.
+  it('lets consent be granted for an action-scoped tool', () => {
+    expect(
+      resolveSchedulePublishAuthorization({
+        autopublishAuthorized: true,
+        autopublishAuthorizedTools: ['twitter_manage_post'],
+        requiredFunctionCalls: ['search_web', 'twitter_manage_post'],
+      })
+    ).toEqual({ authorized: true, tools: ['twitter_manage_post'] });
+  });
+
+  it('drops an UNAUTHORIZED action-scoped tool from the required-function scope', () => {
+    expect(
+      filterRequiredFunctionsToAuthorizedScope(
+        ['search_web', 'linkedin_manage_post'],
+        { authorized: false, tools: [] }
+      )
+    ).toEqual(['search_web']);
+  });
+
+  // Drift guard: the fail-closed default must be a backstop, not the way new actions
+  // silently arrive. Whoever adds an action to one of these tools has to classify it.
+  it('classifies EVERY action the tool actually declares', () => {
+    for (const [toolName, spec] of Object.entries(ACTION_SCOPED_PUBLISH_TOOLS)) {
+      const tool = emmaToolRegistry.getTool(toolName);
+      expect(tool).toBeDefined();
+      const declared: string[] = tool!.definition.inputSchema.properties.action.enum;
+      expect(declared.length).toBeGreaterThan(0);
+      expect([...spec.publishing, ...spec.nonPublishing].sort()).toEqual([...declared].sort());
+    }
   });
 });

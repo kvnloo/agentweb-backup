@@ -154,6 +154,65 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
     });
   });
 
+  // Greptile (security): `twitter_manage_post` posts a NEW public thread and
+  // `linkedin_manage_post` reposts — public writes under the owner's name that the
+  // name-based classification missed entirely, so they reached an unattended run with
+  // no consent check at all.
+  describe('action-scoped publishing tools', () => {
+    it('REFUSES an X thread from a run with no publishing rights', async () => {
+      const d = deps({ ...SCHEDULED_SESSION, publishAdmission: undefined }, AUTHORIZED_SCHEDULE);
+      const refusal = await refuseUnauthorizedScheduledPublish(
+        'twitter_manage_post', { sessionId: 'sess-1' }, d, { action: 'post_thread' }
+      );
+      expect(refusal).not.toBeNull();
+      expect(refusal!.error).toContain('not authorized to publish');
+    });
+
+    it('REFUSES a LinkedIn repost once consent is revoked', async () => {
+      const d = deps(
+        {
+          ...SCHEDULED_SESSION,
+          publishAdmission: { authorized: true, tools: ['linkedin_manage_post'], recordedAt: 'x' },
+        },
+        { ...AUTHORIZED_SCHEDULE, autopublishAuthorized: false, autopublishAuthorizedTools: [] }
+      );
+      expect(
+        await refuseUnauthorizedScheduledPublish(
+          'linkedin_manage_post', { sessionId: 'sess-1' }, d, { action: 'repost' }
+        )
+      ).not.toBeNull();
+    });
+
+    it('leaves an analytics read alone — without reading anything at all', async () => {
+      const d = deps({ ...SCHEDULED_SESSION, publishAdmission: undefined }, AUTHORIZED_SCHEDULE);
+      expect(
+        await refuseUnauthorizedScheduledPublish(
+          'linkedin_manage_post', { sessionId: 'sess-1' }, d, { action: 'get_analytics' }
+        )
+      ).toBeNull();
+      expect(d.getChatSession).not.toHaveBeenCalled();
+    });
+
+    it('ALLOWS a thread the owner authorized this run for', async () => {
+      const d = deps(
+        {
+          ...SCHEDULED_SESSION,
+          publishAdmission: { authorized: true, tools: ['twitter_manage_post'], recordedAt: 'x' },
+        },
+        {
+          ...AUTHORIZED_SCHEDULE,
+          requiredFunctionCalls: ['twitter_manage_post'],
+          autopublishAuthorizedTools: ['twitter_manage_post'],
+        }
+      );
+      expect(
+        await refuseUnauthorizedScheduledPublish(
+          'twitter_manage_post', { sessionId: 'sess-1' }, d, { action: 'post_thread' }
+        )
+      ).toBeNull();
+    });
+  });
+
   it('fails CLOSED when the schedule cannot be read', async () => {
     const d = {
       getChatSession: jest.fn(async () => SCHEDULED_SESSION),
