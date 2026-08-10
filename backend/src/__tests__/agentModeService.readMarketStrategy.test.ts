@@ -315,6 +315,55 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(res.formattedContent).toContain('[offset 0] OrgComp1');
   });
 
+  // ENG-945 non-regression: the character budget exists to protect the TOOL
+  // result's context window. Non-tool callers (the CRM email drafter embeds
+  // formattedContent wholesale into its prompt) used to receive 40 competitors
+  // in full and must keep receiving them — the budget must not quietly shrink
+  // an unrelated prompt.
+  it('honours minCompetitorsInFull, overriding the page character budget', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
+
+    const budgeted = await svc.readMarketStrategy('u1');
+    const legacy = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 40 });
+
+    expect(budgeted.competitorsWithFullDetail).toBeLessThan(40);
+    expect(legacy.competitorsWithFullDetail).toBe(40);
+    expect(legacy.formattedContent).toContain('Description for Comp40');
+    // The tail is still named rather than dropped.
+    expect(legacy.formattedContent).toContain('[offset 48] Comp49');
+  });
+
+  it('never returns more than the list holds when minCompetitorsInFull exceeds it', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(5))));
+
+    const res = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 40 });
+
+    expect(res.competitorsWithFullDetail).toBe(5);
+    expect(res.nextCompetitorOffset).toBeNull();
+    expect(res.formattedContent).not.toMatch(/name only/i);
+  });
+
+  it('applies minCompetitorsInFull from the requested offset, not from zero', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(60))));
+
+    const res = await svc.readMarketStrategy('u1', { competitorOffset: 30, minCompetitorsInFull: 40 });
+
+    expect(res.competitorDetailOffset).toBe(30);
+    expect(res.competitorsWithFullDetail).toBe(30); // 30..59
+    expect(res.nextCompetitorOffset).toBeNull();
+  });
+
+  it('ignores a non-numeric or negative minCompetitorsInFull', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
+
+    const bad = await svc.readMarketStrategy('u1', { minCompetitorsInFull: -10 });
+    const worse = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 'forty' as any });
+    const baseline = await svc.readMarketStrategy('u1');
+
+    expect(bad.competitorsWithFullDetail).toBe(baseline.competitorsWithFullDetail);
+    expect(worse.competitorsWithFullDetail).toBe(baseline.competitorsWithFullDetail);
+  });
+
   it('exposes competitorOffset on the tool schema so the model can actually ask for it', async () => {
     require('../emma/tools');
     const { emmaToolRegistry } = require('../emma/registry');
