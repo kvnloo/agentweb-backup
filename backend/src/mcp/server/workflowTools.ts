@@ -73,7 +73,7 @@ mcpToolRegistry.register({
       'Use this when none of the more specific emma_* tools fits the request. ' +
       'Starts a new task unless you pass task_id to continue an existing one. ' +
       'Usually returns the finished result directly (status "complete"). If status is "running" or "unconfirmed", ' +
-      're-read the session with emma_get_session — "unconfirmed" means the result is real but we could not verify ' +
+      'call emma_get_session with session_id set to the returned task_id — "unconfirmed" means the result is real but we could not verify ' +
       'Emma is not waiting on you. Answer with emma_answer_question when status is "awaiting_input".',
     inputSchema: {
       type: 'object',
@@ -177,9 +177,9 @@ mcpToolRegistry.register({
       next: pending
         ? 'Emma is waiting on an answer. Use emma_answer_question — a plain message abandons the question.'
         : stillBuilding
-          ? 'Emma detached into a longer build. Re-read the session with emma_get_session using this task_id — a session showing no activity is not proof it finished (ENG-1015).'
+          ? 'Emma detached into a longer build. Call emma_get_session with session_id set to this task_id — a session showing no activity is not proof it finished (ENG-1015).'
           : confirmationFailed
-            ? 'The result above is real, but the follow-up check failed, so it is unconfirmed — Emma may be awaiting an answer. Re-read the session with emma_get_session to see.'
+            ? 'The result above is real, but the follow-up check failed, so it is unconfirmed — Emma may be awaiting an answer. Call emma_get_session with session_id set to this task_id to check.'
             : undefined,
     });
   },

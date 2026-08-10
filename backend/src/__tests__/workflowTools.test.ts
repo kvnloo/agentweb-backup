@@ -152,6 +152,21 @@ describe('ENG-982: one call completes the job', () => {
     expect(body.next).toMatch(/ENG-1015/);
   });
 
+  it('guidance naming another tool also names that tool\'s real parameter', () => {
+    // Greptile P1 on #2318: the hint said "using this task_id", but
+    // emma_get_session takes `session_id`. An agent following the instruction
+    // literally issues an invalid call — the exact failure this whole layer
+    // exists to prevent, reintroduced in a help string.
+    const referencedParam: Record<string, string> = { emma_get_session: 'session_id' };
+
+    for (const name of WORKFLOW_TOOL_NAMES) {
+      const text = JSON.stringify(tool(name).definition);
+      for (const [referenced, param] of Object.entries(referencedParam)) {
+        if (text.includes(referenced)) expect(text).toContain(param);
+      }
+    }
+  });
+
   it('no workflow tool points the caller at a tool that is not registered', () => {
     // The failure this guards: a description or `next` hint naming a removed
     // tool sends an agent to call something that does not exist, and it has no
