@@ -281,15 +281,19 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     expect(res.competitorsWithFullDetail).toBeGreaterThan(0);
   });
 
-  it('still returns a single competitor whose description alone blows the page budget', async () => {
+  // Per-field ceilings mean an oversized description is truncated (and marked)
+  // rather than swallowing the whole page, so more than one entry now fits. What
+  // must still hold: the entry is returned, the cut is announced, and the rest
+  // of the roster stays reachable.
+  it('truncates a single oversized description instead of letting it consume the page', async () => {
     userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(3, 'Huge', 30000))));
 
     const res = await svc.readMarketStrategy('u1');
 
-    expect(res.competitorsWithFullDetail).toBe(1);
-    expect(res.nextCompetitorOffset).toBe(1);
+    expect(res.competitorsWithFullDetail).toBeGreaterThanOrEqual(1);
     expect(res.formattedContent).toContain('<strong>Huge1:</strong>');
-    expect(res.formattedContent).toContain('[offset 1] Huge2');
+    expect(res.formattedContent).toMatch(/characters omitted/i);
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
   });
 
   it('sizes the page by characters, not by a fixed count: short descriptions get more per page', async () => {
@@ -320,17 +324,31 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
   // formattedContent wholesale into its prompt) used to receive 40 competitors
   // in full and must keep receiving them — the budget must not quietly shrink
   // an unrelated prompt.
+  // The floor is for prompt-embedding callers, which is how the real CRM email
+  // drafter calls it — those are exempt from the transport clamp. A TOOL caller
+  // asking for the same floor is still clamped, because the transport would cut
+  // the response anyway, and less gracefully.
   it('honours minCompetitorsInFull, overriding the page character budget', async () => {
     userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
 
     const budgeted = await svc.readMarketStrategy('u1');
-    const legacy = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 40 });
+    const legacy = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 40, pagingHints: false } as any);
 
     expect(budgeted.competitorsWithFullDetail).toBeLessThan(40);
     expect(legacy.competitorsWithFullDetail).toBe(40);
     expect(legacy.formattedContent).toContain('Description for Comp40');
     // The tail is still named rather than dropped.
-    expect(legacy.formattedContent).toContain('[offset 48] Comp49');
+    expect(legacy.formattedContent).toContain('Comp49');
+  });
+
+  it('clamps a tool response even when a floor was requested', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
+
+    const res = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 40 } as any);
+
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+    // The completeness guidance is reserved — it is never what gets cut.
+    expect(res.formattedContent).toMatch(/Nothing is missing/);
   });
 
   it('never returns more than the list holds when minCompetitorsInFull exceeds it', async () => {
@@ -529,6 +547,56 @@ describe('AgentModeService.readMarketStrategy competitorOffset paging (ENG-945)'
     // Everyone unaccounted for by name is still counted and still reachable.
     expect(res.formattedContent).toMatch(/more stored competitor/);
     expect(res.formattedContent).toMatch(/competitorOffset/);
+  });
+
+  // Greptile P1 (final): the tool response must be HARD bounded, whatever is
+  // stored. Every oversized part is truncated explicitly — the ENG-945 rule is
+  // "never hide silently", not "never bound". Today those same accounts already
+  // lose their tail to the transport's 20,000-char cap with no marker at all.
+  it('hard-bounds the tool response no matter how pathological the record is', async () => {
+    const competitors = makeCompetitors(400, 'Bulk', 9000);
+    competitors[0].name = 'N'.repeat(9000);
+    const strategy: any = marketStrategyWith(competitors, 30000);
+    strategy.businessOverview = 'O'.repeat(30000);
+    userDb.getUserById.mockResolvedValue(asUser(strategy));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+    // The invariants must survive the clamp, not be the thing that gets cut.
+    expect(res.totalCompetitors).toBe(400);
+    expect(res.formattedContent).toContain('400 total');
+    expect(res.formattedContent).toMatch(/truncated/i);
+    expect(res.formattedContent).toMatch(/competitorOffset/);
+  });
+
+  it('marks what it truncated instead of dropping it silently', async () => {
+    const strategy: any = marketStrategyWith(makeCompetitors(5), 40000);
+    userDb.getUserById.mockResolvedValue(asUser(strategy));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.formattedContent.length).toBeLessThan(IN_CONTEXT_CAP);
+    expect(res.formattedContent).toMatch(/characters omitted/i);
+  });
+
+  it('leaves a normal-sized record completely untruncated', async () => {
+    userDb.getUserById.mockResolvedValue(asUser(marketStrategyWith(makeCompetitors(49))));
+
+    const res = await svc.readMarketStrategy('u1');
+
+    expect(res.formattedContent).not.toMatch(/characters omitted/i);
+    expect(res.formattedContent).toContain('Description for Comp1');
+  });
+
+  it('does not clamp the prompt-embedded path, which has no transport cap', async () => {
+    const strategy: any = marketStrategyWith(makeCompetitors(49), 30000);
+    userDb.getUserById.mockResolvedValue(asUser(strategy));
+
+    const res = await svc.readMarketStrategy('u1', { minCompetitorsInFull: 40, pagingHints: false } as any);
+
+    expect(res.competitorsWithFullDetail).toBe(40);
+    expect(res.formattedContent.length).toBeGreaterThan(IN_CONTEXT_CAP);
   });
 
   it('exposes competitorOffset on the tool schema so the model can actually ask for it', async () => {
