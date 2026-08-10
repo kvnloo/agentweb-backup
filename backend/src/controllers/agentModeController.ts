@@ -482,17 +482,30 @@ async function loadPublishLedger(
   sessionId: string,
   baseline?: Record<string, number> | null,
 ): Promise<FalseFailureLedgerEntry[] | null> {
+  // Retried, because UNKNOWN is no longer a soft outcome: it can stop a scheduled
+  // restart and even pause a customer's schedule. A single transient DynamoDB blip
+  // must not be enough to trigger that — "unreadable" has to mean actually
+  // unreadable, not unlucky once.
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const session = await chatbotDb.getChatSession(sessionId);
+      return ledgerFromSucceededFunctions(
+        diffSucceededFunctions(baseline, session?.calledFunctions || null),
+      );
+    } catch (readError) {
+      if (attempt === 3) {
+        console.error(`loadPublishLedger: session ${sessionId} unreadable after 3 attempts:`, readError);
+      }
+    }
+  }
   try {
-    const session = await chatbotDb.getChatSession(sessionId);
-    return ledgerFromSucceededFunctions(
-      diffSucceededFunctions(baseline, session?.calledFunctions || null),
-    );
-  } catch {
     // NULL means UNKNOWN, and that is deliberately not the same as "nothing was
     // published" (Greptile P1). Collapsing the two let a failed read on the
     // scheduled path restart a run from scratch and repeat a production publish.
     // Callers that only annotate a message may treat null as empty; the caller that
     // decides whether to RE-RUN work must not.
+    return null;
+  } catch {
     return null;
   }
 }
@@ -4057,6 +4070,10 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
   // killed mid-tool-execution is NOT resumed (never re-drive a half-applied side
   // effect). Best-effort: any read/plan failure falls back to a fresh restart.
   let resumeSessionId = '';
+  // Set when this run published (or may have) and cannot be continued: suppressing
+  // the requeue alone leaves the schedule ACTIVE, so its next ORDINARY fire would
+  // still restart from scratch and repeat that work. Only pausing prevents it.
+  let pauseAfterClaim = false;
   if (willRequeue && lease.sessionId) {
     try {
       const priorMessages = await chatbotDb.getMessagesFromMessagesTable(lease.sessionId);
@@ -4091,6 +4108,7 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
         failedAttempts: nextRetryCount,
         failureClass: 'system',
       });
+      pauseAfterClaim = true;
     }
   }
 
@@ -4104,6 +4122,26 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
       : null
   );
   if (!won) return false;
+
+  // Paused only after winning the claim — a lost claim means another instance owns
+  // this recovery and must not have the schedule changed underneath it.
+  if (pauseAfterClaim) {
+    try {
+      await scheduleDb.updateSchedule(schedule.scheduleId, {
+        status: 'paused',
+        updatedAt: new Date().toISOString(),
+      });
+      console.error(
+        `recoverAbandonedScheduledRun: PAUSED schedule ${schedule.scheduleId} — ${noRequeueReason}.`
+      );
+    } catch (pauseError) {
+      console.error(
+        `CRITICAL: failed to pause schedule ${schedule.scheduleId} after an abandoned run that `
+        + `may already have published — its next fire may repeat completed work:`,
+        pauseError
+      );
+    }
+  }
 
   // We own the recovery. Make the orphaned session self-explanatory (best-effort).
   // When the run will RESUME, do NOT append the "job incomplete" placeholder — the

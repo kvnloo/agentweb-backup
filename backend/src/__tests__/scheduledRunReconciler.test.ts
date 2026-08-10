@@ -38,6 +38,7 @@ jest.mock('../services/db', () => ({
   scheduleDb: {
     getInFlightSchedules: jest.fn(),
     claimAbandonedRun: jest.fn(),
+    updateSchedule: jest.fn().mockResolvedValue(undefined),
     addRunResult: jest.fn().mockResolvedValue(undefined),
   },
   userDb: { getUserById: jest.fn() },
@@ -102,6 +103,7 @@ beforeEach(() => {
   jest.spyOn(console, 'error').mockImplementation(() => {});
   jest.spyOn(console, 'log').mockImplementation(() => {});
   mockScheduleDb.claimAbandonedRun.mockResolvedValue(true);
+  (mockScheduleDb as any).updateSchedule.mockResolvedValue(undefined);
   mockScheduleDb.addRunResult.mockResolvedValue(undefined as any);
 });
 
@@ -271,6 +273,28 @@ describe('recoverAbandonedScheduledRun', () => {
 
     const requeue = mockScheduleDb.claimAbandonedRun.mock.calls[0][2];
     expect(requeue).toBeNull();
+    // Suppressing the requeue is not enough: an ACTIVE schedule still fires on its
+    // ordinary cadence and would restart from scratch, repeating the publish.
+    const paused = mockScheduleDb.updateSchedule.mock.calls.find(
+      (c: any[]) => c[1]?.status === 'paused'
+    );
+    expect(paused).toBeDefined();
+  });
+
+  it('does not pause on a single transient ledger read failure', async () => {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([]);
+    // One blip, then a clean read showing nothing published.
+    (mockChatbotDb.getChatSession as jest.Mock)
+      .mockRejectedValueOnce(new Error('transient'))
+      .mockResolvedValue({ sessionId: 'sess-1', calledFunctions: { you_search_web: 1 } } as any);
+    const schedule = scheduleWithLease();
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    expect(
+      mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.status === 'paused')
+    ).toBeUndefined();
+    expect(mockScheduleDb.claimAbandonedRun.mock.calls[0][2]).not.toBeNull();
   });
 
   it('does not restart from scratch when the publish ledger cannot be read', async () => {
