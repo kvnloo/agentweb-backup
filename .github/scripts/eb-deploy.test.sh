@@ -134,6 +134,13 @@ case "$operation" in
         printf '%s\n' "${first#*|}" >&2
         exit 255
       fi
+      if [ "${first%%|*}" = "SLEEP" ]; then
+        # Simulates a stalled/throttled AWS call so the dry run's own timeout
+        # is exercised rather than assumed.
+        sleep "${first#*|}"
+        printf 'None\n'
+        exit 0
+      fi
       if [ "$first" = "NONE" ]; then
         printf 'None\n'
         exit 0
@@ -792,6 +799,30 @@ set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Red|backend-20260729
 set_healthy_underlying "$M"
 run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1'
 check 'ENG-878 dry run: the authoritative Red path is unaffected' 0 'lagging aggregate'
+
+# A stalled probe must not hold the script open past the step's timeout and turn
+# an already-confirmed deploy into a false failure — the exact defect this whole
+# change removes, which the diagnostic would otherwise reintroduce. The probe is
+# abandoned on its own budget and reported as INERT.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+printf 'SLEEP|30\n' >"$M/instances_health"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1' \
+  EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS='2'
+check 'ENG-878 dry run: a stalled probe never fails the deploy' 0 'SUCCESS: environment'
+check 'ENG-878 dry run: the stall is reported, not swallowed' 0 'was abandoned'
+check 'ENG-878 dry run: and a stalled probe reads as INERT' 0 'probe dry run: INERT'
+
+# With almost none of the deploy budget left, the diagnostic is skipped outright
+# rather than spending the seconds the script needs to exit on its own terms.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Updating|Grey|old-version' 'Ready|Green|backend-20260729-pr2216'
+set_healthy_underlying "$M"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_HEALTH_PROBE_DRYRUN='1' \
+  EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS='9999'
+check 'ENG-878 dry run: skipped when the budget is nearly spent' 0 'probe dry run: SKIPPED'
+check 'ENG-878 dry run: skipping still leaves the deploy successful' 0 'SUCCESS: environment'
 
 # ---------------------------------------------------------------------------
 

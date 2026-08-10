@@ -29,6 +29,14 @@
 #                                is confirmed and cannot change the exit status.
 #                                Off by default, so a normal deploy still makes
 #                                no extra AWS calls.
+#   EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS
+#                                Wall-clock bound for that dry run (default 120).
+#                                Exceeding it abandons the probe and reports it
+#                                as INERT; it never fails the deploy.
+#   EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS
+#                                Seconds of the overall budget the dry run must
+#                                leave untouched (default 30). If less than that
+#                                remains, the dry run is skipped outright.
 #
 # EB_TOTAL_TIMEOUT_SECONDS is an absolute deadline covering settling, retries and
 # verification together, so the worst case cannot exceed it no matter how many
@@ -65,6 +73,8 @@ EB_POLL_INTERVAL_SECONDS="${EB_POLL_INTERVAL_SECONDS:-15}"
 EB_UPDATE_MAX_ATTEMPTS="${EB_UPDATE_MAX_ATTEMPTS:-3}"
 EB_REJECTION_GRACE_SECONDS="${EB_REJECTION_GRACE_SECONDS:-180}"
 EB_HEALTH_PROBE_DRYRUN="${EB_HEALTH_PROBE_DRYRUN:-0}"
+EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS="${EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS:-120}"
+EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS="${EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS:-30}"
 
 # Absolute epoch deadline for the whole run; set in main().
 EB_RUN_DEADLINE=0
@@ -316,11 +326,65 @@ underlying_health_verdict() {
 # diagnostic — the opposite of the point.
 #
 # Off by default, so an ordinary deploy still makes zero extra AWS calls.
+#
+# The probe is four sequential AWS calls with no bound of their own. Running it
+# *after* success means a stalled or throttled call would hold the script open
+# past the step's timeout-minutes and report a failure for a deploy that had
+# already been confirmed — the exact false failure this change exists to remove,
+# reintroduced by the diagnostic. So the dry run gets its own wall-clock budget,
+# clamped to what is left of the overall run budget, and abandoning it is just
+# another INERT observation.
 run_health_probe_dryrun() {
   [ "${EB_HEALTH_PROBE_DRYRUN}" = "1" ] || return 0
 
-  log "Probe dry run requested; exercising the lagging-rollup health probe against ${EB_ENVIRONMENT_NAME}."
-  underlying_health_verdict
+  local budget="${EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS}"
+  local remaining
+  # Leave a margin so the script still exits cleanly on its own terms rather
+  # than being killed mid-diagnostic by the workflow.
+  remaining=$(( EB_RUN_DEADLINE - $(now_seconds) - EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS ))
+  [ "${remaining}" -lt "${budget}" ] && budget="${remaining}"
+
+  if [ "${budget}" -le 0 ]; then
+    log "probe dry run: SKIPPED — too little of the ${EB_TOTAL_TIMEOUT_SECONDS}s deploy budget is left to run the probe without risking the step timeout. This did not affect this deploy."
+    return 0
+  fi
+
+  log "Probe dry run requested; exercising the lagging-rollup health probe against ${EB_ENVIRONMENT_NAME} (bounded to ${budget}s)."
+
+  # The verdict is collected through a file rather than by waiting on the child:
+  # a finished-but-unreaped child still answers `kill -0`, so polling liveness
+  # would burn the whole budget on a probe that already returned.
+  local result="${TMPDIR:-/tmp}/eb-probe-dryrun.$$"
+  rm -f "${result}" "${result}.partial"
+  (
+    underlying_health_verdict
+    printf '%s\n%s\n' "${EB_HEALTH_VERDICT}" "${EB_UNHEALTHY_DETAIL:-}" >"${result}.partial"
+    mv "${result}.partial" "${result}"
+  ) &
+  local pid=$!
+
+  local waited=0
+  while [ ! -f "${result}" ] && [ "${waited}" -lt "${budget}" ]; do
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+
+  if [ ! -f "${result}" ]; then
+    kill -TERM "${pid}" 2>/dev/null || true
+    sleep 1
+    kill -KILL "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    rm -f "${result}.partial"
+    log "probe dry run: verdict=UNKNOWN detail=the probe did not finish within ${budget}s and was abandoned"
+    log "probe dry run: INERT — the probe could not complete, so on a real Grey/Red rollup it would fall back to failing the deploy. Fix this before relying on it. This did not affect this deploy."
+    return 0
+  fi
+
+  wait "${pid}" 2>/dev/null || true
+  EB_HEALTH_VERDICT=$(sed -n 1p "${result}")
+  EB_UNHEALTHY_DETAIL=$(sed -n 2p "${result}")
+  rm -f "${result}"
+
   log "probe dry run: verdict=${EB_HEALTH_VERDICT} detail=${EB_UNHEALTHY_DETAIL:-none}"
 
   case "${EB_HEALTH_VERDICT}" in
