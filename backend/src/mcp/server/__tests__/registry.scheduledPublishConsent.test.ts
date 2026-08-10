@@ -52,8 +52,7 @@ describe('ENG-827 — dispatch refuses an unauthorized scheduled publish', () =>
     getScheduleById.mockResolvedValue({
       scheduleId: SCHEDULE_ID,
       requiredFunctionCalls: ['post_on_connected_account'],
-      autopublishAuthorized: false,
-      autopublishAuthorizedTools: [],
+      requirePublishApproval: true,
     });
 
     const result: any = await registry.execute(
@@ -72,8 +71,6 @@ describe('ENG-827 — dispatch refuses an unauthorized scheduled publish', () =>
     getScheduleById.mockResolvedValue({
       scheduleId: SCHEDULE_ID,
       requiredFunctionCalls: ['post_on_connected_account'],
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account'],
     });
 
     const result: any = await registry.execute(
@@ -107,8 +104,6 @@ describe('ENG-827 — dispatch refuses an unauthorized scheduled publish', () =>
     getScheduleById.mockResolvedValue({
       scheduleId: SCHEDULE_ID,
       requiredFunctionCalls: ['post_on_connected_account'],
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account'],
     });
 
     let recheck: any;
@@ -117,8 +112,7 @@ describe('ENG-827 — dispatch refuses an unauthorized scheduled publish', () =>
       getScheduleById.mockResolvedValue({
         scheduleId: SCHEDULE_ID,
         requiredFunctionCalls: ['post_on_connected_account'],
-        autopublishAuthorized: false,
-        autopublishAuthorizedTools: [],
+        requirePublishApproval: true,
       });
       recheck = await context.assertPublishStillAuthorized();
       return { success: true };

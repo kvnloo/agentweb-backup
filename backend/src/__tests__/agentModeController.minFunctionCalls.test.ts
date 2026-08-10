@@ -725,7 +725,10 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     };
 
     it('OMITS an unauthorized publish tool from functionCallDetails, and still passes in ONE attempt', async () => {
-      mockScheduleDb.getScheduleById.mockResolvedValue(publishSchedule as any);
+      // The owner opted OUT of unattended publishing, so the publish requirement is
+      // outside this run's scope and must not be nudged for.
+      const withheld = { ...publishSchedule, requirePublishApproval: true };
+      mockScheduleDb.getScheduleById.mockResolvedValue(withheld as any);
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         content: 'Drafted the post; holding publication for your approval.',
         toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
@@ -734,7 +737,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
         responseMessages: [],
       });
 
-      const result = await runScheduledChat(publishSchedule as any, mockUserId, true);
+      const result = await runScheduledChat(withheld as any, mockUserId, true);
 
       expect(result).toEqual(
         expect.objectContaining({
@@ -753,14 +756,11 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     it('STOPS requiring the publish tool when consent is revoked mid-run', async () => {
       const admitted = {
         ...publishSchedule,
-        autopublishAuthorized: true,
-        autopublishAuthorizedTools: ['post_on_connected_account'],
       };
       // The owner revokes after the run was admitted: every later re-read is revoked.
       mockScheduleDb.getScheduleById.mockResolvedValue({
         ...publishSchedule,
-        autopublishAuthorized: false,
-        autopublishAuthorizedTools: [],
+        requirePublishApproval: true,
       } as any);
       // The model does NOT publish. Under the admitted (authorized) snapshot the
       // checker would nudge for post_on_connected_account until maxAttempts.
@@ -792,13 +792,10 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
       const admitted = {
         ...publishSchedule,
         requiredFunctionCalls: ['read_brand_guidelines', 'analyze_competitors', 'post_on_connected_account'],
-        autopublishAuthorized: true,
-        autopublishAuthorizedTools: ['post_on_connected_account'],
       };
       mockScheduleDb.getScheduleById.mockResolvedValue({
         ...publishSchedule,
-        autopublishAuthorized: false,
-        autopublishAuthorizedTools: [],
+        requirePublishApproval: true,
       } as any);
       // Never satisfies analyze_competitors, so the run takes more than one turn and we
       // can inspect what the SECOND turn actually sent to the model.
@@ -822,8 +819,6 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     it('KEEPS an AUTHORIZED publish tool in functionCallDetails — the scope filters, not the tool name', async () => {
       const authorized = {
         ...publishSchedule,
-        autopublishAuthorized: true,
-        autopublishAuthorizedTools: ['post_on_connected_account'],
       };
       mockScheduleDb.getScheduleById.mockResolvedValue(authorized as any);
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
@@ -857,8 +852,6 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     it('STAMPS the admitted publish scope on the session before the first turn', async () => {
       const authorized = {
         ...publishSchedule,
-        autopublishAuthorized: true,
-        autopublishAuthorizedTools: ['post_on_connected_account'],
       };
       mockScheduleDb.getScheduleById.mockResolvedValue(authorized as any);
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
@@ -886,7 +879,8 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     });
 
     it('does NOT stamp a draft-only run — an absent stamp IS the withheld state', async () => {
-      mockScheduleDb.getScheduleById.mockResolvedValue(publishSchedule as any);
+      const withheld = { ...publishSchedule, requirePublishApproval: true };
+      mockScheduleDb.getScheduleById.mockResolvedValue(withheld as any);
       mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
         content: 'Drafted only.',
         toolCalls: [{ name: 'read_brand_guidelines', arguments: {} }],
@@ -895,7 +889,7 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
         responseMessages: [],
       });
 
-      await runScheduledChat(publishSchedule as any, mockUserId, true);
+      await runScheduledChat(withheld as any, mockUserId, true);
 
       expect(mockChatbotDb.updateSessionPublishAdmission).not.toHaveBeenCalled();
     });
@@ -907,8 +901,6 @@ describe('AgentModeController - Minimum Function Call Requirements', () => {
     it('DOWNGRADES the run to draft-only when the admission cannot be recorded', async () => {
       const authorized = {
         ...publishSchedule,
-        autopublishAuthorized: true,
-        autopublishAuthorizedTools: ['post_on_connected_account'],
       };
       mockScheduleDb.getScheduleById.mockResolvedValue(authorized as any);
       mockChatbotDb.updateSessionPublishAdmission.mockRejectedValueOnce(new Error('throttled'));

@@ -45,10 +45,8 @@ const ctx = (sessionId: string): ToolContext => ({
 const authorized = {
   scheduleId: SCHEDULE_ID,
   requiredFunctionCalls: ['post_on_connected_account'],
-  autopublishAuthorized: true,
-  autopublishAuthorizedTools: ['post_on_connected_account'],
 };
-const revoked = { ...authorized, autopublishAuthorized: false, autopublishAuthorizedTools: [] };
+const revoked = { ...authorized, requirePublishApproval: true };
 
 describe('ENG-827 — the live Emma dispatch path enforces publish consent', () => {
   let registry: ToolRegistry;

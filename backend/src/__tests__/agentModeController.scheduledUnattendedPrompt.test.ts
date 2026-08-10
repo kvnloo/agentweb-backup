@@ -218,12 +218,10 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp).not.toContain('[Schedule Context]');
     expect(sp).toContain('[AUTOMATED UNATTENDED EXECUTION]');
     expect(sp).toContain('PER-ENTITY COMPLETION LOOP');
-    // ENG-827: without a scheduleId there is nothing to look up, so the run must
-    // skip getScheduleById entirely and fall back to the safe withhold default —
-    // guarding against a regression in the `if (scheduleIdMatch)` guard (a default
-    // to true, or a lookup on a bad id, would flip publish authorization on).
+    // ENG-827: with no scheduleId there is nothing to look up, and the publish
+    // decision is not stated on this path at all, so no schedule read may happen.
     expect(scheduleDb.getScheduleById).not.toHaveBeenCalled();
-    expect(sp).toContain('NOT pre-authorized to publish');
+    expect(sp).not.toContain('pre-authorized to publish');
   });
 
   it('does NOT inject the unattended directive for a regular (non-scheduled) session', async () => {
@@ -289,151 +287,27 @@ describe('Scheduled lead-engagement run — assembled system prompt (E2E)', () =
     expect(sp!).not.toContain('IDENTITY RESOLUTION');
   });
 
-  // ── Publish authorization signal (ENG-827) ───────────────────────────────────
-  // The controller resolves the schedule's fullAutonomy flag into the publish
-  // authorization block. Cover the authorize / withhold / lookup-failure branches
-  // end-to-end so a regression in the wiring can't silently drop the signal.
-  // Greptile P1 #4: fullAutonomy governs how a blocking AskUserQuestion is ANSWERED
-  // (ENG-396/ENG-517), not whether a live write may happen. An owner ticking it
-  // consented to Emma choosing between options, not to Emma posting content they
-  // never saw — so it must NOT flip the publish directive.
-  it('WITHHOLDS publishing on fullAutonomy alone — it is not a publish-consent control', async () => {
-    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
-      scheduleId: SCHEDULE_ID,
-      fullAutonomy: true,
-      requiredFunctionCalls: ['post_on_connected_account'],
-    } as any);
+  // ── The publish decision is NOT stated here (ENG-827) ────────────────────────
+  // This system prompt is stored as the session's FIRST message, and
+  // buildMarketingContext slices that message off (startIdx = 1) before the model
+  // sees it. A publish decision written here is therefore a decision nobody reads —
+  // confirmed on a live preview run, where the block was present in the stored
+  // message and had no effect on behaviour. The block is emitted by
+  // AgentModeService instead, appended AFTER the conversation; see
+  // agentModeService.scheduledSessionContext.test.ts. These assertions pin that
+  // split so the decision cannot drift back to the unread copy.
+  it('states NO publish decision — that block belongs on the delivered path', async () => {
     await agentModeController.generateResponse(makeReq(), makeRes());
     const sp = capturedSystemPrompt()!;
-    expect(sp).toContain('PUBLISH AUTHORIZATION');
-    expect(sp).toContain('NOT pre-authorized to publish');
-    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
-  });
-
-  it('WITHHOLDS publishing (draft & notify) when the schedule is not fullAutonomy', async () => {
-    // beforeEach already defaults fullAutonomy:false
-    await agentModeController.generateResponse(makeReq(), makeRes());
-    const sp = capturedSystemPrompt()!;
-    expect(sp).toContain('PUBLISH AUTHORIZATION');
-    expect(sp).toContain('NOT pre-authorized to publish');
-    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
-  });
-
-  // Greptile P1: runScheduledChat fixes the required-function list once from its
-  // own schedule snapshot, while this prompt re-reads the schedule on every
-  // verification attempt. If a throttled read emitted the prohibition, the prompt
-  // would forbid a publish tool the checker still requires — the exact nudge-loop
-  // contradiction. An unreadable schedule must emit NO publish block instead.
-  it('emits NO publish block (not a prohibition) when the schedule lookup THROWS', async () => {
-    jest.spyOn(scheduleDb, 'getScheduleById').mockRejectedValue(new Error('DynamoDB throttled'));
-    await agentModeController.generateResponse(makeReq(), makeRes());
-    const sp = capturedSystemPrompt()!;
-    // the run still proceeds with the rest of the unattended directive
     expect(sp).toContain('[AUTOMATED UNATTENDED EXECUTION]');
-    expect(sp).not.toContain('PUBLISH AUTHORIZATION');
-    expect(sp).not.toContain('NOT pre-authorized to publish');
     expect(sp).not.toContain('PRE-AUTHORIZED to publish');
+    expect(sp).not.toContain('NOT pre-authorized to publish');
   });
 
-  // ── The actual production shape (ENG-827) ────────────────────────────────────
-  // Every reported session ran on a schedule with requiredFunctionCalls naming
-  // post_on_connected_account, fullAutonomy OFF, and a prompt that explicitly
-  // waives approval. The toggle is surfaced as governing mid-run questions, so no
-  // owner automating a daily post ticks it — authorization has to come from the
-  // owner's own configuration, or the fix never fires for a single real schedule.
-  it('AUTHORIZES publishing when the owner set autopublishAuthorized, fullAutonomy OFF', async () => {
-    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
-      scheduleId: SCHEDULE_ID,
-      fullAutonomy: false,
-      requiredFunctionCalls: ['post_on_connected_account'],
-      autopublishAuthorized: true,
-      // consent is bound to the scope approved at grant time
-      autopublishAuthorizedTools: ['post_on_connected_account'],
-    } as any);
+  it('does not read the schedule just to assemble this prompt', async () => {
+    // The publish decision moved out, so the only remaining lookup reason went with
+    // it. A re-appearing read here means the unread copy is being rebuilt.
     await agentModeController.generateResponse(makeReq(), makeRes());
-    const sp = capturedSystemPrompt()!;
-    expect(sp).toContain('PRE-AUTHORIZED to publish');
-    expect(sp).not.toContain('NOT pre-authorized to publish');
-    // the directive must name the exact tool the owner designated
-    expect(sp).toContain('designated post_on_connected_account');
-  });
-
-  // ── Single-source authorization (Greptile P1) ────────────────────────────────
-  // A scheduled run threads the authorization it was ADMITTED under down from
-  // runScheduledChat, which resolved it once from the same schedule snapshot it
-  // used to build `requiredFunctions`. When that override is supplied the prompt
-  // MUST use it verbatim and never re-read the schedule — otherwise the prompt and
-  // the required-function checker are two independent reads that can disagree.
-  const callWithOverride = (auth: { authorized: boolean; tools: string[] }) =>
-    generateSessionResponse(
-      SESSION_ID,
-      'Draft and publish the daily post.',
-      USER_ID,
-      'anthropic.claude-opus-4-8',
-      [],
-      undefined, undefined, undefined, undefined, undefined, undefined,
-      auth
-    );
-
-  it('uses the caller-supplied AUTHORIZED decision and never re-reads the schedule', async () => {
-    // DB disagrees (and would say withheld) — the override must win outright.
-    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({ scheduleId: SCHEDULE_ID, fullAutonomy: false } as any);
-    await callWithOverride({ authorized: true, tools: ['post_on_connected_account'] });
-    const sp = capturedSystemPrompt()!;
-    expect(sp).toContain('PRE-AUTHORIZED to publish');
-    expect(sp).not.toContain('NOT pre-authorized to publish');
-    expect(sp).toContain('designated post_on_connected_account');
     expect(scheduleDb.getScheduleById).not.toHaveBeenCalled();
-  });
-
-  it('uses the caller-supplied WITHHELD decision even when the schedule would authorize', async () => {
-    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
-      scheduleId: SCHEDULE_ID,
-      requiredFunctionCalls: ['post_on_connected_account'],
-    } as any);
-    await callWithOverride({ authorized: false, tools: [] });
-    const sp = capturedSystemPrompt()!;
-    expect(sp).toContain('NOT pre-authorized to publish');
-    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
-    expect(scheduleDb.getScheduleById).not.toHaveBeenCalled();
-  });
-
-  it('is immune to a schedule-lookup failure once the decision is threaded in', async () => {
-    // The exact P1 scenario: a throttled read can no longer flip the prompt away
-    // from the decision the required-function checker is already enforcing.
-    jest.spyOn(scheduleDb, 'getScheduleById').mockRejectedValue(new Error('DynamoDB throttled'));
-    await callWithOverride({ authorized: true, tools: ['post_on_connected_account'] });
-    const sp = capturedSystemPrompt()!;
-    expect(sp).toContain('PRE-AUTHORIZED to publish');
-    expect(sp).not.toContain('NOT pre-authorized to publish');
-  });
-
-  // Greptile P1 regression: the Required Functions picker is a VERIFICATION control
-  // with no approval-waiver language in its UI. A schedule whose owner ticked a
-  // publish tool but never waived approval — the active "LUCAS — LinkedIn Thought
-  // Leadership" shape, and 5 of the 8 production publish-requiring schedules — must
-  // keep drafting, not silently start publishing to a live account.
-  it('WITHHOLDS when a publish tool is required but no consent flag is set', async () => {
-    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
-      scheduleId: SCHEDULE_ID,
-      fullAutonomy: false,
-      requiredFunctionCalls: ['generate_image', 'post_on_connected_account'],
-    } as any);
-    await agentModeController.generateResponse(makeReq(), makeRes());
-    const sp = capturedSystemPrompt()!;
-    expect(sp).toContain('NOT pre-authorized to publish');
-    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
-  });
-
-  it('still WITHHOLDS when the required functions contain no publishing tool', async () => {
-    jest.spyOn(scheduleDb, 'getScheduleById').mockResolvedValue({
-      scheduleId: SCHEDULE_ID,
-      fullAutonomy: false,
-      requiredFunctionCalls: ['you_search_web', 'create_social_media_posts', 'send_email'],
-    } as any);
-    await agentModeController.generateResponse(makeReq(), makeRes());
-    const sp = capturedSystemPrompt()!;
-    expect(sp).toContain('NOT pre-authorized to publish');
-    expect(sp).not.toContain('PRE-AUTHORIZED to publish');
   });
 });

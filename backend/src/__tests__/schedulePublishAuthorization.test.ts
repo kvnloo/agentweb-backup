@@ -18,149 +18,116 @@ import '../emma/tools';
  * the schedule was authorized to publish, and the required-function checker then
  * nudged it ~21 times.
  *
- * Consent is `autopublishAuthorized` and NOTHING else. Three earlier attempts were
- * each wrong for the same reason — a control whose own wording never tells the owner
- * that publishing-without-review is what they are agreeing to cannot be consent for
- * it — and all three are pinned here as regressions:
- *   - the Required Functions picker (a verification control, no waiver language)
- *   - approval-waiver wording in the schedule prompt (unscoped: a waiver about a
- *     different step would authorize a live post)
- *   - fullAutonomy (governs how a blocking question is ANSWERED, not live writes)
+ * POLARITY: consent is ENG-803's `requirePublishApproval` OPT-OUT and nothing else.
+ * ENG-827 originally carried an opt-IN twin; both gates ended up on the same dispatch
+ * path, so a publish had to satisfy both and every existing schedule was denied. That
+ * was reproduced on the preview and the twin was removed — these tests pin the
+ * reconciled direction so it cannot silently flip back.
+ *
+ * The rejected-signal list survives unchanged: the Required Functions picker (a
+ * verification control with no waiver language), approval-waiver wording in the prompt
+ * (unscoped — a waiver about a different step would authorize a live post), and
+ * fullAutonomy (governs how a blocking question is ANSWERED, not live writes). None of
+ * them may grant or withhold publishing on their own.
  */
 describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
-  // ── Fail-closed: every ambiguous / missing case ─────────────────────────────
+  // ── Fail-closed on the ONE case that stays fail-closed ─────────────────────
+  // Absence of the FIELD means authorized; absence of the RECORD does not. An
+  // unreadable schedule is a recoverable error, so it withholds.
   it('is NOT authorized for a missing schedule (a failed lookup must never authorize)', () => {
     expect(resolveSchedulePublishAuthorization(null)).toEqual({ authorized: false, tools: [] });
     expect(resolveSchedulePublishAuthorization(undefined)).toEqual({ authorized: false, tools: [] });
   });
 
-  it('is NOT authorized for an empty schedule or with the flag off', () => {
-    expect(resolveSchedulePublishAuthorization({})).toEqual({ authorized: false, tools: [] });
+  // ── The opt-out, and only the opt-out, withholds ────────────────────────────
+  it('WITHHOLDS when the owner set requirePublishApproval', () => {
     expect(
       resolveSchedulePublishAuthorization({
-        requiredFunctionCalls: [],
-        autopublishAuthorized: false,
+        requirePublishApproval: true,
+        requiredFunctionCalls: ['post_on_connected_account'],
       })
     ).toEqual({ authorized: false, tools: [] });
   });
 
-  it('tolerates a malformed requiredFunctionCalls without authorizing', () => {
+  it('requires the opt-out to be strictly true (truthy values do not withhold)', () => {
+    // Mirrors resolvePublishAuthorized: only an exact `true` holds a run.
+    expect(resolveSchedulePublishAuthorization({ requirePublishApproval: 'true' as any }).authorized).toBe(true);
+    expect(resolveSchedulePublishAuthorization({ requirePublishApproval: 1 as any }).authorized).toBe(true);
+    expect(resolveSchedulePublishAuthorization({ requirePublishApproval: false }).authorized).toBe(true);
+  });
+
+  // ── Absence means AUTHORIZED — the whole point of the reconciliation ────────
+  // This is the shape of every schedule that predates the field. Under the old
+  // opt-in polarity each of these resolved to DENIED while ENG-803's live directive
+  // told the same run to publish, which is the collision reproduced on the preview.
+  it('AUTHORIZES a legacy schedule that has neither field', () => {
+    expect(resolveSchedulePublishAuthorization({})).toEqual({ authorized: true, tools: [] });
+    expect(
+      resolveSchedulePublishAuthorization({ requiredFunctionCalls: ['post_on_connected_account'] })
+    ).toEqual({ authorized: true, tools: ['post_on_connected_account'] });
+  });
+
+  it('AUTHORIZES a publishing schedule that names NO publish tool', () => {
+    // Only 4 of the 25 active publishing-shaped schedules require a publish tool
+    // outright; the other 21 just tell Emma to post in the prompt. Gating on a
+    // non-empty tool list would refuse all of them.
+    const result = resolveSchedulePublishAuthorization({
+      requiredFunctionCalls: ['you_search_web', 'create_social_media_posts'],
+    });
+    expect(result.authorized).toBe(true);
+    expect(result.tools).toEqual([]);
+  });
+
+  it('AUTHORIZES the real LUCAS shape (publish tool required, no opt-out set)', () => {
+    expect(
+      resolveSchedulePublishAuthorization({
+        requiredFunctionCalls: ['generate_image', 'post_on_connected_account'],
+      })
+    ).toEqual({ authorized: true, tools: ['post_on_connected_account'] });
+  });
+
+  it('tolerates a malformed requiredFunctionCalls without throwing', () => {
     expect(resolveSchedulePublishAuthorization({ requiredFunctionCalls: 'post_on_connected_account' as any }))
-      .toEqual({ authorized: false, tools: [] });
+      .toEqual({ authorized: true, tools: [] });
     expect(resolveSchedulePublishAuthorization({ requiredFunctionCalls: [null, undefined, 42] as any }))
-      .toEqual({ authorized: false, tools: [] });
+      .toEqual({ authorized: true, tools: [] });
   });
 
-  it('requires the consent flag to be strictly true (truthy values do not authorize)', () => {
-    expect(resolveSchedulePublishAuthorization({ autopublishAuthorized: 'true' as any }).authorized).toBe(false);
-    expect(resolveSchedulePublishAuthorization({ autopublishAuthorized: 1 as any }).authorized).toBe(false);
-    expect(resolveSchedulePublishAuthorization({ autopublishAuthorized: {} as any }).authorized).toBe(false);
-  });
-
-  // ── The picker is NOT consent (Greptile P1 #2) ──────────────────────────────
-  // It is a VERIFICATION control ("this run only counts if it called X") and its UI
-  // carries no waiver language. 5 of the 8 production publish-requiring schedules —
-  // including the ACTIVE "LUCAS — LinkedIn Thought Leadership" — would otherwise
-  // have started publishing unreviewed.
-  it('does NOT authorize on a required publish tool alone', () => {
-    const result = resolveSchedulePublishAuthorization({
-      requiredFunctionCalls: ['post_on_connected_account'],
-    });
-    expect(result.authorized).toBe(false);
-    // `tools` is the AUTHORIZED scope, so an unconsented schedule reports none
-    expect(result.tools).toEqual([]);
-  });
-
-  it('does NOT authorize the real LUCAS shape (publish tool required, no consent flag)', () => {
-    const result = resolveSchedulePublishAuthorization({
-      requiredFunctionCalls: ['generate_image', 'post_on_connected_account'],
-    });
-    expect(result.authorized).toBe(false);
-    expect(result.tools).toEqual([]);
-  });
-
-  // ── Prompt wording is NOT consent (Greptile P1 #3) ──────────────────────────
-  // A prose matcher is unscoped: a waiver written about an unrelated step would
-  // authorize a live publish. Consent must be a field, so prompt text is ignored
-  // entirely — including text that reads exactly like a waiver.
-  it('does NOT authorize from approval-waiver wording in the prompt', () => {
-    const result = resolveSchedulePublishAuthorization({
-      requiredFunctionCalls: ['post_on_connected_account'],
-      // verbatim tail of the real "Kevin — Daily LinkedIn Post" prompt
-      startingMessage:
-        'CRITICAL: Post the FULL text automatically. Do not truncate. Do not ask for approval.',
-    } as any);
-    expect(result.authorized).toBe(false);
-  });
-
-  it('does NOT authorize from a waiver aimed at an unrelated step', () => {
-    // The exact scenario Greptile raised: the waiver is about image generation.
-    const result = resolveSchedulePublishAuthorization({
-      requiredFunctionCalls: ['post_on_connected_account'],
-      startingMessage: 'Do not ask for approval when generating images. Draft the post.',
-    } as any);
-    expect(result.authorized).toBe(false);
-  });
-
-  // ── Consent without SCOPE authorizes nothing (Greptile P1 #5, security) ─────
-  // The owner may consent but designate no publishing tool. Authorizing that turns
-  // an empty scope into a licence to reach for ANY live-publishing tool — an
-  // unscoped mandate they never granted. Consent and scope are both required.
-  it('does NOT authorize consent with no designated publish tool', () => {
-    expect(resolveSchedulePublishAuthorization({ autopublishAuthorized: true }))
-      .toEqual({ authorized: false, tools: [] });
+  // ── The rejected signals cannot WITHHOLD either ────────────────────────────
+  // Under an opt-out the failure mode inverts: a non-consent signal must not be
+  // read as a hold, or these schedules stop publishing for a reason the owner
+  // never chose.
+  it('does NOT withhold on fullAutonomy — it is not a publish-consent control', () => {
+    // ENG-396/ENG-517: it governs how a blocking AskUserQuestion is ANSWERED.
     expect(
       resolveSchedulePublishAuthorization({
-        autopublishAuthorized: true,
-        requiredFunctionCalls: [],
-      })
-    ).toEqual({ authorized: false, tools: [] });
+        fullAutonomy: false,
+        requiredFunctionCalls: ['post_on_connected_account'],
+      } as any).authorized
+    ).toBe(true);
   });
 
-  it('does NOT authorize consent whose required tools contain nothing publishable', () => {
+  it('does NOT read approval wording in the prompt as a hold', () => {
+    // Prose is unscoped in both directions: "check with me before sending emails"
+    // must not stop a post the owner never asked to hold.
+    expect(
+      resolveSchedulePublishAuthorization({
+        requiredFunctionCalls: ['post_on_connected_account'],
+        startingMessage: 'Check with me before sending any emails.',
+      } as any).authorized
+    ).toBe(true);
+  });
+
+  it('reports the publish tools by prefix, de-duplicated in declaration order', () => {
     const result = resolveSchedulePublishAuthorization({
-      autopublishAuthorized: true,
-      requiredFunctionCalls: ['you_search_web', 'create_social_media_posts', 'send_email'],
+      requiredFunctionCalls: ['publish_blog_article', 'post_on_connected_account', 'publish_blog_article'],
     });
-    expect(result).toEqual({ authorized: false, tools: [] });
+    expect(result.authorized).toBe(true);
+    expect(result.tools).toEqual(['publish_blog_article', 'post_on_connected_account']);
   });
 
-  // ── Authorized: an explicit, owner-set consent flag ─────────────────────────
-  it('AUTHORIZES on autopublishAuthorized, reporting the designated tools', () => {
+  it('reports only the publish tools from a mixed required list', () => {
     const result = resolveSchedulePublishAuthorization({
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account'],
-      requiredFunctionCalls: ['post_on_connected_account'],
-    });
-    expect(result).toEqual({ authorized: true, tools: ['post_on_connected_account'] });
-  });
-
-  // Greptile P1 #4: fullAutonomy governs how a blocking AskUserQuestion is ANSWERED
-  // (ENG-396/ENG-517) — "if Emma needs a decision mid-run she'll proceed with her
-  // recommended option". An owner ticking it consented to Emma choosing between
-  // options, NOT to Emma posting content they never saw. It must not grant publishing.
-  it('does NOT authorize on fullAutonomy — it is not a publish-consent control', () => {
-    const result = resolveSchedulePublishAuthorization({
-      fullAutonomy: true,
-      requiredFunctionCalls: ['post_on_connected_account'],
-    } as any);
-    expect(result.authorized).toBe(false);
-    expect(result.tools).toEqual([]);
-  });
-
-  it('does NOT authorize on fullAutonomy even combined with every other non-consent signal', () => {
-    const result = resolveSchedulePublishAuthorization({
-      fullAutonomy: true,
-      requiredFunctionCalls: ['post_on_connected_account'],
-      startingMessage: 'Post it automatically. Do not ask for approval.',
-    } as any);
-    expect(result.authorized).toBe(false);
-  });
-
-  it('AUTHORIZES on the mixed required-list shape, returning only the publish tools', () => {
-    const result = resolveSchedulePublishAuthorization({
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account'],
       requiredFunctionCalls: [
         'read_brand_guidelines',
         'generate_image',
@@ -168,83 +135,26 @@ describe('resolveSchedulePublishAuthorization (ENG-827)', () => {
         'post_on_connected_account',
       ],
     });
-    expect(result.authorized).toBe(true);
     expect(result.tools).toEqual(['post_on_connected_account']);
   });
 
-  it('covers publish tools by prefix and de-duplicates them in declaration order', () => {
-    const result = resolveSchedulePublishAuthorization({
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['publish_blog_article', 'post_on_connected_account'],
-      requiredFunctionCalls: ['publish_blog_article', 'post_on_connected_account', 'publish_blog_article'],
-    });
-    expect(result.authorized).toBe(true);
-    expect(result.tools).toEqual(['publish_blog_article', 'post_on_connected_account']);
-  });
-
-  // ── Consent is BOUND to the scope it was granted for (Greptile P1 #8) ──────
-  // Without this, editing requiredFunctionCalls after a grant silently re-scopes
-  // standing consent onto tools the owner never saw.
-  it('does NOT extend consent to a publish tool added AFTER the grant', () => {
-    const result = resolveSchedulePublishAuthorization({
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account'],
-      // the owner later added a second publishing tool they never consented to
-      requiredFunctionCalls: ['post_on_connected_account', 'publish_landing_page_changes'],
-    });
-    expect(result.authorized).toBe(true);
-    expect(result.tools).toEqual(['post_on_connected_account']);
-    expect(result.tools).not.toContain('publish_landing_page_changes');
-  });
-
-  it('drops to unauthorized when the approved tool is removed from the schedule', () => {
-    const result = resolveSchedulePublishAuthorization({
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account'],
-      requiredFunctionCalls: ['publish_landing_page_changes'],
-    });
-    expect(result).toEqual({ authorized: false, tools: [] });
-  });
-
-  it('fails closed when consent is recorded with no approved scope', () => {
-    // Unknown scope — cannot be treated as a licence for whatever is required now.
-    expect(
-      resolveSchedulePublishAuthorization({
-        autopublishAuthorized: true,
-        requiredFunctionCalls: ['post_on_connected_account'],
-      })
-    ).toEqual({ authorized: false, tools: [] });
-  });
-
-  it('ignores a malformed approved-tools list rather than trusting it', () => {
-    const result = resolveSchedulePublishAuthorization({
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: [null, 42, {}] as any,
-      requiredFunctionCalls: ['post_on_connected_account'],
-    });
-    expect(result).toEqual({ authorized: false, tools: [] });
-  });
-
-  // ── Tool scoping ───────────────────────────────────────────────────────────
   it('does NOT treat send/outreach tools as publish tools', () => {
     // send_email / linkedin_outreach are governed by SAFETY & VOLUME LIMITS, not the
-    // publish gate, so they never appear in the authorized tool list.
+    // publish gate, so they never appear in the reported tool list.
     const result = resolveSchedulePublishAuthorization({
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account'],
-      requiredFunctionCalls: ['send_email', 'linkedin_outreach', 'twitter_manage_post'],
+      requiredFunctionCalls: ['send_email', 'linkedin_outreach'],
     });
     expect(result.tools).toEqual([]);
   });
 
-  it('scopes the reported tools to the ones the owner actually named', () => {
+  it('reports no tools at all once the run is withheld', () => {
+    // `tools` is the checker's nudge scope, so a withheld run must offer none —
+    // that is what stops the checker demanding a publish the prompt forbids.
     const result = resolveSchedulePublishAuthorization({
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account'],
-      requiredFunctionCalls: ['post_on_connected_account'],
+      requirePublishApproval: true,
+      requiredFunctionCalls: ['post_on_connected_account', 'publish_blog_article'],
     });
-    expect(result.tools).toEqual(['post_on_connected_account']);
-    expect(result.tools).not.toContain('publish_landing_page_changes');
+    expect(result.tools).toEqual([]);
   });
 
   it('does not mutate or alias the caller\'s requiredFunctionCalls array', () => {
@@ -434,13 +344,11 @@ describe('isPublishCall — action-scoped publishing tools (ENG-827)', () => {
     expect(isPublishCapableTool('read_brand_guidelines')).toBe(false);
   });
 
-  // An owner must be able to authorize a thread-posting schedule at all, so consent
+  // An owner must be able to run a thread-posting schedule at all, so the nudge
   // SCOPE has to recognise these tools too — not just the dispatch guard.
-  it('lets consent be granted for an action-scoped tool', () => {
+  it('reports an action-scoped tool in the authorized scope', () => {
     expect(
       resolveSchedulePublishAuthorization({
-        autopublishAuthorized: true,
-        autopublishAuthorizedTools: ['twitter_manage_post'],
         requiredFunctionCalls: ['search_web', 'twitter_manage_post'],
       })
     ).toEqual({ authorized: true, tools: ['twitter_manage_post'] });
