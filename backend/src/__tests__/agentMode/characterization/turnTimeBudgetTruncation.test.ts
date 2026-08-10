@@ -60,15 +60,17 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
   });
 
   /**
-   * Drive the REAL loop. `makeTurn` receives the call index and whether the loop
-   * offered tools on this call; every call burns `msPerCall` of the wall clock.
+   * Drive the REAL loop. `makeTurn` receives the call index and whether this call is
+   * the forced final synthesis; every call burns `msPerCall` of the wall clock.
    *
-   * "Offered" means the loop passed a tool list at all — the harness registry is
-   * empty, so the list is `[]` on a normal turn and omitted entirely once the loop
-   * switches to its tool-free synthesis turn.
+   * The synthesis turn is detected the way production detects it — by the
+   * `[SYSTEM WARNING] ... time limit` nudge in the outgoing messages — NOT by the
+   * tool list. The loop deliberately keeps sending tools on that turn (dropping them
+   * would make Bedrock reject a history containing toolUse/toolResult blocks) and
+   * discards whatever the model calls instead.
    */
   async function runRealLoop(
-    makeTurn: (call: number, toolsOffered: boolean) => any,
+    makeTurn: (call: number, isFinalSynthesis: boolean) => any,
     msPerCall = 60_000,
     /**
      * The caller's whole-turn deadline stamp (ENG-907). The controller takes it right
@@ -80,15 +82,25 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
   ) {
     let call = 0;
     const toolsOfferedPerCall: boolean[] = [];
+    const finalSynthesisPerCall: boolean[] = [];
+    const executedTools: string[] = [];
     jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
       const options = args[2] || {};
-      const toolsOffered = options.tools !== undefined && options.tools !== null;
-      toolsOfferedPerCall.push(toolsOffered);
+      toolsOfferedPerCall.push(options.tools !== undefined && options.tools !== null);
+      const isFinalSynthesis = messages.some(
+        (m: any) =>
+          m?.role === 'user' &&
+          typeof m.content === 'string' &&
+          /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
+      );
+      finalSynthesisPerCall.push(isFinalSynthesis);
       nowMs += msPerCall;
-      return buildLLMResponse(makeTurn(call++, toolsOffered));
+      return buildLLMResponse(makeTurn(call++, isFinalSynthesis));
     });
     jest.spyOn(service as any, 'executeTool').mockImplementation(async (...args: any[]) => {
       const toolName: string = args[1];
+      executedTools.push(toolName);
       return JSON.stringify({ success: true, data: `mock:${toolName}` });
     });
     jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
@@ -111,25 +123,33 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       false, // persistIncrementally
       turnStartMs,
     )) as any;
-    return { result, elapsedMs: nowMs - startedAt, endedAtMs: nowMs, toolsOfferedPerCall };
+    return {
+      result,
+      elapsedMs: nowMs - startedAt,
+      endedAtMs: nowMs,
+      toolsOfferedPerCall,
+      finalSynthesisPerCall,
+      executedTools,
+    };
   }
 
   it('stops discovery and delivers a partial answer instead of running past the hard cap', async () => {
     // The model never volunteers a text-only turn — exactly like the production
     // session, it keeps searching until something stops it. It only produces the
-    // final answer when the loop takes the tools away.
-    const { result, elapsedMs, toolsOfferedPerCall } = await runRealLoop((call, toolsOffered) =>
-      toolsOffered
-        ? {
-            content: `Scanned batch ${call + 1} of X conversations.`,
-            tool_calls: [
-              { id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` },
-            ],
-          }
-        : {
-            content:
-              'Partial results — 6 of the 10 best posts I found so far:\n1. …\n\nStill missing: the second list of 10, the 5 accounts, and the reply ordering.',
-          },
+    // final answer when the loop stops honouring its tool calls.
+    const { result, elapsedMs, toolsOfferedPerCall, finalSynthesisPerCall } = await runRealLoop(
+      (call, isFinalSynthesis) =>
+        isFinalSynthesis
+          ? {
+              content:
+                'Partial results — 6 of the 10 best posts I found so far:\n1. …\n\nStill missing: the second list of 10, the 5 accounts, and the reply ordering.',
+            }
+          : {
+              content: `Scanned batch ${call + 1} of X conversations.`,
+              tool_calls: [
+                { id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` },
+              ],
+            },
     );
 
     // The run must end BEFORE the controller's hard cap — otherwise the whole
@@ -139,15 +159,48 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(result.truncatedByTimeBudget).toBe(true);
     // And the user actually gets the work that was already done.
     expect(result.content).toMatch(/Partial results/);
-    // The last LLM call was made with NO tools — that is what forces synthesis.
-    expect(toolsOfferedPerCall[toolsOfferedPerCall.length - 1]).toBe(false);
-    expect(toolsOfferedPerCall.filter((offered) => !offered)).toHaveLength(1);
+    // Exactly one forced synthesis turn, and it is the last thing the loop did.
+    expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
+    expect(finalSynthesisPerCall[finalSynthesisPerCall.length - 1]).toBe(true);
+    // Tools stayed on the wire for EVERY call, including that one: a Converse request
+    // replaying toolUse/toolResult history with no toolConfig is rejected outright, so
+    // withholding them here would turn the partial delivery into a hard error.
+    expect(toolsOfferedPerCall.every((offered) => offered)).toBe(true);
   });
 
-  it('warns the model to wrap up before it takes the tools away', async () => {
+  it('discards tool calls made during the forced synthesis instead of running them', async () => {
+    // The model ignores the nudge and tries to keep searching. The loop must not honour
+    // it — the whole point of the phase is that no new work can start. The turn ends with
+    // whatever text came back alongside the (dropped) call.
+    const { result, executedTools, finalSynthesisPerCall } = await runRealLoop(
+      (call, isFinalSynthesis) =>
+        isFinalSynthesis
+          ? {
+              content: 'Partial results — here is what I gathered before the time limit.',
+              tool_calls: [
+                { id: 'late', name: 'twitter_outreach', arguments: '{"cursor":999}' },
+              ],
+            }
+          : {
+              content: `Scanned batch ${call + 1}.`,
+              tool_calls: [
+                { id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` },
+              ],
+            },
+    );
+
+    expect(finalSynthesisPerCall.filter(Boolean)).toHaveLength(1);
+    expect(result.truncatedByTimeBudget).toBe(true);
+    expect(result.content).toMatch(/Partial results/);
+    // The late call never ran: exactly one tool executed per PRE-synthesis turn, and
+    // none for the synthesis turn itself.
+    expect(executedTools).toHaveLength(finalSynthesisPerCall.filter((f) => !f).length);
+  });
+
+  it('warns the model to wrap up before it stops honouring tool calls', async () => {
     let sawWrapUpNudge = false;
     let sawFinalNudge = false;
-    await runRealLoop((call, toolsOffered) => {
+    await runRealLoop((call, isFinalSynthesis) => {
       const messages = (service as any).callLLM.mock.calls[call]?.[1] || [];
       const text = messages
         .filter((m: any) => m.role === 'user' && typeof m.content === 'string')
@@ -155,12 +208,12 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
         .join('\n');
       if (/\[SYSTEM\][^\n]*time budget/i.test(text)) sawWrapUpNudge = true;
       if (/\[SYSTEM WARNING\][^\n]*time limit/i.test(text)) sawFinalNudge = true;
-      return toolsOffered
-        ? {
+      return isFinalSynthesis
+        ? { content: 'Here is what I gathered before the time limit.' }
+        : {
             content: `Scanned batch ${call + 1}.`,
             tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
-          }
-        : { content: 'Here is what I gathered before the time limit.' };
+          };
     });
 
     expect(sawWrapUpNudge).toBe(true);
@@ -168,13 +221,13 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
   });
 
   it('falls back to a partial-delivery message when the synthesis turn returns nothing', async () => {
-    const { result } = await runRealLoop((call, toolsOffered) =>
-      toolsOffered
-        ? {
+    const { result } = await runRealLoop((call, isFinalSynthesis) =>
+      isFinalSynthesis
+        ? { content: '' }
+        : {
             content: '',
             tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
-          }
-        : { content: '' },
+          },
     );
 
     expect(result.truncatedByTimeBudget).toBe(true);
@@ -189,13 +242,13 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     // cap that much LATER than the deadline actually enforced — the setup latency would
     // come straight out of the synthesis reserve, and a slow enough setup would let the
     // controller guillotine the turn before the loop ever wrapped itself up.
-    const keepSearching = (call: number, toolsOffered: boolean) =>
-      toolsOffered
-        ? {
+    const keepSearching = (call: number, isFinalSynthesis: boolean) =>
+      isFinalSynthesis
+        ? { content: 'Partial results — here is what I gathered before the time limit.' }
+        : {
             content: `Scanned batch ${call + 1}.`,
             tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
-          }
-        : { content: 'Partial results — here is what I gathered before the time limit.' };
+          };
 
     const SETUP_LATENCY_MS = 180_000; // 3 min burned before the loop starts
 
@@ -214,15 +267,15 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(withStamp.result.truncatedByTimeBudget).toBe(true);
     expect(withStamp.result.content).toMatch(/Partial results/);
     expect(withStamp.endedAtMs).toBeLessThanOrEqual(callerTurnStartMs + CAP_MS);
-    expect(withStamp.toolsOfferedPerCall.length)
-      .toBeLessThan(withoutStamp.toolsOfferedPerCall.length);
+    expect(withStamp.finalSynthesisPerCall.length)
+      .toBeLessThan(withoutStamp.finalSynthesisPerCall.length);
     // Without the stamp the loop would have run SETUP_LATENCY_MS past that deadline.
     expect(callerTurnStartMs + SETUP_LATENCY_MS + withoutStamp.elapsedMs)
       .toBeGreaterThan(callerTurnStartMs + CAP_MS);
   });
 
   it('does NOT fire on a fast run that finishes well inside the budget (no false positive)', async () => {
-    const { result, elapsedMs, toolsOfferedPerCall } = await runRealLoop(
+    const { result, elapsedMs, finalSynthesisPerCall } = await runRealLoop(
       (call) =>
         call === 0
           ? { tool_calls: [{ id: 'c0', name: 'twitter_outreach', arguments: '{"cursor":0}' }] }
@@ -232,8 +285,8 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
 
     expect(result.truncatedByTimeBudget).toBeFalsy();
     expect(elapsedMs).toBeLessThan(CAP_MS / 2);
-    // Tools were offered on every call — the loop never entered synthesis mode.
-    expect(toolsOfferedPerCall.every((offered) => offered)).toBe(true);
+    // The loop never entered synthesis mode — no nudge was ever injected.
+    expect(finalSynthesisPerCall.some(Boolean)).toBe(false);
     expect(result.content).toMatch(/10 best posts/);
   });
 });
