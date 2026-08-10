@@ -10,7 +10,7 @@
 //     `gcUnresolvedMaxAgeDays` (scratch dirs like `tsc-heap` otherwise leak forever).
 
 import { spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, readdirSync, rmSync, statSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, readdirSync, rmSync, statSync, renameSync, readlinkSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { config } from './config.mjs';
@@ -160,12 +160,48 @@ export function ageDaysOf(WT) {
 // closes the scan→rename window: any write in that window bumps an mtime, the re-check
 // sees it, and the dir is restored untouched. Returns the quarantine path to delete, or
 // null to keep (tree restored, or rename itself raced → nothing to do).
-export function quarantineIfStillAged(WT, minAgeDays) {
+// A rename does not invalidate already-open file descriptors (or a process cwd), so a
+// holder inside the quarantined tree could keep writing right up to rmSync — and those
+// writes would be silently destroyed. /proc is the ground truth for that on the Linux
+// runner: scan every process's fd table and cwd for paths inside the quarantined dir.
+// Any holder, or any inability to prove there is none (no /proc, unreadable entries
+// racing away are fine, but a missing table is not) → treat as live. Exported with an
+// injectable proc root so tests can build a fake /proc tree.
+export function openHandleHolders(dir, procRoot = '/proc') {
+  let real;
+  try { real = realpathSync(dir); } catch { return null; } // dir vanished mid-check → can't prove
+  const prefix = real + path.sep;
+  const inside = (p) => p === real || p.startsWith(prefix);
+  let pids;
+  try { pids = readdirSync(procRoot).filter((n) => /^\d+$/.test(n)); } catch { return null; }
+  const holders = [];
+  for (const pid of pids) {
+    const base = path.join(procRoot, pid);
+    try { if (inside(readlinkSync(path.join(base, 'cwd')))) { holders.push(pid); continue; } } catch { /* process gone or not ours — its cwd can't be ours to lose */ }
+    let fds = [];
+    try { fds = readdirSync(path.join(base, 'fd')); } catch { continue; }
+    for (const fd of fds) {
+      try { if (inside(readlinkSync(path.join(base, 'fd', fd)))) { holders.push(pid); break; } } catch { /* fd closed mid-scan */ }
+    }
+  }
+  return holders;
+}
+
+export function quarantineIfStillAged(WT, minAgeDays, procRoot = '/proc') {
   const q = `${WT}.gc-quarantine`;
   try { renameSync(WT, q); } catch { return null; }
-  const age = ageDaysOf(q);
-  if (age === null || age <= minAgeDays) {
+  const restore = () => {
     try { renameSync(q, WT); } catch (e) { console.error('[gc] restore from quarantine failed:', q, e.message); }
+  };
+  const age = ageDaysOf(q);
+  if (age === null || age <= minAgeDays) { restore(); return null; }
+  // Age re-check only proves no *completed* write; a process holding an open fd (or its
+  // cwd) inside the tree can still write after it. No holders — proven via /proc — is
+  // the condition for deletion; holders present or unprovable → restore and keep.
+  const holders = openHandleHolders(q, procRoot);
+  if (holders === null || holders.length > 0) {
+    log(`quarantine ${q}: ${holders === null ? 'open-handle check unavailable' : `open handles held by pid(s) ${holders.join(', ')}`} → keep`);
+    restore();
     return null;
   }
   return q;

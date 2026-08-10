@@ -214,3 +214,97 @@ test('quarantineIfStillAged fails safe to keep when the rename itself races (dir
     assert.equal(quarantineIfStillAged(join(d, 'never-existed'), 14), null);
   } finally { rm(d, { recursive: true, force: true }); }
 });
+
+// A rename preserves already-open file descriptors and process cwds, so the age re-check
+// alone cannot see a holder that will write right up to rmSync. openHandleHolders proves
+// via /proc that no process holds a handle inside the quarantined tree; holders present or
+// an unprovable check (no /proc) → restore and keep. Fake /proc trees drive each branch.
+import { openHandleHolders } from '../gc.mjs';
+import { symlinkSync } from 'node:fs';
+
+function makeTree(d, ageDays = 30) {
+  const t = join(d, 'wt');
+  mkdirSync(t);
+  wf(join(t, 'f.txt'), 'x');
+  const old = (Date.now() - ageDays * 86400000) / 1000;
+  utimesSync(join(t, 'f.txt'), old, old);
+  utimesSync(t, old, old);
+  return t;
+}
+function makeProc(d, entries) {
+  const proc = join(d, 'proc');
+  mkdirSync(proc);
+  for (const [pid, { cwd, fds = {} }] of Object.entries(entries)) {
+    const base = join(proc, pid);
+    mkdirSync(base);
+    mkdirSync(join(base, 'fd'));
+    if (cwd) symlinkSync(cwd, join(base, 'cwd'));
+    for (const [fd, target] of Object.entries(fds)) symlinkSync(target, join(base, 'fd', fd));
+  }
+  return proc;
+}
+
+test('openHandleHolders reports a pid holding an fd inside the dir, ignores outsiders', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-fd-'));
+  try {
+    const t = makeTree(d);
+    const proc = makeProc(d, {
+      101: { cwd: d, fds: { 3: join(t, 'f.txt') } },
+      102: { cwd: '/', fds: { 3: join(d, 'elsewhere.txt') } },
+    });
+    assert.deepEqual(openHandleHolders(t, proc), ['101']);
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
+test('openHandleHolders reports a pid whose cwd is inside the dir', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-fd-'));
+  try {
+    const t = makeTree(d);
+    const proc = makeProc(d, { 201: { cwd: t } });
+    assert.deepEqual(openHandleHolders(t, proc), ['201']);
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
+test('openHandleHolders returns null (unprovable) when the proc table is unreadable', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-fd-'));
+  try {
+    const t = makeTree(d);
+    assert.equal(openHandleHolders(t, join(d, 'no-such-proc')), null);
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
+test('quarantineIfStillAged restores and keeps an aged tree with a live fd holder', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-fd-'));
+  try {
+    const t = makeTree(d);
+    const proc = makeProc(d, { 301: { cwd: '/', fds: { 4: join(t, 'f.txt') } } });
+    // The holder's fd symlink points at the ORIGINAL path; after the quarantine rename the
+    // kernel would rewrite it to the quarantined path. Point the fake at the post-rename
+    // path, which is what the real /proc shows at check time.
+    rm(join(proc, '301', 'fd', '4'), { force: true });
+    symlinkSync(join(`${t}.gc-quarantine`, 'f.txt'), join(proc, '301', 'fd', '4'));
+    const q = quarantineIfStillAged(t, 14, proc);
+    assert.equal(q, null, 'tree with a live holder must not be reaped');
+    assert.ok(ex(t), 'tree must be restored to its original path');
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
+test('quarantineIfStillAged restores and keeps when the holder check is unprovable', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-fd-'));
+  try {
+    const t = makeTree(d);
+    const q = quarantineIfStillAged(t, 14, join(d, 'no-such-proc'));
+    assert.equal(q, null, 'unprovable holder check must fail safe to keep');
+    assert.ok(ex(t), 'tree must be restored to its original path');
+  } finally { rm(d, { recursive: true, force: true }); }
+});
+
+test('quarantineIfStillAged reaps an aged tree when /proc proves no holders', () => {
+  const d = mkdtempSync(join(tmpdir(), 'gc-fd-'));
+  try {
+    const t = makeTree(d);
+    const proc = makeProc(d, { 401: { cwd: '/', fds: { 3: '/somewhere/else' } } });
+    const q = quarantineIfStillAged(t, 14, proc);
+    assert.ok(q && ex(q), 'holder-free aged tree must be reaped');
+  } finally { rm(d, { recursive: true, force: true }); }
+});
