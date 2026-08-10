@@ -28,7 +28,13 @@ jest.mock("aws-sdk", () => ({
 import { orgDb } from "../services/db";
 
 describe("updateShareSettings", () => {
-  beforeEach(() => { mockUpdate.mockReset(); mockGet.mockReset(); });
+  beforeEach(() => {
+    mockUpdate.mockReset();
+    mockGet.mockReset();
+    jest.useRealTimers();
+  });
+
+  afterEach(() => { jest.useRealTimers(); });
 
   it("writes the shareSettings field as a single UpdateItem", async () => {
     mockUpdate.mockResolvedValueOnce({});
@@ -57,6 +63,24 @@ describe("updateShareSettings", () => {
     await orgDb.updateShareSettings("org-1", settings, undefined);
     const args = mockUpdate.mock.calls[0][0];
     expect(args.ConditionExpression).toBe("attribute_not_exists(updatedAt)");
+  });
+
+  it.each([
+    ["the clock equals the prior revision", "2026-01-01T00:00:00.000Z", "2026-01-01T00:00:00.001Z"],
+    ["the clock is one millisecond behind", "2026-01-01T00:00:00.001Z", "2026-01-01T00:00:00.002Z"],
+    ["the clock is well behind", "2026-01-01T00:00:01.000Z", "2026-01-01T00:00:01.001Z"],
+  ])("advances the revision when %s", async (_case, expectedUpdatedAt, nextUpdatedAt) => {
+    jest.useFakeTimers().setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    mockUpdate.mockResolvedValueOnce({});
+
+    await orgDb.updateShareSettings(
+      "org-1",
+      { brandGuidelines: { editors: [] } } as any,
+      expectedUpdatedAt,
+    );
+
+    const args = mockUpdate.mock.calls[0][0];
+    expect(args.ExpressionAttributeValues[":u"]).toBe(nextUpdatedAt);
   });
 });
 

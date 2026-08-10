@@ -9302,6 +9302,15 @@ export const orgDb = {
   // ConditionalCheckFailedException instead of a silent last-writer-wins
   // that erases the other writer's grants.
   async updateShareSettings(orgId: string, settings: OrgShareSettings, expectedUpdatedAt: string | undefined): Promise<void> {
+    const nowMs = Date.now();
+    const expectedMs = expectedUpdatedAt === undefined ? Number.NaN : Date.parse(expectedUpdatedAt);
+    // `updatedAt` is the compare-and-swap revision for this whole-document
+    // write. It must advance even when two writes land in the same millisecond
+    // (or this process's clock trails the stored revision), otherwise the next
+    // stale writer can match the old token and silently overwrite this write.
+    const nextUpdatedAt = new Date(
+      Number.isFinite(expectedMs) && expectedMs >= nowMs ? expectedMs + 1 : nowMs,
+    ).toISOString();
     await dynamodb.update({
       TableName: ORGS_TABLE,
       Key: { orgId },
@@ -9312,7 +9321,7 @@ export const orgDb = {
           : "attribute_not_exists(updatedAt)",
       ExpressionAttributeValues: {
         ":s": settings,
-        ":u": new Date().toISOString(),
+        ":u": nextUpdatedAt,
         ...(expectedUpdatedAt !== undefined ? { ":expected": expectedUpdatedAt } : {}),
       },
     }).promise();
