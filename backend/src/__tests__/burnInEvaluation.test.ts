@@ -817,6 +817,22 @@ describe('evaluateBurnIn — production window alignment (ENG-938)', () => {
     expect(a.reason).toMatch(/missing the snapshot window/i);
   });
 
+  it('collapses a current-day row and the completed row that closes the same day', () => {
+    // The store can briefly hold both: today's row written at `now`, and the
+    // completed row for the same day closing at T23:59:59.999Z. Two rows on one
+    // closing day must not shift the period and read as a missing window.
+    const a = evaluateBurnIn({
+      snapshots: [...snapshots, ...completed('2026-08-04')],
+      releaseAt: RELEASE,
+      releaseIssueId: 'ENG-938',
+    });
+
+    expect(a.reason).not.toMatch(/missing the snapshot window/i);
+    expect(a.verdict).toBe('clean');
+    expect(a.passesClosureCheck4).toBe(true);
+    expect(a.postRelease?.date).toBe('2026-08-04');
+  });
+
   it('still refuses to scan a regression outside the seven-window period', () => {
     const a = evaluateBurnIn({
       snapshots: [

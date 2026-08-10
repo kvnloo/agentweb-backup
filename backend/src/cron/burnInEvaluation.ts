@@ -409,14 +409,25 @@ export function evaluateBurnIn(input: EvaluateBurnInInput): BurnInAssessment {
       stepsBack += 1;
     }
     const firstPeriodDay = closingDayIndex(afterAll[0]) - stepsBack;
-    const inPeriod = afterAll.filter((snapshot) => {
+    // Exactly one authoritative window closes per UTC day, but the store can
+    // briefly hold two rows that close on the same day — the current-day row
+    // written at `now` and the completed-day row that later closes the same day
+    // at `T23:59:59.999Z`. Two rows sharing an index would push every later row
+    // one slot forward and read as a missing window, so collapse a shared day
+    // to its LAST (latest-closing, most complete) row before positioning.
+    const byClosingDay = new Map<number, ReliabilitySnapshot>();
+    for (const snapshot of afterAll) {
       const day = closingDayIndex(snapshot);
-      return (
-        Number.isFinite(day) &&
-        day >= firstPeriodDay &&
-        day < firstPeriodDay + BURN_IN_POST_RELEASE_WINDOW_LIMIT
-      );
-    });
+      if (!Number.isFinite(day)) continue;
+      if (day < firstPeriodDay || day >= firstPeriodDay + BURN_IN_POST_RELEASE_WINDOW_LIMIT) continue;
+      const existing = byClosingDay.get(day);
+      if (!existing || boundaryMs(snapshot.windowEnd) >= boundaryMs(existing.windowEnd)) {
+        byClosingDay.set(day, snapshot);
+      }
+    }
+    const inPeriod = [...byClosingDay.entries()]
+      .sort(([a], [b]) => a - b)
+      .map(([, snapshot]) => snapshot);
 
     // Evidence must be CONTIGUOUS from the start of the period AND unbroken up
     // to the last window read. Two weaker rules were tried and both produce a
