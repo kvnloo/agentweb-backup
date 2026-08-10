@@ -14,7 +14,8 @@
 
 import express, { Request, Response, Router } from 'express';
 import { AuthenticatedRequest } from '../middleware/auth';
-import { crmDb, userDb } from '../services/db';
+import { crmDb } from '../services/db';
+import { canAccessCrmList, canDestructiveCrmList } from '../services/crmAccessControl';
 import { getEnrichSoService } from '../services/enrichSoService';
 import { QuotaExceededError, LookupByEmailQuotaExceededError, type QuotaTracker } from '../services/enrichSoQuota';
 import { validateLeadsInBackground } from '../services/enrichSoLeadValidation';
@@ -58,18 +59,6 @@ function getQuotaTracker(): QuotaTracker | null {
 
 const router: Router = express.Router();
 
-async function canAccessCrmList(
-  userId: string,
-  list: { userId: string } | Record<string, any>,
-): Promise<boolean> {
-  if (list.userId === userId) return true;
-  const [user, owner] = await Promise.all([
-    userDb.getUserById(userId),
-    userDb.getUserById(list.userId),
-  ]);
-  return !!(user?.orgId && owner?.orgId && user.orgId === owner.orgId);
-}
-
 /**
  * POST /lists/:listId/leads/:leadId/validate-email
  * Body: { autoDncOnFailure?: boolean }   — default true
@@ -91,7 +80,7 @@ router.post('/lists/:listId/leads/:leadId/validate-email', async (req: Request, 
   try {
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
+    if (!(await canDestructiveCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
     const lead: any = await crmDb.getLeadById(listId, leadId);
@@ -247,7 +236,7 @@ router.post('/leads/find-email', async (req: Request, res: Response) => {
       if (!persistList) {
         return res.status(404).json({ message: 'persistTo lead list not found' });
       }
-      if (!(await canAccessCrmList(userId, persistList as any))) {
+      if (!(await canDestructiveCrmList(userId, persistList as any))) {
         return res.status(403).json({ message: 'Access denied' });
       }
       const dbLead = await crmDb.getLeadById(persistToListId, persistToLeadId).catch(() => null) as LeadRecord | null;
@@ -493,7 +482,7 @@ router.post('/lists/:listId/leads/find-emails', async (req: Request, res: Respon
   try {
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
+    if (!(await canDestructiveCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
     let leads: any[];
@@ -542,7 +531,7 @@ router.post('/lists/:listId/leads/lookup-emails', async (req: Request, res: Resp
   try {
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
+    if (!(await canDestructiveCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
     let leads: any[];
@@ -605,7 +594,7 @@ router.post('/lists/:listId/leads/validate-emails', async (req: Request, res: Re
   try {
     const list = await crmDb.getLeadListById(listId);
     if (!list) return res.status(404).json({ message: 'Lead list not found' });
-    if (!(await canAccessCrmList(userId, list as any))) {
+    if (!(await canDestructiveCrmList(userId, list as any))) {
       return res.status(403).json({ message: 'Access denied' });
     }
 

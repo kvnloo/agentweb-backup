@@ -1,6 +1,7 @@
 import express from 'express';
 import { authenticateToken } from '../middleware/auth';
-import { crmDb, userDb } from '../services/db';
+import { crmDb } from '../services/db';
+import { canAccessCrmList, canDestructiveCrmList } from '../services/crmAccessControl';
 import {
   externalCrmSyncService,
 } from '../services/externalCrmSyncService';
@@ -11,26 +12,27 @@ router.use(authenticateToken);
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-// Grants access when the user owns the list OR belongs to the same org as the
-// list owner. Mirrors `canAccessCrmList` in crm.ts so org members share lead
-// lists (and their CRM sync configs) consistently across every CRM surface.
+// Grants access to a list's CRM sync surface. Delegates to the shared ENG-686
+// guards (crmAccessControl.ts) so external-CRM sync/push/pull/delete honours
+// the same owner/org-owner/crm.editors rule as every other CRM write surface.
+// `destructive: false` (read-only endpoints) uses the weaker read guard, which
+// still honours the `crm.enabled` toggle; everything else requires being the
+// list owner, the org owner, or a listed crm.editor.
 async function verifyListOwnership(
   userId: string,
-  listId: string
+  listId: string,
+  opts: { destructive?: boolean } = {}
 ): Promise<{ ok: boolean; status?: number; error?: string }> {
   const list = await crmDb.getLeadListById(listId);
   if (!list) return { ok: false, status: 404, error: 'Lead list not found' };
 
-  const ownerId = (list as any).userId;
-  if (ownerId === userId) return { ok: true };
+  const destructive = opts.destructive !== false;
+  const allowed = destructive
+    ? await canDestructiveCrmList(userId, list as any)
+    : await canAccessCrmList(userId, list as any);
+  if (!allowed) return { ok: false, status: 403, error: 'Access denied' };
 
-  const [user, owner] = await Promise.all([
-    userDb.getUserById(userId),
-    userDb.getUserById(ownerId),
-  ]);
-  if (user?.orgId && owner?.orgId && user.orgId === owner.orgId) return { ok: true };
-
-  return { ok: false, status: 403, error: 'Access denied' };
+  return { ok: true };
 }
 
 // ─── Default field mappings ───────────────────────────────────────────────────
@@ -59,7 +61,7 @@ router.get('/custom-fields/:listId', async (req: any, res) => {
     const { listId } = req.params;
     const provider = req.query.provider as string;
 
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const [keys, defaults] = await Promise.all([
@@ -85,7 +87,7 @@ router.get('/config/:listId/:provider', async (req: any, res) => {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { listId, provider } = req.params;
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const config = await externalCrmSyncService.getConfig(userId, listId, provider);
@@ -288,7 +290,7 @@ router.get('/external-properties/:listId/:provider', async (req: any, res) => {
       return res.status(400).json({ error: 'Unsupported provider. Use hubspot or attio.' });
     }
 
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const { objectType, accountId, apiKey } = req.query as {
@@ -348,7 +350,7 @@ router.get('/lifecycle-stages/:listId/:provider', async (req: any, res) => {
       return res.status(400).json({ error: 'Lifecycle stages are only supported for HubSpot.' });
     }
 
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const { accountId, apiKey } = req.query as { accountId?: string; apiKey?: string };
@@ -366,7 +368,7 @@ router.get('/external-pipelines/:listId/:provider', async (req: any, res) => {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { listId, provider } = req.params;
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const { accountId, apiKey } = req.query as { accountId?: string; apiKey?: string };
@@ -494,7 +496,7 @@ router.get('/push/:listId/:provider/status', async (req: any, res) => {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { listId, provider } = req.params;
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const job = await externalCrmSyncService.getPushJob(userId, listId, provider);
@@ -515,7 +517,7 @@ router.get('/push/:listId/status', async (req: any, res) => {
     if (!userId) return res.status(401).json({ error: 'Unauthorized' });
 
     const { listId } = req.params;
-    const ownership = await verifyListOwnership(userId, listId);
+    const ownership = await verifyListOwnership(userId, listId, { destructive: false });
     if (!ownership.ok) return res.status(ownership.status!).json({ error: ownership.error });
 
     const running = await externalCrmSyncService.getRunningPushJobForList(userId, listId);
