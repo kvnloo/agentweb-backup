@@ -1,4 +1,3 @@
-import * as harnessModule from '../scripts/qa-fixture-harness';
 import {
   AdminGrantToken,
   AdminGrantRequest,
@@ -10,16 +9,14 @@ import {
   QaTerminationSignal,
   QA_TERMINATION_SIGNALS,
   TemporaryAdminAdapters,
+  DynamoUpdatePort,
+  createDynamoTemporaryAdminAdapters,
+  createEnvCredentialsLoader,
+  createProcessChildAdapters,
   preflightFixtures,
+  runCli,
   runWithTemporaryAdmin,
 } from '../scripts/qa-fixture-harness';
-
-// Red-stage bridge (TDD): these exports do not exist yet. Destructuring through a
-// loose cast makes the new tests fail at RUNTIME ("not a function") instead of
-// failing the whole suite at compile time, so the salvaged core tests still pass
-// in the same red run. Replaced by direct typed imports once implemented.
-const { runCli, createEnvCredentialsLoader, createDynamoTemporaryAdminAdapters } =
-  harnessModule as unknown as Record<string, any>;
 
 const fixtures: QaFixture[] = [
   {
@@ -393,8 +390,10 @@ describe('DynamoDB compare-and-set adapters', () => {
     runId: 'run-abc',
   };
 
-  function fakeDocClient(impl: (params: unknown) => Promise<unknown>) {
-    const update = jest.fn((params: unknown) => ({ promise: () => impl(params) }));
+  type UpdateParams = Parameters<DynamoUpdatePort['update']>[0];
+
+  function fakeDocClient(impl: (params: UpdateParams) => Promise<unknown>) {
+    const update = jest.fn((params: UpdateParams) => ({ promise: () => impl(params) }));
     return { update };
   }
 
@@ -409,7 +408,7 @@ describe('DynamoDB compare-and-set adapters', () => {
     });
 
     expect(grant).toMatchObject({ userId: 'user-1', previousValue: false, version: 'run-abc' });
-    const params = docClient.update.mock.calls[0][0] as Record<string, unknown>;
+    const params = docClient.update.mock.calls[0][0];
     expect(params.TableName).toBe('Dev-AW-Users');
     expect(params.Key).toEqual({ email: 'eng658-realdomain-check@agentweb.pro' });
     expect(String(params.ConditionExpression)).toContain('userId');
@@ -446,5 +445,58 @@ describe('DynamoDB compare-and-set adapters', () => {
         version: 'run-abc',
       }),
     ).rejects.toThrow('throughput exceeded');
+  });
+
+  it('revoke pins the exact row and run: email key, userId + granted value + run id condition', async () => {
+    const docClient = fakeDocClient(async () => ({}));
+    const adapters = createDynamoTemporaryAdminAdapters(target, docClient);
+
+    await expect(
+      adapters.revokeIfCurrent({
+        userId: 'user-1',
+        previousValue: false,
+        expectedGrantedValue: true,
+        version: 'run-abc',
+      }),
+    ).resolves.toBe(true);
+
+    const params = docClient.update.mock.calls[0][0];
+    expect(params.Key).toEqual({ email: 'eng658-realdomain-check@agentweb.pro' });
+    expect(String(params.ConditionExpression)).toContain('qaAdminGrantRunId');
+    expect(params.ExpressionAttributeValues).toMatchObject({
+      ':uid': 'user-1',
+      ':runId': 'run-abc',
+      ':previous': false,
+    });
+  });
+});
+
+describe('process child adapters', () => {
+  it('startChild reports the real child exit code', async () => {
+    const { startChild } = createProcessChildAdapters();
+
+    const child = await startChild([process.execPath, '-e', 'process.exit(7)']);
+
+    await expect(child.wait()).resolves.toBe(7);
+  });
+
+  it('terminate kills a long-running child and wait still resolves', async () => {
+    const { startChild } = createProcessChildAdapters();
+
+    const child = await startChild([process.execPath, '-e', 'setInterval(() => {}, 1000)']);
+    child.terminate('SIGTERM');
+
+    await expect(child.wait()).resolves.toBeGreaterThanOrEqual(0);
+  });
+
+  it('onSignal registers a process listener and the disposer removes it', () => {
+    const { onSignal } = createProcessChildAdapters();
+    const before = process.listenerCount('SIGHUP');
+
+    const dispose = onSignal('SIGHUP', async () => undefined);
+    expect(process.listenerCount('SIGHUP')).toBe(before + 1);
+
+    dispose();
+    expect(process.listenerCount('SIGHUP')).toBe(before);
   });
 });
