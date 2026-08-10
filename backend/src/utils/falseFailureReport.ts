@@ -73,7 +73,22 @@ const CONFIRMED_PUBLISH_TOOLS: ReadonlySet<string> = new Set<string>([
   'generate_landing_page',
   'duplicate_landing_page',
   'publish_blog_article',
+  // A duplicate social post or a duplicate outreach email is as unrecoverable as a
+  // duplicate deploy, so a false failure after one is just as costly.
+  'post_on_connected_account',
+  'post_thread',
+  'send_email_to_lead',
+  'send_email_from_sender',
+  'send_dm',
 ]);
+
+/**
+ * Deliberately absent: `twitter_manage_post`. It multiplexes create/delete/read
+ * behind one name, and on the diagnosis path only the NAME survives the throw — a
+ * successful delete would be announced as "posted". This guard's whole contract is
+ * that it cannot claim an outcome the ledger does not show, so an ambiguous name is
+ * excluded rather than guessed.
+ */
 
 /** Plain-language label per tool, so the correction reads as prose, not tool names. */
 const PUBLISH_ACTION_LABELS: Record<string, string> = {
@@ -82,50 +97,101 @@ const PUBLISH_ACTION_LABELS: Record<string, string> = {
   generate_landing_page: 'deployed your landing page',
   duplicate_landing_page: 'deployed your landing page',
   publish_blog_article: 'published your blog article',
+  post_on_connected_account: 'posted to your connected account',
+  post_thread: 'posted your thread',
+  send_email_to_lead: 'sent your email',
+  send_email_from_sender: 'sent your email',
+  send_dm: 'sent your direct message',
 };
 
 /** Marker on the appended correction — keeps a second pass idempotent. */
 const CORRECTION_MARKER = '⚠️ Correction: the run log confirms this session DID complete';
 
 /**
- * "…the system timed out…" — an interruption asserted about the run itself. Also
- * covers the "connection was lost / interrupted" phrasings of the same claim.
+ * "…the system timed out…" — an interruption asserted about the run itself. The
+ * message is written by an LLM, so this cannot key off one sentence: "cut short",
+ * "ended unexpectedly", "ran out of time" and "partway through" are the same claim
+ * in the diagnosis agent's own vocabulary.
  */
-const INTERRUPTION_CLAIM_RE = /\btimed[- ]out\b|\btimeouts?\b|\b(?:session|connection|request)\b[^.!?\n]{0,40}\b(?:was )?(?:interrupted|dropped|lost)\b/i;
+const INTERRUPTION_CLAIM_RE = new RegExp([
+  String.raw`\btimed[- ]out\b`,
+  String.raw`\btimeouts?\b`,
+  String.raw`\bran\s+out\s+of\s+time\b`,
+  String.raw`\bcut\s+short\b`,
+  String.raw`\bended\s+unexpectedly\b`,
+  String.raw`\bpartway\s+through\b`,
+  String.raw`\bdid\s*n[o']?t\s+finish\b`,
+  String.raw`\b(?:session|connection|request|run)\b[^.!?\n]{0,40}\b(?:was )?(?:interrupted|dropped|lost)\b`,
+].join('|'), 'i');
 
 /**
- * "…your changes were not saved…" / "…nothing was saved…" / "…your edits were lost…".
- * Requires an explicit not-saved/lost assertion — an accurate, scoped caveat such as
- * "I could not save a memory note" must NOT match (it names the note, not the work).
+ * The loss claim comes in two grammatically OPPOSITE shapes, and conflating them is
+ * what makes a naive regex both miss real failures and fire on truthful reassurance:
+ *
+ *   DENIED SUCCESS — "not saved", "never applied", "did not go through", "nothing
+ *   was published". A negator is REQUIRED for these to assert loss; they are already
+ *   negative, so they need no further negation check.
+ *
+ *   ASSERTED LOSS — "your changes were lost / discarded / reverted". These assert
+ *   loss on their own, which means a negator FLIPS them into reassurance: "no work
+ *   was lost" and "your changes were not lost" are both truthful.
+ *
+ * Handling them with one pattern is why "your changes were not lost" would previously
+ * have fired the guard: the negator sat INSIDE the match, where a prefix-only check
+ * could never see it.
  */
-const NOT_SAVED_CLAIM_RE =
-  /\b(?:was|were|are|is)\s*n[o']?t\s+saved\b|\bnot\s+(?:been\s+)?saved\b|\bnothing\s+(?:was\s+)?saved\b|\bnot\s+persisted\b|\bdid\s*n[o']?t\s+save\b|\b(?:changes?|edits?|updates?|work|progress|fixes?)\b[^.!?\n]{0,40}\b(?:were|was|are|is)?\s*(?:lost|discarded|rolled\s+back|reverted)\b/i;
+const DENIED_SUCCESS_RE = new RegExp([
+  String.raw`\b(?:was|were|are|is|has|have|had|been)\s*n[o']?t\s+(?:been\s+)?(?:saved|persisted|applied|published|deployed|posted|sent|committed|stored)\b`,
+  String.raw`\bnot\s+(?:been\s+)?(?:saved|persisted|applied|published|deployed|posted|sent|committed|stored)\b`,
+  String.raw`\b(?:was|were|are|is)\s+never\s+(?:saved|persisted|applied|published|deployed|posted|sent)\b`,
+  String.raw`\bdid\s*n[o']?t\s+(?:save|persist|apply|publish|deploy|post|send|go\s+through|make\s+it)\b`,
+  String.raw`\bcould\s*n[o']?t\s+be\s+(?:saved|persisted|applied|published|deployed|posted|sent|committed)\b`,
+  // Scoped to the WORK, so a truthful "I could not complete the competitor
+  // comparison" or "…could not complete the memory note" stays silent.
+  String.raw`\bcould\s*n[o']?t\s+(?:complete|finish)\s+(?:the\s+|your\s+)?(?:deployment|deploy|publish\w*|update|changes?|fix(?:es)?|edits?|post|send)\b`,
+  String.raw`\bmay\s+n[o']?t\s+have\s+(?:been\s+)?(?:saved|persisted|applied|published|deployed|sent|gone\s+through)\b`,
+  String.raw`\bnothing\s+(?:was\s+)?(?:saved|persisted|applied|published|deployed|posted|sent)\b`,
+  String.raw`\bnone\s+of\s+(?:the|your|these|those)\s+[^.!?\n]{0,30}?\b(?:made\s+it|went\s+through|(?:was|were)\s+(?:saved|applied|published|deployed|sent|posted))\b`,
+  // "…cut short BEFORE the changes could be applied" — negative by structure, with
+  // no negator anywhere in it. Requires "could BE <verb>", so "before I could save a
+  // memory note" (a truthful scoped caveat) does not match.
+  String.raw`\bbefore\s+[^.!?\n]{0,30}?\bcould\s+be\s+(?:saved|applied|published|deployed|sent|posted|committed)\b`,
+].join('|'), 'i');
+
+/** "…your changes were lost…" — asserts loss outright, so a negator cancels it. */
+const ASSERTED_LOSS_RE =
+  /\b(?:changes?|edits?|updates?|work|progress|fixes?|deployment|post|email|message)\b[^.!?\n]{0,40}\b(?:were|was|are|is|been)?\s*(?:lost|discarded|rolled\s+back|reverted|thrown\s+away|wiped)\b/i;
 
 /**
- * Negators that turn a not-saved clause into a truthful REASSURANCE — "but no work
- * was lost", "however, none of your work was lost", "recovered without any work
- * lost". Matched only against the text PRECEDING the loss/save term inside the same
- * clause, so a genuine "nothing was saved" (where the negator IS the subject that
- * went missing) still counts as an assertion.
+ * Negators that turn an asserted loss into a truthful REASSURANCE — "but no work was
+ * lost", "however, none of your work was lost". Checked against the text PRECEDING
+ * the match inside the same clause.
  */
 const NEGATED_LOSS_PREFIX_RE = /\b(?:no|none|nothing|without|never)\b[^.!?;,\n]{0,24}$/i;
+
+/** The same negators appearing INSIDE the match — "your changes were not lost". */
+const NEGATOR_WITHIN_RE = /\b(?:not|never|n't|no)\b/i;
 
 /** Clause boundaries — a negator only negates within its own clause. */
 const CLAUSE_BOUNDARY_RE = /[.!?;,\n][^.!?;,\n]*$/;
 
 /**
- * The not-saved half of the pattern, ignoring clauses whose loss/save term is negated.
- * All matches are considered: one truthful "no work was lost" clause elsewhere in the
- * message must not excuse a real "your changes were not saved" claim, and vice versa.
+ * The loss half of the pattern. A denied success is decisive on its own; an asserted
+ * loss counts only when nothing negates it, whether the negator sits before the match
+ * or within it. All matches are considered, so one truthful "no work was lost" clause
+ * elsewhere in the message cannot excuse a real "your changes were not saved" claim.
  */
 function assertsWorkNotSaved(content: string): boolean {
-  const re = new RegExp(NOT_SAVED_CLAIM_RE.source, `${NOT_SAVED_CLAIM_RE.flags}g`);
+  if (DENIED_SUCCESS_RE.test(content)) return true;
+
+  const re = new RegExp(ASSERTED_LOSS_RE.source, `${ASSERTED_LOSS_RE.flags}g`);
   let match: RegExpExecArray | null;
   while ((match = re.exec(content)) !== null) {
     if (match[0].length === 0) {
       re.lastIndex += 1;
       continue;
     }
+    if (NEGATOR_WITHIN_RE.test(match[0])) continue;
     const before = content.slice(0, match.index);
     const boundary = before.search(CLAUSE_BOUNDARY_RE);
     const clausePrefix = boundary === -1 ? before : before.slice(boundary + 1);
@@ -216,6 +282,42 @@ export function buildFalseFailureCorrection(actions: string[], bookkeepingFailed
         + 'it does not affect the work above.'
       : '')
   );
+}
+
+/**
+ * The notice for text that carries no false CLAIM but does carry false ADVICE — the
+ * static fallback used when the diagnosis agent is unavailable still says "please try
+ * sending your message again", which after a landed publish is the same double-deploy
+ * instruction that made ENG-971 harmful.
+ */
+export function buildConfirmedWorkNotice(actions: string[]): string {
+  return (
+    `${CORRECTION_MARKER}, successfully: ${actions.join('; ')}. `
+    + 'That work is saved and live, so please do NOT re-run it.'
+  );
+}
+
+/**
+ * Append what the ledger confirms, with no test on the prose.
+ *
+ * `reconcileFalseFailureReport` judges a message and corrects it only when it lies.
+ * This one is for text the CALLER already knows is generic — the fixed fallback
+ * strings on the error path, which have no outcome in them at all and end in blanket
+ * retry advice. There is nothing to judge, so a confirmed publish alone earns the
+ * notice. Never point this at model-written prose: a truthful closing message would
+ * get a "Correction" banner it does not deserve.
+ */
+export function appendConfirmedPublishNotice(
+  content: string,
+  toolCalls: FalseFailureLedgerEntry[] | null | undefined,
+): string {
+  if (typeof content !== 'string' || content.trim().length === 0) return content;
+  if (content.includes(CORRECTION_MARKER)) return content;
+
+  const actions = collectConfirmedPublishActions(toolCalls);
+  if (actions.length === 0) return content;
+
+  return `${content.replace(/\s+$/, '')}\n\n${buildConfirmedWorkNotice(actions)}`;
 }
 
 /**

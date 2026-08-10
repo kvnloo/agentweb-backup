@@ -42,7 +42,12 @@ import { MarketingActionCarrier, normalizeMarketingActions } from '../services/m
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
-import { reconcileFalseFailureReport, ledgerFromSucceededFunctions } from '../utils/falseFailureReport';
+import {
+  reconcileFalseFailureReport,
+  ledgerFromSucceededFunctions,
+  appendConfirmedPublishNotice,
+  FalseFailureLedgerEntry,
+} from '../utils/falseFailureReport';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
@@ -418,15 +423,27 @@ function buildWorkPlanSummary(session: any): string | null {
  * (`calledFunctions`, which toolDispatch flushes per iteration and is therefore
  * durable at the moment of the throw), and its output goes through the same
  * deterministic, append-only guard the loop edge uses.
+ *
+ * The ledger comes back alongside the message because the caller needs it too: when
+ * diagnosis is unavailable the generic fallback still ends in "please try sending
+ * your message again", and that advice is just as wrong after a landed publish.
  */
+interface DiagnosisResult {
+  /** The diagnosis agent's message, already reconciled. Null when unavailable. */
+  message: string | null;
+  /** Publish/deploy calls this run is confirmed to have completed. */
+  publishLedger: FalseFailureLedgerEntry[];
+}
+
 async function getDiagnosticErrorMessage(
   error: unknown,
   sessionId: string,
   userMessage: string
-): Promise<string | null> {
+): Promise<DiagnosisResult> {
   try {
     const session = await chatbotDb.getChatSession(sessionId).catch(() => null);
     const succeededFunctions = session?.calledFunctions || null;
+    const publishLedger = ledgerFromSucceededFunctions(succeededFunctions);
     const context: DiagnosisContext = {
       errorType: classifyErrorType(error),
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -436,10 +453,12 @@ async function getDiagnosticErrorMessage(
       succeededFunctions,
     };
     const message = await agentModeService.generateDiagnosticMessage(context);
-    if (!message) return message;
-    return reconcileFalseFailureReport(message, ledgerFromSucceededFunctions(succeededFunctions));
+    return {
+      message: message ? reconcileFalseFailureReport(message, publishLedger) : null,
+      publishLedger,
+    };
   } catch {
-    return null;
+    return { message: null, publishLedger: [] };
   }
 }
 
@@ -5231,6 +5250,7 @@ export const agentModeController = {
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
+      let publishLedger: FalseFailureLedgerEntry[] = [];
       if (sessionId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
@@ -5239,13 +5259,22 @@ export const agentModeController = {
             diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
           } else {
             const userMessage = req.body?.userMessage || '';
-            diagnosticContent = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+            const diagnosis = await getDiagnosticErrorMessage(error, sessionId, userMessage);
+            diagnosticContent = diagnosis.message;
+            publishLedger = diagnosis.publishLedger;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
+          // ENG-971: the fallback carries no outcome at all, just blanket retry
+          // advice — so when the ledger confirms a publish, name it. Applied ONLY to
+          // the fixed string: a diagnosis message has already been judged on its own
+          // prose, and a truthful one must not collect a "Correction" banner.
           role: 'assistant',
-          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedPublishNotice(
+            'I encountered an error processing your request. Please try sending your message again.',
+            publishLedger,
+          ),
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
@@ -5982,6 +6011,7 @@ export const agentModeController = {
       // Skip for session-limit errors (user message wasn't saved either).
       // Use the diagnosis agent for a context-aware message when possible.
       let diagnosticContent: string | null = null;
+      let publishLedger: FalseFailureLedgerEntry[] = [];
       if (!handledPartialTimeout && shareId && !(error instanceof Error && isSessionLimitError(error))) {
         // Skip diagnosis for context-limit errors (they have specific handling below).
         // Worker-shutdown errors do NOT skip — they leave an orphaned user message and need feedback.
@@ -5990,13 +6020,20 @@ export const agentModeController = {
             diagnosticContent = 'The server restarted while processing your request. Please send your message again.';
           } else {
             const userMessage = req.body?.userMessage || '';
-            diagnosticContent = await getDiagnosticErrorMessage(error, shareId, userMessage);
+            const diagnosis = await getDiagnosticErrorMessage(error, shareId, userMessage);
+            diagnosticContent = diagnosis.message;
+            publishLedger = diagnosis.publishLedger;
           }
         }
 
         const errorAssistantMessage: ChatMessage = {
+          // ENG-971: see the matching comment in generateResponse — the fixed
+          // fallback gets the ledger's confirmed outcome, model prose does not.
           role: 'assistant',
-          content: diagnosticContent || 'I encountered an error processing your request. Please try sending your message again.',
+          content: diagnosticContent || appendConfirmedPublishNotice(
+            'I encountered an error processing your request. Please try sending your message again.',
+            publishLedger,
+          ),
           timestamp: new Date().toISOString(),
           metadata: {
             timestamp: new Date().toISOString(),
