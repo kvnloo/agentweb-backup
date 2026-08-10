@@ -18,10 +18,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const dir = mkdtempSync(path.join(tmpdir(), 'chatcache-'));
 const chatStatePath = path.join(dir, 'chat-state.json');
 
-// ── Faithful copy of chat/server.mjs cache + write-behind (keep in sync) ──
+// ── Faithful copy of chat/server.mjs cache + write-behind + incremental serialize (keep in sync) ──
 let chatStateCache = { mtimeMs: -1, data: null };
 let parseCount = 0;      // test-only: prove we skip the parse on a cache hit
 let diskWrites = 0;      // test-only: prove a burst coalesces
+let entryStringifies = 0; // test-only: how many per-issue JSON.stringify a flush actually ran
+const serializedEntries = new Map();
+const dirtyEntries = new Set();
 const loadChatState = () => {
   try {
     const mtimeMs = statSync(chatStatePath).mtimeMs;
@@ -29,9 +32,22 @@ const loadChatState = () => {
     const data = JSON.parse(readFileSync(chatStatePath, 'utf8'));
     parseCount++;
     chatStateCache = { mtimeMs, data };
+    serializedEntries.clear(); dirtyEntries.clear();
     return data;
   } catch { return chatStateCache.data || {}; }
 };
+function serializeChatState(state) {
+  const keys = Object.keys(state);
+  const parts = [];
+  for (const key of keys) {
+    let s = serializedEntries.get(key);
+    if (s === undefined || dirtyEntries.has(key)) { s = JSON.stringify(state[key]); entryStringifies++; serializedEntries.set(key, s); }
+    parts.push(JSON.stringify(key) + ':' + s);
+  }
+  dirtyEntries.clear();
+  if (serializedEntries.size > keys.length) for (const k of serializedEntries.keys()) if (!(k in state)) serializedEntries.delete(k);
+  return '{' + parts.join(',') + '}';
+}
 let flushDirty = false, flushTimer = null, flushing = false;
 function scheduleFlush() {
   flushDirty = true;
@@ -43,7 +59,7 @@ async function flushChatStateAsync() {
   flushing = true; flushDirty = false;
   const tmp = `${chatStatePath}.tmp.${process.pid}`;
   try {
-    const str = JSON.stringify(chatStateCache.data);
+    const str = serializeChatState(chatStateCache.data);
     await writeFileAsync(tmp, str);
     await renameAsync(tmp, chatStatePath);
     diskWrites++;
@@ -56,14 +72,15 @@ function flushChatStateSync() {
   flushDirty = false;
   try {
     const tmp = `${chatStatePath}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(chatStateCache.data));
+    writeFileSync(tmp, serializeChatState(chatStateCache.data));
     renameSync(tmp, chatStatePath);
     diskWrites++;
     try { chatStateCache.mtimeMs = statSync(chatStatePath).mtimeMs; } catch {}
   } catch {}
 }
-function writeChatState(obj) {
+function writeChatState(obj, dirtyId) {
   chatStateCache = { mtimeMs: chatStateCache.mtimeMs, data: obj };
+  if (dirtyId) dirtyEntries.add(dirtyId); else serializedEntries.clear();
   scheduleFlush();
 }
 const settle = () => sleep(200); // > debounce(120) + flush
@@ -114,6 +131,41 @@ try {
   flushChatStateSync(); // no await
   ok(JSON.parse(readFileSync(chatStatePath, 'utf8'))['ENG-9'].messages[0] === 42, 'sync flush persists immediately (shutdown durability)');
   ok(flushDirty === false, 'sync flush clears the dirty flag');
+
+  // ── incremental serialization: a flush re-stringifies only the DIRTY issue, reusing cached strings ──
+  console.log('incremental serialize');
+  // seed a multi-issue state and flush once to populate the per-entry string cache
+  serializedEntries.clear(); dirtyEntries.clear();
+  const state = { 'ENG-1': { messages: [1] }, 'ENG-2': { messages: [2] }, 'ENG-3': { messages: [3] } };
+  writeChatState(state); // no dirtyId → full rebuild
+  entryStringifies = 0; flushDirty = true;
+  let out = serializeChatState(chatStateCache.data);
+  ok(entryStringifies === 3, 'first flush stringifies every issue (cold cache)');
+  ok(out === JSON.stringify(state), 'incremental output is byte-identical to JSON.stringify(state)');
+
+  // mutate ONE issue in place and mark just it dirty (mirrors updateChatState's writeChatState(s, id))
+  chatStateCache.data['ENG-2'].messages.push(22);
+  writeChatState(chatStateCache.data, 'ENG-2');
+  entryStringifies = 0;
+  out = serializeChatState(chatStateCache.data);
+  ok(entryStringifies === 1, 'a scoped write re-stringifies only the dirty issue (1, not 3)');
+  ok(JSON.parse(out)['ENG-2'].messages.length === 2, 'the dirty issue reflects its mutation on disk');
+  ok(JSON.parse(out)['ENG-1'].messages[0] === 1 && JSON.parse(out)['ENG-3'].messages[0] === 3, 'untouched issues are preserved via cached strings');
+
+  // deleting an issue drops it from the output and evicts its cached string
+  delete chatStateCache.data['ENG-3'];
+  writeChatState(chatStateCache.data, 'ENG-3');
+  entryStringifies = 0;
+  out = serializeChatState(chatStateCache.data);
+  ok(!('ENG-3' in JSON.parse(out)), 'deleted issue no longer serialized');
+  ok(entryStringifies === 0, 'delete needs no re-stringify (survivors served from cache)');
+  ok(!serializedEntries.has('ENG-3'), 'deleted issue evicted from the string cache (no unbounded growth)');
+
+  // a re-parse from disk (mtime change) invalidates the serialize cache so stale strings never leak
+  serializedEntries.set('ENG-STALE', '{"messages":[999]}');
+  const t = statSync(chatStatePath).mtimeMs; utimesSync(chatStatePath, (t / 1000) + 9, (t / 1000) + 9);
+  loadChatState();
+  ok(serializedEntries.size === 0, 're-parse from disk clears the per-entry string cache');
 } finally {
   rmSync(dir, { recursive: true, force: true });
 }
