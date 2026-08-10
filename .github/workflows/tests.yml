@@ -448,10 +448,59 @@ jobs:
             '${{ steps.gate.outputs.verdict }}' '${{ steps.gate.outputs.exit_code }}' >&2
           exit 1
 
+  # The `dependabot[bot]` clause is the only addition to a gate that is otherwise
+  # unchanged (ENG-991). GitHub isolates repository secrets from Dependabot on
+  # `pull_request`: `secrets.AWS_ACCESS_KEY_ID` and `secrets.AWS_SECRET_ACCESS_KEY`
+  # resolve to the empty string unless they are ALSO stored as Dependabot secrets,
+  # which they deliberately are not — these are production deploy credentials and
+  # an automated dependency PR is the last place to widen their reach. So
+  # `Configure AWS credentials` below cannot succeed on a Dependabot PR under any
+  # circumstances, and re-running never changes that.
+  #
+  # Measured on the three open bumps (runs 31349777138 / 31349778959 / 31349790654,
+  # 2026-08-10): every other job passed — including both backend suites and the
+  # Greptile gate — and only this job failed, twice with "Could not load credentials
+  # from any providers" after 5m01s and 4m01s of checkout, npm ci, build and
+  # packaging done before reaching the credentials step. 12 runs over 7 days, 0
+  # successes.
+  #
+  # The wasted runner minutes are the smaller half. This job holds
+  # `concurrency: backend-staging-deploy`, the single shared staging lane, with
+  # `cancel-in-progress: false` — so a Dependabot PR queues for a deploy it can
+  # never perform and can evict a real PR's deploy. That is exactly what happened
+  # to the third run above: cancelled after 15s with "a higher priority waiting
+  # request for backend-staging-deploy exists", which then reported the whole PR
+  # red and invited a re-run of the ~30 runner-minute suite that had just passed.
+  #
+  # Author identity, not paths. Skipping the deploy for `.github/**`-only diffs
+  # would look equivalent and is not: the `backend` filter deliberately counts
+  # `.github/workflows/tests.yml` and `.github/scripts/eb-deploy.sh` as backend
+  # changes so the deploy path gates its own changes (ENG-743), and a path-based
+  # skip would silently delete that. The thing that makes this job impossible is
+  # who opened the PR, so that is what the condition tests.
+  #
+  # `github.event.pull_request.user.login` (the PR's author) rather than
+  # `github.actor` (whoever triggered this run): a human pushing to or reopening a
+  # Dependabot branch makes `github.actor` a human while the PR still runs without
+  # secrets, so the actor-based form would reintroduce the failure on exactly the
+  # push someone made trying to fix it.
+  #
+  # This removes no merge evidence. merge-evidence.sh requires a positive
+  # `success` from "Backend tests (agentMode)" and "Backend tests (all other +
+  # coverage)" only (MERGE_EVIDENCE_BACKEND_JOBS); the staging deploy has never
+  # been in that set, so a Dependabot PR still has to pass the same tests and the
+  # same Greptile 5/5 as anything else. Contract pinned by
+  # .github/scripts/staging-deploy-gate.test.sh.
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
     needs: [detect-changes, backend-tests-a, backend-tests-b, greptile-review]
-    if: github.event.pull_request.draft == false && needs.detect-changes.outputs.backend == 'true' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success' && needs.greptile-review.result == 'success'
+    if: >-
+      github.event.pull_request.draft == false
+      && github.event.pull_request.user.login != 'dependabot[bot]'
+      && needs.detect-changes.outputs.backend == 'true'
+      && needs.backend-tests-a.result == 'success'
+      && needs.backend-tests-b.result == 'success'
+      && needs.greptile-review.result == 'success'
     runs-on: ubuntu-latest
     environment: staging
     concurrency:
