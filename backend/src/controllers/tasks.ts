@@ -80,12 +80,17 @@ export const createTask = async (req: AuthRequest, res: Response) => {
         // Values from req.body (name, prompt, isInteractive, etc.) are used directly or as overrides.
 
         // For deep research tasks, email notification is automatically enabled or taken from request.
-        const finalEmailNotification = emailNotification !== undefined 
-          ? emailNotification 
-          : isDeepResearch !== undefined 
-            ? isDeepResearch 
+        const finalEmailNotification = emailNotification !== undefined
+          ? emailNotification
+          : isDeepResearch !== undefined
+            ? isDeepResearch
             : template.isDeepResearch;
-        
+
+        const requestedDeepResearch = isDeepResearch !== undefined ? isDeepResearch : template.isDeepResearch;
+        if (requestedDeepResearch) {
+          console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, templateId, source: 'createTask(fromTemplate)' });
+        }
+
         // Create task using template values, allowing overrides from request body for most fields.
         // name and prompt from req.body are already fully processed by the frontend.
         const task = {
@@ -135,6 +140,10 @@ export const createTask = async (req: AuthRequest, res: Response) => {
     // Regular task creation without template
     if (!name || !prompt) {
       return res.status(400).json({ message: 'Name and prompt are required' });
+    }
+
+    if (isDeepResearch) {
+      console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, source: 'createTask' });
     }
 
     const task = {
@@ -336,6 +345,9 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
       // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
       // never allow it to be turned back on, only ever off.
       updates.isDeepResearch = false;
+      if (req.body.isDeepResearch) {
+        console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, taskId, source: 'updateTask' });
+      }
     }
 
     if (req.body.isComplexTask !== undefined) {

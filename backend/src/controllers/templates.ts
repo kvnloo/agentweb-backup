@@ -31,6 +31,10 @@ export const createTemplate = async (req: AuthRequest, res: Response) => {
     // Extract parameters from the prompt
     const parameters = extractParameters(prompt);
 
+    if (isDeepResearch) {
+      console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, source: 'createTemplate' });
+    }
+
     // Validate nameParameter is one of the extracted parameters or null
     if (nameParameter && !parameters.includes(nameParameter)) {
       return res.status(400).json({ 
@@ -211,7 +215,12 @@ export const updateTemplate = async (req: AuthRequest, res: Response) => {
     if (isInteractive !== undefined) updates.isInteractive = Boolean(isInteractive);
     // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
     // never allow it to be turned back on, only ever off.
-    if (isDeepResearch !== undefined) updates.isDeepResearch = false;
+    if (isDeepResearch !== undefined) {
+      updates.isDeepResearch = false;
+      if (isDeepResearch) {
+        console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, templateId, source: 'updateTemplate' });
+      }
+    }
     if (isComplexTask !== undefined) updates.isComplexTask = Boolean(isComplexTask);
     
     // Handle outputAsJson and outputAsHtml mutual exclusivity

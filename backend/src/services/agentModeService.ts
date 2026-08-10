@@ -13900,6 +13900,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       // Convert file URLs to attachments
       const attachments = this.convertUrlsToAttachments(attachedFileUrls);
 
+      if (templateData.isDeepResearch) {
+        console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, templateId: templateData.templateId, source: 'createTaskFromTemplate' });
+      }
+
       // Create task using template
       const task = {
         taskId: Date.now().toString(),
