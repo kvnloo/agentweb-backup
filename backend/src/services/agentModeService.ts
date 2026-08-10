@@ -31197,6 +31197,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
     }
 
+    // Access check (ENG-1049): this function creates leads (batchCreateLeads
+    // below), and is called directly by the import_leads_from_search Emma tool
+    // — bypassing the canDestructiveCrmList check that crm.ts's POST
+    // /lists/:listId/leads/find route applies before calling this same method.
+    // Without this, any same-org member could import leads into another
+    // member's list via Emma chat.
+    try {
+      const { crmDb: accessCrmDb } = await import('./db');
+      const accessList = await accessCrmDb.getLeadListById(listId);
+      if (!accessList) {
+        return { success: false, error: 'The specified lead list does not exist' };
+      }
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      if (!(await canDestructiveCrmList(userId, accessList))) {
+        return { success: false, error: CRM_EDITOR_REQUIRED_MESSAGE };
+      }
+    } catch (err) {
+      // Fail closed — an access-check failure must never silently allow the
+      // write. Distinct from the cosmetic, fail-soft list lookups below.
+      return { success: false, error: 'Failed to verify list access' };
+    }
+
     // Resolve account: user's own or platform-wide fallback
     const accountId = await linkedInOutreachService.resolveAccountId(userId);
     if (!accountId) {

@@ -96,6 +96,8 @@ describe('AgentModeService.importLeadsFromSearch — structured filter passthrou
     mockResolveAccountId.mockResolvedValue('test-account-id');
     mockBatchCreateLeads.mockResolvedValue({ newCount: 0, mergedCount: 0, errors: [] });
     mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+    // Caller owns the list (ENG-1049 access check short-circuits on this).
+    mockGetLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1' });
   });
 
   it('forwards location free-text to searchPeople', async () => {
@@ -148,26 +150,29 @@ describe('AgentModeService.importLeadsFromSearch — structured filter passthrou
     it('populates list_total_after_import from getLeadListById', async () => {
       mockSearchPeople.mockResolvedValueOnce({ items: [{ name: 'A B' }], cursor: null });
       mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'l-1' }] });
-      mockGetLeadListById.mockResolvedValue({ listId: 'list-1', leadCount: 42 });
+      mockGetLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1', leadCount: 42 });
       const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
       expect(result.list_total_after_import).toBe(42);
     });
 
-    it('falls back to 0 when getLeadListById returns null', async () => {
-      mockSearchPeople.mockResolvedValueOnce({ items: [{ name: 'A B' }], cursor: null });
-      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'l-1' }] });
+    // ENG-1049: getLeadListById is now also used by the up-front access check,
+    // which must fail closed — a missing/unreadable list can no longer fall
+    // through to a "succeeded, but total unknown" result the way the old
+    // cosmetic-only reporting lookup did.
+    it('denies (does not import) when getLeadListById returns null', async () => {
       mockGetLeadListById.mockResolvedValue(null);
       const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
-      expect(result.list_total_after_import).toBe(0);
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/does not exist/i);
+      expect(mockBatchCreateLeads).not.toHaveBeenCalled();
     });
 
-    it('does not fail when getLeadListById throws', async () => {
-      mockSearchPeople.mockResolvedValueOnce({ items: [{ name: 'A B' }], cursor: null });
-      mockBatchCreateLeads.mockResolvedValueOnce({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'l-1' }] });
+    it('fails closed (does not import) when getLeadListById throws', async () => {
       mockGetLeadListById.mockRejectedValue(new Error('boom'));
       const result = await service.importLeadsFromSearch('user-1', { listId: 'list-1', title: 'CTO' });
-      expect(result.success).toBe(true);
-      expect(result.list_total_after_import).toBe(0);
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/verify list access/i);
+      expect(mockBatchCreateLeads).not.toHaveBeenCalled();
     });
   });
 
@@ -203,7 +208,7 @@ describe('AgentModeService.importLeadsFromSearch — auto_enrich', () => {
     mockResolveAccountId.mockResolvedValue('test-account-id');
     mockSearchPeople.mockResolvedValue({ items: [{ name: 'A B', public_identifier: 'a-b' }], cursor: null });
     mockBatchCreateLeads.mockResolvedValue({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'lead-new-1' }] });
-    mockGetLeadListById.mockResolvedValue({ leadCount: 1 });
+    mockGetLeadListById.mockResolvedValue({ userId: 'user-1', leadCount: 1 });
   });
 
   it('auto_enrich=false: no autoEnrichJobId in response', async () => {
@@ -372,7 +377,7 @@ describe('AgentModeService.importLeadsFromSearch — company fallback chain', ()
     jest.spyOn(service, 'getClientForModel').mockResolvedValue(fakeLlmClient);
     mockResolveAccountId.mockResolvedValue('test-account-id');
     mockBatchCreateLeads.mockResolvedValue({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'lead-new-1' }] });
-    mockGetLeadListById.mockResolvedValue({ leadCount: 1 });
+    mockGetLeadListById.mockResolvedValue({ userId: 'user-1', leadCount: 1 });
   });
 
   it('uses work_experience.company — no regex, no LLM, no profile call', async () => {
@@ -411,7 +416,7 @@ describe('AgentModeService.importLeadsFromSearch — company fallback chain', ()
       cursor: null,
     });
     mockBatchCreateLeads.mockResolvedValue({ newCount: 4, mergedCount: 0, errors: [], created: [{ leadId: 'l-1' }, { leadId: 'l-2' }, { leadId: 'l-3' }, { leadId: 'l-4' }] });
-    mockGetLeadListById.mockResolvedValue({ leadCount: 4 });
+    mockGetLeadListById.mockResolvedValue({ userId: 'user-1', leadCount: 4 });
     mockChatCreate.mockResolvedValue({ choices: [{ message: { content: '["Acme Inc", "Microsoft", "NONE"]' } }] });
     mockGetProfile.mockResolvedValue({ rawData: {} });
 
@@ -468,7 +473,7 @@ describe('AgentModeService.importLeadsFromSearch — findReason tagging', () => 
     mockResolveAccountId.mockResolvedValue('test-account-id');
     mockSearchPeople.mockResolvedValue({ items: [{ name: 'Alice Smith', public_identifier: 'alice', headline: 'CTO' }], cursor: null });
     mockBatchCreateLeads.mockResolvedValue({ newCount: 1, mergedCount: 0, errors: [], created: [{ leadId: 'lead-1' }] });
-    mockGetLeadListById.mockResolvedValue({ leadCount: 1 });
+    mockGetLeadListById.mockResolvedValue({ userId: 'user-1', leadCount: 1 });
   });
 
   it('tags lead.system.findReason when title/company/location filter is present', async () => {
@@ -519,7 +524,7 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
     mockSetLeadListSearchCursor.mockReset();
     service = new AgentModeService();
     mockResolveAccountId.mockResolvedValue('test-account-id');
-    mockGetLeadListById.mockResolvedValue({ listId: 'list-1', leadCount: 0 });
+    mockGetLeadListById.mockResolvedValue({ listId: 'list-1', userId: 'user-1', leadCount: 0 });
     mockDeleteLead.mockResolvedValue(undefined);
     mockSetLeadListSearchCursor.mockResolvedValue(undefined);
   });
@@ -618,8 +623,9 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
   it('persists final cursor against criteria hash and resumes from stored cursor on next call', async () => {
     const hash = expectedCriteriaHash({ title: 'CTO' });
     mockGetLeadListById
-      .mockResolvedValueOnce({ listId: 'list-1', leadCount: 5, searchCursors: { [hash]: { cursor: 'stored-cursor-from-last-run', lastUsedAt: '2026-05-01T00:00:00Z' } } })
-      .mockResolvedValueOnce({ listId: 'list-1', leadCount: 7 });
+      .mockResolvedValueOnce({ listId: 'list-1', userId: 'user-1', leadCount: 5, searchCursors: { [hash]: { cursor: 'stored-cursor-from-last-run', lastUsedAt: '2026-05-01T00:00:00Z' } } })
+      .mockResolvedValueOnce({ listId: 'list-1', userId: 'user-1', leadCount: 5, searchCursors: { [hash]: { cursor: 'stored-cursor-from-last-run', lastUsedAt: '2026-05-01T00:00:00Z' } } })
+      .mockResolvedValueOnce({ listId: 'list-1', userId: 'user-1', leadCount: 7 });
     mockSearchPeople.mockResolvedValueOnce({ items: [makeItem(1), makeItem(2)], cursor: 'final-cursor' });
     mockBatchCreateLeads.mockResolvedValueOnce(batchResult(2, 0, 'p1'));
 
@@ -633,8 +639,9 @@ describe('AgentModeService.importLeadsFromSearch — top-up loop', () => {
   it('caller-provided cursor overrides stored cursor', async () => {
     const hash = expectedCriteriaHash({ title: 'CTO' });
     mockGetLeadListById
-      .mockResolvedValueOnce({ listId: 'list-1', leadCount: 0, searchCursors: { [hash]: { cursor: 'stored-cursor', lastUsedAt: '2026-05-01T00:00:00Z' } } })
-      .mockResolvedValueOnce({ listId: 'list-1', leadCount: 1 });
+      .mockResolvedValueOnce({ listId: 'list-1', userId: 'user-1', leadCount: 0, searchCursors: { [hash]: { cursor: 'stored-cursor', lastUsedAt: '2026-05-01T00:00:00Z' } } })
+      .mockResolvedValueOnce({ listId: 'list-1', userId: 'user-1', leadCount: 0, searchCursors: { [hash]: { cursor: 'stored-cursor', lastUsedAt: '2026-05-01T00:00:00Z' } } })
+      .mockResolvedValueOnce({ listId: 'list-1', userId: 'user-1', leadCount: 1 });
     mockSearchPeople.mockResolvedValueOnce({ items: [makeItem(1)], cursor: null });
     mockBatchCreateLeads.mockResolvedValueOnce(batchResult(1, 0, 'p1'));
 
