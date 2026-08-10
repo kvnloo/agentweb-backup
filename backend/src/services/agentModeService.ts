@@ -8790,7 +8790,7 @@ export class AgentModeService {
   }
 
   // Read current user's market strategy
-  public async readMarketStrategy(userId: string): Promise<any> {
+  public async readMarketStrategy(userId: string, options: { competitorOffset?: number } = {}): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -8830,11 +8830,23 @@ export class AgentModeService {
       const COMPETITOR_DETAIL_LIMIT = 40;
       const competitorCount = Array.isArray(marketStrategy.competitors) ? marketStrategy.competitors.length : 0;
 
+      // `competitorOffset` slides that detail window over the stored list, so a
+      // caller that needs the description of a name-only entry can fetch it
+      // instead of being stuck with a partial record. Clamped into range: an
+      // out-of-range offset lands on the last entry rather than rendering an
+      // empty window, because a silently empty result is the failure mode this
+      // whole ticket was about.
+      const requestedOffset = Number(options?.competitorOffset);
+      const competitorDetailOffset = Number.isFinite(requestedOffset)
+        ? Math.min(Math.max(Math.floor(requestedOffset), 0), Math.max(0, competitorCount - 1))
+        : 0;
+
       // Format the market strategy for LLM consumption
       const formattedContent = this.formatMarketStrategy({
         exists: true,
         marketData: marketStrategy,
-        competitorDetailLimit: COMPETITOR_DETAIL_LIMIT
+        competitorDetailLimit: COMPETITOR_DETAIL_LIMIT,
+        competitorDetailOffset
       });
 
       // Return structured response — no raw marketData to keep tool result size manageable
@@ -8843,7 +8855,8 @@ export class AgentModeService {
         message: `Market strategy retrieved successfully`,
         exists: true,
         totalCompetitors: competitorCount,
-        competitorsWithFullDetail: Math.min(competitorCount, COMPETITOR_DETAIL_LIMIT),
+        competitorDetailOffset,
+        competitorsWithFullDetail: Math.max(0, Math.min(competitorCount - competitorDetailOffset, COMPETITOR_DETAIL_LIMIT)),
         createdAt: marketStrategy.createdAt,
         updatedAt: marketStrategy.updatedAt,
         formattedContent
@@ -22718,25 +22731,34 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const detailLimit = typeof marketResult.competitorDetailLimit === 'number'
       ? marketResult.competitorDetailLimit
       : competitors.length;
-    const detailedCompetitors = competitors.slice(0, detailLimit);
-    const nameOnlyCompetitors = competitors.slice(detailLimit);
+    const detailOffset = typeof marketResult.competitorDetailOffset === 'number'
+      ? marketResult.competitorDetailOffset
+      : 0;
+    const detailEnd = detailOffset + detailLimit;
+    const nameOf = (competitor: any) =>
+      (typeof competitor === 'object' && competitor && competitor.name) ? competitor.name : String(competitor);
+    const inWindow = (index: number) => index >= detailOffset && index < detailEnd;
+    const nameOnlyCount = competitors.filter((_, index) => !inWindow(index)).length;
 
     formattedSummary += `<strong>🏆 Competitors (${competitors.length} total)</strong><br>`;
     if (competitors.length > 0) {
-      detailedCompetitors.forEach((competitor: any) => {
+      competitors.forEach((competitor: any, index: number) => {
+        if (!inWindow(index)) return;
         if (typeof competitor === 'object' && competitor.name) {
           formattedSummary += `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
         } else {
           formattedSummary += `• ${competitor}<br>`;
         }
       });
-      if (nameOnlyCompetitors.length > 0) {
-        const names = nameOnlyCompetitors.map((competitor: any) =>
-          (typeof competitor === 'object' && competitor.name) ? competitor.name : String(competitor)
-        );
-        formattedSummary += `<br><strong>ℹ️ ${nameOnlyCompetitors.length} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again:<br>`;
-        names.forEach((name: string) => {
-          formattedSummary += `• ${name}<br>`;
+      if (nameOnlyCount > 0) {
+        // Point at the next unread page: the entries after the window, or back
+        // to the start once the window has run past the end of the list.
+        const nextOffset = detailEnd < competitors.length ? detailEnd : 0;
+        const nextCount = Math.min(detailLimit, competitors.length - nextOffset);
+        formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside it (e.g. <code>competitorOffset: ${nextOffset}</code> returns the next ${nextCount} in full):<br>`;
+        competitors.forEach((competitor: any, index: number) => {
+          if (inWindow(index)) return;
+          formattedSummary += `• [offset ${index}] ${nameOf(competitor)}<br>`;
         });
       }
     } else {
@@ -22765,7 +22787,11 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
 
     formattedSummary += `<br><em>💡 I'll use this market strategy information to inform marketing campaigns, content strategy, and business development decisions.</em>`;
-    formattedSummary += `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`;
+    // Only tell the model the read is exhaustive when it actually is. With a
+    // name-only tail, a second call is the supported way to read the rest.
+    formattedSummary += nameOnlyCount > 0
+      ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above, but ${nameOnlyCount} of them are shown by name only. Nothing is missing. To read any of those in full, call read_market_strategy again with competitorOffset set to the offset shown beside the name.`
+      : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`;
 
     return formattedSummary;
   }
