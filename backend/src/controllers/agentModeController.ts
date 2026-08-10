@@ -1310,10 +1310,18 @@ export function scheduledRunSignalsConditionalSkip(
   // count, which is what makes it safe: a stripped HTML table renders as
   // "Succeeded 0 Failed 1", where the "0" belongs to the PREVIOUS row — there,
   // "Failed" is followed by "1", so it is left intact and still vetoes.
+  //
+  // That lookahead must tolerate PUNCTUATION between the label and its own count
+  // (Greptile P1): "Succeeded 0 Failed, 1" / "… Failed; 1" / "… Failed | 1" all bind
+  // the 1 to "Failed", but a separator class of only [:=-] failed to see it, so the
+  // "0 Failed" was neutralised and a reported failure was waived as a clean skip.
+  // Widening the class is strictly fail-CLOSED — it can only make the veto fire more
+  // often, never less — and the real production ledger is unaffected because every
+  // count after "0 failed" there is itself a zero ("0 failed / 0 queued").
   const failureScan = expandContractions(
     text
       .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
-      .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[:=-]?\s*\d*[1-9])/gi, ' ')
+      .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
   );
   // (2a) Hard failure evidence vetoes anywhere in the turn.
   if (HARD_FAILURE_PATTERNS.some((re) => re.test(failureScan))) return false;
