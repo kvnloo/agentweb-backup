@@ -7556,6 +7556,38 @@ export const agentModeController = {
         updates.runCount = runCount;
       }
 
+      // ENG-827 (Greptile): consent was granted against a SPECIFIC set of publishing
+      // tools. Editing the schedule's required functions moves that set, and the
+      // stored grant would otherwise stand unchanged — leaving publishing authority
+      // attached to a tool the owner has since removed.
+      //
+      // Re-derive the scope from the tools this edit leaves behind, intersected with
+      // what was actually approved. Narrowing only: a publishing tool ADDED here does
+      // not inherit consent, because the owner approved the old set, not this one. An
+      // intersection that empties out is no longer an authorization, so the grant goes
+      // with it and the owner has to give it again against what the schedule now does.
+      const priorConsent = resolveSchedulePublishAuthorization(existingSchedule as any);
+      if (priorConsent.authorized && updates.requiredFunctionCalls !== undefined) {
+        const stillRequired = getRequiredPublishTools(updates.requiredFunctionCalls);
+        const narrowed = narrowPublishAuthorization(priorConsent, {
+          authorized: stillRequired.length > 0,
+          tools: stillRequired,
+        });
+        if (!narrowed.authorized || narrowed.tools.length !== priorConsent.tools.length) {
+          updates.autopublishAuthorized = narrowed.authorized;
+          updates.autopublishAuthorizedTools = narrowed.tools;
+          if (!narrowed.authorized) {
+            updates.autopublishAuthorizedAt = null;
+            updates.autopublishAuthorizedBy = null;
+          }
+          console.log(
+            `AgentMode: ENG-827 publish consent narrowed on edit for schedule ${scheduleId}: ` +
+            `[${priorConsent.tools.join(', ')}] -> [${narrowed.tools.join(', ')}]` +
+            `${narrowed.authorized ? '' : ' (revoked — no approved publishing tool remains)'}.`
+          );
+        }
+      }
+
       await scheduleDb.updateSchedule(scheduleId, updates);
 
       res.json({
