@@ -120,16 +120,41 @@ describe('refuseUnauthorizedScheduledPublish (ENG-827)', () => {
       expect(d.getChatSession).not.toHaveBeenCalled();
     });
 
-    it('allows the call when the session read fails, rather than blocking every publish', async () => {
-      // Deliberate: refusing here would break interactive publishing for everyone on
-      // a transient blip. The between-turn re-check and prompt directive still apply.
+    it('rides out a SINGLE session-read blip and proceeds', async () => {
+      // One dropped connection must not refuse a human's approved post.
+      let calls = 0;
       const d = {
-        getChatSession: jest.fn(async () => { throw new Error('read failed'); }),
+        getChatSession: jest.fn(async () => {
+          calls++;
+          if (calls === 1) throw new Error('transient');
+          return { sessionId: 'sess-2', sessionType: 'agent' };
+        }),
         getScheduleById: jest.fn(async () => AUTHORIZED_SCHEDULE),
       };
       expect(
-        await refuseUnauthorizedScheduledPublish('post_on_connected_account', { sessionId: 'sess-1' }, d)
+        await refuseUnauthorizedScheduledPublish('post_on_connected_account', { sessionId: 'sess-2' }, d)
       ).toBeNull();
+      expect(d.getChatSession).toHaveBeenCalledTimes(2);
     });
+  });
+
+  // Greptile (security): the session read is what identifies an unattended run, so
+  // a failure is "unknown", not "probably interactive". Permitting there let a
+  // datastore blip bypass a consent the owner had just withdrawn — and a live post
+  // cannot be un-made.
+  it('REFUSES when the session cannot be read even after a retry', async () => {
+    const d = {
+      getChatSession: jest.fn(async () => { throw new Error('read failed'); }),
+      getScheduleById: jest.fn(async () => AUTHORIZED_SCHEDULE),
+    };
+
+    const refusal = await refuseUnauthorizedScheduledPublish(
+      'post_on_connected_account', { sessionId: 'sess-1' }, d
+    );
+
+    expect(refusal).not.toBeNull();
+    expect(refusal!.success).toBe(false);
+    expect(refusal!.error).toContain('could not be confirmed');
+    expect(d.getChatSession).toHaveBeenCalledTimes(2);
   });
 });

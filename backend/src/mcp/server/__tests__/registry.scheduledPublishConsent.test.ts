@@ -83,6 +83,20 @@ describe('ENG-827 — dispatch refuses an unauthorized scheduled publish', () =>
     expect(result.success).toBe(true);
   });
 
+  it('does NOT run the handler when the session read keeps failing', async () => {
+    // A datastore blip must not become a way past a withdrawn consent.
+    getChatSession.mockRejectedValue(new Error('ProvisionedThroughputExceeded'));
+
+    const result: any = await registry.execute(
+      'post_on_connected_account',
+      { content: 'hello world' },
+      { userId: 'u1', sessionId: 'sess-scheduled' }
+    );
+
+    expect(publishHandler).not.toHaveBeenCalled();
+    expect(result.success).toBe(false);
+  });
+
   it('leaves interactive publishing untouched', async () => {
     getChatSession.mockResolvedValue({ sessionId: 'sess-interactive', sessionType: 'agent' });
 
