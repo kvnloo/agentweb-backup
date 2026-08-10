@@ -110,7 +110,11 @@ export const CONTEXT_TRIM_TOOL_CONTENT_LIMIT = 8_000;
 // trim floor was 8_000, which opened a dead zone: a response of 8,000–10,000 chars was big enough
 // to be compressed to a 200-char preview on the next turn, yet too small to be offloaded — so the
 // payload was destroyed with no S3 key to recover it. A Daily PR Digest run lost its entire
-// get_pr_digest payload (~8,981 chars) that way and nearly reported fabricated PR details.
+// get_pr_digest payload (~8,981 chars) that way. Note the actual harm, since the ticket reports
+// it backwards: the model had ALREADY summarized the payload correctly while it was readable, then
+// saw only the preview a few turns later, concluded its own accurate summary must have been
+// invented, deleted the correct memory and reported the digest as unproducible. Losing the key
+// does not just hide data — it makes a run repudiate correct work it has already done.
 
 // extractToolContent now lives in ../utils/extractToolContent (pure, monolith-free)
 // so the tool-output contract validator and the toolDispatch unit suite can wire
