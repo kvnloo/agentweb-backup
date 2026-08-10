@@ -15,6 +15,7 @@ import { toolResultError } from '../utils/toolResultError';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
+import { isUnusableSynthesis, buildExecutedActionsFallback } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -3580,6 +3581,12 @@ export class AgentModeService {
       let emptySynthesisRetries = 0;
       const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
 
+      // ENG-1054: set true once a turn's whole answer was discarded as serialization
+      // residue (e.g. "}]"). It survives the retry so that, if the retry ALSO fails to
+      // synthesize, the loop reports the executed-action ledger instead of ending on a
+      // blank reply — turning one silent-output bug into another would be no fix.
+      let synthesisResidueDropped = false;
+
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
       // was exhausted. This is the deterministic signal a long data-gathering
@@ -3870,6 +3877,21 @@ export class AgentModeService {
           responseContent = (responseMessage.content as any).text || '';
         }
 
+        // ENG-1054: a turn whose entire text is serialization residue (observed in
+        // production as a closing message of literally "}]") is a FAILED synthesis,
+        // not an answer. Left alone it is non-empty, so the termination ladder below
+        // accepts it as the final response and the turn's deliverables are lost.
+        // Treat it as no text at all: the bounded empty-synthesis nudge then re-asks
+        // for the summary. Blanking responseMessage.content too keeps the debris out
+        // of the persisted transcript AND out of the history sent on the retry (this
+        // runs before the message is appended to `messages` below).
+        if (isUnusableSynthesis(responseContent)) {
+          console.warn(`AgentMode: Discarding unusable final synthesis ${JSON.stringify(responseContent.trim())} in session ${sessionId} — treating as an empty turn`);
+          synthesisResidueDropped = true;
+          responseContent = '';
+          responseMessage.content = '';
+        }
+
         // Update content with LLM's response
         if (responseContent) {
           content = responseContent;
@@ -3964,6 +3986,17 @@ export class AgentModeService {
             console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
             (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
+          }
+
+          // ENG-1054: the loop is terminating after a synthesis that was discarded as
+          // residue, and the bounded retry produced no usable text either. Ending here
+          // would hand the user a blank reply and, worse, erase the record of the
+          // (already-applied) actions the run executed. Report that ledger instead —
+          // tool names and outcome counts only, so it can never claim a false success.
+          if (synthesisResidueDropped && !content) {
+            console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
+            content = buildExecutedActionsFallback(toolCalls);
+            if (responseMessage) responseMessage.content = content;
           }
 
           // Log the stop reason for debugging
