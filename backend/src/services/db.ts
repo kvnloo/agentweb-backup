@@ -3081,6 +3081,10 @@ export const scheduleDb = {
       variableRequestAccessTokenExpiresAt: string;
       variableRequestAccessTokenConsumedAt: string;
       zeroAssistantRetryCount: number;
+      // ENG-971: marks the requeued zero-output run to CONTINUE the abandoned
+      // session rather than restart it, so work that already published is not
+      // repeated. Consumed (at most once) by the next dispatch.
+      pendingResumeSessionId: string;
       lastZeroAssistantOutputAt: string;
       lastZeroAssistantOutputSessionId: string;
     }>

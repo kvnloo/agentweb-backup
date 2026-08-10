@@ -123,13 +123,22 @@ const SCHEDULED_RUN_SYSTEM_ERROR_MESSAGE =
  * is worse than the wording, because it republishes. This message replaces them for
  * that case, and the requeue is suppressed alongside it.
  */
-function zeroAssistantPublishedMessage(actions: string[]): string {
-  return (
+function zeroAssistantPublishedMessage(actions: string[], willResume: boolean): string {
+  const landed =
     'This scheduled run stopped before it could report back — but it did not stop before doing the work: it '
-    + `${actions.join('; ')}. That is live and saved. `
-    + 'Because re-running would repeat it, this run has NOT been retried automatically. '
-    + 'Check the result, and start the schedule again yourself if something is still missing.'
-  );
+    + `${actions.join('; ')}. That is live and saved. `;
+  return willResume
+    // Resuming continues the same session from its last settled step, so the rest of
+    // the task finishes without repeating what already went out.
+    ? landed
+      + 'I will pick up where this run left off shortly and finish the rest — '
+      + 'what already went out will not be repeated, so there is nothing for you to re-run.'
+    // Not safely continuable: a restart would repeat the publish, so we stop and tell
+    // the owner rather than leaving a part-finished run to look like a success.
+    : landed
+      + 'The rest of this run could not be continued safely, and re-running it from the start '
+      + 'would repeat what already went out — so it has NOT been retried automatically. '
+      + 'Check whether anything is still outstanding; the schedule owner has been notified.';
 }
 
 const SCHEDULED_RUN_TRANSIENT_ERROR_MESSAGE =
@@ -2669,6 +2678,38 @@ function getZeroAssistantRetryCount(schedule: any): number {
   return Number.isFinite(rawCount) && rawCount > 0 ? rawCount : 0;
 }
 
+/**
+ * Tell the schedule owner a run needs a human look. Recipients: the schedule's
+ * configured notification list, else the owner's account email. Best-effort by
+ * design — a notification failure must never break the run.
+ */
+async function notifyScheduleOwnerOfFailure(
+  schedule: any,
+  userId: string,
+  detail: { failedAttempts: number; failureClass: any }
+): Promise<void> {
+  try {
+    let recipients: string[] = Array.isArray(schedule.emailNotifications)
+      ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
+      : [];
+    if (recipients.length === 0) {
+      const owner = await userDb.getUserById(userId);
+      if (owner?.email) recipients = [owner.email];
+    }
+    if (recipients.length > 0) {
+      await emailService.sendScheduledRunFailedEmail(
+        recipients, schedule.scheduleName, schedule.scheduleId, detail
+      );
+    } else {
+      console.error(
+        `No notification recipients for schedule ${schedule.scheduleId}; owner alert skipped.`
+      );
+    }
+  } catch (notifyError) {
+    console.error(`Failed to send owner failure alert for schedule ${schedule.scheduleId}:`, notifyError);
+  }
+}
+
 function getZeroAssistantRequeueDelayMs(retryCount: number): number {
   const exponent = Math.max(0, retryCount - 1);
   return Math.min(ZERO_ASSISTANT_REQUEUE_MAX_MS, ZERO_ASSISTANT_REQUEUE_BASE_MS * Math.pow(2, exponent));
@@ -3637,6 +3678,33 @@ export async function runScheduledChat(
         ? collectConfirmedPublishActions(await loadPublishLedger(sessionId, runStartCalledFunctions))
         : [];
 
+      // Work landed this run, so there are three options and only one is good.
+      // A blind requeue restarts from scratch and REPUBLISHES it. Simply not
+      // retrying avoids that, but can leave a multi-step run (publish 1 of 5, then
+      // die) permanently part-done with nothing surfaced — a quieter, harder-to-
+      // diagnose failure than the duplicate it prevents. So prefer RESUME:
+      // planScheduledRunResume says yes only when the transcript ends on a settled,
+      // balanced boundary, which by construction never re-drives a tool that already
+      // ran. The rest of the task finishes; the publish is not repeated.
+      const zeroOutputNextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+      let willResumePublishedRun = false;
+      if (
+        publishedActions.length > 0
+        && !isTest
+        && sessionId
+        && zeroOutputNextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES
+      ) {
+        try {
+          const priorMessages = await chatbotDb.getMessagesFromMessagesTable(sessionId);
+          willResumePublishedRun = planScheduledRunResume(priorMessages as any).resumable;
+        } catch (planError) {
+          console.error(
+            `Zero-output resume-plan check failed for session ${sessionId}; will not retry:`,
+            planError
+          );
+        }
+      }
+
       // Never leave the session silent (ENG-209). Persist a structured
       // "job incomplete" assistant message so the user sees graceful feedback
       // instead of an empty session. Done BEFORE requeue so the failed session
@@ -3649,7 +3717,7 @@ export async function runScheduledChat(
         // debugging it. Budget-shaped failures keep the original guidance.
         const failureClass = classifyZeroAssistantFailure(error);
         const incompleteMessage = publishedActions.length > 0
-          ? zeroAssistantPublishedMessage(publishedActions)
+          ? zeroAssistantPublishedMessage(publishedActions, willResumePublishedRun)
           : zeroAssistantIncompleteMessage(error);
         try {
           await chatbotDb.addMessageToSession(sessionId, {
@@ -3681,16 +3749,44 @@ export async function runScheduledChat(
       });
 
       if (publishedActions.length > 0) {
-        // Deliberately no requeue and no retry-count bump: this run's work landed, so
-        // the schedule is left to its next natural slot rather than replaying a
-        // publish. Scoped to a CONFIRMED publish, so every other zero-output failure
-        // keeps self-healing exactly as before.
-        console.error(
-          `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
-          + `(${publishedActions.join('; ')}); NOT requeuing — a retry would repeat it.`
-        );
+        if (willResumePublishedRun) {
+          // Requeue AS A RESUME: same session, continued from its last settled step.
+          const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(zeroOutputNextRetryCount)).toISOString();
+          zeroAssistantRequeuedAt = retryAt;
+          try {
+            await scheduleDb.updateSchedule(schedule.scheduleId, {
+              status: 'active',
+              nextRunTime: retryAt,
+              zeroAssistantRetryCount: zeroOutputNextRetryCount,
+              lastZeroAssistantOutputAt: new Date().toISOString(),
+              lastZeroAssistantOutputSessionId: sessionId || '',
+              pendingResumeSessionId: sessionId || '',
+              updatedAt: new Date().toISOString(),
+            });
+            console.error(
+              `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
+              + `(${publishedActions.join('; ')}); requeued as a RESUME so the rest completes without repeating it.`
+            );
+          } catch (requeueError) {
+            console.error(`Failed to requeue-as-resume zero-output scheduled chat ${schedule.scheduleId}:`, requeueError);
+          }
+        } else {
+          // Cannot continue safely and must not restart. Stopping here is the least-bad
+          // option, but it would otherwise be SILENT — the owner is told so a part-done
+          // run cannot masquerade as a finished one.
+          console.error(
+            `Scheduled chat ${schedule.scheduleId} produced zero output AFTER confirmed work `
+            + `(${publishedActions.join('; ')}) and is not safely resumable; NOT requeuing — notifying owner.`
+          );
+          if (!isTest) {
+            await notifyScheduleOwnerOfFailure(schedule, userId, {
+              failedAttempts: zeroOutputNextRetryCount,
+              failureClass: classifyZeroAssistantFailure(error),
+            });
+          }
+        }
       } else if (!isTest) {
-        const nextRetryCount = getZeroAssistantRetryCount(schedule) + 1;
+        const nextRetryCount = zeroOutputNextRetryCount;
         if (nextRetryCount <= ZERO_ASSISTANT_MAX_REQUEUES) {
           const retryAt = new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString();
           zeroAssistantRequeuedAt = retryAt;
@@ -3725,35 +3821,10 @@ export async function runScheduledChat(
           // atomic with the email send, so any such flag inevitably diverges from actual
           // delivery (a duplicate alert if the write fails after a send, or a missed alert
           // if the ordering is inverted). No dedup state means no divergence to get wrong.
-          try {
-            let recipients: string[] = Array.isArray(schedule.emailNotifications)
-              ? schedule.emailNotifications.filter((e: any) => typeof e === 'string' && e.trim())
-              : [];
-            if (recipients.length === 0) {
-              const owner = await userDb.getUserById(userId);
-              if (owner?.email) recipients = [owner.email];
-            }
-            if (recipients.length > 0) {
-              await emailService.sendScheduledRunFailedEmail(
-                recipients,
-                schedule.scheduleName,
-                schedule.scheduleId,
-                {
-                  failedAttempts: nextRetryCount,
-                  failureClass: classifyZeroAssistantFailure(error),
-                }
-              );
-            } else {
-              console.error(
-                `No notification recipients for repeatedly-failing schedule ${schedule.scheduleId}; owner alert skipped.`
-              );
-            }
-          } catch (notifyError) {
-            console.error(
-              `Failed to send owner failure alert for schedule ${schedule.scheduleId}:`,
-              notifyError
-            );
-          }
+          await notifyScheduleOwnerOfFailure(schedule, userId, {
+            failedAttempts: nextRetryCount,
+            failureClass: classifyZeroAssistantFailure(error),
+          });
         }
       }
     }
