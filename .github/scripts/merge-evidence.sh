@@ -175,7 +175,7 @@ trap 'rm -f "${stderr_file}"' EXIT
 # ---------------------------------------------------------------------------
 
 pr_json="$(gh pr view "${PR_NUMBER}" --repo "${REPO}" \
-  --json number,state,isDraft,mergeable,mergeStateStatus,headRefOid,baseRefName \
+  --json number,state,isDraft,mergeable,headRefOid,baseRefName \
   2>"${stderr_file}")"
 gh_exit=$?
 
@@ -183,12 +183,12 @@ if [ "${gh_exit}" -ne 0 ]; then
   hard_fail "GitHub API call failed (exit ${gh_exit}) reading ${REPO}#${PR_NUMBER}: $(tr '\n' ' ' <"${stderr_file}")"
 fi
 
-# `mergeStateStatus` was already requested here and then thrown away. ENG-1003
-# reads it: BEHIND is GitHub's own statement that the base moved under this PR,
-# so the staleness check in section 8 costs no extra API call on a current PR.
+# ENG-1003: the freshness compare in section 8 now runs unconditionally, so
+# mergeStateStatus is no longer fetched — GitHub reports only one dominant
+# state and gating on BEHIND missed PRs that were behind AND something else.
 parsed="$(printf '%s' "${pr_json}" | jq -r '
     [ (.state // ""), (.isDraft | tostring), (.mergeable // ""), (.headRefOid // ""),
-      (.mergeStateStatus // ""), (.baseRefName // "") ]
+      (.baseRefName // "") ]
     | join("\u001f")' 2>/dev/null)"
 jq_exit=$?
 
@@ -197,7 +197,7 @@ if [ "${jq_exit}" -ne 0 ] || [ -z "${parsed}" ]; then
   hard_fail "unparseable response from \`gh pr view ${PR_NUMBER}\` — expected a JSON object with state/isDraft/mergeable/headRefOid"
 fi
 
-IFS="${SEP}" read -r pr_state pr_draft pr_mergeable head_sha pr_merge_state base_ref <<<"${parsed}"
+IFS="${SEP}" read -r pr_state pr_draft pr_mergeable head_sha base_ref <<<"${parsed}"
 
 if [ -z "${pr_state}" ] || [ -z "${pr_mergeable}" ]; then
   surface 'gh pr view response (raw)' "${pr_json}"
