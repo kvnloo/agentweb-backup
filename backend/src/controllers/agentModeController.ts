@@ -3839,25 +3839,30 @@ export async function runScheduledChat(
         // above is retried first, and why nothing pauses on an ordinary failure.
         if (!publishedRunDidResume && !isTest) {
           zeroAssistantRequeuedAt = undefined;
-          try {
-            await scheduleDb.updateSchedule(schedule.scheduleId, {
-              status: 'paused',
-              lastZeroAssistantOutputAt: new Date().toISOString(),
-              lastZeroAssistantOutputSessionId: sessionId || '',
-              updatedAt: new Date().toISOString(),
-            });
-            publishedRunPaused = true;
-            console.error(
-              `Scheduled chat ${schedule.scheduleId} PAUSED: it published `
-              + `(${publishedActions.join('; ') || 'outcome unreadable'}) and cannot be continued, `
-              + `so its next fire would repeat that work.`
-            );
-          } catch (pauseError) {
-            console.error(
-              `CRITICAL: failed to pause schedule ${schedule.scheduleId} after a published, `
-              + `non-resumable run — its next fire may repeat completed work:`,
-              pauseError
-            );
+          // Retried like the marker write above: this is the last durable thing
+          // standing between a published run and a repeat, so one unlucky call must
+          // not decide it.
+          for (let attempt = 1; attempt <= 3 && !publishedRunPaused; attempt++) {
+            try {
+              await scheduleDb.updateSchedule(schedule.scheduleId, {
+                status: 'paused',
+                lastZeroAssistantOutputAt: new Date().toISOString(),
+                lastZeroAssistantOutputSessionId: sessionId || '',
+                updatedAt: new Date().toISOString(),
+              });
+              publishedRunPaused = true;
+              console.error(
+                `Scheduled chat ${schedule.scheduleId} PAUSED: it published `
+                + `(${publishedActions.join('; ') || 'outcome unreadable'}) and cannot be continued, `
+                + `so its next fire would repeat that work.`
+              );
+            } catch (pauseError) {
+              console.error(
+                `CRITICAL: failed to pause schedule ${schedule.scheduleId} after a published, `
+                + `non-resumable run (attempt ${attempt}/3) — its next fire may repeat completed work:`,
+                pauseError
+              );
+            }
           }
         }
 
@@ -4126,20 +4131,24 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
   // Paused only after winning the claim — a lost claim means another instance owns
   // this recovery and must not have the schedule changed underneath it.
   if (pauseAfterClaim) {
-    try {
-      await scheduleDb.updateSchedule(schedule.scheduleId, {
-        status: 'paused',
-        updatedAt: new Date().toISOString(),
-      });
-      console.error(
-        `recoverAbandonedScheduledRun: PAUSED schedule ${schedule.scheduleId} — ${noRequeueReason}.`
-      );
-    } catch (pauseError) {
-      console.error(
-        `CRITICAL: failed to pause schedule ${schedule.scheduleId} after an abandoned run that `
-        + `may already have published — its next fire may repeat completed work:`,
-        pauseError
-      );
+    let paused = false;
+    for (let attempt = 1; attempt <= 3 && !paused; attempt++) {
+      try {
+        await scheduleDb.updateSchedule(schedule.scheduleId, {
+          status: 'paused',
+          updatedAt: new Date().toISOString(),
+        });
+        paused = true;
+        console.error(
+          `recoverAbandonedScheduledRun: PAUSED schedule ${schedule.scheduleId} — ${noRequeueReason}.`
+        );
+      } catch (pauseError) {
+        console.error(
+          `CRITICAL: failed to pause schedule ${schedule.scheduleId} after an abandoned run that `
+          + `may already have published (attempt ${attempt}/3) — its next fire may repeat completed work:`,
+          pauseError
+        );
+      }
     }
   }
 
