@@ -8790,7 +8790,10 @@ export class AgentModeService {
   }
 
   // Read current user's market strategy
-  public async readMarketStrategy(userId: string, options: { competitorOffset?: number } = {}): Promise<any> {
+  public async readMarketStrategy(
+    userId: string,
+    options: { competitorOffset?: number; minCompetitorsInFull?: number } = {}
+  ): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -8840,7 +8843,13 @@ export class AgentModeService {
       const competitorDetailOffset = Number.isFinite(requestedOffset)
         ? Math.min(Math.max(Math.floor(requestedOffset), 0), Math.max(0, competitorCount - 1))
         : 0;
-      const window = this.resolveCompetitorDetailWindow(competitors, competitorDetailOffset);
+      // The character budget protects the TOOL result's context window. Callers
+      // that embed formattedContent in their own prompt instead (the CRM email
+      // drafter) pass minCompetitorsInFull to keep the coverage they had before
+      // ENG-945, so paging can't silently shrink an unrelated prompt.
+      const requestedMin = Number(options?.minCompetitorsInFull);
+      const minInFull = Number.isFinite(requestedMin) && requestedMin > 0 ? Math.floor(requestedMin) : 1;
+      const window = this.resolveCompetitorDetailWindow(competitors, competitorDetailOffset, minInFull);
 
       // Format the market strategy for LLM consumption
       const formattedContent = this.formatMarketStrategy({
@@ -12262,8 +12271,13 @@ export class AgentModeService {
       // Get brand guidelines
       const brandGuidelines = await this.readBrandGuidelines(userId);
 
-      // Get market strategy
-      const marketStrategy = await this.readMarketStrategy(userId);
+      // Get market strategy. This prompt embeds formattedContent wholesale, so
+      // it is NOT bounded by the tool-result page budget — before ENG-945 it
+      // received 40 competitors in full and it still must (plus, now, the names
+      // of any beyond that).
+      const marketStrategy = await this.readMarketStrategy(userId, {
+        minCompetitorsInFull: AgentModeService.PROMPT_EMBEDDED_COMPETITOR_DETAIL
+      });
 
       // Get sender information (from lead record, or default sender from CRM configuration)
       // Pass list.userId so org members use the list owner's sender config
@@ -22721,6 +22735,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   // response inline.
   private static readonly COMPETITOR_DETAIL_CHAR_BUDGET = 8000;
 
+  // Coverage guaranteed to callers that embed formattedContent directly in their
+  // own prompt rather than returning it as a tool result. 40 is exactly what
+  // readMarketStrategy rendered in full before ENG-945, so those prompts are
+  // unchanged by the introduction of paging.
+  private static readonly PROMPT_EMBEDDED_COMPETITOR_DETAIL = 40;
+
   private formatCompetitorDetailLine(competitor: any): string {
     if (typeof competitor === 'object' && competitor && competitor.name) {
       return `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
@@ -22730,17 +22750,23 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   /**
    * Fill a page of full-detail competitors starting at `offset`, stopping when
-   * the character budget is spent. Always yields at least one entry so a single
-   * oversized description can still be read — an empty page would be the same
-   * silent-nothing failure mode the budget exists to prevent.
+   * the character budget is spent.
+   *
+   * `minEntries` is a floor the budget cannot undercut: the first `minEntries`
+   * are always rendered in full, however long they are. It defaults to 1 so a
+   * single oversized description can still be read — an empty page would be the
+   * same silent-nothing failure mode the budget exists to prevent — and
+   * non-tool callers raise it to preserve their pre-ENG-945 coverage.
    */
-  private resolveCompetitorDetailWindow(competitors: any[], offset: number): { start: number; end: number } {
+  private resolveCompetitorDetailWindow(competitors: any[], offset: number, minEntries: number = 1): { start: number; end: number } {
     const start = Math.min(Math.max(Math.floor(offset) || 0, 0), Math.max(0, competitors.length - 1));
+    const floor = Math.max(1, Math.floor(minEntries) || 1);
     let used = 0;
     let end = start;
     while (end < competitors.length) {
       const cost = this.formatCompetitorDetailLine(competitors[end]).length;
-      if (end > start && used + cost > AgentModeService.COMPETITOR_DETAIL_CHAR_BUDGET) break;
+      const withinFloor = end - start < floor;
+      if (!withinFloor && used + cost > AgentModeService.COMPETITOR_DETAIL_CHAR_BUDGET) break;
       used += cost;
       end++;
     }
