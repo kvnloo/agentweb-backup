@@ -311,6 +311,58 @@ describe('AgentModeService - search_knowledge_base', () => {
       expect(result.success).toBe(false);
       expect(result.error).toBe('Unknown error');
     });
+
+    // ENG-1057: the Vertex source was the one path in this function that never
+    // capped content length, unlike Drive/ClickUp docs/ClickUp tasks below it.
+    // A single oversized result crashed the whole process with a Node
+    // ERR_STRING_TOO_LONG uncaught exception, taking down every request on this
+    // single-instance backend until auto-restart.
+    it('should truncate Vertex result content over 5000 chars with a truncation marker', async () => {
+      const longContent = 'x'.repeat(6000);
+      mockSearchPlatformKnowledgeBase.mockResolvedValue([
+        { id: 'kb-1', content: longContent, metadata: { source: 'public-knowledge-base' } },
+      ]);
+
+      const result = await (agentModeService as any).searchKnowledgeBase('test query', 5, 'user-123');
+
+      expect(result.results[0].content).toBe('x'.repeat(5000) + '\n\n[Content truncated]');
+      expect(result.results[0].content.length).toBeLessThan(longContent.length);
+    });
+
+    it('should not truncate Vertex result content at exactly 5000 chars', async () => {
+      const boundaryContent = 'x'.repeat(5000);
+      mockSearchPlatformKnowledgeBase.mockResolvedValue([
+        { id: 'kb-1', content: boundaryContent, metadata: { source: 'public-knowledge-base' } },
+      ]);
+
+      const result = await (agentModeService as any).searchKnowledgeBase('test query', 5, 'user-123');
+
+      expect(result.results[0].content).toBe(boundaryContent);
+      expect(result.results[0].content).not.toContain('[Content truncated]');
+    });
+
+    it('should not truncate Vertex result content under 5000 chars', async () => {
+      mockSearchPlatformKnowledgeBase.mockResolvedValue([
+        { id: 'kb-1', content: 'short content', metadata: { source: 'public-knowledge-base' } },
+      ]);
+
+      const result = await (agentModeService as any).searchKnowledgeBase('test query', 5, 'user-123');
+
+      expect(result.results[0].content).toBe('short content');
+    });
+
+    it('should truncate only the oversized result when multiple Vertex results have mixed lengths', async () => {
+      const longContent = 'y'.repeat(7000);
+      mockSearchPlatformKnowledgeBase.mockResolvedValue([
+        { id: 'kb-1', content: 'short content', metadata: { source: 'public-knowledge-base' } },
+        { id: 'kb-2', content: longContent, metadata: { source: 'private-knowledge-base' } },
+      ]);
+
+      const result = await (agentModeService as any).searchKnowledgeBase('test query', 5, 'user-123');
+
+      expect(result.results[0].content).toBe('short content');
+      expect(result.results[1].content).toBe('y'.repeat(5000) + '\n\n[Content truncated]');
+    });
   });
 
   describe('Mock Responses', () => {
