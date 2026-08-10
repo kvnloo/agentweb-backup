@@ -17,6 +17,7 @@ import {
   assertsUnsavedInterruption,
   isBookkeepingTool,
   ledgerFromSucceededFunctions,
+  diffSucceededFunctions,
   appendConfirmedPublishNotice,
   BOOKKEEPING_TOOLS,
 } from '../utils/falseFailureReport';
@@ -136,19 +137,22 @@ describe('falseFailureReport', () => {
       ).toEqual(['published your landing-page changes']);
     });
 
-    it('collects a deployed generate_landing_page record', () => {
+    // generate_landing_page is NO LONGER a confirmed publish, even with a deployed
+    // record: it produces a draft plus a preview. It was removed once this same set
+    // began gating scheduled auto-retry, where over-reach silently disables a schedule.
+    it('does not treat a deployed generate_landing_page record as a publish', () => {
       expect(
         collectConfirmedPublishActions([
           { name: 'generate_landing_page', result: { status: 'deployed', deployedUrl: 'https://x.example.com' } },
         ]),
-      ).toEqual(['deployed your landing page']);
+      ).toEqual([]);
     });
 
     it('de-duplicates repeated equivalent actions', () => {
       expect(
         collectConfirmedPublishActions([
           { name: 'deploy_landing_page', result: { status: 'deployed' } },
-          { name: 'generate_landing_page', result: { status: 'deployed' } },
+          { name: 'deploy_landing_page', result: { status: 'deployed' } },
         ]),
       ).toEqual(['deployed your landing page']);
     });
@@ -275,6 +279,8 @@ describe('falseFailureReport', () => {
 
     it('feeds the guard the production session 7b4895fd shape', () => {
       // Successes flushed before the 600s timeout threw: the publish DID land.
+      // generate_landing_page also succeeded, but it only produced a DRAFT, so it
+      // must not appear as a deploy.
       const ledger = ledgerFromSucceededFunctions({
         publish_landing_page_changes: 1,
         generate_landing_page: 1,
@@ -284,7 +290,6 @@ describe('falseFailureReport', () => {
 
       expect(collectConfirmedPublishActions(ledger)).toEqual([
         'published your landing-page changes',
-        'deployed your landing page',
       ]);
       expect(
         reconcileFalseFailureReport(
@@ -317,6 +322,18 @@ describe('falseFailureReport', () => {
       expect(reconcileFalseFailureReport(FALSE_FAILURE_TEXT, ledger)).toContain(label);
     });
 
+    // FAIL case: a draft is not a deploy. These were in the set until review; once
+    // the same set also gated scheduled auto-retry, over-reach stopped being cosmetic
+    // and started silently disabling schedules.
+    it.each(['generate_landing_page', 'duplicate_landing_page'])(
+      '%s produces a draft, not a confirmed publish',
+      (tool) => {
+        const ledger = ledgerFromSucceededFunctions({ [tool]: 1 });
+        expect(collectConfirmedPublishActions(ledger)).toEqual([]);
+        expect(reconcileFalseFailureReport(FALSE_FAILURE_TEXT, ledger)).toBe(FALSE_FAILURE_TEXT);
+      },
+    );
+
     // FAIL case: twitter_manage_post multiplexes create/delete/read behind ONE
     // name. On the diagnosis path only the name survives, so a successful DELETE
     // would be reported as "posted" — the guard must not claim what it cannot see.
@@ -324,6 +341,57 @@ describe('falseFailureReport', () => {
       const ledger = ledgerFromSucceededFunctions({ twitter_manage_post: 1 });
       expect(collectConfirmedPublishActions(ledger)).toEqual([]);
       expect(reconcileFalseFailureReport(FALSE_FAILURE_TEXT, ledger)).toBe(FALSE_FAILURE_TEXT);
+    });
+  });
+
+  /**
+   * calledFunctions accumulates for the LIFE of the session, so reading it raw
+   * attributes an earlier turn's (or an earlier RESUMED RUN's) success to the current
+   * failure. On the scheduled path that meant an inherited publish could suppress the
+   * requeue of an unrelated failure and silently end a schedule's auto-recovery.
+   */
+  describe('diffSucceededFunctions', () => {
+    it('keeps only what increased since the snapshot', () => {
+      expect(
+        diffSucceededFunctions(
+          { publish_landing_page_changes: 1, get_leads: 2 },
+          { publish_landing_page_changes: 1, get_leads: 5, send_dm: 1 },
+        ),
+      ).toEqual({ get_leads: 3, send_dm: 1 });
+    });
+
+    it('hides a publish that belongs to an earlier turn', () => {
+      const before = { publish_landing_page_changes: 1 };
+      const after = { publish_landing_page_changes: 1, you_search_web: 4 };
+      const ledger = ledgerFromSucceededFunctions(diffSucceededFunctions(before, after));
+
+      expect(collectConfirmedPublishActions(ledger)).toEqual([]);
+      expect(reconcileFalseFailureReport(FALSE_FAILURE_TEXT, ledger)).toBe(FALSE_FAILURE_TEXT);
+    });
+
+    it('still surfaces a publish that happened in THIS turn', () => {
+      const ledger = ledgerFromSucceededFunctions(
+        diffSucceededFunctions({ get_leads: 2 }, { get_leads: 2, publish_landing_page_changes: 1 }),
+      );
+      expect(collectConfirmedPublishActions(ledger)).toEqual(['published your landing-page changes']);
+    });
+
+    it('counts a SECOND publish in a session that already had one', () => {
+      const ledger = ledgerFromSucceededFunctions(
+        diffSucceededFunctions({ publish_landing_page_changes: 1 }, { publish_landing_page_changes: 2 }),
+      );
+      expect(collectConfirmedPublishActions(ledger)).toEqual(['published your landing-page changes']);
+    });
+
+    it('treats a missing baseline as nothing-known-before', () => {
+      expect(diffSucceededFunctions(null, { publish_landing_page_changes: 1 }))
+        .toEqual({ publish_landing_page_changes: 1 });
+      expect(diffSucceededFunctions(undefined, null)).toEqual({});
+      expect(diffSucceededFunctions({ a: 1 }, undefined)).toEqual({});
+    });
+
+    it('ignores malformed counts rather than trusting them', () => {
+      expect(diffSucceededFunctions({ a: 'x' } as any, { a: 2, b: 'y' } as any)).toEqual({ a: 2 });
     });
   });
 

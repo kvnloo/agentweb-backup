@@ -1023,14 +1023,36 @@ describe('AgentModeController - Error Handling', () => {
       );
     };
 
-    it('passes the run\'s successful calls to the diagnosis agent, not just the failures', async () => {
-      mockChatbotDb.getChatSession.mockResolvedValue({
+    /**
+     * Stage a turn the way production actually runs it. calledFunctions is
+     * session-cumulative, so the controller snapshots it BEFORE the turn and diffs
+     * against the value at failure time. A mock that returns one fixed session for
+     * both reads makes every turn look like it accomplished nothing — and, worse,
+     * would hide the bug where an EARLIER turn's publish is credited to this one.
+     * `before` is what the session already carried; `after` is what it carries once
+     * the turn has run.
+     */
+    const stageTurn = (
+      after: Record<string, number>,
+      opts: { before?: Record<string, number>; error?: any } = {}
+    ) => {
+      const before = opts.before ?? {};
+      let turnRan = false;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(async () => {
+        turnRan = true;
+        throw opts.error ?? generationTimeout();
+      });
+      mockChatbotDb.getChatSession.mockImplementation(async () => ({
         ...mockSession,
-        calledFunctions: { publish_landing_page_changes: 1, get_deployment_status: 2 },
+        messages: [{ role: 'user', content: 'prior message' }],
+        calledFunctions: turnRan ? after : before,
         failedFunctions: { save_memory: 1, coding_agent: 1 },
-      } as any);
+      }) as any);
+    };
+
+    it('passes the run\'s successful calls to the diagnosis agent, not just the failures', async () => {
+      stageTurn({ publish_landing_page_changes: 1, get_deployment_status: 2 });
       mockAgentModeService.generateDiagnosticMessage.mockResolvedValue('diagnosed');
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
 
       await runTurn();
 
@@ -1043,13 +1065,8 @@ describe('AgentModeController - Error Handling', () => {
     });
 
     it('appends the true outcome when the diagnosis claims unsaved work after a confirmed publish', async () => {
-      mockChatbotDb.getChatSession.mockResolvedValue({
-        ...mockSession,
-        calledFunctions: { publish_landing_page_changes: 1, generate_landing_page: 1, save_memory: 1 },
-        failedFunctions: { save_memory: 1, coding_agent: 1 },
-      } as any);
+      stageTurn({ publish_landing_page_changes: 1, generate_landing_page: 1, save_memory: 1 });
       mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(PROD_FALSE_FAILURE);
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
 
       const errorCall = await runTurn();
 
@@ -1061,14 +1078,30 @@ describe('AgentModeController - Error Handling', () => {
       expect(errorCall![1].metadata!.isDiagnosticMessage).toBe(true);
     });
 
-    it('leaves the diagnosis untouched when the run published nothing', async () => {
-      mockChatbotDb.getChatSession.mockResolvedValue({
-        ...mockSession,
-        calledFunctions: { you_search_web: 3, get_leads: 1 },
-        failedFunctions: { you_search_web: 1 },
-      } as any);
+    /**
+     * The regression this nearly shipped with. calledFunctions accumulates for the
+     * LIFE of the session, so a publish from turn 1 would otherwise be announced as
+     * this turn's work when turn 7 fails for an unrelated reason.
+     */
+    it('does not credit an EARLIER turn\'s publish to this turn\'s failure', async () => {
+      stageTurn(
+        { publish_landing_page_changes: 1, you_search_web: 4 },
+        { before: { publish_landing_page_changes: 1 } }
+      );
       mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(PROD_FALSE_FAILURE);
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
+
+      const errorCall = await runTurn();
+
+      // Nothing was published THIS turn, so there is nothing to correct.
+      expect(errorCall![1].content).toBe(PROD_FALSE_FAILURE);
+      expect(mockAgentModeService.generateDiagnosticMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ succeededFunctions: { you_search_web: 4 } })
+      );
+    });
+
+    it('leaves the diagnosis untouched when the run published nothing', async () => {
+      stageTurn({ you_search_web: 3, get_leads: 1 });
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(PROD_FALSE_FAILURE);
 
       const errorCall = await runTurn();
 
@@ -1078,13 +1111,8 @@ describe('AgentModeController - Error Handling', () => {
     it('leaves a truthful diagnosis untouched even after a confirmed publish', async () => {
       const truthful =
         'Your landing page is published and live. The run was cut short before I could save a memory note.';
-      mockChatbotDb.getChatSession.mockResolvedValue({
-        ...mockSession,
-        calledFunctions: { publish_landing_page_changes: 1 },
-        failedFunctions: { save_memory: 1 },
-      } as any);
+      stageTurn({ publish_landing_page_changes: 1 });
       mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(truthful);
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
 
       const errorCall = await runTurn();
 
@@ -1096,12 +1124,8 @@ describe('AgentModeController - Error Handling', () => {
     // again" — the same double-deploy advice, minus the false claim. There is no
     // prose to judge, so a confirmed publish alone earns the notice.
     it('adds the true outcome to the generic fallback when the diagnosis agent is unavailable', async () => {
-      mockChatbotDb.getChatSession.mockResolvedValue({
-        ...mockSession,
-        calledFunctions: { publish_landing_page_changes: 1 },
-      } as any);
+      stageTurn({ publish_landing_page_changes: 1 });
       mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(null);
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
 
       const errorCall = await runTurn();
 
@@ -1116,14 +1140,7 @@ describe('AgentModeController - Error Handling', () => {
     // (ENG-657). "Please send your message again" after a landed publish is the same
     // double-deploy advice as the generic fallback, so it earns the same notice.
     it('adds the true outcome to the server-restart message after a confirmed publish', async () => {
-      mockChatbotDb.getChatSession.mockResolvedValue({
-        ...mockSession,
-        messages: [{ role: 'user', content: 'prior message' }],
-        calledFunctions: { publish_landing_page_changes: 1 },
-      } as any);
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(
-        new Error('Worker shutdown')
-      );
+      stageTurn({ publish_landing_page_changes: 1 }, { error: new Error('Worker shutdown') });
 
       const errorCall = await runTurn();
 
@@ -1134,14 +1151,7 @@ describe('AgentModeController - Error Handling', () => {
     });
 
     it('leaves the server-restart message bare when the run published nothing', async () => {
-      mockChatbotDb.getChatSession.mockResolvedValue({
-        ...mockSession,
-        messages: [{ role: 'user', content: 'prior message' }],
-        calledFunctions: { get_leads: 1 },
-      } as any);
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(
-        new Error('Worker shutdown')
-      );
+      stageTurn({ get_leads: 1 }, { error: new Error('Worker shutdown') });
 
       const errorCall = await runTurn();
 
@@ -1151,12 +1161,8 @@ describe('AgentModeController - Error Handling', () => {
     });
 
     it('leaves the generic fallback bare when the run published nothing', async () => {
-      mockChatbotDb.getChatSession.mockResolvedValue({
-        ...mockSession,
-        calledFunctions: { get_leads: 2 },
-      } as any);
+      stageTurn({ get_leads: 2 });
       mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(null);
-      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
 
       const errorCall = await runTurn();
 

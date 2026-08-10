@@ -953,6 +953,14 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       const zeroOutput = {
         content: '', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [],
       };
+      // Local copies of the ENG-657 resume fixtures (theirs are scoped to that describe).
+      const resumeSessionId = 'resume-sess-eng971';
+      const resumableMessages = [
+        { role: 'system', content: 'automated run' },
+        { role: 'user', content: 'Enrich the CRM leads and recommend the top 10.' },
+        { role: 'assistant', content: 'Firing enrichment.', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: '{"mode":"enrich","processedCount":5}' },
+      ];
 
       const runWithLedger = async (calledFunctions: Record<string, number>) => {
         mockChatbotDb.getChatSession.mockResolvedValue({
@@ -1007,6 +1015,51 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
           (c: any[]) => c[1]?.metadata?.jobIncomplete === true
         );
         expect(note![1].content).toContain('will be retried automatically');
+      });
+
+      /**
+       * The regression this nearly shipped with. calledFunctions is SESSION-cumulative
+       * and a recovered run RESUMES the abandoned run's session, so a publish from the
+       * previous run would otherwise be read as this run's work and suppress the
+       * requeue — silently ending the schedule's auto-recovery. Only successes that
+       * increased since this run started may count.
+       */
+      it('still requeues when the publish belongs to the PREVIOUS run of a resumed session', async () => {
+        // The resumed session carries the abandoned run's publish in calledFunctions
+        // and gains nothing new this run. Read raw, that inherited publish would
+        // suppress the requeue forever.
+        // jest.clearAllMocks() clears CALLS but not implementations, and an earlier
+        // test in this file pins claimPendingResume to false. Without this the run
+        // takes the lost-claim early return, no session is created, and the
+        // "we resumed" assertion below passes for entirely the wrong reason.
+        (mockScheduleDb.claimPendingResume as jest.Mock).mockResolvedValue(true);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: resumableMessages,
+          calledFunctions: { publish_landing_page_changes: 1 },
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0,
+            pendingResumeSessionId: resumeSessionId } as any,
+          mockUserId,
+          false
+        );
+
+        // Prove the resume actually happened: the turn ran against the ABANDONED
+        // session, not a fresh one. Asserting only "no session was created" would also
+        // be true of the lost-claim early return.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        const workerArg = (mockGenerateMarketingResponseWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
+        expect(workerArg.sessionId).toBe(resumeSessionId);
+
+        const requeue = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1
+        );
+        expect(requeue).toBeDefined();
       });
 
       it('still requeues when the session read fails (no ledger, old behaviour)', async () => {
