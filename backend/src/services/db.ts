@@ -3073,12 +3073,17 @@ export const scheduleDb = {
       // Its own consent control precisely because the required-function picker is a
       // verification control, not a waiver. Default off.
       //
-      // POLARITY, AND WHY BOTH FIELDS EXIST (see schedulePublishAuthorization.ts):
-      // requirePublishApproval above is the owner's HOLD; autopublishAuthorized is
-      // the owner's WAIVER of the per-post review that a hold would otherwise
-      // require. They are not duplicates and they do not fight: a schedule that is
-      // not held publishes as it always has, and the waiver only ever matters on a
-      // schedule that IS held. A hold with no waiver drafts and notifies.
+      // UNRECONCILED POLARITY COLLISION — DO NOT SHIP BOTH GATES AS THEY STAND.
+      // requirePublishApproval (ENG-803, merged) is an opt-OUT: absent => AUTHORIZED.
+      // autopublishAuthorized (ENG-827, this branch) is an opt-IN: absent => DENIED.
+      // Both are enforced at tool dispatch — ENG-803 in AgentModeService.executeTool,
+      // ENG-827 in the toolRegistry it then dispatches through — so a scheduled
+      // publish must satisfy BOTH, and the conjunction is DENY for every schedule
+      // that predates this branch (autopublishAuthorized is written only by the
+      // unshipped /publish-consent route, so no existing row can have it). Worse,
+      // ENG-803's directive is the one that actually reaches the model, so the run is
+      // ORDERED to publish and then mechanically refused.
+      // The two fields must be reconciled into one decision before this merges.
       autopublishAuthorized?: boolean;
       // ENG-827: the publish tools the owner could see when they consented. Consent
       // is bound to THIS list, so a later edit to requiredFunctionCalls cannot

@@ -4,6 +4,7 @@ import {
   isPublishCall,
   SchedulePublishAuthorization,
 } from './schedulePublishAuthorization';
+import { extractScheduleId } from './schedulePublishApproval';
 
 /**
  * ENG-827 — enforcing publish consent at the moment a publish tool RUNS.
@@ -197,7 +198,15 @@ export async function refuseUnauthorizedScheduledPublish(
 
   if (session?.sessionType !== 'scheduled') return null;
 
-  const scheduleId = String(session?.pageIdentifier || '').match(/scheduleId:([a-f0-9-]+)/)?.[1];
+  // Use ENG-803's ANCHORED parser rather than an unanchored search. `pageIdentifier`
+  // is `"<scheduleName>|scheduleId:<id>"`, and the schedule NAME is owner-supplied
+  // text sitting in front of the authoritative id — so an unanchored match takes the
+  // FIRST hit and a schedule named `Evil scheduleId:deadbeef` resolves this run's
+  // consent against a DIFFERENT schedule's record. Verified: on
+  // `"Evil scheduleId:deadbeef|scheduleId:<real>"` the unanchored form returned
+  // `deadbeef`. One shared, audited parser so the two gates cannot disagree about
+  // which schedule a run belongs to.
+  const scheduleId = extractScheduleId(session?.pageIdentifier);
   if (!scheduleId) {
     // A scheduled session whose schedule cannot be identified has no consent record
     // to stand on. The prompt directive treats this same state as 'withheld'.

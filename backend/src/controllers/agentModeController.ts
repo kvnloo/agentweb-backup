@@ -22,7 +22,7 @@ import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } fro
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
-import { resolvePublishAuthorized } from '../utils/schedulePublishApproval';
+import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
@@ -4404,9 +4404,14 @@ export async function generateSessionResponse(
 
         // For scheduled chat sessions, inject schedule context so Emma can reference/update the schedule
         if (session.sessionType === 'scheduled' && session.pageIdentifier) {
-          const scheduleIdMatch = session.pageIdentifier.match(/scheduleId:([a-f0-9-]+)/);
+          // ANCHORED parser (ENG-803's shared helper): the schedule NAME precedes the
+          // authoritative id in `"<name>|scheduleId:<id>"`, so an unanchored match lets
+          // a schedule named `Evil scheduleId:deadbeef` select a DIFFERENT schedule's
+          // record — which this same value then uses to resolve publish authorization
+          // below. One parser for both gates.
+          const scheduleIdMatch = extractScheduleId(session.pageIdentifier);
           if (scheduleIdMatch) {
-            systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
+            systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
           }
           // Resolve the schedule owner's admin status so the directive only
           // injects its admin-only (get_chat_history / list_all_clients) identity
@@ -4443,7 +4448,7 @@ export async function generateSessionResponse(
             authorizedPublishTools = publishAuthorizationOverride.tools;
           } else if (scheduleIdMatch) {
             try {
-              const auth = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleIdMatch[1]));
+              const auth = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(scheduleIdMatch));
               publishAuthorization = auth.authorized ? 'authorized' : 'withheld';
               authorizedPublishTools = auth.tools;
             } catch (scheduleLookupError) {
