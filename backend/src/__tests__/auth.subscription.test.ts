@@ -190,6 +190,10 @@ describe('GET /api/auth/me subscription fields', () => {
       orgId: 'org-1',
       ownerUserId: 'owner-1',
       name: 'Test Org',
+      // Populated so the ENG-927 owner-record fallback does not fire here: the
+      // guard below is that the BILLING overlay never reads the owner record,
+      // and an unrelated brand lookup would blunt it.
+      brandGuidelines: { brandData: { brandName: 'Test Org Brand' } },
     } as any);
 
     mockedGetUserSubscriptionType.mockResolvedValueOnce('Pro');
