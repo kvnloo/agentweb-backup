@@ -10,6 +10,8 @@ import {
   transferLandingPageOwner,
 } from "../services/v0Service";
 import { OWNED_FEATURES, OwnedFeature } from "../services/orgShareService";
+import { can, roleOf } from "../services/orgAuthz";
+import { billingRootMayDepart, reassignBillingRootOnDeparture } from "./org";
 
 const router = express.Router();
 
@@ -54,8 +56,9 @@ router.get("/:userId/removal-preview", async (req, res) => {
   try {
     const callerId = (req as any).user.userId;
     const caller = await userDb.getUserById(callerId);
-    if (!caller?.orgId || caller.orgRole !== "owner") {
-      return res.status(403).json({ message: "Org owner only" });
+    const callerOrg = caller?.orgId ? await orgDb.getOrgById(caller.orgId) : null;
+    if (!caller?.orgId || !can({ userId: callerId, orgId: caller.orgId, orgRole: caller.orgRole }, callerOrg, "org:members:manage")) {
+      return res.status(403).json({ message: "Org owners and admins only" });
     }
 
     const target = await userDb.getUserById(req.params.userId);
@@ -106,8 +109,15 @@ router.post("/:userId/remove", async (req, res) => {
     const callerId = (req as any).user.userId;
     const callerEmail = (req as any).user.email as string;
     const caller = await userDb.getUserById(callerId);
-    if (!caller?.orgId || caller.orgRole !== "owner") {
-      return res.status(403).json({ message: "Org owner only" });
+    const callerOrg = caller?.orgId ? await orgDb.getOrgById(caller.orgId) : null;
+    if (!caller?.orgId || !can({ userId: callerId, orgId: caller.orgId, orgRole: caller.orgRole }, callerOrg, "org:members:manage")) {
+      return res.status(403).json({ message: "Org owners and admins only" });
+    }
+
+    // can() above returns false for a null org, so reaching here proves it is
+    // set. Narrowed here, before any use, rather than beside the first one.
+    if (!callerOrg) {
+      return res.status(404).json({ message: "Organization not found" });
     }
 
     if (req.body?.confirm !== true) {
@@ -117,6 +127,66 @@ router.post("/:userId/remove", async (req, res) => {
     const target = await userDb.getUserById(req.params.userId);
     if (!target || target.orgId !== caller.orgId) {
       return res.status(404).json({ message: "Member not found in your org" });
+    }
+
+    // Both guards were missing here, unlike the sibling route in routes/org.ts.
+    // Without them an owner could remove themselves, leaving org.ownerUserId
+    // pointing at a non-member and the org permanently unadministrable.
+    if (target.userId === callerId) {
+      return res.status(400).json({ message: "Cannot remove yourself. Use the leave endpoint or delete the org." });
+    }
+    if (roleOf({ userId: target.userId, orgId: target.orgId, orgRole: target.orgRole }, callerOrg) === "owner") {
+      // Owner-only, for the same reason PATCH /:orgId/members/:memberId/role is:
+      // this revokes ownership. It matters more here than there, because this
+      // route also honours `transfer` decisions — an admin removing an owner
+      // would inherit that owner's landing pages, skills, work plans and
+      // knowledge base in the same request.
+      if (roleOf({ userId: callerId, orgId: caller.orgId, orgRole: caller.orgRole }, callerOrg) !== "owner") {
+        return res.status(403).json({ message: "Only an owner can remove an owner" });
+      }
+      const members = await orgDb.getOrgMembers(caller.orgId);
+      const anotherOwner = members.some(
+        (m: any) => m.userId !== target.userId &&
+          roleOf({ userId: m.userId, orgId: m.orgId, orgRole: m.orgRole }, callerOrg) === "owner");
+      if (!anotherOwner) {
+        return res.status(409).json({ message: "Cannot remove the only owner. Promote another member to owner first." });
+      }
+      // Claim the owner-loss slot on the org item. Without this, a concurrent
+      // departure that passed the same roster read proceeds too and the org
+      // ends with no owner (Greptile, #2297).
+      if (!(await orgDb.claimOwnerChange(caller.orgId, callerOrg.ownerEpoch ?? 0))) {
+        return res.status(409).json({ message: "Another owner change is in progress. Please retry." });
+      }
+    }
+
+    // Every refusal must precede the asset work below. This route honours
+    // `transfer` and `delete` decisions, so a 409 raised after those loops
+    // leaves the target still in the org with their landing pages, skills,
+    // work plans and knowledge base already moved to the caller or destroyed —
+    // strictly worse than the removal it was refusing (Greptile, #2297).
+    //
+    // Placing it here rather than beside the departure write is the point: the
+    // departure write is the LAST thing this handler does, which is exactly
+    // why the gate was ineffective when it lived next to it.
+    const mayGo = await billingRootMayDepart(callerOrg, target.userId);
+    if (!mayGo.ok) {
+      return res.status(409).json({ message: mayGo.error, code: mayGo.code });
+    }
+    // Move the billing pointer BEFORE any asset work, not after.
+    //
+    // It has no ordering dependency on the transfers — it only has to happen
+    // by the time the member is gone. Running it afterwards meant its failure
+    // path returned 409 with the target's landing pages, skills, work plans
+    // and knowledge base already transferred or destroyed, and the target
+    // still in the org. Two reads of the roster can also disagree under GSI
+    // lag, so "the guard already proved a successor exists" is not something
+    // the later call can rely on (Greptile, #2297).
+    //
+    // Failing here instead leaves nothing mutated. If the asset work below
+    // fails after this point, the pointer has moved to another owner and the
+    // target is still a member — consistent, and harmless, unlike the reverse.
+    if (!(await reassignBillingRootOnDeparture(callerOrg, target.userId, callerId))) {
+      return res.status(409).json({ message: "Cannot remove the only owner. Promote another member to owner first." });
     }
 
     const decisions: Partial<Record<OwnedFeature, Decision>> = req.body?.decisions || {};
@@ -193,6 +263,10 @@ router.post("/:userId/remove", async (req, res) => {
       await Promise.all(workers);
     }
 
+    // Carry the billing root with the departure, exactly as the sibling route
+    // in routes/org.ts does. This route was missed when that landed, and it is
+    // the one the portal's remove dialog actually calls — so the fix shipped
+    // without covering the path a human uses.
     // Clear org membership on the target user
     await userDb.clearOrgMembership(target.userId);
     // Prune editor lists

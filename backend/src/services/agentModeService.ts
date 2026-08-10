@@ -27,7 +27,9 @@ import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
-import { taskDb, taskTemplateDb, accountMemoryDb, userDb } from './db';
+import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
+import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -170,6 +172,48 @@ export const AGENT_MODE_MAX_OUTPUT_TOKENS = 32000;
 // Already-complete HTML drafts bypass the render entirely (see
 // isCompleteHtmlDocument) and are NOT subject to this cap.
 export const CREATE_HTML_RENDER_MAX_DRAFT_CHARS = 60000;
+
+// Above this draft size, a render TIMEOUT is deterministic rather than transient,
+// so ENG-203's retry only spends another full 5-minute window arriving at the
+// identical failure. Backstop for the streaming render (see the createLLMService
+// call in createHTMLFile): streaming is what actually stops the 5-minute
+// socket-inactivity timer from firing mid-generation, but if a render still times
+// out on a draft this large, the size — not a blip — is why.
+//
+// The threshold is empirical, from the create_html_file calls in prod:
+//   timed out: 45,000 / 42,232 / 37,604 / 31,213 / 25,580-char drafts
+//   succeeded: 23,010 / 22,456 / 11,975 / 11,825-char drafts
+// so the cliff sat between ~23K and ~25.5K. 20K keeps a margin under the smallest
+// observed success, and well below CREATE_HTML_RENDER_MAX_DRAFT_CHARS so ordinary
+// drafts — where a timeout really is a one-off blip — keep the retry.
+export const CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS = 20000;
+
+// Largest draft still rendered by ONE monolithic LLM call. Above it the render
+// is all-or-nothing at a size where prod says it does not reliably fit the
+// per-call budget (see the observed cliff above), so the draft is rendered
+// section by section instead and the fragments are assembled locally. That
+// keeps the styled design for exactly the large reports that used to strand —
+// degrading to plain built-in styling stays the last resort, not the plan.
+export const CREATE_HTML_RENDER_SINGLE_PASS_MAX_DRAFT_CHARS = 24000;
+
+// Target size of one section render. Comfortably inside the smallest draft size
+// observed to render successfully in prod (23,010 chars), so no single section
+// is anywhere near the per-call budget, and small enough that the 60K ceiling
+// splits into a handful of parallel calls rather than dozens.
+export const CREATE_HTML_RENDER_CHUNK_MAX_CHARS = 12000;
+
+// Is this render error a per-call TIMEOUT (as opposed to a throttle, 5xx or
+// terminal error)? Bedrock surfaces these as TimeoutError/ModelTimeoutException,
+// or — for the streaming render — as "Stream timed out because of no activity
+// for 300000 ms", which carries no distinguishing name or code.
+export function isRenderTimeoutError(error: unknown): boolean {
+  if (!error) return false;
+  const e = error as any;
+  if (e.name === 'TimeoutError' || e.name === 'ModelTimeoutException') return true;
+  if (e.code === 'ETIMEDOUT' || e.code === 'ECONNABORTED') return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /timed?\s?out|timeout/i.test(message);
+}
 
 // A create_html_file content_draft that is already a complete HTML document does
 // not need the internal HTML-generation LLM call — re-rendering HTML->HTML is
@@ -355,7 +399,9 @@ function recordAgentModeToolTelemetry(
         // as a failure (it carries no error signal).
         void recorder.toolDeferred(runId, {
           toolName,
-          reason: 'media_generation_time_budget',
+          // A handler-supplied deferral names its own reason (ENG-822); the
+          // media-budget path keeps the original default.
+          reason: (r.result as any)?.reason || 'media_generation_time_budget',
           iteration,
           sessionId,
           ...(budgetContext?.mediaAssetsProducedThisRun != null
@@ -1160,6 +1206,8 @@ export class AgentModeService {
         await import('../emma/navigateTools');
         await import('../emma/connectAccountTool');
         await import('../emma/solveRecaptchaTool');
+        await import('../emma/siteSigninTools');
+        await import('../emma/verificationCodeTool');
         await import('../emma/calendarTools');
         await import('../emma/localAgentTools');
 
@@ -1191,7 +1239,10 @@ export class AgentModeService {
           this.toolRegistry.register({
             name: toolHandler.name,
             definition: openAiDef,
-            execute: toolHandler.execute
+            execute: toolHandler.execute,
+            // ENG-822: carry the account-scope flag across the copy. Dropping it
+            // here is what made the registry guard inert for live sessions.
+            requiresUserAccount: toolHandler.requiresUserAccount
           });
         }
       }
@@ -3018,6 +3069,47 @@ export class AgentModeService {
     );
   }
 
+  /**
+   * ENG-803: does this scheduled run's schedule allow it to publish externally?
+   *
+   * The default lives in the FIELD, not in this lookup. A schedule we read that has
+   * no `requirePublishApproval` is authorized (every existing row, so nothing
+   * changes behaviour) — but a schedule we could not read AT ALL is not, because an
+   * owner who did set it would otherwise be overridden by a transient DynamoDB blip
+   * and a public post cannot be taken back (Greptile review #16). Withholding is the
+   * recoverable error: the run still does the work, saves the drafts, and tells the
+   * owner what is waiting.
+   *
+   * Every scheduled session is stamped `"<title>|scheduleId:<id>"` by
+   * runScheduledChat — which is also the path a "Test run" takes — so a scheduled
+   * session with no parseable id is an unverifiable state, and is withheld for the
+   * same reason.
+   *
+   * Non-scheduled sessions short-circuit to true and never reach a lookup; the value
+   * is only ever consumed by getScheduledSessionOverride, which self-guards on
+   * sessionType and emits nothing for them.
+   */
+  private async resolveScheduledPublishAuthorized(currentSession: any): Promise<boolean> {
+    if (currentSession?.sessionType !== 'scheduled') return true;
+    const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
+    if (!scheduleId) {
+      console.warn(
+        `AgentMode: scheduled session ${currentSession?.sessionId} has no parseable scheduleId; withholding publish authorization rather than assuming it.`
+      );
+      return false;
+    }
+    try {
+      // resolvePublishAuthorized returns false for a null/deleted schedule too.
+      return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId));
+    } catch (error) {
+      console.error(
+        `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding publish authorization for this turn rather than publishing unverified:`,
+        error
+      );
+      return false;
+    }
+  }
+
   private getVisionFallbackModel(primaryModel: string): string | undefined {
     const fallbackOrder = ['anthropic.claude-opus-4-8', 'gemini-3-flash-preview', 'gpt-5.4-nano'];
     return fallbackOrder.find((model) => model !== primaryModel && this.llmModels[model]?.supportsVision === true);
@@ -3157,7 +3249,16 @@ export class AgentModeService {
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
-      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType);
+      // ENG-803: resolve this scheduled run's publish authorization from the schedule
+      // record so the directive states a DECISION rather than leaving one for the
+      // model to guess — guessing is what produced the fabricated "X publishing gate".
+      // Resolved here rather than in the controller so ENG-803 stays clear of the
+      // regions ENG-827 (PR #2263) rewrites. Never derived from the schedule's prompt
+      // text. This is the UNATTENDED run path, so it always passes a resolved
+      // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
+      // deliberately passes nothing (see the tri-state note on the override).
+      const publishAuthorized = await this.resolveScheduledPublishAuthorized(currentSession);
+      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];
@@ -4148,7 +4249,9 @@ export class AgentModeService {
             // 'deferred' (non-backing) rather than 'success'.
             status: tc.error !== undefined
               ? 'error'
-              : (tc.duplicateOf || (tc.result && (tc.result as any).deferred === true) ? 'deferred' : 'success'),
+              // ENG-803: shared with the title-evidence filter so the two cannot
+              // drift — they encode the same "never executed, cannot back a claim".
+              : (toolCallNeverExecuted(tc) ? 'deferred' : 'success'),
             result: tc.result,
           }));
           const guardOutcome = await runFinalizeGuard({
@@ -5069,6 +5172,15 @@ export class AgentModeService {
 
     // Timing
     'wait_seconds',
+
+    // Magic-link / email-code login recovery (ENG-795). Foundation rather than
+    // skill-scoped because the tool lists of the DB-defined skills (e.g. "Browser
+    // automation") are data, not code: a tool added here would otherwise be
+    // invisible to every existing session and every scheduled run until someone
+    // edited each skill row by hand. loadFoundationTools unions
+    // DEFAULT_FOUNDATION_TOOLS, so a stale prod override cannot strip them.
+    'read_verification_code',
+    'open_site_signin',
 
     // Session Notifications (no email integration required)
     'notify_session',
@@ -7047,6 +7159,109 @@ export class AgentModeService {
     );
   }
 
+  /**
+   * ENG-803: ENFORCE the owner's publish-approval setting at dispatch, not just in
+   * the prompt (Greptile review #21).
+   *
+   * A directive is guidance; this ticket is literally a report of a model reasoning
+   * its way around instructions. So the setting an owner ticks has to be a real
+   * boundary: if the schedule requires approval, the publishing call does not
+   * execute, whatever the model decided.
+   *
+   * The refusal is returned as a normal tool error on purpose. It gives the model a
+   * REAL, quotable failure — satisfying the directive's "reason (2): a tool call you
+   * ACTUALLY made returned an error" — so the run reports an accurate blocker
+   * instead of inventing one. That is the same ticket's other half.
+   *
+   * FAILS CLOSED for scheduled runs (Greptile review #22). An earlier revision
+   * allowed the call when a lookup threw, reasoning that a blip should not stop
+   * publishing — but that let a transient DynamoDB error publish irreversibly past
+   * an owner's explicit setting, and it contradicted the same asymmetry argument
+   * this fix already applies at the prompt layer: when the answer cannot be
+   * verified, take the RECOVERABLE outcome. A blocked publish saves the drafts and
+   * retries next run; a published post cannot be withdrawn.
+   *
+   * A session we can read that is NOT scheduled returns immediately, so the attended
+   * paths that share this dispatcher (the Emma sidebar via chatbotService, and
+   * liveVoiceService) are unaffected — there is no owner schedule setting to apply
+   * to them, and a human is present.
+   */
+  private static publishApprovalBlock(toolName: string, reason: 'required' | 'unverifiable') {
+    const detail =
+      reason === 'required'
+        ? `this schedule has "Require approval before publishing" turned ON, so ${toolName} cannot publish on the owner's behalf in an unattended run.`
+        : `${toolName} cannot publish in this unattended run because its schedule's publish-approval setting could not be verified, and publishing is irreversible.`;
+    return {
+      success: false as const,
+      error:
+        `Blocked: ${detail} ` +
+        `This is an account-level setting on the schedule — it is NOT a platform, X/Twitter, LinkedIn, API, or credential limit. ` +
+        `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`,
+      publishApprovalRequired: true as const,
+    };
+  }
+
+  private async blockedByScheduledPublishApproval(
+    toolName: string,
+    args: any,
+    sessionId: string
+  ): Promise<{ success: false; error: string; publishApprovalRequired: true } | null> {
+    if (!sessionId || !isExternalContentPublish(toolName, args)) return null;
+
+    let session: any;
+    try {
+      session = await chatbotDb.getChatSession(sessionId);
+    } catch (firstError) {
+      // One retry absorbs a single throttled read before we resort to blocking.
+      try {
+        session = await chatbotDb.getChatSession(sessionId);
+      } catch (retryError) {
+        console.error(
+          `AgentMode ENG-803: could not read session ${sessionId} to verify publish approval for ${toolName}; blocking rather than publishing unverified:`,
+          retryError
+        );
+        return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+      }
+    }
+
+    // A NULL session is unverifiable, not attended: deleting a scheduled session
+    // does not cancel its in-flight worker, so the worker runs on and its lookup
+    // starts returning null (Greptile review #23).
+    const sessionClass = classifySessionForPublishGate(session);
+    if (sessionClass === 'unverifiable') {
+      console.warn(
+        `AgentMode ENG-803: session ${sessionId} not found while verifying publish approval for ${toolName}; blocking rather than assuming it was attended.`
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+    // Attended / non-scheduled sessions have no owner schedule setting to enforce.
+    if (sessionClass === 'allow') return null;
+
+    const scheduleId = extractScheduleId(session?.pageIdentifier);
+    if (!scheduleId) {
+      console.warn(
+        `AgentMode ENG-803: scheduled session ${sessionId} has no parseable scheduleId; blocking ${toolName} rather than assuming approval.`
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+
+    try {
+      // resolvePublishAuthorized also returns false for a missing/deleted schedule.
+      if (resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId))) return null;
+    } catch (scheduleError) {
+      console.error(
+        `AgentMode ENG-803: could not read schedule ${scheduleId} to verify publish approval for ${toolName}; blocking rather than publishing unverified:`,
+        scheduleError
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+
+    console.warn(
+      `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} requires approval before publishing.`
+    );
+    return AgentModeService.publishApprovalBlock(toolName, 'required');
+  }
+
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
@@ -7090,6 +7305,12 @@ export class AgentModeService {
         policy: policyDecision,
       };
     }
+
+    // ENG-803: the owner's publish-approval setting is enforced HERE, so it holds
+    // even if the model ignores the directive. Checked after arg repair so the
+    // action is read from the same args the tool would have run with.
+    const publishApprovalBlock = await this.blockedByScheduledPublishApproval(toolName, preparedArgs, sessionId);
+    if (publishApprovalBlock) return publishApprovalBlock;
 
     // In mock mode, only session-state tools (install_skills) execute for real
     // because they modify DynamoDB session state with no external side effects
@@ -14181,16 +14402,25 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
-  async generateScheduledChatSummary(startingMessage: string, response: string): Promise<string | null> {
+  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[]): Promise<string | null> {
     try {
+      // ENG-803: the summary becomes the run's title suffix, so it must describe
+      // what the run DID, not what its prose claimed. Previously this saw only the
+      // request and the response text, which let a run that posted nothing be
+      // titled "Replies queued". Ground it in the tools that actually SUCCEEDED —
+      // the caller filters out errored and preflight-rejected calls, because a
+      // failed twitter_manage_post is evidence that nothing was posted, not
+      // evidence that something was (Greptile review #19).
+      const succeeded = Array.from(new Set((succeededToolNames || []).filter(Boolean))).slice(0, 40);
+      const evidence = succeeded.length > 0 ? succeeded.join(', ') : 'none';
       const response_ = await this.callLLM(DIAGNOSIS_MODEL, [
         {
           role: 'system',
-          content: `You are a task summarizer. Given a user's request and the agent's response, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). Return ONLY the summary, nothing else.`
+          content: `You are a task summarizer. Given a user's request, the agent's response, and the list of tools that ran SUCCESSFULLY, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). The summary must reflect that list, not the response's claims. The list contains ONLY calls that succeeded — a tool that was attempted and failed is absent from it, so treat it as not having happened. If no tool that posts, publishes, or sends appears in the list, do NOT use words like "Posted", "Published", "Sent", or "Queued" — describe what actually happened instead (e.g. "Drafts Prepared", "Nothing Posted", "Posting Failed"). Return ONLY the summary, nothing else.`
         },
         {
           role: 'user',
-          content: `Request: ${startingMessage.slice(0, 300)}\n\nResult: ${response.slice(0, 500)}`
+          content: `Request: ${startingMessage.slice(0, 300)}\n\nTools that ran SUCCESSFULLY (failed calls are excluded): ${evidence}\n\nResult: ${response.slice(0, 500)}`
         }
       ], {
         max_completion_tokens: 20,
@@ -26414,12 +26644,16 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
       // immediately instead. (Complete-HTML drafts already returned above and are
       // not size-limited.)
       if (contentDraft.length > CREATE_HTML_RENDER_MAX_DRAFT_CHARS) {
-        console.warn(`AgentMode: create_html_file — draft too large to render in one file (${contentDraft.length} chars > ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS})`);
-        return {
-          success: false,
-          message: 'Draft too large to render into a single HTML file',
-          error: `content_draft is too large to render into one HTML file in a single pass (${contentDraft.length} characters, limit ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}). Either provide the draft as a complete, self-contained HTML document (which is saved directly without limit), or split it into smaller sections and create multiple files.`
-        };
+        console.warn(`AgentMode: create_html_file — draft too large for an LLM render (${contentDraft.length} chars > ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}); delivering it deterministically instead`);
+        // ENG-873: keep ENG-472's "spend nothing on a render that cannot finish"
+        // rule, but not its "return nothing" outcome — that is the same way the
+        // 40-competitor report was stranded, only at a larger size. The
+        // deterministic renderer has no size ceiling and costs no LLM call, so
+        // the completed work is still delivered as the requested HTML file.
+        return await this.deliverDeterministicHtmlFallback(
+          title, contentDraft, userId, documentType,
+          new Error(`content_draft is too large for the styled render (${contentDraft.length} characters, limit ${CREATE_HTML_RENDER_MAX_DRAFT_CHARS}) — split it into smaller sections, or send a complete self-contained HTML document, which is saved verbatim with no size limit`),
+        );
       }
 
       // Use Claude model by default (check for Claude in model name)
@@ -26427,8 +26661,13 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
 
       // Import LLMService
       const { createLLMService } = await import('../utils/llmService');
-      // Use high token limit for HTML generation — reports like GTM audits can be large
-      const llmService = createLLMService(defaultClaudeModel, 0.8, 64000);
+      // Use high token limit for HTML generation — reports like GTM audits can be large.
+      // ENG-873: stream the render. A 64K-token document routinely takes longer than
+      // the Bedrock client's 5-minute socket-inactivity timeout to generate, and a
+      // NON-streaming call puts nothing on the socket until it is completely done —
+      // so every large report timed out deterministically. Streaming keeps bytes
+      // flowing, so the inactivity timer never fires mid-generation.
+      const llmService = createLLMService(defaultClaudeModel, 0.8, 64000, { streaming: true });
 
       // Email mode produces a one-off newsletter/marketing email rendered in
       // HTML that is safe across email clients (Gmail, Outlook, Apple Mail).
@@ -26542,13 +26781,44 @@ Please generate a complete, professional HTML document that properly formats and
       console.log(`AgentMode: Generating HTML ${isEmail ? 'email' : 'file'} with LLMService (Claude model)`);
       const maxRenderAttempts = 3;
       let htmlContent = '';
-      for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
+      let renderFailure: unknown = null;
+      // ENG-873: above this draft size a render TIMEOUT is a property of the
+      // payload, not a blip — the same monolithic render cannot fit in the same
+      // per-call budget on a second attempt, so a retry just spends another five
+      // minutes reaching the identical failure. Below it, ENG-203's retry still
+      // applies: a small draft that times out really did hit a one-off blip.
+      const timeoutIsDeterministic = contentDraft.length > CREATE_HTML_RENDER_TIMEOUT_RETRY_MAX_DRAFT_CHARS;
+
+      // ENG-873: a draft too big for one render is not rendered in one call at
+      // all. Emails are excluded — an email is a single assembled table layout
+      // that cannot be stitched together from independently designed pieces.
+      const renderInSections =
+        !isEmail && contentDraft.length > CREATE_HTML_RENDER_SINGLE_PASS_MAX_DRAFT_CHARS;
+      if (renderInSections) {
+        try {
+          htmlContent = await this.renderHtmlDraftInSections(
+            title, contentDraft, formatRequirements, userId, sessionId, llmService,
+          );
+        } catch (sectionError) {
+          console.error(`AgentMode: sectioned HTML render failed on a ${contentDraft.length}-char draft (session ${sessionId}):`, sectionError instanceof Error ? sectionError.message : sectionError);
+          renderFailure = sectionError;
+        }
+      }
+      // Sectioned drafts have already been rendered (or failed) above.
+      const singlePassAttempts = renderInSections ? 0 : maxRenderAttempts;
+      for (let attempt = 1; attempt <= singlePassAttempts; attempt++) {
         try {
           htmlContent = await llmService.generateHTML(systemPrompt, userPrompt, this.makeToolUsageCallback(sessionId, 'createHTMLFile'), { userId, sessionId, feature: 'content_gen' });
           break;
         } catch (renderError) {
           const isLastAttempt = attempt === maxRenderAttempts;
           const isTransient = isTransientLLMError(renderError);
+          const renderErrorText = renderError instanceof Error ? renderError.message : renderError;
+          if (timeoutIsDeterministic && isRenderTimeoutError(renderError)) {
+            console.error(`AgentMode: HTML render timed out on a ${contentDraft.length}-char draft (session ${sessionId}) — too large to re-render inside the per-call budget, degrading instead of retrying:`, renderErrorText);
+            renderFailure = renderError;
+            break;
+          }
           if (isLastAttempt || !isTransient) {
             // Distinguish exhaustion from a terminal error. If every attempt hit a
             // transient timeout, the render likely can't finish inside the per-call
@@ -26557,18 +26827,30 @@ Please generate a complete, professional HTML document that properly formats and
             // chunking the render (ENG-203 follow-up). Log it distinctly so these are
             // greppable and separable from one-off blips and terminal errors.
             if (isLastAttempt && isTransient) {
-              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderError instanceof Error ? renderError.message : renderError);
+              console.error(`AgentMode: HTML render exhausted all ${maxRenderAttempts} attempts on a transient error (session ${sessionId}); render may be deterministically over the per-call timeout:`, renderErrorText);
             }
-            throw renderError;
+            renderFailure = renderError;
+            break;
           }
           const backoffMs = 1000 * Math.pow(2, attempt - 1);
-          console.warn(`AgentMode: HTML render attempt ${attempt}/${maxRenderAttempts} failed with a transient error, retrying in ${backoffMs}ms:`, renderError instanceof Error ? renderError.message : renderError);
+          console.warn(`AgentMode: HTML render attempt ${attempt}/${maxRenderAttempts} failed with a transient error, retrying in ${backoffMs}ms:`, renderErrorText);
           await this.sleep(backoffMs);
         }
       }
 
-      if (!htmlContent || htmlContent.trim().length === 0) {
-        throw new Error('LLM did not generate HTML content');
+      if (!renderFailure && (!htmlContent || htmlContent.trim().length === 0)) {
+        renderFailure = new Error('LLM did not generate HTML content');
+      }
+
+      // ENG-873: the styled render is a FORMATTING step at the very end of a run
+      // that may have cost an hour of research. Losing it must never lose the
+      // work: render the draft deterministically and deliver that instead of
+      // returning nothing (which is what stranded a completed 40-competitor
+      // report — two monolithic renders, two timeouts, no deliverable at all).
+      if (renderFailure) {
+        return await this.deliverDeterministicHtmlFallback(
+          title, contentDraft, userId, documentType, renderFailure,
+        );
       }
 
       // Upload to S3
@@ -26598,6 +26880,149 @@ Please generate a complete, professional HTML document that properly formats and
         message: 'Failed to create HTML file',
         error: error instanceof Error ? error.message : 'Unknown error'
       };
+    }
+  }
+
+  /**
+   * ENG-873 — render a draft that is too large for one call as N section
+   * renders, then assemble the fragments into a single document under one
+   * stylesheet (supplied by chunkedHtmlRender, not by the model, so sections
+   * cannot drift apart visually).
+   *
+   * Sections render concurrently: each is well inside the per-call budget, so
+   * the wall-clock cost is roughly one render rather than N. A section that
+   * fails transiently is retried once — losing an hour of research to one blip
+   * on one section of the report is exactly the failure being fixed here. If a
+   * section still cannot render, this throws and the caller degrades to the
+   * deterministic document, which never loses content.
+   */
+  private async renderHtmlDraftInSections(
+    title: string,
+    contentDraft: string,
+    formatRequirements: string,
+    userId: string,
+    sessionId: string,
+    llmService: {
+      generateHTML: (
+        systemPrompt: string,
+        userPrompt: string,
+        onUsage: any,
+        context: any,
+      ) => Promise<string>;
+    },
+  ): Promise<string> {
+    const { splitDraftIntoRenderChunks, extractHtmlFragment, assembleChunkedHtmlDocument } =
+      await import('../utils/chunkedHtmlRender');
+
+    const chunks = splitDraftIntoRenderChunks(contentDraft, CREATE_HTML_RENDER_CHUNK_MAX_CHARS);
+    if (chunks.length === 0) {
+      throw new Error('content_draft contains no renderable content');
+    }
+    console.log(`AgentMode: create_html_file — rendering a ${contentDraft.length}-char draft as ${chunks.length} sections (session ${sessionId})`);
+
+    const systemPrompt = `You are an expert web developer rendering ONE SECTION of a larger HTML report. Convert the section of the content draft you are given into clean, professional HTML.
+
+Return ONLY the HTML body fragment for this section:
+- No document-level markup at all — no doctype, no html/head/body tags, no stylesheet block and no scripts. The surrounding document and its stylesheet already exist.
+- Use semantic tags (h2, h3, p, ul, ol, table/thead/tbody/tr/th/td, blockquote). They are already styled by the document's stylesheet, so do NOT add CSS, class names or style attributes.
+- Present the section's content faithfully and completely — every entity, row and figure in it must appear in your output.
+- Do not add an introduction, conclusion, or navigation for the report as a whole: other sections are rendered separately and assembled around yours.
+
+DATA ACCURACY RULES (CRITICAL):
+- NEVER invent, estimate, approximate, or round numeric values
+- Use ONLY the exact numbers, names, dates and links provided — copy them verbatim
+- NEVER use placeholder labels like "Competitor A" or "Label 1" — use the actual names
+- If a value is not present in the section, omit it rather than guessing
+
+CHARTS (if the section's data calls for one):
+- Use a QuickChart image only: https://quickchart.io/chart?v=2.9.4&c=<URL-encoded Chart.js v2 JSON config> as the src of an <img>
+- Every string in the chart config JSON must have BOTH an opening and a closing quote, and the whole config must be URL-encoded
+- Do not use inline Chart.js or any other script: sections are assembled into one page, so scripts and canvas ids would collide${formatRequirements ? `\n\nAdditional Format Requirements:\n${formatRequirements}` : ''}`;
+
+    const renderSection = async (chunk: string, index: number): Promise<string> => {
+      const userPrompt = `Report title: ${title}
+
+This is section ${index + 1} of ${chunks.length} of the report.${index === 0 ? ' Open it with the report title in an <h1>, then use <h2> for the sections below it.' : ' Do not repeat the report title — the first section already carries it in an <h1>. Start at <h2>.'}
+
+Section content:
+${chunk}
+
+Return the HTML body fragment for this section only.`;
+      const maxSectionAttempts = 2;
+      for (let attempt = 1; attempt <= maxSectionAttempts; attempt++) {
+        try {
+          const rendered = await llmService.generateHTML(
+            systemPrompt,
+            userPrompt,
+            this.makeToolUsageCallback(sessionId, 'createHTMLFile'),
+            { userId, sessionId, feature: 'content_gen' },
+          );
+          const fragment = extractHtmlFragment(rendered);
+          if (!fragment) {
+            throw new Error(`section ${index + 1} of ${chunks.length} rendered empty`);
+          }
+          return fragment;
+        } catch (sectionError) {
+          // A streamed render timeout arrives as a bare "Stream timed out
+          // because of no activity for 300000 ms" with no name or code, so
+          // isTransientLLMError alone does not recognise it — but on a section
+          // this small a timeout really is a blip, so it is worth one retry.
+          const isTransient = isTransientLLMError(sectionError) || isRenderTimeoutError(sectionError);
+          if (attempt === maxSectionAttempts || !isTransient) throw sectionError;
+          console.warn(`AgentMode: section ${index + 1}/${chunks.length} render failed transiently, retrying once:`, sectionError instanceof Error ? sectionError.message : sectionError);
+          await this.sleep(1000);
+        }
+      }
+      // Unreachable: the loop either returns a fragment or throws.
+      throw new Error(`section ${index + 1} of ${chunks.length} could not be rendered`);
+    };
+
+    const fragments = await Promise.all(chunks.map(renderSection));
+    return assembleChunkedHtmlDocument(title, fragments);
+  }
+
+  /**
+   * ENG-873 — graceful degradation for create_html_file. When the styled render
+   * cannot run, convert the draft to HTML deterministically (no LLM, no network,
+   * no size ceiling) and deliver THAT, so a downstream formatting failure can
+   * never discard the upstream work that produced the draft.
+   *
+   * Throws the original render failure if the fallback itself cannot be
+   * delivered — the caller's catch then reports the real error, as before.
+   */
+  private async deliverDeterministicHtmlFallback(
+    title: string,
+    contentDraft: string,
+    userId: string,
+    documentType: 'document' | 'email',
+    renderFailure: unknown,
+  ): Promise<any> {
+    const reason = renderFailure instanceof Error ? renderFailure.message : String(renderFailure);
+    let uploadResult: { success: boolean; url?: string; error?: string };
+    try {
+      const { renderMarkdownReportDocumentAsync } = await import('../utils/markdownHtmlReport');
+      const { uploadFileToS3 } = await import('../utils/s3Utils');
+      const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
+      const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
+      uploadResult = await uploadFileToS3(fallbackHtml, filename, userId, 'text/html');
+      if (!uploadResult.success || !uploadResult.url) {
+        throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
+      }
+      console.warn(`AgentMode: create_html_file — styled render failed (${reason}); delivered a deterministically rendered fallback document instead:`, uploadResult.url);
+      return {
+        success: true,
+        s3_url: uploadResult.url,
+        filename,
+        title,
+        document_type: documentType,
+        rendered: false,
+        degraded: true,
+        degraded_reason: reason,
+        message: `HTML file created, but with basic built-in styling: the styled render step failed (${reason}), so the draft was converted to HTML directly. The full content is intact — nothing was lost. Do NOT call create_html_file again with the same draft; it will fail the same way. Give the user this file and mention the simpler styling. If they want the richer design, send a complete self-contained HTML document as content_draft (that is saved verbatim, with no size limit) or split the report into smaller sections.`,
+      };
+    } catch (fallbackError) {
+      console.error('AgentMode: create_html_file — deterministic fallback also failed:', fallbackError);
+      throw renderFailure;
     }
   }
 
@@ -26683,8 +27108,11 @@ Please generate a complete, professional HTML document that properly formats and
       const defaultClaudeModel = 'anthropic.claude-sonnet-4-6';
 
       const { createLLMService } = await import('../utils/llmService');
-      // Use 16K tokens for HTML template generation to avoid truncation
-      const llmService = createLLMService(defaultClaudeModel, 0.8, 16384);
+      // Use 16K tokens for HTML template generation to avoid truncation.
+      // Streamed for the same reason as the create_html_file render above
+      // (ENG-873) — a 16K-token template can also outrun the 5-minute
+      // socket-inactivity timeout when the call returns nothing until it ends.
+      const llmService = createLLMService(defaultClaudeModel, 0.8, 16384, { streaming: true });
 
       // Build system prompt for HTML template creation
       const systemPrompt = `You are an expert web developer and HTML email template designer. Your task is to create or enhance an HTML email template based on the provided HTML content and instructions.

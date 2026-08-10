@@ -643,8 +643,14 @@ export async function executePreparedTools(
     functionArgs: any,
   ): DispatchToolResult =>
     outcome.status === 'success'
-      ? { status: 'success', toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision }
-      : { status: 'error', toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
+      // A handler may decline to run at all and say so with `deferred: true`
+      // (ENG-822's anonymous account-scoped refusal). That is neither a success
+      // nor a failure — same accounting as the media-budget deferral below — so
+      // it maps to 'deferred' rather than being counted either way.
+      ? ((outcome.result as any)?.deferred === true
+          ? { status: 'deferred' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision }
+          : { status: 'success' as const, toolCall, functionArgs, result: outcome.result, duration: outcome.durationMs, policyDecision: outcome.policyDecision })
+      : { status: 'error' as const, toolCall, functionArgs, error: outcome.error, duration: outcome.durationMs, policyDecision: outcome.policyDecision };
 
   // Per-run media-generation time budget. Once the run is over its deadline AND has
   // already produced at least one asset (this run, including earlier calls in this
@@ -942,8 +948,14 @@ export async function executePreparedTools(
       // ask the user to reply "continue" — the asset-awareness block then resumes the
       // batch on the next turn without regenerating the already-saved images.
       const { toolCall, functionArgs } = toolResult;
-      const deferContent =
-        `⚠️ Media generation paused for this turn — the assistant has been working on this batch for a while and is approaching the per-response time limit. `
+      // A handler-supplied deferral (ENG-822) carries its own instruction and
+      // reason; only the media-budget deferral gets the media prose below.
+      const handlerDeferral = (toolResult as any).result?.deferred === true
+        ? (toolResult as any).result
+        : null;
+      const deferContent = handlerDeferral?.message
+        ? String(handlerDeferral.message)
+        : `⚠️ Media generation paused for this turn — the assistant has been working on this batch for a while and is approaching the per-response time limit. `
         + `The image(s) already generated this session are saved. `
         + `Do NOT call ${toolCall.function.name} again right now. Instead: briefly tell the user how many assets are done versus still remaining, then ask them to reply "continue" to generate the rest. `
         + `When they continue, generate ONLY the still-missing assets (see the already-generated assets list), then mark the step complete.`;
@@ -951,7 +963,7 @@ export async function executePreparedTools(
         id: toolCall.id,
         name: toolCall.function.name,
         arguments: functionArgs || toolCall.function.arguments,
-        result: { deferred: true, reason: 'media_generation_time_budget' },
+        result: handlerDeferral || { deferred: true, reason: 'media_generation_time_budget' },
         duration: 0,
       });
       messages.push({

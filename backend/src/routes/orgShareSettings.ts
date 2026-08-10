@@ -2,6 +2,7 @@ import express from "express";
 import { userDb, orgDb } from "../services/db";
 import type { OrgShareSettings } from "../services/db";
 import { TOGGLEABLE_FEATURES, ALWAYS_ON_FEATURES } from "../services/orgShareService";
+import { can } from "../services/orgAuthz";
 
 const router = express.Router();
 
@@ -39,9 +40,10 @@ router.patch("/", async (req, res) => {
     const { userId } = (req as any).user;
     const user = await userDb.getUserById(userId);
     if (!user?.orgId) return res.status(404).json({ message: "No org" });
-    if (user.orgRole !== "owner") return res.status(403).json({ message: "Org owner only" });
-
     const org = await orgDb.getOrgById(user.orgId);
+    if (!can({ userId, orgId: user.orgId, orgRole: user.orgRole }, org, "org:configure")) {
+      return res.status(403).json({ message: "Org owners and admins only" });
+    }
 
     // Back-fill newer features from the org's existing settings when an older client
     // omits them, so pre-deploy portals keep working.

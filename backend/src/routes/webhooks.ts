@@ -22,6 +22,7 @@ import { mergeCustomFields } from '../utils/customFieldsGuard';
 import { recordLeadCaptureFailure } from '../services/leadCaptureFailureService';
 import { metaService } from '../services/metaService';
 import { isSmokeTestEmail } from '../utils/smokeTestLead';
+import { enqueueJob, markJobComplete, markJobFailed, registerProcessor, startHeartbeat } from '../services/asyncJobQueue';
 
 // ─── HubSpot signature helpers ────────────────────────────────────────────────
 
@@ -522,8 +523,44 @@ router.post('/forward-lead', async (req: express.Request, res: express.Response)
       leadData.lastTouch = touch;
     }
 
-    // Add custom fields with source tracking
+    // Any top-level key this handler did NOT destructure above is caller data, and used to
+    // be silently discarded. A landing page that posts its own fields flat (rather than
+    // nested under `customFields`) got a 201 and a visible lead row with the data gone.
+    // Real incident 2026-08-07: the healthcare lander's entire qualification payload
+    // (qualified / annual_revenue / total_funding / can_start_tomorrow) vanished, so the
+    // page's gate answers never reached the CRM while everything looked successful.
+    //
+    // Collected rather than added to the destructure list, because "remember to add your
+    // field name here" is the failure mode itself — it has already been forgotten at least
+    // once, and the miss is invisible.
+    //
+    // BOUNDED on purpose. This route is public, CORS-open and unauthenticated. Express
+    // already rejects an oversized body with 413, but total size is not key count: a
+    // compact payload can still carry hundreds of keys straight into storage.
+    const HANDLED_TOP_LEVEL_KEYS = new Set([
+      'listId', 'email', 'firstName', 'lastName', 'phone', 'company', 'title', 'notes',
+      'linkedin', 'source', 'customFields', 'attribution', 'utm', 'pixelId',
+      'metaAccountId', 'eventId', 'fbp', 'fbc', 'capturedAtMs',
+    ]);
+    const PASSTHROUGH_MAX_KEYS = 50;
+    const PASSTHROUGH_MAX_VALUE_LENGTH = 1000;
+
+    const passthroughFields: Record<string, any> = {};
+    let passthroughCount = 0;
+    for (const [key, value] of Object.entries(req.body || {})) {
+      if (HANDLED_TOP_LEVEL_KEYS.has(key)) continue;
+      if (passthroughCount >= PASSTHROUGH_MAX_KEYS) break;
+      passthroughFields[key] =
+        typeof value === 'string' && value.length > PASSTHROUGH_MAX_VALUE_LENGTH
+          ? value.slice(0, PASSTHROUGH_MAX_VALUE_LENGTH)
+          : value;
+      passthroughCount++;
+    }
+
+    // Add custom fields with source tracking. Explicit nested `customFields` wins over
+    // top-level passthrough — an intentional shape beats an inferred one.
     const incomingCustomFields: Record<string, any> = {
+      ...passthroughFields,
       ...(customFields && typeof customFields === 'object' ? customFields : {}),
       // Add source field (from request or default to 'api')
       source: source?.trim() || customFields?.source || 'api',
@@ -966,84 +1003,25 @@ router.post('/attio', async (req: express.Request, res: express.Response) => {
 //   contact.propertyChange  → update matching lead's fields
 //   contact.deletion        → flag matching lead as removed
 // ─────────────────────────────────────────────────────────────────────────────
-router.post('/hubspot', (req: express.Request, res: express.Response) => {
-  // Return 200 immediately — HubSpot retries on non-2xx or timeout.
-  // All processing happens asynchronously (fire-and-forget).
-  res.status(200).json({ received: true });
+interface HubspotContactChange {
+  portalId: number;
+  properties: Record<string, string>;
+  isCreation: boolean;
+  isDeleted: boolean;
+  isDealChange: boolean;
+}
 
-  void (async () => {
-    try {
-      // Raw body captured by express.raw() — parse once for processing.
-      const rawBody = req.body as Buffer;
-      const parsedBody: any = JSON.parse(rawBody.toString('utf8'));
+interface HubspotJobPayload {
+  changesByObjectId: Record<string, HubspotContactChange>;
+}
 
-      // ── Signature verification ──────────────────────────────────────────────
-      // Verify X-HubSpot-Signature when present. If the header is missing we
-      // log a warning and continue (supports local dev / test environments).
-      const signature = req.headers['x-hubspot-signature'] as string | undefined;
-      const isProd = process.env.NODE_ENV === 'production';
-      // HubSpot signs each event with the secret of the app that owns the
-      // subscription. Resolve the secret by the event's appId so events from an
-      // app we don't manage (e.g. a stray delivery from a different app pointed at
-      // this URL) are ignored — not verified against our app's secret.
-      const eventAppId: string | number | undefined = Array.isArray(parsedBody)
-        ? parsedBody[0]?.appId
-        : parsedBody?.appId;
-      if (signature) {
-        const clientSecret = await getHubSpotClientSecretForAppId(eventAppId).catch(() => null);
-        if (!clientSecret) {
-          console.warn(`[HubSpot Webhook] No managed client secret for appId=${eventAppId ?? 'absent'} — request ignored (unmanaged app or missing creds)`);
-          return;
-        }
-        if (!verifyHubSpotSignature(clientSecret, rawBody, signature)) {
-          console.warn('[HubSpot Webhook] Signature mismatch — request ignored');
-          return;
-        }
-      } else if (isProd) {
-        console.warn('[HubSpot Webhook] Missing X-HubSpot-Signature in production — request rejected');
-        return;
-      } else {
-        console.warn('[HubSpot Webhook] No X-HubSpot-Signature header — proceeding without verification (dev only)');
-      }
-
-      // ── Aggregate events by objectId ────────────────────────────────────────
-      const events: any[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
-      type ContactChange = {
-        portalId: number;
-        properties: Record<string, string>;
-        isCreation: boolean;
-        isDeleted: boolean;
-        isDealChange: boolean;
-      };
-      const changesByObjectId: Record<string, ContactChange> = {};
-
-      for (const event of events) {
-        const eventType: string = event?.subscriptionType ?? 'unknown';
-        const portalId: number = event?.portalId;
-        const objectId: string = String(event?.objectId ?? '');
-        const propertyName: string = event?.propertyName ?? '';
-        const propertyValue: string = event?.propertyValue ?? '';
-
-        console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
-
-        const isContactEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
-        const isDealEvent = eventType === 'deal.propertyChange';
-        if (!isContactEvent && !isDealEvent) continue;
-        if (!objectId) continue;
-
-        if (!changesByObjectId[objectId]) {
-          changesByObjectId[objectId] = { portalId, properties: {}, isCreation: false, isDeleted: false, isDealChange: false };
-        }
-        if (eventType === 'contact.creation') changesByObjectId[objectId].isCreation = true;
-        if (eventType === 'contact.deletion') changesByObjectId[objectId].isDeleted = true;
-        if (isDealEvent) changesByObjectId[objectId].isDealChange = true;
-        if (propertyName && propertyValue !== undefined) {
-          changesByObjectId[objectId].properties[propertyName] = propertyValue;
-        }
-      }
-
-      // ── Process each contact / deal ─────────────────────────────────────────
-      for (const [objectId, data] of Object.entries(changesByObjectId)) {
+/** Contact/deal sync, run either inline (same request, the common case) or later by
+ *  the async job queue's poller if the process crashed before finishing (ENG-524
+ *  fast-follow, Greptile P1 — same fire-and-forget crash-loss risk the Calendly
+ *  receiver had, since this handler acks HubSpot's webhook before this runs). */
+export async function processHubspotWebhookJob(payload: HubspotJobPayload): Promise<void> {
+  // ── Process each contact / deal ─────────────────────────────────────────
+  for (const [objectId, data] of Object.entries(payload.changesByObjectId)) {
         const userId = await getUserIdByHubSpotPortalId(data.portalId);
         if (!userId) {
           console.log(`[HubSpot Webhook] No user found for portal ${data.portalId}`);
@@ -1226,6 +1204,122 @@ router.post('/hubspot', (req: express.Request, res: express.Response) => {
             console.log(`[HubSpot Webhook] Synced updates to lead ${lead.leadId} in list ${list.listId}`);
           }
         }
+      }
+    }
+
+registerProcessor('hubspot_webhook', processHubspotWebhookJob);
+
+// invitee.created delivery shapes handled:
+//   contact.creation         → fetch full contact, create lead
+//   contact.propertyChange   → resolve email if absent, create or update lead
+//   contact.deletion         → flag matching lead as removed
+//   deal.propertyChange      → resolve associated contacts, sync deal fields
+router.post('/hubspot', (req: express.Request, res: express.Response) => {
+  // Return 200 immediately — HubSpot retries on non-2xx or timeout.
+  // All processing happens asynchronously (fire-and-forget).
+  res.status(200).json({ received: true });
+
+  void (async () => {
+    try {
+      // Raw body captured by express.raw() — parse once for processing.
+      const rawBody = req.body as Buffer;
+      const parsedBody: any = JSON.parse(rawBody.toString('utf8'));
+
+      // ── Signature verification ──────────────────────────────────────────────
+      // Verify X-HubSpot-Signature when present. If the header is missing we
+      // log a warning and continue (supports local dev / test environments).
+      const signature = req.headers['x-hubspot-signature'] as string | undefined;
+      const isProd = process.env.NODE_ENV === 'production';
+      // HubSpot signs each event with the secret of the app that owns the
+      // subscription. Resolve the secret by the event's appId so events from an
+      // app we don't manage (e.g. a stray delivery from a different app pointed at
+      // this URL) are ignored — not verified against our app's secret.
+      const eventAppId: string | number | undefined = Array.isArray(parsedBody)
+        ? parsedBody[0]?.appId
+        : parsedBody?.appId;
+      if (signature) {
+        const clientSecret = await getHubSpotClientSecretForAppId(eventAppId).catch(() => null);
+        if (!clientSecret) {
+          console.warn(`[HubSpot Webhook] No managed client secret for appId=${eventAppId ?? 'absent'} — request ignored (unmanaged app or missing creds)`);
+          return;
+        }
+        if (!verifyHubSpotSignature(clientSecret, rawBody, signature)) {
+          console.warn('[HubSpot Webhook] Signature mismatch — request ignored');
+          return;
+        }
+      } else if (isProd) {
+        console.warn('[HubSpot Webhook] Missing X-HubSpot-Signature in production — request rejected');
+        return;
+      } else {
+        console.warn('[HubSpot Webhook] No X-HubSpot-Signature header — proceeding without verification (dev only)');
+      }
+
+      // ── Aggregate events by objectId ────────────────────────────────────────
+      const events: any[] = Array.isArray(parsedBody) ? parsedBody : [parsedBody];
+      const changesByObjectId: Record<string, HubspotContactChange> = {};
+
+      for (const event of events) {
+        const eventType: string = event?.subscriptionType ?? 'unknown';
+        const portalId: number = event?.portalId;
+        const objectId: string = String(event?.objectId ?? '');
+        const propertyName: string = event?.propertyName ?? '';
+        const propertyValue: string = event?.propertyValue ?? '';
+
+        console.log(`[HubSpot Webhook] event=${eventType} portal=${portalId} object=${objectId}${propertyName ? ` property=${propertyName}` : ''}`);
+
+        const isContactEvent = ['contact.creation', 'contact.propertyChange', 'contact.deletion'].includes(eventType);
+        const isDealEvent = eventType === 'deal.propertyChange';
+        if (!isContactEvent && !isDealEvent) continue;
+        if (!objectId) continue;
+
+        if (!changesByObjectId[objectId]) {
+          changesByObjectId[objectId] = { portalId, properties: {}, isCreation: false, isDeleted: false, isDealChange: false };
+        }
+        if (eventType === 'contact.creation') changesByObjectId[objectId].isCreation = true;
+        if (eventType === 'contact.deletion') changesByObjectId[objectId].isDeleted = true;
+        if (isDealEvent) changesByObjectId[objectId].isDealChange = true;
+        if (propertyName && propertyValue !== undefined) {
+          changesByObjectId[objectId].properties[propertyName] = propertyValue;
+        }
+      }
+
+      // Dedupe key: HubSpot payloads are arrays of events, not a single-booking id
+      // like Calendly's invitee URI, so there's no natural per-delivery identifier —
+      // a hash of the raw body is stable across a genuine redelivery of the exact
+      // same payload and distinct for any payload with different actual content.
+      const dedupeKey = crypto.createHash('sha256').update(rawBody).digest('hex');
+      const jobPayload: HubspotJobPayload = { changesByObjectId };
+
+      // claimImmediately: this same request processes the job right below, so the
+      // enqueue writes it straight in as 'processing' — no separate claim call, no
+      // window where it sits 'pending' and claimable by the poller.
+      const enqueueResult = await enqueueJob('hubspot_webhook', dedupeKey, jobPayload, { claimImmediately: true });
+      if (enqueueResult === 'duplicate') {
+        console.log(`[HubSpot Webhook] Duplicate delivery (${dedupeKey.slice(0, 12)}...) — already queued, skipping`);
+        return;
+      }
+
+      // Keeps the claim's updatedAt fresh for as long as this inline call actually
+      // runs — without it, processing slower than the poller's stale threshold
+      // looks identical to an abandoned claim, and the poller would claim and
+      // re-run this same delivery concurrently (Greptile P1 on #2291).
+      const stopHeartbeat = enqueueResult === 'enqueued' ? startHeartbeat('hubspot_webhook', dedupeKey) : () => {};
+      try {
+        await processHubspotWebhookJob(jobPayload);
+        if (enqueueResult === 'enqueued') {
+          await markJobComplete('hubspot_webhook', dedupeKey);
+        }
+      } catch (processingError: any) {
+        if (enqueueResult === 'enqueued') {
+          // Durable record exists — the poller will retry, so don't lose this silently.
+          await markJobFailed('hubspot_webhook', dedupeKey, processingError);
+        } else {
+          // Queue unavailable (e.g. table not provisioned yet) — no durable record to
+          // retry from, so this is exactly today's fire-and-forget failure behavior.
+          console.error('[HubSpot Webhook] Processing failed with no durable record (queue unavailable):', processingError?.message ?? processingError);
+        }
+      } finally {
+        stopHeartbeat();
       }
     } catch (error: any) {
       console.error('[HubSpot Webhook] error:', error);

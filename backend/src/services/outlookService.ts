@@ -222,6 +222,9 @@ export class OutlookService implements IEmailService {
       subject: m.subject || '',
       from: fromName ? `${fromName} <${fromAddr}>` : fromAddr,
       date: m.receivedDateTime || '',
+      // Graph's receivedDateTime is stamped by the server on receipt, so it is
+      // the trustworthy arrival time as well as the display date.
+      receivedAt: m.receivedDateTime || undefined,
       snippet: m.bodyPreview || '',
     };
   }

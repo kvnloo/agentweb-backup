@@ -6,12 +6,18 @@
 
 import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
+import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
 
 const router = Router();
 
 // All routes require authentication
 router.use(authenticateToken);
+
+// ENG-973: every route that performs work is subject to the monthly token quota.
+// Classification lives in EMMA_ROUTE_BUDGET; a route with no entry is treated as
+// metered, and a contract test fails if a registered route is left unclassified.
+router.use(requireEmmaTokenBudget);
 
 // ─── Lazy service imports ───────────────────────────────────────────────────
 

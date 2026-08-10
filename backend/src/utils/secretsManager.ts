@@ -379,6 +379,48 @@ export async function getOutlookCredentials(): Promise<OutlookCredentials> {
 }
 
 /**
+ * Interface for Calendly OAuth credentials returned from Secrets Manager
+ */
+export interface CalendlyCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+/**
+ * Get Calendly OAuth credentials from AWS Secrets Manager.
+ *
+ * Secret location: dev/AgentWeb/Calendly (or prod/... for production)
+ * Secret format: { "clientId": "...", "clientSecret": "..." }
+ *
+ * @returns Calendly OAuth client credentials
+ */
+export async function getCalendlyCredentials(): Promise<CalendlyCredentials> {
+  try {
+    const environment = process.env.NODE_ENV || 'development';
+    const secretName = environment === 'production'
+      ? 'prod/AgentWeb/Calendly'
+      : 'dev/AgentWeb/Calendly';
+
+    const secretString = await getSecret(secretName);
+
+    if (!secretString || secretString.trim() === '') {
+      throw new Error('Calendly credentials secret is empty');
+    }
+
+    const credentials = JSON.parse(secretString) as CalendlyCredentials;
+
+    if (!credentials.clientId || !credentials.clientSecret) {
+      throw new Error('Calendly credentials missing clientId or clientSecret');
+    }
+
+    return credentials;
+  } catch (error) {
+    console.error('Error fetching Calendly credentials from Secrets Manager:', error);
+    throw new Error('Failed to fetch Calendly credentials from Secrets Manager');
+  }
+}
+
+/**
  * Interface for Twitter/X OAuth2 credentials returned from Secrets Manager
  */
 export interface TwitterCredentials {
@@ -777,6 +819,47 @@ export async function get2CaptchaApiKey(): Promise<string> {
   return key.trim();
 }
 
+
+export interface RankAICredentials {
+  /** First-party key that suppresses RankAI's invisible reCAPTCHA on their signin page. */
+  captchaBypassKey: string;
+  /** Base signin URL, e.g. https://rankai.ai/signin */
+  signinUrl: string;
+  /** Account the scheduled report signs in as. */
+  reportAccountEmail?: string;
+  /** Dashboard the report reads. */
+  dashboardId?: string;
+}
+
+/**
+ * Get RankAI automation credentials from AWS Secrets Manager (ENG-795).
+ *
+ * Secret format: JSON at dev/AgentWeb/RankAI or prod/AgentWeb/RankAI. The
+ * captcha bypass key is RankAI's own credential for their own bot protection —
+ * it is sensitive, must never be committed or written into a chat prompt, and is
+ * therefore always read at runtime from here.
+ */
+export async function getRankAICredentials(): Promise<RankAICredentials> {
+  const environment = process.env.NODE_ENV || 'development';
+  const secretName = environment === 'production'
+    ? 'prod/AgentWeb/RankAI'
+    : 'dev/AgentWeb/RankAI';
+
+  const raw = await getSecret(secretName);
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`Secret ${secretName} is not valid JSON. Expected keys: captchaBypassKey, signinUrl.`);
+  }
+
+  return {
+    captchaBypassKey: parsed.captchaBypassKey,
+    signinUrl: parsed.signinUrl,
+    reportAccountEmail: parsed.reportAccountEmail,
+    dashboardId: parsed.dashboardId,
+  };
+}
 
 /**
  * Get the email-verification provider API key from AWS Secrets Manager.

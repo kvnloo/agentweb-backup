@@ -37,6 +37,9 @@ const mockWorkPlanTransferOwner = jest.fn();
 const mockGetSkillsByOwner = jest.fn();
 const mockDeleteSkill = jest.fn();
 const mockSkillTransferOwner = jest.fn();
+const mockGetOrgById = jest.fn();
+const mockGetOrgMembers = jest.fn();
+const mockUpdateOrg = jest.fn();
 const mockDynamoGet = jest.fn();
 const mockDynamoPut = jest.fn();
 const mockGetLeadListsByUserId = jest.fn();
@@ -50,7 +53,13 @@ jest.mock("../services/db", () => ({
     clearOrgMembership: mockClearOrgMembership,
   },
   orgDb: {
+    // ENG-954: owner-loss serialization. Default-true = no contention,
+    // which is every test here except the explicit race case.
+    claimOwnerChange: jest.fn(() => Promise.resolve(true)),
     pruneEditorListsForUser: mockPruneEditorListsForUser,
+    getOrgById: mockGetOrgById,
+    getOrgMembers: mockGetOrgMembers,
+    updateOrg: mockUpdateOrg,
   },
   taskDb: {
     getTasksByUserId: mockGetTasksByUserId,
@@ -220,6 +229,11 @@ function setupNormalUsers() {
 describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // ENG-954: the routes now resolve org authority through orgAuthz.can(),
+    // which needs the org record. callerOwner is the org's owner, so every
+    // previously-passing authorization outcome is unchanged.
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: callerUserId, name: "Test Org" });
+    mockGetOrgMembers.mockResolvedValue([callerOwner, targetMember]);
   });
 
   it("returns correct itemCounts for a member with mixed items", async () => {
@@ -320,6 +334,10 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
   });
 
   it("returns 403 if caller is not org owner", async () => {
+    // ownerUserId must point elsewhere: orgAuthz unions ownerUserId with
+    // orgRole, so a caller who is the org's ownerUserId is an owner even with a
+    // drifted role. That union is the stale-role-lockout fix, not an accident.
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "someone-else", name: "Test Org" });
     mockGetUserById.mockImplementation((uid: string) => {
       if (uid === callerUserId)
         return Promise.resolve({ userId: callerUserId, orgId, orgRole: "member" });
@@ -331,7 +349,7 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
     );
 
     expect(res.status).toBe(403);
-    expect(res.body.message).toBe("Org owner only");
+    expect(res.body.message).toBe("Org owners and admins only");
   });
 
   it("returns 403 if caller is not in any org", async () => {
@@ -347,7 +365,7 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
     );
 
     expect(res.status).toBe(403);
-    expect(res.body.message).toBe("Org owner only");
+    expect(res.body.message).toBe("Org owners and admins only");
   });
 
   it("handles getTasksByUserId returning undefined gracefully", async () => {
@@ -382,6 +400,7 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
 
   // 1. 403 when caller is not orgRole=owner
   it("returns 403 when caller is not org owner", async () => {
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "someone-else", name: "Test Org" });
     mockGetUserById.mockImplementation((uid: string) => {
       if (uid === callerUserId)
         return Promise.resolve({ userId: callerUserId, orgId, orgRole: "member" });
@@ -393,7 +412,7 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
       .send({ confirm: true, decisions: allDelete });
 
     expect(res.status).toBe(403);
-    expect(res.body.message).toBe("Org owner only");
+    expect(res.body.message).toBe("Org owners and admins only");
   });
 
   // 2. 400 when confirm:true is missing
@@ -688,5 +707,220 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
     expect(res.body.summary.knowledgeBase.errors[0]).toMatch(/conditional check failed/);
     // Other features still processed and cleanup called
     expect(mockClearOrgMembership).toHaveBeenCalledWith(targetUserId);
+  });
+});
+
+// ENG-954 — the two guards this route was missing entirely, unlike its sibling
+// in routes/org.ts. Without them an owner could remove themselves, leaving
+// org.ownerUserId pointing at a non-member with no transfer route to recover.
+describe("orgMemberRemoval guards", () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: callerUserId, name: "Test Org" });
+    mockGetOrgMembers.mockResolvedValue([callerOwner, targetMember]);
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(callerOwner);
+      if (uid === targetUserId) return Promise.resolve(targetMember);
+      return Promise.resolve(null);
+    });
+  });
+
+  it("refuses self-removal — this is what bricked orgs", async () => {
+    const res = await request(app)
+      .post(`/api/orgs/me/members/${callerUserId}/remove`)
+      .send({ confirm: true, decisions: {} });
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/cannot remove yourself/i);
+    expect(mockClearOrgMembership).not.toHaveBeenCalled();
+  });
+
+  it("refuses to remove a PAYING billing owner — the gate this route kept missing", async () => {
+    // Live run, 2026-08-09: this exact route returned 200 while the org went
+    // Pro -> Free and the departed payer's sub_... stayed active. Twice now a
+    // guard landed on routes/org.ts and not here.
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    const payingRoot = {
+      userId: "u-root", orgId, orgRole: "owner",
+      subscriptionType: "Pro", subscription_status: "active", stripe_customer_id: "cus_x",
+    };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === "u-root") return Promise.resolve(payingRoot);
+      return Promise.resolve(null);
+    });
+    mockGetOrgMembers.mockResolvedValue([ownerCaller, payingRoot]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-root", name: "Test Org" });
+
+    // allTRANSFER, not allLeave. The first version of this test used `leave`
+    // decisions, which mutate nothing — so it passed while the gate sat AFTER
+    // the asset loops and a refused removal had already moved the target's
+    // content to the caller. Greptile caught what the test could not.
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-root/remove`)
+      .send({ confirm: true, decisions: allTransfer });
+
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("BILLING_OWNER_HAS_SUBSCRIPTION");
+    expect(mockClearOrgMembership).not.toHaveBeenCalled();
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
+    // Nothing of theirs may have moved or died on a refused removal.
+    expect(mockUpdateTaskOwner).not.toHaveBeenCalled();
+    expect(mockTransferLandingPageOwner).not.toHaveBeenCalled();
+    expect(mockWorkPlanTransferOwner).not.toHaveBeenCalled();
+    expect(mockSkillTransferOwner).not.toHaveBeenCalled();
+    expect(mockTransferAllTemplates).not.toHaveBeenCalled();
+    expect(mockDeleteTask).not.toHaveBeenCalled();
+    expect(mockDeleteLandingPageByRecord).not.toHaveBeenCalled();
+    expect(mockDeleteSkill).not.toHaveBeenCalled();
+    expect(mockDeleteAllTemplates).not.toHaveBeenCalled();
+  });
+
+  it("a FREE billing owner still goes through this route", async () => {
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    const freeRoot = { userId: "u-root", orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === "u-root") return Promise.resolve(freeRoot);
+      return Promise.resolve(null);
+    });
+    mockGetOrgMembers.mockResolvedValue([ownerCaller, freeRoot]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-root", name: "Test Org" });
+    mockUpdateOrg.mockResolvedValue({});
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-root/remove`)
+      .send({ confirm: true, decisions: allLeave });
+    expect(res.status).toBe(200);
+    expect(mockUpdateOrg).toHaveBeenCalledWith(orgId, { ownerUserId: callerUserId });
+  });
+
+  it("a failed billing reassignment mutates nothing — it runs before the asset work", async () => {
+    // The failure path exists (two roster reads can disagree under GSI lag), so
+    // it must not sit downstream of transfers. Greptile, #2297.
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    const targetRoot = { userId: "u-root", orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === "u-root") return Promise.resolve(targetRoot);
+      return Promise.resolve(null);
+    });
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-root", name: "Test Org" });
+    // The admitting guard sees both owners; the reassignment's read then lags
+    // and sees only the departing one, so it cannot find a successor.
+    mockGetOrgMembers
+      .mockResolvedValueOnce([ownerCaller, targetRoot])
+      .mockResolvedValue([targetRoot]);
+    // The target genuinely owns things, or the loops would iterate over nothing
+    // and this assertion would hold regardless of ordering.
+    mockGetTasksByUserId.mockResolvedValue(makeTasks(3));
+    mockGetLandingPagesByOwner.mockResolvedValue(makeLandingPages(2));
+    mockGetSkillsByOwner.mockResolvedValue(makeSkills(2));
+    mockGetWorkPlansByOwner.mockResolvedValue(makeWorkPlans(2));
+    mockGetTemplatesByOwner.mockResolvedValue(makeTemplates(2));
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-root/remove`)
+      .send({ confirm: true, decisions: allTransfer });
+
+    expect(res.status).toBe(409);
+    expect(mockClearOrgMembership).not.toHaveBeenCalled();
+    expect(mockUpdateTaskOwner).not.toHaveBeenCalled();
+    expect(mockTransferLandingPageOwner).not.toHaveBeenCalled();
+    expect(mockSkillTransferOwner).not.toHaveBeenCalled();
+    expect(mockWorkPlanTransferOwner).not.toHaveBeenCalled();
+    expect(mockTransferAllTemplates).not.toHaveBeenCalled();
+  });
+
+  it("carries the billing root to the remover — this route was missed the first time", async () => {
+    // The reassignment landed on routes/org.ts only, while the commit claimed
+    // both paths. This route is the one the portal's remove dialog calls, so
+    // the gap was the one a human would hit — and did, twice.
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    const targetRoot = { userId: "u-root", orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === "u-root") return Promise.resolve(targetRoot);
+      return Promise.resolve(null);
+    });
+    mockGetOrgMembers.mockResolvedValue([ownerCaller, targetRoot]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-root", name: "Test Org" });
+    mockUpdateOrg.mockResolvedValue({});
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-root/remove`)
+      .send({ confirm: true, decisions: allLeave });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateOrg).toHaveBeenCalledWith(orgId, { ownerUserId: callerUserId });
+    expect(mockClearOrgMembership).toHaveBeenCalledWith("u-root");
+  });
+
+  it("removing a NON-billing member leaves the pointer alone", async () => {
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === targetUserId) return Promise.resolve(targetMember);
+      return Promise.resolve(null);
+    });
+    mockGetOrgMembers.mockResolvedValue([ownerCaller, targetMember]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: callerUserId, name: "Test Org" });
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/${targetUserId}/remove`)
+      .send({ confirm: true, decisions: allLeave });
+    expect(res.status).toBe(200);
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
+  });
+
+  it("refuses to let an ADMIN remove an owner — and so never hands them the owner's content", async () => {
+    // This route does more than evict: `transfer` decisions move the target's
+    // landing pages, skills, work plans and knowledge base to *the caller*. An
+    // admin cannot demote an owner (403 on PATCH .../role), so being able to
+    // remove one would be the same revocation plus an asset transfer.
+    const adminCaller = { userId: callerUserId, orgId, orgRole: "admin" };
+    const targetOwner = { userId: "u-second", orgId, orgRole: "owner" };
+    const thirdOwner = { userId: "u-third", orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(adminCaller);
+      if (uid === "u-second") return Promise.resolve(targetOwner);
+      if (uid === "u-third") return Promise.resolve(thirdOwner);
+      return Promise.resolve(null);
+    });
+    // Deliberately two other owners, so the last-owner guard cannot be what
+    // refuses this. Only the owner-only guard stands here.
+    mockGetOrgMembers.mockResolvedValue([adminCaller, targetOwner, thirdOwner]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-third", name: "Test Org" });
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-second/remove`)
+      .send({ confirm: true, decisions: allTransfer });
+    expect(res.status).toBe(403);
+    expect(res.body.message).toMatch(/only an owner/i);
+    expect(mockClearOrgMembership).not.toHaveBeenCalled();
+    expect(mockTransferLandingPageOwner).not.toHaveBeenCalled();
+    expect(mockSkillTransferOwner).not.toHaveBeenCalled();
+    expect(mockWorkPlanTransferOwner).not.toHaveBeenCalled();
+    expect(mockUpdateTaskOwner).not.toHaveBeenCalled();
+  });
+
+  it("refuses to remove the only owner the member listing knows about", async () => {
+    const ownerCaller = { userId: callerUserId, orgId, orgRole: "owner" };
+    const targetOwner = { userId: "u-second", orgId, orgRole: "owner" };
+    mockGetUserById.mockImplementation((uid: string) => {
+      if (uid === callerUserId) return Promise.resolve(ownerCaller);
+      if (uid === "u-second") return Promise.resolve(targetOwner);
+      return Promise.resolve(null);
+    });
+    // getOrgMembers reads an eventually-consistent GSI: the caller's own
+    // promotion may not have propagated, leaving one owner visible.
+    mockGetOrgMembers.mockResolvedValue([targetOwner]);
+    mockGetOrgById.mockResolvedValue({ orgId, ownerUserId: "u-second", name: "Test Org" });
+
+    const res = await request(app)
+      .post(`/api/orgs/me/members/u-second/remove`)
+      .send({ confirm: true, decisions: {} });
+    expect(res.status).toBe(409);
+    expect(res.body.message).toMatch(/only owner/i);
+    expect(mockClearOrgMembership).not.toHaveBeenCalled();
   });
 });

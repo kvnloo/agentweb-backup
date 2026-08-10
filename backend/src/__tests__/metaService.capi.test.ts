@@ -58,6 +58,30 @@ describe('sendCapiLeadEvent', () => {
     expect(result.success).toBe(false);
   });
 
+  it('defaults event_name to "Lead" when no eventName is passed (existing callers, e.g. webhooks.ts)', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+    });
+
+    await metaService.sendCapiLeadEvent('px1', 'tok', baseEvent);
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.data[0].event_name).toBe('Lead');
+  });
+
+  it('sends the given eventName instead of "Lead" when one is passed (e.g. Calendly bookings send "Schedule", ENG-524)', async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: jest.fn().mockResolvedValue({ events_received: 1, fbtrace_id: 'trace1' }),
+    });
+
+    await metaService.sendCapiLeadEvent('px1', 'tok', { ...baseEvent, eventName: 'Schedule' });
+
+    const body = JSON.parse(mockFetch.mock.calls[0][1].body);
+    expect(body.data[0].event_name).toBe('Schedule');
+  });
+
   it('still sends even with no email and no phone (must not silently under-report Leads)', async () => {
     mockFetch.mockResolvedValue({
       ok: true,
