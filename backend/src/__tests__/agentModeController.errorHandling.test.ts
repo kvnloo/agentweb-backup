@@ -1091,7 +1091,11 @@ describe('AgentModeController - Error Handling', () => {
       expect(errorCall![1].content).toBe(truthful);
     });
 
-    it('does not correct the generic fallback when the diagnosis agent is unavailable', async () => {
+    // The diagnosis agent races a 20s timeout and returns null under load, and the
+    // static fallback that replaces it still says "please try sending your message
+    // again" — the same double-deploy advice, minus the false claim. There is no
+    // prose to judge, so a confirmed publish alone earns the notice.
+    it('adds the true outcome to the generic fallback when the diagnosis agent is unavailable', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue({
         ...mockSession,
         calledFunctions: { publish_landing_page_changes: 1 },
@@ -1102,7 +1106,25 @@ describe('AgentModeController - Error Handling', () => {
       const errorCall = await runTurn();
 
       expect(errorCall![1].content).toContain('I encountered an error processing your request');
+      expect(errorCall![1].content).toContain('published your landing-page changes');
+      expect(errorCall![1].content).toContain('do NOT re-run it');
+      // Still not a diagnosis — the flag tracks who WROTE the message.
       expect(errorCall![1].metadata!.isDiagnosticMessage).toBeUndefined();
+    });
+
+    it('leaves the generic fallback bare when the run published nothing', async () => {
+      mockChatbotDb.getChatSession.mockResolvedValue({
+        ...mockSession,
+        calledFunctions: { get_leads: 2 },
+      } as any);
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(null);
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockRejectedValue(generationTimeout());
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toBe(
+        'I encountered an error processing your request. Please try sending your message again.'
+      );
     });
   });
 

@@ -17,6 +17,7 @@ import {
   assertsUnsavedInterruption,
   isBookkeepingTool,
   ledgerFromSucceededFunctions,
+  appendConfirmedPublishNotice,
   BOOKKEEPING_TOOLS,
 } from '../utils/falseFailureReport';
 
@@ -91,6 +92,40 @@ describe('falseFailureReport', () => {
     it('does not fire on a clean success message', () => {
       expect(assertsUnsavedInterruption('Published and verified live. All done.')).toBe(false);
       expect(assertsUnsavedInterruption('')).toBe(false);
+    });
+
+    // The message is written by an LLM, so the guard cannot key off one sentence.
+    // These are rephrasings of the SAME claim that the first pass missed entirely.
+    describe('semantic variants of the same claim', () => {
+      const SHOULD_FIRE = [
+        'The request timed out, so the update did not go through. Please try again.',
+        'The run was cut short before the changes could be applied.',
+        'Unfortunately the operation timed out and nothing was published.',
+        'The session ended unexpectedly, so your edits may not have persisted.',
+        'The system ran out of time and could not complete the deployment.',
+        'I hit an error partway through; none of the changes made it to production.',
+        'The run did not finish, so your changes were never applied.',
+        'The connection dropped and the post was not sent.',
+      ];
+
+      it.each(SHOULD_FIRE)('fires on: %s', (text) => {
+        expect(assertsUnsavedInterruption(text)).toBe(true);
+      });
+
+      // FAIL cases: each pairs an interruption with a TRUTHFUL, correctly-scoped
+      // caveat. Widening the loss half must not swallow these.
+      const SHOULD_NOT_FIRE = [
+        'The run was cut short before I could save a memory note, but your page is live.',
+        'The session ended unexpectedly. Everything you asked for was published first.',
+        'The run ran out of time while drafting the follow-up email; nothing else was affected.',
+        'The lookup timed out, so I could not complete the competitor comparison.',
+        'The run was cut short, but none of your changes were lost.',
+        'The session timed out partway through. Your landing page had already gone live.',
+      ];
+
+      it.each(SHOULD_NOT_FIRE)('stays silent on: %s', (text) => {
+        expect(assertsUnsavedInterruption(text)).toBe(false);
+      });
     });
   });
 
@@ -264,6 +299,64 @@ describe('falseFailureReport', () => {
       const ledger = ledgerFromSucceededFunctions({ get_leads: 5, you_search_web: 2 });
       expect(collectConfirmedPublishActions(ledger)).toEqual([]);
       expect(reconcileFalseFailureReport(FALSE_FAILURE_TEXT, ledger)).toBe(FALSE_FAILURE_TEXT);
+    });
+  });
+
+  // A landing page is not the only thing a user would wrongly re-run. A duplicate
+  // social post or a duplicate outreach email is just as unrecoverable.
+  describe('confirmed publish set beyond landing pages', () => {
+    it.each([
+      ['post_on_connected_account', 'posted to your connected account'],
+      ['post_thread', 'posted your thread'],
+      ['send_email_to_lead', 'sent your email'],
+      ['send_email_from_sender', 'sent your email'],
+      ['send_dm', 'sent your direct message'],
+    ])('%s confirms a real send/post', (tool, label) => {
+      const ledger = ledgerFromSucceededFunctions({ [tool]: 1 });
+      expect(collectConfirmedPublishActions(ledger)).toEqual([label]);
+      expect(reconcileFalseFailureReport(FALSE_FAILURE_TEXT, ledger)).toContain(label);
+    });
+
+    // FAIL case: twitter_manage_post multiplexes create/delete/read behind ONE
+    // name. On the diagnosis path only the name survives, so a successful DELETE
+    // would be reported as "posted" — the guard must not claim what it cannot see.
+    it('excludes multi-action tools whose success does not prove a publish', () => {
+      const ledger = ledgerFromSucceededFunctions({ twitter_manage_post: 1 });
+      expect(collectConfirmedPublishActions(ledger)).toEqual([]);
+      expect(reconcileFalseFailureReport(FALSE_FAILURE_TEXT, ledger)).toBe(FALSE_FAILURE_TEXT);
+    });
+  });
+
+  // The diagnosis agent can be unavailable — it races a timeout and returns null.
+  // The static fallback that replaces it still says "please try sending your
+  // message again", which after a landed publish is the same double-deploy advice
+  // that made ENG-971 harmful. There is no prose to judge here, so the caller
+  // decides and this appends unconditionally on a confirmed publish.
+  describe('appendConfirmedPublishNotice', () => {
+    const GENERIC = 'I encountered an error processing your request. Please try sending your message again.';
+
+    it('adds the true outcome to the generic fallback after a confirmed publish', () => {
+      const out = appendConfirmedPublishNotice(
+        GENERIC,
+        ledgerFromSucceededFunctions({ publish_landing_page_changes: 1 }),
+      );
+      expect(out).toContain(GENERIC);
+      expect(out).toContain('published your landing-page changes');
+      expect(out).toContain('do NOT re-run it');
+    });
+
+    it('leaves the fallback alone when the run published nothing', () => {
+      expect(appendConfirmedPublishNotice(GENERIC, ledgerFromSucceededFunctions({ get_leads: 1 })))
+        .toBe(GENERIC);
+      expect(appendConfirmedPublishNotice(GENERIC, [])).toBe(GENERIC);
+      expect(appendConfirmedPublishNotice(GENERIC, null)).toBe(GENERIC);
+    });
+
+    it('is idempotent and leaves empty content alone', () => {
+      const ledger = ledgerFromSucceededFunctions({ publish_landing_page_changes: 1 });
+      const once = appendConfirmedPublishNotice(GENERIC, ledger);
+      expect(appendConfirmedPublishNotice(once, ledger)).toBe(once);
+      expect(appendConfirmedPublishNotice('', ledger)).toBe('');
     });
   });
 });
