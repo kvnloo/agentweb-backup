@@ -38,12 +38,14 @@ jest.mock("aws-sdk", () => ({
 
 const mockGetOrgById = jest.fn();
 const mockGetUserById = jest.fn();
+const mockGetUserByEmailConsistent = jest.fn();
 const mockUpdateOrg = jest.fn();
 const mockUpdateUser = jest.fn();
 
 jest.mock("../services/db", () => ({
   userDb: {
     getUserById: (...a: any[]) => mockGetUserById(...a),
+    getUserByEmailConsistent: (...a: any[]) => mockGetUserByEmailConsistent(...a),
     updateUser: (...a: any[]) => mockUpdateUser(...a),
   },
   orgDb: {
@@ -104,6 +106,8 @@ beforeEach(() => {
   mockS3Delete.mockResolvedValue({});
   mockUpdateOrg.mockResolvedValue({});
   mockUpdateUser.mockResolvedValue({});
+  // Undefined by default so the existing fixtures fall back to the GSI row.
+  mockGetUserByEmailConsistent.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -207,7 +211,8 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
         brandGuidelines: expect.objectContaining({
           attachments: [expect.objectContaining({ key: OWN_LOGO_KEY })],
         }),
-      })
+      }),
+      expect.anything()
     );
   });
 
@@ -253,7 +258,8 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
         brandGuidelines: expect.objectContaining({
           attachments: [expect.objectContaining({ key: OWN_LOGO_KEY })],
         }),
-      })
+      }),
+      expect.anything()
     );
   });
 
@@ -283,7 +289,8 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
         brandGuidelines: expect.objectContaining({
           attachments: [expect.objectContaining({ key: OWN_LOGO_KEY })],
         }),
-      })
+      }),
+      expect.anything()
     );
   });
 
@@ -372,6 +379,108 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
 
     expect(res.status).toBe(200);
     expect(mockDynamoUpdate).toHaveBeenCalled();
+  });
+
+  it("prunes from the strong-consistent owner read, not the stale GSI row", async () => {
+    // getUserById goes through UserIdIndex, which can return a row from before
+    // a just-landed brand edit. Writing back that snapshot would roll the edit
+    // back, since this path replaces the whole brandGuidelines value.
+    const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
+    mockDynamoGet.mockResolvedValue({ Item: editor });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "owner-u",
+      shareSettings: {
+        brandGuidelines: { editors: ["editor-u"] },
+        marketingStrategy: { editors: [] },
+      },
+    });
+    mockGetUserById.mockResolvedValue({
+      userId: "owner-u",
+      email: "owner@test.com",
+      brandGuidelines: { ...ownBrand, brandData: { brandName: "Stale Co" } },
+    });
+    mockGetUserByEmailConsistent.mockResolvedValue({
+      userId: "owner-u",
+      email: "owner@test.com",
+      brandGuidelines: { ...ownBrand, brandData: { brandName: "Renamed Co" } },
+    });
+
+    const res = await del(editor, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(200);
+    expect(mockGetUserByEmailConsistent).toHaveBeenCalledWith("owner@test.com");
+    // The rename survives the delete rather than being reverted to "Stale Co".
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      "owner-u",
+      expect.objectContaining({
+        brandGuidelines: expect.objectContaining({
+          brandData: { brandName: "Renamed Co" },
+          attachments: [expect.objectContaining({ key: OWN_LOGO_KEY })],
+        }),
+      }),
+      expect.anything()
+    );
+  });
+
+  it("409s instead of clobbering when the owner's brand moves mid-delete", async () => {
+    const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
+    mockDynamoGet.mockResolvedValue({ Item: editor });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "owner-u",
+      shareSettings: {
+        brandGuidelines: { editors: ["editor-u"] },
+        marketingStrategy: { editors: [] },
+      },
+    });
+    mockGetUserById.mockResolvedValue({
+      userId: "owner-u",
+      email: "owner@test.com",
+      brandGuidelines: { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z" },
+    });
+    mockUpdateUser.mockRejectedValue(
+      Object.assign(new Error("The conditional request failed"), {
+        code: "ConditionalCheckFailedException",
+      })
+    );
+
+    const res = await del(editor, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(409);
+    // Aborted before the destructive step, so the retry has something to delete.
+    expect(mockS3Delete).not.toHaveBeenCalled();
+  });
+
+  it("guards the owner write on the brand not having moved since it was read", async () => {
+    const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
+    mockDynamoGet.mockResolvedValue({ Item: editor });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "owner-u",
+      shareSettings: {
+        brandGuidelines: { editors: ["editor-u"] },
+        marketingStrategy: { editors: [] },
+      },
+    });
+    mockGetUserById.mockResolvedValue({
+      userId: "owner-u",
+      email: "owner@test.com",
+      brandGuidelines: { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z" },
+    });
+
+    await del(editor, OWN_ASSET_KEY);
+
+    expect(mockUpdateUser).toHaveBeenCalledWith(
+      "owner-u",
+      expect.anything(),
+      expect.objectContaining({
+        condition: expect.objectContaining({
+          expression: "brandGuidelines.updatedAt = :expectedBrandUpdatedAt",
+          values: { ":expectedBrandUpdatedAt": "2026-08-10T00:00:00.000Z" },
+        }),
+      })
+    );
   });
 
   it("refuses a foreign key even on an un-copied org", async () => {
