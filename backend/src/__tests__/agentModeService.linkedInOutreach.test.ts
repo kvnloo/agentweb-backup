@@ -33,6 +33,7 @@ const mockResolveAccountId = jest.fn();
 const mockGetInviteCharLimitForAccount = jest.fn().mockResolvedValue(200);
 const mockIsAccountConnected = jest.fn().mockResolvedValue(true);
 const mockProbeAccountSession = jest.fn().mockResolvedValue('connected');
+const mockProbeSearchCapability = jest.fn().mockResolvedValue('ok');
 const mockClearStatusCache = jest.fn();
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
@@ -46,6 +47,7 @@ jest.mock('../services/linkedInOutreachService', () => ({
     getInviteCharLimitForAccount: (...args: any[]) => mockGetInviteCharLimitForAccount(...args),
     isAccountConnected: (...args: any[]) => mockIsAccountConnected(...args),
     probeAccountSession: (...args: any[]) => mockProbeAccountSession(...args),
+    probeSearchCapability: (...args: any[]) => mockProbeSearchCapability(...args),
     clearStatusCache: (...args: any[]) => mockClearStatusCache(...args),
   },
 }));
@@ -119,6 +121,9 @@ describe('AgentModeService - LinkedIn Outreach', () => {
     // session would leak that state into every test after it.
     mockIsAccountConnected.mockResolvedValue(true);
     mockProbeAccountSession.mockResolvedValue('connected');
+    // Default: the account CAN search, so a zero-result search is a real
+    // no-match and the ENG-975 guard stays out of the way.
+    mockProbeSearchCapability.mockResolvedValue('ok');
   });
 
   describe('send-message', () => {
@@ -925,6 +930,129 @@ describe('AgentModeService - LinkedIn Outreach', () => {
       expect(result.success).toBe(false);
       expect(result.error || '').toMatch(/keyword|filter|search_url|cursor/i);
       expect(mockSearchPeople).not.toHaveBeenCalled();
+    });
+  });
+
+  // ENG-975 — a people search that returns zero because the ACCOUNT can no
+  // longer search looks byte-identical to one that returns zero because nobody
+  // matches. Reported in production: every query on one account came back
+  // `success: true, items: [], paging.total_count: 0` while get-profile and
+  // list-sent-invitations on the SAME account worked, so the agent read it as
+  // "no one matches", tried six query variants, and reported a false empty.
+  describe('ENG-975: zero-result search is not silently reported as "no matches"', () => {
+    it('returns an explicit failure when the account can no longer search at all', async () => {
+      mockSearchPeople.mockResolvedValue({
+        object: 'LinkedinSearch',
+        items: [],
+        paging: { start: 0, page_count: 0, total_count: 0 },
+        cursor: null,
+      });
+      mockProbeSearchCapability.mockResolvedValue('degraded');
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'CMO healthtech',
+      });
+
+      expect(mockProbeSearchCapability).toHaveBeenCalledWith('test-account-id');
+      expect(result.success).toBe(false);
+      expect(result.searchUnavailable).toBe(true);
+      expect(result.message).toBe('LinkedIn people search is unavailable');
+    });
+
+    it('tells the agent to stop trying query variants and to report the outage', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+      mockProbeSearchCapability.mockResolvedValue('degraded');
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'marketing',
+      });
+
+      expect(result.error).toContain('DO NOT');
+      expect(result.error).toMatch(/is not "no one matches your filters"/i);
+    });
+
+    it('leaves a genuine narrow no-match as a successful empty result', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+      mockProbeSearchCapability.mockResolvedValue('ok');
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'underwater basket weaver at Acme',
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.data.items).toEqual([]);
+    });
+
+    it('does not block on an indeterminate probe', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+      mockProbeSearchCapability.mockResolvedValue('unknown');
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'marketing',
+      });
+
+      expect(result.success).toBe(true);
+    });
+
+    it('does not probe when the search returned people', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [{ provider_id: 'p-1' }], cursor: 'c1' });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'marketing',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockProbeSearchCapability).not.toHaveBeenCalled();
+    });
+
+    // Paging past the last page legitimately returns zero — that is exhaustion,
+    // not an outage, and must not cost a probe or raise a false alarm.
+    it('does not probe when a paginated continuation runs out of results', async () => {
+      mockSearchPeople.mockResolvedValue({ items: [], cursor: null });
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-people',
+        account_id: 'test-account-id',
+        keywords: 'marketing',
+        cursor: 'page-4-cursor',
+      });
+
+      expect(result.success).toBe(true);
+      expect(mockProbeSearchCapability).not.toHaveBeenCalled();
+    });
+
+    // The same outage empties entity resolution too: the reported session got
+    // `candidates: []` for INDUSTRY 'hospital health care'.
+    it('surfaces the outage for search-parameters instead of an empty candidate list', async () => {
+      const { setUnipileSearchParamServiceForTesting, __resetUnipileSearchParamServiceForTesting } =
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        require('../services/unipileSearchParamService');
+      __resetUnipileSearchParamServiceForTesting();
+      setUnipileSearchParamServiceForTesting({
+        resolve: jest.fn().mockResolvedValue({ candidates: [], fromCache: true, source: 'cache' }),
+      });
+      mockProbeSearchCapability.mockResolvedValue('degraded');
+
+      const result = await service.linkedinOutreach('user-1', {
+        action: 'search-parameters',
+        account_id: 'test-account-id',
+        type: 'INDUSTRY',
+        keywords: 'hospital health care',
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.searchUnavailable).toBe(true);
+      __resetUnipileSearchParamServiceForTesting();
     });
   });
 
