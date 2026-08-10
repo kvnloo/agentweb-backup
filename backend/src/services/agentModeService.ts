@@ -29195,10 +29195,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       !args.comment_text ? { success: false, message: 'comment_text is required for action=comment' } : null;
 
     switch (action) {
+      // ENG-827 (Greptile): the check above still leaves an account lookup and a token
+      // refresh in front of the write, so the hook is handed down and re-run
+      // immediately before the irreversible call. Reads below get nothing to run.
       case 'repost':
-        return requirePostUrn('repost') ?? this.linkedinRepost(userId, account_id, args.post_urn!, args.commentary);
+        return requirePostUrn('repost') ?? this.linkedinRepost(userId, account_id, args.post_urn!, args.commentary, toolContext);
       case 'comment':
-        return requirePostUrn('comment') ?? requireCommentText() ?? this.commentOnLinkedInPost(userId, account_id, args.post_urn!, args.comment_text!, args.parent_comment_urn);
+        return requirePostUrn('comment') ?? requireCommentText() ?? this.commentOnLinkedInPost(userId, account_id, args.post_urn!, args.comment_text!, args.parent_comment_urn, toolContext);
       case 'list_comments':
         return requirePostUrn('list_comments') ?? this.listLinkedInComments(userId, account_id, args.post_urn!);
       case 'react':
@@ -29210,7 +29213,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  async linkedinRepost(userId: string, accountId: string, postUrn: string, commentary?: string): Promise<any> {
+  async linkedinRepost(userId: string, accountId: string, postUrn: string, commentary?: string, toolContext?: any): Promise<any> {
     console.log('[AgentMode] linkedinRepost called:', { userId, accountId, postUrn, hasCommentary: !!commentary });
 
     try {
@@ -29231,6 +29234,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: false, message: 'Repost is not supported for this platform' };
       }
 
+      // ENG-827: last point before the repost is public — after the account lookup and
+      // with the adapter's token refresh still to come inside the call.
+      const withdrawnNow = await publishWithdrawnMidFlight(toolContext);
+      if (withdrawnNow) return withdrawnNow;
+
       const result = await adapter.createRepost(account, postUrn, commentary, userId);
 
       return {
@@ -29248,7 +29256,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     }
   }
 
-  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string): Promise<any> {
+  async commentOnLinkedInPost(userId: string, accountId: string, postUrn: string, commentText: string, parentCommentUrn?: string, toolContext?: any): Promise<any> {
     console.log('[AgentMode] commentOnLinkedInPost called:', {
       userId,
       accountId,
@@ -29322,6 +29330,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           // If the check fails, log and proceed — better to risk a duplicate than silently fail
           console.warn('[AgentMode] commentOnLinkedInPost: could not check existing comments, proceeding anyway:', checkError.message);
         }
+
+        // ENG-827 (Greptile): the duplicate-comment lookup above is a network call, and
+        // the adapter refreshes the token inside createComment. Re-check here, the last
+        // point before the comment is public under the owner's name.
+        const withdrawnNow = await publishWithdrawnMidFlight(toolContext);
+        if (withdrawnNow) return withdrawnNow;
 
         console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');
         const result = await adapter.createComment(account, postUrn, commentText, userId, parentCommentUrn);
@@ -30510,8 +30524,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           if (tweets.length < 2) {
             throw new Error('post_thread requires at least 2 tweets. To post a single tweet, use post_on_connected_account instead.');
           }
-          const result = await twitterService.postThread(ownerUserId, account_id, tweets);
+          // ENG-827 (Greptile): a thread is N separate public writes. The check above
+          // covers the first tweet only, so consent is re-read before each subsequent
+          // one and the thread stops the moment it is withdrawn.
+          const result = await twitterService.postThread(
+            ownerUserId, account_id, tweets,
+            toolContext?.assertPublishStillAuthorized
+          );
           if (result[0]) await logCrm('twitter.tweet.sent', result[0].id, result[0].text);
+          if (result.length < tweets.length) {
+            // Report the truncation rather than a clean success: those tweets are
+            // public and cannot be un-made, and the owner needs to know the thread is
+            // a fragment so they can finish or delete it.
+            return {
+              success: false,
+              message:
+                `Publishing consent was withdrawn part-way through the thread. ${result.length} of ` +
+                `${tweets.length} tweets were already posted and cannot be un-posted; the rest were ` +
+                `not sent. Do NOT retry — tell the owner the thread is incomplete so they can finish ` +
+                `or remove it.`,
+              data: result,
+            };
+          }
           return { success: true, data: result };
         }
 

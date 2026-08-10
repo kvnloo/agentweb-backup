@@ -590,13 +590,39 @@ export class TwitterService {
    * previous whole-thread call, wrapped in a single withRetryOn401, would re-run
    * the entire chain on a mid-thread 401 and duplicate the already-posted tweets.
    */
-  async postThread(ownerUserId: string, accountId: string, texts: string[]): Promise<TweetResult[]> {
+  /**
+   * @param assertStillAuthorized ENG-827 (Greptile, security): a thread is N SEPARATE
+   * public writes, not one. The caller's consent check covers the first tweet only, so
+   * an owner revoking after tweet 1 would still have tweets 2..N go out under a
+   * decision they had already withdrawn — and a long thread takes a while. Re-checked
+   * before every subsequent tweet.
+   *
+   * On withdrawal the loop STOPS and returns what was already posted. Those tweets are
+   * public and cannot be un-made; returning them is what lets the caller report the
+   * truncation honestly instead of claiming a thread that is not there.
+   */
+  async postThread(
+    ownerUserId: string,
+    accountId: string,
+    texts: string[],
+    assertStillAuthorized?: () => Promise<{ success: false; error: string } | null>
+  ): Promise<TweetResult[]> {
     if (!Array.isArray(texts) || texts.length === 0) {
       throw new Error('Thread must contain at least one tweet');
     }
     const results: TweetResult[] = [];
     let inReplyToTweetId: string | undefined;
     for (const text of texts) {
+      if (results.length > 0 && assertStillAuthorized) {
+        const withdrawn = await assertStillAuthorized();
+        if (withdrawn) {
+          console.warn(
+            `[TwitterService] ENG-827: stopping thread after ${results.length} of ${texts.length} ` +
+            'tweets — publish consent was withdrawn mid-thread.'
+          );
+          break;
+        }
+      }
       const result = await this.postTweet(
         ownerUserId,
         accountId,
