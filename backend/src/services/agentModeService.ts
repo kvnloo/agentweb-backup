@@ -23077,7 +23077,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         let listed = 0;
         for (const entry of nameOnly) {
           const cost = (pagingHints ? `• [offset ${entry.index}] ${entry.name}<br>` : `• ${entry.name}<br>`).length;
-          if (listed > 0 && indexChars + cost > nameIndexBudget) break;
+          // Strict: a single pathological name must not blow the index. Competitor
+          // names are unbounded on write, so admitting the first entry regardless
+          // of size would let one record overflow the whole response. The index
+          // may end up empty — the remainder line below then accounts for
+          // everyone, so nobody is hidden either way.
+          if (indexChars + cost > nameIndexBudget) break;
           indexChars += cost;
           listed++;
         }
@@ -23088,13 +23093,15 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           // below carries its own offset, so any single competitor is one call
           // away. Teaching "next page" first would have the model walk the list in
           // order to reach entry 48 (ENG-945).
-          const lastListed = nameOnly[listed - 1];
+          // With a strict cap the index can be empty, so the worked example must
+          // fall back to the first unlisted entry rather than indexing off the end.
+          const exampleOffset = listed > 0 ? nameOnly[listed - 1].index : nameOnly[0].index;
           // Only advertise a next page when one actually exists — otherwise the
           // prose contradicts nextCompetitorOffset: null and restarts the reader.
           const walkHint = detailEnd < competitors.length
             ? ` To walk the entire list in order instead, use the nextCompetitorOffset value returned with each page (currently ${detailEnd}).`
             : '';
-          formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read any one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside that name — you can jump straight to the entry you want, there is no need to page through in order (e.g. <code>competitorOffset: ${lastListed.index}</code> reads the entry marked [offset ${lastListed.index}]).${walkHint}<br>`;
+          formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read any one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside that name — you can jump straight to the entry you want, there is no need to page through in order (e.g. <code>competitorOffset: ${exampleOffset}</code> reads the entry marked [offset ${exampleOffset}]).${walkHint}<br>`;
           nameOnly.slice(0, listed).forEach(e => {
             formattedSummary += `• [offset ${e.index}] ${e.name}<br>`;
           });
