@@ -23461,8 +23461,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     sessionId: string,
     imageModel?: string,
     logoImage?: string,
-    confirm?: boolean
+    confirm?: boolean,
+    category?: string
   ): Promise<any> {
+    // ENG-343: the producing flow must self-declare the eval use case — Matt's
+    // review feedback differs entirely between ads and organic posts, and a
+    // prompt-text classifier was explicitly ruled out. Missing/invalid input
+    // fails visibly (recorded decision 2026-07-27 on ENG-343) so the caller gets
+    // fixed instead of a falsely categorized candidate reaching the eval queue.
+    if (category !== 'ad' && category !== 'organic_post') {
+      return {
+        success: false,
+        error: 'invalid_category',
+        message:
+          `generate_image requires category: 'ad' | 'organic_post' (got ${JSON.stringify(category)}). ` +
+          `Declare the use case: 'ad' for paid ad creatives, 'organic_post' for organic social content.`
+      };
+    }
+
     // Human-in-the-loop gate for image EDITING (inputImages present). Editing the
     // wrong source images is the wrong-set mistake from the satisfaction incident,
     // so before regenerating/editing existing images we surface the exact source
@@ -23682,6 +23698,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           reviewType: 'creative_image',
           userId,
           sessionId,
+          category,
           artifactUrl: result.imageUrl,
           originalRequest: prompt,
           outputSummary:

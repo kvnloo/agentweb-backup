@@ -1934,9 +1934,10 @@ mcpToolRegistry.register({
         quality: { type: 'string', enum: ['low', 'medium', 'high'], description: 'Quality', default: 'medium' },
         input_images: { type: 'array', items: { type: 'string' }, description: 'Input images for editing' },
         logo_image: { type: 'string', description: 'Logo image URL to add' },
-        image_model: { type: 'string', description: 'Model to use' }
+        image_model: { type: 'string', description: 'Model to use' },
+        category: { type: 'string', enum: ['ad', 'organic_post'], description: "Use-case declaration for the human eval queue: 'ad' for paid ad creatives, 'organic_post' for organic social/content imagery" }
       },
-      required: ['prompt', 'filename']
+      required: ['prompt', 'filename', 'category']
     }
   },
   execute: async (args: any, context: any) => {
@@ -1946,7 +1947,8 @@ mcpToolRegistry.register({
         prompt: args.prompt, filename: args.filename,
         size: args.size || '1024x1024', quality: args.quality || 'medium',
         input_images: args.input_images || [],
-        image_model: args.image_model, logo_image: args.logo_image
+        image_model: args.image_model, logo_image: args.logo_image,
+        category: args.category
       }
     });
     return jsonResult(data);
