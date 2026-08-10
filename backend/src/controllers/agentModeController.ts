@@ -4003,9 +4003,9 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
   // failure recorded) — just not rescheduled.
   const isActive = schedule.status === 'active';
   const overCap = nextRetryCount > ZERO_ASSISTANT_MAX_REQUEUES;
-  const willRequeue = isActive && !overCap;
-  const noRequeueReason = willRequeue ? '' : (!isActive ? `schedule is ${schedule.status}` : 'over requeue cap');
-  const requeuedAt = willRequeue
+  let willRequeue = isActive && !overCap;
+  let noRequeueReason = willRequeue ? '' : (!isActive ? `schedule is ${schedule.status}` : 'over requeue cap');
+  let requeuedAt = willRequeue
     ? new Date(Date.now() + getZeroAssistantRequeueDelayMs(nextRetryCount)).toISOString()
     : undefined;
 
@@ -4022,7 +4022,33 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
         resumeSessionId = lease.sessionId;
       }
     } catch (planError) {
-      console.error(`recoverAbandonedScheduledRun: resume-plan check failed for session ${lease.sessionId}, will restart fresh:`, planError);
+      console.error(`recoverAbandonedScheduledRun: resume-plan check failed for session ${lease.sessionId}:`, planError);
+    }
+  }
+
+  // ENG-971 (Greptile): without a resume marker this requeue RESTARTS the task from
+  // scratch, re-driving its side effects. The paths that reach here without one are
+  // exactly the dangerous cases — an unresumable transcript, or a plan check that
+  // threw — and `claimAbandonedRun` with no resumeSessionId also REMOVES any marker
+  // already stored. So restart only when the ledger can be read AND shows nothing
+  // published; a confirmed publish or an unreadable ledger stops the restart and
+  // tells the owner instead, matching the zero-output path in runScheduledChat.
+  if (willRequeue && !resumeSessionId && lease.sessionId) {
+    const ledger = await loadPublishLedger(lease.sessionId);
+    const mayHavePublished = ledger === null || collectConfirmedPublishActions(ledger).length > 0;
+    if (mayHavePublished) {
+      willRequeue = false;
+      requeuedAt = undefined;
+      noRequeueReason = ledger === null
+        ? 'publish ledger unreadable — a fresh restart could repeat completed work'
+        : 'run already published — a fresh restart would repeat it';
+      console.error(
+        `recoverAbandonedScheduledRun: NOT restarting schedule ${schedule.scheduleId} — ${noRequeueReason}.`
+      );
+      await notifyScheduleOwnerOfFailure(schedule, schedule.userId, {
+        failedAttempts: nextRetryCount,
+        failureClass: 'system',
+      });
     }
   }
 

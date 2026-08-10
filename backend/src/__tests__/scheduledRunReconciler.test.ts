@@ -253,6 +253,52 @@ describe('recoverAbandonedScheduledRun', () => {
     expect(mockAlert.mock.calls[0][0].subject).toContain('Abandoned Run Recovered');
   });
 
+  /**
+   * ENG-971 (Greptile). Without a resume marker this requeue RESTARTS the task from
+   * scratch, and claimAbandonedRun with no resumeSessionId also REMOVES any marker
+   * already stored — so an unresumable/unreadable run whose publish already landed
+   * would have its production side effect repeated.
+   */
+  it('does not restart from scratch when the abandoned run already published', async () => {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([]); // not resumable
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      sessionId: 'sess-1',
+      calledFunctions: { publish_landing_page_changes: 1 },
+    } as any);
+    const schedule = scheduleWithLease();
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    const requeue = mockScheduleDb.claimAbandonedRun.mock.calls[0][2];
+    expect(requeue).toBeNull();
+  });
+
+  it('does not restart from scratch when the publish ledger cannot be read', async () => {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([]);
+    mockChatbotDb.getChatSession.mockRejectedValue(new Error('DynamoDB timeout'));
+    const schedule = scheduleWithLease();
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    const requeue = mockScheduleDb.claimAbandonedRun.mock.calls[0][2];
+    expect(requeue).toBeNull();
+  });
+
+  it('still restarts a run that published nothing', async () => {
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([]);
+    mockChatbotDb.getChatSession.mockResolvedValue({
+      sessionId: 'sess-1',
+      calledFunctions: { you_search_web: 2 },
+    } as any);
+    const schedule = scheduleWithLease();
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    const requeue = mockScheduleDb.claimAbandonedRun.mock.calls[0][2] as any;
+    expect(requeue).not.toBeNull();
+    expect(requeue.nextRunTime).toEqual(expect.any(String));
+  });
+
   it('does not annotate the session or alert when the claim is lost', async () => {
     mockScheduleDb.claimAbandonedRun.mockResolvedValue(false);
     const schedule = scheduleWithLease();
