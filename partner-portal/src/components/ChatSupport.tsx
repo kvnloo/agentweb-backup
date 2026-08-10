@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { useLocation } from 'react-router-dom';
 import axios from 'axios';
-import { Button, Box, Typography, CircularProgress, TextField, IconButton, Alert } from '@mui/material';
+import { Button, Box, Typography, CircularProgress, TextField, IconButton, Alert, Menu, MenuItem, Tooltip } from '@mui/material';
 import ChatIcon from '@mui/icons-material/Chat';
 import CloseIcon from '@mui/icons-material/Close';
 import SendIcon from '@mui/icons-material/Send';
@@ -10,14 +10,17 @@ import SmartToy from '@mui/icons-material/SmartToy';
 import Person from '@mui/icons-material/Person';
 import AddCircleOutline from '@mui/icons-material/AddCircleOutline';
 import NavigationIcon from '@mui/icons-material/Navigation';
+import OpenInFullIcon from '@mui/icons-material/OpenInFull';
+import CloseFullscreenIcon from '@mui/icons-material/CloseFullscreen';
+import TextFieldsIcon from '@mui/icons-material/TextFields';
 import { getPageTitle } from '../utils/pageTitles';
 import { Chart } from 'chart.js/auto';
 import { io, Socket } from 'socket.io-client';
-import { DISCORD_INVITE_URL } from '../config';
+import { API_URL, DISCORD_INVITE_URL } from '../config';
 
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string | any[];
+  content: string | unknown[];
 }
 
 interface ChatSession {
@@ -29,8 +32,43 @@ interface ChatSession {
   pageContext?: string;
 }
 
+type ChatWidth = 'default' | 'wide';
+type ChatFontSize = 'small' | 'default' | 'large';
+
+interface ChatDisplayPreferences {
+  width: ChatWidth;
+  fontSize: ChatFontSize;
+}
+
+const DEFAULT_DISPLAY_PREFERENCES: ChatDisplayPreferences = {
+  width: 'default',
+  fontSize: 'default',
+};
+
+const CHAT_FONT_SIZES: Record<ChatFontSize, string> = {
+  small: '0.78rem',
+  default: '0.875rem',
+  large: '1rem',
+};
+
+const displayPreferenceKey = (userId?: string) => `agentweb.chatDisplay.v1.${userId || 'anonymous'}`;
+
+const loadDisplayPreferences = (userId?: string): ChatDisplayPreferences => {
+  try {
+    const stored = JSON.parse(localStorage.getItem(displayPreferenceKey(userId)) || '{}');
+    return {
+      width: stored.width === 'wide' ? 'wide' : 'default',
+      fontSize: ['small', 'default', 'large'].includes(stored.fontSize)
+        ? stored.fontSize
+        : 'default',
+    };
+  } catch {
+    return DEFAULT_DISPLAY_PREFERENCES;
+  }
+};
+
 const ChatSupport: React.FC = () => {
-  const { token } = useAuth();
+  const { token, user } = useAuth();
   const location = useLocation();
   const [isOpen, setIsOpen] = useState(false);
   const [message, setMessage] = useState('');
@@ -38,10 +76,44 @@ const ChatSupport: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [currentPage, setCurrentPage] = useState<string>('');
   const [showPageNotification, setShowPageNotification] = useState(false);
+  const [displayPreferences, setDisplayPreferences] = useState<ChatDisplayPreferences>(
+    () => loadDisplayPreferences(user?.userId)
+  );
+  const [displayMenuAnchor, setDisplayMenuAnchor] = useState<HTMLElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<Socket | null>(null);
-  const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+  const apiUrl = API_URL;
   const chartRefs = useRef<{ [key: string]: HTMLCanvasElement }>({});
+
+  useEffect(() => {
+    setDisplayPreferences(loadDisplayPreferences(user?.userId));
+  }, [user?.userId]);
+
+  const updateDisplayPreferences = (
+    update: (current: ChatDisplayPreferences) => ChatDisplayPreferences
+  ) => {
+    setDisplayPreferences((current) => {
+      const next = update(current);
+      try {
+        localStorage.setItem(displayPreferenceKey(user?.userId), JSON.stringify(next));
+      } catch {
+        // Keep the in-memory preference usable when browser storage is unavailable.
+      }
+      return next;
+    });
+  };
+
+  const toggleChatWidth = () => {
+    updateDisplayPreferences((current) => ({
+      ...current,
+      width: current.width === 'wide' ? 'default' : 'wide',
+    }));
+  };
+
+  const chooseFontSize = (fontSize: ChatFontSize) => {
+    updateDisplayPreferences((current) => ({ ...current, fontSize }));
+    setDisplayMenuAnchor(null);
+  };
 
   // Initialize WebSocket connection
   useEffect(() => {
@@ -426,6 +498,7 @@ const ChatSupport: React.FC = () => {
         {/* Chat toggle button */}
         {!isOpen ? (
           <Button
+            aria-label="Open support chat"
             variant="contained"
             color="primary"
             onClick={() => setIsOpen(true)}
@@ -440,16 +513,21 @@ const ChatSupport: React.FC = () => {
           </Button>
         ) : (
           <Box 
+            data-testid="chat-support-panel"
+            data-chat-width={displayPreferences.width}
             sx={{ 
               bgcolor: 'background.paper',
               borderRadius: 2,
               boxShadow: 3,
               display: 'flex',
               flexDirection: 'column',
-              width: '384px',
+              width: displayPreferences.width === 'wide'
+                ? { xs: 'calc(100vw - 32px)', sm: 'min(760px, calc(100vw - 32px))' }
+                : { xs: 'calc(100vw - 32px)', sm: '384px' },
               height: 384,
               border: '1px solid',
-              borderColor: 'divider'
+              borderColor: 'divider',
+              transition: 'width 180ms ease-out'
             }}
           >
             {/* Header */}
@@ -468,26 +546,64 @@ const ChatSupport: React.FC = () => {
                 <SmartToy sx={{ mr: 1 }} />
                 <Typography variant="subtitle1">AgentWeb Support</Typography>
               </Box>
-              <Box>
-                <Button
-                  variant="outlined"
-                  size="small"
-                  startIcon={<AddCircleOutline />}
-                  onClick={createNewChatSession}
-                  disabled={isLoading}
-                  sx={{ 
-                    color: 'white', 
-                    borderColor: 'rgba(255,255,255,0.5)',
-                    mr: 1,
-                    '&:hover': {
-                      borderColor: 'white',
-                      bgcolor: 'rgba(255,255,255,0.1)'
-                    }
-                  }}
+              <Box sx={{ display: 'flex', alignItems: 'center' }}>
+                <Tooltip title="New chat">
+                  <span>
+                    <IconButton
+                      aria-label="Start a new chat"
+                      size="small"
+                      onClick={createNewChatSession}
+                      disabled={isLoading}
+                      sx={{
+                        color: 'white',
+                        '&:hover': {
+                          bgcolor: 'rgba(255,255,255,0.1)'
+                        }
+                      }}
+                    >
+                      <AddCircleOutline />
+                    </IconButton>
+                  </span>
+                </Tooltip>
+                <Tooltip title={displayPreferences.width === 'wide' ? 'Default width' : 'Wide chat'}>
+                  <IconButton
+                    aria-label={displayPreferences.width === 'wide' ? 'Use default chat width' : 'Use wide chat'}
+                    size="small"
+                    onClick={toggleChatWidth}
+                    sx={{ color: 'inherit' }}
+                  >
+                    {displayPreferences.width === 'wide' ? <CloseFullscreenIcon /> : <OpenInFullIcon />}
+                  </IconButton>
+                </Tooltip>
+                <Tooltip title="Text size">
+                  <IconButton
+                    aria-label="Chat display settings"
+                    size="small"
+                    onClick={(event) => setDisplayMenuAnchor(event.currentTarget)}
+                    sx={{ color: 'inherit' }}
+                  >
+                    <TextFieldsIcon />
+                  </IconButton>
+                </Tooltip>
+                <Menu
+                  anchorEl={displayMenuAnchor}
+                  open={Boolean(displayMenuAnchor)}
+                  onClose={() => setDisplayMenuAnchor(null)}
+                  MenuListProps={{ 'aria-label': 'Chat text size' }}
                 >
-                  New Chat
-                </Button>
+                  {(['small', 'default', 'large'] as const).map((fontSize) => (
+                    <MenuItem
+                      key={fontSize}
+                      selected={displayPreferences.fontSize === fontSize}
+                      onClick={() => chooseFontSize(fontSize)}
+                      aria-label={`${fontSize[0].toUpperCase()}${fontSize.slice(1)} text`}
+                    >
+                      {fontSize[0].toUpperCase()}{fontSize.slice(1)} text
+                    </MenuItem>
+                  ))}
+                </Menu>
                 <IconButton 
+                  aria-label="Close support chat"
                   size="small" 
                   onClick={() => setIsOpen(false)}
                   sx={{ color: 'inherit' }}
@@ -507,7 +623,7 @@ const ChatSupport: React.FC = () => {
                 maxWidth: '100%',
                 overflowX: 'auto'
               }
-            }}>
+            }} data-testid="chat-messages" data-chat-font-size={displayPreferences.fontSize}>
               {/* Discord community notice */}
               <Box sx={{ 
                 mb: 2,
@@ -592,7 +708,7 @@ const ChatSupport: React.FC = () => {
                         display: 'inline-block',
                         p: 1.5,
                         borderRadius: 2.5,
-                        maxWidth: '85%',
+                        maxWidth: msg.role === 'assistant' && displayPreferences.width === 'wide' ? '100%' : '85%',
                         boxShadow: '0 1px 2px rgba(0,0,0,0.1)',
                         transition: 'all 0.2s ease',
                         '&:hover': {
@@ -631,9 +747,12 @@ const ChatSupport: React.FC = () => {
                         </Typography>
                       </Box>
                       <Typography 
+                        component="div"
                         variant="body2" 
                         sx={{ 
                           whiteSpace: 'normal',
+                          overflowX: 'auto',
+                          fontSize: CHAT_FONT_SIZES[displayPreferences.fontSize],
                           lineHeight: 1.4,
                           fontWeight: msg.role === 'user' ? 400 : 400,
                           letterSpacing: '0.1px',
@@ -674,8 +793,20 @@ const ChatSupport: React.FC = () => {
                             padding: '0.15em 0.3em',
                             borderRadius: '3px',
                             fontSize: '0.9em'
+                          },
+                          '& table': {
+                            display: 'block',
+                            maxWidth: '100%',
+                            overflowX: 'auto',
+                            borderCollapse: 'collapse',
+                            whiteSpace: 'nowrap',
+                            WebkitOverflowScrolling: 'touch'
+                          },
+                          '& th, & td': {
+                            whiteSpace: 'nowrap'
                           }
                         }}
+                        data-testid={`chat-message-content-${index}`}
                         dangerouslySetInnerHTML={{
                           __html: renderChart(typeof msg.content === 'string' ? msg.content : '')
                         }}
@@ -730,4 +861,4 @@ const ChatSupport: React.FC = () => {
   );
 };
 
-export default ChatSupport; 
+export default ChatSupport;
