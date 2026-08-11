@@ -48,6 +48,17 @@ describe('user release notes — org access control (ENG-954)', () => {
     expect(text).toMatch(/only that person can change the plan/i);
   });
 
+  // Second Greptile P1 on #2350: saying only that "someone else has to start a
+  // subscription first" describes a handoff that `billingRootMayDepart`
+  // (routes/org.ts) still rejects — the guard keys on the DEPARTING member's own
+  // live subscription, so the successor subscribing is necessary but not
+  // sufficient. The departing member must end theirs too.
+  it('states that the paying member must also end their own subscription before leaving', () => {
+    const text = textFor('2026-08-09');
+    expect(text).toMatch(/must end theirs/i);
+    expect(text).not.toMatch(/someone else has to start a subscription first, and billing then moves to them/i);
+  });
+
   it('leaves the 2026-05-12 historical entry untouched', () => {
     const may = textFor('2026-05-12');
     expect(may).toMatch(/co-owner roles do not exist/i);
