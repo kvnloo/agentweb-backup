@@ -70,6 +70,7 @@ import {
   buildListByPathForRepo,
   resolveRootRecord,
   runBackfillForTarget,
+  resolveTargets,
 } from "../scripts/backfill-eng923-attribution-repos";
 
 const RANKAI_REPO = "AgentWebPro/lp-free-ai-seo-geo-audit-37343865";
@@ -157,6 +158,42 @@ describe("backfill-eng923-attribution-repos: target list", () => {
     expect(byClient.RankAI).toMatchObject({ ownerUserId: RANKAI_OWNER, repo: RANKAI_REPO, mode: "wide" });
     expect(byClient.Haven).toMatchObject({ ownerUserId: HAVEN_OWNER, repo: HAVEN_REPO, mode: "narrow" });
     expect(TARGETS.some((t) => t.client === "Every.io")).toBe(false);
+  });
+});
+
+describe("resolveTargets: --repo filter safety (Greptile P1, PR #2333)", () => {
+  // Greptile P1: "When --apply is combined with an empty or non-unique --repo value,
+  // substring matching selects both hardcoded targets, causing an ostensibly scoped command
+  // to modify both production repositories. An unmatched typo likewise exits successfully
+  // without performing the requested repair; require a nonempty filter that resolves to
+  // exactly one target before applying."
+
+  it("returns all targets when --repo was never passed (documented --apply-both-targets flow)", () => {
+    expect(resolveTargets(false, undefined)).toEqual(TARGETS);
+  });
+
+  it("returns exactly one target for a filter that uniquely matches", () => {
+    const result = resolveTargets(true, "lp-free-ai-seo-geo-audit-37343865");
+    expect(result).toHaveLength(1);
+    expect(result[0].client).toBe("RankAI");
+  });
+
+  it("fails closed on an EMPTY --repo= value instead of silently running all targets", () => {
+    // Reproduces the exact bug: `REPO_FILTER ? filter(...) : TARGETS` treats "" as falsy,
+    // so `--repo=` (typo'd/empty) fell through to the unscoped "both targets" branch.
+    expect(() => resolveTargets(true, "")).toThrow(/empty/i);
+  });
+
+  it("fails closed on an AMBIGUOUS --repo value that substring-matches BOTH targets", () => {
+    // Both hardcoded repos share the "AgentWebPro" org prefix — a filter of just the org
+    // name (a plausible typo/misunderstanding of the flag) must not silently write to both.
+    expect(() =>
+      resolveTargets(true, "AgentWebPro")
+    ).toThrow(/matched 2 target repos/i);
+  });
+
+  it("fails closed on an UNMATCHED --repo value instead of silently no-op'ing as success", () => {
+    expect(() => resolveTargets(true, "totally-unknown-repo-typo")).toThrow(/matched no target repo/i);
   });
 });
 
