@@ -46,7 +46,7 @@ function makeLead(campaign: string | undefined, createdAt: string) {
 
 describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
     global.fetch = jest.fn();
 
     mockUserDb.getUserById.mockResolvedValue({
@@ -174,13 +174,115 @@ describe('ENG-916 snapshotMetaMetricsForDate (shared per-day logic)', () => {
     await expect(snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE)).rejects.toThrow();
     expect(mockMetricsDb.putSnapshot).not.toHaveBeenCalled();
   });
+
+  // Greptile P1 #1: pagination truncates campaign snapshots — the insights fetch only ever
+  // read the first page of `body.data` and never followed `body.paging.next`, so a campaign
+  // that only showed up on a later page silently got no snapshot row.
+  it('follows paging.next to fetch every page of campaign insights, not just the first', async () => {
+    (global.fetch as jest.Mock)
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: [
+            { campaign_id: 'campaign_page1', campaign_name: 'Page1 Campaign', spend: '1', impressions: '10', clicks: '1', ctr: '1', cpm: '1', frequency: '1' },
+          ],
+          paging: { next: 'https://graph.facebook.com/v25.0/act_1842363582956923/insights?after=CURSOR1' },
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          data: [
+            { campaign_id: 'campaign_page2', campaign_name: 'Page2 Campaign', spend: '2', impressions: '20', clicks: '2', ctr: '2', cpm: '2', frequency: '2' },
+          ],
+          // No paging.next -- this is the last page.
+        }),
+      });
+
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: null, hasMore: false } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE);
+
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    expect(mockMetricsDb.putSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ campaignId: 'campaign_page1' })
+    );
+    expect(mockMetricsDb.putSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ campaignId: 'campaign_page2' })
+    );
+    expect(result.rowsWritten).toBe(2);
+  });
+
+  // Greptile P1 #2: early stop uses an unordered field — getLeadsForListOnDate breaks out of
+  // pagination the moment it sees ANY lead whose createdAt sorts before the target date, but
+  // the underlying DynamoDB query is ordered by leadId (ScanIndexForward: false), not by
+  // createdAt. An older-createdAt lead can sort ahead of a target-date lead that lives on a
+  // later page, and the old early-stop would never fetch that later page.
+  it('does not stop paging just because an older-createdAt lead sorts ahead of a target-date lead on a later page', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '10', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10', frequency: '1.2' },
+      ]),
+    });
+
+    mockCrmDb.getLeadsByListId
+      .mockResolvedValueOnce({
+        // Page 1 (leadId order): an older-dated lead sorts ahead of the target-date lead.
+        items: [makeLead('120244135557390173', '2026-08-01T09:00:00.000Z')],
+        lastEvaluatedKey: { listId: 'list_test', leadId: 'cursor1' },
+        hasMore: true,
+      } as any)
+      .mockResolvedValueOnce({
+        // Page 2: the target-date lead, reachable only if pagination continues.
+        items: [makeLead('120244135557390173', `${TEST_DATE}T10:00:00.000Z`)],
+        lastEvaluatedKey: null,
+        hasMore: false,
+      } as any);
+
+    await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE);
+
+    expect(mockCrmDb.getLeadsByListId).toHaveBeenCalledTimes(2);
+    expect(mockMetricsDb.putSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ campaignId: '120244135557390173', leadCount: 1 })
+    );
+  });
+
+  // Greptile P1 #3: unattributed counts are not persisted — the account-wide
+  // unattributedLeadCount is computed correctly and returned from the function, but every
+  // persisted row hardcodes 0, so the real value never survives past the cron's own log line.
+  it('persists the real account-wide unattributedLeadCount onto snapshot rows instead of hardcoding zero', async () => {
+    (global.fetch as jest.Mock).mockResolvedValue({
+      ok: true,
+      json: async () => makeCampaignInsightsResponse([
+        { campaign_id: '120244135557390173', campaign_name: 'Leasing', spend: '10', impressions: '1000', clicks: '20', ctr: '2.0', cpm: '10', frequency: '1.2' },
+      ]),
+    });
+
+    mockCrmDb.getLeadsByListId.mockResolvedValue({
+      items: [
+        makeLead('120244135557390173', `${TEST_DATE}T10:00:00.000Z`),
+        makeLead('some-other-campaign', `${TEST_DATE}T11:00:00.000Z`),
+        makeLead(undefined, `${TEST_DATE}T12:00:00.000Z`),
+      ],
+      lastEvaluatedKey: null,
+      hasMore: false,
+    } as any);
+
+    const result = await snapshotMetaMetricsForDate(HAVEN_USER_ID, TEST_DATE);
+
+    expect(result.unattributedLeadCount).toBe(2);
+    expect(mockMetricsDb.putSnapshot).toHaveBeenCalledWith(
+      expect.objectContaining({ campaignId: '120244135557390173', unattributedLeadCount: 2 })
+    );
+  });
 });
 
 describe('ENG-916 runMetaMetricsSnapshot (3-day settling window + per-day failure isolation)', () => {
   const cronModule = jest.requireActual('../cron/metaMetricsSnapshotCron');
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    jest.resetAllMocks();
     global.fetch = jest.fn();
     mockUserDb.getUserById.mockResolvedValue({
       userId: HAVEN_USER_ID,

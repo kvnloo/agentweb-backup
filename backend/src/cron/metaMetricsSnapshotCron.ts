@@ -24,25 +24,30 @@ function toDateStr(d: Date): string {
 }
 
 /**
- * Leads for a single list on a single date, newest-first, stopping as soon as we've
- * paged past the target date (everything after that point is strictly older).
+ * Leads for a single list on a single date. Scans every page for the list rather than
+ * early-stopping on the first lead whose `createdAt` sorts before the target date.
+ *
+ * An early-stop optimization would only be safe if pages arrived in `createdAt` order, but
+ * `crmDb.getLeadsByListId` orders by `leadId` (ScanIndexForward: false — newest leadId
+ * first), not by `createdAt`. Those two orderings are not guaranteed to agree (e.g. a lead
+ * whose `createdAt` was backdated, imported, or otherwise set independently of when its
+ * leadId was assigned), so an older-`createdAt` lead can sort ahead of a target-date lead
+ * that only shows up on a later page — stopping early would silently drop it from the
+ * persisted campaign counts (ENG-916 Greptile P1 #2). Full-page scan is the correct
+ * behavior until the query is actually ordered by `createdAt` (would need a new GSI on
+ * `AW-Leads`, a database/data-plane change out of scope here).
  */
 async function getLeadsForListOnDate(listId: string, dateStr: string): Promise<any[]> {
   const matches: any[] = [];
   let lastKey: any = undefined;
   do {
     const { items, lastEvaluatedKey } = await crmDb.getLeadsByListId(listId, 100, lastKey);
-    let sawOlder = false;
     for (const lead of items) {
       const leadDate = (lead.createdAt || "").split("T")[0];
       if (leadDate === dateStr) {
         matches.push(lead);
-      } else if (leadDate && leadDate < dateStr) {
-        sawOlder = true;
-        break;
       }
     }
-    if (sawOlder) break;
     lastKey = lastEvaluatedKey;
   } while (lastKey);
   return matches;
@@ -83,15 +88,22 @@ export async function snapshotMetaMetricsForDate(
     `&time_range={'since':'${dateStr}','until':'${dateStr}'}` +
     `&level=campaign&access_token=${accessToken}`;
 
-  const res = await fetch(insightsUrl);
-  const body = await res.json();
-  if (!res.ok || body?.error) {
-    throw new Error(
-      `[ENG-916] Meta Insights API failed for ${dateStr}: ${body?.error?.message || res.status}`
-    );
+  // Follow Meta's cursor pagination (`paging.next`) until exhausted. A single-page read
+  // silently truncated campaigns past the first page, leaving them with no snapshot row and
+  // their CRM leads counted as unattributed (ENG-916 Greptile P1 #1).
+  const campaignRows: any[] = [];
+  let nextUrl: string | undefined = insightsUrl;
+  while (nextUrl) {
+    const res = await fetch(nextUrl);
+    const body: any = await res.json();
+    if (!res.ok || body?.error) {
+      throw new Error(
+        `[ENG-916] Meta Insights API failed for ${dateStr}: ${body?.error?.message || res.status}`
+      );
+    }
+    campaignRows.push(...(body?.data || []));
+    nextUrl = body?.paging?.next;
   }
-
-  const campaignRows: any[] = body?.data || [];
 
   // Resolve this user's leads for the date once, across all their lists — reused for
   // every campaign's join below rather than re-querying per campaign.
@@ -135,7 +147,12 @@ export async function snapshotMetaMetricsForDate(
       cpm: parseFloat(c.cpm) || 0,
       frequency: parseFloat(c.frequency) || 0,
       leadCount: leadCountByCampaign.get(campaignId) || 0,
-      unattributedLeadCount: 0, // per-campaign rows don't carry the account-wide unattributed count
+      // Account-wide for the date, not per-campaign — the same total is stamped on every
+      // campaign row for this date/user since there's no campaign-less place to persist it.
+      // Previously hardcoded to 0, which made a real lost-attribution count indistinguishable
+      // from a genuine zero (ENG-916 Greptile P1 #3); the value now survives past the cron's
+      // own log line.
+      unattributedLeadCount,
       snapshotSource: "daily",
       capturedAt,
     });
