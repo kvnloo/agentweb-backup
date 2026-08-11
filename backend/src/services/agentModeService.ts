@@ -5872,7 +5872,12 @@ export class AgentModeService {
         success: actualResult.success,
         message: actualResult.message,
         imageUrl: actualResult.imageUrl,
-        filename: actualResult.filename
+        filename: actualResult.filename,
+        // ENG-936: an image EDIT parks on the human-in-the-loop confirmation gate and
+        // returns success:true with no imageUrl. Dropping this flag made that state
+        // indistinguishable from a broken generation downstream (the auto-revision
+        // path reported it as "failed to extract asset URL").
+        ...(actualResult.awaitingUserConfirmation === true && { awaitingUserConfirmation: true })
       };
     }
 

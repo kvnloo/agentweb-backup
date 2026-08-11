@@ -5,6 +5,61 @@ import { isSessionLimitError } from '../utils/agentModeErrors';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
 
 /**
+ * ENG-936: the Agent Mode revision prompt, shared by every entry point (this
+ * service and the two Slack interaction handlers) so the three copies cannot drift.
+ *
+ * The image branch carries `confirm=true` deliberately. Asking the model to edit the
+ * original asset makes `inputImages` non-empty, which trips the human-in-the-loop
+ * image-edit confirmation gate in `generate_image`. That gate exists to stop the model
+ * editing the WRONG source image — but here the user picked this exact asset and asked
+ * for this revision, so the approval already happened. Without it the tool returns
+ * `awaitingUserConfirmation` and no image, and the revision silently never happens.
+ */
+export function buildAgentModeRevisionMessage(
+  assetType: string | undefined,
+  assetUrl: string,
+  feedback: string
+): string {
+  if (assetType === 'image') {
+    return `Please use the generate_image function to revise this image: ${assetUrl}\n\nRevision request: ${feedback}\n\nUse the original image as an input image for editing. The user has already approved this exact source image by requesting this revision, so pass confirm=true on that generate_image call — do not stop to ask for confirmation, nobody is waiting to answer.`;
+  }
+  if (assetType === 'html') {
+    return `Please revise this HTML report: ${assetUrl}\n\nRevision request: ${feedback}\n\nFirst, call read_file_content to understand the current HTML structure. Then use update_html_file with update_type="css" and CSS selectors to target the specific elements that need changes. Keep the HTML well-structured and production-ready.`;
+  }
+  throw new Error(`Unsupported asset type for Agent Mode revision: ${assetType}`);
+}
+
+/**
+ * ENG-936: classify why a revision produced no asset, so the oncall alert names the
+ * real cause. "Could not extract new asset URL" is the last resort, not the default —
+ * a run parked on the image-edit confirmation gate is a different failure with a
+ * different fix, and reporting it as an extraction bug is what filed ENG-936.
+ */
+export function describeRevisionFailure(state: {
+  toolCallFailed: boolean;
+  toolCallFailureMessage: string;
+  awaitingConfirmation: boolean;
+}): { subject: string; reason: string } {
+  if (state.toolCallFailed) {
+    return {
+      subject: 'Agent Mode Revision: Tool Call Failed',
+      reason: `Tool call failed: ${state.toolCallFailureMessage}`,
+    };
+  }
+  if (state.awaitingConfirmation) {
+    return {
+      subject: 'Agent Mode Revision: Blocked on Image-Edit Confirmation',
+      reason:
+        'The revision tool stopped for user confirmation of the source image, but an auto-revision has no user in the loop, so no asset was produced.',
+    };
+  }
+  return {
+    subject: 'Agent Mode Revision: Failed to Extract Asset URL',
+    reason: 'Could not extract new asset URL from toolCalls',
+  };
+}
+
+/**
  * Trigger auto-revision for an asset based on reviewer feedback.
  * Extracted from slack.ts feedback_modal handler so it can be reused
  * from both Slack interactions and the batch review page.
@@ -56,18 +111,15 @@ async function runAgentModeRevision(
     throw new Error('Session not found');
   }
 
-  let revisionMessage: string;
-  let requiredFunctions: Array<{ functionName: string; minCount: number }>;
-
-  if (approval.assetType === 'image') {
-    revisionMessage = `Please use the generate_image function to revise this image: ${approval.assetUrl}\n\nRevision request: ${feedback}\n\nUse the original image as an input image for editing.`;
-    requiredFunctions = [{ functionName: 'generate_image', minCount: 1 }];
-  } else if (approval.assetType === 'html') {
-    revisionMessage = `Please revise this HTML report: ${approval.assetUrl}\n\nRevision request: ${feedback}\n\nFirst, call read_file_content to understand the current HTML structure. Then use update_html_file with update_type="css" and CSS selectors to target the specific elements that need changes. Keep the HTML well-structured and production-ready.`;
-    requiredFunctions = [{ functionName: 'update_html_file', minCount: 1 }];
-  } else {
-    throw new Error(`Unsupported asset type for Agent Mode revision: ${approval.assetType}`);
-  }
+  const revisionMessage = buildAgentModeRevisionMessage(
+    approval.assetType,
+    approval.assetUrl,
+    feedback
+  );
+  const requiredFunctions: Array<{ functionName: string; minCount: number }> =
+    approval.assetType === 'image'
+      ? [{ functionName: 'generate_image', minCount: 1 }]
+      : [{ functionName: 'update_html_file', minCount: 1 }];
 
   const { runVerifiedChat } = await import('../controllers/agentModeController');
 
@@ -88,10 +140,18 @@ async function runAgentModeRevision(
     let newAssetFilename: string | null = null;
     let toolCallFailed = false;
     let toolCallFailureMessage = '';
+    let awaitingConfirmation = false;
 
     if (result.success && result.toolCalls.length > 0) {
       for (const toolCall of result.toolCalls) {
         const toolResult = toolCall?.result || {};
+
+        // ENG-936: a tool that parked for user confirmation produced no asset and
+        // never will — nobody is in this loop to answer it.
+        if (toolResult.awaitingUserConfirmation === true) {
+          awaitingConfirmation = true;
+          continue;
+        }
 
         if (approval.assetType === 'image') {
           if (toolResult.success) {
@@ -162,10 +222,12 @@ async function runAgentModeRevision(
         console.log(`New revision asset sent to Slack for review`);
       }
     } else {
-      const failureReason = toolCallFailed
-        ? `Tool call failed: ${toolCallFailureMessage}`
-        : 'Could not extract new asset URL from toolCalls';
-      console.warn(`${failureReason}. Tool calls: ${JSON.stringify(result.toolCalls)}`);
+      const failure = describeRevisionFailure({
+        toolCallFailed,
+        toolCallFailureMessage,
+        awaitingConfirmation,
+      });
+      console.warn(`${failure.reason}. Tool calls: ${JSON.stringify(result.toolCalls)}`);
 
       try {
         let ishareLink = '';
@@ -177,12 +239,8 @@ async function runAgentModeRevision(
         }
 
         await sendAgentModeOncallAlert({
-          subject: toolCallFailed
-            ? 'Agent Mode Revision: Tool Call Failed'
-            : 'Agent Mode Revision: Failed to Extract Asset URL',
-          message: toolCallFailed
-            ? `The revision tool call failed during Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${approval.assetType}\nOriginal Asset URL: ${approval.assetUrl}\nFeedback: ${feedback}\nError: ${toolCallFailureMessage}`
-            : `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${approval.assetType}\nOriginal Asset URL: ${approval.assetUrl}\nFeedback: ${feedback}`,
+          subject: failure.subject,
+          message: `${failure.reason}\n\nSession: ${agentSessionId}\nAsset Type: ${approval.assetType}\nOriginal Asset URL: ${approval.assetUrl}\nFeedback: ${feedback}`,
           sessionId: agentSessionId,
           context: {
             'iShare Link': ishareLink,
@@ -192,6 +250,7 @@ async function runAgentModeRevision(
             'Feedback': feedback,
             'Revision Success': result.success,
             'Tool Call Failed': toolCallFailed,
+            'Awaiting User Confirmation': awaitingConfirmation,
             'Tool Call Failure Message': toolCallFailed ? toolCallFailureMessage : 'N/A',
             'Tool Calls Count': result.toolCalls.length,
             'Tool Calls': JSON.stringify(result.toolCalls, null, 2),

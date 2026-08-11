@@ -1366,31 +1366,17 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   throw new Error('Session not found');
                 }
                 
-                // Format revision message based on asset type (similar to Images/Reports pages)
-                let revisionMessage: string;
-                let requiredFunctions: Array<{ functionName: string; minCount: number }>;
-                
-                if (originalApproval.assetType === 'image') {
-                  // For images, use generate_image function
-                  revisionMessage = `Please use the generate_image function to revise this image: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nUse the original image as an input image for editing.`;
-                  requiredFunctions = [
-                    {
-                      functionName: 'generate_image',
-                      minCount: 1
-                    }
-                  ];
-                } else if (originalApproval.assetType === 'html') {
-                  // For HTML reports, use update_html_file function
-                  revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to understand the current HTML structure. Then use update_html_file with update_type="css" and CSS selectors to target the specific elements that need changes. Keep the HTML well-structured and production-ready.`;
-                  requiredFunctions = [
-                    {
-                      functionName: 'update_html_file',
-                      minCount: 1
-                    }
-                  ];
-                } else {
-                  throw new Error(`Unsupported asset type for Agent Mode revision: ${originalApproval.assetType}`);
-                }
+                // ENG-936: one shared prompt for every revision entry point (see revisionService).
+                const { buildAgentModeRevisionMessage } = await import('../services/revisionService');
+                const revisionMessage = buildAgentModeRevisionMessage(
+                  originalApproval.assetType,
+                  originalApproval.assetUrl,
+                  feedbackValue
+                );
+                const requiredFunctions: Array<{ functionName: string; minCount: number }> =
+                  originalApproval.assetType === 'image'
+                    ? [{ functionName: 'generate_image', minCount: 1 }]
+                    : [{ functionName: 'update_html_file', minCount: 1 }];
                 
                 // Use runVerifiedChat function (same as verified-generate endpoint)
                 const { runVerifiedChat } = await import('../controllers/agentModeController');
@@ -1412,12 +1398,20 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                   let newAssetUrl: string | null = null;
                   let newAssetFilename: string | null = null;
                   let toolCallFailed = false;
+                  let awaitingConfirmation = false;
                   let toolCallFailureMessage = '';
 
                   if (result.success && result.toolCalls.length > 0) {
                     // Find the tool call that created the asset
                     for (const toolCall of result.toolCalls) {
                       const toolResult = toolCall?.result || {};
+
+                      // ENG-936: a tool parked on the human-in-the-loop confirmation gate produced no
+                      // asset and never will — no user is watching this auto-revision.
+                      if (toolResult.awaitingUserConfirmation === true) {
+                        awaitingConfirmation = true;
+                        continue;
+                      }
 
                       if (originalApproval.assetType === 'image') {
                         // For images, look for imageUrl, image_url, s3_url, url, or file_url (save_file fallback)
@@ -1484,9 +1478,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                     }
                   } else {
                     // Determine the failure reason for better logging
-                    const failureReason = toolCallFailed
-                      ? `Tool call failed: ${toolCallFailureMessage}`
-                      : 'Could not extract new asset URL from toolCalls';
+                    const { describeRevisionFailure } = await import('../services/revisionService');
+                    const failure = describeRevisionFailure({ toolCallFailed, toolCallFailureMessage, awaitingConfirmation });
+                    const failureReason = failure.reason;
 
                     console.warn(`⚠️ ${failureReason}. Tool calls: ${JSON.stringify(result.toolCalls)}`);
 
@@ -1506,12 +1500,8 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       }
 
                       await sendAgentModeOncallAlert({
-                        subject: toolCallFailed
-                          ? 'Agent Mode Revision: Tool Call Failed'
-                          : 'Agent Mode Revision: Failed to Extract Asset URL',
-                        message: toolCallFailed
-                          ? `The revision tool call failed during Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}\nError: ${toolCallFailureMessage}`
-                          : `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                        subject: failure.subject,
+                        message: `${failure.reason}\n\nSession: ${agentSessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
                         sessionId: agentSessionId,
                         context: {
                           'iShare Link': ishareLink,
@@ -1521,6 +1511,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           'Feedback': feedbackValue,
                           'Revision Success': result.success,
                           'Tool Call Failed': toolCallFailed,
+                          'Awaiting User Confirmation': awaitingConfirmation,
                           'Tool Call Failure Message': toolCallFailed ? toolCallFailureMessage : 'N/A',
                           'Tool Calls Count': result.toolCalls.length,
                           'Tool Calls': JSON.stringify(result.toolCalls, null, 2),
@@ -1593,31 +1584,17 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       throw new Error('Session not found');
                     }
                     
-                    // Format revision message based on asset type (similar to Images/Reports pages)
-                    let revisionMessage: string;
-                    let requiredFunctions: Array<{ functionName: string; minCount: number }>;
-                    
-                    if (originalApproval.assetType === 'image') {
-                      // For images, use generate_image function
-                      revisionMessage = `Please use the generate_image function to revise this image: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nUse the original image as an input image for editing.`;
-                      requiredFunctions = [
-                        {
-                          functionName: 'generate_image',
-                          minCount: 1
-                        }
-                      ];
-                    } else if (originalApproval.assetType === 'html') {
-                      // For HTML reports, use update_html_file function
-                      revisionMessage = `Please revise this HTML report: ${originalApproval.assetUrl}\n\nRevision request: ${feedbackValue}\n\nFirst, call read_file_content to understand the current HTML structure. Then use update_html_file with update_type="css" and CSS selectors to target the specific elements that need changes. Keep the HTML well-structured and production-ready.`;
-                      requiredFunctions = [
-                        {
-                          functionName: 'update_html_file',
-                          minCount: 1
-                        }
-                      ];
-                    } else {
-                      throw new Error(`Unsupported asset type for Agent Mode revision: ${originalApproval.assetType}`);
-                    }
+                    // ENG-936: one shared prompt for every revision entry point (see revisionService).
+                    const { buildAgentModeRevisionMessage } = await import('../services/revisionService');
+                    const revisionMessage = buildAgentModeRevisionMessage(
+                      originalApproval.assetType,
+                      originalApproval.assetUrl,
+                      feedbackValue
+                    );
+                    const requiredFunctions: Array<{ functionName: string; minCount: number }> =
+                      originalApproval.assetType === 'image'
+                        ? [{ functionName: 'generate_image', minCount: 1 }]
+                        : [{ functionName: 'update_html_file', minCount: 1 }];
                     
                     // Use runVerifiedChat function (same as verified-generate endpoint)
                     const { runVerifiedChat } = await import('../controllers/agentModeController');
@@ -1639,12 +1616,20 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                       let newAssetUrl: string | null = null;
                       let newAssetFilename: string | null = null;
                       let toolCallFailed = false;
+                      let awaitingConfirmation = false;
                       let toolCallFailureMessage = '';
 
                       if (result.success && result.toolCalls.length > 0) {
                         // Find the tool call that created the asset
                         for (const toolCall of result.toolCalls) {
                           const toolResult = toolCall?.result || {};
+
+                          // ENG-936: a tool parked on the human-in-the-loop confirmation gate produced no
+                          // asset and never will — no user is watching this auto-revision.
+                          if (toolResult.awaitingUserConfirmation === true) {
+                            awaitingConfirmation = true;
+                            continue;
+                          }
 
                           if (originalApproval.assetType === 'image') {
                             // For images, look for imageUrl, image_url, s3_url, url, or file_url (save_file fallback)
@@ -1711,9 +1696,9 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                         }
                       } else {
                         // Determine the failure reason for better logging
-                        const failureReason = toolCallFailed
-                          ? `Tool call failed: ${toolCallFailureMessage}`
-                          : 'Could not extract new asset URL from toolCalls';
+                        const { describeRevisionFailure } = await import('../services/revisionService');
+                        const failure = describeRevisionFailure({ toolCallFailed, toolCallFailureMessage, awaitingConfirmation });
+                        const failureReason = failure.reason;
 
                         console.warn(`⚠️ ${failureReason}. Tool calls: ${JSON.stringify(result.toolCalls)}`);
 
@@ -1733,12 +1718,8 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                           }
 
                           await sendAgentModeOncallAlert({
-                            subject: toolCallFailed
-                              ? 'Agent Mode Revision: Tool Call Failed'
-                              : 'Agent Mode Revision: Failed to Extract Asset URL',
-                            message: toolCallFailed
-                              ? `The revision tool call failed during Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}\nError: ${toolCallFailureMessage}`
-                              : `Failed to extract new asset URL from toolCalls after Agent Mode revision.\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
+                            subject: failure.subject,
+                            message: `${failure.reason}\n\nSession: ${task.sessionId}\nAsset Type: ${originalApproval.assetType}\nOriginal Asset URL: ${originalApproval.assetUrl}\nFeedback: ${feedbackValue}`,
                             sessionId: task.sessionId,
                             context: {
                               'iShare Link': ishareLink,
@@ -1748,6 +1729,7 @@ router.post("/interactions", express.urlencoded({ extended: true }), async (req:
                               'Feedback': feedbackValue,
                               'Revision Success': result.success,
                               'Tool Call Failed': toolCallFailed,
+                          'Awaiting User Confirmation': awaitingConfirmation,
                               'Tool Call Failure Message': toolCallFailed ? toolCallFailureMessage : 'N/A',
                               'Tool Calls Count': result.toolCalls.length,
                               'Tool Calls': JSON.stringify(result.toolCalls, null, 2),
