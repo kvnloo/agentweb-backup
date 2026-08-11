@@ -9,7 +9,8 @@
  * Charles' castle for "Guesty".
  *
  * These helpers reduce a query to the terms that actually identify its subject
- * and check whether an article mentions enough of them to be about that subject.
+ * and check whether an article mentions the primary one, i.e. whether it is
+ * about that subject at all.
  */
 
 /**
@@ -32,14 +33,6 @@ const NEWS_QUERY_STOPWORDS = new Set([
   'were', 'what', 'when', 'which', 'who', 'why', 'with', 'www', 'year', 'yesterday',
 ]);
 
-/**
- * An article must match this many distinct query terms to count as on-topic.
- * One shared token is how the noise gets in ("payment" matching a UEFA story),
- * so two are required whenever the query offers two — a single-term query such
- * as "Zenoti" still only needs its one entity term.
- */
-const MIN_TERM_MATCHES = 2;
-
 const MIN_TERM_LENGTH = 3;
 
 function tokenize(text: string): string[] {
@@ -60,6 +53,9 @@ function singularize(token: string): string {
 
 /**
  * The terms of a query that identify its subject, in query order, deduplicated.
+ * The first one is the primary term — these queries name their subject first
+ * ("Stripe payments", "Guesty short-term rental platform") — and relevance is
+ * anchored on it.
  * Returns an empty list for a purely generic query ("latest news today") — there
  * is then nothing to judge relevance against, so nothing may be filtered out.
  */
@@ -83,9 +79,16 @@ export interface RelevanceCandidate {
 }
 
 /**
- * True when the article mentions enough of the query's significant terms to be
- * about the query's subject. Whole-token matching only (after singularization),
- * so "guest" does not satisfy "guesty" and "striped" does not satisfy "stripe".
+ * True when the article mentions the query's primary term — the entity the
+ * query is about. Counting term hits instead would cut both ways: requiring two
+ * throws away the headlines a competitor digest exists to find, because a real
+ * one names the company and nothing else ("Stripe launches Tempo",
+ * "UpKeep raises $50M Series C"), while accepting any one lets the trending feed
+ * back in through a descriptor ("vacation resorts" for a Guesty query).
+ * Anchoring on the entity keeps the first and rejects the second.
+ *
+ * Whole-token matching only (after singularization), so "guest" does not satisfy
+ * "guesty" and "striped" does not satisfy "stripe".
  */
 export function isRelevantToQuery(result: RelevanceCandidate, significantTerms: string[]): boolean {
   if (!significantTerms.length) return true;
@@ -98,14 +101,5 @@ export function isRelevantToQuery(result: RelevanceCandidate, significantTerms: 
   ].join(' ');
 
   const tokens = new Set(tokenize(haystack).map(singularize));
-  const required = Math.min(MIN_TERM_MATCHES, significantTerms.length);
-
-  let matches = 0;
-  for (const term of significantTerms) {
-    if (tokens.has(term)) {
-      matches += 1;
-      if (matches >= required) return true;
-    }
-  }
-  return false;
+  return tokens.has(significantTerms[0]);
 }
