@@ -4695,7 +4695,7 @@ router.get("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
-    const allAvailableFeatures = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
@@ -4780,7 +4780,7 @@ router.post("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
-    const allAvailableFeatures = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
