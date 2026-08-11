@@ -105,6 +105,13 @@ describe('GET /api/admin/slack/channel-info — unresolved configured channels',
     expect(res.status).toBe(400);
     expect(mockGetSlackChannelInfo).not.toHaveBeenCalled();
   });
+
+  it('rejects a whitespace-only configured channel id', async () => {
+    const res = await request(app).get('/api/admin/slack/channel-info?channelId=%20%20%20');
+
+    expect(res.status).toBe(400);
+    expect(mockGetSlackChannelInfo).not.toHaveBeenCalled();
+  });
 });
 
 describe('PUT /api/admin/users/:userId/slack-channel — cache invalidation', () => {

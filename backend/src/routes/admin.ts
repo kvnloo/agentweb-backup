@@ -1249,11 +1249,14 @@ router.put("/users/:userId/email-sender", async (req, res) => {
 router.get("/slack/channel-info", async (req, res) => {
   try {
     const { channelId } = req.query;
-    if (!channelId || typeof channelId !== "string") {
+    if (typeof channelId !== "string") {
+      return res.status(400).json({ message: "channelId query param required" });
+    }
+    const configuredChannelId = channelId.trim();
+    if (!configuredChannelId) {
       return res.status(400).json({ message: "channelId query param required" });
     }
     const { getSlackChannelInfo } = await import("../services/slackService");
-    const configuredChannelId = channelId.trim();
     const info = await getSlackChannelInfo(configuredChannelId);
     if (!info) {
       return res.json({
