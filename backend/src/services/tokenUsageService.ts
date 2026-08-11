@@ -17,10 +17,11 @@ export interface TokenUsageStatus {
   costUsed: number; // USD spent this month
   costAllowance: number | null; // null = unlimited
   costPercentUsed: number; // 0-100+, 0 if unlimited (cost dimension)
-  // Whether the cost cap is the ENFORCED gate right now (ENFORCE_COST_CAP). While
-  // false the dollar figures are observe-only — we're gathering spend data to
-  // decide the cost quota. UIs use this to know when a real cost denominator
-  // exists: the customer-facing meter only surfaces cost once this is true.
+  // Whether the cost cap is the dimension actually gating THIS user right now.
+  // Requires both ENFORCE_COST_CAP and a configured costAllowance — the flag alone
+  // is not enough, because an unpriced tier falls back to its token cap (ENG-1116).
+  // While false the dollar figures are observe-only. UIs use this to know which
+  // dimension to render as the quota: true means a real cost denominator exists.
   costEnforced: boolean;
 }
 
@@ -144,33 +145,38 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     billingUserId
   );
 
-  // Two independent limits: token-count and dollar cost. The cost dimension is
-  // what will eventually make higher-cost models (e.g. Fable) safe to enable — a
-  // token-count cap alone can't bound dollar spend.
+  // Two dimensions are measured — token-count and dollar cost — but only ONE of
+  // them gates at a time. Dollars are the real unit of consumption: a token-count
+  // cap cannot bound spend once models are priced differently (ENG-207), so a
+  // token allowance sized for cheap models silently becomes either a giveaway or,
+  // as happened here, a wall. ENFORCE_COST_CAP selects which dimension gates.
   //
-  // Cost enforcement is OFF by default (observe-only): we accumulate and surface
-  // per-user cost so we can gather real spend data before deciding to gate on it,
-  // but we do NOT block users on cost yet. Token-count remains the only hard gate.
-  // Per-model pricing is now normalized and accurate (ENG-207 — every model,
-  // including Fable, is priced from the shared llmPricing book), so the dollar
-  // figure is trustworthy. We still keep the cap observe-only until we've
-  // validated real per-user spend against the shadow book. Flip
-  // ENFORCE_COST_CAP=true to enable the cost cap; the enforcement path stays
-  // tested below.
+  // ENG-1116 — this used to AND the two caps (cost as an *additional* limit).
+  // It now REPLACES: with the flag on, cost gates and the token counter is
+  // observe-only. Keeping the token cap live alongside cost would defeat the flip
+  // entirely, because the token allowances are the thing being retired — four prod
+  // users are already past them, one at 1600% of a Free tier's 3M.
   const enforceCostCap = process.env.ENFORCE_COST_CAP === "true";
 
   const tokenPercentUsed = computePercentUsed(usage.totalTokens, effectiveAllowance);
   const costPercentUsed = computePercentUsed(usage.totalCost, costAllowance);
 
+  // A tier with no configured dollar allowance would become completely ungated the
+  // moment the flag flips — a strictly worse failure than the cap being replaced.
+  // Such tiers keep their token cap until someone prices them. That guard is also
+  // what makes the rollout order-independent: this code can ship to prod, where
+  // every tier is currently unpriced, and change nothing until the allowances land.
+  const costIsGate = enforceCostCap && costAllowance !== null;
+
   const tokenAllowed = effectiveAllowance === null || tokenPercentUsed < 100;
   const costAllowed = costAllowance === null || costPercentUsed < 100;
-  const allowed = tokenAllowed && (enforceCostCap ? costAllowed : true);
+  const allowed = costIsGate ? costAllowed : tokenAllowed;
 
-  const tokenWarning = effectiveAllowance !== null && tokenPercentUsed >= 80 && tokenPercentUsed < 100;
-  // Only surface a cost warning to users when the cost cap is actually enforced —
-  // otherwise we'd nag about a limit that can't block them.
-  const costWarning =
-    enforceCostCap && costAllowance !== null && costPercentUsed >= 80 && costPercentUsed < 100;
+  // Warn only on the dimension that can actually block. Warning about a cap that
+  // no longer gates is the same nag ENG-951 stripped from customer surfaces.
+  const tokenWarning =
+    !costIsGate && effectiveAllowance !== null && tokenPercentUsed >= 80 && tokenPercentUsed < 100;
+  const costWarning = costIsGate && costPercentUsed >= 80 && costPercentUsed < 100;
 
   return {
     allowed,
@@ -184,7 +190,7 @@ export async function checkTokenUsage(userId: string): Promise<TokenUsageStatus>
     costUsed: usage.totalCost,
     costAllowance,
     costPercentUsed: costAllowance === null ? 0 : costPercentUsed,
-    costEnforced: enforceCostCap,
+    costEnforced: costIsGate,
   };
 }
 
@@ -204,6 +210,7 @@ export function deriveBlockedByCost(status: {
   percentUsed?: number;
   costAllowance?: number | null;
   costPercentUsed?: number;
+  costEnforced?: boolean;
 }): { costCapTriggered: boolean; tokenCapTriggered: boolean; blockedByCost: boolean } {
   const costCapTriggered =
     status.costAllowance != null && (status.costPercentUsed ?? 0) >= 100;
@@ -211,11 +218,18 @@ export function deriveBlockedByCost(status: {
     status.effectiveAllowance != null ? status.effectiveAllowance : status.allowance;
   const tokenCapTriggered =
     effectiveTokenAllowance != null && (status.percentUsed ?? 0) >= 100;
-  return {
-    costCapTriggered,
-    tokenCapTriggered,
-    blockedByCost: costCapTriggered && !tokenCapTriggered,
-  };
+
+  // ENG-1116: when cost is the gate, the token counter cannot block anyone, so a
+  // block over both caps is a COST block and must be worded in dollars. The old
+  // `!tokenCapTriggered` veto was right only while the caps were ANDed — under
+  // replacement it would tell a user they had run out of tokens, pointing them at
+  // a limit that no longer exists. When cost is not the gate the original
+  // attribution stands: a token block reads in tokens.
+  const blockedByCost = status.costEnforced
+    ? costCapTriggered
+    : costCapTriggered && !tokenCapTriggered;
+
+  return { costCapTriggered, tokenCapTriggered, blockedByCost };
 }
 
 /**
