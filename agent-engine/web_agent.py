@@ -18,10 +18,11 @@ from pydantic import SecretStr, BaseModel
 from botocore.config import Config
 from dotenv import load_dotenv
 import logging
+import secrets_manager
 from pathlib import Path
 from browser_use.agent.views import ActionResult
 from cookie_sync import CookieSync
-from aws_utils import get_dynamodb_resource, get_bedrock_client
+from aws_utils import get_dynamodb_resource, get_bedrock_client, get_s3_client
 import time
 import asyncio
 import random
@@ -65,14 +66,19 @@ AZURE_IMAGE_API_KEY_ENV = 'AZURE_IMAGE_API_KEY'
 
 
 def get_azure_image_endpoint() -> Optional[str]:
-    """Return the configured Azure image endpoint (no trailing slash), or None if unset."""
-    endpoint = (os.getenv(AZURE_IMAGE_ENDPOINT_ENV) or '').strip()
+    """Return the configured Azure image endpoint (no trailing slash), or None if unset.
+
+    Routed through secrets_manager (env var first, GCP Secret Manager
+    fallback in prod) rather than a bare os.getenv - found via ENG-389 live
+    testing that a bare env-var read here would silently break in
+    production, same class of gap ENG-816 fixed for OPENAI_API_KEY."""
+    endpoint = (secrets_manager.get_azure_image_endpoint() or '').strip()
     return endpoint.rstrip('/') or None
 
 
 def get_azure_image_api_key() -> Optional[str]:
     """Return the configured Azure image API key, or None if unset."""
-    return (os.getenv(AZURE_IMAGE_API_KEY_ENV) or '').strip() or None
+    return (secrets_manager.get_azure_image_api_key() or '').strip() or None
 
 # Initialize DynamoDB client
 dynamodb = get_dynamodb_resource()
@@ -246,7 +252,7 @@ class WebAgent:
         self.current_task_id = None
         self.controller = Controller()
         self.question_count = 0  # Track number of questions asked
-        self.s3_client = boto3.client('s3')
+        self.s3_client = get_s3_client()
         self.s3_bucket = os.getenv('S3_BUCKET_NAME')  # Make sure to set this in .env
         self._log_handlers = []  # Store log handlers for cleanup
         self.generate_gif = None
@@ -617,7 +623,7 @@ class WebAgent:
                 if not query or not isinstance(query, str):
                     return ActionResult(error="Please provide a non-empty search query")
 
-                api_key = os.getenv('GOOGLE_SEARCH_API_KEY')
+                api_key = secrets_manager.get_google_search_api_key()
                 search_engine_id = os.getenv('GOOGLE_SEARCH_ENGINE_ID')
 
                 if not api_key or not search_engine_id:
@@ -967,7 +973,7 @@ class WebAgent:
                         return ActionResult(error="OpenAI package not installed. Install with: pip install openai")
 
                     # Get API key
-                    api_key = os.getenv('OPENAI_API_KEY')
+                    api_key = secrets_manager.get_openai_api_key()
                     if not api_key:
                         return ActionResult(error="OPENAI_API_KEY environment variable is not set")
 
@@ -1832,7 +1838,7 @@ class WebAgent:
                             return ActionResult(error="Runway ML package not installed. Install with: pip install runwayml")
                         
                         # Get API key
-                        api_key = os.getenv('RUNWAY_API_KEY')
+                        api_key = secrets_manager.get_runway_api_key()
                         if not api_key:
                             return ActionResult(error="RUNWAY_API_KEY environment variable is not set")
                         
@@ -1896,7 +1902,7 @@ class WebAgent:
                         import time
                         
                         # Get API key
-                        api_key = os.getenv('REELMIND_API_KEY')
+                        api_key = secrets_manager.get_reelmind_api_key()
                         if not api_key:
                             return ActionResult(error="REELMIND_API_KEY environment variable is not set (Do not retry - this is a permanent failure)")
                         
@@ -2110,7 +2116,7 @@ class WebAgent:
                             return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
                         
                         # Get API key
-                        api_key = os.getenv('GOOGLE_VEO_API_KEY')
+                        api_key = secrets_manager.get_google_veo_api_key()
                         if not api_key:
                             return ActionResult(error="GOOGLE_VEO_API_KEY environment variable is not set")
                         
@@ -2508,7 +2514,7 @@ class WebAgent:
                     return ActionResult(error="Google Gemini SDK not installed. Install with: pip install google-genai")
 
                 # Get API key
-                api_key = os.getenv('GEMINI_API_KEY')
+                api_key = secrets_manager.get_gemini_api_key()
                 if not api_key:
                     return ActionResult(error="GEMINI_API_KEY environment variable is not set")
 
@@ -2722,7 +2728,7 @@ class WebAgent:
                     return ActionResult(error="Google Generative AI package not installed. Install with: pip install google-genai")
 
                 # Get API key
-                api_key = os.getenv('GEMINI_API_KEY')
+                api_key = secrets_manager.get_gemini_api_key()
                 if not api_key:
                     return ActionResult(error="GEMINI_API_KEY environment variable is not set")
 
@@ -3240,7 +3246,7 @@ class WebAgent:
                     logger.info(f"Azure AI Services FLUX model configured: {azure_model_name}")
                 elif model_to_use == "gemini-2.5-flash-image":
                     # Use Google Gemini Nano Banana image model
-                    api_key = os.getenv('GOOGLE_IMAGE_API_KEY')
+                    api_key = secrets_manager.get_google_image_api_key()
                     if not api_key:
                         return ActionResult(error="GOOGLE_IMAGE_API_KEY environment variable is not set for Google Nano Banana model")
                     try:
@@ -3268,7 +3274,7 @@ class WebAgent:
                     azure_model_name = "gpt-image-1"
                 else:
                     # Use OpenAI for other models
-                    api_key = os.getenv('OPENAI_IMAGE_API_KEY')
+                    api_key = secrets_manager.get_openai_image_api_key()
                     if not api_key:
                         return ActionResult(error="OPENAI_IMAGE_API_KEY environment variable is not set")
                     
