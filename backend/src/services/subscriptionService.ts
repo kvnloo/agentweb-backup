@@ -362,7 +362,7 @@ export async function getPublicAllowedSkills(): Promise<string[]> {
  * "instagram" is a separate UI entry even though it uses the "meta" OAuth flow.
  */
 export function getAllAvailableConnectedAccounts(): string[] {
-  return ['linkedin', 'unipile', 'meta', 'gmail', 'outlook', 'youtube', 'fathom', 'instagram', 'twitter', 'hubspot', 'attio', 'google_ads', 'google_drive'];
+  return ['linkedin', 'unipile', 'meta', 'gmail', 'outlook', 'calendly', 'youtube', 'fathom', 'instagram', 'twitter', 'hubspot', 'attio', 'google_ads', 'google_drive'];
 }
 
 /**
