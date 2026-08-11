@@ -30,9 +30,13 @@ import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type Judge
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import { SchedulePublishAuthorization, resolveSchedulePublishAuthorization, narrowPublishAuthorization } from '../utils/schedulePublishAuthorization';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+// ENG-1002: the anonymized-hit rule lives in one place so the import tool and
+// the outreach-onboarding prospect preview cannot drift apart.
+import { isAnonymizedSearchLead } from '../utils/anonymizedLinkedInLead';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -894,6 +898,7 @@ function buildFindReason(filters: {
   const joined = parts.join('; ');
   return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
 }
+
 
 /**
  * ENG-182: extract a LinkedIn public identifier from a profile URL, e.g.
@@ -8896,12 +8901,15 @@ export class AgentModeService {
         };
       }
 
-      // If user belongs to an org, read from org data instead
+      // If user belongs to an org, read from org data instead — falling back to
+      // the org owner's record when the org was created without copying the
+      // profile over, so Emma sees the same brand the settings page shows a
+      // member of an un-copied org (ENG-927).
       let brand = user.brandGuidelines;
       if (user.orgId) {
         const org = await orgDb.getOrgById(user.orgId);
-        if (org && org.brandGuidelines) {
-          brand = org.brandGuidelines;
+        if (org) {
+          brand = await resolveOrgProfileField(user, org, 'brandGuidelines');
         }
       }
       if (!brand) {
@@ -9052,12 +9060,13 @@ export class AgentModeService {
         };
       }
 
-      // If user belongs to an org, read from org data instead
+      // Same owner-record fallback as the brand read: an un-copied org must not
+      // hide the owner's strategy from a member (ENG-927).
       let marketStrategy = user.marketStrategy;
       if (user.orgId) {
         const org = await orgDb.getOrgById(user.orgId);
-        if (org && org.marketStrategy) {
-          marketStrategy = org.marketStrategy;
+        if (org) {
+          marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
         }
       }
       if (!marketStrategy) {
@@ -9187,7 +9196,9 @@ export class AgentModeService {
             error: 'Permission denied'
           };
         }
-        existingMarketStrategy = org?.marketStrategy;
+        // Same owner-record fallback as the brand path — merging onto an
+        // unpopulated org record would drop the owner's competitors/ICPs.
+        existingMarketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy', { forWrite: true });
       } else {
         existingMarketStrategy = user.marketStrategy;
       }
@@ -10462,12 +10473,13 @@ export class AgentModeService {
         };
       }
 
-      const hasAccessAddLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessAddLeads = await canDestructiveCrmList(userId, list);
       if (!hasAccessAddLeads) {
         return {
           success: false,
           message: 'Access denied',
-          error: 'You do not have permission to add leads to this list'
+          error: CRM_EDITOR_REQUIRED_MESSAGE
         };
       }
 
@@ -10816,21 +10828,25 @@ export class AgentModeService {
       }
 
       // Resolve and access-check each list. In single-list mode an inaccessible
-      // list_id is a hard error; in multi-list mode we silently skip so the
-      // caller still gets results from the lists they CAN see.
+      // list_id is a hard error; in multi-list mode we skip and record the list ID
+      // in skipped_list_ids so callers can distinguish a permission skip from an
+      // empty result.
       type ListEntry = { listId: string; list: any } | null;
       const lists: ListEntry[] = [];
+      const skippedListIds: string[] = [];
       for (let i = 0; i < cursorListIds.length; i++) {
         const id = cursorListIds[i];
         const list = await crmDb.getLeadListById(id);
         if (!list) {
           if (!isMultiList) return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+          skippedListIds.push(id);
           lists.push(null);
           continue;
         }
         const access = await crmDb.canOrgMemberAccessList(userId, list);
         if (!access) {
           if (!isMultiList) return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+          skippedListIds.push(id);
           lists.push(null);
           continue;
         }
@@ -10934,6 +10950,7 @@ export class AgentModeService {
         ...(isMultiList ? {
           listsScanned: lists.filter((e: ListEntry): e is { listId: string; list: any } => !!e)
             .map((e) => ({ listId: e.listId, listName: e.list.name })),
+          skipped_list_ids: skippedListIds,
         } : {}),
         has_more: !!cursorOut,
         ...(nextCursor && { next_cursor: nextCursor }),
@@ -11298,9 +11315,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -11406,9 +11424,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const now = new Date().toISOString();
@@ -11469,9 +11488,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       if (!leadIds || leadIds.length === 0) {
@@ -11519,9 +11539,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       if (!filters || filters.length === 0) {
@@ -11692,9 +11713,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Filter out undefined values
@@ -11752,9 +11774,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccessUpdateStatus = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessUpdateStatus = await canDestructiveCrmList(userId, list);
       if (!hasAccessUpdateStatus) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Fetch current lead
@@ -11847,9 +11870,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Validate statusConfig entries
@@ -11891,9 +11915,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const listName = list.name;
@@ -11982,9 +12007,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -12019,9 +12045,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccessSend = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessSend = await canDestructiveCrmList(userId, list);
       if (!hasAccessSend) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to send emails from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -12505,12 +12532,13 @@ export class AgentModeService {
         };
       }
 
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
         return {
           success: false,
           message: 'Access denied',
-          error: 'You do not have permission to access this lead list'
+          error: CRM_EDITOR_REQUIRED_MESSAGE
         };
       }
 
@@ -12933,7 +12961,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
             error: 'Permission denied'
           };
         }
-        existingBrand = org?.brandGuidelines;
+        // Fall back to the org owner's record when the org record was never
+        // populated, so a tweak merges onto the existing brand instead of
+        // building a fresh empty structure over it (ENG-927).
+        existingBrand = await resolveOrgProfileField(user, org, 'brandGuidelines', { forWrite: true });
       } else {
         existingBrand = user.brandGuidelines;
       }
@@ -13170,7 +13201,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     if (user?.orgId) {
       const { orgDb } = await import('./db');
       const org = await orgDb.getOrgById(user.orgId);
-      if (org && org.marketStrategy) return org.marketStrategy;
+      // Owner-record fallback for an org that was never populated (ENG-927), so
+      // the re-setup offer and the regenerate flow count what the user actually
+      // has rather than offering to build a strategy that already exists.
+      if (org) return resolveOrgProfileField(user, org, 'marketStrategy');
     }
     return user?.marketStrategy;
   }
@@ -30518,7 +30552,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
               const { crmDb } = await import('./db');
               const mirrorList = await crmDb.getLeadListById(mirrorListId);
-              if (!mirrorList || !(await crmDb.canOrgMemberAccessList(userId, mirrorList))) {
+              const { canDestructiveCrmList } = await import('./crmAccessControl');
+              if (!mirrorList || !(await canDestructiveCrmList(userId, mirrorList))) {
                 console.warn(`[AgentMode] send-invite: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
                 return;
               }
@@ -31839,6 +31874,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
     }
 
+    // Access check (ENG-1049): this function creates leads (batchCreateLeads
+    // below), and is called directly by the import_leads_from_search Emma tool
+    // — bypassing the canDestructiveCrmList check that crm.ts's POST
+    // /lists/:listId/leads/find route applies before calling this same method.
+    // Without this, any same-org member could import leads into another
+    // member's list via Emma chat.
+    try {
+      const { crmDb: accessCrmDb } = await import('./db');
+      const accessList = await accessCrmDb.getLeadListById(listId);
+      if (!accessList) {
+        return { success: false, error: 'The specified lead list does not exist' };
+      }
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      if (!(await canDestructiveCrmList(userId, accessList))) {
+        return { success: false, error: CRM_EDITOR_REQUIRED_MESSAGE };
+      }
+    } catch (err) {
+      // Fail closed — an access-check failure must never silently allow the
+      // write. Distinct from the cosmetic, fail-soft list lookups below.
+      return { success: false, error: 'Failed to verify list access' };
+    }
+
     // Resolve account: user's own or platform-wide fallback
     const accountId = await linkedInOutreachService.resolveAccountId(userId);
     if (!accountId) {
@@ -31895,8 +31952,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     let searchError: string | null = null;
     let searchUnavailable = false;
     const allErrors: string[] = [];
-    const allCreated: Array<{ leadId: string; email?: string }> = [];
-    const allMappedLeadsPreview: any[] = []; // first-5 preview only
+    // `lead` is the mapped payload the record was written from — the response
+    // preview is derived from this so it can only ever describe real writes.
+    const allCreated: Array<{ leadId: string; email?: string; lead?: any }> = [];
+    // Out-of-network "LinkedIn Member" hits dropped before the write.
+    let anonymizedSkipped = 0;
 
     while (iterationCount < MAX_ITERATIONS) {
       iterationCount++;
@@ -32003,14 +32063,35 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return lead;
       });
 
+      // Phase 1b (ENG-1002): drop anonymized / identity-less hits BEFORE any
+      // further work. LinkedIn returns out-of-network profiles as the
+      // placeholder "LinkedIn Member" with no public identifier; persisting
+      // one produces a nameless, emailless, un-linkable record that can never
+      // be dedup'd — so every subsequent run of the same search creates
+      // another copy. Skipping them also means the top-up loop keeps
+      // paginating until it finds `limit` genuinely usable leads.
+      const candidates: Array<{ lead: any; item: any }> = [];
+      for (let i = 0; i < leads.length; i++) {
+        if (isAnonymizedSearchLead(leads[i])) {
+          anonymizedSkipped++;
+          continue;
+        }
+        candidates.push({ lead: leads[i], item: items[i] });
+      }
+      const importable: any[] = candidates.map((c) => c.lead);
+      if (importable.length === 0) {
+        if (!nextCursor) break;
+        continue;
+      }
+
       // Phase 2: Tier 3 — one batched Gemini Flash call for all titles still
       // missing a company. Skipped entirely when no candidates remain.
       const llmIndices: number[] = [];
       const llmTitles: string[] = [];
-      for (let i = 0; i < leads.length; i++) {
-        if (!leads[i].company && typeof leads[i].title === 'string' && leads[i].title) {
+      for (let i = 0; i < importable.length; i++) {
+        if (!importable[i].company && typeof importable[i].title === 'string' && importable[i].title) {
           llmIndices.push(i);
-          llmTitles.push(leads[i].title);
+          llmTitles.push(importable[i].title);
         }
       }
       if (llmTitles.length > 0) {
@@ -32019,7 +32100,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
-            if (v && v !== 'NONE') leads[llmIndices[k]].company = v;
+            if (v && v !== 'NONE') importable[llmIndices[k]].company = v;
           }
         } catch (e: any) {
           console.warn('[importLeadsFromSearch] LLM batch company-parse failed:', e?.message ?? String(e));
@@ -32027,8 +32108,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
 
       // Phase 3: Tier 4 — Unipile getProfile for still-empty leads, parallel.
-      await Promise.all(items.map(async (item: any, idx: number) => {
-        const lead = leads[idx];
+      await Promise.all(candidates.map(async ({ lead, item }) => {
         if (lead.company || !item.public_identifier || !accountId) return;
         try {
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
@@ -32044,18 +32124,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }));
 
-      const result = await crmDb.batchCreateLeads(listId, leads);
+      const result = await crmDb.batchCreateLeads(listId, importable);
       cumulativeNew += result.newCount ?? 0;
       cumulativeMerged += result.mergedCount ?? 0;
       if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);
       const created = Array.isArray((result as any).created) ? (result as any).created : [];
-      if (created.length) allCreated.push(...created);
-
-      if (allMappedLeadsPreview.length < 5) {
-        for (const lead of leads) {
-          if (allMappedLeadsPreview.length >= 5) break;
-          allMappedLeadsPreview.push(lead);
-        }
+      // Carry the source row alongside each created id so the response preview
+      // is built from the records that were actually written — not from every
+      // candidate we looked at (ENG-1002). Rows that dedup'd into an existing
+      // lead, or that were unchanged no-ops, never appear in `created`.
+      for (const entry of created) {
+        const source = typeof entry?.sourceIndex === 'number' ? importable[entry.sourceIndex] : undefined;
+        allCreated.push({ ...entry, lead: source });
       }
 
       if (cumulativeNew >= limit) break;
@@ -32122,14 +32202,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       cursor: resumeCursor,
       iterations: iterationCount,
       trimmed: trimmedCount,
+      anonymizedSkipped,
       safetyCapHit,
     };
     if (searchError) response.searchError = searchError;
     if (searchUnavailable) response.searchUnavailable = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
+    } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
+      response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
     }
-    response.importedLeads = allMappedLeadsPreview;
+    // Preview strictly the records that were written and survived trimming.
+    response.importedLeads = allCreated.slice(0, 5).map((c) => c.lead).filter(Boolean);
 
     if (auto_enrich && cumulativeNew > 0) {
       const newLeadIds: string[] = allCreated.map((c) => c.leadId);

@@ -36,6 +36,7 @@ jest.mock('../services/db', () => ({
   taskDb: { getTaskById: jest.fn() },
   subscriberDb: { getAllTaskSubscribers: jest.fn() },
   userDb: { getUserById: jest.fn() },
+  orgDb: { getOrgById: jest.fn(), getOrgMembers: jest.fn() },
 }));
 
 jest.mock('../services/emailEventsDb', () => ({
@@ -64,6 +65,7 @@ jest.mock('../services/contactDedupService', () => ({
 
 import router from '../routes/crm';
 import { dedupContactsForUser } from '../services/contactDedupService';
+import { userDb, orgDb } from '../services/db';
 
 const asMock = (fn: any) => fn as jest.Mock;
 
@@ -164,6 +166,78 @@ describe('GET /api/crm/contacts', () => {
         durationMs: expect.any(Number),
       }),
     );
+  });
+
+  // ENG-686 follow-up (found via live QA): this route pre-dated the
+  // org-share model and unconditionally merged in every org member's
+  // contacts regardless of shareSettings.crm.enabled.
+  describe('org-share fan-out honours crm.enabled (ENG-686 follow-up)', () => {
+    beforeEach(() => {
+      asMock(dedupContactsForUser).mockResolvedValue({
+        contacts: [],
+        total: 0,
+        rawCount: 0,
+        listsCount: 0,
+      });
+      (orgDb.getOrgMembers as jest.Mock).mockResolvedValue([
+        { userId: 'test-user-id' },
+        { userId: 'other-member' },
+      ]);
+    });
+
+    afterEach(() => {
+      // jest.clearAllMocks() (outer beforeEach) clears call history but not
+      // mockResolvedValue — reset explicitly so these org fixtures don't leak
+      // into unrelated tests later in this file.
+      (userDb.getUserById as jest.Mock).mockReset();
+      (orgDb.getOrgById as jest.Mock).mockReset();
+      (orgDb.getOrgMembers as jest.Mock).mockReset();
+    });
+
+    it('does not dedup across other members when crm.enabled is false and caller is a plain member', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-id', orgId: 'org-A' });
+      (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+        orgId: 'org-A',
+        ownerUserId: 'org-owner-id',
+        shareSettings: { crm: { enabled: false, editors: [] } },
+      });
+
+      await handler!(mockReq, mockRes);
+
+      expect(dedupContactsForUser).toHaveBeenCalledTimes(1);
+      expect(dedupContactsForUser).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: 'test-user-id' }),
+      );
+    });
+
+    it('still dedups across every member when crm.enabled is false and caller is the org owner', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-id', orgId: 'org-A' });
+      (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+        orgId: 'org-A',
+        ownerUserId: 'test-user-id',
+        shareSettings: { crm: { enabled: false, editors: [] } },
+      });
+
+      await handler!(mockReq, mockRes);
+
+      expect(dedupContactsForUser).toHaveBeenCalledTimes(2);
+      expect(dedupContactsForUser).toHaveBeenCalledWith(expect.objectContaining({ userId: 'test-user-id' }));
+      expect(dedupContactsForUser).toHaveBeenCalledWith(expect.objectContaining({ userId: 'other-member' }));
+    });
+
+    it('dedups across every member when crm.enabled is true (default)', async () => {
+      (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-id', orgId: 'org-A' });
+      (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+        orgId: 'org-A',
+        ownerUserId: 'org-owner-id',
+        shareSettings: { crm: { enabled: true, editors: [] } },
+      });
+
+      await handler!(mockReq, mockRes);
+
+      expect(dedupContactsForUser).toHaveBeenCalledTimes(2);
+      expect(dedupContactsForUser).toHaveBeenCalledWith(expect.objectContaining({ userId: 'other-member' }));
+    });
   });
 
   it('parses listIds from comma-separated query param', async () => {
