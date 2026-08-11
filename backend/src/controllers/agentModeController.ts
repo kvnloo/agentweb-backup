@@ -23,7 +23,7 @@ import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, shouldStopPressingForPublish } from '../utils/publishPressCircuitBreaker';
 import { resolvePublishAuthorized } from '../utils/schedulePublishApproval';
-import { toolCallSucceeded } from '../utils/toolCallOutcome';
+import { toolCallSucceeded, requirementEvidenceNames } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -1992,9 +1992,7 @@ export async function runVerifiedChat(
   // tool calls the abandoned portion already made so requiredFunctionCalls counts
   // the whole task — otherwise a resumed run is falsely marked incomplete and the
   // verify loop could re-prompt the model into re-running a completed side effect.
-  const allActualFunctionCallsForReporting: string[] = Array.isArray(params.priorToolCalls)
-    ? params.priorToolCalls.map((c) => c.name).filter(Boolean)
-    : [];
+  const allActualFunctionCallsForReporting: string[] = requirementEvidenceNames(params.priorToolCalls ?? []);
 
   // Set when the completion gate asks for one more continuation turn; the next
   // iteration uses a "finish the unfinished entities" continuation message.
@@ -2183,7 +2181,7 @@ export async function runVerifiedChat(
         const continuationToolCalls = continuationResponse.toolCalls || [];
         allToolCalls.push(...continuationToolCalls);
         allActualFunctionCallsForReporting.push(
-          ...continuationToolCalls.map((call: any) => call.name).filter(Boolean)
+          ...requirementEvidenceNames(continuationToolCalls)
         );
         // ENG-396: a completion-gate continuation turn can ALSO emit a blocking
         // AskUserQuestion. Route it through the same park/auto-take handler as the
@@ -2319,9 +2317,7 @@ export async function runVerifiedChat(
       // Extract function calls from the response
       const toolCalls = response.toolCalls || [];
       allToolCalls.push(...toolCalls);
-      const actualFunctionCalls = toolCalls.map((call: any) => call.name).filter(Boolean);
-
-      allActualFunctionCallsForReporting.push(...actualFunctionCalls);
+      allActualFunctionCallsForReporting.push(...requirementEvidenceNames(toolCalls));
 
       // ENG-396: this MAIN turn may have left an unanswered blocking
       // AskUserQuestion — auto-take (full autonomy) or park before doing anything
@@ -3442,13 +3438,19 @@ export async function runScheduledChat(
       console.error('AgentMode: Failed to update session title with summary:', err);
     }
 
-    // Convert result to scheduled chat format
+    // Convert result to scheduled chat format. This list is the AUDIT record of what
+    // the model called, so it deliberately keeps failed attempts — "it tried and the
+    // tool errored" is exactly what someone reading run history needs to see.
     const actualFunctionCalls = result.toolCalls.map((call: any) => call.name).filter(Boolean);
 
-    // Calculate final function call details
+    // Calculate final function call details. Counted off the requirement evidence,
+    // NOT the audit list above (ENG-947): a failed publish must not report
+    // `actual: 1, required: 1` next to a functionCallMisses entry naming the same
+    // tool. The two fields would contradict each other in run history and in the
+    // result email, and the reassuring one is the one that is wrong.
     const finalFunctionCallDetails: { [functionName: string]: { actual: number; required: number } } = {};
     const actualFunctionCallCounts: { [functionName: string]: number } = {};
-    actualFunctionCalls.forEach((call: string) => {
+    requirementEvidenceNames(result.toolCalls).forEach((call: string) => {
       actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
     });
 
