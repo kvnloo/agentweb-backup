@@ -65,6 +65,58 @@ async function uploadBrandFile(
 }
 
 /**
+ * Recover the S3 key from a stored asset URL, for legacy attachments saved
+ * before we persisted `key` alongside them.
+ *
+ * This used to be a `startsWith` against a hardcoded
+ * `https://<bucket>.s3.us-west-2.amazonaws.com/` prefix, while uploads build
+ * their URL from `process.env.AWS_REGION`. Any deployment not in us-west-2
+ * therefore wrote URLs its own delete path could not parse: the key came back
+ * undefined, the object delete was skipped entirely, and the attachment was
+ * dereferenced anyway — a silent orphan reported as a clean delete. Path-style
+ * and region-less URLs failed the same way.
+ *
+ * Matching on the bucket rather than on one spelling of its hostname covers
+ * virtual-hosted, path-style, region-less and cross-region forms alike.
+ * Returns undefined for anything not in our bucket — an externally hosted
+ * asset (e.g. a brand-guide link) has no object of ours to delete.
+ */
+function deriveOwnBucketKey(rawUrl: string): string | undefined {
+  const bucket = process.env.AWS_S3_BUCKET || "agentweb-user-files";
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return undefined;
+  }
+  const host = parsed.hostname.toLowerCase();
+  if (!host.endsWith(".amazonaws.com")) return undefined;
+
+  let path: string;
+  try {
+    path = decodeURIComponent(parsed.pathname.replace(/^\//, ""));
+  } catch {
+    path = parsed.pathname.replace(/^\//, "");
+  }
+  if (!path) return undefined;
+
+  // Virtual-hosted: <bucket>.s3.amazonaws.com/<key>, <bucket>.s3.<region>...,
+  // <bucket>.s3-<region>..., including dualstack spellings.
+  const marker = host.indexOf(".s3.") >= 0 ? host.indexOf(".s3.") : host.indexOf(".s3-");
+  if (marker > 0 && host.slice(0, marker) === bucket) return path;
+
+  // Path-style: s3.amazonaws.com/<bucket>/<key>, s3.<region>.../<bucket>/<key>.
+  if (host === "s3.amazonaws.com" || host.startsWith("s3.") || host.startsWith("s3-")) {
+    const slash = path.indexOf("/");
+    if (slash > 0 && path.slice(0, slash) === bucket) {
+      return path.slice(slash + 1) || undefined;
+    }
+  }
+
+  return undefined;
+}
+
+/**
  * Delete an S3 object, retrying transient failures before giving up.
  *
  * DeleteObject is idempotent — deleting an absent key succeeds — so a retry is
@@ -599,10 +651,7 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     let s3Key: string | undefined =
       typeof target.key === "string" && target.key !== "undefined" ? target.key : undefined;
     if (!s3Key && typeof target.url === "string") {
-      const bucketPrefix = `https://${process.env.AWS_S3_BUCKET || "agentweb-user-files"}.s3.us-west-2.amazonaws.com/`;
-      if (target.url.startsWith(bucketPrefix)) {
-        s3Key = target.url.slice(bucketPrefix.length);
-      }
+      s3Key = deriveOwnBucketKey(target.url);
     }
 
     // A match is guaranteed here, so this drops the target (and any duplicate
