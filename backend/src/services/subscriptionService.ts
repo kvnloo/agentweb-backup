@@ -2,6 +2,7 @@ import { settingsService } from "./settingsService";
 import { userDb, orgDb } from "./db";
 import { CUSTOMER_PORTAL_PAGES } from "./customerPortalPages";
 import { skillService } from "./skillService";
+import { hasOwnLiveSubscription } from "./orgAuthz";
 
 export interface SubscriptionType {
   name: string;
@@ -72,8 +73,10 @@ export async function getUserSubscriptionType(userId: string): Promise<string> {
     // the member has no live subscription of their own; otherwise their own
     // tier governs (matches the "active"/"trialing" = entitling convention
     // already used throughout stripeService.ts).
-    const hasOwnActiveSubscription =
-      user?.subscription_status === "active" || user?.subscription_status === "trialing";
+    // ENG-1084: shared with `resolveBillingUserId` via `inheritsOrgBilling` so a
+    // member's tier and their quota counter can never again answer "whose plan is
+    // this?" differently — the local copy of this test is what drifted last time.
+    const hasOwnActiveSubscription = hasOwnLiveSubscription(user);
     // Anchored on the org's billing root (Organization.ownerUserId), NOT on a role.
     // This used to read `user.orgRole === "member"` as a stand-in for "not the
     // owner", which silently breaks the moment a third role exists: an admin is

@@ -1948,16 +1948,28 @@ emmaToolRegistry.register({
   requiresUserAccount: true,
   definition: {
     name: 'read_market_strategy',
-    description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set.',
+    description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set. The response is size-bounded: full competitor descriptions come one page at a time, further competitors are listed by name with a bracketed offset where space allows, and on a very large roster some stored competitors are NOT named at all (the response says how many). totalCompetitors is always the true stored count. NEVER conclude a competitor is absent because it does not appear in the response — before adding any competitor, verify with competitorNames, which answers stored/not-stored regardless of what this page shows. Use competitorOffset (or the returned nextCompetitorOffset) to read further descriptions.',
     inputSchema: {
       type: 'object',
       properties: {
+        competitorOffset: {
+          type: 'number',
+          description: 'Optional 0-based index of the first competitor to return with its full description. As many competitors as fit the page budget are returned in full from there; further ones are listed by name where space allows. Defaults to 0. Pass the offset printed in brackets beside a name-only competitor to read that entry in full, or the nextCompetitorOffset value from a previous response to read the next page.'
+        },
+        competitorNames: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional. Names to check against the stored competitor list. The response answers stored/not-stored for each (with its offset when stored), regardless of whether that competitor appears in this page. ALWAYS use this before adding competitors to a large market strategy — it is the reliable way to avoid re-adding one that already exists. Up to 50 names per call.'
+        }
       },
       required: []
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.readMarketStrategy(context?.userId);
+    return await agentModeService.readMarketStrategy(context?.userId, {
+      competitorOffset: args?.competitorOffset,
+      competitorNames: args?.competitorNames,
+    });
   }
 });
 
@@ -7072,6 +7084,9 @@ const adminToolNames = [
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
   'get_registration_status',
+  'resolve_landing_page_by_url',
+  'share_landing_page_with_org',
+  'get_landing_page_effective_view',
 ];
 
 for (const toolName of bridgedToolNames) {

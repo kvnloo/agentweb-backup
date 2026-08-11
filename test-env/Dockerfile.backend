@@ -26,6 +26,7 @@ RUN npx -y playwright install chrome --with-deps && rm -rf /var/lib/apt/lists/*
 
 # Copy source and build
 COPY backend/tsconfig.json ./
+COPY backend/tsconfig.build.json ./
 COPY backend/src ./src
 COPY backend/docs ./docs
 RUN NODE_OPTIONS=--max-old-space-size=4096 npm run build

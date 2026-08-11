@@ -2889,6 +2889,97 @@ Use this to quickly diagnose a client's marketing funnel completeness.`,
   }
 });
 
+// ─── Admin landing-page discovery/reassociation (ENG-721, admin-only) ───────
+
+mcpToolRegistry.register({
+  name: 'resolve_landing_page_by_url',
+  definition: {
+    name: 'resolve_landing_page_by_url',
+    description: `Resolve a landing page by its live URL or domain across ALL accounts. Admin-only tool.
+
+Use this when a customer references a live page (e.g. "https://acme.agentwebforms.com/book-a-demo") and you need to find which account owns it — list_landing_pages only shows the calling user's own pages.
+
+Returns matches with the page record (id, status, lead list), the owner (userId, email, orgId), and the canonical live URL. Returns 404 when no page matches. If \`scannedAll\` is false the lookup hit its scan cap and a non-match is inconclusive.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        url: {
+          type: 'string',
+          description: 'The live page URL or bare hostname to resolve, e.g. "https://acme.agentwebforms.com/book-a-demo" or "acme.agentwebforms.com".'
+        }
+      },
+      required: ['url']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/admin/landing-pages/resolve?url=${encodeURIComponent(args.url)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'share_landing_page_with_org',
+  definition: {
+    name: 'share_landing_page_with_org',
+    description: `Enable org-level visibility for a landing page's owner organization and grant named org members edit access. Admin-only tool.
+
+Works entirely through share settings — no page duplication, no redeploy, no raw database access. The members must already belong to the page owner's organization. Returns the updated share state plus each member's effective access (canView/canEdit) so you can verify the grant took effect.
+
+Find the page id first with resolve_landing_page_by_url or list_landing_pages.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page id.' },
+        member_emails: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Org member emails (or userIds) to grant edit access.'
+        }
+      },
+      required: ['page_id', 'member_emails']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST',
+      path: `/api/admin/landing-pages/${encodeURIComponent(args.page_id)}/org-share`,
+      context: ctx(context),
+      body: { memberEmails: args.member_emails }
+    });
+    return jsonResult(data);
+  }
+});
+
+mcpToolRegistry.register({
+  name: 'get_landing_page_effective_view',
+  definition: {
+    name: 'get_landing_page_effective_view',
+    description: `Report what a specific user actually sees for a landing page: whether they can view it, whether they can edit it, the canonical live URL, deploy status, and the connected lead list. Admin-only tool.
+
+Use this after share_landing_page_with_org to verify the target member's effective access, or to diagnose "user can't see the page" reports.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        page_id: { type: 'string', description: 'The landing page id.' },
+        member: { type: 'string', description: 'The user to check — email or userId.' }
+      },
+      required: ['page_id', 'member']
+    }
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'GET',
+      path: `/api/admin/landing-pages/${encodeURIComponent(args.page_id)}/effective-view?member=${encodeURIComponent(args.member)}`,
+      context: ctx(context)
+    });
+    return jsonResult(data);
+  }
+});
+
 // ─── Lifecycle Drip segmentation (admin-only) ───────────────────────────────
 
 mcpToolRegistry.register({
