@@ -130,6 +130,14 @@ export interface User {
   supportNote?: string;
   roles?: ("partner" | "customer" | "free" | "contractor")[];
   displayName?: string;
+  /**
+   * ENG-1085 — customer portal Settings > Preferences. Account-level opt-in
+   * for non-task-specific notification email (distinct from the per-task
+   * `emailNotification` flag on TaskExecution params). Undefined/absent
+   * means enabled — this is an opt-out control, so a user who has never
+   * touched the setting keeps receiving mail rather than silently losing it.
+   */
+  emailNotificationsEnabled?: boolean;
   stripe_customer_id?: string;
   adAccount?: string; // Meta ad account ID
   emailDomain?: string; // Email sender domain
