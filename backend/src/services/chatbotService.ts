@@ -4073,7 +4073,11 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         const content = segment.structValue.fields.content.stringValue;
         results.push({
           id: `kb-public-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          content: content,
+          // ENG-1057: cap here, at the shared source, so every consumer of
+          // this function is protected uniformly instead of relying on each
+          // one to remember to truncate independently (which is exactly how
+          // one uncapped path crashed the backend with ERR_STRING_TOO_LONG).
+          content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
           metadata: {
             source: 'public-knowledge-base',
             ...(fileName && { fileName })
@@ -4120,7 +4124,8 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         const content = segment.structValue.fields.content.stringValue;
         results.push({
           id: `kb-private-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          content: content,
+          // ENG-1057: same cap as the public branch above.
+          content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
           metadata: {
             source: 'private-knowledge-base',
             taskId: taskId,
