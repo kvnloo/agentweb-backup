@@ -2324,4 +2324,102 @@ describe('CRM Database Service', () => {
       expect(params.ExpressionAttributeValues).not.toHaveProperty(':linkedin');
     });
   });
+
+  // ENG-1002 follow-up: `batchCreateLeads` is the single choke point every CRM
+  // write goes through — CSV import, bulk import, outreach save,
+  // import_leads_from_search AND add_leads_to_list. Filtering anonymized hits
+  // only in the import path left `add_leads_to_list` as an open bypass: an
+  // agent that pipes `linkedin_outreach search-people` results straight into it
+  // re-creates the exact nameless, un-dedupable rows ENG-1002 fixed.
+  //
+  // The rule here is deliberately NARROWER than isAnonymizedSearchLead: it
+  // rejects ONLY the explicit LinkedIn placeholder name. The search-boundary
+  // rule also drops rows with no name and no profile URL, which at this
+  // boundary would silently destroy legitimate email-only leads (newsletter
+  // signups, form fills, a CSV of bare addresses).
+  describe('anonymized LinkedIn placeholder guard (write choke point)', () => {
+    const listId = 'list_guard';
+
+    const primeMocks = () => {
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Items: [] }),
+      });
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+    };
+
+    beforeEach(primeMocks);
+
+    it('refuses the English placeholder, whatever the caller', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'LinkedIn', lastName: 'Member' },
+      ]);
+
+      expect(result.newCount).toBe(0);
+      expect(result.created).toHaveLength(0);
+      expect(result.anonymizedSkipped).toBe(1);
+    });
+
+    it('refuses the localized and variant spellings', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'LinkedIn', lastName: 'User' },
+        { firstName: 'Anonymous', lastName: 'LinkedIn Member' },
+        { firstName: 'Miembro de', lastName: 'LinkedIn' },
+        { firstName: '\u9886\u82f1\u4f1a\u5458' },
+      ]);
+
+      expect(result.newCount).toBe(0);
+      expect(result.anonymizedSkipped).toBe(4);
+    });
+
+    it('does NOT drop an email-only lead that has no name at all', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { email: 'nobody@example.com' },
+      ]);
+
+      expect(result.anonymizedSkipped).toBe(0);
+      expect(result.newCount).toBe(1);
+    });
+
+    it('does NOT drop a real person whose name carries a LinkedIn badge', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Jane', lastName: 'Doe | LinkedIn Top Voice', linkedin: 'https://www.linkedin.com/in/janedoe' },
+      ]);
+
+      expect(result.anonymizedSkipped).toBe(0);
+      expect(result.newCount).toBe(1);
+    });
+
+    it('keeps sourceIndex aligned to the ORIGINAL rows when it skips one', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'LinkedIn', lastName: 'Member' },
+        { firstName: 'Real', lastName: 'Person', linkedin: 'https://www.linkedin.com/in/realperson' },
+      ]);
+
+      expect(result.anonymizedSkipped).toBe(1);
+      expect(result.created).toHaveLength(1);
+      // Row 1 was skipped, so the surviving write must still report index 1 —
+      // re-indexing here would mis-attribute every downstream preview.
+      expect(result.created[0].sourceIndex).toBe(1);
+    });
+
+    it('imports a clean batch untouched', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves' },
+        { firstName: 'Omar', lastName: 'Haddad', email: 'omar@example.com' },
+      ]);
+
+      expect(result.anonymizedSkipped).toBe(0);
+      expect(result.newCount).toBe(2);
+      expect(result.created).toHaveLength(2);
+    });
+  });
+
 });
