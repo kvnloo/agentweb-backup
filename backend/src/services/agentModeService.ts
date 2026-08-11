@@ -28,6 +28,7 @@ import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type Judge
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { resolveOrgProfileField } from './orgProfileResolver';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
 // ENG-1002: the anonymized-hit rule lives in one place so the import tool and
@@ -8846,12 +8847,15 @@ export class AgentModeService {
         };
       }
 
-      // If user belongs to an org, read from org data instead
+      // If user belongs to an org, read from org data instead — falling back to
+      // the org owner's record when the org was created without copying the
+      // profile over, so Emma sees the same brand the settings page shows a
+      // member of an un-copied org (ENG-927).
       let brand = user.brandGuidelines;
       if (user.orgId) {
         const org = await orgDb.getOrgById(user.orgId);
-        if (org && org.brandGuidelines) {
-          brand = org.brandGuidelines;
+        if (org) {
+          brand = await resolveOrgProfileField(user, org, 'brandGuidelines');
         }
       }
       if (!brand) {
@@ -9002,12 +9006,13 @@ export class AgentModeService {
         };
       }
 
-      // If user belongs to an org, read from org data instead
+      // Same owner-record fallback as the brand read: an un-copied org must not
+      // hide the owner's strategy from a member (ENG-927).
       let marketStrategy = user.marketStrategy;
       if (user.orgId) {
         const org = await orgDb.getOrgById(user.orgId);
-        if (org && org.marketStrategy) {
-          marketStrategy = org.marketStrategy;
+        if (org) {
+          marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
         }
       }
       if (!marketStrategy) {
@@ -9137,7 +9142,9 @@ export class AgentModeService {
             error: 'Permission denied'
           };
         }
-        existingMarketStrategy = org?.marketStrategy;
+        // Same owner-record fallback as the brand path — merging onto an
+        // unpopulated org record would drop the owner's competitors/ICPs.
+        existingMarketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy', { forWrite: true });
       } else {
         existingMarketStrategy = user.marketStrategy;
       }
@@ -12900,7 +12907,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
             error: 'Permission denied'
           };
         }
-        existingBrand = org?.brandGuidelines;
+        // Fall back to the org owner's record when the org record was never
+        // populated, so a tweak merges onto the existing brand instead of
+        // building a fresh empty structure over it (ENG-927).
+        existingBrand = await resolveOrgProfileField(user, org, 'brandGuidelines', { forWrite: true });
       } else {
         existingBrand = user.brandGuidelines;
       }
@@ -13137,7 +13147,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     if (user?.orgId) {
       const { orgDb } = await import('./db');
       const org = await orgDb.getOrgById(user.orgId);
-      if (org && org.marketStrategy) return org.marketStrategy;
+      // Owner-record fallback for an org that was never populated (ENG-927), so
+      // the re-setup offer and the regenerate flow count what the user actually
+      // has rather than offering to build a strategy that already exists.
+      if (org) return resolveOrgProfileField(user, org, 'marketStrategy');
     }
     return user?.marketStrategy;
   }
