@@ -839,6 +839,76 @@ check 'ENG-878 dry run: skipped when the budget is nearly spent' 0 'probe dry ru
 check 'ENG-878 dry run: skipping still leaves the deploy successful' 0 'SUCCESS: environment'
 
 # ---------------------------------------------------------------------------
+# ENG-1125: an aborted rollout is recoverable, not terminal.
+#
+# 2026-08-11, PR #2313: an ASG replacement instance joined 31s before the deploy
+# landed, ran its self-startup pipeline concurrently with app-deploy, and both
+# staged into /var/app/staging/. One flipped it to /var/app/current/ and the
+# other's container_command then died on the missing directory. EB got 3-of-4,
+# aborted the rollout, and reverted the environment's version pointer.
+#
+# verify_deployment saw Ready-on-the-old-version and declared "this will never
+# converge" — which was false. Nothing was wrong with the bundle or the config;
+# the next deploy to land (PR #2352, 28 minutes later) applied cleanly and took
+# the environment Green. The cost of calling it terminal is a red PR and a
+# ~30 runner-minute re-run of a suite that had just passed.
+#
+# So: this exact signature re-applies within the existing budget. Every other
+# terminal condition is untouched, and a terminal pattern still wins outright.
+# ---------------------------------------------------------------------------
+
+ABORT_EVENTS='During an aborted deployment, some instances may have deployed the new application version.	Failed to deploy application.	Unsuccessful command execution on instance id(s) '"'"'i-05f5717b884b5ec85'"'"'. Aborting the operation.'
+
+# The rollout aborts once, the re-apply converges, and the job goes green.
+M=$(new_mock_dir)
+set_describe_states "$M" \
+  'Ready|Green|old-version' \
+  'Ready|Green|old-version' \
+  'Ready|Green|old-version' \
+  'Ready|Green|old-version' \
+  'Updating|Grey|old-version' \
+  'Ready|Green|backend-20260729-pr2216'
+printf '%s\n' "${ABORT_EVENTS}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1'
+check 'ENG-1125: an aborted rollout is re-applied instead of failing the job' 0 \
+  'SUCCESS: environment'
+check 'ENG-1125: the re-apply is announced, not silent' 0 \
+  'aborted the rollout on a subset of instances'
+
+# Bounded. An abort that keeps aborting still fails — but with the real reason,
+# not the false "will never converge" claim.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${ABORT_EVENTS}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1'
+check 'ENG-1125: a repeating abort still fails the job' 1 \
+  'EB_DEPLOY_FAILED'
+check 'ENG-1125: and the failure names the abort rather than claiming it never converges' 1 \
+  'aborted the rollout of version'
+
+# The re-apply is opt-outable, so a bad day can be pinned back to old behaviour
+# without a code change.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${ABORT_EVENTS}" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1' EB_ABORT_MAX_RETRIES='0'
+check 'ENG-1125: EB_ABORT_MAX_RETRIES=0 restores the immediate failure' 1 \
+  'EB_DEPLOY_FAILED'
+
+# Safety: a genuine terminal rejection must still fail immediately even when an
+# abort event is sitting next to it. Terminal wins; recoverable never masks it.
+M=$(new_mock_dir)
+set_describe_states "$M" 'Ready|Green|old-version'
+printf '%s\n' "${ABORT_EVENTS}	Configuration validation exception: Invalid option value" >"$M/events"
+run_deploy "$M" EB_TOTAL_TIMEOUT_SECONDS='60' EB_REJECTION_GRACE_SECONDS='1' \
+  EB_POLL_INTERVAL_SECONDS='1'
+check 'ENG-1125: a terminal pattern still wins over a co-occurring abort' 1 \
+  'Elastic Beanstalk REJECTED this update'
+
+# ---------------------------------------------------------------------------
 
 printf '\n%s checks run, %s failed\n' "${TESTS_RUN}" "${TESTS_FAILED}"
 [ "${TESTS_FAILED}" -eq 0 ] || exit 1
