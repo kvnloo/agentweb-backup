@@ -396,6 +396,15 @@ export interface User {
     }>;
     createdAt: string;
     updatedAt: string;
+    /**
+     * Opaque identity of the write that produced this value, stamped only by
+     * the asset-delete path's conditional writes. `updatedAt` is millisecond
+     * granular and every other brand writer mints its own, so two writes can
+     * share a stamp; pairing it with a revision lets a conditional write
+     * identify the exact value it read. Absent on anything written by another
+     * path, which those conditions match explicitly.
+     */
+    rev?: string;
   };
   marketStrategy?: {
     businessOverview: string;

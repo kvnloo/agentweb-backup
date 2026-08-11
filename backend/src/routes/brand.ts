@@ -562,6 +562,50 @@ router.post(
   }
 );
 
+/**
+ * Identity of one specific brand value, for the conditional writes below.
+ *
+ * `updatedAt` on its own cannot serve: it is millisecond granular and every
+ * other brand writer stamps its own (`POST /guidelines` above uses a plain
+ * `new Date().toISOString()`), so a save landing in the same millisecond as a
+ * delete's prune produces a byte-identical token. A guard comparing only the
+ * stamp would then pass against a value it never read — the rollback would
+ * restore its stale attachment list over the other writer's save, and a second
+ * delete would prune from a snapshot that no longer reflects the record.
+ * Pairing the stamp with an opaque per-write revision closes that: the pair
+ * identifies one write rather than one millisecond. Values written by any other
+ * path carry no revision at all, which the absence form matches exactly.
+ */
+const brandVersionGuard = (
+  version: { updatedAt?: string; rev?: string } | undefined,
+  names: { updatedAt: string; rev: string }
+): { expression: string; values: Record<string, any> } => {
+  const clauses: string[] = [];
+  const values: Record<string, any> = {};
+  if (version?.updatedAt) {
+    clauses.push(`brandGuidelines.updatedAt = ${names.updatedAt}`);
+    values[names.updatedAt] = version.updatedAt;
+  } else {
+    clauses.push("attribute_not_exists(brandGuidelines.updatedAt)");
+  }
+  if (version?.rev) {
+    clauses.push(`brandGuidelines.rev = ${names.rev}`);
+    values[names.rev] = version.rev;
+  } else {
+    clauses.push("attribute_not_exists(brandGuidelines.rev)");
+  }
+  return { expression: clauses.join(" AND "), values };
+};
+
+const EXPECTED_BRAND_NAMES = {
+  updatedAt: ":expectedBrandUpdatedAt",
+  rev: ":expectedBrandRev",
+};
+const JUST_WRITTEN_BRAND_NAMES = {
+  updatedAt: ":justWritten",
+  rev: ":justWrittenRev",
+};
+
 // Delete a brand asset
 router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
   try {
@@ -667,26 +711,23 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
     );
 
     // The value this prune is derived from, and a replacement token guaranteed
-    // to differ from it (see the owner branch: a same-millisecond write would
-    // otherwise leave the token unchanged and make the guards below decorative).
+    // to differ from it (a same-millisecond write would otherwise leave the
+    // stamp unchanged). The revision this request stamps alongside it is what
+    // actually makes the write identifiable — see `brandVersionGuard`.
     const sourceUpdatedAt = brandGuidelines?.updatedAt;
     const sourceNowMs = Date.now();
     const prunedUpdatedAt =
       new Date(sourceNowMs).toISOString() === sourceUpdatedAt
         ? new Date(sourceNowMs + 1).toISOString()
         : new Date(sourceNowMs).toISOString();
+    const prunedRev = uuidv4();
 
     // Only write if the brand still holds the value this prune was computed
     // from. Without it, two concurrent deletes each write a full snapshot and
     // the later one restores the attachment the earlier one removed — whose
     // object is already gone — and a brand save overlapping a delete is erased
-    // outright. Legacy records carry no updatedAt, so match on its absence.
-    const pruneCondition = sourceUpdatedAt
-      ? {
-          expression: "brandGuidelines.updatedAt = :expectedBrandUpdatedAt",
-          values: { ":expectedBrandUpdatedAt": sourceUpdatedAt },
-        }
-      : { expression: "attribute_not_exists(brandGuidelines.updatedAt)" };
+    // outright. Legacy records carry neither marker, matched by their absence.
+    const pruneCondition = brandVersionGuard(brandGuidelines, EXPECTED_BRAND_NAMES);
 
     const brandMovedResponse = () =>
       res.status(409).json({
@@ -698,6 +739,7 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       ...brandGuidelines,
       attachments: updatedAttachments,
       updatedAt: prunedUpdatedAt,
+      rev: prunedRev,
     };
 
     // Set by whichever branch below actually writes, so a failed S3 delete can
@@ -753,11 +795,10 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       // owner editing their brand concurrently loses nothing: the condition
       // fails, we abort before touching S3, and the retry sees fresh data.
       const expectedBrandUpdatedAt = ownerRecord?.brandGuidelines?.updatedAt;
-      // The token has to actually move, or the guard is decorative. updatedAt is
-      // millisecond-granular, so a write landing in the same millisecond as the
-      // value it read would leave it unchanged — and a second concurrent delete
-      // would then pass its condition against a stale attachment list and
-      // restore a reference whose object is already gone. Step past a collision.
+      // The stamp has to actually move, or it carries no information at all:
+      // updatedAt is millisecond granular, so a write landing in the same
+      // millisecond as the value it read would leave it unchanged. The revision
+      // stamped beside it is what makes this write identifiable to the rollback.
       const nowMs = Date.now();
       const nextUpdatedAt =
         new Date(nowMs).toISOString() === expectedBrandUpdatedAt
@@ -771,15 +812,14 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
               ...ownerRecord.brandGuidelines,
               attachments: prunedOwnerAttachments,
               updatedAt: nextUpdatedAt,
+              rev: prunedRev,
             },
           } as any,
           {
-            condition: expectedBrandUpdatedAt
-              ? {
-                  expression: "brandGuidelines.updatedAt = :expectedBrandUpdatedAt",
-                  values: { ":expectedBrandUpdatedAt": expectedBrandUpdatedAt },
-                }
-              : { expression: "attribute_not_exists(brandGuidelines.updatedAt)" },
+            condition: brandVersionGuard(
+              ownerRecord.brandGuidelines,
+              EXPECTED_BRAND_NAMES
+            ),
           }
         );
       } catch (casError: any) {
@@ -792,8 +832,9 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       }
       console.log(`[BRAND DEBUG] Successfully pruned owner source attachments after asset deletion`);
       // Undo of exactly this write, used only if the S3 delete below fails.
-      // Conditioned on the token we just wrote so a concurrent edit landing in
-      // between is never clobbered by the compensation.
+      // Conditioned on the stamp AND revision we just wrote, so a concurrent
+      // edit landing in between is never clobbered by the compensation — not
+      // even one that happens to share the millisecond.
       rollbackPrune = async () => {
         await userDb.updateUser(
           fallbackOwnerUserId!,
@@ -807,10 +848,10 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
             },
           } as any,
           {
-            condition: {
-              expression: "brandGuidelines.updatedAt = :justWritten",
-              values: { ":justWritten": nextUpdatedAt },
-            },
+            condition: brandVersionGuard(
+              { updatedAt: nextUpdatedAt, rev: prunedRev },
+              JUST_WRITTEN_BRAND_NAMES
+            ),
           }
         );
       };
@@ -836,12 +877,7 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
         await orgDb.updateOrg(
           user.orgId!,
           { brandGuidelines },
-          {
-            condition: {
-              expression: "brandGuidelines.updatedAt = :justWritten",
-              values: { ":justWritten": updatedBrandGuidelines.updatedAt },
-            },
-          }
+          { condition: brandVersionGuard(updatedBrandGuidelines, JUST_WRITTEN_BRAND_NAMES) }
         );
       };
     } else {
@@ -868,17 +904,21 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       rollbackPrune = async () => {
         // Same guard as the org and owner branches — restore only if this
         // request's write is still the current value.
+        const rollbackCondition = brandVersionGuard(
+          updatedBrandGuidelines,
+          JUST_WRITTEN_BRAND_NAMES
+        );
         await dynamodb
           .update({
             TableName: `${TABLE_PREFIX}AW-Users`,
             Key: { email: user.email },
             UpdateExpression:
               "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
-            ConditionExpression: "brandGuidelines.updatedAt = :justWritten",
+            ConditionExpression: rollbackCondition.expression,
             ExpressionAttributeValues: {
               ":brandGuidelines": brandGuidelines,
               ":updatedAt": new Date().toISOString(),
-              ":justWritten": updatedBrandGuidelines.updatedAt,
+              ...rollbackCondition.values,
             },
           })
           .promise();
