@@ -212,8 +212,12 @@ jobs:
       # ts-jest is transpile-only and reports no type errors at all. This step
       # is therefore the ONLY thing type-checking the backend on a PR; deleting
       # it (rather than narrowing it) would have silently removed that gate.
-      # `npm run typecheck` is `tsc --noEmit` over the same tsconfig.json as
-      # `npm run build`, so the diagnostics are identical — only the emit goes.
+      # `npm run typecheck` is `tsc --noEmit` over `tsconfig.json`, which spans
+      # the whole `src/` tree including `__tests__`. ENG-1059 pointed the deploy
+      # build at `tsconfig.build.json` (same options, tests excluded) so compiled
+      # tests stop shipping to Elastic Beanstalk — which makes this step a strict
+      # SUPERSET of `npm run build`'s diagnostics, never a subset. The test files
+      # are type-checked here and nowhere else, so this stays over tsconfig.json.
       - name: Type-check
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run typecheck --if-present
