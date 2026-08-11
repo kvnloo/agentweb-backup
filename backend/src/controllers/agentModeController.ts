@@ -56,7 +56,11 @@ import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
 import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { normalizeEmailList } from '../utils/validation';
-import { getAllowedSkills } from '../services/subscriptionService';
+import {
+  getAllowedSkills,
+  isSubscriptionFeatureEnabled,
+  type SubscriptionFeatureId,
+} from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
@@ -65,6 +69,22 @@ import { DynamoDB } from 'aws-sdk';
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
 const ZERO_ASSISTANT_MAX_REQUEUES = 3;
+const SCHEDULED_CHATS_FEATURE: SubscriptionFeatureId = 'scheduled_chats';
+const SCHEDULED_CHATS_NOT_INCLUDED_ERROR = {
+  error: 'Scheduled chats are not included in your current plan.',
+  code: 'subscription_feature_not_included',
+  feature: SCHEDULED_CHATS_FEATURE,
+};
+
+async function userCanUseScheduledChats(userId: string): Promise<boolean> {
+  return isSubscriptionFeatureEnabled(userId, SCHEDULED_CHATS_FEATURE);
+}
+
+async function rejectWhenScheduledChatsDisabled(userId: string, res: Response): Promise<boolean> {
+  if (await userCanUseScheduledChats(userId)) return false;
+  res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
+  return true;
+}
 
 // ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
 // only saves a run that finishes within DRAIN_CEILING_MS (10 min) of SIGTERM; a
@@ -2851,6 +2871,35 @@ export async function runScheduledChat(
       }
 
       return orphanedUserResult;
+    }
+
+    // Central guard covers cron/manual/public execution and old schedules that
+    // remain stored after an admin removes this entitlement.
+    if (!(await userCanUseScheduledChats(userId))) {
+      await scheduleDb.updateSchedule(schedule.scheduleId, {
+        status: 'paused',
+        updatedAt: new Date().toISOString(),
+      }).catch((error) => console.error(`Failed to auto-pause schedule ${schedule.scheduleId}:`, error));
+
+      const entitlementResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: SCHEDULED_CHATS_NOT_INCLUDED_ERROR.error,
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      await scheduleDb.addRunResult(schedule.scheduleId, entitlementResult)
+        .catch((error) => console.error('Error saving scheduled-chat entitlement result:', error));
+      return entitlementResult;
     }
 
     const scheduleVariables: ScheduledChatVariable[] = Array.isArray(schedule.variables) ? schedule.variables : [];
@@ -7383,6 +7432,7 @@ export const agentModeController = {
   async createScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const {
         sessionId,
         scheduleName,
@@ -7595,6 +7645,7 @@ export const agentModeController = {
   async updateScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
       const {
         scheduleName,
@@ -7805,6 +7856,7 @@ export const agentModeController = {
   async submitScheduledChatVariables(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
       const { variableValues, triggerRun } = req.body as { variableValues?: Record<string, string>; triggerRun?: boolean };
 
@@ -7968,6 +8020,9 @@ export const agentModeController = {
       if (!schedule) {
         return res.status(404).json({ error: 'Invalid or expired variable request link' });
       }
+      if (!(await userCanUseScheduledChats(schedule.userId))) {
+        return res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
+      }
 
       const nowIso = new Date().toISOString();
       const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
@@ -8090,6 +8145,9 @@ export const agentModeController = {
       if (!schedule) {
         return res.status(404).json({ error: 'Invalid or expired variable request link' });
       }
+      if (!(await userCanUseScheduledChats(schedule.userId))) {
+        return res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
+      }
 
       const expiresAtMs = schedule.variableRequestAccessTokenExpiresAt
         ? new Date(schedule.variableRequestAccessTokenExpiresAt).getTime()
@@ -8133,6 +8191,7 @@ export const agentModeController = {
   async testScheduledChat(req: Request, res: Response) {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { scheduleId } = req.params;
 
       // Verify schedule exists and belongs to user
@@ -8216,6 +8275,7 @@ export const agentModeController = {
       if (!status || !['active', 'paused'].includes(status)) {
         return res.status(400).json({ error: 'Invalid status. Must be "active" or "paused"' });
       }
+      if (status === 'active' && await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
 
       // Verify schedule exists and belongs to user
       const schedule = await scheduleDb.getScheduleById(scheduleId);
@@ -9995,6 +10055,7 @@ export const agentModeController = {
   createScheduleFromTemplate: async (req: AuthenticatedRequest, res: Response) => {
     try {
       const user = req.user as User;
+      if (await rejectWhenScheduledChatsDisabled(user.userId, res)) return;
       const { templateId } = req.params;
       const {
         scheduleName, nextRunTime, scheduleFrequency,

@@ -11,6 +11,7 @@ jest.mock('../services/subscriptionService', () => ({
     'set_work_plan_status',
   ]),
   getAllowedSkills: jest.fn(async () => ['*']),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({
@@ -138,13 +139,14 @@ import { agentModeService } from '../services/agentModeService';
 import { scheduleDb, taskDb, userDb } from '../services/db';
 import { emailService } from '../services/emailService';
 import { generateMarketingResponseWorkerService } from '../services/generateMarketingResponseWorkerService';
-import { getAllowedFunctionCalls, getAllowedSkills } from '../services/subscriptionService';
+import { getAllowedFunctionCalls, getAllowedSkills, isSubscriptionFeatureEnabled } from '../services/subscriptionService';
 import { skillService } from '../services/skillService';
 import { checkTokenUsage } from '../services/tokenUsageService';
 import { agentModeController, runScheduledChat } from '../controllers/agentModeController';
 
 const mockedGetAllowedFunctionCalls = getAllowedFunctionCalls as jest.MockedFunction<typeof getAllowedFunctionCalls>;
 const mockedGetAllowedSkills = getAllowedSkills as jest.MockedFunction<typeof getAllowedSkills>;
+const mockedIsSubscriptionFeatureEnabled = isSubscriptionFeatureEnabled as jest.MockedFunction<typeof isSubscriptionFeatureEnabled>;
 const mockedSkillService = skillService as jest.Mocked<typeof skillService>;
 const mockedCheckTokenUsage = checkTokenUsage as jest.MockedFunction<typeof checkTokenUsage>;
 
@@ -192,6 +194,7 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    mockedIsSubscriptionFeatureEnabled.mockResolvedValue(true);
     mockAgentModeService.getDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
     mockAgentModeService.getScheduledChatsDefaultModel.mockResolvedValue(mockAgentModeService.default_model);
 
@@ -223,6 +226,46 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     // Clean up to prevent memory leaks
     jest.clearAllTimers();
     jest.useRealTimers();
+  });
+
+  describe('admin-configured scheduled chat entitlement', () => {
+    const response = () => ({ json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response);
+
+    it('rejects creation before writing a schedule', async () => {
+      mockedIsSubscriptionFeatureEnabled.mockResolvedValue(false);
+      const res = response();
+      await agentModeController.createScheduledChat({
+        user: { userId: mockUserId }, body: {},
+      } as unknown as Request, res);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ feature: 'scheduled_chats' }));
+      expect(mockScheduleDb.createSchedule).not.toHaveBeenCalled();
+    });
+
+    it('pauses an existing schedule before model work', async () => {
+      mockedIsSubscriptionFeatureEnabled.mockResolvedValue(false);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(mockScheduleId, expect.objectContaining({ status: 'paused' }));
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+      expect(result.actualResponse).toBe('Scheduled chats are not included in your current plan.');
+    });
+
+    it('blocks resume while still allowing a user to pause', async () => {
+      mockedIsSubscriptionFeatureEnabled.mockResolvedValue(false);
+      const resumeRes = response();
+      await agentModeController.toggleScheduledChatStatus({
+        user: { userId: mockUserId }, params: { scheduleId: mockScheduleId }, body: { status: 'active' },
+      } as unknown as Request, resumeRes);
+      expect(resumeRes.status).toHaveBeenCalledWith(403);
+
+      const pauseRes = response();
+      await agentModeController.toggleScheduledChatStatus({
+        user: { userId: mockUserId }, params: { scheduleId: mockScheduleId }, body: { status: 'paused' },
+      } as unknown as Request, pauseRes);
+      expect(mockScheduleDb.updateSchedule).toHaveBeenCalledWith(mockScheduleId, expect.objectContaining({ status: 'paused' }));
+    });
   });
 
   describe('runScheduledChat function', () => {

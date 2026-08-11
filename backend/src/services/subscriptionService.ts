@@ -10,6 +10,7 @@ export interface SubscriptionType {
   hiddenPages?: string[]; // Array of page paths to hide entirely (not shown as locked); subset of pages not in allowedPages
   allowedSkills: string[]; // Array of skill IDs (e.g., ["skill-uuid-1", "skill-uuid-2"]) or ["*"] for all
   allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
+  allowedFeatures?: string[]; // Stable product feature IDs or ["*"]; undefined = legacy row (all current features)
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
   monthlyTokenAllowance?: number | null; // Monthly token limit; null/undefined = unlimited
   monthlyCostAllowance?: number | null; // Monthly LLM spend limit in USD (cost-based cap; guards higher-cost models); null/undefined = unlimited
@@ -36,6 +37,26 @@ const FREE_TIER_FALLBACK: SubscriptionType = {
   allowedPages: [...DEFAULT_PAGES],
   allowedSkills: [], // No premium skills on Free tier
 };
+
+export const SUBSCRIPTION_FEATURES = {
+  SCHEDULED_CHATS: "scheduled_chats",
+} as const;
+
+export type SubscriptionFeatureId = typeof SUBSCRIPTION_FEATURES[keyof typeof SUBSCRIPTION_FEATURES];
+
+const AVAILABLE_SUBSCRIPTION_FEATURES: ReadonlyArray<{
+  id: SubscriptionFeatureId;
+  label: string;
+  description: string;
+}> = [{
+  id: SUBSCRIPTION_FEATURES.SCHEDULED_CHATS,
+  label: "Scheduled chats",
+  description: "Create, edit, test, resume, and execute recurring Agent Mode chats.",
+}];
+
+export function getAllAvailableSubscriptionFeatures() {
+  return AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => ({ ...feature }));
+}
 
 /**
  * Get tier configuration by name — reads from DynamoDB first, falls back
@@ -115,6 +136,29 @@ export async function getUserSubscriptionType(userId: string): Promise<string> {
     console.error("Error getting user subscription type:", error);
     return "Free";
   }
+}
+
+/** Return product features for the user's effective, org-aware subscription. */
+export async function getAllowedFeatures(userId: string): Promise<string[]> {
+  const subscriptionTypeName = await getUserSubscriptionType(userId);
+  const config = await getTierConfig(subscriptionTypeName);
+  if (!config) return [];
+
+  // Existing subscription rows predate feature entitlements. Preserve their
+  // behavior until an admin explicitly saves this field.
+  if (!Array.isArray(config.allowedFeatures) || config.allowedFeatures.includes("*")) {
+    return AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => feature.id);
+  }
+
+  const knownFeatures = new Set(AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => feature.id));
+  return config.allowedFeatures.filter((feature) => knownFeatures.has(feature as SubscriptionFeatureId));
+}
+
+export async function isSubscriptionFeatureEnabled(
+  userId: string,
+  feature: SubscriptionFeatureId
+): Promise<boolean> {
+  return (await getAllowedFeatures(userId)).includes(feature);
 }
 
 /**

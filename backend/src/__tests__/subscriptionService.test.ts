@@ -16,6 +16,7 @@ import {
   getPublicAllowedSkills,
   resolveSkillsToToolNames,
   findTiersAllowingSkill,
+  getAllowedFeatures,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -90,6 +91,37 @@ describe('subscriptionService', () => {
     mockedUserDb.getUserById.mockResolvedValueOnce({ userId: 'u2' } as any);
     const t2 = await getUserSubscriptionType('u2');
     expect(t2).toBe('Free');
+  });
+
+  it('uses an explicit feature entitlement without relying on the tier name', async () => {
+    mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Community' } as any);
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingValue: JSON.stringify([{
+        name: 'Community', allowedPages: ['/'], allowedSkills: [], allowedFeatures: ['scheduled_chats'],
+      }]),
+    } as any);
+
+    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats']);
+  });
+
+  it('denies a feature when an admin explicitly omits it', async () => {
+    mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Community' } as any);
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingValue: JSON.stringify([{
+        name: 'Community', allowedPages: ['/'], allowedSkills: [], allowedFeatures: [],
+      }]),
+    } as any);
+
+    expect(await getAllowedFeatures('u1')).toEqual([]);
+  });
+
+  it('keeps legacy subscription rows permissive until an admin saves feature settings', async () => {
+    mockedUserDb.getUserById.mockResolvedValue({ userId: 'u1', subscriptionType: 'Legacy' } as any);
+    mockedSettingsService.getSetting.mockResolvedValue({
+      settingValue: JSON.stringify([{ name: 'Legacy', allowedPages: ['/'], allowedSkills: [] }]),
+    } as any);
+
+    expect(await getAllowedFeatures('u1')).toEqual(['scheduled_chats']);
   });
 
   it('getUserSubscriptionType resolves an org member to the owner tier dynamically (ENG-288)', async () => {
