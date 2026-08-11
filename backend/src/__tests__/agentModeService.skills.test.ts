@@ -1170,6 +1170,12 @@ describe('AgentModeService - Skills', () => {
   });
 
   describe('getSkillsForDisplay', () => {
+    it('returns a full authorized Skill snapshot without widening the display projection', async () => {
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([{ skillId: 'skill-1', name: 'Web Search', description: 'Search tools', toolNames: [], isPublished: true, welcomeMessage: 'Start here.' }]);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+      await expect(agentModeService.getAuthorizedSkill('skill-1', 'user-1')).resolves.toEqual(expect.objectContaining({ welcomeMessage: 'Start here.' }));
+    });
     it('fails closed when an upstream catalog returns another user\'s pending-review skill', async () => {
       (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([{ skillId: 'pending', name: 'Pending', description: 'd', toolNames: [], ownerId: 'owner-1', visibility: 'pending_review', isPublished: true }]);
       const { getAllowedSkills } = require('../services/subscriptionService');
@@ -1217,7 +1223,7 @@ describe('AgentModeService - Skills', () => {
     });
     it('should return published skills with installed status and toolNames', async () => {
       const publishedSkills = [
-        { skillId: 'skill-1', name: 'Web Search', description: 'Search tools', toolNames: ['search_web'], isPublished: true },
+        { skillId: 'skill-1', name: 'Web Search', description: 'Search tools', toolNames: ['search_web'], isPublished: true, welcomeMessage: 'Do not expose.' },
         { skillId: 'skill-2', name: 'Image Gen', description: 'Image tools', toolNames: ['generate_image'], isPublished: true },
       ];
       (skillService.getPublishedSkills as jest.Mock).mockResolvedValue(publishedSkills);
@@ -1230,6 +1236,7 @@ describe('AgentModeService - Skills', () => {
         expect.objectContaining({ skillId: 'skill-1', name: 'Web Search', installed: true, toolNames: ['search_web'] }),
         expect.objectContaining({ skillId: 'skill-2', name: 'Image Gen', installed: false, toolNames: ['generate_image'] }),
       ]));
+      expect(result.find(skill => skill.skillId === 'skill-1')).not.toHaveProperty('welcomeMessage');
     });
 
     it('should filter skills by subscription when not wildcard', async () => {

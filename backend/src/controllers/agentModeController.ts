@@ -4559,7 +4559,6 @@ export const agentModeController = {
     // ~30 create-session calls on 6/27). Hoisted so the catch block can
     // release a held claim after an error unwinds.
     let createIdemKeyHeld: string | undefined;
-    let partialSkillSessionId: string | undefined;
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
@@ -4568,8 +4567,7 @@ export const agentModeController = {
       const portalType = skillId ? 'agent' : requestedPortalType;
       let skill;
       if (skillId) {
-        const available = await agentModeService.getSkillsForDisplay([], user.userId);
-        skill = available.find(candidate => candidate.skillId === skillId);
+        skill = await agentModeService.getAuthorizedSkill(skillId, user.userId);
         if (!skill) {
           return res.status(404).json({ error: 'Skill not found' });
         }
@@ -4612,6 +4610,21 @@ export const agentModeController = {
       // Pass delegate info if this is a delegated access session
       const delegateInfo = authReq.delegateInfo;
 
+      // Resolve all initial state before the one session Put, so a Skill
+      // session is either fully initialized or absent.
+      let modelToUse: string;
+      if (finalSessionType === 'report_generation') {
+        modelToUse = await agentModeService.getReportsModel();
+      } else if (portalType === 'emma-sidebar') {
+        modelToUse = await agentModeService.getCustomerSupportDefaultModel();
+      } else {
+        modelToUse = await agentModeService.getDefaultModel();
+      }
+      const welcomeMessage = skill?.welcomeMessage?.trim();
+      const initialSkillState = skillId ? {
+        llmModel: modelToUse, associatedSkills: [skillId],
+        messages: welcomeMessage ? [{ role: 'assistant' as const, content: welcomeMessage, metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' } }] : [],
+      } : undefined;
       const session = await chatbotDb.createChatSession(
         user.userId,
         undefined, // pageContent
@@ -4622,32 +4635,10 @@ export const agentModeController = {
         undefined, // executionId
         undefined, // emailCampaignTaskId
         finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation",
-        delegateInfo // Pass delegate info for admin delegation tracking
+        delegateInfo, // Pass delegate info for admin delegation tracking
+        initialSkillState
       );
-      if (skillId) partialSkillSessionId = session.sessionId;
-
-      // Set default model for new sessions
-      // Use reports model for report_generation sessions, customer support model for emma-sidebar, otherwise use default model
-      let modelToUse: string;
-      if (finalSessionType === 'report_generation') {
-        modelToUse = await agentModeService.getReportsModel();
-      } else if (portalType === 'emma-sidebar') {
-        modelToUse = await agentModeService.getCustomerSupportDefaultModel();
-      } else {
-        modelToUse = await agentModeService.getDefaultModel();
-      }
-      const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
-
-      if (skillId && skill) {
-        await chatbotDb.addAssociatedSkills(session.sessionId, [skillId]);
-        const welcomeMessage = skill.welcomeMessage?.trim();
-        if (welcomeMessage) {
-          await chatbotDb.addMessageToSession(session.sessionId, {
-            role: 'assistant', content: welcomeMessage,
-            metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' },
-          });
-        }
-      }
+      const sessionWithModel = skillId ? session : await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
 
       // Stamp the winner's sessionId on the idem claim so duplicate losers
       // attach to THIS session instead of getting 409 (best-effort by design —
@@ -4662,11 +4653,7 @@ export const agentModeController = {
       } : sessionWithModel);
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
-      let cleanupSucceeded = true;
-      if (partialSkillSessionId) try { await chatbotDb.deleteSession(partialSkillSessionId); }
-      catch (cleanupError) { cleanupSucceeded = false; console.error('AgentMode: Partial Skill session cleanup failed:', cleanupError); }
-      // Retry only after cleanup; a retained claim prevents duplicates until TTL.
-      if (createIdemKeyHeld && cleanupSucceeded) {
+      if (createIdemKeyHeld) {
         await releaseIdempotency(createIdemKeyHeld);
       }
       res.status(500).json({ error: 'Failed to create session' });

@@ -52,7 +52,7 @@ import path from 'path';
 import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
-import { skillService } from './skillService';
+import { skillService, Skill } from './skillService';
 import { resolveUserSkillAccess } from './userSkillAccessService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
@@ -5423,18 +5423,28 @@ export class AgentModeService {
   /**
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
-  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
+  private async loadAuthorizedSkillCatalog(userId?: string): Promise<{ skills: Skill[]; allowedIds: string[] }> {
     const userOrgId = userId ? (await resolveUserSkillAccess(userId)).sharedOrgId : undefined;
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSet = new Set(userAllowedSkillIds);
+    return { skills: publishedSkills.filter(s => (s.visibility !== 'pending_review' || s.ownerId === userId) && (isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId))), allowedIds: userAllowedSkillIds };
+  }
+
+  public async getAuthorizedSkill(skillId: string, userId: string): Promise<Skill | undefined> {
+    return (await this.loadAuthorizedSkillCatalog(userId)).skills.find(skill => skill.skillId === skillId);
+  }
+
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
+    const { skills: publishedSkills, allowedIds: userAllowedSkillIds } = await this.loadAuthorizedSkillCatalog(userId);
     const installedIds = new Set(associatedSkillIds);
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
 
     const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = publishedSkills
-      .filter(s => (s.visibility !== 'pending_review' || s.ownerId === userId) && (isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId)))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
