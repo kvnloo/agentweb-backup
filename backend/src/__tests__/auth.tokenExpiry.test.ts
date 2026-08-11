@@ -9,6 +9,22 @@ jest.mock('../services/waitlistDb');
 jest.mock('bcryptjs');
 jest.mock('jsonwebtoken');
 
+// ENG-1112: this suite is about JWT expiry, but `register()` fires
+// `emailService.sendTeamIntroductionEmail(...)` un-awaited (controllers/auth.ts:239).
+// With email un-mocked that reached `resendService` → the Resend SDK → a live POST to
+// api.resend.com addressed to the fixture's `freeuser@example.com`. Because the send is
+// fire-and-forget and swallowed, the suite stayed green while sending, and the request
+// landed whenever the rate-limited queue got to it — often during a *later* suite in the
+// same worker, which is how the leak got attributed to the wrong file.
+// `__mocks__/resend.ts` is the floor that makes this unreachable everywhere; mocking the
+// service here removes the stray send from the suite that actually causes it.
+jest.mock('../services/emailService', () => ({
+  emailService: {
+    sendEmail: jest.fn().mockResolvedValue(undefined),
+    sendTeamIntroductionEmail: jest.fn().mockResolvedValue(undefined),
+  },
+}));
+
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockWaitlistDb = waitlistDb as jest.Mocked<typeof waitlistDb>;
 const mockBcryptHash = bcrypt.hash as jest.MockedFunction<typeof bcrypt.hash>;
