@@ -1,6 +1,7 @@
 import express, { Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { crmDb, taskDb, subscriberDb, userDb, orgDb } from '../services/db';
+import { resolveOrgProfileField } from '../services/orgProfileResolver';
 import {
   canAccessCrmList,
   canDestructiveCrmList,
@@ -2238,7 +2239,9 @@ router.get('/icp/filters', async (req: Request, res: Response) => {
       let marketStrategy: any = user?.marketStrategy;
       if (user?.orgId) {
         const org: any = await orgDb.getOrgById(user.orgId);
-        if (org) marketStrategy = org.marketStrategy;
+        if (org) {
+          marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
+        }
       }
       const marketIcp = Array.isArray(marketStrategy?.icp) ? marketStrategy.icp : [];
       if (marketIcp.length > 0) {
