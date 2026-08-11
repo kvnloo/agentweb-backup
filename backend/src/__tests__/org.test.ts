@@ -1,5 +1,6 @@
 import request from 'supertest';
 import express from 'express';
+import orgRoutes from '../routes/org';
 
 // Mock user state
 let mockUser: any = {
@@ -107,7 +108,6 @@ jest.mock('../services/emailService', () => ({
 }));
 
 import { emailService } from '../services/emailService';
-import orgRoutes from '../routes/org';
 
 const mockSendEmail = emailService.sendEmail as jest.Mock;
 
