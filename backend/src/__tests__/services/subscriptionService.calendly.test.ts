@@ -14,6 +14,9 @@
  * and reverted to unchecked on refresh in production is exactly this bug.
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+
 // ---------------------------------------------------------------------------
 // Mock heavy dependencies before any module imports so that the service's
 // top-level imports resolve to lightweight stubs and don't blow up on missing
@@ -62,6 +65,34 @@ jest.mock('../../utils/secretsManager', () => ({}));
 import { getAllAvailableConnectedAccounts } from '../../services/subscriptionService';
 
 // ---------------------------------------------------------------------------
+// Reads partner-portal's actual AVAILABLE_CONNECTED_ACCOUNTS ids straight out
+// of its source file — not a hand-copied literal — so the parity test below
+// validates against the real, current frontend list on every run instead of
+// a second hardcoded copy that could itself silently drift (Greptile finding
+// on this PR: the original version of this test compared against a manually
+// duplicated array, which defeats the point of a drift-detection test).
+// ---------------------------------------------------------------------------
+function readFrontendAvailableConnectedAccountIds(): string[] {
+  const frontendPath = path.join(
+    __dirname,
+    '../../../../partner-portal/src/components/admin/SubscriptionTypesTab.tsx',
+  );
+  const source = fs.readFileSync(frontendPath, 'utf8');
+  const blockMatch = source.match(/const AVAILABLE_CONNECTED_ACCOUNTS = \[([\s\S]*?)\n\];/);
+  if (!blockMatch) {
+    throw new Error(
+      `Could not locate the AVAILABLE_CONNECTED_ACCOUNTS array in ${frontendPath} — its declaration shape ` +
+      `changed and this test needs updating alongside it, rather than silently comparing against nothing.`,
+    );
+  }
+  const ids = [...blockMatch[1].matchAll(/id:\s*'([a-z_]+)'/g)].map((m) => m[1]);
+  if (ids.length === 0) {
+    throw new Error(`Matched the AVAILABLE_CONNECTED_ACCOUNTS block but extracted zero ids from ${frontendPath}.`);
+  }
+  return ids;
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -99,28 +130,46 @@ describe('getAllAvailableConnectedAccounts', () => {
     expect(result).toHaveLength(14);
   });
 
-  it('matches partner-portal\'s AVAILABLE_CONNECTED_ACCOUNTS ids exactly, so the "select all -> save" path never silently drops a platform', () => {
-    // Mirrors SubscriptionTypesTab.tsx's AVAILABLE_CONNECTED_ACCOUNTS ids. If either
-    // list changes, keep them in sync — the frontend collapses a full selection to
-    // '*' before saving, and the backend expands '*' via THIS list, so any drift
-    // here silently strips whatever platform is missing on save.
-    const frontendIds = [
-      'linkedin',
-      'unipile',
-      'meta',
-      'instagram',
-      'twitter',
-      'gmail',
-      'outlook',
-      'calendly',
-      'youtube',
-      'fathom',
-      'hubspot',
-      'attio',
-      'google_ads',
-      'google_drive',
-    ];
+  it('matches partner-portal\'s actual AVAILABLE_CONNECTED_ACCOUNTS ids, read live from its source file, so the "select all -> save" path can never silently drop a platform again', () => {
+    // The frontend collapses a full selection to '*' before saving
+    // (SubscriptionTypesTab.tsx's handleSave), and the backend expands '*'
+    // via getAllAvailableConnectedAccounts() — so this comparison has to be
+    // against the REAL frontend list, not a copy of it, or a future drift
+    // between the two would go undetected by this exact test again.
+    const frontendIds = readFrontendAvailableConnectedAccountIds();
     const result = getAllAvailableConnectedAccounts();
     expect(new Set(result)).toEqual(new Set(frontendIds));
+  });
+
+  // ── Boundary / invalid-data-shape coverage ──────────────────────────────
+  // getAllAvailableConnectedAccounts() takes no arguments and has no I/O, so
+  // there's no "invalid input" or "error path" in the usual sense — but the
+  // shape of what it returns still has real invariants worth locking down,
+  // since this exact list is round-tripped through '*' expansion on every
+  // subscription-type save and silently determines what a customer can see.
+
+  it('contains no duplicate platform ids', () => {
+    const result = getAllAvailableConnectedAccounts();
+    expect(new Set(result).size).toBe(result.length);
+  });
+
+  it('contains no empty, whitespace-only, or non-string entries', () => {
+    const result = getAllAvailableConnectedAccounts();
+    for (const platform of result) {
+      expect(typeof platform).toBe('string');
+      expect(platform.trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  it('returns a fresh array on every call, not a shared mutable reference', () => {
+    // If this were ever refactored to `return SOME_CONST_ARRAY` instead of a
+    // fresh literal, a caller mutating its result (e.g. `.push()`) would
+    // corrupt every subsequent call's return value — a real bug class for a
+    // list this many call sites treat as read-only.
+    const first = getAllAvailableConnectedAccounts();
+    first.push('mutated-should-not-leak');
+    const second = getAllAvailableConnectedAccounts();
+    expect(second).not.toContain('mutated-should-not-leak');
+    expect(second).toHaveLength(14);
   });
 });
