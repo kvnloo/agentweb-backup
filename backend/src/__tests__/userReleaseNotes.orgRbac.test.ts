@@ -37,6 +37,17 @@ describe('user release notes — org access control (ENG-954)', () => {
     expect(text).toMatch(/last owner|at least one owner/i);
   });
 
+  // Greptile P1 on #2350: the first draft said owners "manage billing", which is
+  // false — billing hangs off the singular billing root (`org.ownerUserId`) whose
+  // personal Stripe customer holds the subscription (routes/org.ts
+  // `billingRootMayDepart`). A non-billing-root owner hitting the billing routes
+  // mutates their own subscription and leaves the org's plan unchanged.
+  it('does not claim that every owner can manage the organization’s billing', () => {
+    const text = textFor('2026-08-09');
+    expect(text).not.toMatch(/owners can do everything[^\n]*manage billing/i);
+    expect(text).toMatch(/only that person can change the plan/i);
+  });
+
   it('leaves the 2026-05-12 historical entry untouched', () => {
     const may = textFor('2026-05-12');
     expect(may).toMatch(/co-owner roles do not exist/i);
