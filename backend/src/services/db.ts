@@ -2958,6 +2958,13 @@ export const waitlistDb = {
   },
 };
 
+// Legacy recurring task schedules predate the `type: scheduled_chat` discriminator.
+// Direct polling for those rows was removed from agent-engine in fb83fc151, but old
+// active rows can remain indefinitely overdue. Keep a per-process record so the
+// scheduled-chat poll makes each newly observed orphan visible without emitting the
+// same warning every five seconds.
+const reportedUnsupportedLegacyScheduleIds = new Set<string>();
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3166,20 +3173,41 @@ export const scheduleDb = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         IndexName: 'StatusStartTimeIndex',
         KeyConditionExpression: '#status = :status AND #nextRunTime <= :now',
-        FilterExpression: '#type = :type',
         ExpressionAttributeNames: {
           '#status': 'status',
           '#nextRunTime': 'nextRunTime',
-          '#type': 'type',
         },
         ExpressionAttributeValues: {
           ':status': 'active',
           ':now': now,
-          ':type': 'scheduled_chat',
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      const dueSchedules = await paginatedQuery(dynamodb, params);
+      const newlyDetectedLegacyIds: string[] = [];
+
+      for (const schedule of dueSchedules) {
+        const isLegacyTaskSchedule = !schedule.type && Boolean(schedule.taskId);
+        if (
+          isLegacyTaskSchedule &&
+          typeof schedule.scheduleId === 'string' &&
+          !reportedUnsupportedLegacyScheduleIds.has(schedule.scheduleId)
+        ) {
+          reportedUnsupportedLegacyScheduleIds.add(schedule.scheduleId);
+          newlyDetectedLegacyIds.push(schedule.scheduleId);
+        }
+      }
+
+      if (newlyDetectedLegacyIds.length > 0) {
+        console.warn(JSON.stringify({
+          event: 'scheduled_chat_schedule_skipped',
+          reason: 'legacy_task_schedule_unsupported',
+          count: newlyDetectedLegacyIds.length,
+          scheduleIds: newlyDetectedLegacyIds.sort(),
+        }));
+      }
+
+      return dueSchedules.filter((schedule: any) => schedule.type === 'scheduled_chat');
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesReadyToRun");
       return [];
