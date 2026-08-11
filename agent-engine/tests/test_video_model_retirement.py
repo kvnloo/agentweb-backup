@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Behavioral + guard tests for retiring the stale Veo video model ID from web_agent.py.
+"""Behavioral + guard tests for retiring the stale Veo video model ID from web_agent.py,
+and for a related scoping bug (ENG-1122) it unmasked.
 
 web_agent.py hardcoded model="veo-3.0-generate-preview" for Google Veo video
 generation. That model ID is retired -- a live video-gen task hit an
@@ -21,8 +22,17 @@ top-level imports pull in the full agent-engine conda environment
 installed in this stripped-down CI/dev box (no conda, no pip even).
 Rather than hand-mock that whole chain -- fragile, and liable to pass for
 the wrong reasons -- these tests extract just the two new definitions via
-ast and exec them in isolation, so they run against the actual source text
-of the fix, not a reimplementation of it.
+a line-range slice of the real source and exec it in isolation.
+
+ENG-1122: fixing the 404 let a live task execute further into
+generate_short_video and immediately hit a second, previously-masked bug --
+UnboundLocalError on 'time'. The kling-v2.1-std branch had a redundant
+`import time` (plus `requests`/`json`/`uuid`) that, despite never executing
+on the Veo path, statically made those names local to the *entire*
+enclosing closure per Python's scoping rules -- breaking every reference to
+them elsewhere in the same function, including the Veo branch's
+`time.sleep()` polling loop. All four are unambiguous stdlib names already
+imported at module level, so the fix is to delete the redundant locals.
 """
 import os
 import unittest
@@ -67,6 +77,31 @@ def _load_web_agent_video_helpers():
         if name not in namespace:
             raise AssertionError(f"web_agent.py no longer defines {name} in the expected location")
     return namespace
+
+
+def _read_generate_short_video_closure():
+    """Return the source lines spanning the generate_short_video closure body,
+    from its decorator line through (but excluding) the next sibling statement
+    in the enclosing method."""
+    path = os.path.join(AGENT_ENGINE_DIR, "web_agent.py")
+    with open(path, "r") as f:
+        lines = f.readlines()
+
+    start_idx = end_idx = None
+    for i, line in enumerate(lines):
+        if "async def generate_short_video(" in line:
+            start_idx = i
+        elif start_idx is not None and "if self.update_lead_list:" in line:
+            end_idx = i
+            break
+
+    if start_idx is None or end_idx is None:
+        raise AssertionError(
+            "Could not locate the generate_short_video closure boundaries in "
+            "web_agent.py -- the function or its known trailing sibling "
+            "statement was renamed or restructured"
+        )
+    return "".join(lines[start_idx:end_idx])
 
 
 class TestVeoConfigParamsBehavior(unittest.TestCase):
@@ -157,6 +192,43 @@ class TestNoStaleVeoModelReferences(unittest.TestCase):
             "the default video_model fallback must reference VEO_MODEL_ID, "
             "not a duplicated literal",
         )
+
+
+class TestNoRedundantLocalImportsInVideoClosure(unittest.TestCase):
+    """ENG-1122 guard: no branch inside generate_short_video may locally
+    re-import a name that's already imported at module level. Python scopes
+    a name as local to the *whole* enclosing function the moment any local
+    import/assignment of that name appears anywhere in its body -- even in a
+    branch that never executes on a given code path -- so a redundant local
+    import here silently breaks every other branch's use of the same name.
+    This regressed once already (time, inside the unrelated kling-v2.1-std
+    branch, broke the Veo branch's time.sleep() polling loop)."""
+
+    # Names already available module-wide in web_agent.py (see its top-level
+    # imports) that must never be locally re-imported inside this closure.
+    MODULE_LEVEL_NAMES = ("time", "json", "requests", "uuid")
+
+    def setUp(self):
+        self.closure_src = _read_generate_short_video_closure()
+
+    def test_closure_boundaries_are_found(self):
+        self.assertIn("async def generate_short_video(", self.closure_src)
+
+    def test_no_redundant_local_imports_of_module_level_names(self):
+        for name in self.MODULE_LEVEL_NAMES:
+            with self.subTest(name=name):
+                self.assertNotIn(
+                    f"import {name}", self.closure_src,
+                    f"generate_short_video locally re-imports '{name}', which is "
+                    "already available at module level -- this poisons the "
+                    "whole closure's scope for that name (ENG-1122), even in "
+                    "branches that never execute the local import",
+                )
+
+    def test_time_sleep_is_still_called_in_the_veo_polling_loop(self):
+        """Guard the guard: confirm the assertion above isn't vacuously true
+        because the polling loop itself was removed."""
+        self.assertIn("time.sleep(20)", self.closure_src)
 
 
 if __name__ == "__main__":
