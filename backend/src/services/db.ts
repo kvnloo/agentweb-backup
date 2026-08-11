@@ -6458,7 +6458,10 @@ export const crmDb = {
         // IDs of newly created leads (excludes merged updates). Used by callers
         // that need to act on freshly-imported leads — e.g., the CSV importer
         // queues these for enrich.so email validation when the user opts in.
-        created: [] as Array<{ leadId: string; email?: string }>,
+        // `sourceIndex` is the position in the input `leads` array the record
+        // was written from, so callers can join a created leadId back to the
+        // row it came from even when the row carries no email (ENG-1002).
+        created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
       };
 
       // Get existing leads to check for duplicates by email
@@ -6490,7 +6493,9 @@ export const crmDb = {
       const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
 
       // Deduplicate leads within the upload by email AND by normalized LinkedIn URL.
-      const uniqueLeads = new Map<string, typeof leads[0]>();
+      // The map value carries the row's original index so `results.created` can
+      // report which input row each written lead came from (ENG-1002).
+      const uniqueLeads = new Map<string, { lead: typeof leads[0]; index: number }>();
       const seenLinkedIn = new Set<string>();
       leads.forEach((lead, index) => {
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
@@ -6530,12 +6535,14 @@ export const crmDb = {
           seenLinkedIn.add(liKey);
         }
 
-        uniqueLeads.set(emailKey, lead);
+        uniqueLeads.set(emailKey, { lead, index });
       });
 
-      // Add unique new leads
-      uniqueLeads.forEach((lead) => {
+      // Add unique new leads (keeping each one's input-array position aligned).
+      const newLeadSourceIndices: number[] = [];
+      uniqueLeads.forEach(({ lead, index }) => {
         newLeads.push(lead);
+        newLeadSourceIndices.push(index);
       });
 
       // Process new leads in batches of 25 (DynamoDB batch write limit)
@@ -6543,11 +6550,11 @@ export const crmDb = {
       for (let i = 0; i < newLeads.length; i += batchSize) {
         const batch = newLeads.slice(i, i + batchSize);
 
-        const batchCreated: Array<{ leadId: string; email?: string }> = [];
-        const writeRequests = batch.map(lead => {
+        const batchCreated: Array<{ leadId: string; email?: string; sourceIndex: number }> = [];
+        const writeRequests = batch.map((lead, batchIndex) => {
           const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
           const emailValue = lead.email?.trim().toLowerCase();
-          batchCreated.push({ leadId, email: emailValue });
+          batchCreated.push({ leadId, email: emailValue, sourceIndex: newLeadSourceIndices[i + batchIndex] });
 
           const item: any = {
             listId,
@@ -6805,7 +6812,7 @@ export const crmDb = {
         mergedCount: 0,
         errorCount: leads.length,
         errors: [`Batch upload failed: ${error.message}`],
-        created: [] as Array<{ leadId: string; email?: string }>,
+        created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
       };
     }
   },
