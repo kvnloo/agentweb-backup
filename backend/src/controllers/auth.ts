@@ -163,7 +163,7 @@ export const register = async (req: Request, res: Response) => {
       companyNameFromWaitlist, // from waitlist
       useCaseCategoriesFromWaitlist, // from waitlist
       touch // attribution — passes through onUserSignup hook
-    );
+    ).catch(() => undefined);
 
     // Nothing below this boundary is safe unless createUser persisted the row.
     if (!newUser) {

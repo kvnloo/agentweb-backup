@@ -113,6 +113,25 @@ describe('register persistence boundary', () => {
     expect(mockUpdateUser).not.toHaveBeenCalled();
   });
 
+  it('returns the same actionable response when the persistence adapter throws', async () => {
+    mockCreateUser.mockRejectedValue(new Error('DynamoDB write failed'));
+
+    const response = await registerRequest();
+
+    expect(response.status).toBe(503);
+    expect(response.body).toEqual({
+      message: 'We could not create your account. Please try again.',
+      code: 'registration_persistence_failed',
+    });
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    expect(mockGetOrgWithPendingInviteForEmail).not.toHaveBeenCalled();
+    expect(mockGetOrgsWithAutoJoinDomain).not.toHaveBeenCalled();
+    expect(mockSyncNewUserToLeadList).not.toHaveBeenCalled();
+    expect(mockOnUserRegistered).not.toHaveBeenCalled();
+    expect(mockSendTeamIntroductionEmail).not.toHaveBeenCalled();
+    expect(mockJwtSign).not.toHaveBeenCalled();
+  });
+
   it('creates no pending organization request when persistence fails', async () => {
     mockCreateUser.mockResolvedValue(undefined);
     mockGetOrgsWithAutoJoinDomain.mockResolvedValue([{ orgId: 'org-1' }]);
