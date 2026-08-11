@@ -2425,6 +2425,26 @@ describe('CRM Database Service', () => {
       expect(result.anonymizedSkipped).toBe(2);
     });
 
+    // Greptile P1 on #2362 (second round) flagged the catch path for zeroing
+    // anonymizedSkipped. The shape there is corrected, but it is NOT asserted
+    // here on purpose: handleDynamoDbError always rethrows, so batchCreateLeads
+    // propagates the failure instead of returning that object, and a test
+    // pretending to reach it would only be pinning dead code.
+    it('propagates a failure that lands after the placeholder filter', async () => {
+      // incrementLeadCount rethrows, and it runs after the rows have already
+      // been classified — the narrow way into the outer catch.
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockRejectedValue(new Error('DynamoDB unavailable')),
+      });
+
+      await expect(
+        crmDb.batchCreateLeads(listId, [
+          { firstName: 'LinkedIn', lastName: 'Member' },
+          { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves-fail' },
+        ]),
+      ).rejects.toThrow('DynamoDB unavailable');
+    });
+
     it('imports a clean batch untouched', async () => {
       const result = await crmDb.batchCreateLeads(listId, [
         { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves' },
