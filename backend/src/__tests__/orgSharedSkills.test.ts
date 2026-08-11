@@ -442,20 +442,16 @@ describe("POST /api/user-skills — new skill gets orgId stamped", () => {
   it("preserves the legacy create call shape when welcomeMessage is absent", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId });
     mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "skill-legacy" });
-
     await request(app).post("/api/user-skills").send({ name: "Legacy", description: "d" });
-
     expect(mockCreateSkill).toHaveBeenCalledWith("Legacy", "d", [], undefined, false);
   });
 
   it("passes the existing welcomeMessage field through canonical user-skill creation", async () => {
     mockGetUserById.mockResolvedValue({ userId: mockUserId });
     mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "skill-brief" });
-
     await request(app).post("/api/user-skills").send({
       name: "Brief", description: "d", welcomeMessage: "**Bring** [the artifact](https://example.com).",
     });
-
     expect(mockCreateSkill).toHaveBeenCalledWith(
       "Brief", "d", [], undefined, false, "**Bring** [the artifact](https://example.com)."
     );

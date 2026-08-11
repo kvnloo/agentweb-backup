@@ -100,16 +100,10 @@ jest.mock('../services/db', () => ({
 // failures by design (ENG-164) — so the suite would stay green either way. The transport
 // guard installed in `beforeEach` is the belt to this mock's braces: it asserts the
 // absence of traffic rather than trusting that the mock registered.
-jest.mock('../services/emailService', () => ({
-  emailService: {
-    sendEmail: jest.fn().mockResolvedValue(undefined),
-  },
-}));
-
-const { emailService } = require('../services/emailService');
+const mockSendEmail = jest.fn().mockResolvedValue({ id: 'test-email' });
+jest.mock('../services/chatbotService', () => ({ chatbotDb: {} }));
+jest.mock('../services/resendService', () => ({ resendService: { sendEmail: mockSendEmail } }));
 const orgRoutes = require('../routes/org').default;
-
-const mockSendEmail = emailService.sendEmail as jest.Mock;
 
 // ---------------------------------------------------------------------------
 // Outbound-transport guard (ENG-1112, same shape as seo.orgAnalytics.test.ts)
@@ -467,7 +461,7 @@ describe('Organization routes', () => {
       expect(res.status).toBe(200);
 
       expect(mockSendEmail).toHaveBeenCalledTimes(1);
-      const [to, subject, text, html] = mockSendEmail.mock.calls[0];
+      const [{ to, subject, text, html }] = mockSendEmail.mock.calls[0];
 
       // Addressed to the invitee, normalised to lower case — the same value stored on
       // the org's pendingInvites, so accept-invite can match it.
