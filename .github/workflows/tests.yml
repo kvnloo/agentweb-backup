@@ -53,7 +53,7 @@ jobs:
       # The checkout could be dropped outright per those docs; a shallow one is
       # kept so the workspace is still populated for anything added here later.
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
@@ -189,7 +189,7 @@ jobs:
       # in backend/src/__tests__, and jest resolves from `src/`). One sampled
       # run spent 209s here.
       - name: Checkout PR head
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
@@ -249,7 +249,7 @@ jobs:
       # ENG-729: shallow, for the same reason as backend-tests-a. The coverage
       # comment step below talks to the GitHub API, not to git.
       - name: Checkout PR head
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
@@ -356,7 +356,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Lint CI scripts
         run: shellcheck .github/scripts/*.sh
@@ -410,7 +410,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Checkout PR head
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -477,7 +477,7 @@ jobs:
       # merges has to gate its own changes, or the fix ships unexercised
       # (the ENG-743 lesson).
       - name: Checkout PR head
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Split across two steps on purpose. A step that fails cannot publish an
       # output, and `continue-on-error` would mark the JOB successful, silently
@@ -573,7 +573,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
@@ -684,7 +684,7 @@ jobs:
       # is `tsc -b && vite build`, so unlike the backend jobs the build is the
       # type-check here, not a discarded emit.
       - name: Checkout PR head
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
