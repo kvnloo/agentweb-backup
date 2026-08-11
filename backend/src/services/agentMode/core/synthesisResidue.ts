@@ -213,7 +213,7 @@ export function buildExecutedActionsFooter(toolCalls: ExecutedToolCall[]): strin
     '',
     renderLedgerLines(counts),
     '',
-    `${COUNT_BASIS_NOTE}${closing}`.trim(),
+    `${closing} ${COUNT_BASIS_NOTE}`.trim(),
   ].filter((line, i, all) => !(line === '' && all[i - 1] === '')).join('\n').trim();
 }
 
@@ -255,8 +255,8 @@ export function buildExecutedActionsFallback(toolCalls: ExecutedToolCall[]): str
   if (totalDeferred > 0) {
     closing.push('The ones marked “not run” were never executed, so nothing was applied for them.');
   }
-  closing.push(COUNT_BASIS_NOTE);
   closing.push("Ask me to summarize what I just did and I'll write up the details.");
+  closing.push(COUNT_BASIS_NOTE);
 
   return [preamble, '', lines.join('\n'), '', closing.join(' ')].join('\n');
 }
