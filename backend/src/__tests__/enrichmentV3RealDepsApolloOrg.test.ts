@@ -15,6 +15,7 @@ const mockYouSearchWeb = jest.fn().mockResolvedValue({ success: true, results: [
 jest.mock('../services/agentModeService', () => ({
   agentModeService: { youSearchWeb: (...args: any[]) => mockYouSearchWeb(...args) },
 }));
+jest.mock('../utils/llmService', () => ({ createLLMService: () => ({ generateJSONContent: async () => ({}) }) }));
 
 import { buildOrchestratorDeps } from '../services/enrichmentV3RealDeps';
 import * as apolloServiceModule from '../services/apolloService';
