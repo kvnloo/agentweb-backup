@@ -6488,25 +6488,29 @@ export const crmDb = {
      *  lead-filter UI. */
     system?: Record<string, any>;
   }>) {
-    try {
-      const results = {
-        successCount: 0,
-        newCount: 0,
-        mergedCount: 0,
-        errorCount: 0,
-        errors: [] as string[],
-        // IDs of newly created leads (excludes merged updates). Used by callers
-        // that need to act on freshly-imported leads — e.g., the CSV importer
-        // queues these for enrich.so email validation when the user opts in.
-        // `sourceIndex` is the position in the input `leads` array the record
-        // was written from, so callers can join a created leadId back to the
-        // row it came from even when the row carries no email (ENG-1002).
-        created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
-        // Rows refused because they are LinkedIn's anonymized placeholder
-        // rather than a person (ENG-1002). Reported, never dropped silently.
-        anonymizedSkipped: 0,
-      };
+    // Declared OUTSIDE the try so the catch below can still see what was
+    // already classified. Refused placeholders are counted before any write
+    // happens, and a later DynamoDB failure must not relabel them as database
+    // errors (ENG-1002 follow-up).
+    const results = {
+      successCount: 0,
+      newCount: 0,
+      mergedCount: 0,
+      errorCount: 0,
+      errors: [] as string[],
+      // IDs of newly created leads (excludes merged updates). Used by callers
+      // that need to act on freshly-imported leads — e.g., the CSV importer
+      // queues these for enrich.so email validation when the user opts in.
+      // `sourceIndex` is the position in the input `leads` array the record
+      // was written from, so callers can join a created leadId back to the
+      // row it came from even when the row carries no email (ENG-1002).
+      created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
+      // Rows refused because they are LinkedIn's anonymized placeholder
+      // rather than a person (ENG-1002). Reported, never dropped silently.
+      anonymizedSkipped: 0,
+    };
 
+    try {
       // Get existing leads to check for duplicates by email
       // Note: We need to fetch all existing leads, so we'll paginate through them
       const allExistingLeads: any[] = [];
@@ -6858,14 +6862,22 @@ export const crmDb = {
       return results;
     } catch (error: any) {
       handleDynamoDbError(error, "batchCreateLeads");
+      // NOTE: handleDynamoDbError above always rethrows, so this return is not
+      // reached today — callers see the exception, not this object. It is kept
+      // consistent anyway: the placeholder refusals happened before the failure
+      // and are still true, so they are carried through and the failure is
+      // billed only to the rows actually attempted. Zeroing them would report a
+      // refused placeholder as a database error — the same misreporting
+      // ENG-1002 is about — while still summing to `leads.length` and so
+      // slipping past the accounting invariant unnoticed.
       return {
         successCount: 0,
         newCount: 0,
         mergedCount: 0,
-        errorCount: leads.length,
+        errorCount: leads.length - results.anonymizedSkipped,
         errors: [`Batch upload failed: ${error.message}`],
         created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
-        anonymizedSkipped: 0,
+        anonymizedSkipped: results.anonymizedSkipped,
       };
     }
   },
