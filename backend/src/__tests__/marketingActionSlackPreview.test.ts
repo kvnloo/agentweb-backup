@@ -172,6 +172,30 @@ describe('buildMarketingActionSlackPreview — parity with the shared payload', 
     expect(preview.text).toContain('https://app.agentweb.pro/campaigns/camp-b');
   });
 
+  it('fails closed for off-origin and Slack-control-character deep links', () => {
+    const offOrigin = attachMarketingActions({ runId: 'r-off-origin' }, [
+      candidate({
+        actionType: 'pause_ad',
+        scopeId: 'camp-off-origin',
+        deepLink: 'https://evil.example/campaigns/camp-off-origin',
+      }),
+    ]);
+    const slackControl = attachMarketingActions({ runId: 'r-slack-control' }, [
+      candidate({
+        actionType: 'pause_ad',
+        scopeId: 'camp-slack-control',
+        deepLink: '/campaigns/camp-slack-control|<!channel>',
+      }),
+    ]);
+
+    expect(buildMarketingActionSlackPreview(offOrigin, { portalBaseUrl: PORTAL }).kind).toBe(
+      'invalid'
+    );
+    expect(buildMarketingActionSlackPreview(slackControl, { portalBaseUrl: PORTAL }).kind).toBe(
+      'invalid'
+    );
+  });
+
   it('escapes Slack control characters in user-visible action text', () => {
     const envelope = attachMarketingActions({ runId: 'r' }, [
       candidate({
@@ -242,6 +266,22 @@ describe('buildMarketingActionSlackPreview — degraded states (AC6)', () => {
     const result = buildMarketingActionSlackPreview(broken, { portalBaseUrl: PORTAL });
     expect(result.kind).toBe('invalid');
   });
+
+  it('rejects an oversized stored payload instead of rendering or truncating it', () => {
+    const firstThree = readMarketingActions(fixtureEnvelope());
+    const fourth = readMarketingActions(
+      attachMarketingActions({ runId: 'r-fourth' }, [
+        candidate({ actionType: 'reduce_bid', scopeId: 'camp-d' }),
+      ])
+    )[0];
+
+    const result = buildMarketingActionSlackPreview(
+      { runId: 'r-oversized', marketingActions: [...firstThree, fourth] },
+      { portalBaseUrl: PORTAL }
+    );
+
+    expect(result.kind).toBe('invalid');
+  });
 });
 
 describe('sendMarketingActionsSlackPreview — thin transport (AC5)', () => {
@@ -282,6 +322,14 @@ describe('sendMarketingActionsSlackPreview — thin transport (AC5)', () => {
     );
     expect(outcome.kind).toBe('invalid');
     expect(postSlackMessage).not.toHaveBeenCalled();
+  });
+
+  it('returns an explicit failed outcome when Slack transport rejects', async () => {
+    postSlackMessage.mockRejectedValueOnce(new Error('transport unavailable'));
+
+    await expect(
+      sendMarketingActionsSlackPreview('C123', fixtureEnvelope(), { portalBaseUrl: PORTAL })
+    ).resolves.toEqual({ kind: 'failed', reason: 'Slack transport failed: transport unavailable' });
   });
 
   it('defaults the portal base to CUSTOMER_FRONTEND_URL, falling back to prod portal', () => {

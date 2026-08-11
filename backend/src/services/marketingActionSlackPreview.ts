@@ -31,7 +31,8 @@ export type MarketingActionSlackPreview =
 export type MarketingActionSlackSendOutcome =
   | { kind: 'sent'; ts: string; channel: string }
   | { kind: 'empty' }
-  | { kind: 'invalid'; reason: string };
+  | { kind: 'invalid'; reason: string }
+  | { kind: 'failed'; reason: string };
 
 /** Read at call time (not module load) so tests and env changes both apply. */
 export function defaultPortalBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
@@ -51,12 +52,20 @@ const STATUS_MARKER: Record<MarketingAction['status'], string> = {
 const escapeSlackText = (s: string) =>
   s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-/** Absolute http(s) deepLinks pass through; portal paths join the portal base. */
-function resolveDeepLink(deepLink: string, portalBaseUrl: string): string {
-  if (/^https?:\/\//.test(deepLink)) return deepLink;
-  const base = portalBaseUrl.replace(/\/+$/, '');
-  const path = deepLink.startsWith('/') ? deepLink : `/${deepLink}`;
-  return `${base}${path}`;
+/** Portal-relative and same-origin http(s) links are safe inside Slack link syntax. */
+function resolveDeepLink(deepLink: string, portalBaseUrl: string): string | null {
+  if (/[<>|\u0000-\u001f\u007f]/.test(deepLink)) return null;
+
+  try {
+    const base = new URL(portalBaseUrl);
+    const resolved = new URL(deepLink, `${base.origin}/`);
+    if (!['http:', 'https:'].includes(resolved.protocol)) return null;
+    if (resolved.origin !== base.origin) return null;
+    if (resolved.username || resolved.password) return null;
+    return resolved.toString();
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -77,17 +86,24 @@ export function buildMarketingActionSlackPreview(
     throw err;
   }
   if (actions.length === 0) return { kind: 'empty' };
+  if (actions.length > 3) {
+    return { kind: 'invalid', reason: 'Marketing action payload exceeds the three-action limit' };
+  }
 
   const portalBaseUrl = options.portalBaseUrl || defaultPortalBaseUrl();
 
-  const lines = actions.map((action, index) => {
+  const lines: string[] = [];
+  for (const [index, action] of actions.entries()) {
     const url = resolveDeepLink(action.deepLink, portalBaseUrl);
-    return (
+    if (!url) {
+      return { kind: 'invalid', reason: `Action ${action.id} has an unsafe portal deep link` };
+    }
+    lines.push(
       `${index + 1}. ${STATUS_MARKER[action.status]} *${escapeSlackText(action.recommendation)}*` +
       ` — ${escapeSlackText(action.expectedImpact)}` +
       `\n    status: ${action.status} · id: \`${action.id}\` · <${url}|View in portal>`
     );
-  });
+  }
 
   return {
     kind: 'preview',
@@ -109,6 +125,11 @@ export async function sendMarketingActionsSlackPreview(
   const preview = buildMarketingActionSlackPreview(envelope, options);
   if (preview.kind !== 'preview') return preview;
 
-  const { ts, channel } = await postSlackMessage(channelId, preview.text);
-  return { kind: 'sent', ts, channel };
+  try {
+    const { ts, channel } = await postSlackMessage(channelId, preview.text);
+    return { kind: 'sent', ts, channel };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { kind: 'failed', reason: `Slack transport failed: ${message}` };
+  }
 }
