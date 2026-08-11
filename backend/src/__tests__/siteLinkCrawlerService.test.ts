@@ -168,6 +168,9 @@ describe('siteLinkCrawlerService', () => {
     const hung = fakeDeps({});
     hung.deps.resolvePinned = async () => new Promise<never>(() => undefined);
     expect(await crawlWebsiteLinks('https://site.test/', { deadlineMs: 1 }, hung.deps)).toMatchObject({ deadlineExceeded: true, truncated: true });
+    const hungRequest = fakeDeps({});
+    hungRequest.deps.request = async () => new Promise<never>(() => undefined);
+    expect(await crawlWebsiteLinks('https://site.test/', { deadlineMs: 1, requestDelayMs: 0 }, hungRequest.deps)).toMatchObject({ deadlineExceeded: true, truncated: true });
   });
 
   it('caps URL, response body, and unique-link output', async () => {

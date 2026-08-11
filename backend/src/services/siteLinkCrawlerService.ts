@@ -111,7 +111,7 @@ async function requestFollowingRedirects(
     if (delayMs) await byDeadline((deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(delayMs), remaining);
     remaining = deadlineAt - now();
     if (remaining <= 0) throw new ScanDeadlineError('Site scan deadline exceeded');
-    const reply = await request(url, pinned, method, Math.min(TIMEOUT_MS, remaining), MAX_BODY_BYTES);
+    const reply = await byDeadline(request(url, pinned, method, Math.min(TIMEOUT_MS, remaining), MAX_BODY_BYTES), remaining);
     if (method === 'GET' && Buffer.byteLength(String(reply.data ?? '')) > MAX_BODY_BYTES) throw new Error('Response body exceeds maximum size');
     if (reply.status < 300 || reply.status >= 400) return { ...reply, finalUrl: url };
     const location = header(reply.headers, 'location');
