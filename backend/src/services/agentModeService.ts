@@ -122,7 +122,7 @@ export const CONTEXT_TRIM_TOOL_CONTENT_LIMIT = 8_000;
 // existing `from '../services/agentModeService'` importers are unaffected.
 export { extractToolContent } from '../utils/extractToolContent';
 import { extractToolContent } from '../utils/extractToolContent';
-import { extractToolResponseS3Ref } from '../utils/toolResponseS3Ref';
+import { extractToolResponseHeader } from '../utils/toolResponseS3Ref';
 
 /**
  * Normalize a video timecode to a numeric number of seconds.
@@ -22540,8 +22540,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (toolIndices.length <= recentToPreserve) return messages;
 
-    // Most recent N tool results: keep at full size
+    // Most recent N tool results by pure recency. This drives the "old assistant
+    // message" test below ONLY — an assistant whose call was just answered must
+    // keep its arguments intact, and that is a question about recency, not size.
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
+
+    // Size at which THIS tool's result would be compressed (per-tool allowances
+    // may raise the default floor, never lower it).
+    const trimLimitFor = (msg: any): number =>
+      AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+
+    // ENG-940: which results the preserve window actually protects. A result at
+    // or below its trim limit is passed through untouched whether or not it is
+    // preserved, so spending a slot on it protects nothing while evicting a
+    // result that the trimmer really would destroy. The reported run died on
+    // exactly that: three 488-char save_memory schema rejections landed after an
+    // 8,981-char get_pr_digest payload and pushed it out of a 3-slot window
+    // inside one logical turn. So the window keeps the N most recent AT-RISK
+    // results. The worst-case context cost is unchanged — it was always up to N
+    // full-size results — this only stops the window being wasted on results
+    // that were never in danger.
+    const atRiskIndices = toolIndices.filter(
+      (i) => typeof messages[i].content === 'string' && messages[i].content.length > trimLimitFor(messages[i]),
+    );
+    const atRiskPreserveSet = new Set(atRiskIndices.slice(-recentToPreserve));
 
     // Track which assistant messages are "old" (none of their tool_calls resolve
     // to a preserved tool result after them). We trim large argument fields on these.
@@ -22571,16 +22593,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const result = messages.map((msg, idx) => {
       if (
         msg.role === 'tool' &&
-        !preserveSet.has(idx) &&
+        !atRiskPreserveSet.has(idx) &&
         typeof msg.content === 'string'
       ) {
-        const limit = AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+        const limit = trimLimitFor(msg);
         if (msg.content.length > limit) {
           // ENG-940: an offloaded response carries its "[Full response stored at S3 key: …]"
-          // header at the very front. Preview it separately from the header, otherwise the
-          // 200-char slice spends its whole budget on (and can cut in half) the only key that
-          // lets search_tool_response / read_tool_response recover the payload.
-          const s3Ref = extractToolResponseS3Ref(msg.content);
+          // header at the very front — or, when the offload failed, the "could NOT be stored"
+          // notice. Preview the payload separately from that header, otherwise the 200-char
+          // slice spends its whole budget on (and can cut in half) the only thing telling the
+          // model how much of this result it is still allowed to trust.
+          const s3Ref = extractToolResponseHeader(msg.content);
           const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
           const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
