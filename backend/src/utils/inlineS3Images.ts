@@ -37,8 +37,7 @@ function attributeValueRange(
   if (equals === -1) return null;
 
   let offset = equals + 1;
-  while (/\s/.test(raw[offset] || '')) offset++;
-  if (offset >= raw.length) return null;
+  while (/\s/.test(raw[offset])) offset++;
 
   const quote = raw[offset] === '"' || raw[offset] === "'" ? raw[offset] : null;
   if (!quote) {
@@ -54,10 +53,9 @@ function attributeValueRange(
     };
   }
 
-  const closingQuote = raw.endsWith(quote);
   return {
     valueStart: attributeStart + offset + 1,
-    valueEnd: closingQuote ? attributeEnd : attributeEnd + 1,
+    valueEnd: attributeStart + raw.lastIndexOf(quote),
     quoted: true,
   };
 }
@@ -81,7 +79,6 @@ function findRenderableImageSources(html: string): ImageSourceOccurrence[] {
       },
       onattribute: (name, value) => {
         if (currentTag !== 'img' || name !== 'src' || templateDepth > 0) return;
-        if (parser.startIndex < 0 || parser.endIndex < parser.startIndex) return;
         const range = attributeValueRange(html, parser.startIndex, parser.endIndex);
         if (!range) return;
         occurrences.push({ url: value, ...range });
@@ -118,7 +115,7 @@ const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
 function imageMimeType(url: string, storedContentType?: string): string {
   if (storedContentType?.toLowerCase().startsWith('image/')) return storedContentType;
   const pathname = url.split(/[?#]/, 1)[0];
-  const extension = pathname.split('.').pop()?.toLowerCase();
+  const extension = pathname.split('.').pop()!.toLowerCase();
   return (extension && IMAGE_MIME_BY_EXTENSION[extension]) || 'application/octet-stream';
 }
 
