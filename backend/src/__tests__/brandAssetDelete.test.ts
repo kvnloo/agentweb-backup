@@ -656,6 +656,64 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     (console.error as jest.Mock).mockRestore();
   });
 
+  it("guards the solo prune itself, not just its rollback", async () => {
+    // Two concurrent deletes each write a full snapshot; without a condition the
+    // later one restores the attachment the earlier removed, whose object is
+    // already gone. A brand save overlapping a delete is erased outright.
+    const stamped = { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...soloUser, brandGuidelines: stamped } });
+
+    await del(soloUser, OWN_ASSET_KEY);
+
+    const prune = mockDynamoUpdate.mock.calls[0][0];
+    expect(prune.ConditionExpression).toBe("brandGuidelines.updatedAt = :expectedBrandUpdatedAt");
+    expect(prune.ExpressionAttributeValues[":expectedBrandUpdatedAt"]).toBe(
+      "2026-08-10T00:00:00.000Z"
+    );
+  });
+
+  it("guards the populated-org prune itself", async () => {
+    const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
+    const stamped = { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "me",
+      brandGuidelines: stamped,
+      shareSettings: { brandGuidelines: { editors: [] }, marketingStrategy: { editors: [] } },
+    });
+
+    await del(orgUser, OWN_ASSET_KEY);
+
+    const [, , options] = mockUpdateOrg.mock.calls[0];
+    expect(options.condition.values[":expectedBrandUpdatedAt"]).toBe("2026-08-10T00:00:00.000Z");
+  });
+
+  it("409s and destroys nothing when the brand moved before the prune landed", async () => {
+    const stamped = { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...soloUser, brandGuidelines: stamped } });
+    mockDynamoUpdate.mockRejectedValue(
+      Object.assign(new Error("The conditional request failed"), {
+        code: "ConditionalCheckFailedException",
+      })
+    );
+
+    const res = await del(soloUser, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(409);
+    expect(mockS3Delete).not.toHaveBeenCalled();
+  });
+
+  it("matches on the absence of updatedAt for a legacy brand record", async () => {
+    const legacy = { brandData: { brandName: "Acme" }, attachments: ownBrand.attachments };
+    mockDynamoGet.mockResolvedValue({ Item: { ...soloUser, brandGuidelines: legacy } });
+
+    await del(soloUser, OWN_ASSET_KEY);
+
+    const prune = mockDynamoUpdate.mock.calls[0][0];
+    expect(prune.ConditionExpression).toBe("attribute_not_exists(brandGuidelines.updatedAt)");
+  });
+
   it("refuses a foreign key even on an un-copied org", async () => {
     const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
     mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
