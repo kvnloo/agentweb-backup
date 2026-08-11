@@ -13,6 +13,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
+import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import {
@@ -845,6 +846,14 @@ export interface DiagnosisContext {
   userMessage: string;
   workPlanSummary: string | null;
   failedFunctions: Record<string, number> | null;
+  /**
+   * ENG-971: the calls that SUCCEEDED before the turn died (session.calledFunctions).
+   * Without it the diagnosis agent sees a failure-only view of the run and answers
+   * "be specific about what was accomplished" by asserting nothing was — which is how
+   * a 600s timeout AFTER a landed production publish became "your changes were not
+   * saved. Please try your request again." Optional so older callers still compile.
+   */
+  succeededFunctions?: Record<string, number> | null;
 }
 
 /**
@@ -4347,8 +4356,17 @@ export class AgentModeService {
       // the URL. It only ADDS the true deliverable, never rewrites the model's text, so it
       // cannot invent a false success. Mirrors the finalize guard's in-place last-assistant
       // patch so the persisted transcript matches what the user sees.
+      // ENG-971: the INVERSION of the above — a false FAILURE report. Same shape of
+      // guard (deterministic, always-on, append-only, applied at the same seam): when
+      // the closing narrative claims the session timed out AND that the user's changes
+      // were not saved, while the ledger holds a CONFIRMED successful publish/deploy,
+      // append the true outcome so the user does not re-run a production deploy that
+      // already landed. Runs after the landing reconciler so both corrections compose.
       if (content && !wasCancelled) {
-        const reconciledContent = reconcileLandingDeploymentReport(content, toolCalls);
+        const reconciledContent = reconcileFalseFailureReport(
+          reconcileLandingDeploymentReport(content, toolCalls),
+          toolCalls,
+        );
         if (reconciledContent !== content) {
           content = reconciledContent;
           for (let i = messages.length - 1; i >= 0; i--) {
@@ -14405,7 +14423,18 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    */
   async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
     try {
-      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.`;
+      // ENG-971: the truthfulness rules exist because this agent wrote "the system
+      // timed out ... so your changes were not saved. Please try your request again"
+      // for a run whose production publish had already landed and been verified. It
+      // is told what succeeded (below) and forbidden from turning an interruption
+      // into a claim of lost work.
+      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.
+
+TRUTHFULNESS RULES (these override tone):
+- The "Succeeded operations" list is what actually happened. Anything on it completed — say so, and name it.
+- An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
+- Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
+- Do not attribute a failure to an operation that appears in the succeeded list.`;
 
       const parts: string[] = [
         `Error type: ${context.errorType}`,
@@ -14416,6 +14445,9 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
         parts.push(`Work plan status:\n${context.workPlanSummary}`);
       } else {
         parts.push('No work plan.');
+      }
+      if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
+        parts.push(`Succeeded operations (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);
@@ -19897,6 +19929,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (safeMessage.includes('Scheduled chat not found')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The schedule_id doesn't exist or doesn't belong to this user. Call list_scheduled_chats to get a valid schedule_id before retrying update/toggle/delete.`;
       }
+    }
+    // ENG-971: bookkeeping / side-effect tools (save_memory, save_org_memory, …)
+    // record a note ABOUT the work — they are not the work. A trailing save_memory
+    // schema rejection got the generic "adjust the plan" guidance below, read like a
+    // failure of the primary task, and was generalized into "the system timed out and
+    // your changes were not saved. Please try again." — after a landing-page publish
+    // that had already gone live in production. Give the criticality verdict
+    // explicitly, and keep it accurate even when the memory note WAS what the user
+    // asked for: the failure is real and must be reported, it is just SCOPED to the note.
+    if (isBookkeepingTool(toolName)) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: ${toolName} is a NON-CRITICAL bookkeeping call — it only stores a note for future sessions. Its failure is scoped to that note: it did not undo, roll back, or lose any work already completed in this session, and it is NOT a session, system, or connection timeout. Do NOT tell the user that the system timed out, that their changes were not saved, or that they should re-run work that already succeeded — re-running a publish or deploy that already landed is the worst outcome here. Say in one line that the note could not be saved, then report the true outcome of the rest of the session exactly as the earlier tool results confirmed it.`;
     }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
