@@ -6,7 +6,6 @@ import { callerCan, can, roleOf } from "../services/orgAuthz";
 import { v4 as uuidv4 } from "uuid";
 import crypto from "crypto";
 import { isCompanyEmail } from "../utils/validation";
-import { emailService } from "../services/emailService";
 
 const router = Router();
 
@@ -599,6 +598,7 @@ router.post("/:orgId/invite", async (req: Request, res: Response) => {
 
     // Send invite email
     try {
+      const { emailService } = await import("../services/emailService");
       const inviteUrl = `${process.env.CUSTOMER_FRONTEND_URL || "http://localhost:5174"}/org/accept-invite?token=${inviteToken}&orgId=${orgId}`;
       const ownerUser = await userDb.getUserById(userId);
       const ownerName = ownerUser?.displayName || ownerUser?.email || "Someone";

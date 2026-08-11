@@ -304,7 +304,6 @@ describe('AgentModeService - Skills', () => {
       expect(result.message).toContain('not available with your current subscription');
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
     });
-
     it('rejects a same-org private skill when skill sharing is disabled', async () => {
       const mockDb = require('../services/db');
       mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
