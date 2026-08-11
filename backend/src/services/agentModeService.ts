@@ -20060,7 +20060,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
 
       const results: Array<{ content: string; source: string; fileName?: string }> = (searchResults || []).map(result => ({
-        content: result.content,
+        // ENG-1057: unlike the Drive/ClickUp sources below, Vertex results were
+        // never capped, so a single oversized entry could exceed Node's max
+        // string length once merged/serialized downstream and crash the process.
+        content: result.content && result.content.length > 5000
+          ? result.content.substring(0, 5000) + '\n\n[Content truncated]'
+          : result.content,
         source: result.metadata?.source || 'unknown',
         ...(result.metadata?.fileName && { fileName: result.metadata.fileName })
       }));
