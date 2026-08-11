@@ -53,4 +53,19 @@ console.log = (...args) => {
     originalConsoleLog(...args);
   }
 };
+
+// ENG-1111: block outbound network egress from the test suite.
+//
+// Installed here — before any test file's own imports are evaluated — because the
+// leaks this closes are largely *module-load* side effects, which fire on import and
+// would already have left the box by the time a `beforeAll` ran.
+//
+// Loopback is untouched, so supertest, in-process fakes, and DynamoDB Local behave
+// exactly as before. Any other host throws a named error identifying the test and the
+// URL. See src/__tests__/networkEgressGuard.ts for the incident history (ENG-960,
+// ENG-1112) and for why the allowlist must stay empty.
+import { installNetworkEgressGuard } from './networkEgressGuard';
+
+installNetworkEgressGuard();
+
 export {};
