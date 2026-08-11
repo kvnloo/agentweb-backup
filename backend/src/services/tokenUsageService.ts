@@ -41,7 +41,17 @@ export async function resolveBillingUserId(userId: string): Promise<string> {
   // owner". With admins (or a second owner) that is false: they are not "member",
   // so usage stopped landing on the org counter and started burning their own
   // quota — silently. Everyone except the billing root pools onto it.
-  if (!inheritsOrgBilling({ userId, orgId: user.orgId }, org)) return userId;
+  // ENG-1084: a member holding their own live subscription no longer pools onto
+  // the root — `inheritsOrgBilling` is now the single predicate entitlement and
+  // quota both resolve through, so the two cannot drift a fourth time.
+  if (
+    !inheritsOrgBilling(
+      { userId, orgId: user.orgId, subscription_status: user.subscription_status },
+      org,
+    )
+  ) {
+    return userId;
+  }
 
   return org.ownerUserId;
 }
