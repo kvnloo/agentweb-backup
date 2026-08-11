@@ -63,6 +63,19 @@ async function resolveMember(ref: string): Promise<UserRecordLike | null> {
   return ((await userDb.getUserById(trimmed)) as UserRecordLike | null) ?? null;
 }
 
+async function findDepartedMembers(
+  members: ResolvedMember[],
+  expectedOrgId: string,
+): Promise<ResolvedMember[]> {
+  const currentMembers = await Promise.all(
+    members.map((member) => userDb.getUserByEmailConsistent(member.email)),
+  );
+  return members.filter((member, index) => {
+    const current = currentMembers[index] as UserRecordLike | undefined;
+    return !current || current.userId !== member.userId || current.orgId !== expectedOrgId;
+  });
+}
+
 async function memberAccess(
   page: GeneratedLandingPage,
   member: UserRecordLike,
@@ -177,6 +190,18 @@ router.post("/:id/org-share", async (req: Request, res: Response) => {
       resolved.push({ ...user, email });
     }
 
+    // The org-members and userId lookups above use GSIs and may lag a member
+    // removal. Prove current membership through the email primary key before
+    // the first authorization write, not only after a CAS conflict.
+    const departedBeforeWrite = await findDepartedMembers(resolved, ownerOrgId);
+    if (departedBeforeWrite.length > 0) {
+      return res.status(409).json({
+        message: `Organization membership changed concurrently — no longer members: ${departedBeforeWrite
+          .map((m) => m.email)
+          .join(", ")}`,
+      });
+    }
+
     // Read-modify-write guarded on updatedAt: an overlapping sharing request
     // (or departed-member cleanup) fails the conditional write, and we re-read
     // and re-apply this grant on top of the fresh document instead of
@@ -214,13 +239,7 @@ router.post("/:id/org-share", async (req: Request, res: Response) => {
         // still belongs to this org after a concurrent departure. Revalidate
         // every target through the email primary key's strongly consistent
         // read before restoring their editor grant on the retry.
-        const currentMembers = await Promise.all(
-          resolved.map((m) => userDb.getUserByEmailConsistent(m.email)),
-        );
-        const departed = resolved.filter((m, index) => {
-          const current = currentMembers[index] as UserRecordLike | undefined;
-          return !current || current.userId !== m.userId || current.orgId !== ownerOrgId;
-        });
+        const departed = await findDepartedMembers(resolved, ownerOrgId);
         if (departed.length > 0) {
           return res.status(409).json({
             message: `Organization membership changed concurrently — no longer members: ${departed

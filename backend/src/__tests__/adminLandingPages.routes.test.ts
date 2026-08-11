@@ -276,6 +276,26 @@ describe("POST /:id/org-share", () => {
     expect(mockRecordAdminAudit).not.toHaveBeenCalled();
   });
 
+  it("rejects a stale index member before the initial editor grant", async () => {
+    // Both eventual indexes still expose the departed user, but the decisive
+    // base-table read reflects their completed move to another organization.
+    mockGetOrgMembers.mockResolvedValue([ownerUser, memberUser]);
+    mockGetUserByEmailConsistent.mockResolvedValueOnce({
+      ...memberUser,
+      orgId: "org-other",
+    });
+
+    const app = makeApp(admin);
+    const res = await request(app)
+      .post("/api/admin/landing-pages/page-1/org-share")
+      .send({ memberEmails: [memberUser.email] });
+
+    expect(res.status).toBe(409);
+    expect(mockGetUserByEmailConsistent).toHaveBeenCalledWith(memberUser.email);
+    expect(mockUpdateShareSettings).not.toHaveBeenCalled();
+    expect(mockRecordAdminAudit).not.toHaveBeenCalled();
+  });
+
   it("rejects when the page owner has no org", async () => {
     mockGetUserById.mockImplementation(async (id: string) =>
       id === ownerId ? { ...ownerUser, orgId: undefined } : null
@@ -379,10 +399,12 @@ describe("POST /:id/org-share", () => {
     // The OrgIdIndex can still return a stale member after departure. The
     // retry must fail closed using a strongly consistent primary-key read.
     mockGetOrgMembers.mockResolvedValue([ownerUser, memberUser]);
-    mockGetUserByEmailConsistent.mockResolvedValueOnce({
-      ...memberUser,
-      orgId: "org-other",
-    });
+    mockGetUserByEmailConsistent
+      .mockResolvedValueOnce(memberUser)
+      .mockResolvedValueOnce({
+        ...memberUser,
+        orgId: "org-other",
+      });
     mockUpdateShareSettings.mockRejectedValueOnce(
       Object.assign(new Error("conditional check failed"), { code: "ConditionalCheckFailedException" })
     );
