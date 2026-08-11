@@ -10427,6 +10427,13 @@ export class AgentModeService {
       if (result.errorCount > 0) {
         messageParts.push(`${result.errorCount} lead(s) failed`);
       }
+      // ENG-1002 (follow-up): say so when rows were refused as anonymized
+      // placeholders, so the agent cannot report a clean import that silently
+      // wrote fewer records than the caller handed over.
+      const anonymizedSkipped = result.anonymizedSkipped || 0;
+      if (anonymizedSkipped > 0) {
+        messageParts.push(`${anonymizedSkipped} out-of-network LinkedIn placeholder(s) skipped`);
+      }
 
       return {
         success: result.successCount > 0,
@@ -10437,6 +10444,7 @@ export class AgentModeService {
         newCount: result.newCount || 0,
         mergedCount: result.mergedCount || 0,
         errorCount: result.errorCount,
+        anonymizedSkipped,
         errors: result.errors.length > 0 ? result.errors : undefined
       };
     } catch (error) {

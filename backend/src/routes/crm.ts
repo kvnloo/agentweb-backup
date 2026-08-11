@@ -2099,6 +2099,10 @@ router.post('/lists/:listId/leads/bulk-import', async (req: Request, res: Respon
     res.status(201).json({
       imported: result.newCount,
       skipped: result.mergedCount,
+      // ENG-1002: rows refused as LinkedIn placeholders are neither imported
+      // nor merged, so without this the caller sees an unexplained gap between
+      // `total` and what it can account for.
+      anonymizedSkipped: result.anonymizedSkipped || 0,
       errors: result.errors,
       total: leads.length,
     });
@@ -2976,13 +2980,19 @@ router.post('/lists/:listId/leads/import', upload.single('file'), async (req: Re
       }
     }
 
+    const csvAnonymizedSkipped = results.anonymizedSkipped || 0;
     res.json({
       success: true,
       successCount: results.successCount,
       mergedCount: results.mergedCount,
       errorCount: results.errorCount,
+      // ENG-1002: placeholder rows are refused before the write, so say so —
+      // otherwise the row count the user uploaded silently exceeds every
+      // number reported back.
+      anonymizedSkipped: csvAnonymizedSkipped,
       errors: results.errors,
-      message: `Imported ${results.successCount} leads${results.errorCount > 0 ? `, ${results.errorCount} errors` : ''}`,
+      message: `Imported ${results.successCount} leads${results.errorCount > 0 ? `, ${results.errorCount} errors` : ''}`
+        + (csvAnonymizedSkipped > 0 ? `, ${csvAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped` : ''),
     });
   } catch (error: any) {
     if (error.code === 'LIMIT_FILE_SIZE') {
@@ -3503,6 +3513,7 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
       }));
 
       const leadBatchSize = 100;
+      let connectionsAnonymizedSkipped = 0;
 
       for (let i = 0; i < leads.length; i += leadBatchSize) {
         const batch = leads.slice(i, i + leadBatchSize);
@@ -3510,6 +3521,10 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
 
         connectionsSuccessCount += results.successCount;
         connectionsErrorCount += results.errorCount;
+        // ENG-1002: refused placeholder rows are neither a success nor an
+        // error, so they must be carried separately or the connection count
+        // the user sees silently under-reports what was submitted.
+        connectionsAnonymizedSkipped += results.anonymizedSkipped || 0;
         if (results.errors.length > 0) {
           connectionsErrors.push(...results.errors);
         }
@@ -3530,9 +3545,11 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
         success: true,
         successCount: connectionsSuccessCount,
         errorCount: connectionsErrorCount,
+        anonymizedSkipped: connectionsAnonymizedSkipped,
         errors: connectionsErrors,
         messagesImported: messagesSuccessCount,
-        message: `Imported ${connectionsSuccessCount} connections${messagesSuccessCount > 0 ? ` and ${messagesSuccessCount} message events` : ''}${connectionsErrorCount > 0 ? `, ${connectionsErrorCount} errors` : ''}`,
+        message: `Imported ${connectionsSuccessCount} connections${messagesSuccessCount > 0 ? ` and ${messagesSuccessCount} message events` : ''}${connectionsErrorCount > 0 ? `, ${connectionsErrorCount} errors` : ''}`
+          + (connectionsAnonymizedSkipped > 0 ? `, ${connectionsAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped` : ''),
       });
     } else {
       res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "import"' });
@@ -5613,6 +5630,7 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
     // Batch create/merge leads (always force update)
     const results = await crmDb.batchCreateLeads(leadList.listId, leads);
 
+    const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
     res.json({
       success: true,
       listId: leadList.listId,
@@ -5621,8 +5639,10 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
       newCount: results.newCount,
       mergedCount: results.mergedCount,
       errorCount: results.errorCount,
+      anonymizedSkipped: syncAnonymizedSkipped,
       errors: results.errors,
-      message: `Synced ${results.successCount} subscriber(s) to lead list "${listName}"${results.errorCount > 0 ? `, ${results.errorCount} error(s)` : ''}`,
+      message: `Synced ${results.successCount} subscriber(s) to lead list "${listName}"${results.errorCount > 0 ? `, ${results.errorCount} error(s)` : ''}`
+        + (syncAnonymizedSkipped > 0 ? `, ${syncAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped` : ''),
     });
   } catch (error: any) {
     console.error('Error syncing subscribers to CRM:', error);
