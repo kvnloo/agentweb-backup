@@ -64,6 +64,35 @@ async function uploadBrandFile(
   return { url, key };
 }
 
+/**
+ * Delete an S3 object, retrying transient failures before giving up.
+ *
+ * DeleteObject is idempotent — deleting an absent key succeeds — so a retry is
+ * always safe. Worth doing because the caller's fallback is to roll back the
+ * metadata prune and fail the request, and most deleteObject failures are
+ * throttling or a blip rather than anything a retry will not clear.
+ */
+async function deleteObjectWithRetry(key: string, attempts = 3): Promise<void> {
+  let lastError: any;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await s3
+        .deleteObject({
+          Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
+          Key: key,
+        })
+        .promise();
+      return;
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, 100 * attempt));
+      }
+    }
+  }
+  throw lastError;
+}
+
 // Get user's brand guidelines
 router.get("/guidelines", authenticateToken, async (req, res) => {
   try {
@@ -595,6 +624,10 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       updatedAt: new Date().toISOString(),
     };
 
+    // Set by whichever branch below actually writes, so a failed S3 delete can
+    // put that exact record back instead of stranding the object.
+    let rollbackPrune: (() => Promise<void>) | null = null;
+
     if (fallbackOwnerUserId) {
       // The attachments live on the OWNER's record, not the org's, so prune them
       // there — and only there. Writing the pruned copy to the org as well would
@@ -682,9 +715,35 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
         throw casError;
       }
       console.log(`[BRAND DEBUG] Successfully pruned owner source attachments after asset deletion`);
+      // Undo of exactly this write, used only if the S3 delete below fails.
+      // Conditioned on the token we just wrote so a concurrent edit landing in
+      // between is never clobbered by the compensation.
+      rollbackPrune = async () => {
+        await userDb.updateUser(
+          fallbackOwnerUserId!,
+          {
+            brandGuidelines: {
+              ...ownerRecord.brandGuidelines,
+              attachments: ownerAttachments,
+              updatedAt: new Date(
+                Math.max(Date.now(), new Date(nextUpdatedAt).getTime() + 1)
+              ).toISOString(),
+            },
+          } as any,
+          {
+            condition: {
+              expression: "brandGuidelines.updatedAt = :justWritten",
+              values: { ":justWritten": nextUpdatedAt },
+            },
+          }
+        );
+      };
     } else if (isOrgLevel) {
       await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedBrandGuidelines });
       console.log(`[BRAND DEBUG] Successfully updated org brand guidelines after asset deletion`);
+      rollbackPrune = async () => {
+        await orgDb.updateOrg(user.orgId!, { brandGuidelines });
+      };
     } else {
       await dynamodb
         .update({
@@ -699,44 +758,62 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
         })
         .promise();
       console.log(`[BRAND DEBUG] Successfully updated user brand guidelines after asset deletion`);
-    }
-
-    // Delete the S3 object LAST, once every record has stopped pointing at it.
-    // A failure here leaks bytes; a failure with this ordering reversed strands
-    // a reference to a key that no longer resolves, which is what the UI renders.
-    let objectDeleted = true;
-    if (s3Key) {
-      try {
-        await s3
-          .deleteObject({
-            Bucket: process.env.AWS_S3_BUCKET || "agentweb-user-files",
-            Key: s3Key,
+      rollbackPrune = async () => {
+        await dynamodb
+          .update({
+            TableName: `${TABLE_PREFIX}AW-Users`,
+            Key: { email: user.email },
+            UpdateExpression:
+              "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
+            ExpressionAttributeValues: {
+              ":brandGuidelines": brandGuidelines,
+              ":updatedAt": new Date().toISOString(),
+            },
           })
           .promise();
+      };
+    }
+
+    // Delete the S3 object LAST, once every record has stopped pointing at it,
+    // so a reference can never outlive the object it points at.
+    //
+    // If the object will not delete, undo the prune rather than reporting a
+    // partial success. Dereferencing the attachment and leaving the bytes was
+    // the worst of both: the object stays live at a URL that still resolves,
+    // and it is no longer reachable through this endpoint at all — the retry
+    // 404s because the attachment it matches on is gone, so nothing can ever
+    // clean it up. Restoring the attachment keeps the delete atomic from the
+    // caller's side: either the asset and its object are both gone, or nothing
+    // moved and the request can simply be retried.
+    if (s3Key) {
+      try {
+        await deleteObjectWithRetry(s3Key);
       } catch (s3Error) {
-        // Still not worth failing the request on — the reference is already
-        // gone, which is what the caller asked for, and re-adding it would be
-        // worse. But do not call this a clean delete: the bytes survive at a
-        // URL that still resolves, so someone holding that link can keep
-        // fetching an asset the UI reports as deleted. Say so instead of
-        // warning into a log nobody reads.
-        objectDeleted = false;
-        console.error(
-          `[BRAND] Asset dereferenced but its S3 object survives and stays retrievable: ${s3Key}`,
-          s3Error
-        );
+        console.error(`[BRAND] Could not delete S3 object ${s3Key}, rolling back the prune`, s3Error);
+        try {
+          if (rollbackPrune) await rollbackPrune();
+          return res.status(502).json({
+            error:
+              "The stored file could not be deleted, so nothing was changed. Please try again.",
+          });
+        } catch (rollbackError) {
+          // Both the delete and its compensation failed. This is the one case
+          // that still strands bytes, so name the key loudly — it is now only
+          // reclaimable out of band.
+          console.error(
+            `[BRAND] Rollback failed after a failed S3 delete — object ${s3Key} is orphaned and needs manual cleanup`,
+            rollbackError
+          );
+          return res.status(500).json({
+            error:
+              "The asset was removed but its stored file could not be deleted and may still be reachable by direct link.",
+            objectDeleted: false,
+          });
+        }
       }
     }
 
-    res.json(
-      objectDeleted
-        ? { message: "Asset deleted successfully", objectDeleted: true }
-        : {
-            message:
-              "Asset removed from your brand guidelines, but the stored file could not be deleted and may still be reachable by direct link.",
-            objectDeleted: false,
-          }
-    );
+    res.json({ message: "Asset deleted successfully", objectDeleted: true });
   } catch (error) {
     console.error("[BRAND DEBUG] Error deleting brand asset:", error);
     res.status(500).json({ error: "Failed to delete brand asset" });
