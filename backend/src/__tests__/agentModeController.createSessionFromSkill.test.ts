@@ -113,8 +113,7 @@ describe('createSessionFromSkill authenticated static brief', () => {
   });
   it('keeps an authorized skill without a welcome message usable', async () => {
     (agent.getAuthorizedSkill as jest.Mock).mockResolvedValue({ ...skill, welcomeMessage: undefined });
-    const res = response();
-    await agentModeController.createSession(request('skill-1'), res);
+    const res = response(); await agentModeController.createSession(request('skill-1'), res);
     expect(db.createChatSession.mock.calls[0][10]).toEqual(expect.objectContaining({ messages: [] }));
     expect(res.status).toHaveBeenCalledWith(201);
   });

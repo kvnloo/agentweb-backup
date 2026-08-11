@@ -102,6 +102,7 @@ jest.mock('../services/db', () => ({
 // guard installed in `beforeEach` is the belt to this mock's braces: it asserts the
 // absence of traffic rather than trusting that the mock registered.
 jest.mock('../services/emailService', () => ({
+  __esModule: true,
   emailService: {
     sendEmail: jest.fn().mockResolvedValue(undefined),
   },
