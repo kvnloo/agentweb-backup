@@ -34,6 +34,20 @@
 export const TRUNCATION_NOTICE = '[Content truncated — full response in S3]';
 
 /**
+ * Seal a slice with a caller-supplied notice instead of the S3 one.
+ *
+ * The storage cap below the S3 preview is a SECOND bare `substring` on the same
+ * payload, reachable whenever the S3 upload failed (or was skipped) and left the
+ * content full-size. It would re-cut an already-sealed payload right back open, so
+ * it has to seal too — but its notice reports the original size rather than
+ * pointing at an S3 object that does not exist.
+ */
+export function sealTruncatedPayloadWithNotice(slice: string, notice: string): string {
+  const sealed = sealTruncatedPayload(slice);
+  return sealed.slice(0, sealed.length - TRUNCATION_NOTICE.length) + notice;
+}
+
+/**
  * How many times we rewind to an earlier boundary looking for a slice that closes
  * into valid JSON. Each rewind is cheap and strictly shortens the body; the cap is
  * only a backstop against a pathological payload (e.g. a long string value full of

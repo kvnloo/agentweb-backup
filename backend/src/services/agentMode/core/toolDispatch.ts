@@ -29,7 +29,7 @@ import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
-import { sealTruncatedPayload } from './truncatedPayload';
+import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
 // OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
 // exporter env config (spans become no-ops), so they don't entangle the module
 // or affect the characterization contract — telemetry only, never behavior.
@@ -933,8 +933,14 @@ export async function executePreparedTools(
         }
       }
 
+      // ENG-1054: seal here too. This cap is a SECOND bare cut on the same payload,
+      // reached when the S3 offload above failed and left the content full-size —
+      // an unsealed slice here would reopen the JSON just as the preview one did.
       const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > maxToolContentSize
-        ? toolContent.substring(0, maxToolContentSize) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
+        ? sealTruncatedPayloadWithNotice(
+          toolContent.substring(0, maxToolContentSize),
+          '[Content truncated for storage — original size: ' + toolContent.length + ' chars]',
+        )
         : toolContent;
       (messages as any[]).push({
         tool_call_id: toolCall.id,

@@ -4,7 +4,7 @@
  * 20,081-char echo were the model finishing JSON we had cut mid-string.
  */
 
-import { sealTruncatedPayload, TRUNCATION_NOTICE } from '../truncatedPayload';
+import { sealTruncatedPayload, sealTruncatedPayloadWithNotice, TRUNCATION_NOTICE } from '../truncatedPayload';
 
 /** The payload is only useful to the model if it still parses. */
 function parsedBody(sealed: string): any {
@@ -77,5 +77,17 @@ describe('sealTruncatedPayload (ENG-1054)', () => {
     expect(body.knowledge_bases[0].name).toBe('Hello World Test');
     expect(body.knowledge_bases[1].name).toBe('1_fixed_csv');
     expect(sealed).toContain(TRUNCATION_NOTICE);
+  });
+});
+
+describe('sealTruncatedPayloadWithNotice (ENG-1054)', () => {
+  it('seals the slice but reports the caller\'s notice, not the S3 one', () => {
+    const notice = '[Content truncated for storage — original size: 400000 chars]';
+    const sealed = sealTruncatedPayloadWithNotice('{"success":true,"ads":[{"id":"1"}', notice);
+
+    expect(sealed).toContain(notice);
+    expect(sealed).not.toContain(TRUNCATION_NOTICE);
+    expect(JSON.parse(sealed.slice(0, sealed.indexOf(notice)).trim()))
+      .toEqual({ success: true, ads: [{ id: '1' }] });
   });
 });
