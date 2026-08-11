@@ -64,6 +64,7 @@ const mockOrgDisabled = {
 const mockGetSkillsByOwner = jest.fn();
 const mockGetSkillsByOrg = jest.fn();
 const mockGetSkillsByVisibility = jest.fn();
+const mockGetSkillsAvailableToUser = jest.fn();
 const mockGetSkill = jest.fn();
 const mockUpdateSkill = jest.fn();
 const mockDeleteSkill = jest.fn();
@@ -74,6 +75,7 @@ jest.mock("../services/skillService", () => ({
     getSkillsByOwner: mockGetSkillsByOwner,
     getSkillsByOrg: mockGetSkillsByOrg,
     getSkillsByVisibility: mockGetSkillsByVisibility,
+    getSkillsAvailableToUser: mockGetSkillsAvailableToUser,
     getSkill: mockGetSkill,
     updateSkill: mockUpdateSkill,
     deleteSkill: mockDeleteSkill,
@@ -110,6 +112,18 @@ describe("GET /api/user-skills — org sharing", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockGetSkillsByVisibility.mockResolvedValue([]);
+    mockGetSkillsAvailableToUser.mockImplementation(async (userId: string, orgId?: string) => {
+      const [own, org, publicSkills, systemSkills] = await Promise.all([
+        mockGetSkillsByOwner(userId),
+        orgId ? mockGetSkillsByOrg(orgId, userId) : [],
+        mockGetSkillsByVisibility('public'),
+        mockGetSkillsByVisibility('system'),
+      ]);
+      const seen = new Set<string>();
+      return [...own, ...org, ...publicSkills, ...systemSkills].filter(skill =>
+        seen.has(skill.skillId) ? false : (seen.add(skill.skillId), true)
+      );
+    });
   });
 
   it("includes org members' private skills when user is in an org (skills enabled)", async () => {
@@ -423,6 +437,70 @@ describe("POST /api/user-skills — new skill gets orgId stamped", () => {
     expect(res.status).toBe(201);
     const call = mockUpdateSkill.mock.calls[0][0];
     expect(call.orgId).toBeUndefined();
+  });
+
+  it("preserves the legacy create call shape when welcomeMessage is absent", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId });
+    mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "skill-legacy" });
+    await request(app).post("/api/user-skills").send({ name: "Legacy", description: "d" });
+    expect(mockCreateSkill).toHaveBeenCalledWith("Legacy", "d", [], undefined, false);
+  });
+
+  it("passes the existing welcomeMessage field through canonical user-skill creation", async () => {
+    mockGetUserById.mockResolvedValue({ userId: mockUserId });
+    mockCreateSkill.mockResolvedValue({ ...mySkill, skillId: "skill-brief" });
+    await request(app).post("/api/user-skills").send({
+      name: "Brief", description: "d", welcomeMessage: "**Bring** [the artifact](https://example.com).",
+    });
+    expect(mockCreateSkill).toHaveBeenCalledWith(
+      "Brief", "d", [], undefined, false, "**Bring** [the artifact](https://example.com)."
+    );
+  });
+
+  it.each([
+    '<script>alert(1)</script>',
+    '<iframe src="https://evil.test"></iframe>',
+    '<form action="https://evil.test"><input></form>',
+    '<img src=x onerror="alert(1)">',
+    'hello\u0000world',
+    null,
+  ])("rejects unsafe welcomeMessage before user-skill creation: %s", async (welcomeMessage) => {
+    const res = await request(app).post("/api/user-skills").send({
+      name: "Unsafe", description: "d", welcomeMessage,
+    });
+
+    expect(res.status).toBe(400);
+    expect(mockCreateSkill).not.toHaveBeenCalled();
+  });
+});
+
+describe("PUT /api/user-skills/:skillId — welcomeMessage", () => {
+  it("updates the existing welcomeMessage field on an owned private skill", async () => {
+    mockGetSkill.mockResolvedValue(mySkill);
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue(mockOrgEnabled);
+
+    const res = await request(app).put("/api/user-skills/skill-1").send({
+      welcomeMessage: "Updated static brief.",
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockUpdateSkill).toHaveBeenCalledWith(expect.objectContaining({
+      skillId: "skill-1", welcomeMessage: "Updated static brief.",
+    }));
+  });
+
+  it.each(['<svg/onload=alert(1)>', null])("rejects unsafe welcomeMessage before updating an owned skill: %s", async (welcomeMessage) => {
+    mockGetSkill.mockResolvedValue(mySkill);
+    mockGetUserById.mockResolvedValue({ userId: mockUserId, orgId: mockOrgId });
+    mockGetOrgById.mockResolvedValue(mockOrgEnabled);
+
+    const res = await request(app).put("/api/user-skills/skill-1").send({
+      welcomeMessage,
+    });
+
+    expect(res.status).toBe(400);
+    expect(mockUpdateSkill).not.toHaveBeenCalled();
   });
 });
 

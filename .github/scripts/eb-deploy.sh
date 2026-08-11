@@ -23,6 +23,10 @@
 #   EB_HEALTH_SETTLE_SECONDS     Grace for health to leave Grey/Red once Ready (default 180)
 #   EB_POLL_INTERVAL_SECONDS     Seconds between describe-environments polls (default 15)
 #   EB_UPDATE_MAX_ATTEMPTS       Retries for a concurrent-update collision (default 3)
+#   EB_ABORT_MAX_RETRIES         Re-applies when EB aborts the rollout on a subset
+#                                of instances (default 1). Set to 0 to restore the
+#                                pre-ENG-1127 behaviour of failing immediately.
+#                                Bounded by EB_TOTAL_TIMEOUT_SECONDS either way.
 #   EB_HEALTH_PROBE_DRYRUN       '1' exercises the lagging-rollup health probe on
 #                                an already-successful deploy and logs what it
 #                                saw. Observation only — it runs after the deploy
@@ -72,6 +76,7 @@ EB_HEALTH_SETTLE_SECONDS="${EB_HEALTH_SETTLE_SECONDS:-180}"
 EB_POLL_INTERVAL_SECONDS="${EB_POLL_INTERVAL_SECONDS:-15}"
 EB_UPDATE_MAX_ATTEMPTS="${EB_UPDATE_MAX_ATTEMPTS:-3}"
 EB_REJECTION_GRACE_SECONDS="${EB_REJECTION_GRACE_SECONDS:-180}"
+EB_ABORT_MAX_RETRIES="${EB_ABORT_MAX_RETRIES:-1}"
 EB_HEALTH_PROBE_DRYRUN="${EB_HEALTH_PROBE_DRYRUN:-0}"
 EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS="${EB_HEALTH_PROBE_DRYRUN_TIMEOUT_SECONDS:-120}"
 EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS="${EB_HEALTH_PROBE_DRYRUN_MARGIN_SECONDS:-30}"
@@ -107,6 +112,38 @@ EB_TERMINAL_EVENT_PATTERNS=(
   'Failed to deploy configuration'
   'You cannot configure a load balancer'
 )
+
+# ERROR-severity EB events that mean the rollout failed on a SUBSET of instances
+# and can succeed on a re-apply (ENG-1127).
+#
+# EB requires every instance to succeed. One instance failing its app-deploy
+# aborts the whole rollout, reverts the environment's version pointer, and
+# leaves the instances that did succeed on the new version. The environment then
+# sits Ready on the old version — indistinguishable, from status alone, from the
+# ENG-837 rejection this script correctly treats as terminal.
+#
+# It is not the same thing. Nothing is wrong with the bundle or the config, so
+# re-applying it converges. On 2026-08-11 the abort came from a concurrent
+# self-startup on an ASG replacement instance that had joined 31 seconds before
+# the deploy; the next deploy to land went Green untouched.
+#
+# Kept as narrow as the terminal list, and for the same reason: these two
+# strings are EB's own wording for "some instances, not your config".
+EB_ABORT_EVENT_PATTERNS=(
+  'Unsuccessful command execution on instance id(s)'
+  'During an aborted deployment'
+)
+
+# Raw text of the ERROR events read by the most recent scan, so the stale-Ready
+# branch can tell a recoverable abort from a terminal rejection without paying
+# for a second describe-events call.
+EB_LAST_ERROR_EVENTS=''
+EB_ABORT_RETRIES_USED=0
+
+# verify_deployment's return code for "the rollout aborted on a subset of
+# instances; re-apply". Distinct from 0/1 so main() cannot confuse it with a
+# genuine failure.
+readonly EB_VERIFY_RETRYABLE_ABORT=75
 
 log() {
   echo "[eb-deploy] $*"
@@ -436,6 +473,7 @@ scan_for_terminal_events() {
   [ "${EB_UPDATE_ACCEPTED_AT}" -eq 0 ] && return 0
 
   local since out pattern
+  EB_LAST_ERROR_EVENTS=''
   # EB wants an ISO-8601 timestamp; both BSD and GNU date are in play (macOS
   # locally, Linux on the runner), so try the BSD form first and fall back.
   since="$(date -u -r "${EB_UPDATE_ACCEPTED_AT}" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
@@ -459,6 +497,8 @@ scan_for_terminal_events() {
   log "[events] EB reported ERROR-severity events since the update was accepted:"
   log "[events] ${out}"
 
+  EB_LAST_ERROR_EVENTS="${out}"
+
   for pattern in "${EB_TERMINAL_EVENT_PATTERNS[@]}"; do
     if printf '%s' "${out}" | grep -qF "${pattern}"; then
       fail "Elastic Beanstalk REJECTED this update and it cannot succeed. EB reported: '${pattern}'. Version '${EB_VERSION_LABEL}' was NOT applied and '${EB_ENVIRONMENT_NAME}' is still running '${EB_CURRENT_VERSION}'. Full event text: ${out}"
@@ -466,6 +506,24 @@ scan_for_terminal_events() {
   done
 
   return 0
+}
+
+# True when the most recent event scan carries EB's wording for a rollout that
+# failed on a subset of instances rather than being rejected outright.
+#
+# Reads only what scan_for_terminal_events already fetched, so this costs no
+# extra AWS call and cannot itself fail the deploy.
+events_show_recoverable_abort() {
+  local pattern
+  if [ -z "${EB_LAST_ERROR_EVENTS}" ]; then
+    return 1
+  fi
+  for pattern in "${EB_ABORT_EVENT_PATTERNS[@]}"; do
+    if printf '%s' "${EB_LAST_ERROR_EVENTS}" | grep -qF "${pattern}"; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 # Creates the application version. A genuine failure fails the job; the single
@@ -583,6 +641,19 @@ verify_deployment() {
         stale_ready_since=$(now_seconds)
         log "Environment is Ready but still running '${EB_CURRENT_VERSION}'; allowing ${EB_REJECTION_GRACE_SECONDS}s for the update to begin."
       elif [ "$(( $(now_seconds) - stale_ready_since ))" -ge "${EB_REJECTION_GRACE_SECONDS}" ]; then
+        # A subset-of-instances abort lands in exactly this state but is not a
+        # rejection: the bundle is fine and a re-apply converges (ENG-1127).
+        # scan_for_terminal_events has already run and would have failed the job
+        # outright on a terminal pattern, so a terminal rejection can never be
+        # retried here even when EB reports both in the same event batch.
+        if events_show_recoverable_abort; then
+          if [ "${EB_ABORT_RETRIES_USED}" -lt "${EB_ABORT_MAX_RETRIES}" ]; then
+            EB_ABORT_RETRIES_USED=$(( EB_ABORT_RETRIES_USED + 1 ))
+            log "[abort-retry] EB aborted the rollout on a subset of instances, so '${EB_VERSION_LABEL}' was not applied and '${EB_ENVIRONMENT_NAME}' is back on '${EB_CURRENT_VERSION}'. The bundle and config are fine, so re-applying (${EB_ABORT_RETRIES_USED}/${EB_ABORT_MAX_RETRIES}) within the remaining budget. EB reported: ${EB_LAST_ERROR_EVENTS}"
+            return "${EB_VERIFY_RETRYABLE_ABORT}"
+          fi
+          fail "environment '${EB_ENVIRONMENT_NAME}' aborted the rollout of version '${EB_VERSION_LABEL}' on a subset of instances and was still Ready on '${EB_CURRENT_VERSION}' after ${EB_ABORT_RETRIES_USED} re-apply attempt(s). Version '${EB_VERSION_LABEL}' was NOT applied. EB reported: ${EB_LAST_ERROR_EVENTS}"
+        fi
         fail "environment '${EB_ENVIRONMENT_NAME}' has been Ready on version '${EB_CURRENT_VERSION}' for ${EB_REJECTION_GRACE_SECONDS}s after update-environment accepted '${EB_VERSION_LABEL}'. Elastic Beanstalk took the request and then declined to apply it, so this will never converge. Check the environment's ERROR events for the rejection reason."
       fi
     else
@@ -652,8 +723,24 @@ main() {
   log "Deploying '${EB_VERSION_LABEL}' to application '${EB_APPLICATION_NAME}' environment '${EB_ENVIRONMENT_NAME}'."
   log "Overall budget: ${EB_TOTAL_TIMEOUT_SECONDS}s (settle cap ${EB_SETTLE_TIMEOUT_SECONDS}s per attempt, up to ${EB_UPDATE_MAX_ATTEMPTS} attempts)."
   create_application_version
-  update_environment
-  verify_deployment
+
+  # One apply/verify cycle, plus a bounded re-apply when EB aborts the rollout
+  # on a subset of instances (ENG-1127). Every other outcome still exits from
+  # inside verify_deployment via fail(), and EB_RUN_DEADLINE bounds the loop
+  # regardless of how many cycles it takes.
+  local verify_rc
+  while :; do
+    update_environment
+    verify_rc=0
+    verify_deployment || verify_rc=$?
+    if [ "${verify_rc}" -eq 0 ]; then
+      break
+    fi
+    if [ "${verify_rc}" -ne "${EB_VERIFY_RETRYABLE_ABORT}" ]; then
+      exit "${verify_rc}"
+    fi
+  done
+
   log "Deployment of '${EB_VERSION_LABEL}' to '${EB_ENVIRONMENT_NAME}' is complete and verified."
 }
 
