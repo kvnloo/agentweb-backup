@@ -53,10 +53,13 @@ async function main() {
   console.log(`account=${accountId} list=${listId} user=${userId ?? '(none)'}`);
   const before = Date.now();
   const result = await reconcileSentInvitationsToCrm({ accountId, listId, userId, dryRun });
+  const refreshEvidence = result.liveRefreshFailed
+    ? `source=cache newestCachedSyncedAt=${result.newestCachedSyncedAt ?? 'none'}`
+    : 'source=live';
   console.log(
     `Done in ${Math.round((Date.now() - before) / 1000)}s — ` +
       `total=${result.total} created=${result.created} updated=${result.updated} ` +
-      `(alreadyRecorded=${result.alreadyRecorded}) skipped=${result.skipped}`,
+      `(alreadyRecorded=${result.alreadyRecorded}) skipped=${result.skipped} ${refreshEvidence}`,
   );
 }
 
