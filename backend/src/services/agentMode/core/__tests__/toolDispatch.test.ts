@@ -260,6 +260,33 @@ describe('executePreparedTools', () => {
   // {success:false} (it swallows its own errors), so the offload used to be
   // skipped silently and the payload became indistinguishable from a small
   // response until the trimmer destroyed it.
+  // ENG-1054: the in-memory preview is a hard byte slice, so it lands mid-JSON.
+  // Handing the model an unterminated structure is what produced the production
+  // "}]" final answer — the model closed our JSON instead of writing a reply.
+  it('seals the S3 preview so a truncated response is never left mid-JSON', async () => {
+    const big = `{"success":true,"ads":[${'{"id":"120248669405960585","picture":"https://s3.example.com/a.png"},'.repeat(500)}]}`;
+    expect(big.length).toBeGreaterThan(20_000);
+    const upload = jest.fn().mockResolvedValue({ success: true, key: 'tool-responses/sess-1/b.txt' });
+    const ports = makePorts({
+      executePreparedAgentTool: async () => big,
+      extractToolContent: (r: any) => r,
+      uploadFileToS3WithPath: upload,
+    });
+    const input = makeInput([toolCall('a', 'call_meta_marketing_api', '{}')], ports);
+    await executePreparedTools(input);
+
+    const stored = input.messages[0].content as string;
+    const notice = '[Content truncated — full response in S3]';
+    expect(stored).toContain(notice);
+
+    // Everything between the S3 header and the notice must parse on its own.
+    const body = stored.slice(stored.indexOf('\n\n') + 2, stored.indexOf(notice)).trim();
+    const parsed = JSON.parse(body);
+    expect(parsed.success).toBe(true);
+    expect(Array.isArray(parsed.ads)).toBe(true);
+    expect(parsed.ads.length).toBeGreaterThan(0);
+  });
+
   it('retries a failed S3 offload once before giving up', async () => {
     const big = 'Y'.repeat(15_000);
     const upload = jest

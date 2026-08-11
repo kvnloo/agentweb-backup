@@ -16,6 +16,7 @@ import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentRepo
 import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -3610,6 +3611,23 @@ export class AgentModeService {
       let emptySynthesisRetries = 0;
       const MAX_EMPTY_SYNTHESIS_RETRIES = 1;
 
+      // ENG-1054: set true once a turn's whole answer was discarded as serialization
+      // residue (e.g. "}]"). It survives the retry so that, if the retry ALSO fails to
+      // synthesize, the loop reports the executed-action ledger instead of ending on a
+      // blank reply — turning one silent-output bug into another would be no fix.
+      let synthesisResidueDropped = false;
+
+      // ENG-1054 kill switch — ON by default; set AGENT_SYNTHESIS_RESIDUE_GUARD=false
+      // to disable the guard and its recap.
+      //
+      // This guard DISCARDS model output it judges unusable, and its failure mode is
+      // silent: a false positive costs the user their answer and only shows up as a
+      // log line, never as an error. Merging here deploys straight to production, so
+      // there needs to be a way to stand it down from config rather than waiting on a
+      // revert — matching how AGENT_FINALIZE_GUARD gates the other output-rewriting
+      // seam. Off restores the exact pre-ENG-1054 behaviour.
+      const synthesisResidueGuardEnabled = process.env.AGENT_SYNTHESIS_RESIDUE_GUARD !== 'false';
+
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
       // was exhausted. This is the deterministic signal a long data-gathering
@@ -3900,6 +3918,30 @@ export class AgentModeService {
           responseContent = (responseMessage.content as any).text || '';
         }
 
+        // ENG-1054: a turn whose entire text is serialization residue (observed in
+        // production as a closing message of literally "}]") is a FAILED synthesis,
+        // not an answer. Left alone it is non-empty, so the termination ladder below
+        // accepts it as the final response and the turn's deliverables are lost.
+        // Treat it as no text at all: the bounded empty-synthesis nudge then re-asks
+        // for the summary. Blanking responseMessage.content too keeps the debris out
+        // of the persisted transcript AND out of the history sent on the retry (this
+        // runs before the message is appended to `messages` below).
+        const residueDroppedThisTurn = synthesisResidueGuardEnabled && isUnusableSynthesis(responseContent);
+        if (residueDroppedThisTurn) {
+          console.warn(`AgentMode: Discarding unusable final synthesis ${JSON.stringify(responseContent.trim())} in session ${sessionId} — treating as an empty turn`);
+          synthesisResidueDropped = true;
+          responseContent = '';
+          responseMessage.content = '';
+        }
+
+        // ENG-1054: did THIS turn produce usable text? `content` below is a sticky
+        // cross-turn accumulator — any earlier turn that narrated alongside its tool
+        // calls (the common case, and the shape of the production session) leaves it
+        // non-empty for the rest of the run. So it cannot answer "did the turn we are
+        // about to terminate on actually answer?", and gating the ENG-1054 remedies on
+        // it would silently disarm both. They gate on this per-turn flag instead.
+        const turnHadUsableText = responseContent.trim().length > 0;
+
         // Update content with LLM's response
         if (responseContent) {
           content = responseContent;
@@ -3967,7 +4009,11 @@ export class AgentModeService {
           const termination = computeTermination({
             finishReason,
             stopReason,
-            content,
+            // ENG-1054: present THIS turn's (already-blanked) text when the turn's
+            // whole answer was residue. Passing the sticky accumulator would make a
+            // residue-only final turn look answered — the ladder would return
+            // final_response and the bounded synthesis retry would never fire.
+            content: residueDroppedThisTurn ? '' : content,
             toolCallsSoFar: toolCalls.length,
             maxTokensContinuations,
             maxTokenContinuationsLimit: MAX_TOKEN_CONTINUATIONS,
@@ -3994,6 +4040,33 @@ export class AgentModeService {
             console.warn(`AgentMode: Empty response after ${toolCalls.length} tool calls in session ${sessionId} — injecting synthesis prompt (retry ${emptySynthesisRetries}/${MAX_EMPTY_SYNTHESIS_RETRIES})`);
             (messages as any[]).push({ role: 'user', content: termination.injectMessage });
             continue;
+          }
+
+          // ENG-1054: the loop is terminating after a synthesis that was discarded as
+          // residue, and this final turn produced no usable text either. Ending here
+          // would hand the user stale narration from an earlier turn (or a blank reply)
+          // and erase the record of the (already-applied) actions the run executed.
+          // Report that ledger instead — tool names and outcome counts only, so it can
+          // never claim a false success. Gated on the per-turn flag, not on `content`:
+          // `content` still holds any earlier turn's text and would suppress this.
+          if (synthesisResidueGuardEnabled && synthesisResidueDropped) {
+            if (!turnHadUsableText) {
+              console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
+              content = buildExecutedActionsFallback(toolCalls);
+            } else {
+              // The retry DID produce text. Keep it — but do not let "the model
+              // emitted characters" stand in for "the model answered". A retry that
+              // returns a fragment or drifts also satisfies that check, and the
+              // record of what executed would be lost with it. Judging the prose
+              // instead is unbounded and would risk discarding a real answer, so
+              // append the ledger rather than choosing between them.
+              const footer = buildExecutedActionsFooter(toolCalls);
+              if (footer) {
+                console.warn(`AgentMode: Synthesis recovered after residue in session ${sessionId} — appending the executed-action ledger (${toolCalls.length} tool call(s))`);
+                content = `${content}\n\n${footer}`;
+              }
+            }
+            if (responseMessage) responseMessage.content = content;
           }
 
           // Log the stop reason for debugging

@@ -29,6 +29,7 @@ import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
+import { sealTruncatedPayload, sealTruncatedPayloadWithNotice } from './truncatedPayload';
 import {
   buildToolResponseS3Header,
   buildToolResponseUnavailableHeader,
@@ -943,8 +944,12 @@ export async function executePreparedTools(
 
         if (uploadedKey) {
           const header = buildToolResponseS3Header(uploadedKey, toolContent.length);
+          // ENG-1054: seal the slice instead of leaving the JSON it cut open. A bare
+          // substring lands mid-string/mid-object, and a model handed an unterminated
+          // structure completes it rather than answering — that is where the
+          // production `}]` final answer came from.
           const preview = toolContent.length > S3_IN_MEMORY_CAP
-            ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
+            ? sealTruncatedPayload(toolContent.substring(0, S3_IN_MEMORY_CAP))
             : toolContent;
           toolContent = header + preview;
         } else {
@@ -959,8 +964,14 @@ export async function executePreparedTools(
         }
       }
 
+      // ENG-1054: seal here too. This cap is a SECOND bare cut on the same payload,
+      // reached when the S3 offload above failed and left the content full-size —
+      // an unsealed slice here would reopen the JSON just as the preview one did.
       const truncatedToolContent = typeof toolContent === 'string' && toolContent.length > maxToolContentSize
-        ? toolContent.substring(0, maxToolContentSize) + '\n\n[Content truncated for storage — original size: ' + toolContent.length + ' chars]'
+        ? sealTruncatedPayloadWithNotice(
+          toolContent.substring(0, maxToolContentSize),
+          '[Content truncated for storage — original size: ' + toolContent.length + ' chars]',
+        )
         : toolContent;
       (messages as any[]).push({
         tool_call_id: toolCall.id,
