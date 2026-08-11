@@ -347,6 +347,65 @@ describe('temporary admin lifecycle', () => {
       expect(adapters.revokeIfCurrent).toHaveBeenCalledWith(grant);
     },
   );
+
+  /**
+   * Baseline for the race below: a signal arriving AFTER the child handle has
+   * resolved. The in-flight window must be indistinguishable from this.
+   */
+  async function signalAfterChildStarted(
+    signal: QaTerminationSignal,
+    exitCode: number,
+  ): Promise<{ code: number; terminateCalls: unknown[][]; revokeCalls: number }> {
+    const { adapters, handlers, child, calls } = adminAdapters(exitCode);
+    const run = runWithTemporaryAdmin('user-1', ['node', 'qa.js'], adapters);
+    await flushUntil(() => calls.includes('startChild'));
+    await handlers.get(signal)!();
+    return {
+      code: await run,
+      terminateCalls: child.terminate.mock.calls,
+      revokeCalls: adapters.revokeIfCurrent.mock.calls.length,
+    };
+  }
+
+  it.each(QA_TERMINATION_SIGNALS)(
+    'terminates the child spawned during the %s in-flight window instead of leaving it running',
+    async signal => {
+      const exitCode = 7;
+      const baseline = await signalAfterChildStarted(signal, exitCode);
+
+      const { adapters, handlers, child, grant, calls } = adminAdapters(exitCode);
+      // The process is already spawned but the handle has NOT been returned yet —
+      // the exact window in which the signal handler sees `child` as undefined.
+      let releaseSpawn!: () => void;
+      const spawnInFlight = new Promise<void>(resolve => {
+        releaseSpawn = resolve;
+      });
+      adapters.startChild.mockImplementation(async () => {
+        calls.push('startChild');
+        await spawnInFlight;
+        return child;
+      });
+
+      const run = runWithTemporaryAdmin('user-1', ['node', 'qa.js'], adapters);
+      await flushUntil(() => calls.includes('startChild'));
+
+      await handlers.get(signal)!();
+      // Nothing exists to kill yet: this is the race, not the bug.
+      expect(child.terminate).not.toHaveBeenCalled();
+
+      releaseSpawn();
+
+      // The child must not outlive the signal that revoked its grant — it would
+      // 403 on every request from here on.
+      await expect(run).resolves.toBe(baseline.code);
+      expect(child.terminate.mock.calls).toEqual(baseline.terminateCalls);
+      expect(child.terminate).toHaveBeenCalledWith(signal);
+      // Exactly one completed compare-and-set revoke, same as every other path.
+      expect(adapters.revokeIfCurrent).toHaveBeenCalledTimes(baseline.revokeCalls);
+      expect(adapters.revokeIfCurrent).toHaveBeenCalledWith(grant);
+      expect(calls).toContain('revoke');
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------
