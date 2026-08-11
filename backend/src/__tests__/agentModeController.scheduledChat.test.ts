@@ -252,6 +252,18 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       expect(result.actualResponse).toBe('Scheduled chats are not included in your current plan.');
     });
 
+    it('does not pause a schedule when entitlement configuration is temporarily unavailable', async () => {
+      mockedIsSubscriptionFeatureEnabled.mockResolvedValue(null);
+      const result = await runScheduledChat(baseSchedule, mockUserId, true);
+
+      expect(mockScheduleDb.updateSchedule).not.toHaveBeenCalledWith(
+        mockScheduleId,
+        expect.objectContaining({ status: 'paused' })
+      );
+      expect(mockGenerateMarketingResponseWorkerService.runInWorker).not.toHaveBeenCalled();
+      expect(result.actualResponse).toContain('temporarily unavailable');
+    });
+
     it('blocks resume while still allowing a user to pause', async () => {
       mockedIsSubscriptionFeatureEnabled.mockResolvedValue(false);
       const resumeRes = response();

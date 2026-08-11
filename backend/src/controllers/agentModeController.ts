@@ -76,12 +76,12 @@ const SCHEDULED_CHATS_NOT_INCLUDED_ERROR = {
   feature: SCHEDULED_CHATS_FEATURE,
 };
 
-async function userCanUseScheduledChats(userId: string): Promise<boolean> {
+async function userCanUseScheduledChats(userId: string): Promise<boolean | null> {
   return isSubscriptionFeatureEnabled(userId, SCHEDULED_CHATS_FEATURE);
 }
 
 async function rejectWhenScheduledChatsDisabled(userId: string, res: Response): Promise<boolean> {
-  if (await userCanUseScheduledChats(userId)) return false;
+  if ((await userCanUseScheduledChats(userId)) === true) return false;
   res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
   return true;
 }
@@ -2875,7 +2875,30 @@ export async function runScheduledChat(
 
     // Central guard covers cron/manual/public execution and old schedules that
     // remain stored after an admin removes this entitlement.
-    if (!(await userCanUseScheduledChats(userId))) {
+    const scheduledChatAccess = await userCanUseScheduledChats(userId);
+    if (scheduledChatAccess === null) {
+      const unresolvedEntitlementResult = {
+        scheduleId: schedule.scheduleId,
+        runId: preGeneratedRunId || require('uuid').v4(),
+        status: 'failure' as const,
+        passed: false,
+        actualResponse: 'Scheduled chat was not run because subscription features are temporarily unavailable. It will remain active and retry on the next scheduled run.',
+        actualFunctionCalls: [],
+        keywordMatches: [],
+        keywordMisses: schedule.keywords || [],
+        functionCallMatches: [],
+        functionCallMisses: schedule.requiredFunctionCalls || [],
+        executionTime: 0,
+        sessionId: '',
+        attempt: 0,
+        createdAt: new Date().toISOString(),
+      };
+      await scheduleDb.addRunResult(schedule.scheduleId, unresolvedEntitlementResult)
+        .catch((error) => console.error('Error saving unresolved scheduled-chat entitlement result:', error));
+      return unresolvedEntitlementResult;
+    }
+
+    if (!scheduledChatAccess) {
       await scheduleDb.updateSchedule(schedule.scheduleId, {
         status: 'paused',
         updatedAt: new Date().toISOString(),

@@ -157,8 +157,19 @@ export async function getAllowedFeatures(userId: string): Promise<string[]> {
 export async function isSubscriptionFeatureEnabled(
   userId: string,
   feature: SubscriptionFeatureId
-): Promise<boolean> {
-  return (await getAllowedFeatures(userId)).includes(feature);
+): Promise<boolean | null> {
+  const subscriptionTypeName = await getUserSubscriptionType(userId);
+  const config = await getSubscriptionTypeConfig(subscriptionTypeName);
+
+  // Keep explicit denial distinct from an unavailable/malformed admin setting.
+  // Interactive entry points still fail closed on null, while background jobs
+  // can retry later without permanently pausing a permitted schedule.
+  if (!config) return null;
+  if (!Array.isArray(config.allowedFeatures) || config.allowedFeatures.includes("*")) {
+    return true;
+  }
+
+  return config.allowedFeatures.includes(feature);
 }
 
 /**
