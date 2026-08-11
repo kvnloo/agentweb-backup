@@ -26,9 +26,7 @@ const agent = agentModeService as jest.Mocked<typeof agentModeService> & {
   applyOpeningAction: jest.Mock; executeTool: jest.Mock;
 };
 const response = () => {
-  const res: any = {};
-  res.status = jest.fn().mockReturnValue(res); res.json = jest.fn().mockReturnValue(res);
-  return res as Response;
+  const res: any = {}; res.status = jest.fn().mockReturnValue(res); res.json = jest.fn().mockReturnValue(res); return res as Response;
 };
 const request = (skillId: string, body: Record<string, unknown> = {}): AuthenticatedRequest => ({
   params: { skillId }, user: { userId: 'user-1', email: 'user@example.com' },

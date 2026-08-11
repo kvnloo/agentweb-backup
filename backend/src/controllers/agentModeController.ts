@@ -4625,7 +4625,7 @@ export const agentModeController = {
         llmModel: modelToUse, associatedSkills: [skillId],
         messages: welcomeMessage ? [{ role: 'assistant' as const, content: welcomeMessage, metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' } }] : [],
       } : undefined;
-      const session = await chatbotDb.createChatSession(
+      const createSessionArgs: Parameters<typeof chatbotDb.createChatSession> = [
         user.userId,
         undefined, // pageContent
         portalType,
@@ -4635,9 +4635,10 @@ export const agentModeController = {
         undefined, // executionId
         undefined, // emailCampaignTaskId
         finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation",
-        delegateInfo, // Pass delegate info for admin delegation tracking
-        initialSkillState
-      );
+        delegateInfo // Pass delegate info for admin delegation tracking
+      ];
+      if (initialSkillState) createSessionArgs.push(initialSkillState);
+      const session = await chatbotDb.createChatSession(...createSessionArgs);
       const sessionWithModel = skillId ? session : await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
 
       // Stamp the winner's sessionId on the idem claim so duplicate losers
