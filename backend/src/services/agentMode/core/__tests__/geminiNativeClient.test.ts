@@ -191,6 +191,47 @@ describe('toGeminiRequest', () => {
     expect(texts).toContain('[Result of get_weather: {"tempF":41}]');
   });
 
+  // ENG-1054: Gemini signs only the FIRST functionCall part of a multi-call turn.
+  // Treating `signed` per-call degraded 77 of 105 calls in the production session
+  // into conversational text, which is what taught the model to reply with
+  // transcribed tool output (and, once a payload was cut mid-JSON, with `}]`).
+  // Verified live: unsigned parts alongside a signed sibling are ACCEPTED.
+  it('keeps a MIXED-signature turn structural — only the first call is signed', () => {
+    const params: OpenAIChatParams = {
+      model: 'gemini-3.1-pro-preview',
+      messages: [
+        { role: 'user', content: 'pause both campaigns and list my knowledge bases' },
+        {
+          role: 'assistant',
+          content: '',
+          tool_calls: [
+            { id: 'c1', type: 'function', thought_signature: 'SIG1', function: { name: 'call_meta_marketing_api', arguments: '{"a":1}' } },
+            { id: 'c2', type: 'function', function: { name: 'call_meta_marketing_api', arguments: '{"a":2}' } },
+            { id: 'c3', type: 'function', function: { name: 'list_knowledge_base_files', arguments: '{}' } },
+          ],
+        },
+        { role: 'tool', tool_call_id: 'c1', content: '{"success":true}' },
+        { role: 'tool', tool_call_id: 'c2', content: '{"success":true}' },
+        { role: 'tool', tool_call_id: 'c3', content: '{"knowledge_bases":[]}' },
+      ],
+    };
+    const req = toGeminiRequest(params, OPTS);
+    const allParts = req.contents.flatMap((c: any) => c.parts);
+
+    // All three calls stay structural; only the one Gemini signed carries a signature.
+    const calls = allParts.filter((p: any) => 'functionCall' in p);
+    expect(calls).toHaveLength(3);
+    expect(calls[0].thoughtSignature).toBe('SIG1');
+    expect(calls[1].thoughtSignature).toBeUndefined();
+    expect(calls[2].thoughtSignature).toBeUndefined();
+
+    // And all three results pair as functionResponse — none leak into the
+    // conversation as `[Result of ...]` prose the model can transcribe back.
+    expect(allParts.filter((p: any) => 'functionResponse' in p)).toHaveLength(3);
+    expect(allParts.some((p: any) => typeof p.text === 'string' && p.text.startsWith('[Result of '))).toBe(false);
+    expect(allParts.some((p: any) => typeof p.text === 'string' && p.text.startsWith('[Previously called '))).toBe(false);
+  });
+
   it('translates tools to functionDeclarations with sanitized schemas', () => {
     const params: OpenAIChatParams = {
       model: 'gemini-3.5-flash',
