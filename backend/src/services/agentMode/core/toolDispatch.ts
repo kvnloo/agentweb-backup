@@ -29,6 +29,7 @@ import type { AgentToolPolicyDecision } from '../../agentToolGatewayService';
 import { classifyToolErrorClass } from '../../../utils/toolErrorClassifier';
 import { Citation, CitationRegistry, WEB_SEARCH_TOOL_NAMES, buildCitationIndexBlock } from '../../../utils/citations';
 import { appendRetryabilityGuidance } from './errorRetryability';
+import { sealTruncatedPayload } from './truncatedPayload';
 // OTel spine (ENG-141). Direct imports, NOT ports: both are pure/inert without
 // exporter env config (spans become no-ops), so they don't entangle the module
 // or affect the characterization contract — telemetry only, never behavior.
@@ -918,8 +919,12 @@ export async function executePreparedTools(
           );
           if (uploadResult.success && uploadResult.key) {
             const header = `[Full response stored at S3 key: ${uploadResult.key} (${toolContent.length} chars) — use search_tool_response tool to find specific fields]\n\n`;
+            // ENG-1054: seal the slice instead of leaving the JSON it cut open.
+            // A bare substring lands mid-string/mid-object, and a model handed an
+            // unterminated structure completes it rather than answering — that is
+            // where the production `}]` final answer came from.
             const preview = toolContent.length > S3_IN_MEMORY_CAP
-              ? toolContent.substring(0, S3_IN_MEMORY_CAP) + '\n\n[Content truncated — full response in S3]'
+              ? sealTruncatedPayload(toolContent.substring(0, S3_IN_MEMORY_CAP))
               : toolContent;
             toolContent = header + preview;
           }
