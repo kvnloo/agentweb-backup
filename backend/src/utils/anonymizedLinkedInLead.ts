@@ -50,6 +50,45 @@ export function isAnonymizedSearchLead(lead: {
 }
 
 /**
+ * True only when the lead is named with one of LinkedIn's placeholder
+ * spellings. This is the narrow half of `isAnonymizedSearchLead`, for use at
+ * the CRM write boundary (`batchCreateLeads`) where every path lands — CSV
+ * import, bulk import, outreach save, `add_leads_to_list`.
+ *
+ * The full search-boundary rule must NOT be used there. It also rejects rows
+ * with no name and no profile URL, which is right for a LinkedIn search hit
+ * (anonymized) but wrong for a CRM write: an email-only lead — a newsletter
+ * signup, a form fill, a CSV of bare addresses — has no name by design and is
+ * perfectly legitimate. Applying the wide rule at the write boundary would
+ * silently destroy it.
+ *
+ * Nobody is legitimately named "LinkedIn Member", so this half is safe
+ * everywhere. Callers report the count rather than dropping silently — a
+ * response that does not match what was written is the original ENG-1002 bug.
+ */
+export function isLinkedInPlaceholderName(lead: {
+  firstName?: string;
+  lastName?: string;
+}): boolean {
+  const fullName = `${lead.firstName ?? ''} ${lead.lastName ?? ''}`.trim().replace(/\s+/g, ' ');
+  if (!fullName) return false;
+  if (LINKEDIN_PLACEHOLDER_NAME.test(fullName)) return true;
+  // Localized spellings ("Miembro de LinkedIn", "领英会员") are not enumerable,
+  // so fall back to the brand token. Safe here because a real person's badge
+  // name ("Jane Doe | LinkedIn Top Voice") carries other name words too.
+  return LINKEDIN_BRAND_TOKEN.test(fullName) && wordsOutsideBrandToken(fullName) === 0;
+}
+
+/** Count the name's words that are not LinkedIn branding or a connective. */
+function wordsOutsideBrandToken(fullName: string): number {
+  return fullName
+    .split(/[\s|·,]+/)
+    .filter((w) => w && !LINKEDIN_BRAND_TOKEN.test(w) && !/^(de|del|di|van|von|der|the|a)$/i.test(w))
+    .filter((w) => !/^(member|user|anonymous|miembro|mitglied|utente|membre|会员)$/i.test(w))
+    .length;
+}
+
+/**
  * Same rule, applied to a raw Unipile people-search item. Mirrors how callers
  * derive a name and profile URL from the item, so a caller that filters before
  * mapping gets the identical verdict to one that filters after.

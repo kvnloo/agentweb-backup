@@ -12,6 +12,7 @@ import type { OrgRole } from "./orgAuthz";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
+import { isLinkedInPlaceholderName } from "../utils/anonymizedLinkedInLead";
 
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -6462,6 +6463,9 @@ export const crmDb = {
         // was written from, so callers can join a created leadId back to the
         // row it came from even when the row carries no email (ENG-1002).
         created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
+        // Rows refused because they are LinkedIn's anonymized placeholder
+        // rather than a person (ENG-1002). Reported, never dropped silently.
+        anonymizedSkipped: 0,
       };
 
       // Get existing leads to check for duplicates by email
@@ -6498,6 +6502,15 @@ export const crmDb = {
       const uniqueLeads = new Map<string, { lead: typeof leads[0]; index: number }>();
       const seenLinkedIn = new Set<string>();
       leads.forEach((lead, index) => {
+        // ENG-1002 (follow-up): refuse LinkedIn's anonymized placeholder at the
+        // one point every write path converges, so no caller can reintroduce
+        // the nameless, un-dedupable rows by routing around the import tool.
+        // `return` (not a re-indexed filter) keeps every surviving row's
+        // sourceIndex pointing at its ORIGINAL position for callers joining on it.
+        if (isLinkedInPlaceholderName(lead)) {
+          results.anonymizedSkipped++;
+          return;
+        }
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
         const liKey = normalizeLinkedInUrl(lead.linkedin);
 
@@ -6813,6 +6826,7 @@ export const crmDb = {
         errorCount: leads.length,
         errors: [`Batch upload failed: ${error.message}`],
         created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
+        anonymizedSkipped: 0,
       };
     }
   },
