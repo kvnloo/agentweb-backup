@@ -233,11 +233,49 @@ export interface TemporaryAdminOptions {
   visibilityAttempts?: number;
 }
 
+/**
+ * Blocks until the grant is readable on the auth path, or fails closed.
+ *
+ * Bounded by attempt count rather than wall-clock so the poll is deterministic
+ * under an injected clock. No wait follows the final read — a trailing sleep
+ * would delay the block without ever changing its outcome.
+ */
+async function awaitGrantVisible(
+  grant: AdminGrantToken,
+  adapters: TemporaryAdminAdapters,
+  attempts: number,
+  isAborted: () => boolean,
+): Promise<boolean> {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    // A termination signal during the poll has already revoked the grant.
+    // Continuing would hand the child a grant that no longer exists.
+    if (isAborted()) {
+      return false;
+    }
+    if (await adapters.readGrantVisibility(grant)) {
+      return true;
+    }
+    if (attempt < attempts) {
+      await adapters.waitBeforeRetry(attempt);
+    }
+  }
+  throw new AdminGrantNotVisibleError({
+    verdict: 'block',
+    phase: 'grant-visibility',
+    userId: grant.userId,
+    attempts,
+    detail:
+      `Admin grant for ${grant.userId} was written but never became visible on the ` +
+      `UserIdIndex read path after ${attempts} attempts — refusing to start the child, ` +
+      'which would 403 on its first protected request.',
+  });
+}
+
 export async function runWithTemporaryAdmin(
   userId: string,
   command: string[],
   adapters: TemporaryAdminAdapters,
-  _options: TemporaryAdminOptions = {},
+  options: TemporaryAdminOptions = {},
 ): Promise<number> {
   if (command.length === 0) {
     throw new Error('with-admin requires a command after --');
@@ -250,6 +288,7 @@ export async function runWithTemporaryAdmin(
   });
   let child: ChildProcessHandle | undefined;
   let cleanupPromise: Promise<void> | undefined;
+  let aborted = false;
   const unsubscribe: Array<() => void> = [];
   const cleanup = (): Promise<void> => {
     cleanupPromise ??= adapters.revokeIfCurrent(grant).then(revoked => {
@@ -263,9 +302,26 @@ export async function runWithTemporaryAdmin(
   try {
     for (const signal of QA_TERMINATION_SIGNALS) {
       unsubscribe.push(adapters.onSignal(signal, async () => {
+        aborted = true;
         child?.terminate(signal);
         await cleanup();
       }));
+    }
+
+    // The base-table write returning success does NOT mean auth can see it:
+    // authenticateToken -> getUserById queries the eventually consistent
+    // UserIdIndex GSI. Starting the child before that read flips is the race
+    // that 403s the run despite a successful grant.
+    const visible = await awaitGrantVisible(
+      grant,
+      adapters,
+      options.visibilityAttempts ?? DEFAULT_GRANT_VISIBILITY_ATTEMPTS,
+      () => aborted,
+    );
+    if (!visible || aborted) {
+      // Terminated while waiting; the grant is already revoked. Never start the
+      // child against a grant that no longer exists.
+      return 1;
     }
 
     child = await adapters.startChild(command);
@@ -382,8 +438,25 @@ export interface DynamoUpdatePort {
 export function createDynamoTemporaryAdminAdapters(
   target: TemporaryAdminTarget,
   docClient: DynamoUpdatePort = new AWS.DynamoDB.DocumentClient(),
-): Pick<TemporaryAdminAdapters, 'grantConditional' | 'revokeIfCurrent'> {
+): Pick<TemporaryAdminAdapters, 'grantConditional' | 'revokeIfCurrent' | 'readGrantVisibility'> {
   return {
+    /**
+     * Mirrors `userDb.getUserById` exactly — same table, same `UserIdIndex`
+     * query, no ConsistentRead. Reading the base table instead would always
+     * report the grant we just wrote and prove nothing about what the child
+     * sees. A missing row means not-yet-visible, never "assume it landed".
+     */
+    async readGrantVisibility(grant) {
+      const result = await docClient
+        .query({
+          TableName: target.tableName,
+          IndexName: 'UserIdIndex',
+          KeyConditionExpression: 'userId = :userId',
+          ExpressionAttributeValues: { ':userId': grant.userId },
+        })
+        .promise();
+      return result.Items?.[0]?.isAdmin === grant.expectedGrantedValue;
+    },
     async grantConditional(request) {
       await docClient
         .update({
@@ -436,8 +509,16 @@ export function createDynamoTemporaryAdminAdapters(
 }
 
 /** Real child-process + process-signal adapters for `with-admin`. */
-export function createProcessChildAdapters(): Pick<TemporaryAdminAdapters, 'startChild' | 'onSignal'> {
+export function createProcessChildAdapters(
+  baseDelayMs = 250,
+): Pick<TemporaryAdminAdapters, 'startChild' | 'onSignal' | 'waitBeforeRetry'> {
   return {
+    /** Linear backoff between GSI visibility reads. Only the real CLI ever sleeps. */
+    async waitBeforeRetry(attempt) {
+      await new Promise<void>(resolve => {
+        setTimeout(resolve, baseDelayMs * attempt);
+      });
+    },
     async startChild(command) {
       const child = spawn(command[0], command.slice(1), { stdio: 'inherit' });
       const exit = new Promise<number>((resolve, reject) => {
@@ -585,6 +666,13 @@ async function runWithAdminCommand(
   try {
     return await runWithTemporaryAdmin(required.QA_ADMIN_FIXTURE_USER_ID, command, adapters);
   } catch (error) {
+    if (error instanceof AdminGrantNotVisibleError) {
+      // Structured verdict on stdout like every other block, so a caller
+      // parsing our output sees WHICH step refused to proceed.
+      io.stdout(JSON.stringify(error.report));
+      io.stderr(error.report.detail);
+      return 1;
+    }
     io.stderr(error instanceof Error ? error.message : String(error));
     return 1;
   }

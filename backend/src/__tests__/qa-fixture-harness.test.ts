@@ -105,6 +105,16 @@ function adminAdapters(exitCode = 0): {
   };
 }
 
+/** Drains microtasks until `predicate` holds, so tests never guess tick counts. */
+async function flushUntil(predicate: () => boolean, maxTicks = 100): Promise<void> {
+  for (let tick = 0; tick < maxTicks && !predicate(); tick += 1) {
+    await Promise.resolve();
+  }
+  if (!predicate()) {
+    throw new Error('flushUntil: condition never became true');
+  }
+}
+
 describe('QA fixture preflight', () => {
   const partnerFixtures = fixtures.map(fixture => ({
     ...fixture,
@@ -294,13 +304,39 @@ describe('temporary admin lifecycle', () => {
     expect(calls[calls.length - 1]).toBe('revoke');
   });
 
+  it('never starts the child when a termination signal lands during the visibility wait', async () => {
+    const { adapters, handlers, grant, calls } = adminAdapters();
+    let signalled = false;
+    // Invisible until the signal lands, then visible — so a run that ignores
+    // the abort would sail on and spawn the child against a REVOKED grant.
+    adapters.readGrantVisibility.mockImplementation(async () => {
+      calls.push('visibility');
+      return signalled;
+    });
+
+    const run = runWithTemporaryAdmin('user-1', ['node', 'qa.js'], adapters, {
+      visibilityAttempts: 50,
+    });
+    await flushUntil(() => calls.includes('visibility'));
+
+    signalled = true;
+    await handlers.get('SIGTERM')!();
+    await expect(run).resolves.toBe(1);
+
+    // The signal handler revoked the grant; spawning afterwards would hand the
+    // child a grant that no longer exists.
+    expect(adapters.startChild).not.toHaveBeenCalled();
+    expect(adapters.revokeIfCurrent).toHaveBeenCalledWith(grant);
+  });
+
   it.each(QA_TERMINATION_SIGNALS)(
     'terminates the child and compare-and-set cleans the grant on %s',
     async signal => {
-      const { adapters, handlers, child, grant } = adminAdapters();
+      const { adapters, handlers, child, grant, calls } = adminAdapters();
       const run = runWithTemporaryAdmin('user-1', ['node', 'qa.js'], adapters);
-      await Promise.resolve();
-      await Promise.resolve();
+      // Wait for the child to actually be running rather than guessing at a
+      // microtask count — the visibility poll changes how many ticks that takes.
+      await flushUntil(() => calls.includes('startChild'));
 
       const handler = handlers.get(signal);
       expect(handler).toBeDefined();
@@ -597,9 +633,14 @@ describe('DynamoDB compare-and-set adapters', () => {
   type UpdateParams = Parameters<DynamoUpdatePort['update']>[0];
   type QueryParams = Parameters<DynamoUpdatePort['query']>[0];
 
-  function fakeDocClient(impl: (params: UpdateParams) => Promise<unknown>) {
+  function fakeDocClient(
+    impl: (params: UpdateParams) => Promise<unknown>,
+    queryImpl: (params: QueryParams) => Promise<{ Items?: Array<Record<string, unknown>> }> =
+      async () => ({ Items: [] }),
+  ) {
     const update = jest.fn((params: UpdateParams) => ({ promise: () => impl(params) }));
-    return { update };
+    const query = jest.fn((params: QueryParams) => ({ promise: () => queryImpl(params) }));
+    return { update, query };
   }
 
   it('grants with a userId-pinned conditional update keyed on the fixture email', async () => {
@@ -654,15 +695,10 @@ describe('DynamoDB compare-and-set adapters', () => {
 
   it('reads visibility through UserIdIndex, mirroring the auth path getUserById uses', async () => {
     const queried: QueryParams[] = [];
-    const docClient = {
-      ...fakeDocClient(async () => ({})),
-      query: jest.fn((params: QueryParams) => ({
-        promise: async () => {
-          queried.push(params);
-          return { Items: [{ userId: 'user-1', isAdmin: true }] };
-        },
-      })),
-    };
+    const docClient = fakeDocClient(async () => ({}), async params => {
+      queried.push(params);
+      return { Items: [{ userId: 'user-1', isAdmin: true }] };
+    });
     const adapters = createDynamoTemporaryAdminAdapters(target, docClient);
 
     await expect(
@@ -681,12 +717,10 @@ describe('DynamoDB compare-and-set adapters', () => {
   });
 
   it('reports the grant as not yet visible when the index still serves the old isAdmin', async () => {
-    const docClient = {
-      ...fakeDocClient(async () => ({})),
-      query: jest.fn(() => ({
-        promise: async () => ({ Items: [{ userId: 'user-1', isAdmin: false }] }),
-      })),
-    };
+    const docClient = fakeDocClient(
+      async () => ({}),
+      async () => ({ Items: [{ userId: 'user-1', isAdmin: false }] }),
+    );
     const adapters = createDynamoTemporaryAdminAdapters(target, docClient);
 
     await expect(
@@ -700,10 +734,7 @@ describe('DynamoDB compare-and-set adapters', () => {
   });
 
   it('treats a missing row on the index as not visible rather than assuming the grant landed', async () => {
-    const docClient = {
-      ...fakeDocClient(async () => ({})),
-      query: jest.fn(() => ({ promise: async () => ({ Items: [] }) })),
-    };
+    const docClient = fakeDocClient(async () => ({}), async () => ({ Items: [] }));
     const adapters = createDynamoTemporaryAdminAdapters(target, docClient);
 
     await expect(
