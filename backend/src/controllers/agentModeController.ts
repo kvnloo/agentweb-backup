@@ -4564,7 +4564,7 @@ export const agentModeController = {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
       const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
-      const skillId = req.params.skillId;
+      const skillId = req.params?.skillId;
       const portalType = skillId ? 'agent' : requestedPortalType;
       let skill;
       if (skillId) {
