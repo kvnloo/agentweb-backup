@@ -243,6 +243,44 @@ describe('runScheduledChat — publish-press circuit breaker (ENG-947)', () => {
     expect(result.status).toBe('failure');
   });
 
+  it('does not let a FAILED publish satisfy the requirement', async () => {
+    // Live preview repro (2026-08-11): the model called post_on_connected_account,
+    // the tool errored with "Multiple twitter accounts connected", NOTHING was
+    // posted — and the run was stored as success with the requirement matched,
+    // because the ledger counted the attempt. The owner is told their post went
+    // out when it did not.
+    mockWorker.runInWorker.mockResolvedValue(workerReply([
+      { name: 'post_on_connected_account', arguments: {}, error: 'Multiple twitter accounts connected' } as any,
+    ], 'I attempted the post.') as any);
+
+    const result = await runScheduledChat(publishSchedule, 'kevin', true);
+
+    expect(result.status).toBe('failure');
+    expect(result.passed).toBe(false);
+    expect(result.functionCallMatches).toEqual([]);
+    expect(result.functionCallMisses).toEqual(['post_on_connected_account']);
+    // And the run is still capped rather than pressed to 20 — the two fixes compose.
+    expect(result.attempt).toBe(MAX_PUBLISH_PRESS_ATTEMPTS);
+    expect((result as any).publishHeldForApproval).toBe(true);
+  });
+
+  it('leaves a failed NON-publish required call counting as met, exactly as before', async () => {
+    // The blast-radius guard. Only irreversible publishes are tightened; every
+    // other scheduled run keeps the historical attempted-counts-as-met rule, so
+    // this change cannot start failing runs that pass today.
+    const readOnlySchedule = { ...publishSchedule, requiredFunctionCalls: ['get_marketing_tips'] };
+    mockScheduleDb.getScheduleById.mockResolvedValue(readOnlySchedule as any);
+    mockWorker.runInWorker.mockResolvedValue(workerReply([
+      { name: 'get_marketing_tips', arguments: {}, error: 'upstream 500' } as any,
+    ], 'Here is a summary.') as any);
+
+    const result = await runScheduledChat(readOnlySchedule, 'kevin', true);
+
+    expect(result.status).toBe('success');
+    expect(result.functionCallMisses).toEqual([]);
+    expect(mockWorker.runInWorker).toHaveBeenCalledTimes(1);
+  });
+
   it('leaves a MIXED requirement set on the full retry budget', async () => {
     const mixedSchedule = {
       ...publishSchedule,
