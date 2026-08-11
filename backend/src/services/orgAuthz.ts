@@ -183,11 +183,40 @@ export function isBillingRoot(
  * except the billing root itself.
  */
 export function inheritsOrgBilling(
-  user: Pick<AuthzUser, "userId" | "orgId"> | null | undefined,
+  user: BillingSubject | null | undefined,
   org: AuthzOrg | null | undefined,
 ): boolean {
   if (!user?.orgId || !org) return false;
-  return !isBillingRoot(user, org);
+  if (isBillingRoot(user, org)) return false;
+  // ENG-1084: unified on the SELF-PAY side, not the pooling side. Entitlement
+  // (`getUserSubscriptionType`) already let a member riding their own live
+  // subscription read their own tier — accepting an invite touches no billing
+  // state, so a member can independently pay for a tier the owner doesn't have.
+  // Quota (`resolveBillingUserId`) had no such carve-out and pooled them onto
+  // the owner's counter regardless, so the member read one plan and spent
+  // another. Pooling them instead would have meant charging the org for usage
+  // by someone paying separately, and silently voiding a plan the member is
+  // billed for — the worse of the two wrongs. A member who pays for a plan gets
+  // that plan's quota; everyone else inherits the root's. Third drift between
+  // these two fields (ENG-288, ENG-954, ENG-1084) — hence one predicate now.
+  return !hasOwnLiveSubscription(user);
+}
+
+/** The fields billing resolution reads off a user record. */
+export type BillingSubject = Pick<AuthzUser, "userId" | "orgId"> & {
+  subscription_status?: string | null;
+};
+
+/**
+ * Whether the user holds a live subscription of their own, independent of any org.
+ *
+ * `active` / `trialing` is the entitling convention used throughout
+ * `stripeService.ts`; any other status (canceled, past_due, unset) is not live.
+ */
+export function hasOwnLiveSubscription(
+  user: Pick<BillingSubject, "subscription_status"> | null | undefined,
+): boolean {
+  return user?.subscription_status === "active" || user?.subscription_status === "trialing";
 }
 
 /** Roles that count toward the "an org must always retain an owner" invariant. */
