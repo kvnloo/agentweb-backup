@@ -693,7 +693,7 @@ router.post("/crm-sync/:source/start", async (req, res) => {
     const syncStartedAt = new Date().toISOString();
     const results = leads.length > 0
       ? await crmDb.batchCreateLeads(parsed.listId, leads)
-      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[] };
+      : { successCount: 0, newCount: 0, mergedCount: 0, errorCount: 0, errors: [] as string[], anonymizedSkipped: 0 };
 
     let updatedLastSyncAt: string | null = parsed.lastSyncAt || null;
     if (results.errorCount === 0) {
@@ -711,6 +711,16 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       );
     }
 
+    // ENG-1002: this route reports `attemptedCount` outright, so a row refused
+    // as a LinkedIn placeholder leaves attempted > success + errors with
+    // nothing to explain the difference. Report it in both the payload and the
+    // message, as the other import paths do.
+    const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
+    const skippedNote =
+      syncAnonymizedSkipped > 0
+        ? ` ${syncAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped.`
+        : "";
+
     return res.json({
       success: true,
       source,
@@ -723,11 +733,13 @@ router.post("/crm-sync/:source/start", async (req, res) => {
       newCount: results.newCount,
       mergedCount: results.mergedCount,
       errorCount: results.errorCount,
+      anonymizedSkipped: syncAnonymizedSkipped,
       errors: results.errors,
       message:
-        results.errorCount === 0
+        (results.errorCount === 0
           ? `Synced ${results.successCount} record(s) from ${source}.`
-          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`,
+          : `Sync completed with ${results.errorCount} error(s). Last sync time was not updated.`) +
+        skippedNote,
     });
   } catch (error: any) {
     console.error("Error running CRM sync:", error);
