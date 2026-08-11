@@ -550,7 +550,8 @@ export class ChatbotDB {
     executionId?: string,
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
-    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
+    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -589,6 +590,7 @@ export class ChatbotDB {
       sessionType: sessionType || "regular", // Default to regular if not specified
       delegateInfo, // Store delegate access info if provided
       ...(portalType === "agent" ? { associatedSkills: [] } : {}), // Initialize for agent sessions so skill enforcement applies
+      ...initialState,
     };
 
     if (pageContent) {

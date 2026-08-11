@@ -45,6 +45,7 @@ import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
+import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
@@ -4561,7 +4562,19 @@ export const agentModeController = {
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
-      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
+      const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
+      const skillId = req.params?.skillId;
+      const portalType = skillId ? 'agent' : requestedPortalType;
+      let skill;
+      if (skillId) {
+        skill = await agentModeService.getAuthorizedSkill(skillId, user.userId);
+        if (!skill) {
+          return res.status(404).json({ error: 'Skill not found' });
+        }
+        const validationError = validateWelcomeMessage(skill.welcomeMessage);
+        if (validationError) return res.status(400).json({ error: validationError });
+      }
+      const pageIdentifier = skillId ? `skill-${skillId}` : requestedPageIdentifier;
 
       // Cross-restart duplicate-submit lock, keyed by the client-provided
       // idempotencyKey scoped to this user. The conditional idem#… put means
@@ -4592,12 +4605,27 @@ export const agentModeController = {
       // Determine sessionType: if explicitly provided, use it; otherwise default to 'regular'
       // For ad image generation from Images page, sessionType should be 'image-generation'
       // For ad video generation from Videos page, sessionType should be 'video-generation'
-      const finalSessionType = sessionType || 'regular';
+      const finalSessionType = skillId ? 'regular' : sessionType || 'regular';
 
       // Pass delegate info if this is a delegated access session
       const delegateInfo = authReq.delegateInfo;
 
-      const session = await chatbotDb.createChatSession(
+      // Resolve all initial state before the one session Put, so a Skill
+      // session is either fully initialized or absent.
+      let modelToUse: string;
+      if (finalSessionType === 'report_generation') {
+        modelToUse = await agentModeService.getReportsModel();
+      } else if (portalType === 'emma-sidebar') {
+        modelToUse = await agentModeService.getCustomerSupportDefaultModel();
+      } else {
+        modelToUse = await agentModeService.getDefaultModel();
+      }
+      const welcomeMessage = skill?.welcomeMessage?.trim();
+      const initialSkillState = skillId ? {
+        llmModel: modelToUse, associatedSkills: [skillId],
+        messages: welcomeMessage ? [{ role: 'assistant' as const, content: welcomeMessage, metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' } }] : [],
+      } : undefined;
+      const createSessionArgs: Parameters<typeof chatbotDb.createChatSession> = [
         user.userId,
         undefined, // pageContent
         portalType,
@@ -4608,19 +4636,10 @@ export const agentModeController = {
         undefined, // emailCampaignTaskId
         finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation",
         delegateInfo // Pass delegate info for admin delegation tracking
-      );
-
-      // Set default model for new sessions
-      // Use reports model for report_generation sessions, customer support model for emma-sidebar, otherwise use default model
-      let modelToUse: string;
-      if (finalSessionType === 'report_generation') {
-        modelToUse = await agentModeService.getReportsModel();
-      } else if (portalType === 'emma-sidebar') {
-        modelToUse = await agentModeService.getCustomerSupportDefaultModel();
-      } else {
-        modelToUse = await agentModeService.getDefaultModel();
-      }
-      const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+      ];
+      if (initialSkillState) createSessionArgs.push(initialSkillState);
+      const session = await chatbotDb.createChatSession(...createSessionArgs);
+      const sessionWithModel = skillId ? session : await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
 
       // Stamp the winner's sessionId on the idem claim so duplicate losers
       // attach to THIS session instead of getting 409 (best-effort by design —
@@ -4629,11 +4648,12 @@ export const agentModeController = {
         await recordIdempotencySessionId(createIdemKeyHeld, session.sessionId);
       }
 
-      res.status(201).json(sessionWithModel);
+      res.status(201).json(skillId ? {
+        ...sessionWithModel,
+        redirectUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${session.sessionId}`,
+      } : sessionWithModel);
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
-      // Release the claim so the client's retry is accepted — a failed create
-      // must not lock the user out for the idem ttl.
       if (createIdemKeyHeld) {
         await releaseIdempotency(createIdemKeyHeld);
       }
