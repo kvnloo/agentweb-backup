@@ -49,7 +49,7 @@ import path from 'path';
 import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
-import { skillService } from './skillService';
+import { skillService, Skill } from './skillService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
@@ -7386,6 +7386,84 @@ export class AgentModeService {
       console.error(`AgentMode: Error executing tool ${toolName}:`, error);
       throw error;
     }
+  }
+
+  // ENG-712 — Opening actions. When a session is created from a Skill that
+  // carries an `openingAction`, this renders the container's first move as a
+  // synthetic assistant turn before the user's first input:
+  //   - 'brief': static text (the ritual reminder).
+  //   - 'prefetch': runs the declared tool calls and renders their raw
+  //     results — never LLM-narrated, so it can't read as a generic
+  //     auto-draft. A failed/thrown tool call degrades LOUDLY into a plain,
+  //     honest statement; it never fabricates placeholder material and never
+  //     leaves the session silently blank (AC4).
+  // A skill with no `openingAction` costs nothing here: this returns
+  // `{ applied: false }` without touching the session or calling any tool
+  // (AC5) — the caller (createSessionFromSkill) still creates a perfectly
+  // normal session either way.
+  public async applyOpeningAction(
+    skill: Skill,
+    sessionId: string,
+    userId: string
+  ): Promise<{ applied: boolean; degraded?: boolean }> {
+    const openingAction = skill.openingAction;
+    if (!openingAction) {
+      return { applied: false };
+    }
+
+    let content: string;
+    let degraded = false;
+
+    if (openingAction.type === 'brief') {
+      content = openingAction.content || '';
+    } else if (openingAction.type === 'prefetch') {
+      try {
+        const toolCalls = openingAction.toolCalls || [];
+        const results: Array<{ toolName: string; result: any }> = [];
+        for (const call of toolCalls) {
+          const toolResult = await this.executeTool(
+            skill.llmModel || this.default_model,
+            call.toolName,
+            call.args || {},
+            userId,
+            sessionId,
+            false
+          );
+          if (!toolResult || toolResult.success === false) {
+            throw new Error(
+              (toolResult && toolResult.error) || `Tool "${call.toolName}" returned no result`
+            );
+          }
+          results.push({ toolName: call.toolName, result: toolResult });
+        }
+        content = this.formatOpeningActionPrefetchResults(results);
+      } catch (error) {
+        console.error(`AgentMode: Opening action prefetch failed for skill ${skill.skillId}:`, error);
+        degraded = true;
+        content =
+          "I couldn't fetch the material for this yet — you can still tell me what you're working on and I'll help from here.";
+      }
+    } else {
+      // Unknown/unsupported type — defensive no-op, never fabricate a turn.
+      return { applied: false };
+    }
+
+    await chatbotDb.addMessageToSession(sessionId, {
+      role: 'assistant',
+      content,
+      metadata: {
+        timestamp: new Date().toISOString(),
+        kind: degraded ? 'opening-action-degraded' : `opening-action-${openingAction.type}`,
+      },
+    });
+
+    return { applied: true, degraded };
+  }
+
+  private formatOpeningActionPrefetchResults(results: Array<{ toolName: string; result: any }>): string {
+    return results
+      .map(({ toolName, result }) => `### ${toolName}\n${JSON.stringify(result, null, 2)}`)
+      .join('\n\n');
   }
 
   /**

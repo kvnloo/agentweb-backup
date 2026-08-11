@@ -4641,6 +4641,74 @@ export const agentModeController = {
     }
   },
 
+  // ENG-712 — Create a session directly from a Skill (public, one call), so a
+  // deep link (e.g. a task from the recap surface) lands on a primed chat
+  // instead of a blank one (AC6). If the skill carries an `openingAction`,
+  // it is applied before this returns, so the very first turn is already in
+  // the session by the time the client navigates to `redirectUrl`. Mirrors
+  // the shape of createSessionWithPlan for work plans, simplified — no plan
+  // step/progress machinery, since a skill isn't a plan.
+  async createSessionFromSkill(req: Request, res: Response) {
+    try {
+      const { skillId } = req.params;
+      if (!skillId) {
+        return res.status(400).json({ error: 'Skill ID is required' });
+      }
+
+      const skill = await skillService.getSkill(skillId);
+      if (!skill) {
+        return res.status(404).json({ error: `Skill "${skillId}" not found` });
+      }
+
+      // Route is public (anonymous callers get their own session), but a
+      // private skill is only usable by its owner — mirrors the intent of
+      // the work-plan private-visibility gate, applied per-skill since this
+      // endpoint looks a skill up directly by ID rather than from a
+      // pre-authorized owned/org/public/system list.
+      const result = await getUserFromToken(req);
+      const userId = result.user ? result.user.userId : `anon_${uuidv4()}`;
+
+      if (skill.visibility === 'private' && (!result.user || skill.ownerId !== result.user.userId)) {
+        return res.status(403).json({ error: 'Not authorized to use this skill' });
+      }
+
+      const session = await chatbotDb.createChatSession(
+        userId,
+        undefined, // pageContent
+        'agent', // portalType
+        `skill-${skillId}`, // pageIdentifier
+        undefined, // selectedStartupId
+        undefined, // workflowId
+        undefined, // executionId
+        undefined, // emailCampaignTaskId
+        'regular' // sessionType
+      );
+
+      await chatbotDb.addAssociatedSkills(session.sessionId, [skillId]);
+
+      const modelToUse = await agentModeService.getDefaultModel();
+      await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
+
+      // AC1-5: applies the container's opening move (or is a costless no-op
+      // when the skill has none) before the client ever navigates in.
+      const openingResult = await agentModeService.applyOpeningAction(skill, session.sessionId, userId);
+
+      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
+      const redirectUrl = `${customerFrontendUrl}/agent-mode/${session.sessionId}`;
+
+      res.status(201).json({
+        sessionId: session.sessionId,
+        redirectUrl,
+        userId: session.userId,
+        openingActionApplied: openingResult.applied,
+        openingActionDegraded: !!openingResult.degraded,
+      });
+    } catch (error) {
+      console.error('AgentMode: Create session from skill error:', error);
+      res.status(500).json({ error: 'Failed to create session from skill' });
+    }
+  },
+
   // Get specific chat session
   async getSession(req: Request, res: Response) {
     try {

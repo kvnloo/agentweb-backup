@@ -36,6 +36,24 @@ export interface SkillSyncInfo {
   changedFields: string[];
 }
 
+export type SkillOpeningActionType = 'brief' | 'prefetch';
+
+export interface SkillOpeningActionToolCall {
+  toolName: string;
+  args?: Record<string, any>;
+}
+
+// ENG-712: an optional first move for a Skill-backed session. `brief` renders
+// static text as the first assistant turn (the "ritual" reminder); `prefetch`
+// runs tool calls and renders their raw results — never LLM-narrated — before
+// yielding to the user. Absent on a skill, this changes nothing about how
+// that skill behaves today.
+export interface SkillOpeningAction {
+  type: SkillOpeningActionType;
+  content?: string; // required for type 'brief'
+  toolCalls?: SkillOpeningActionToolCall[]; // required for type 'prefetch'
+}
+
 export interface Skill {
   skillId: string;
   name: string;
@@ -58,6 +76,7 @@ export interface Skill {
   orgId?: string;
   visibility?: SkillVisibility;
   reviewFeedback?: string;
+  openingAction?: SkillOpeningAction; // ENG-712, optional, all-backward-compatible
 }
 
 export class SkillService {
@@ -91,7 +110,8 @@ export class SkillService {
     description: string,
     toolNames: string[],
     systemPrompt?: string,
-    isPublished?: boolean
+    isPublished?: boolean,
+    openingAction?: SkillOpeningAction
   ): Promise<Skill> {
     const timestamp = new Date().toISOString();
     const skill: Skill = {
@@ -103,6 +123,7 @@ export class SkillService {
       isPublished: isPublished || false, // Default to Draft (not published)
       createdAt: timestamp,
       updatedAt: timestamp,
+      ...(openingAction ? { openingAction } : {}),
     };
 
     const skillItem: any = {

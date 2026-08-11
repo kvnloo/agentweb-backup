@@ -91,6 +91,12 @@ router.get('/public/plan/:planTitle', asyncHandler(agentModeController.getPredef
 // Create session with predefined work plan (public)
 router.post('/public/plan/:planTitle/session', asyncHandler(agentModeController.createSessionWithPlan));
 
+// POST /api/agent-mode/public/skill/:skillId/session
+// ENG-712: Create session directly from a Skill (public) — applies the
+// skill's openingAction (if any) before returning, so a deep link lands on
+// a primed chat in one navigation.
+router.post('/public/skill/:skillId/session', asyncHandler(agentModeController.createSessionFromSkill));
+
 // GET /api/agent-mode/public/llm-models
 // Get supported LLM models (public)
 router.get('/public/llm-models', asyncHandler(agentModeController.getSupportedModels));
