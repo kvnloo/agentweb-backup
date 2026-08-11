@@ -76,9 +76,13 @@ export async function getTierConfig(tierName: string): Promise<SubscriptionType 
 /**
  * Get subscription type for a user (defaults to "Free" if not set)
  */
-export async function getUserSubscriptionType(userId: string): Promise<string> {
+async function resolveUserSubscriptionType(userId: string): Promise<{
+  subscriptionType: string;
+  resolved: boolean;
+}> {
   try {
     const user = await userDb.getUserById(userId);
+    const ownSubscriptionType = user?.subscriptionType || "Free";
     // Org members inherit the org owner's tier dynamically — the org's effective
     // tier is whatever the owner currently holds (orgs carry no tier field).
     // Resolving at read time (instead of snapshotting the owner's tier onto the
@@ -125,17 +129,25 @@ export async function getUserSubscriptionType(userId: string): Promise<string> {
           // updated) would propagate as-is — an accepted limitation of the
           // current data model, not something this function can detect.
           const owner = await userDb.getUserById(org.ownerUserId);
-          return owner?.subscriptionType || "Free";
+          if (!owner) {
+            return { subscriptionType: ownSubscriptionType, resolved: false };
+          }
+          return { subscriptionType: owner.subscriptionType || "Free", resolved: true };
         }
       } catch (orgLookupError) {
         console.error("Error resolving org owner for subscription type:", orgLookupError);
+        return { subscriptionType: ownSubscriptionType, resolved: false };
       }
     }
-    return user?.subscriptionType || "Free";
+    return { subscriptionType: ownSubscriptionType, resolved: true };
   } catch (error) {
     console.error("Error getting user subscription type:", error);
-    return "Free";
+    return { subscriptionType: "Free", resolved: false };
   }
+}
+
+export async function getUserSubscriptionType(userId: string): Promise<string> {
+  return (await resolveUserSubscriptionType(userId)).subscriptionType;
 }
 
 /** Return product features for the user's effective, org-aware subscription. */
@@ -158,8 +170,10 @@ export async function isSubscriptionFeatureEnabled(
   userId: string,
   feature: SubscriptionFeatureId
 ): Promise<boolean | null> {
-  const subscriptionTypeName = await getUserSubscriptionType(userId);
-  const config = await getSubscriptionTypeConfig(subscriptionTypeName);
+  const subscriptionResolution = await resolveUserSubscriptionType(userId);
+  if (!subscriptionResolution.resolved) return null;
+
+  const config = await getSubscriptionTypeConfig(subscriptionResolution.subscriptionType);
 
   // Keep explicit denial distinct from an unavailable/malformed admin setting.
   // Interactive entry points still fail closed on null, while background jobs

@@ -17,6 +17,7 @@ import {
   resolveSkillsToToolNames,
   findTiersAllowingSkill,
   getAllowedFeatures,
+  isSubscriptionFeatureEnabled,
 } from '../services/subscriptionService';
 
 jest.mock('../services/settingsService', () => ({
@@ -161,6 +162,17 @@ describe('subscriptionService', () => {
 
     const tier = await getUserSubscriptionType('member-1');
     expect(tier).toBe('Pro');
+  });
+
+  it('keeps a transient org lookup distinct from an explicit feature denial', async () => {
+    const mockedOrgDb = orgDb as jest.Mocked<typeof orgDb>;
+    mockedUserDb.getUserById.mockResolvedValueOnce({
+      userId: 'member-1', orgId: 'org-1', orgRole: 'member', subscriptionType: 'Free',
+    } as any);
+    mockedOrgDb.getOrgById.mockRejectedValueOnce(new Error('ProvisionedThroughputExceededException'));
+
+    expect(await isSubscriptionFeatureEnabled('member-1', 'scheduled_chats')).toBeNull();
+    expect(mockedSettingsService.getSetting).not.toHaveBeenCalled();
   });
 
   it('getUserSubscriptionType lets a member own ACTIVE subscription govern instead of the owner (regression: pvandervalk@xcures.com)', async () => {
