@@ -31,8 +31,23 @@ const MAX_RESIDUE_LENGTH = 40;
 const STRUCTURAL_ONLY = /^[\s{}[\],:"']+$/;
 
 /**
- * True when `content` is non-empty but carries no answer at all — just leftover
- * JSON structure such as `}]`, `},{` or `"}`.
+ * The two markers `geminiNativeClient.toGeminiRequest` uses when it degrades an
+ * unsigned tool call and its result into conversational text. They are OUR history
+ * serialization, never something a user asked for, so a reply that opens with one
+ * is the model transcribing its own context back instead of answering.
+ *
+ * This is the same ENG-1054 failure as `}]`, one step earlier: in the production
+ * session, message 163 was a 20,081-char verbatim echo of the preceding tool result
+ * (ending `…[Content truncated — full response in S3]}}`) shipped as the assistant's
+ * answer. Length alone cannot catch it — the echo is enormous — so it is matched by
+ * its opening marker instead.
+ */
+const HISTORY_ECHO_PREFIX = /^\[(?:Result of \S+:|Previously called )/;
+
+/**
+ * True when `content` is non-empty but carries no answer at all — either leftover
+ * JSON structure such as `}]`, `},{` or `"}`, or a transcription of the loop's own
+ * degraded tool history.
  *
  * Empty/whitespace content returns FALSE on purpose: that case already has its own
  * bounded handling in the termination ladder, and this guard must not change it.
@@ -41,6 +56,8 @@ export function isUnusableSynthesis(content: unknown): boolean {
   if (typeof content !== 'string') return false;
   const trimmed = content.trim();
   if (trimmed.length === 0) return false;
+  // Checked before the length cap: a history echo is long by nature.
+  if (HISTORY_ECHO_PREFIX.test(trimmed)) return true;
   if (trimmed.length > MAX_RESIDUE_LENGTH) return false;
   return STRUCTURAL_ONLY.test(trimmed);
 }
@@ -60,14 +77,35 @@ export interface ExecutedToolCall {
    * a `{ deferred: true }` result means the call was NOT executed — the media
    * budget paused it for a later turn. It carries no `error`, so without its own
    * bucket it would be reported as an action that already ran.
+   *
+   * A `{ success: false }` result means the handler REPORTED failure by returning
+   * rather than throwing. Only a throw reaches the dispatcher's error path
+   * (toolDispatch.ts:440); a returned failure is pushed through the success path
+   * (toolDispatch.ts:849) with no `error` key, so it too needs reading here.
    */
   result?: unknown;
 }
 
+/** Narrow an entry's `result` to an object we can read flags off. */
+function resultFlags(call: ExecutedToolCall): { deferred?: unknown; success?: unknown } | null {
+  const result = call.result as { deferred?: unknown; success?: unknown } | null | undefined;
+  return result && typeof result === 'object' ? result : null;
+}
+
 /** True for a ledger entry the dispatcher deferred instead of executing. */
 function isDeferred(call: ExecutedToolCall): boolean {
-  const result = call.result as { deferred?: unknown } | null | undefined;
-  return Boolean(result && typeof result === 'object' && result.deferred === true);
+  return resultFlags(call)?.deferred === true;
+}
+
+/**
+ * True for a call whose handler returned a failure instead of throwing one.
+ *
+ * Strictly `=== false`: most results have no `success` key at all, and treating a
+ * missing flag as failure would under-report actions that really did apply — the
+ * mirror-image error, and just as misleading on a recap the user is relying on.
+ */
+function isReportedFailure(call: ExecutedToolCall): boolean {
+  return resultFlags(call)?.success === false;
 }
 
 /**
@@ -84,7 +122,7 @@ export function buildExecutedActionsFallback(toolCalls: ExecutedToolCall[]): str
     // separately. Including it would report the same action twice.
     if (call.duplicateOf !== undefined && call.duplicateOf !== null) continue;
     const entry = counts.get(name) || { ok: 0, failed: 0, deferred: 0 };
-    if ('error' in call) entry.failed++;
+    if ('error' in call || isReportedFailure(call)) entry.failed++;
     else if (isDeferred(call)) entry.deferred++;
     else entry.ok++;
     counts.set(name, entry);
