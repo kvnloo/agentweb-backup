@@ -9,6 +9,19 @@ export interface UserReleaseNote {
 // Store the release notes data
 export const userReleaseNotes: UserReleaseNote[] = [
   {
+    date: '2026-08-09',
+    changes: [
+      'Changed: Organizations Can Now Have More Than One Owner',
+      '- An organization used to support exactly one owner, so handing over or sharing responsibility meant routing everything through a single person',
+      '- There are now three roles — owner, admin and member — and an organization can have multiple owners and multiple admins',
+      '- Owners can do everything: manage people and roles, edit all organization settings and shared content, manage billing, and delete the organization',
+      '- Admins can invite and remove members, change organization settings, manage shared content, and promote members to admin. Only an owner can grant or revoke the owner role, remove an owner, or delete the organization',
+      '- Members use every platform feature for their own work and see whatever the organization has shared. Brand Guidelines, Market Strategy, the knowledge base, templates and landing pages are read-only for them unless an owner or admin adds them as an editor for that area',
+      '- An organization must always keep at least one owner: the last owner cannot be removed, demoted, or leave until someone else is promoted to owner. To hand an organization over, promote the new owner first, then leave — there is no separate transfer step',
+      '- This supersedes the 2026-05-12 note stating that only one owner is supported and that co-owner roles do not exist',
+    ],
+  },
+  {
     date: '2026-08-05',
     changes: [
       'New: Emma Can Finish an Email-Code Login on Her Own, Including in Scheduled Runs',
