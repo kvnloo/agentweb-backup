@@ -205,13 +205,34 @@ describe('GmailService', () => {
 
   // ── Token refresh ────────────────────────────────────────────────────────
   describe('token refresh', () => {
+    // ENG-1111: these two tests drive the full `searchEmails` path, which ends in
+    // `doBatchRequest` → the *global* `fetch` → https://www.googleapis.com/batch/gmail/v1.
+    // The `googleapis` mock at the top of this file replaces the SDK (messages.list /
+    // messages.get) but not that raw fetch, so before this stub both tests issued a real
+    // HTTPS POST to Google's production Gmail batch endpoint on every run. It never
+    // surfaced because `batchFetchSummaries` treats a failed batch as "partial results
+    // are fine" and silently skips the messages — so the assertions below passed while
+    // the batch step did nothing.
+    //
+    // Stubbing the transport also makes the success path real: each test now asserts the
+    // summaries that came back through the batch parse, which no assertion covered before.
+    beforeEach(() => {
+      global.fetch = jest
+        .fn()
+        .mockResolvedValue(makeBatchMetaResponse(mockListResponse.data.messages));
+    });
+
     it('uses existing token when not expiring soon', async () => {
       mockGetAccountById.mockResolvedValue(VALID_ACCOUNT);
       mockMessagesList.mockResolvedValue(mockListResponse);
       mockMessagesGet.mockResolvedValue(makeMessageDetail('hello'));
 
-      await service.searchEmails('user-123', ACCOUNT_ID, 'test');
+      const results = await service.searchEmails('user-123', ACCOUNT_ID, 'test');
       expect(mockUpdateAccountTokens).not.toHaveBeenCalled();
+      // The batch step actually ran and was parsed, rather than silently no-opping.
+      expect(global.fetch).toHaveBeenCalledTimes(1);
+      expect(results).toHaveLength(2);
+      expect(results[0]).toMatchObject({ id: 'msg-001', subject: 'Test Subject' });
     });
 
     it('refreshes token when expiring within 5-min buffer', async () => {
@@ -219,13 +240,17 @@ describe('GmailService', () => {
       mockMessagesList.mockResolvedValue(mockListResponse);
       mockMessagesGet.mockResolvedValue(makeMessageDetail('hello'));
 
-      await service.searchEmails('user-123', ACCOUNT_ID, 'test');
+      const results = await service.searchEmails('user-123', ACCOUNT_ID, 'test');
       expect(mockUpdateAccountTokens).toHaveBeenCalledWith(
         'user-123',
         'gmail',
         expect.objectContaining({ access_token: 'new-access-token' }),
         ACCOUNT_ID
       );
+      // The refreshed token is the one the batch request is sent with.
+      const [, init] = (global.fetch as jest.Mock).mock.calls[0];
+      expect(init.headers.Authorization).toBe('Bearer new-access-token');
+      expect(results).toHaveLength(2);
     });
 
     it('throws GmailTokenRevokedError when no refresh_token and token expired', async () => {

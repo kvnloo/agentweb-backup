@@ -18,6 +18,7 @@ import * as apolloServiceModule from '../services/apolloService';
 import type { ApolloService } from '../services/apolloService';
 import { createApolloFetchContext, createEnrichSoFetchContext } from '../services/enrichmentGroupWaterfall';
 import type { LeadRecord } from '../services/crmEnrichmentService';
+import * as llmServiceModule from '../utils/llmService';
 
 const PERSON_RAW = { id: 'p1', first_name: 'Jane', last_name: 'Doe', email: 'jane@acme.com' };
 const MATCH_RESULT = {
@@ -46,6 +47,19 @@ function makeLead(overrides: Partial<LeadRecord> = {}): LeadRecord {
     ...overrides,
   } as LeadRecord;
 }
+
+// ENG-1111: default LLM stub for every test in this file.
+//
+// `enrichmentV3RealDeps` builds its language models through `createLLMService`, which
+// constructs a real `AzureChatOpenAI`. Nothing in this file replaced it, so the tests
+// that reach the identity gate issued a real request to the configured Azure endpoint,
+// retried by langchain's p-retry. The suite still passed — the enrichment path treats an
+// LLM failure as "no extraction" — so the network dependency was invisible.
+beforeEach(() => {
+  jest
+    .spyOn(llmServiceModule, 'createLLMService')
+    .mockReturnValue({ generateRaw: jest.fn().mockResolvedValue('{}') } as any);
+});
 
 afterEach(() => {
   jest.restoreAllMocks();

@@ -67,6 +67,23 @@ jest.mock('../services/linkedInOutreachService', () => ({
   },
 }));
 
+// ENG-1111: default LLM stub for every test in this file.
+//
+// `enrichmentV3RealDeps` builds its language models through `createLLMService`, which
+// constructs a real `AzureChatOpenAI`. The tests below that call `mockLLM(...)` replaced
+// it; the ones that did not fell through to the live client and issued a real request to
+// the configured Azure endpoint, retried by langchain's p-retry until jest's 5000 ms
+// budget expired. That is what made `findUnipileCompany` look like a slow test rather
+// than a networked one.
+//
+// This floor guarantees no test in the file can reach the network through the LLM path.
+// `mockLLM(...)` still overrides it per test, so existing expectations are unchanged.
+beforeEach(() => {
+  jest
+    .spyOn(llmServiceModule, 'createLLMService')
+    .mockReturnValue({ generateRaw: jest.fn().mockResolvedValue('{}') } as any);
+});
+
 afterEach(() => {
   jest.restoreAllMocks();
   jest.clearAllMocks();

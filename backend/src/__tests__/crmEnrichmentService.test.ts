@@ -87,6 +87,29 @@ jest.mock('../services/linkedInOutreachService', () => {
   return actual;
 });
 
+// ENG-1111: stub the page-content fetcher.
+//
+// `gatherWebContext` feeds every search-result URL to `fetchTopPages`, which really does
+// an HTTP GET and scrapes the page. The fixtures below hand it `https://acme.com` and
+// `https://example.com`, so this suite was scraping two live websites on every run — 16
+// requests per run. It never failed, because `fetchAndExtract` swallows every error and
+// returns `null`, so a blocked or offline run just silently produced no page content.
+//
+// That silence was the real problem: citation verification matches an LLM's `sourceQuote`
+// against the web context, and the web context included whatever those live pages happened
+// to say that day. A test asserting a quote is *not* found could have started failing
+// because a third party edited their homepage.
+//
+// The default here is "no extra page content", which is what every existing expectation in
+// this file was written against. `mockFetchTopPages` lets a test opt into real page content
+// so the "Full page content (top results)" branch — previously never exercised
+// deterministically — can be asserted.
+const mockFetchTopPages = jest.fn().mockResolvedValue([]);
+jest.mock('../services/webContentFetcher', () => ({
+  fetchTopPages: (...args: any[]) => mockFetchTopPages(...args),
+  fetchAndExtract: jest.fn().mockResolvedValue(null),
+}));
+
 import { crmDb } from '../services/db';
 import { agentModeService } from '../services/agentModeService';
 import { getAccountsByUserId } from '../services/connectedAccountsDb';
@@ -2384,6 +2407,48 @@ describe('CrmEnrichmentService - citation verification', () => {
     const result = await service.execute(spec);
     expect(result.processedCount).toBe(1);
     expect(lastUpdateCustomFields().funding_stage).toBe('Series B');
+  });
+
+  // ENG-1111 (AC5). Stubbing the transport made this branch reachable deterministically
+  // for the first time. `gatherWebContext` appends "Full page content (top results)" from
+  // `fetchTopPages`, and citation verification matches `sourceQuote` against that combined
+  // context — so a quote present only in the fetched page body, and absent from the search
+  // snippet, must still be accepted. Previously nothing pinned this: the page body came
+  // from a live scrape of acme.com, so the assertion would have been at the mercy of
+  // whatever that site served.
+  it('accepts a sourceQuote found only in the fetched page body, not in the search snippet', async () => {
+    setupSingleLeadJob('Acme is a startup');
+    mockFetchTopPages.mockResolvedValueOnce([
+      {
+        title: 'Acme — About',
+        url: 'https://acme.com',
+        text: 'Acme closed a Series C round led by Example Capital in 2025.',
+      },
+    ]);
+    mockGeminiCreate.mockResolvedValue(
+      geminiResponse({
+        funding_stage: {
+          value: 'Series C',
+          sourceQuote: 'closed a Series C round',
+          sourceUrl: 'https://acme.com',
+          confidence: 'high',
+        },
+      })
+    );
+
+    const spec: EnrichmentJobSpec = {
+      listId: 'list1', userId: 'user1',
+      instruction: 'Get funding stage',
+      outputFields: ['funding_stage'],
+      sources: ['web_search'],
+    };
+
+    const result = await service.execute(spec);
+    expect(result.processedCount).toBe(1);
+    // The page fetcher was actually consulted, with the search-result URL.
+    expect(mockFetchTopPages).toHaveBeenCalledWith(['https://acme.com'], 2);
+    // And the quote, which appears nowhere in the snippet, survived verification.
+    expect(lastUpdateCustomFields().funding_stage).toBe('Series C');
   });
 
   it('rejects (removes) a value when sourceQuote is not found in any source', async () => {
