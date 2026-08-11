@@ -19,7 +19,8 @@
  */
 import { Request, Response, NextFunction } from 'express';
 import { AuthenticatedRequest } from './auth';
-import { checkTokenUsage } from '../services/tokenUsageService';
+import { checkTokenUsage, getQuotaUpgradeInfo } from '../services/tokenUsageService';
+import { getUserSubscriptionType } from '../services/subscriptionService';
 
 export type EmmaRouteBudget = 'metered' | 'exempt';
 
@@ -170,11 +171,24 @@ export async function requireEmmaTokenBudget(
   try {
     const usageStatus = await checkTokenUsage(user.userId);
     if (!usageStatus.allowed) {
-      // Same contract as controllers/chatbot.ts:156-159, so an MCP caller that
-      // runs out of quota is indistinguishable from a web caller that does.
+      let currentPlan = 'Free';
+      try {
+        currentPlan = await getUserSubscriptionType(user.userId);
+      } catch {
+        // The quota decision is already fail-closed. A transient plan lookup
+        // must not turn a useful 429 into a generic 500.
+      }
+      const upgrade = getQuotaUpgradeInfo(currentPlan, usageStatus);
+      // Keep legacy tokenUsage fields, but also put actionable fields at the
+      // top level so a thin MCP client can relay them without nested parsing.
       res.status(429).json({
-        error: 'Monthly token limit reached. Please contact support or upgrade your plan.',
-        tokenUsage: usageStatus,
+        error: upgrade.upgradeMessage,
+        tokenUsage: { ...usageStatus, ...upgrade },
+        current_plan: upgrade.currentPlan,
+        next_tier: upgrade.nextTier,
+        remaining_allowance: upgrade.remainingAllowance,
+        upgrade_url: upgrade.upgradeUrl,
+        upgrade_message: upgrade.upgradeMessage,
       });
       return;
     }

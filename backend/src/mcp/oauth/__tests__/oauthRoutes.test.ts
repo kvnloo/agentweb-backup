@@ -249,6 +249,7 @@ describe('MCP OAuth Routes', () => {
       expect(location).toContain('utm_source=mcp');
       expect(location).toContain('utm_medium=unknown');
       expect(location).toContain('mcp_client_id=client-123');
+      expect(location).toContain('mcp_signup_intent=');
       expect(mockRecordMcpOAuthStarted).toHaveBeenCalledWith(
         expect.objectContaining({
           clientId: 'client-123',

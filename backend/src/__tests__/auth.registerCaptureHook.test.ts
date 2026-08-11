@@ -60,6 +60,7 @@ jest.mock('bcryptjs', () => ({
 
 jest.mock('jsonwebtoken', () => ({
   sign: jest.fn().mockReturnValue('test.jwt.token'),
+  verify: jest.fn().mockReturnValue({ purpose: 'mcp_signup' }),
 }));
 
 // Import the controller AFTER mocks are set up.
@@ -112,6 +113,17 @@ describe('register controller fires onUserRegistered', () => {
     // 201 is returned before the hook's promise would settle — the test passes
     // as long as the controller doesn't throw synchronously.
     expect(res.status).toBe(201);
+  });
+
+  it('records MCP-originated OAuth signup without accepting arbitrary source values', async () => {
+    const app = makeApp();
+    const res = await request(app)
+      .post('/register')
+      .send({ email: 'new@user.com', password: 'ValidPass123!', signupSource: 'mcp', signupIntent: 'signed-intent' });
+
+    expect(res.status).toBe(201);
+    expect(mockOnUserRegistered.mock.calls[0][0].signupSource).toBe('mcp');
+    expect(mockUpdateUser).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ signupSource: 'mcp' }));
   });
 
   it('does not call the hook when registration fails early (user already exists)', async () => {

@@ -10,8 +10,10 @@
  */
 
 import express, { Request, Response, NextFunction } from 'express';
+import jwt from 'jsonwebtoken';
 import { mcpOAuthService } from './oauthService';
 import { authenticateToken, getUserFromToken } from '../../middleware/auth';
+import { getJwtSecret } from '../../config/jwt';
 import {
   classifyMcpClient,
   recordMcpOAuthAuthorized,
@@ -207,6 +209,15 @@ export function setupMcpOAuth(app: express.Express) {
     consentUrl.searchParams.set('utm_source', 'mcp');
     consentUrl.searchParams.set('utm_medium', classifyMcpClient({ clientName: client.clientName, userAgent: req.get('user-agent'), redirectUri: actualRedirectUri }));
     consentUrl.searchParams.set('mcp_client_id', client_id);
+    // Short-lived, signed proof for the inline signup page. The registration
+    // endpoint accepts MCP attribution only with this server-minted intent,
+    // so a normal public signup cannot spoof acquisition source.
+    const signupIntent = jwt.sign(
+      { purpose: 'mcp_signup', clientId: client_id },
+      getJwtSecret(),
+      { expiresIn: '15m' },
+    );
+    consentUrl.searchParams.set('mcp_signup_intent', signupIntent);
 
     return res.redirect(302, consentUrl.toString());
   });

@@ -26,6 +26,13 @@ jest.mock('../middleware/auth', () => ({
 const mockCheckTokenUsage = jest.fn();
 jest.mock('../services/tokenUsageService', () => ({
   checkTokenUsage: (...args: any[]) => mockCheckTokenUsage(...args),
+  getQuotaUpgradeInfo: (_plan: string, status: any) => ({
+    currentPlan: 'Free',
+    nextTier: 'Starter',
+    remainingAllowance: Math.max((status.effectiveAllowance ?? 0) - status.used, 0),
+    upgradeUrl: 'https://app.agentweb.pro/pricing?upgrade=starter&source=mcp',
+    upgradeMessage: 'You have reached your plan limit. Upgrade to Starter to keep going.',
+  }),
 }));
 
 const mockGenerateImage = jest.fn();
@@ -80,6 +87,7 @@ describe('ENG-973: /api/emma/* enforces the monthly token quota', () => {
 
     expect(res.status).toBe(429);
     expect(res.body.tokenUsage).toMatchObject({ allowed: false, percentUsed: 100 });
+    expect(res.body).toMatchObject({ next_tier: 'Starter', upgrade_url: expect.stringContaining('/pricing?upgrade=starter') });
     // The point of the fix: the paid call must not happen.
     expect(mockGenerateImage).not.toHaveBeenCalled();
   });

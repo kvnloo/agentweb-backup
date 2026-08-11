@@ -77,6 +77,8 @@ describe('apiTools', () => {
         'list_knowledge_bases', 'search_knowledge_base', 'read_knowledge_base_files',
         'manage_brand', 'manage_market_strategy',
         'list_connected_accounts', 'post_on_account',
+        'emma_get_onboarding_status', 'emma_update_onboarding',
+        'emma_record_onboarding_event', 'emma_start_brand_build',
       ];
       for (const tool of expectedTools) {
         expect(names).toContain(tool);
@@ -1271,6 +1273,7 @@ describe('apiTools', () => {
       mockMcpFetch.mockImplementation(async (opts: any) => {
         if (opts.path === '/api/auth/me') return meResponse;
         if (opts.path === '/api/v1/agent/api-keys') return { keys: [{ keyId: 'k1' }, { keyId: 'k2' }, { keyId: 'k3' }] };
+        if (opts.path === '/api/subscription/usage') return { used: 100, allowance: 1000, effectiveAllowance: 1000, percentUsed: 10, warning: false };
         throw new Error(`Unexpected path: ${opts.path}`);
       });
 
@@ -1284,6 +1287,10 @@ describe('apiTools', () => {
         current_period_end: '2026-07-01T00:00:00Z',
         allowed_features: ['chat', 'crm', 'reports'],
         api_key_count: 3,
+        usage: { used: 100, allowance: 1000, remaining_allowance: 900, percent_used: 10, warning: false },
+        next_tier: 'Managed',
+        upgrade_url: 'https://calendly.com/harsha-agentweb/30min',
+        upgrade_message: 'You have reached your plan limit. Book a call to move to Managed.',
       });
     });
 
@@ -1291,6 +1298,7 @@ describe('apiTools', () => {
       mockMcpFetch.mockImplementation(async (opts: any) => {
         if (opts.path === '/api/auth/me') return meResponse;
         if (opts.path === '/api/v1/agent/api-keys') return { keys: [] };
+        if (opts.path === '/api/subscription/usage') return { used: 0, allowance: 100, effectiveAllowance: 100, percentUsed: 0, warning: false };
         throw new Error(`Unexpected path: ${opts.path}`);
       });
 
@@ -1321,6 +1329,10 @@ describe('apiTools', () => {
         current_period_end: null,
         allowed_features: [],
         api_key_count: 0,
+        usage: null,
+        next_tier: 'Starter',
+        upgrade_url: 'https://app.agentweb.pro/pricing?upgrade=starter&source=mcp',
+        upgrade_message: 'You have reached your plan limit. Upgrade to Starter to keep going.',
       });
     });
 
@@ -1361,6 +1373,54 @@ describe('apiTools', () => {
       await expect(
         mcpToolRegistry.execute('get_account_status', {}, context)
       ).rejects.toThrow('API error (401): Unauthorized');
+    });
+  });
+
+  describe('MCP onboarding tools', () => {
+    it('reads onboarding state from the existing authenticated routes', async () => {
+      mockMcpFetch
+        .mockResolvedValueOnce({ onboardingProgress: { step: 'brand' }, onboardingDismissed: false })
+        .mockResolvedValueOnce({ stage: 'brand_submitted', eventCount: 2 })
+        .mockResolvedValueOnce({ status: 'building' });
+
+      const result = await mcpToolRegistry.execute('emma_get_onboarding_status', {}, context);
+      const parsed = JSON.parse((result as any).content[0].text);
+      expect(parsed).toEqual({
+        onboarding_progress: { step: 'brand' },
+        onboarding_dismissed: false,
+        stage: 'brand_submitted',
+        event_count: 2,
+        brand_build: 'building',
+      });
+      expect(mockMcpFetch).toHaveBeenNthCalledWith(1, expect.objectContaining({ path: '/api/users/me/onboarding' }));
+      expect(mockMcpFetch).toHaveBeenNthCalledWith(2, expect.objectContaining({ path: '/api/onboarding/events/me' }));
+      expect(mockMcpFetch).toHaveBeenNthCalledWith(3, expect.objectContaining({ path: '/api/onboarding/brand-build/status' }));
+    });
+
+    it('persists progress and records events without exposing a second auth path', async () => {
+      mockMcpFetch.mockResolvedValue({ ok: true });
+      await mcpToolRegistry.execute('emma_update_onboarding', { onboarding_progress: { step: 'goal' } }, context);
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'PATCH', path: '/api/users/me/onboarding',
+        body: { onboardingProgress: { step: 'goal' } },
+      }));
+
+      jest.clearAllMocks();
+      mockMcpFetch.mockResolvedValue({ stage: 'goal_selected' });
+      await mcpToolRegistry.execute('emma_record_onboarding_event', { event: 'goal_selected', data: { goal: 'seo' } }, context);
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'POST', path: '/api/onboarding/events',
+        body: { event: 'goal_selected', data: { goal: 'seo' } },
+      }));
+    });
+
+    it('starts the existing brand-build flow from MCP', async () => {
+      mockMcpFetch.mockResolvedValue({ status: 'building' });
+      await mcpToolRegistry.execute('emma_start_brand_build', { company_url: 'https://example.com', goal: 'positioning' }, context);
+      expect(mockMcpFetch).toHaveBeenCalledWith(expect.objectContaining({
+        method: 'POST', path: '/api/onboarding/brand-build/start',
+        body: { companyUrl: 'https://example.com', companyName: undefined, goal: 'positioning' },
+      }));
     });
   });
 

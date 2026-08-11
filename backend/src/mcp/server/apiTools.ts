@@ -11,6 +11,7 @@
 import { mcpToolRegistry } from './registry';
 import { mcpFetch } from './httpClient';
 import { fetchMergedPRs, formatDigestText } from '../../services/prDigestService';
+import { getQuotaUpgradeInfo } from '../../services/tokenUsageService';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -3371,6 +3372,107 @@ mcpToolRegistry.register({
 // ─── Account ─────────────────────────────────────────────────────────────────
 
 mcpToolRegistry.register({
+  name: 'emma_get_onboarding_status',
+  definition: {
+    name: 'emma_get_onboarding_status',
+    description: 'Read your Emma onboarding progress and current brand-build status so you can continue onboarding from this MCP connection.',
+    inputSchema: { type: 'object', properties: {}, required: [] },
+  },
+  execute: async (_args: any, context: any) => {
+    const c = ctx(context);
+    const [state, events, brandBuild] = await Promise.all([
+      mcpFetch({ method: 'GET', path: '/api/users/me/onboarding', context: c }),
+      mcpFetch({ method: 'GET', path: '/api/onboarding/events/me', context: c }),
+      mcpFetch({ method: 'GET', path: '/api/onboarding/brand-build/status', context: c }),
+    ]);
+    return jsonResult({
+      onboarding_progress: state?.onboardingProgress ?? {},
+      onboarding_dismissed: state?.onboardingDismissed ?? false,
+      stage: events?.stage ?? null,
+      event_count: events?.eventCount ?? 0,
+      brand_build: brandBuild?.status ?? brandBuild ?? null,
+    });
+  },
+});
+
+mcpToolRegistry.register({
+  name: 'emma_update_onboarding',
+  definition: {
+    name: 'emma_update_onboarding',
+    description: 'Save onboarding progress from MCP. Use this for the current step and answers; it does not change billing or permissions.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        onboarding_progress: { type: 'object', description: 'Progress fields to persist.' },
+        onboarding_dismissed: { type: 'boolean', description: 'Whether the user dismissed onboarding.' },
+      },
+      required: [],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    if (args.onboarding_progress === undefined && args.onboarding_dismissed === undefined) {
+      return jsonResult({ error: 'Provide onboarding_progress or onboarding_dismissed.' });
+    }
+    const data = await mcpFetch({
+      method: 'PATCH',
+      path: '/api/users/me/onboarding',
+      context: ctx(context),
+      body: {
+        ...(args.onboarding_progress !== undefined && { onboardingProgress: args.onboarding_progress }),
+        ...(args.onboarding_dismissed !== undefined && { onboardingDismissed: args.onboarding_dismissed }),
+      },
+    });
+    return jsonResult(data);
+  },
+});
+
+mcpToolRegistry.register({
+  name: 'emma_record_onboarding_event',
+  definition: {
+    name: 'emma_record_onboarding_event',
+    description: 'Record an onboarding step or answer so Emma can resume the flow from MCP.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        event: { type: 'string', description: 'An allowed onboarding event name.' },
+        data: { type: 'object', description: 'Optional small event payload.' },
+      },
+      required: ['event'],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({ method: 'POST', path: '/api/onboarding/events', context: ctx(context), body: { event: args.event, data: args.data } });
+    return jsonResult(data);
+  },
+});
+
+mcpToolRegistry.register({
+  name: 'emma_start_brand_build',
+  definition: {
+    name: 'emma_start_brand_build',
+    description: 'Start Emma’s onboarding brand review from MCP using the company website and optional company name or goal.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        company_url: { type: 'string', description: 'Company website URL.' },
+        company_name: { type: 'string', description: 'Company name.' },
+        goal: { type: 'string', description: 'What the user wants Emma to help with.' },
+      },
+      required: [],
+    },
+  },
+  execute: async (args: any, context: any) => {
+    const data = await mcpFetch({
+      method: 'POST',
+      path: '/api/onboarding/brand-build/start',
+      context: ctx(context),
+      body: { companyUrl: args.company_url, companyName: args.company_name, goal: args.goal },
+    });
+    return jsonResult(data);
+  },
+});
+
+mcpToolRegistry.register({
   name: 'get_account_status',
   definition: {
     name: 'get_account_status',
@@ -3394,6 +3496,19 @@ mcpToolRegistry.register({
       apiKeyCount = 0;
     }
 
+    // Usage is best-effort so a transient meter read never hides account
+    // identity. When available, expose the same actionable upgrade contract
+    // used by the 429 quota response instead of making the MCP client guess.
+    let usage: any = null;
+    try {
+      usage = await mcpFetch({ method: 'GET', path: '/api/subscription/usage', context: c });
+    } catch {
+      usage = null;
+    }
+    const upgrade = usage
+      ? getQuotaUpgradeInfo(me?.subscriptionType, usage)
+      : getQuotaUpgradeInfo(me?.subscriptionType, { used: 0, effectiveAllowance: null });
+
     // Curate a stable, minimal shape. Never echo the raw /me payload — it carries
     // sensitive fields (stripe ids, tokens, internal flags).
     return jsonResult({
@@ -3403,6 +3518,18 @@ mcpToolRegistry.register({
       current_period_end: me?.current_period_end ?? null,
       allowed_features: Array.isArray(me?.allowedPages) ? me.allowedPages : [],
       api_key_count: apiKeyCount,
+      usage: usage
+        ? {
+            used: usage.used ?? 0,
+            allowance: usage.allowance ?? null,
+            remaining_allowance: upgrade.remainingAllowance,
+            percent_used: usage.percentUsed ?? 0,
+            warning: usage.warning === true,
+          }
+        : null,
+      next_tier: upgrade.nextTier,
+      upgrade_url: upgrade.upgradeUrl,
+      upgrade_message: upgrade.upgradeMessage,
     });
   }
 });

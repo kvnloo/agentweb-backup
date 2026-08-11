@@ -84,6 +84,8 @@ export const register = async (req: Request, res: Response) => {
       displayName: reqDisplayName,
       utm,
       attribution,
+      signupSource: requestedSignupSource,
+      signupIntent,
     } = req.body;
 
     if (!email || !password) {
@@ -149,6 +151,17 @@ export const register = async (req: Request, res: Response) => {
     // compute after createUser like before, the signup hook fires BEFORE
     // attribution is known and the enrolled lead is missing UTM data.
     const touch = normalizeAttribution(attribution) ?? normalizeAttribution(utm);
+    // The MCP OAuth signup page is the only public caller allowed to set this
+    // attribution. Do not accept arbitrary event/source values from a browser.
+    let signupSource = "password";
+    if (requestedSignupSource === "mcp" && typeof signupIntent === "string") {
+      try {
+        const intent = jwt.verify(signupIntent, getJwtSecret()) as { purpose?: string };
+        if (intent?.purpose === "mcp_signup") signupSource = "mcp";
+      } catch {
+        // Invalid/expired intent falls back to ordinary password attribution.
+      }
+    }
 
     const newUser = await userDb.createUser(
       email,
@@ -180,6 +193,7 @@ export const register = async (req: Request, res: Response) => {
       subscriptionType: "Free",
       allowedPages: freeTierConfig?.allowedPages ?? [...DEFAULT_PAGES],
       allowedSkills: freeTierConfig?.allowedSkills ?? [],
+      signupSource,
       ...(touch && {
         firstTouch: touch,
         lastTouch: touch,
@@ -231,7 +245,7 @@ export const register = async (req: Request, res: Response) => {
       userId,
       email,
       displayName: finalDisplayName,
-      signupSource: "password",
+      signupSource,
       createdAt: new Date().toISOString(),
     }).catch(() => {});
 

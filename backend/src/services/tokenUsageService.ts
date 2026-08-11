@@ -24,6 +24,55 @@ export interface TokenUsageStatus {
   costEnforced: boolean;
 }
 
+export interface QuotaUpgradeInfo {
+  currentPlan: string;
+  nextTier: string | null;
+  remainingAllowance: number | null;
+  upgradeUrl: string | null;
+  upgradeMessage: string;
+}
+
+/**
+ * Keep quota refusals actionable for every caller, including MCP clients.
+ * The tier ordering intentionally mirrors the customer portal's existing
+ * upgradeTarget helper and uses the existing pricing/upgrade route rather than
+ * inventing a second billing surface.
+ */
+export function getQuotaUpgradeInfo(
+  currentPlan: string | null | undefined,
+  status: Pick<TokenUsageStatus, 'used' | 'effectiveAllowance'>,
+): QuotaUpgradeInfo {
+  const normalized = (currentPlan || 'Free').trim().toLowerCase();
+  const current = currentPlan || 'Free';
+  const remainingAllowance = status.effectiveAllowance == null
+    ? null
+    : Math.max(status.effectiveAllowance - status.used, 0);
+  const frontend = process.env.CUSTOMER_FRONTEND_URL || 'https://app.agentweb.pro';
+
+  let nextTier: string | null;
+  let upgradeUrl: string | null;
+  let upgradeMessage: string;
+  if (normalized === 'managed' || normalized === 'enterprise' || normalized === 'custom' || normalized === 'complete' || normalized.includes('enterprise')) {
+    nextTier = null;
+    upgradeUrl = 'mailto:founders@agentweb.pro?subject=Enterprise%20limits';
+    upgradeMessage = 'You are on the highest plan. Contact support to discuss higher limits.';
+  } else if (normalized === 'pro' || normalized === 'super premium') {
+    nextTier = 'Managed';
+    upgradeUrl = 'https://calendly.com/harsha-agentweb/30min';
+    upgradeMessage = 'You have reached your plan limit. Book a call to move to Managed.';
+  } else if (normalized === 'starter' || normalized === 'basic') {
+    nextTier = 'Pro';
+    upgradeUrl = `${frontend}/pricing?upgrade=pro&source=mcp`;
+    upgradeMessage = 'You have reached your plan limit. Upgrade to Pro to keep going.';
+  } else {
+    nextTier = 'Starter';
+    upgradeUrl = `${frontend}/pricing?upgrade=starter&source=mcp`;
+    upgradeMessage = 'You have reached your plan limit. Upgrade to Starter to keep going.';
+  }
+
+  return { currentPlan: current, nextTier, remainingAllowance, upgradeUrl, upgradeMessage };
+}
+
 /**
  * For org members, returns the org owner's userId so that all quota checks
  * and usage increments are applied to the owner (the subscription holder).
