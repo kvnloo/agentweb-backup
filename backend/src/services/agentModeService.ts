@@ -27035,7 +27035,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
         const { uploadFileToS3 } = await import('../utils/s3Utils');
         const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
-        const uploadResult = await uploadFileToS3(contentDraft, filename, userId, 'text/html');
+        const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
+        const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
           throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
         }
@@ -27268,7 +27269,8 @@ Please generate a complete, professional HTML document that properly formats and
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
-      const uploadResult = await uploadFileToS3(htmlContent, filename, userId, 'text/html');
+      const uploadableHtml = await this.inlinePrivateS3Images(htmlContent, documentType, userId);
+      const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
@@ -27293,6 +27295,25 @@ Please generate a complete, professional HTML document that properly formats and
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
+  }
+
+  /**
+   * Embed private, same-bucket S3 images in downloadable HTML documents. The
+   * image fetcher intentionally ignores all other URLs, and the inliner fully
+   * validates byte limits before returning HTML so callers can never upload a
+   * partially transformed document. Email keeps absolute image URLs because
+   * email clients have materially different payload constraints.
+   */
+  private async inlinePrivateS3Images(
+    html: string,
+    documentType: 'document' | 'email',
+    userId: string,
+  ): Promise<string> {
+    if (documentType === 'email') return html;
+    const { createDefaultS3ImageFetcher, inlineS3ImagesAsDataUris } =
+      await import('../utils/inlineS3Images');
+    const result = await inlineS3ImagesAsDataUris(html, createDefaultS3ImageFetcher(userId));
+    return result.html;
   }
 
   /**
@@ -27415,8 +27436,9 @@ Return the HTML body fragment for this section only.`;
       const { renderMarkdownReportDocumentAsync } = await import('../utils/markdownHtmlReport');
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
+      const uploadableHtml = await this.inlinePrivateS3Images(fallbackHtml, documentType, userId);
       const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
-      uploadResult = await uploadFileToS3(fallbackHtml, filename, userId, 'text/html');
+      uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
       }
@@ -27434,6 +27456,9 @@ Return the HTML body fragment for this section only.`;
       };
     } catch (fallbackError) {
       console.error('AgentMode: create_html_file — deterministic fallback also failed:', fallbackError);
+      if ((fallbackError as { code?: string })?.code === 'INLINE_S3_IMAGE_ERROR') {
+        throw fallbackError;
+      }
       throw renderFailure;
     }
   }
