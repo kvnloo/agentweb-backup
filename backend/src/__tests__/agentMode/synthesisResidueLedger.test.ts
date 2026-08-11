@@ -139,3 +139,27 @@ describe('buildExecutedActionsFooter — recovered-turn recap (ENG-1054)', () =>
     expect(buildExecutedActionsFooter([])).toBeNull();
   });
 });
+
+/**
+ * ENG-1054: every number in the recap is a TOOL-CALL count. Session 39eb5663
+ * imported 75 leads as three 25-row batches and closed with "successfully added
+ * the 3 leads" — the batch count read as a record count. This recap would render
+ * that same run as "add_leads_to_list — 3 succeeded", so it must say what the 3 is.
+ */
+describe('recap states its counting basis (ENG-1054)', () => {
+  it('says the counts are tool calls, not records, in the footer', () => {
+    const footer = buildExecutedActionsFooter([
+      { name: 'add_leads_to_list', result: {} },
+      { name: 'add_leads_to_list', result: {} },
+      { name: 'add_leads_to_list', result: {} },
+    ]) as string;
+
+    expect(footer).toContain('- add_leads_to_list — 3 succeeded');
+    expect(footer).toContain('Counts are tool calls, not the number of records created or changed');
+  });
+
+  it('says the same in the full fallback', () => {
+    const text = buildExecutedActionsFallback([{ name: 'add_leads_to_list', result: {} }]);
+    expect(text).toContain('Counts are tool calls, not the number of records created or changed');
+  });
+});

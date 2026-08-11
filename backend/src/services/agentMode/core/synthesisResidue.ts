@@ -155,6 +155,17 @@ function tallyExecutedActions(
   return counts;
 }
 
+/**
+ * Every number in the recap counts TOOL CALLS, never records touched — and the two
+ * are easy to confuse in exactly the situation the recap exists for. Session
+ * 39eb5663 imported 75 leads as three 25-row batches and closed with "successfully
+ * added the 3 leads": the run's batch count read as a record count. This recap would
+ * render that same run as "add_leads_to_list — 3 succeeded", so it says outright
+ * what the 3 refers to rather than leaving the reader to guess.
+ */
+const COUNT_BASIS_NOTE =
+  '(Counts are tool calls, not the number of records created or changed.)';
+
 /** Render the `- tool — n succeeded, n failed` lines for a tally. */
 function renderLedgerLines(
   counts: Map<string, { ok: number; failed: number; deferred: number }>,
@@ -201,7 +212,8 @@ export function buildExecutedActionsFooter(toolCalls: ExecutedToolCall[]): strin
     "*Part of my reply for this turn didn't come through correctly, so for completeness, here is what I actually ran:*",
     '',
     renderLedgerLines(counts),
-    `${closing}`.trim(),
+    '',
+    `${COUNT_BASIS_NOTE}${closing}`.trim(),
   ].filter((line, i, all) => !(line === '' && all[i - 1] === '')).join('\n').trim();
 }
 
@@ -243,6 +255,7 @@ export function buildExecutedActionsFallback(toolCalls: ExecutedToolCall[]): str
   if (totalDeferred > 0) {
     closing.push('The ones marked “not run” were never executed, so nothing was applied for them.');
   }
+  closing.push(COUNT_BASIS_NOTE);
   closing.push("Ask me to summarize what I just did and I'll write up the details.");
 
   return [preamble, '', lines.join('\n'), '', closing.join(' ')].join('\n');
