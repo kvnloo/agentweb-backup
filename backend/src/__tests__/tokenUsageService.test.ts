@@ -5,6 +5,7 @@ import {
   incrementUserTokenUsage,
   grantTokenBonus,
   resolveBillingUserId,
+  deriveBlockedByCost,
 } from "../services/tokenUsageService";
 
 // Mock dependencies
@@ -745,5 +746,195 @@ describe("incrementUserTokenUsage - org member increments owner counter", () => 
       "2026-05-01T00:00:00.000Z"
     );
     expect(mockUpdateUser).not.toHaveBeenCalledWith("member1", expect.anything());
+  });
+});
+
+// ─── ENG-1116: cost REPLACES tokens as the enforced gate ─────────────────
+// Until now the two caps were ANDed: `tokenAllowed && (enforceCostCap ? costAllowed
+// : true)`. Cost was an *additional* cap. The product decision is that cost is the
+// real unit of consumption, so when ENFORCE_COST_CAP is on the dollar cap becomes
+// the gate and the token counter goes observe-only.
+//
+// The one exception is the ungated-tier guard: a tier with no monthlyCostAllowance
+// would otherwise become completely unlimited the moment the flag flips, which is a
+// strictly worse failure than the cap it replaces. Those tiers keep their token cap
+// until a dollar allowance is configured, which also makes the rollout order-
+// independent — the code can ship before the allowances are set.
+
+describe("checkTokenUsage - cost replaces tokens as the gate (ENG-1116)", () => {
+  afterEach(() => {
+    delete process.env.ENFORCE_COST_CAP;
+  });
+
+  function tierWithCostCap() {
+    mockGetUserSubscriptionType.mockResolvedValue("Basic");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Basic",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 100000,
+      monthlyCostAllowance: 20,
+    });
+  }
+
+  function tierWithoutCostCap() {
+    mockGetUserSubscriptionType.mockResolvedValue("Basic");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Basic",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 100000,
+      // no monthlyCostAllowance — the state every prod tier is in today
+    });
+  }
+
+  function usageOf(totalTokens: number, totalCost: number) {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: {
+        month: currentMonth(),
+        totalTokens,
+        totalCost,
+        resetDate: "2026-09-01T00:00:00.000Z",
+      },
+      tokenAllowanceBonus: 0,
+    });
+  }
+
+  it("does NOT block a user who is over the token cap but under the cost cap", async () => {
+    // The whole point of the flip. This user is at 1600% of an undersized token
+    // allowance — the exact shape of the four prod users blocked today — but has
+    // spent $2 of $20. They must be allowed through.
+    process.env.ENFORCE_COST_CAP = "true";
+    usageOf(1600000, 2.0);
+    tierWithCostCap();
+
+    const result = await checkTokenUsage("u1");
+
+    expect(result.allowed).toBe(true);
+    expect(result.percentUsed).toBe(1600);
+    expect(result.costPercentUsed).toBe(10);
+  });
+
+  it("blocks a user over the cost cap even when the token counter is also over", async () => {
+    // Over both. Under the old AND this blocked too, but for the wrong reason —
+    // the block must now be attributable to cost so the message reads in dollars.
+    process.env.ENFORCE_COST_CAP = "true";
+    usageOf(1600000, 25.0);
+    tierWithCostCap();
+
+    const result = await checkTokenUsage("u1");
+
+    expect(result.allowed).toBe(false);
+    expect(result.costEnforced).toBe(true);
+    expect(deriveBlockedByCost(result).blockedByCost).toBe(true);
+  });
+
+  it("falls back to the token cap for a tier with no cost allowance (never ungated)", async () => {
+    // Guard: flipping the env var must not silently remove all limits from a tier
+    // nobody has priced yet.
+    process.env.ENFORCE_COST_CAP = "true";
+    usageOf(150000, 999.0);
+    tierWithoutCostCap();
+
+    const result = await checkTokenUsage("u1");
+
+    expect(result.allowed).toBe(false);
+    expect(result.percentUsed).toBe(150);
+  });
+
+  it("reports costEnforced=false for a tier with no cost allowance, even with the flag on", async () => {
+    // costEnforced is the UI's signal that a real dollar denominator exists. With
+    // no allowance configured there is nothing to render a quota against, so the
+    // customer meter must keep showing the dimension that actually gates them.
+    process.env.ENFORCE_COST_CAP = "true";
+    usageOf(1000, 5.0);
+    tierWithoutCostCap();
+
+    const result = await checkTokenUsage("u1");
+
+    expect(result.costEnforced).toBe(false);
+  });
+
+  it("stops warning on the token dimension once cost is the gate", async () => {
+    // 85% of tokens, 10% of budget. Warning about a cap that can no longer block
+    // is exactly the nag ENG-951 wanted off customer surfaces.
+    process.env.ENFORCE_COST_CAP = "true";
+    usageOf(85000, 2.0);
+    tierWithCostCap();
+
+    const result = await checkTokenUsage("u1");
+
+    expect(result.allowed).toBe(true);
+    expect(result.warning).toBe(false);
+  });
+
+  it("still warns on the token dimension when the flag is off", async () => {
+    usageOf(85000, 2.0);
+    tierWithCostCap();
+
+    const result = await checkTokenUsage("u1");
+
+    expect(result.allowed).toBe(true);
+    expect(result.warning).toBe(true);
+  });
+
+  it("still blocks on tokens when the flag is off, whatever the spend", async () => {
+    // Byte-identical-to-today guarantee for the un-flipped environment.
+    usageOf(150000, 0.5);
+    tierWithCostCap();
+
+    const result = await checkTokenUsage("u1");
+
+    expect(result.allowed).toBe(false);
+    expect(result.costEnforced).toBe(false);
+  });
+});
+
+describe("deriveBlockedByCost - respects the enforced dimension (ENG-1116)", () => {
+  it("attributes a block to cost when cost is the gate and both caps are exceeded", () => {
+    // Without costEnforced this returns false (tokenCapTriggered vetoes it) and the
+    // user is told they ran out of tokens — a cap that no longer blocks anyone.
+    const result = deriveBlockedByCost({
+      allowance: 100000,
+      effectiveAllowance: 100000,
+      percentUsed: 1600,
+      costAllowance: 20,
+      costPercentUsed: 125,
+      costEnforced: true,
+    });
+
+    expect(result.blockedByCost).toBe(true);
+    expect(result.costCapTriggered).toBe(true);
+    expect(result.tokenCapTriggered).toBe(true);
+  });
+
+  it("keeps the legacy attribution when cost is not the enforced gate", () => {
+    const result = deriveBlockedByCost({
+      allowance: 100000,
+      effectiveAllowance: 100000,
+      percentUsed: 1600,
+      costAllowance: 20,
+      costPercentUsed: 125,
+    });
+
+    expect(result.blockedByCost).toBe(false);
+  });
+
+  it("does not attribute a token-only block to cost while cost is the gate", () => {
+    // Cost is enforced but under budget — a block here came from the fallback
+    // guard (an unpriced tier), so the message must stay in tokens.
+    const result = deriveBlockedByCost({
+      allowance: 100000,
+      effectiveAllowance: 100000,
+      percentUsed: 150,
+      costAllowance: null,
+      costPercentUsed: 0,
+      costEnforced: false,
+    });
+
+    expect(result.blockedByCost).toBe(false);
+    expect(result.tokenCapTriggered).toBe(true);
   });
 });
