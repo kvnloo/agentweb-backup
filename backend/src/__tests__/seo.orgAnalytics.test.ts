@@ -81,6 +81,93 @@ jest.mock("../services/analyticsConfigResolver", () => ({
   resolveAnalyticsConfig: jest.fn(),
 }));
 
+// ---------------------------------------------------------------------------
+// Google Search Console transport stub (ENG-960)
+//
+// `routes/seo.ts` reaches Search Console through the *global* `fetch`, not
+// through `seoService`. Stubbing `seoService` above only replaces the token
+// helper (`getGoogleSearchConsoleAccessToken`) — it does not intercept the
+// request. So before this stub, every `/metrics` test issued a real HTTPS POST
+// to https://www.googleapis.com/webmasters/v3/... and received a live
+// `401 UNAUTHENTICATED` from Google's production API. Test duration was
+// therefore set by an uncontrolled third-party network round trip; under CI
+// contention its long tail crossed jest's 5000 ms per-test budget and the suite
+// flaked intermittently (ENG-960).
+//
+// Stubbing the transport is not masking the flake — it removes the suite's
+// dependency on internet egress and on Google's production API, and it
+// *strengthens* coverage: the handler's success path (parsing the daily,
+// overall, query and page responses) had never once been exercised, because the
+// live 401 short-circuited the domain out on its very first request every run.
+// ---------------------------------------------------------------------------
+const GSC_ORIGIN = "https://www.googleapis.com";
+
+type GscCall = { url: string; authorization: string; body: any };
+/** Every Search Console request the handler made, in order. */
+const gscCalls: GscCall[] = [];
+
+// Fixed Search Console payloads. Numbers are arbitrary but internally
+// consistent so the handler's derived values (ctr, weighted position) are
+// assertable.
+const GSC_DAILY_ROWS = [
+  { keys: ["2026-01-01"], clicks: 30, impressions: 400 },
+  { keys: ["2026-01-02"], clicks: 70, impressions: 600 },
+];
+const GSC_OVERALL_ROW = {
+  clicks: 100,
+  impressions: 1000,
+  ctr: 0.1,
+  position: 8.5,
+};
+const GSC_QUERY_ROWS = [
+  { keys: ["acme widgets"], clicks: 60, impressions: 600, position: 6 },
+  { keys: ["acme pricing"], clicks: 40, impressions: 400, position: 12 },
+];
+const GSC_PAGE_ROWS = [
+  { keys: ["https://acme.com/"], clicks: 55, impressions: 500, position: 7 },
+  { keys: ["https://acme.com/pricing"], clicks: 45, impressions: 500, position: 10 },
+];
+
+/** Mirrors the Search Console contract: the response shape follows `dimensions`. */
+function gscPayloadFor(body: any) {
+  const dimension: string | undefined = body?.dimensions?.[0];
+  if (dimension === undefined) return { rows: [GSC_OVERALL_ROW] };
+  if (dimension === "date") return { rows: GSC_DAILY_ROWS };
+  if (dimension === "query") return { rows: GSC_QUERY_ROWS };
+  if (dimension === "page") return { rows: GSC_PAGE_ROWS };
+  throw new Error(`Unexpected GSC dimension requested by the handler: ${dimension}`);
+}
+
+const realFetch = global.fetch;
+
+function installGscFetchStub() {
+  gscCalls.length = 0;
+  global.fetch = jest.fn(async (input: any, init: any) => {
+    const url = typeof input === "string" ? input : input?.url;
+    // Fail loudly rather than silently reaching the network: if the handler
+    // ever grows a call to a different host, this suite must go red instead of
+    // quietly becoming network-dependent again.
+    if (typeof url !== "string" || !url.startsWith(GSC_ORIGIN)) {
+      throw new Error(
+        `seo.orgAnalytics.test.ts attempted a live network call to ${url}. ` +
+          `Tests must not reach third-party APIs — add a stub for it.`
+      );
+    }
+    const body = init?.body ? JSON.parse(init.body) : {};
+    gscCalls.push({
+      url,
+      authorization: init?.headers?.Authorization,
+      body,
+    });
+    const payload = gscPayloadFor(body);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => payload,
+    };
+  }) as unknown as typeof fetch;
+}
+
 import { userDb, orgDb } from "../services/db";
 import { resolveAnalyticsConfig } from "../services/analyticsConfigResolver";
 import seoRoutes from "../routes/seo";
@@ -109,12 +196,19 @@ describe("seo routes — org analytics inheritance", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     awSettingsGetKeys.length = 0;
+    // Re-install per test: `clearMocks` resets call history, and a fresh stub
+    // keeps each test's `gscCalls` assertions independent of run order.
+    installGscFetchStub();
     // A member with no analytics config of their own.
     mockUserDb.getUserById.mockResolvedValue({
       userId: "member-1",
       email: "member@example.com",
       orgId: "org-1",
     } as any);
+  });
+
+  afterAll(() => {
+    global.fetch = realFetch;
   });
 
   test("GET /metrics: member inherits org analytics — no not-configured 400", async () => {
@@ -130,6 +224,30 @@ describe("seo routes — org analytics inheritance", () => {
       .get("/api/seo/metrics")
       .set("Authorization", `Bearer ${memberToken}`);
     expect(res.status).not.toBe(400);
+
+    // ENG-960: the inherited org domain must actually drive a Search Console
+    // request, and its response must be parsed. Previously this suite reached
+    // Google's live API, got a 401, and asserted only "not 400" — so it passed
+    // whether or not the inherited config was used at all.
+    expect(res.status).toBe(200);
+    expect(gscCalls.length).toBeGreaterThan(0);
+    expect(gscCalls[0].url).toBe(
+      `${GSC_ORIGIN}/webmasters/v3/sites/${encodeURIComponent(
+        "sc-domain:acme.com"
+      )}/searchAnalytics/query`
+    );
+    expect(gscCalls[0].authorization).toBe("Bearer test-token");
+
+    const metric = res.body.metrics[0];
+    expect(metric.domain).toBe("acme.com");
+    expect(metric.error).toBeUndefined();
+    expect(metric.clicks).toBe(100);
+    expect(metric.impressions).toBe(1000);
+    expect(metric.ctr).toBeCloseTo(10);
+    expect(metric.position).toBeCloseTo(8.5);
+    expect(metric.dailyData).toHaveLength(2);
+    expect(metric.topQueries[0].query).toBe("acme widgets");
+    expect(metric.topPages[0].page).toBe("https://acme.com/");
   });
 
   test("GET /product-metrics: member inherits org productDomain — no not-configured 400", async () => {
@@ -184,5 +302,9 @@ describe("seo routes — org analytics inheritance", () => {
     expect(res.status).toBe(200);
     // The AW-Settings get must have been keyed funnels_m-2
     expect(awSettingsGetKeys).toContain("funnels_m-2");
+    // ENG-960: the org-inherited domain still drives a stubbed GSC request —
+    // no live call, and the funnel lookup did not short-circuit metrics.
+    expect(gscCalls[0].url).toContain(encodeURIComponent("sc-domain:acme.com"));
+    expect(res.body.metrics[0].clicks).toBe(100);
   });
 });
