@@ -369,21 +369,51 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     expect(ownerPrune).toBeLessThan(s3Delete);
   });
 
-  it("does not claim a clean delete when the S3 object survives", async () => {
-    // Deleting the object last means a failure here leaks bytes and nothing
-    // else — the record has already stopped referencing it, so the request
-    // still succeeds. But the bytes remain at a URL that resolves, so the
-    // response must not call that "deleted successfully".
+  it("rolls the prune back and fails retryably when the object will not delete", async () => {
+    // Dereferencing the attachment and leaving the bytes was the worst of both:
+    // the object stays live at a URL that resolves, and the retry 404s because
+    // the attachment it matches on is gone — so nothing can ever clean it up.
     mockDynamoGet.mockResolvedValue({ Item: soloUser });
     mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
     jest.spyOn(console, "error").mockImplementation(() => {});
 
     const res = await del(soloUser, OWN_ASSET_KEY);
 
+    expect(res.status).toBe(502);
+    expect(res.body.error).toMatch(/nothing was changed/i);
+    // Last write restores the full attachment list, so a retry still resolves it.
+    const restored =
+      mockDynamoUpdate.mock.calls.at(-1)![0].ExpressionAttributeValues[":brandGuidelines"];
+    expect(restored.attachments).toHaveLength(2);
+    (console.error as jest.Mock).mockRestore();
+  });
+
+  it("retries a transient S3 failure instead of rolling back", async () => {
+    mockDynamoGet.mockResolvedValue({ Item: soloUser });
+    mockS3Delete
+      .mockRejectedValueOnce(new Error("SlowDown"))
+      .mockResolvedValueOnce({});
+
+    const res = await del(soloUser, OWN_ASSET_KEY);
+
     expect(res.status).toBe(200);
-    expect(mockDynamoUpdate).toHaveBeenCalled();
+    expect(mockS3Delete).toHaveBeenCalledTimes(2);
+    // One write only — the prune stands, nothing was rolled back.
+    expect(mockDynamoUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports the orphan when the rollback itself also fails", async () => {
+    mockDynamoGet.mockResolvedValue({ Item: soloUser });
+    mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
+    mockDynamoUpdate
+      .mockResolvedValueOnce({ Attributes: {} })
+      .mockRejectedValueOnce(new Error("throughput exceeded"));
+    jest.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await del(soloUser, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(500);
     expect(res.body.objectDeleted).toBe(false);
-    expect(res.body.message).toMatch(/could not be deleted/i);
     (console.error as jest.Mock).mockRestore();
   });
 
@@ -529,6 +559,40 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     expect(written).not.toBe(sameMs);
     expect(new Date(written).getTime()).toBeGreaterThan(new Date(sameMs).getTime());
     (Date.now as jest.Mock).mockRestore();
+  });
+
+  it("aborts cleanly, not with a 500, when the owner row vanishes before the write", async () => {
+    // The resolver already read this owner's brand to answer the request, so a
+    // miss on the delete path's own lookup is GSI lag, not a real absence.
+    // Spreading the undefined record threw a TypeError that surfaced as a
+    // blanket 500 — after which nothing at all had been deleted.
+    const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
+    mockDynamoGet.mockResolvedValue({ Item: editor });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "owner-u",
+      brandGuidelines: undefined,
+      shareSettings: {
+        brandGuidelines: { editors: ["editor-u"] },
+        marketingStrategy: { editors: [] },
+      },
+    });
+    // First lookup (via the resolver) sees the owner; the delete path's own
+    // lookup then comes back empty.
+    mockGetUserById
+      .mockResolvedValueOnce({ userId: "owner-u", email: "owner@test.com", brandGuidelines: ownBrand })
+      .mockResolvedValueOnce(undefined);
+    jest.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await del(editor, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/try again/i);
+    // Nothing destroyed, so the retry has something to delete.
+    expect(mockS3Delete).not.toHaveBeenCalled();
+    expect(mockUpdateUser).not.toHaveBeenCalled();
+    expect(mockUpdateOrg).not.toHaveBeenCalled();
+    (console.error as jest.Mock).mockRestore();
   });
 
   it("refuses a foreign key even on an un-copied org", async () => {
