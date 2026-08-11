@@ -1198,6 +1198,42 @@ describe('CRM Database Service', () => {
       expect(result.errorCount).toBe(0);
     });
 
+    // ENG-1002: callers that preview "what was imported" need to map each
+    // created leadId back to the input row it came from. Without sourceIndex
+    // there is no join key for rows that carry no email (LinkedIn-sourced
+    // leads), so previews get built from the wrong records.
+    it('reports the input-array index each created lead came from', async () => {
+      const listId = 'list_123';
+      const leads = [
+        { linkedin: 'https://www.linkedin.com/in/already-there', firstName: 'Dup', lastName: 'Licate' },
+        { linkedin: 'https://www.linkedin.com/in/brand-new', firstName: 'Brand', lastName: 'New' },
+      ];
+
+      mockDocumentClientMethods.query.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({
+          Items: [
+            { leadId: 'lead-existing', listId, linkedin: 'https://www.linkedin.com/in/already-there', firstName: 'Dup' },
+          ],
+        }),
+      });
+      mockDocumentClientMethods.batchWrite.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+      mockDocumentClientMethods.get.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({ Item: { listId, fieldNames: [] } }),
+      });
+      mockDocumentClientMethods.update.mockReturnValue({
+        promise: jest.fn().mockResolvedValue({}),
+      });
+
+      const result = await crmDb.batchCreateLeads(listId, leads);
+
+      expect(result.newCount).toBe(1);
+      expect(result.created).toHaveLength(1);
+      // Index 0 merged into the existing lead; only index 1 was written.
+      expect(result.created[0].sourceIndex).toBe(1);
+    });
+
     it('should merge leads with existing emails', async () => {
       const listId = 'list_123';
       const leads = [
