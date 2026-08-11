@@ -256,6 +256,10 @@ describe('executePreparedTools', () => {
     expect(stored.length).toBeLessThan(15_000 + 500);
   });
 
+  // ENG-940 follow-up B: uploadFileToS3WithPath signals failure by RETURNING
+  // {success:false} (it swallows its own errors), so the offload used to be
+  // skipped silently and the payload became indistinguishable from a small
+  // response until the trimmer destroyed it.
   // ENG-1054: the in-memory preview is a hard byte slice, so it lands mid-JSON.
   // Handing the model an unterminated structure is what produced the production
   // "}]" final answer — the model closed our JSON instead of writing a reply.
@@ -281,6 +285,60 @@ describe('executePreparedTools', () => {
     expect(parsed.success).toBe(true);
     expect(Array.isArray(parsed.ads)).toBe(true);
     expect(parsed.ads.length).toBeGreaterThan(0);
+  });
+
+  it('retries a failed S3 offload once before giving up', async () => {
+    const big = 'Y'.repeat(15_000);
+    const upload = jest
+      .fn()
+      .mockResolvedValueOnce({ success: false, error: 'SlowDown' })
+      .mockResolvedValueOnce({ success: true, key: 'tool-responses/sess-1/a.txt' });
+    const ports = makePorts({
+      executePreparedAgentTool: async () => big,
+      extractToolContent: (r: any) => r,
+      uploadFileToS3WithPath: upload,
+    });
+    const input = makeInput([toolCall('a', 'read_market_strategy', '{}')], ports);
+    await executePreparedTools(input);
+
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(input.messages[0].content as string).toContain(
+      '[Full response stored at S3 key: tool-responses/sess-1/a.txt',
+    );
+  });
+
+  it('marks the response unrecoverable when both offload attempts fail', async () => {
+    const big = 'Y'.repeat(15_000);
+    const upload = jest.fn().mockResolvedValue({ success: false, error: 'AccessDenied' });
+    const ports = makePorts({
+      executePreparedAgentTool: async () => big,
+      extractToolContent: (r: any) => r,
+      uploadFileToS3WithPath: upload,
+    });
+    const input = makeInput([toolCall('a', 'read_market_strategy', '{}')], ports);
+    await executePreparedTools(input);
+
+    expect(upload).toHaveBeenCalledTimes(2);
+    const stored = input.messages[0].content as string;
+    expect(stored).toContain('could NOT be stored');
+    expect(stored).not.toContain('[Full response stored at S3 key:');
+    // The payload itself is still delivered in full for THIS turn.
+    expect(stored).toContain(big);
+  });
+
+  it('marks the response unrecoverable when the offload throws', async () => {
+    const big = 'Y'.repeat(15_000);
+    const upload = jest.fn().mockRejectedValue(new Error('socket hang up'));
+    const ports = makePorts({
+      executePreparedAgentTool: async () => big,
+      extractToolContent: (r: any) => r,
+      uploadFileToS3WithPath: upload,
+    });
+    const input = makeInput([toolCall('a', 'read_market_strategy', '{}')], ports);
+    await executePreparedTools(input);
+
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(input.messages[0].content as string).toContain('could NOT be stored');
   });
 
   it('preflight-blocks an admin-only tool for a non-admin session', async () => {

@@ -200,6 +200,11 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
     // Reset persist implementation each test (clearAllMocks does not reset implementations)
     mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
+    // Same reason: tests that force schedule-write failures would otherwise leave
+    // updateSchedule/clearRunInFlight rejecting for every test that follows.
+    (mockScheduleDb.updateSchedule as jest.Mock).mockResolvedValue(undefined);
+    (mockScheduleDb.clearRunInFlight as jest.Mock).mockResolvedValue(true);
+    (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
@@ -940,6 +945,340 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
       const retryAt = new Date(nextRunTime as string).getTime();
       expect(retryAt).toBeGreaterThanOrEqual(beforeRun + 14 * 60 * 1000);
       expect(retryAt).toBeLessThanOrEqual(Date.now() + 16 * 60 * 1000);
+    });
+
+    /**
+     * ENG-971. Zero assistant output does NOT mean the run did nothing — a publish
+     * can land and the process die before the summary. Auto-retrying that run
+     * REPUBLISHES it, and unlike the interactive paths no human sees the transcript
+     * between the failure and the retry, so a warning in the message would arrive
+     * far too late. The requeue itself has to be suppressed.
+     */
+    describe('zero output AFTER a confirmed publish (ENG-971)', () => {
+      const zeroOutput = {
+        content: '', toolCalls: [], knowledgeBaseQueries: [], sources: [], responseMessages: [],
+      };
+      // Local copies of the ENG-657 resume fixtures (theirs are scoped to that describe).
+      const resumeSessionId = 'resume-sess-eng971';
+      const resumableMessages = [
+        { role: 'system', content: 'automated run' },
+        { role: 'user', content: 'Enrich the CRM leads and recommend the top 10.' },
+        { role: 'assistant', content: 'Firing enrichment.', tool_calls: [{ id: 'c1', function: { name: 'enrich_leads_execute' } }] },
+        { role: 'tool', tool_call_id: 'c1', content: '{"mode":"enrich","processedCount":5}' },
+      ];
+
+      const runWithLedger = async (calledFunctions: Record<string, number>) => {
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions,
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+        return runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+      };
+
+      it('does NOT requeue when the ledger confirms a publish', async () => {
+        await runWithLedger({ publish_landing_page_changes: 1, get_deployment_status: 2 });
+
+        const requeue = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1
+        );
+        expect(requeue).toBeUndefined();
+      });
+
+      // A run that published 1 of 5 pages and died must NOT be abandoned part-done.
+      // Resume continues the SAME session from its last settled step, so the rest
+      // finishes and the publish is not repeated.
+      it('requeues as a RESUME when the transcript can be safely continued', async () => {
+        const balanced = [
+          { role: 'system', content: 'automated run' },
+          { role: 'user', content: 'Publish the five vertical landers.' },
+          { role: 'assistant', content: 'Publishing the first.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+          { role: 'tool', tool_call_id: 'p1', content: '{"success":true}' },
+        ];
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(balanced);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions: { publish_landing_page_changes: 1 },
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        const requeue = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1
+        );
+        expect(requeue).toBeDefined();
+        // The marker that makes the retry CONTINUE instead of restart.
+        expect(requeue![1].pendingResumeSessionId).toBe('test-session-123');
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note![1].content).toContain('published your landing-page changes');
+        expect(note![1].content).toMatch(/pick up where this run left off/i);
+        // No owner alert: nothing needs a human when the run self-heals.
+        expect(mockEmailService.sendScheduledRunFailedEmail).not.toHaveBeenCalled();
+      });
+
+      // The message must follow the OUTCOME, not the intent. If the requeue write
+      // fails there is no resume, and promising one would be the same false-success
+      // reporting this whole issue is about.
+      it('does not promise a resume when the requeue write fails', async () => {
+        const balanced = [
+          { role: 'system', content: 'automated run' },
+          { role: 'user', content: 'Publish the five vertical landers.' },
+          { role: 'assistant', content: 'Publishing the first.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+          { role: 'tool', tool_call_id: 'p1', content: '{"success":true}' },
+        ];
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(balanced);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions: { publish_landing_page_changes: 1 },
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+        // Fail every resume-marker attempt so the retry budget is exhausted.
+        (mockScheduleDb.updateSchedule as jest.Mock)
+          .mockRejectedValueOnce(new Error('DynamoDB throttled'))
+          .mockRejectedValueOnce(new Error('DynamoDB throttled'))
+          .mockRejectedValueOnce(new Error('DynamoDB throttled'));
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note).toBeDefined();
+        expect(note![1].content).not.toMatch(/pick up where this run left off/i);
+        expect(note![1].content).toMatch(/NOT been retried automatically/i);
+        expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalled();
+        // The marker write is retried before giving up...
+        const markerAttempts = mockScheduleDb.updateSchedule.mock.calls.filter(
+          (c: any[]) => c[1]?.pendingResumeSessionId !== undefined
+        );
+        expect(markerAttempts.length).toBe(3);
+        // ...and when it will not persist, the schedule is PAUSED, because only
+        // persisted state can stop the next ordinary fire repeating the publish.
+        const paused = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.status === 'paused'
+        );
+        expect(paused).toBeDefined();
+        expect(note![1].content).toMatch(/paused this schedule/i);
+      });
+
+      /**
+       * The last backstop, and the only one that cannot fail: if every durable
+       * write is refused, the run keeps its lease. setRunInFlight is conditional
+       * on attribute_not_exists(runInFlight), so while it stands the schedule
+       * physically cannot start a fresh run and repeat the publish — no successful
+       * write required, because holding the lease is a decision NOT to act.
+       */
+      it('holds the in-flight lease when neither resume nor pause can be persisted', async () => {
+        const balanced = [
+          { role: 'system', content: 'automated run' },
+          { role: 'user', content: 'Publish the five vertical landers.' },
+          { role: 'assistant', content: 'Publishing.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+          { role: 'tool', tool_call_id: 'p1', content: '{"success":true}' },
+        ];
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(balanced);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions: { publish_landing_page_changes: 1 },
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+        // Every schedule write fails: the resume marker AND all pause retries.
+        (mockScheduleDb.updateSchedule as jest.Mock).mockRejectedValue(new Error('DynamoDB unavailable'));
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        expect(mockScheduleDb.clearRunInFlight).not.toHaveBeenCalled();
+      });
+
+      it('releases the lease normally when the run did resume', async () => {
+        const balanced = [
+          { role: 'system', content: 'automated run' },
+          { role: 'user', content: 'Publish the landers.' },
+          { role: 'assistant', content: 'Publishing.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+          { role: 'tool', tool_call_id: 'p1', content: '{"success":true}' },
+        ];
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(balanced);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions: { publish_landing_page_changes: 1 },
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        // A resumed run is recovered by its own requeue; holding the lease would
+        // block the very run we just scheduled.
+        expect(mockScheduleDb.clearRunInFlight).toHaveBeenCalled();
+      });
+
+      // Nothing may claim an action we cannot confirm — the owner alert is
+      // best-effort, skipped for test runs, and sent AFTER this text is composed.
+      it('never claims the owner was notified', async () => {
+        await runWithLedger({ publish_landing_page_changes: 1 });
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note![1].content).not.toMatch(/owner has been notified/i);
+      });
+
+      // Not safely continuable: stopping is right, but it must not be SILENT.
+      it('notifies the owner when a published run cannot be safely continued', async () => {
+        await runWithLedger({ publish_landing_page_changes: 1 });
+
+        expect(
+          mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.zeroAssistantRetryCount === 1)
+        ).toBeUndefined();
+        expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalled();
+        // An email cannot stop a cron: the schedule itself must be pausable state,
+        // or its next ordinary fire repeats the publish.
+        const paused = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.status === 'paused'
+        );
+        expect(paused).toBeDefined();
+      });
+
+      it('tells the user what went live and that it will not be retried', async () => {
+        await runWithLedger({ publish_landing_page_changes: 1 });
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note).toBeDefined();
+        expect(note![1].content).toContain('published your landing-page changes');
+        expect(note![1].content).toMatch(/not been retried|will not be retried/i);
+        // The old copy is now false for this case and must be gone.
+        expect(note![1].content).not.toContain('no results were generated');
+        expect(note![1].content).not.toContain('will be retried automatically');
+      });
+
+      // FAIL case: the ordinary zero-output run is untouched. Suppressing the requeue
+      // for every failure would silently stop schedules from self-healing.
+      it('still requeues a zero-output run that published nothing', async () => {
+        await runWithLedger({ get_leads: 3, you_search_web: 1 });
+
+        const requeue = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1
+        );
+        expect(requeue).toBeDefined();
+        expect(requeue![1]).toEqual(
+          expect.objectContaining({ status: 'active', nextRunTime: expect.any(String) })
+        );
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note![1].content).toContain('will be retried automatically');
+      });
+
+      /**
+       * The regression this nearly shipped with. calledFunctions is SESSION-cumulative
+       * and a recovered run RESUMES the abandoned run's session, so a publish from the
+       * previous run would otherwise be read as this run's work and suppress the
+       * requeue — silently ending the schedule's auto-recovery. Only successes that
+       * increased since this run started may count.
+       */
+      it('still requeues when the publish belongs to the PREVIOUS run of a resumed session', async () => {
+        // The resumed session carries the abandoned run's publish in calledFunctions
+        // and gains nothing new this run. Read raw, that inherited publish would
+        // suppress the requeue forever.
+        // jest.clearAllMocks() clears CALLS but not implementations, and an earlier
+        // test in this file pins claimPendingResume to false. Without this the run
+        // takes the lost-claim early return, no session is created, and the
+        // "we resumed" assertion below passes for entirely the wrong reason.
+        (mockScheduleDb.claimPendingResume as jest.Mock).mockResolvedValue(true);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          sessionId: resumeSessionId,
+          userId: mockUserId,
+          messages: resumableMessages,
+          calledFunctions: { publish_landing_page_changes: 1 },
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0,
+            pendingResumeSessionId: resumeSessionId } as any,
+          mockUserId,
+          false
+        );
+
+        // Prove the resume actually happened: the turn ran against the ABANDONED
+        // session, not a fresh one. Asserting only "no session was created" would also
+        // be true of the lost-claim early return.
+        expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+        const workerArg = (mockGenerateMarketingResponseWorkerService.runInWorker as jest.Mock).mock.calls[0][0];
+        expect(workerArg.sessionId).toBe(resumeSessionId);
+
+        const requeue = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1
+        );
+        expect(requeue).toBeDefined();
+      });
+
+      // Greptile P1. A FAILED ledger read is UNKNOWN, not "nothing was published".
+      // This test previously asserted the old behaviour — restart from scratch — which
+      // is exactly how a completed production publish would get repeated.
+      it('does not restart from scratch when the ledger read fails', async () => {
+        (mockChatbotDb.getChatSession as jest.Mock).mockRejectedValue(new Error('DynamoDB timeout'));
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        // No fresh-start requeue…
+        const restart = mockScheduleDb.updateSchedule.mock.calls.find(
+          (c: any[]) => c[1]?.zeroAssistantRetryCount === 1 && !c[1]?.pendingResumeSessionId
+        );
+        expect(restart).toBeUndefined();
+        // …and the owner is told, so an unknown outcome is never silent.
+        expect(mockEmailService.sendScheduledRunFailedEmail).toHaveBeenCalled();
+      });
+
+      it('says it could not confirm progress rather than naming work it never read', async () => {
+        (mockChatbotDb.getChatSession as jest.Mock).mockRejectedValue(new Error('DynamoDB timeout'));
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        const note = mockChatbotDb.addMessageToSession.mock.calls.find(
+          (c: any[]) => c[1]?.metadata?.jobIncomplete === true
+        );
+        expect(note![1].content).toMatch(/could not confirm how far it got/i);
+        expect(note![1].content).not.toMatch(/no results were generated/i);
+      });
     });
 
     // ENG-826 #1: proactively notify the owner once the automatic retries are exhausted.

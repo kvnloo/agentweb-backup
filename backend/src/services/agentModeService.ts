@@ -13,6 +13,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
+import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
@@ -54,7 +55,8 @@ import path from 'path';
 import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
-import { skillService } from './skillService';
+import { skillService, Skill } from './skillService';
+import { resolveUserSkillAccess } from './userSkillAccessService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
@@ -102,10 +104,24 @@ const ADMIN_SKILL_TOOL_NAMES = ['manage_linear_governance_label', 'manage_predef
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
 const MAX_TOOL_CONTENT_SIZE = 300_000;
 
+// Floor above which trimToolMessagesForContext compresses an OLD tool result down to a
+// 200-char preview (per-tool allowances in LARGE_TOOL_RESULT_LIMIT may raise it, never lower it).
+export const CONTEXT_TRIM_TOOL_CONTENT_LIMIT = 8_000;
+
 // Threshold above which a tool response is saved in full to S3 so the LLM can search it later.
-// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed 8KB context-trim limit and
+// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed the context-trim limit and
 // get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
 // to retrieve specific fields from the original payload without needing the full text in context.
+//
+// ENG-940: this MUST stay at (or below) the context-trim floor. It used to be 10_000 while the
+// trim floor was 8_000, which opened a dead zone: a response of 8,000–10,000 chars was big enough
+// to be compressed to a 200-char preview on the next turn, yet too small to be offloaded — so the
+// payload was destroyed with no S3 key to recover it. A Daily PR Digest run lost its entire
+// get_pr_digest payload (~8,981 chars) that way. Note the actual harm, since the ticket reports
+// it backwards: the model had ALREADY summarized the payload correctly while it was readable, then
+// saw only the preview a few turns later, concluded its own accurate summary must have been
+// invented, deleted the correct memory and reported the digest as unproducible. Losing the key
+// does not just hide data — it makes a run repudiate correct work it has already done.
 
 // extractToolContent now lives in ../utils/extractToolContent (pure, monolith-free)
 // so the tool-output contract validator and the toolDispatch unit suite can wire
@@ -113,6 +129,7 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 // existing `from '../services/agentModeService'` importers are unaffected.
 export { extractToolContent } from '../utils/extractToolContent';
 import { extractToolContent } from '../utils/extractToolContent';
+import { extractToolResponseHeader } from '../utils/toolResponseS3Ref';
 
 /**
  * Normalize a video timecode to a numeric number of seconds.
@@ -156,7 +173,7 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 // re-exported so any importer of the old path keeps working.
 export { normalizeMetaCampaignIds };
 
-const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
+export const TOOL_RESPONSE_S3_THRESHOLD = CONTEXT_TRIM_TOOL_CONTENT_LIMIT;
 
 // Max output tokens for agent-mode LLM turns. Must be large enough to hold a
 // single big tool-call argument (e.g. create_html_file's content_draft, which
@@ -845,6 +862,14 @@ export interface DiagnosisContext {
   userMessage: string;
   workPlanSummary: string | null;
   failedFunctions: Record<string, number> | null;
+  /**
+   * ENG-971: the calls that SUCCEEDED before the turn died (session.calledFunctions).
+   * Without it the diagnosis agent sees a failure-only view of the run and answers
+   * "be specific about what was accomplished" by asserting nothing was — which is how
+   * a 600s timeout AFTER a landed production publish became "your changes were not
+   * saved. Please try your request again." Optional so older callers still compile.
+   */
+  succeededFunctions?: Record<string, number> | null;
 }
 
 /**
@@ -4419,8 +4444,17 @@ export class AgentModeService {
       // the URL. It only ADDS the true deliverable, never rewrites the model's text, so it
       // cannot invent a false success. Mirrors the finalize guard's in-place last-assistant
       // patch so the persisted transcript matches what the user sees.
+      // ENG-971: the INVERSION of the above — a false FAILURE report. Same shape of
+      // guard (deterministic, always-on, append-only, applied at the same seam): when
+      // the closing narrative claims the session timed out AND that the user's changes
+      // were not saved, while the ledger holds a CONFIRMED successful publish/deploy,
+      // append the true outcome so the user does not re-run a production deploy that
+      // already landed. Runs after the landing reconciler so both corrections compose.
       if (content && !wasCancelled) {
-        const reconciledContent = reconcileLandingDeploymentReport(content, toolCalls);
+        const reconciledContent = reconcileFalseFailureReport(
+          reconcileLandingDeploymentReport(content, toolCalls),
+          toolCalls,
+        );
         if (reconciledContent !== content) {
           content = reconciledContent;
           for (let i = messages.length - 1; i >= 0; i--) {
@@ -5117,58 +5151,13 @@ export class AgentModeService {
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
-      // Best-effort org fanout: only attach orgId when `shareSettings.skills`
-      // is effectively enabled for this caller (plain members need
-      // enabled=true; editors and the org owner always get fanout). Any
-      // lookup failure degrades to non-org behavior.
-      let sessionUserOrgId: string | undefined;
-      try {
-        const { userDb: uDb, orgDb } = await import('./db');
-        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
-        const sessionUser = await uDb.getUserById(userId);
-        const candidateOrgId = sessionUser?.orgId;
-        if (candidateOrgId) {
-          const org = await orgDb.getOrgById(candidateOrgId);
-          const effectivelyEnabled = isFeatureEffectivelyEnabled(
-            { userId, orgId: candidateOrgId, orgRole: sessionUser?.orgRole },
-            org,
-            'skills',
-          );
-          if (effectivelyEnabled) sessionUserOrgId = candidateOrgId;
-        }
-      } catch { /* skip — org-sharing is best-effort */ }
-      const publishedSkills = await skillService.getSkillsAvailableToUser(userId, sessionUserOrgId);
-
-      if (!publishedSkills.length)
-        return { message: "No skills available in the library." };
-
       const session = await chatbotDb.getChatSession(sessionId);
-      const currentAssociated = session?.associatedSkills || [];
-      const associatedSkillIds = new Set(currentAssociated);
-
-      const availableSkills = publishedSkills.filter(s => !associatedSkillIds.has(s.skillId));
-
-      // Add admin skill for admin users (if not already installed)
-      if (!associatedSkillIds.has(ADMIN_SKILL_VIRTUAL_ID)) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          if (user?.isAdmin) {
-            availableSkills.push({
-              skillId: ADMIN_SKILL_VIRTUAL_ID,
-              name: 'Admin Tools',
-              description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
-              toolNames: ADMIN_SKILL_TOOL_NAMES,
-              isPublished: true,
-            } as any);
-          }
-        } catch (e) {
-          console.warn('[listSkills] Error checking admin status:', (e as Error).message);
-        }
-      }
-
-      if (!availableSkills.length)
+      const skills = await this.getSkillsForDisplay(session?.associatedSkills || [], userId);
+      if (!skills.length) return { message: "No skills available in the library." };
+      const availableSkills = skills.filter(skill => !skill.installed);
+      if (!availableSkills.length) {
         return { message: "All available skills are already installed." };
+      }
 
       return {
         message: `Found ${availableSkills.length} available skill(s).`,
@@ -5289,7 +5278,8 @@ export class AgentModeService {
     'send_email_from_sender',
 
     // S3 overflow retrieval — always available so the LLM can read large tool
-    // responses that were offloaded to S3 by the 10KB overflow mechanism.
+    // responses that were offloaded to S3 by the TOOL_RESPONSE_S3_THRESHOLD
+    // overflow mechanism (pinned to CONTEXT_TRIM_TOOL_CONTENT_LIMIT).
     // Without these, the LLM sees the "[Full response stored at S3 key: ...]"
     // header but has no tool to retrieve the full content.
     'search_tool_response',
@@ -5541,25 +5531,28 @@ export class AgentModeService {
   /**
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
-  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
-    let userOrgId: string | undefined;
-    if (userId) {
-      try {
-        const { userDb: uDb } = await import('./db');
-        const u = await uDb.getUserById(userId);
-        userOrgId = u?.orgId;
-      } catch { /* skip */ }
-    }
+  private async loadAuthorizedSkillCatalog(userId?: string): Promise<{ skills: Skill[]; allowedIds: string[] }> {
+    const userOrgId = userId ? (await resolveUserSkillAccess(userId)).sharedOrgId : undefined;
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSet = new Set(userAllowedSkillIds);
+    return { skills: publishedSkills.filter(s => (s.visibility !== 'pending_review' || s.ownerId === userId) && (isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId))), allowedIds: userAllowedSkillIds };
+  }
+
+  public async getAuthorizedSkill(skillId: string, userId: string): Promise<Skill | undefined> {
+    return (await this.loadAuthorizedSkillCatalog(userId)).skills.find(skill => skill.skillId === skillId);
+  }
+
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
+    const { skills: publishedSkills, allowedIds: userAllowedSkillIds } = await this.loadAuthorizedSkillCatalog(userId);
     const installedIds = new Set(associatedSkillIds);
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
 
     const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = publishedSkills
-      .filter(s => isWildcard || allowedSet.has(s.skillId) || (s.ownerId && s.ownerId === userId))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
@@ -5611,40 +5604,10 @@ export class AgentModeService {
         return { message: "skillIds must be a non-empty array of skill IDs." };
       }
 
-      let installUserOrgId: string | undefined;
-      try {
-        const { userDb: uDb } = await import('./db');
-        const installUser = await uDb.getUserById(userId);
-        installUserOrgId = installUser?.orgId;
-      } catch { /* skip — org-sharing is best-effort */ }
-      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getSkillsAvailableToUser(userId, installUserOrgId),
-        getAllowedSkills(userId)
-      ]);
-
-      const isWildcard = userAllowedSkillIds.includes("*");
-      const allowedSkillSet = new Set(userAllowedSkillIds);
-
-      // Check admin status for admin skill gating
-      let isAdmin = false;
-      if (skillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          isAdmin = user?.isAdmin === true;
-        } catch (e) {
-          console.warn('[installSkills] Error checking admin status:', (e as Error).message);
-        }
-      }
-
-      // Filter valid IDs: exists in published/user skills OR is a virtual skill ID
-      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill, or org-shared private skill)
+      const availableSkills = await this.getSkillsForDisplay([], userId);
+      const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
       const validSkillIds = skillIds.filter(id => {
-        const skill = publishedSkills.find(s => s.skillId === id);
-        const isOwnSkill = skill && skill.ownerId === userId;
-        const isOrgSkill = skill && skill.orgId && skill.orgId === installUserOrgId;
-        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && (isAdmin || isDelegatedAccess)) || skill) &&
-          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isOrgSkill || isWildcard || allowedSkillSet.has(id));
+        return availableById.has(id) || (id === ADMIN_SKILL_VIRTUAL_ID && isDelegatedAccess);
       });
 
       const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
@@ -5661,7 +5624,7 @@ export class AgentModeService {
           } else if (id === ADMIN_SKILL_VIRTUAL_ID) {
             installedNames.push('Admin Tools');
           } else {
-            const skill = publishedSkills.find(s => s.skillId === id);
+            const skill = availableById.get(id);
             if (skill) installedNames.push(skill.name);
           }
         });
@@ -10537,6 +10500,13 @@ export class AgentModeService {
       if (result.errorCount > 0) {
         messageParts.push(`${result.errorCount} lead(s) failed`);
       }
+      // ENG-1002 (follow-up): say so when rows were refused as anonymized
+      // placeholders, so the agent cannot report a clean import that silently
+      // wrote fewer records than the caller handed over.
+      const anonymizedSkipped = result.anonymizedSkipped || 0;
+      if (anonymizedSkipped > 0) {
+        messageParts.push(`${anonymizedSkipped} out-of-network LinkedIn placeholder(s) skipped`);
+      }
 
       return {
         success: result.successCount > 0,
@@ -10547,6 +10517,7 @@ export class AgentModeService {
         newCount: result.newCount || 0,
         mergedCount: result.mergedCount || 0,
         errorCount: result.errorCount,
+        anonymizedSkipped,
         errors: result.errors.length > 0 ? result.errors : undefined
       };
     } catch (error) {
@@ -14549,7 +14520,18 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    */
   async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
     try {
-      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.`;
+      // ENG-971: the truthfulness rules exist because this agent wrote "the system
+      // timed out ... so your changes were not saved. Please try your request again"
+      // for a run whose production publish had already landed and been verified. It
+      // is told what succeeded (below) and forbidden from turning an interruption
+      // into a claim of lost work.
+      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.
+
+TRUTHFULNESS RULES (these override tone):
+- The "Succeeded operations" list is what actually happened. Anything on it completed — say so, and name it.
+- An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
+- Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
+- Do not attribute a failure to an operation that appears in the succeeded list.`;
 
       const parts: string[] = [
         `Error type: ${context.errorType}`,
@@ -14560,6 +14542,9 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
         parts.push(`Work plan status:\n${context.workPlanSummary}`);
       } else {
         parts.push('No work plan.');
+      }
+      if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
+        parts.push(`Succeeded operations (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);
@@ -20042,6 +20027,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The schedule_id doesn't exist or doesn't belong to this user. Call list_scheduled_chats to get a valid schedule_id before retrying update/toggle/delete.`;
       }
     }
+    // ENG-971: bookkeeping / side-effect tools (save_memory, save_org_memory, …)
+    // record a note ABOUT the work — they are not the work. A trailing save_memory
+    // schema rejection got the generic "adjust the plan" guidance below, read like a
+    // failure of the primary task, and was generalized into "the system timed out and
+    // your changes were not saved. Please try again." — after a landing-page publish
+    // that had already gone live in production. Give the criticality verdict
+    // explicitly, and keep it accurate even when the memory note WAS what the user
+    // asked for: the failure is real and must be reported, it is just SCOPED to the note.
+    if (isBookkeepingTool(toolName)) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: ${toolName} is a NON-CRITICAL bookkeeping call — it only stores a note for future sessions. Its failure is scoped to that note: it did not undo, roll back, or lose any work already completed in this session, and it is NOT a session, system, or connection timeout. Do NOT tell the user that the system timed out, that their changes were not saved, or that they should re-run work that already succeeded — re-running a publish or deploy that already landed is the worst outcome here. Say in one line that the note could not be saved, then report the true outcome of the rest of the session exactly as the earlier tool results confirmed it.`;
+    }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }
 
@@ -20133,7 +20129,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       const searchResults = await searchPlatformKnowledgeBase(query, limitedMaxResults, userId);
 
       const results: Array<{ content: string; source: string; fileName?: string }> = (searchResults || []).map(result => ({
-        content: result.content,
+        // ENG-1057: unlike the Drive/ClickUp sources below, Vertex results were
+        // never capped, so a single oversized entry could exceed Node's max
+        // string length once merged/serialized downstream and crash the process.
+        content: result.content && result.content.length > 5000
+          ? result.content.substring(0, 5000) + '\n\n[Content truncated]'
+          : result.content,
         source: result.metadata?.source || 'unknown',
         ...(result.metadata?.fileName && { fileName: result.metadata.fileName })
       }));
@@ -22703,7 +22704,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'update_html_file': { fields: ['html_content', 'css_content'], limit: 200 },
   };
 
-  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
+  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = CONTEXT_TRIM_TOOL_CONTENT_LIMIT): any[] {
     // Single linear scan: collect tool-role indices and map each tool_call_id to
     // the index of its (first) resolving tool message. This map replaces the
     // original per-assistant nested forward scan (O(n^2) per call) with O(1)
@@ -22723,8 +22724,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (toolIndices.length <= recentToPreserve) return messages;
 
-    // Most recent N tool results: keep at full size
+    // Most recent N tool results by pure recency. This drives the "old assistant
+    // message" test below ONLY — an assistant whose call was just answered must
+    // keep its arguments intact, and that is a question about recency, not size.
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
+
+    // Size at which THIS tool's result would be compressed (per-tool allowances
+    // may raise the default floor, never lower it).
+    const trimLimitFor = (msg: any): number =>
+      AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+
+    // ENG-940: which results the preserve window actually protects. A result at
+    // or below its trim limit is passed through untouched whether or not it is
+    // preserved, so spending a slot on it protects nothing while evicting a
+    // result that the trimmer really would destroy. The reported run died on
+    // exactly that: three 488-char save_memory schema rejections landed after an
+    // 8,981-char get_pr_digest payload and pushed it out of a 3-slot window
+    // inside one logical turn. So the window keeps the N most recent AT-RISK
+    // results. The worst-case context cost is unchanged — it was always up to N
+    // full-size results — this only stops the window being wasted on results
+    // that were never in danger.
+    const atRiskIndices = toolIndices.filter(
+      (i) => typeof messages[i].content === 'string' && messages[i].content.length > trimLimitFor(messages[i]),
+    );
+    const atRiskPreserveSet = new Set(atRiskIndices.slice(-recentToPreserve));
 
     // Track which assistant messages are "old" (none of their tool_calls resolve
     // to a preserved tool result after them). We trim large argument fields on these.
@@ -22754,14 +22777,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const result = messages.map((msg, idx) => {
       if (
         msg.role === 'tool' &&
-        !preserveSet.has(idx) &&
+        !atRiskPreserveSet.has(idx) &&
         typeof msg.content === 'string'
       ) {
-        const limit = AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+        const limit = trimLimitFor(msg);
         if (msg.content.length > limit) {
+          // ENG-940: an offloaded response carries its "[Full response stored at S3 key: …]"
+          // header at the very front — or, when the offload failed, the "could NOT be stored"
+          // notice. Preview the payload separately from that header, otherwise the 200-char
+          // slice spends its whole budget on (and can cut in half) the only thing telling the
+          // model how much of this result it is still allowed to trust.
+          const s3Ref = extractToolResponseHeader(msg.content);
+          const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
-          const preview = msg.content.slice(0, 200).replace(/\n/g, ' ').trim();
-          return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
+          const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
+          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }
 
