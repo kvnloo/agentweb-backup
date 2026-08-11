@@ -464,7 +464,7 @@ export class McpClientService {
 
     for (const sessionId of staleSessionIds) {
       console.log(`[MCP-CLEANUP] Removing stale session client pool: ${sessionId.substring(0, 8)}`);
-      await this.releaseSessionClients(sessionId);
+      await this.releasePool(sessionId);
     }
   }
 
@@ -788,16 +788,36 @@ export class McpClientService {
   /**
    * Release all clients for a specific chat session
    * Call this when a chat session ends to free resources
+   *
+   * Browser pools are keyed `${owner}::${chatSessionId}` (see getPoolKey), so a
+   * bare session id must also release its compound pools — otherwise this
+   * no-ops for exactly the per-session browser processes it exists to reclaim.
    */
   async releaseSessionClients(chatSessionId: string): Promise<void> {
-    const sessionPool = this.sessionClientPools.get(chatSessionId);
+    const suffix = `::${chatSessionId}`;
+    const poolKeys = Array.from(this.sessionClientPools.keys()).filter(
+      key => key === chatSessionId || key.endsWith(suffix)
+    );
+
+    for (const poolKey of poolKeys) {
+      await this.releasePool(poolKey);
+    }
+  }
+
+  /**
+   * Release one client pool by its exact pool key.
+   * Used by the stale sweep and shutdown, which already hold real pool keys and
+   * must not release sibling pools that merely share an owner.
+   */
+  private async releasePool(poolKey: string): Promise<void> {
+    const sessionPool = this.sessionClientPools.get(poolKey);
     if (!sessionPool) {
       return;
     }
 
     sessionPool.released = true;
-    this.sessionClientPools.delete(chatSessionId);
-    console.log(`[MCP-SESSION] Releasing ${sessionPool.clients.size} client(s) for session: ${chatSessionId.substring(0, 8)}`);
+    this.sessionClientPools.delete(poolKey);
+    console.log(`[MCP-SESSION] Releasing ${sessionPool.clients.size} client(s) for session: ${poolKey.substring(0, 8)}`);
 
     for (const [serverName, client] of sessionPool.clients.entries()) {
       try {
@@ -1548,8 +1568,8 @@ export class McpClientService {
     }
 
     // Close all session client pools
-    for (const sessionId of this.sessionClientPools.keys()) {
-      await this.releaseSessionClients(sessionId);
+    for (const poolKey of Array.from(this.sessionClientPools.keys())) {
+      await this.releasePool(poolKey);
     }
 
     // Close shared clients (from initial initialization)
