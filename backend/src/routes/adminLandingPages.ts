@@ -36,6 +36,8 @@ interface UserRecordLike {
   orgRole?: "owner" | "admin" | "member";
 }
 
+type ResolvedMember = UserRecordLike & { email: string };
+
 function pageSummary(page: GeneratedLandingPage) {
   return {
     id: page.id,
@@ -154,15 +156,25 @@ router.post("/:id/org-share", async (req: Request, res: Response) => {
     const orgMembers = (await orgDb.getOrgMembers(ownerOrgId)) as UserRecordLike[];
     const memberById = new Map(orgMembers.map((m) => [m.userId, m]));
 
-    const resolved: UserRecordLike[] = [];
+    const resolved: ResolvedMember[] = [];
     for (const ref of memberRefs) {
       const user = await resolveMember(ref);
-      if (!user || !memberById.has(user.userId)) {
+      const orgMember = user ? memberById.get(user.userId) : undefined;
+      if (!user || !orgMember) {
         return res.status(400).json({
           message: `'${ref}' is not a member of the page owner's organization`,
         });
       }
-      resolved.push(user);
+      // User rows are keyed by email, but a projected getUserById result can
+      // omit it. Preserve the canonical email from the org-members result so
+      // retries can perform a strongly consistent base-table membership read.
+      const email = user.email ?? orgMember.email;
+      if (!email) {
+        return res.status(400).json({
+          message: `'${ref}' has no canonical email for membership verification`,
+        });
+      }
+      resolved.push({ ...user, email });
     }
 
     // Read-modify-write guarded on updatedAt: an overlapping sharing request
@@ -203,11 +215,7 @@ router.post("/:id/org-share", async (req: Request, res: Response) => {
         // every target through the email primary key's strongly consistent
         // read before restoring their editor grant on the retry.
         const currentMembers = await Promise.all(
-          resolved.map((m) =>
-            m.email
-              ? userDb.getUserByEmailConsistent(m.email)
-              : Promise.resolve(undefined),
-          ),
+          resolved.map((m) => userDb.getUserByEmailConsistent(m.email)),
         );
         const departed = resolved.filter((m, index) => {
           const current = currentMembers[index] as UserRecordLike | undefined;

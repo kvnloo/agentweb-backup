@@ -138,6 +138,10 @@ const nonAdmin = { userId: outsiderId, email: "x@other.com", isAdmin: false };
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // clear queued once-values as well as call history so a fail-closed early
+  // return in one concurrency test cannot leak a response into the next one
+  mockUpdateShareSettings.mockReset();
+  mockGetUserByEmailConsistent.mockReset();
   mockGetUserById.mockImplementation(async (id: string) =>
     ({ [ownerId]: ownerUser, [memberId]: memberUser, [outsiderId]: outsiderUser } as any)[id] ?? null
   );
@@ -329,6 +333,37 @@ describe("POST /:id/org-share", () => {
     // …and our grant is applied on top of the fresh document.
     expect(retriedSettings.landingPages.editors).toContain(memberId);
     expect(expectedUpdatedAt).toBe("2026-08-10T15:00:00.000Z");
+  });
+
+  it("revalidates a user-id grant when its first lookup omitted the canonical email", async () => {
+    const userWithoutProjectedEmail = { ...memberUser, email: undefined };
+    mockGetUserById.mockImplementation(async (id: string) =>
+      ({
+        [ownerId]: ownerUser,
+        [memberId]: userWithoutProjectedEmail,
+        [outsiderId]: outsiderUser,
+      } as any)[id] ?? null
+    );
+    mockGetOrgById
+      .mockResolvedValueOnce(JSON.parse(JSON.stringify(baseOrg)))
+      .mockResolvedValueOnce({
+        ...JSON.parse(JSON.stringify(baseOrg)),
+        updatedAt: "2026-08-10T15:00:00.000Z",
+      });
+    mockUpdateShareSettings
+      .mockRejectedValueOnce(
+        Object.assign(new Error("conditional check failed"), { code: "ConditionalCheckFailedException" })
+      )
+      .mockResolvedValueOnce(undefined);
+
+    const app = makeApp(admin);
+    const res = await request(app)
+      .post("/api/admin/landing-pages/page-1/org-share")
+      .send({ memberUserIds: [memberId] });
+
+    expect(res.status).toBe(200);
+    expect(mockGetUserByEmailConsistent).toHaveBeenCalledWith(memberUser.email);
+    expect(mockUpdateShareSettings).toHaveBeenCalledTimes(2);
   });
 
   it("409s when the retried grant targets a member removed by the concurrent writer", async () => {
