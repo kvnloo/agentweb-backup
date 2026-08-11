@@ -135,12 +135,10 @@ function isReportedFailure(call: ExecutedToolCall): boolean {
   return resultFlags(call)?.success === false;
 }
 
-/**
- * Render a truthful recap of what the run actually executed, for use when the model
- * could not produce a written synthesis. It reports only tool names and outcome
- * counts — never invented results — so it cannot manufacture a false success.
- */
-export function buildExecutedActionsFallback(toolCalls: ExecutedToolCall[]): string {
+/** Tally the ledger into per-tool outcome counts, ignoring collapsed duplicates. */
+function tallyExecutedActions(
+  toolCalls: ExecutedToolCall[],
+): Map<string, { ok: number; failed: number; deferred: number }> {
   const counts = new Map<string, { ok: number; failed: number; deferred: number }>();
   for (const call of toolCalls || []) {
     const name = call && typeof call.name === 'string' ? call.name.trim() : '';
@@ -154,6 +152,75 @@ export function buildExecutedActionsFallback(toolCalls: ExecutedToolCall[]): str
     else entry.ok++;
     counts.set(name, entry);
   }
+  return counts;
+}
+
+/** Render the `- tool — n succeeded, n failed` lines for a tally. */
+function renderLedgerLines(
+  counts: Map<string, { ok: number; failed: number; deferred: number }>,
+): string {
+  const lines: string[] = [];
+  for (const [name, { ok, failed, deferred }] of counts) {
+    const parts: string[] = [];
+    if (ok > 0) parts.push(`${ok} succeeded`);
+    if (failed > 0) parts.push(`${failed} failed`);
+    if (deferred > 0) parts.push(`${deferred} not run (paused for budget)`);
+    lines.push(`- ${name} — ${parts.join(', ')}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Recap to APPEND when a turn's synthesis broke once and the retry then produced
+ * text (ENG-1054).
+ *
+ * The gate here used to be either/or: any text at all from the retry suppressed the
+ * ledger completely. But "did the model emit characters?" is not "did the model
+ * answer" — a retry that returns a fragment, or drifts, satisfied it and the record
+ * of what had executed was lost anyway. Classifying the retry's prose as good-or-bad
+ * is the wrong tool: it is unbounded, and any false positive discards a real answer.
+ *
+ * So do not choose. Keep whatever the model wrote AND state what ran underneath it.
+ * On a recovered turn that costs a few honest lines; on a turn where the retry
+ * drifted it is the difference between the user knowing their campaigns were paused
+ * and not knowing. This is the ticket's own recommendation — a synthesis failure
+ * must not be able to erase the record of executed actions.
+ *
+ * Returns null when there is nothing to report, so nothing is appended.
+ */
+export function buildExecutedActionsFooter(toolCalls: ExecutedToolCall[]): string | null {
+  const counts = tallyExecutedActions(toolCalls);
+  if (counts.size === 0) return null;
+
+  const closing = countsInclude(counts, 'ok')
+    ? " The ones marked “succeeded” have already been applied — please don't re-run them."
+    : '';
+
+  return [
+    '---',
+    "*Part of my reply for this turn didn't come through correctly, so for completeness, here is what I actually ran:*",
+    '',
+    renderLedgerLines(counts),
+    `${closing}`.trim(),
+  ].filter((line, i, all) => !(line === '' && all[i - 1] === '')).join('\n').trim();
+}
+
+/** True when any tool in the tally has at least one call in `bucket`. */
+function countsInclude(
+  counts: Map<string, { ok: number; failed: number; deferred: number }>,
+  bucket: 'ok' | 'failed' | 'deferred',
+): boolean {
+  for (const entry of counts.values()) if (entry[bucket] > 0) return true;
+  return false;
+}
+
+/**
+ * Render a truthful recap of what the run actually executed, for use when the model
+ * could not produce a written synthesis at all. It reports only tool names and
+ * outcome counts — never invented results — so it cannot manufacture a false success.
+ */
+export function buildExecutedActionsFallback(toolCalls: ExecutedToolCall[]): string {
+  const counts = tallyExecutedActions(toolCalls);
 
   const preamble =
     'I ran into a problem writing up my final response for this turn, so the summary below is built directly from the actions I actually ran.';
@@ -162,18 +229,9 @@ export function buildExecutedActionsFallback(toolCalls: ExecutedToolCall[]): str
     return `${preamble}\n\nNo actions were taken, so nothing has changed. Please send your request again and I'll pick it back up.`;
   }
 
-  const lines: string[] = [];
-  let totalOk = 0;
-  let totalDeferred = 0;
-  for (const [name, { ok, failed, deferred }] of counts) {
-    const parts: string[] = [];
-    if (ok > 0) parts.push(`${ok} succeeded`);
-    if (failed > 0) parts.push(`${failed} failed`);
-    if (deferred > 0) parts.push(`${deferred} not run (paused for budget)`);
-    totalOk += ok;
-    totalDeferred += deferred;
-    lines.push(`- ${name} — ${parts.join(', ')}`);
-  }
+  const lines = [renderLedgerLines(counts)];
+  const totalOk = countsInclude(counts, 'ok') ? 1 : 0;
+  const totalDeferred = countsInclude(counts, 'deferred') ? 1 : 0;
 
   // Only the succeeded bucket may be described as applied. A deferred call was
   // never executed, so telling the user not to re-run it would be the exact false

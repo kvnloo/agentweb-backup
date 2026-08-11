@@ -64,7 +64,11 @@ describe('AgentMode — broken-JSON final synthesis guard (ENG-1054)', () => {
     });
 
     expect(snapshot.content).not.toBe('}]');
-    expect(snapshot.content).toBe('I paused both campaigns. Your brand guidelines are attached below.');
+    // The retry's answer is delivered verbatim. It is followed by the executed-action
+    // recap: this turn's synthesis DID break once, and the record of what ran must
+    // not depend on us judging whether the retry's prose is a real answer.
+    expect(snapshot.content).toContain('I paused both campaigns. Your brand guidelines are attached below.');
+    expect(snapshot.content).toContain('read_brand_guidelines');
     // Turn 1 (tools) + turn 2 (residue) + turn 3 (the synthesis retry).
     expect(snapshot.llmTurnsConsumed).toBe(3);
   });
@@ -91,7 +95,7 @@ describe('AgentMode — broken-JSON final synthesis guard (ENG-1054)', () => {
       expect(persisted.trim()).not.toBe('}]');
       expect(persisted.trim()).not.toBe('}');
     }
-    expect(snapshot.content).toBe('Both campaigns are paused.');
+    expect(snapshot.content).toContain('Both campaigns are paused.');
   });
 
   // The production shape: the first turn narrates ("I'll pause them now.") WHILE
@@ -111,7 +115,7 @@ describe('AgentMode — broken-JSON final synthesis guard (ENG-1054)', () => {
       ],
     });
 
-    expect(snapshot.content).toBe('Both campaigns are paused. Here are your brand guidelines.');
+    expect(snapshot.content).toContain('Both campaigns are paused. Here are your brand guidelines.');
     expect(snapshot.llmTurnsConsumed).toBe(3);
   });
 
@@ -155,6 +159,28 @@ describe('AgentMode — broken-JSON final synthesis guard (ENG-1054)', () => {
     expect(snapshot.content).not.toBe('}');
     expect(snapshot.content.trim().length).toBeGreaterThan(0);
     expect(snapshot.content).toContain('read_brand_guidelines');
+  });
+
+  // The gap this closes: the retry emitted characters, so the old either/or gate
+  // treated the turn as answered and dropped the ledger — even when those
+  // characters were a fragment or drift rather than an answer. Observed live: a
+  // retry returned 75 chars of unrelated text and the record of what ran was lost.
+  it('keeps BOTH the retry\'s answer and the record of what executed', async () => {
+    const snapshot = await runScenario(service, {
+      message: 'Pause both new campaigns.',
+      transcript: [
+        { tool_calls: [{ id: 'call-g1', name: 'read_brand_guidelines', arguments: '{}' }] },
+        { content: '}]' },
+        // A retry that emits text but does not actually answer.
+        { content: ' Do not repeat what you already said, and do not add any introductory text.' },
+      ],
+    });
+
+    // The model's text survives — we never judge whether prose is "good enough".
+    expect(snapshot.content).toContain('Do not repeat what you already said');
+    // ...and so does the truthful record the user needs.
+    expect(snapshot.content).toContain('read_brand_guidelines');
+    expect(snapshot.content).toContain("didn't come through correctly");
   });
 
   it('leaves a normal final answer untouched', async () => {

@@ -15,7 +15,7 @@ import { toolResultError } from '../utils/toolResultError';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
-import { isUnusableSynthesis, buildExecutedActionsFallback } from './agentMode/core/synthesisResidue';
+import { isUnusableSynthesis, buildExecutedActionsFallback, buildExecutedActionsFooter } from './agentMode/core/synthesisResidue';
 import {
   downloadBrandLogoToS3,
   getPersistedBrandLogoUrlForUser,
@@ -4013,9 +4013,23 @@ export class AgentModeService {
           // Report that ledger instead — tool names and outcome counts only, so it can
           // never claim a false success. Gated on the per-turn flag, not on `content`:
           // `content` still holds any earlier turn's text and would suppress this.
-          if (synthesisResidueDropped && !turnHadUsableText) {
-            console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
-            content = buildExecutedActionsFallback(toolCalls);
+          if (synthesisResidueDropped) {
+            if (!turnHadUsableText) {
+              console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
+              content = buildExecutedActionsFallback(toolCalls);
+            } else {
+              // The retry DID produce text. Keep it — but do not let "the model
+              // emitted characters" stand in for "the model answered". A retry that
+              // returns a fragment or drifts also satisfies that check, and the
+              // record of what executed would be lost with it. Judging the prose
+              // instead is unbounded and would risk discarding a real answer, so
+              // append the ledger rather than choosing between them.
+              const footer = buildExecutedActionsFooter(toolCalls);
+              if (footer) {
+                console.warn(`AgentMode: Synthesis recovered after residue in session ${sessionId} — appending the executed-action ledger (${toolCalls.length} tool call(s))`);
+                content = `${content}\n\n${footer}`;
+              }
+            }
             if (responseMessage) responseMessage.content = content;
           }
 

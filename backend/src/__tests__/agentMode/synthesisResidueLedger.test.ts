@@ -7,7 +7,7 @@
  * "already applied".
  */
 
-import { buildExecutedActionsFallback } from '../../services/agentMode/core/synthesisResidue';
+import { buildExecutedActionsFallback, buildExecutedActionsFooter } from '../../services/agentMode/core/synthesisResidue';
 
 describe('buildExecutedActionsFallback — outcome bucketing (ENG-1054)', () => {
   it('reports succeeded and failed calls separately', () => {
@@ -92,5 +92,50 @@ describe('buildExecutedActionsFallback — outcome bucketing (ENG-1054)', () => 
 
   it('says nothing changed when the ledger is empty', () => {
     expect(buildExecutedActionsFallback([])).toContain('No actions were taken');
+  });
+});
+
+/**
+ * ENG-1054: "the model emitted characters" is not "the model answered". When a
+ * turn's synthesis broke once and the retry then produced text, the record of what
+ * executed must survive alongside that text — not be suppressed by it.
+ */
+describe('buildExecutedActionsFooter — recovered-turn recap (ENG-1054)', () => {
+  it('reports what ran so a drifting retry cannot erase the record', () => {
+    const footer = buildExecutedActionsFooter([
+      { name: 'call_meta_marketing_api', result: {} },
+      { name: 'call_meta_marketing_api', result: {} },
+      { name: 'list_knowledge_base_files', result: {} },
+    ]) as string;
+
+    expect(footer).toContain("didn't come through correctly");
+    expect(footer).toContain('- call_meta_marketing_api — 2 succeeded');
+    expect(footer).toContain('- list_knowledge_base_files — 1 succeeded');
+    expect(footer).toContain('already been applied');
+  });
+
+  it('never claims a failed-only run was applied', () => {
+    const footer = buildExecutedActionsFooter([
+      { name: 'call_meta_marketing_api', error: new Error('rate limited') },
+    ]) as string;
+
+    expect(footer).toContain('- call_meta_marketing_api — 1 failed');
+    expect(footer).not.toContain('already been applied');
+  });
+
+  it('honours the same deferred/duplicate rules as the full fallback', () => {
+    const footer = buildExecutedActionsFooter([
+      { name: 'generate_image', result: { deferred: true } },
+      { name: 'meta', result: { ok: true } },
+      { name: 'meta', duplicateOf: 'call-1' },
+    ]) as string;
+
+    expect(footer).toContain('- generate_image — 1 not run (paused for budget)');
+    expect(footer).toContain('- meta — 1 succeeded');
+    expect(footer).not.toContain('2 succeeded');
+  });
+
+  it('returns null when there is nothing to report, so nothing is appended', () => {
+    expect(buildExecutedActionsFooter([])).toBeNull();
   });
 });
