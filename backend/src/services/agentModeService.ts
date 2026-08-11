@@ -30,6 +30,9 @@ import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoa
 import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
 import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
 import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+// ENG-1002: the anonymized-hit rule lives in one place so the import tool and
+// the outreach-onboarding prospect preview cannot drift apart.
+import { isAnonymizedSearchLead } from '../utils/anonymizedLinkedInLead';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -892,6 +895,7 @@ function buildFindReason(filters: {
   const joined = parts.join('; ');
   return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
 }
+
 
 /**
  * ENG-182: extract a LinkedIn public identifier from a profile URL, e.g.
@@ -31636,8 +31640,11 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     let searchError: string | null = null;
     let searchUnavailable = false;
     const allErrors: string[] = [];
-    const allCreated: Array<{ leadId: string; email?: string }> = [];
-    const allMappedLeadsPreview: any[] = []; // first-5 preview only
+    // `lead` is the mapped payload the record was written from — the response
+    // preview is derived from this so it can only ever describe real writes.
+    const allCreated: Array<{ leadId: string; email?: string; lead?: any }> = [];
+    // Out-of-network "LinkedIn Member" hits dropped before the write.
+    let anonymizedSkipped = 0;
 
     while (iterationCount < MAX_ITERATIONS) {
       iterationCount++;
@@ -31744,14 +31751,35 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return lead;
       });
 
+      // Phase 1b (ENG-1002): drop anonymized / identity-less hits BEFORE any
+      // further work. LinkedIn returns out-of-network profiles as the
+      // placeholder "LinkedIn Member" with no public identifier; persisting
+      // one produces a nameless, emailless, un-linkable record that can never
+      // be dedup'd — so every subsequent run of the same search creates
+      // another copy. Skipping them also means the top-up loop keeps
+      // paginating until it finds `limit` genuinely usable leads.
+      const candidates: Array<{ lead: any; item: any }> = [];
+      for (let i = 0; i < leads.length; i++) {
+        if (isAnonymizedSearchLead(leads[i])) {
+          anonymizedSkipped++;
+          continue;
+        }
+        candidates.push({ lead: leads[i], item: items[i] });
+      }
+      const importable: any[] = candidates.map((c) => c.lead);
+      if (importable.length === 0) {
+        if (!nextCursor) break;
+        continue;
+      }
+
       // Phase 2: Tier 3 — one batched Gemini Flash call for all titles still
       // missing a company. Skipped entirely when no candidates remain.
       const llmIndices: number[] = [];
       const llmTitles: string[] = [];
-      for (let i = 0; i < leads.length; i++) {
-        if (!leads[i].company && typeof leads[i].title === 'string' && leads[i].title) {
+      for (let i = 0; i < importable.length; i++) {
+        if (!importable[i].company && typeof importable[i].title === 'string' && importable[i].title) {
           llmIndices.push(i);
-          llmTitles.push(leads[i].title);
+          llmTitles.push(importable[i].title);
         }
       }
       if (llmTitles.length > 0) {
@@ -31760,7 +31788,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
-            if (v && v !== 'NONE') leads[llmIndices[k]].company = v;
+            if (v && v !== 'NONE') importable[llmIndices[k]].company = v;
           }
         } catch (e: any) {
           console.warn('[importLeadsFromSearch] LLM batch company-parse failed:', e?.message ?? String(e));
@@ -31768,8 +31796,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
 
       // Phase 3: Tier 4 — Unipile getProfile for still-empty leads, parallel.
-      await Promise.all(items.map(async (item: any, idx: number) => {
-        const lead = leads[idx];
+      await Promise.all(candidates.map(async ({ lead, item }) => {
         if (lead.company || !item.public_identifier || !accountId) return;
         try {
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
@@ -31785,18 +31812,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }));
 
-      const result = await crmDb.batchCreateLeads(listId, leads);
+      const result = await crmDb.batchCreateLeads(listId, importable);
       cumulativeNew += result.newCount ?? 0;
       cumulativeMerged += result.mergedCount ?? 0;
       if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);
       const created = Array.isArray((result as any).created) ? (result as any).created : [];
-      if (created.length) allCreated.push(...created);
-
-      if (allMappedLeadsPreview.length < 5) {
-        for (const lead of leads) {
-          if (allMappedLeadsPreview.length >= 5) break;
-          allMappedLeadsPreview.push(lead);
-        }
+      // Carry the source row alongside each created id so the response preview
+      // is built from the records that were actually written — not from every
+      // candidate we looked at (ENG-1002). Rows that dedup'd into an existing
+      // lead, or that were unchanged no-ops, never appear in `created`.
+      for (const entry of created) {
+        const source = typeof entry?.sourceIndex === 'number' ? importable[entry.sourceIndex] : undefined;
+        allCreated.push({ ...entry, lead: source });
       }
 
       if (cumulativeNew >= limit) break;
@@ -31863,14 +31890,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       cursor: resumeCursor,
       iterations: iterationCount,
       trimmed: trimmedCount,
+      anonymizedSkipped,
       safetyCapHit,
     };
     if (searchError) response.searchError = searchError;
     if (searchUnavailable) response.searchUnavailable = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
+    } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
+      response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
     }
-    response.importedLeads = allMappedLeadsPreview;
+    // Preview strictly the records that were written and survived trimming.
+    response.importedLeads = allCreated.slice(0, 5).map((c) => c.lead).filter(Boolean);
 
     if (auto_enrich && cumulativeNew > 0) {
       const newLeadIds: string[] = allCreated.map((c) => c.leadId);
