@@ -179,7 +179,8 @@ export class SkillService {
 
     try {
       const items = await paginatedScan(dynamodb, params);
-      return (items.map(item => this.normalizeSkill(item)) as Skill[]) || [];
+      return ((items.map(item => this.normalizeSkill(item)) as Skill[]) || [])
+        .filter(skill => skill.visibility !== 'pending_review');
     } catch (error) {
       if ((error as any).code === 'ResourceNotFoundException') {
         return [];
@@ -203,6 +204,7 @@ export class SkillService {
     const seen = new Set(publishedSkills.map(s => s.skillId));
     const privateSkills: Skill[] = [];
     for (const s of [...userSkills, ...orgSkills]) {
+      if (s.visibility === 'pending_review' && s.ownerId !== userId) continue;
       if (!seen.has(s.skillId)) {
         seen.add(s.skillId);
         privateSkills.push(s);

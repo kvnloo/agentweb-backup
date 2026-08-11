@@ -5430,7 +5430,7 @@ export class AgentModeService {
     const allowedSet = new Set(userAllowedSkillIds);
 
     const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = publishedSkills
-      .filter(s => isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId))
+      .filter(s => (s.visibility !== 'pending_review' || s.ownerId === userId) && (isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId)))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,

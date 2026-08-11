@@ -308,14 +308,9 @@ describe('AgentModeService - Skills', () => {
     it('rejects a same-org private skill when skill sharing is disabled', async () => {
       const mockDb = require('../services/db');
       mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
-      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
-        orgId: 'org-1', ownerUserId: 'owner-1',
-        shareSettings: { skills: { enabled: false, editors: [] } },
-      }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1', shareSettings: { skills: { enabled: false, editors: [] } } }) };
       (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([]);
-
       const result = await agentModeService.installSkills(['org-private'], 'member-1', 'session-1');
-
       expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', undefined);
       expect(result.message).toContain('not available with your current subscription');
       expect(chatbotDb.addAssociatedSkills).not.toHaveBeenCalled();
@@ -1175,42 +1170,34 @@ describe('AgentModeService - Skills', () => {
   });
 
   describe('getSkillsForDisplay', () => {
+    it('fails closed when an upstream catalog returns another user\'s pending-review skill', async () => {
+      (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([{ skillId: 'pending', name: 'Pending', description: 'd', toolNames: [], ownerId: 'owner-1', visibility: 'pending_review', isPublished: true }]);
+      const { getAllowedSkills } = require('../services/subscriptionService');
+      (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
+      const result = await agentModeService.getSkillsForDisplay([], 'member-1');
+      expect(result).toEqual([]);
+    });
     it('admits an enabled same-org private skill when the restricted subscription includes it', async () => {
-      const orgSkill = {
-        skillId: 'org-skill', name: 'Org Skill', description: 'd', toolNames: ['read_tool'],
-        ownerId: 'owner-1', orgId: 'org-1', visibility: 'private', isPublished: false,
-      };
+      const orgSkill = { skillId: 'org-skill', name: 'Org Skill', description: 'd', toolNames: ['read_tool'], ownerId: 'owner-1', orgId: 'org-1', visibility: 'private', isPublished: false };
       const mockDb = require('../services/db');
       mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
-      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
-        orgId: 'org-1', ownerUserId: 'owner-1',
-        shareSettings: { skills: { enabled: true, editors: [] } },
-      }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1', shareSettings: { skills: { enabled: true, editors: [] } } }) };
       (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([orgSkill]);
       const { getAllowedSkills } = require('../services/subscriptionService');
       (getAllowedSkills as jest.Mock).mockResolvedValue([]);
-
       const result = await agentModeService.getSkillsForDisplay([], 'member-1');
-
       expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', 'org-1');
       expect(result).toEqual([expect.objectContaining({ skillId: 'org-skill' })]);
     });
-
     it('does not admit another member\'s private skill when org skill sharing is disabled', async () => {
       const mockDb = require('../services/db');
       mockDb.userDb = { getUserById: jest.fn().mockResolvedValue({ userId: 'member-1', orgId: 'org-1', orgRole: 'member' }) };
-      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({
-        orgId: 'org-1', ownerUserId: 'owner-1',
-        shareSettings: { skills: { enabled: false, editors: [] } },
-      }) };
+      mockDb.orgDb = { getOrgById: jest.fn().mockResolvedValue({ orgId: 'org-1', ownerUserId: 'owner-1', shareSettings: { skills: { enabled: false, editors: [] } } }) };
       (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue([]);
-
       const result = await agentModeService.getSkillsForDisplay([], 'member-1');
-
       expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', undefined);
       expect(result).toEqual([]);
     });
-
     it.each(['user', 'org'])('preserves owned and public skills when the %s lookup fails transiently', async (failure) => {
       const catalog = [
         { skillId: 'own', name: 'Own', description: 'd', toolNames: [], ownerId: 'member-1' },
@@ -1224,13 +1211,10 @@ describe('AgentModeService - Skills', () => {
       (skillService.getSkillsAvailableToUser as jest.Mock).mockResolvedValue(catalog);
       const { getAllowedSkills } = require('../services/subscriptionService');
       (getAllowedSkills as jest.Mock).mockResolvedValue(['*']);
-
       const result = await agentModeService.getSkillsForDisplay([], 'member-1');
-
       expect(skillService.getSkillsAvailableToUser).toHaveBeenCalledWith('member-1', undefined);
       expect(result.map(skill => skill.skillId)).toEqual(['own', 'public']);
     });
-
     it('should return published skills with installed status and toolNames', async () => {
       const publishedSkills = [
         { skillId: 'skill-1', name: 'Web Search', description: 'Search tools', toolNames: ['search_web'], isPublished: true },
