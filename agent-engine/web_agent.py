@@ -126,6 +126,27 @@ class GenerateVideoParams(BaseModel):
     image_file_name: Optional[str] = None  # Optional input image for image-to-video generation
     negative_prompt: Optional[str] = None  # Optional negative prompt to avoid certain elements
 
+# Single source of truth for the Veo model ID, so a future Google retirement
+# (ENG-1070: the prior preview ID 404'd) only needs updating in one place
+# instead of two duplicated literals across the image-to-video and
+# text-to-video branches.
+VEO_MODEL_ID = "veo-3.1-generate-preview"
+
+
+def build_veo_config_params(negative_prompt: Optional[str] = None) -> dict:
+    """Build the kwargs for types.GenerateVideosConfig() used by both Veo generation branches.
+
+    Pure and dependency-free (no google.genai import needed) so it's directly
+    unit-testable without the full browser-use/langchain import chain.
+    """
+    config_params = {
+        "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
+        "number_of_videos": 1,  # 1 video generated per request
+    }
+    if negative_prompt:
+        config_params["negative_prompt"] = negative_prompt
+    return config_params
+
 class LogFilterThread(threading.Thread):
     """Thread that continuously filters the log file in real-time"""
     
@@ -1758,7 +1779,7 @@ class WebAgent:
                 The generated video is saved to the downloads folder.
                 
                 Supported models:
-                - veo-3.0-generate-preview (Google): 8-second videos with audio supported, 16:9 aspect ratio
+                - veo-3.1-generate-preview (Google): 8-second videos with audio supported, 16:9 aspect ratio
                 - gen4_turbo (Runway AI): 5-second videos without audio, 1280:720 ratio
                 - kling-v2.1-std (ReelMind): 5-second image-to-video generation, 16:9 aspect ratio (Kling V1.6 Std used for text-to-video)
                 
@@ -1774,7 +1795,7 @@ class WebAgent:
                 """
                 try:
                     # Get the video model to use (default to Google VEO if not specified)
-                    video_model = self.video_model or "veo-3.0-generate-preview"
+                    video_model = self.video_model or VEO_MODEL_ID
                     logger.info(f"Using video model: {video_model}")
                     
                     # Validate output file extension (must end with .mp4)
@@ -2151,15 +2172,10 @@ class WebAgent:
                         if image_object:
                             # Image-to-video generation
                             logger.info("Generating video from input image using Google VEO")
-                            config_params = {
-                                "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
-                                "number_of_videos": 1,  # 1 video generated per request
-                            }
-                            if params.negative_prompt:
-                                config_params["negative_prompt"] = params.negative_prompt
-                            
+                            config_params = build_veo_config_params(params.negative_prompt)
+
                             operation = client.models.generate_videos(
-                                model="veo-3.0-generate-preview",
+                                model=VEO_MODEL_ID,
                                 prompt=params.prompt,
                                 image=image_object,
                                 config=types.GenerateVideosConfig(**config_params)
@@ -2167,15 +2183,10 @@ class WebAgent:
                         else:
                             # Text-to-video generation
                             logger.info("Generating video from text prompt using Google VEO")
-                            config_params = {
-                                "aspect_ratio": "16:9",  # 16:9 is the only supported value for Veo 3
-                                "number_of_videos": 1,  # 1 video generated per request
-                            }
-                            if params.negative_prompt:
-                                config_params["negative_prompt"] = params.negative_prompt
-                            
+                            config_params = build_veo_config_params(params.negative_prompt)
+
                             operation = client.models.generate_videos(
-                                model="veo-3.0-generate-preview",
+                                model=VEO_MODEL_ID,
                                 prompt=params.prompt,
                                 config=types.GenerateVideosConfig(**config_params)
                             )
@@ -4177,7 +4188,7 @@ async def main():
     parser.add_argument('--lead-list-identifier', help='Identifier field name for lead list records')
     parser.add_argument('--has-attachments', action='store_true', help='Task has attachments')
     parser.add_argument('--create-video', action='store_true', help='Create video recording of task execution')
-    parser.add_argument('--video-model', help='Video model to use for video generation (veo-3.0-generate-preview, gen4_turbo, or kling-v2.1-std)')
+    parser.add_argument('--video-model', help='Video model to use for video generation (veo-3.1-generate-preview, gen4_turbo, or kling-v2.1-std)')
     parser.add_argument('--image-model', help='Image model to use for image generation (openai-image-1 or FLUX.1-Kontext-pro)')
     args = parser.parse_args()
 
