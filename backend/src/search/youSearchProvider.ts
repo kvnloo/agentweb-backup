@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { getSecret, secretExists } from '../utils/secretsManager';
+import { extractSignificantTerms, isRelevantToQuery } from './newsRelevance';
 import {
   normalizeSearchCount,
   NormalizedSearchResult,
@@ -66,7 +67,12 @@ export class YouSearchProvider implements SearchProvider {
 
     const data = response.data as any;
     const resultSource = request.resultSource || 'all';
-    const web = resultSource === 'news' ? [] : this.normalizeResults(data?.results?.web, 'web');
+
+    if (resultSource === 'news') {
+      return this.buildNewsResponse(data, request);
+    }
+
+    const web = this.normalizeResults(data?.results?.web, 'web');
     const news = resultSource === 'web' ? [] : this.normalizeResults(data?.results?.news, 'news');
 
     return {
@@ -77,6 +83,51 @@ export class YouSearchProvider implements SearchProvider {
         ...(data?.metadata || {}),
         provider: this.name,
         resultSource,
+      },
+    };
+  }
+
+  /**
+   * ENG-1050 — You.com's `news` bucket is not a query-scoped news index.
+   *
+   * It is only populated when the query itself carries news intent (a plain
+   * entity query such as "Stripe payments" or "Zenoti" comes back with a `web`
+   * bucket only), and when it IS populated it is a loosely-matched trending feed
+   * that ranks on generic tokens rather than on the entity being asked about.
+   *
+   * Returning only that bucket therefore produced both reported failure modes:
+   * "No results found" for companies with abundant coverage, and world/sports
+   * headlines with no connection to the query. So a news search:
+   *   1. drops news articles that have no lexical connection to the query, and
+   *   2. falls back to the `web` bucket, which You.com scopes to the same
+   *      freshness window and does rank against the query.
+   * Web-sourced entries keep sourceType 'web' so callers can tell a news article
+   * from a recent web page, and an empty result now genuinely means "no coverage".
+   */
+  private buildNewsResponse(data: any, request: SearchRequest): SearchProviderResponse {
+    const limit = normalizeSearchCount(request.count);
+    const rawNews = this.normalizeResults(data?.results?.news, 'news');
+    const significantTerms = extractSignificantTerms(request.query);
+    const relevantNews = rawNews.filter((result) => isRelevantToQuery(result, significantTerms));
+
+    const seenUrls = new Set(relevantNews.map((result) => result.url));
+    const webFallback = this.normalizeResults(data?.results?.web, 'web')
+      .filter((result) => !seenUrls.has(result.url));
+
+    const results = [...relevantNews, ...webFallback].slice(0, limit);
+    const newsResultCount = results.filter((result) => result.sourceType === 'news').length;
+
+    return {
+      provider: this.name,
+      query: String(data?.metadata?.query || request.query),
+      results,
+      metadata: {
+        ...(data?.metadata || {}),
+        provider: this.name,
+        resultSource: 'news' as const,
+        newsResultCount,
+        irrelevantNewsDropped: rawNews.length - relevantNews.length,
+        webFallbackCount: results.length - newsResultCount,
       },
     };
   }
