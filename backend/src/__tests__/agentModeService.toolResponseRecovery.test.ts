@@ -32,6 +32,8 @@ import {
 } from '../services/agentModeService';
 import {
   buildToolResponseS3Header,
+  buildToolResponseUnavailableHeader,
+  extractToolResponseHeader,
   extractToolResponseS3Ref,
   parseToolResponseS3Key,
 } from '../utils/toolResponseS3Ref';
@@ -75,6 +77,12 @@ describe('ENG-940: trimming preserves the S3 recovery reference', () => {
     ];
     // The tool message under test, followed by enough newer tool messages that
     // it falls outside the preserved-recent window.
+    //
+    // The padding results must themselves be over the trim limit: the window
+    // only spends slots on results the trimmer could actually destroy, so small
+    // ones no longer evict anything (see the eviction suite below). These tests
+    // are about what the COMPRESSED form keeps, so they have to force the
+    // compression to happen.
     messages.push({
       role: 'assistant',
       content: null,
@@ -85,9 +93,9 @@ describe('ENG-940: trimming preserves the S3 recovery reference', () => {
       messages.push({
         role: 'assistant',
         content: null,
-        tool_calls: [{ id: `tc_${i}`, function: { name: 'small_tool', arguments: '{}' } }],
+        tool_calls: [{ id: `tc_${i}`, function: { name: 'bulky_tool', arguments: '{}' } }],
       });
-      messages.push({ role: 'tool', tool_call_id: `tc_${i}`, name: 'small_tool', content: `ok ${i}` });
+      messages.push({ role: 'tool', tool_call_id: `tc_${i}`, name: 'bulky_tool', content: `${i}`.repeat(9_000) });
     }
     return messages;
   }
@@ -162,5 +170,146 @@ describe('ENG-940: S3 reference header round-trip', () => {
     // toolDispatch always prepends it.
     const header = buildToolResponseS3Header('tool-responses/x/y.txt', 10);
     expect(extractToolResponseS3Ref('noise ' + header)).toBeNull();
+  });
+});
+
+/**
+ * ENG-940 follow-up A — the preserve window must not be spent on results that
+ * were never at risk.
+ *
+ * trimToolMessagesForContext keeps the N most recent tool results at full size.
+ * It used to pick those N by recency ALONE, so a tool result small enough that
+ * the trimmer would never touch it still consumed a slot and evicted a large
+ * one. In the reported run that is precisely what happened: three 488-char
+ * save_memory schema rejections landed after the 8,981-char get_pr_digest
+ * payload and pushed it out of a 3-slot window inside a single logical turn.
+ *
+ * A result at or below its trim limit is passed through untouched whether or
+ * not it is "preserved", so protecting it buys nothing. The window therefore
+ * only spends slots on results the trimmer could actually destroy.
+ */
+describe('ENG-940: small tool results do not evict a large one from the preserve window', () => {
+  const DIGEST = 'D'.repeat(PR_DIGEST_PAYLOAD_SIZE);
+  const SCHEMA_ERROR =
+    '⚠️ Tool Error: save_memory\nReason: Tool "save_memory" arguments failed schema validation before execution. ' +
+    'Argument "content" must be at most 2000 character(s).';
+
+  /** The reported run: one big digest, then three small save_memory rejections. */
+  function reportedRun() {
+    const messages: any[] = [
+      { role: 'user', content: 'Fetch the last 24 hours of merged PRs.' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'tc_digest', function: { name: 'get_pr_digest', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'tc_digest', name: 'get_pr_digest', content: DIGEST },
+    ];
+    for (let i = 0; i < 3; i++) {
+      messages.push({ role: 'assistant', content: '', tool_calls: [{ id: `tc_mem${i}`, function: { name: 'save_memory', arguments: '{}' } }] });
+      messages.push({ role: 'tool', tool_call_id: `tc_mem${i}`, name: 'save_memory', content: SCHEMA_ERROR });
+    }
+    return messages;
+  }
+
+  it('keeps the digest readable after three failed save_memory calls', () => {
+    const service = new AgentModeService();
+    const trimmed = service.trimToolMessagesForContext(reportedRun());
+    const digest = trimmed.find((m: any) => m.tool_call_id === 'tc_digest');
+
+    // Previously: compressed to "[Tool: get_pr_digest — DDD...]" with no S3 key.
+    expect(digest.content).toBe(DIGEST);
+  });
+
+  it('still passes the small error results through untouched', () => {
+    const service = new AgentModeService();
+    const trimmed = service.trimToolMessagesForContext(reportedRun());
+    for (const m of trimmed.filter((x: any) => x.name === 'save_memory')) {
+      expect(m.content).toBe(SCHEMA_ERROR);
+    }
+  });
+
+  it('still bounds the window — a 4th large result evicts the oldest large one', () => {
+    const messages: any[] = [{ role: 'user', content: 'go' }];
+    for (let i = 0; i < 4; i++) {
+      messages.push({ role: 'assistant', content: '', tool_calls: [{ id: `tc${i}`, function: { name: 'get_pr_digest', arguments: '{}' } }] });
+      messages.push({ role: 'tool', tool_call_id: `tc${i}`, name: 'get_pr_digest', content: `${i}`.repeat(9_000) });
+    }
+    const trimmed = new AgentModeService().trimToolMessagesForContext(messages);
+
+    // Oldest of four large results is compressed; the three most recent survive.
+    expect(trimmed.find((m: any) => m.tool_call_id === 'tc0').content).toContain('[Tool: get_pr_digest —');
+    for (const id of ['tc1', 'tc2', 'tc3']) {
+      expect(trimmed.find((m: any) => m.tool_call_id === id).content.length).toBe(9_000);
+    }
+  });
+
+  it('honours a per-tool allowance when deciding what is at risk', () => {
+    // read_market_strategy may hold 50,000 chars, so a 9,000-char one is NOT at
+    // risk and must not consume a slot that the 9,000-char digest needs.
+    const messages: any[] = [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'tc_digest', function: { name: 'get_pr_digest', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'tc_digest', name: 'get_pr_digest', content: 'D'.repeat(9_000) },
+    ];
+    for (let i = 0; i < 3; i++) {
+      messages.push({ role: 'assistant', content: '', tool_calls: [{ id: `tc_ms${i}`, function: { name: 'read_market_strategy', arguments: '{}' } }] });
+      messages.push({ role: 'tool', tool_call_id: `tc_ms${i}`, name: 'read_market_strategy', content: 'M'.repeat(9_000) });
+    }
+    const trimmed = new AgentModeService().trimToolMessagesForContext(messages);
+
+    expect(trimmed.find((m: any) => m.tool_call_id === 'tc_digest').content.length).toBe(9_000);
+  });
+});
+
+/**
+ * ENG-940 follow-up B — a failed S3 offload must not degrade into silent loss.
+ *
+ * The offload is the ONLY recovery path, and uploadFileToS3WithPath reports a
+ * failure by returning {success:false} rather than throwing — so the original
+ * code simply skipped the header and carried on. The payload then looked exactly
+ * like a small response until the trimmer compressed it away, and the model was
+ * left with a preview it had no way to know was lossy. That is the state that
+ * made the reported run disbelieve its own correct summary.
+ *
+ * We cannot conjure a recovery path when S3 is down, but we can refuse to hide
+ * it: the response carries an explicit "could NOT be stored" notice, and the
+ * trimmer preserves that notice exactly as it preserves a real S3 key.
+ */
+describe('ENG-940: an un-offloadable response is marked, not silently lost', () => {
+  it('builds an unavailable notice that the matcher reads back', () => {
+    const header = buildToolResponseUnavailableHeader(8981);
+    expect(header).toContain('8981 chars');
+    expect(header).toMatch(/could NOT be stored/);
+    expect(extractToolResponseHeader(header + 'body')).toBe(header);
+    // It is NOT an S3 reference — there is no key to parse out of it.
+    expect(parseToolResponseS3Key(header + 'body')).toBeNull();
+  });
+
+  it('still recognises a real S3 reference through the shared matcher', () => {
+    const header = buildToolResponseS3Header('tool-responses/x/y.txt', 10);
+    expect(extractToolResponseHeader(header + 'body')).toBe(header);
+  });
+
+  it('returns null for content carrying neither header', () => {
+    expect(extractToolResponseHeader('plain tool output')).toBeNull();
+  });
+
+  it('keeps the notice at the front when the trimmer compresses the payload', () => {
+    const notice = buildToolResponseUnavailableHeader(9_000);
+    const messages: any[] = [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: '', tool_calls: [{ id: 'tc_digest', function: { name: 'get_pr_digest', arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'tc_digest', name: 'get_pr_digest', content: notice + 'D'.repeat(9_000) },
+    ];
+    for (let i = 0; i < 3; i++) {
+      messages.push({ role: 'assistant', content: '', tool_calls: [{ id: `tc${i}`, function: { name: 'get_pr_digest', arguments: '{}' } }] });
+      messages.push({ role: 'tool', tool_call_id: `tc${i}`, name: 'get_pr_digest', content: `${i}`.repeat(9_000) });
+    }
+    const trimmed = new AgentModeService().trimToolMessagesForContext(messages);
+    const digest = trimmed.find((m: any) => m.tool_call_id === 'tc_digest');
+
+    // Compressed (it is the oldest of four at-risk results) but still self-describing:
+    // the model is told the payload is gone rather than being handed a bare preview.
+    expect(digest.content).toContain('[Tool: get_pr_digest —');
+    expect(extractToolResponseHeader(digest.content)).not.toBeNull();
+    // The preview shows the PAYLOAD, not the notice text.
+    expect(digest.content).toContain('DDD');
   });
 });
