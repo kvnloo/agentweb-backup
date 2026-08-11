@@ -11,6 +11,11 @@ export interface MetaAdsCampaignParams {
   objective: string;
   status?: string;
   special_ad_categories?: string[];
+  // Lifetime hard-stop spend cap for the campaign, in the ad account currency's MINOR units
+  // (cents) — e.g. 300000 = $3,000. Kept in minor units to match Meta's own field and the
+  // long-standing CAMPAIGN UPDATE pass-through, which already applies this value verbatim;
+  // converting only here would silently reinterpret every existing caller's number by 100x.
+  spend_cap?: number;
 }
 
 export interface MetaAdsAdSetParams {
@@ -172,7 +177,10 @@ export class MetaService {
    */
   private static readonly CAMPAIGN_READ_FIELDS = [
     'id', 'name', 'status', 'objective',
-    'daily_budget', 'lifetime_budget', 'budget_remaining',
+    // spend_cap is the campaign's hard money stop. It was writable via UPDATE but absent
+    // from this allow-list, so a cap could be set and then never read back — the write was
+    // unverifiable from inside the product (ENG-1018).
+    'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap',
     'bid_strategy', 'start_time', 'stop_time',
   ] as const;
 
@@ -300,6 +308,50 @@ export class MetaService {
     if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
       throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
     }
+    MetaService.assertNoUnappliedCampaignCreateParams(params);
+  }
+
+  /**
+   * Params `createCampaign` actually forwards to Meta, plus the ones this layer legitimately
+   * consumes before the call (the objective gate's `objective_quote`, the write-confirmation
+   * gate's `confirm`, and the wrapper-injected `account_id`). Anything else a caller sends on
+   * CAMPAIGN CREATE is dropped by createCampaign's literal-key allow-list.
+   */
+  private static readonly CAMPAIGN_CREATE_APPLIED_PARAMS = [
+    'name', 'objective', 'status', 'special_ad_categories', 'spend_cap',
+    'advantage_campaign_budget', 'budget_amount',
+  ] as const;
+
+  private static readonly CAMPAIGN_CREATE_CONSUMED_PARAMS = [
+    'account_id', 'objective_quote', 'confirm',
+  ] as const;
+
+  /**
+   * Reject a CAMPAIGN CREATE param that would never reach Meta, BEFORE anything is created.
+   * A silently-dropped param plus a success message is how a campaign was created with no
+   * spend cap while the operator was told the cap was in place (ENG-1018) — money-affecting
+   * fields must fail loudly, not quietly. Rejecting pre-flight means nothing is created, so
+   * the caller can simply fix the params and retry (no orphaned campaign to clean up).
+   */
+  private static assertNoUnappliedCampaignCreateParams(params: Partial<MetaAdsCampaignParams>): void {
+    const known = new Set<string>([
+      ...MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS,
+      ...MetaService.CAMPAIGN_CREATE_CONSUMED_PARAMS,
+    ]);
+    const unapplied = Object.keys(params || {}).filter(
+      key => !known.has(key) && (params as any)[key] !== undefined
+    );
+    if (unapplied.length === 0) return;
+
+    throw new Error(
+      `Campaign CREATE does not support param(s): ${unapplied.join(', ')} — they would NOT be applied ` +
+      `to the campaign, so this create was rejected instead of silently ignoring them. ` +
+      `Supported CAMPAIGN CREATE params: ${MetaService.CAMPAIGN_CREATE_APPLIED_PARAMS.join(', ')}. ` +
+      `Campaign-level budget: set advantage_campaign_budget=true plus budget_amount (in dollars). ` +
+      `Hard spend cap: spend_cap (in cents, e.g. 300000 = $3,000). ` +
+      `Ad-set fields (daily_budget, lifetime_budget, bid_strategy, bid_amount, targeting, ` +
+      `optimization_goal, billing_event, start_time, end_time) belong on AD_SET CREATE.`
+    );
   }
 
   /**
@@ -331,6 +383,8 @@ export class MetaService {
     if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
       throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
     }
+
+    MetaService.assertNoUnappliedCampaignCreateParams(params);
   }
 
   /**
@@ -875,7 +929,9 @@ export class MetaService {
     try {
       this.initApi(accessToken);
       const campaign = new Campaign(campaignId);
-      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining'];
+      // spend_cap is read here too so a spend-cap write can be verified with an
+      // independent read-back rather than trusted from the write response (ENG-1018).
+      const fields = ['id', 'name', 'status', 'objective', 'daily_budget', 'lifetime_budget', 'budget_remaining', 'spend_cap'];
       this.log(`Fetching campaign: ${campaignId}`);
       const result = await campaign.get(fields);
       return result._data;
@@ -944,6 +1000,15 @@ export class MetaService {
       // Handle Advantage Campaign Budget (CBO)
       if ((params as any).advantage_campaign_budget && (params as any).budget_amount) {
         finalParams.daily_budget = Math.round((params as any).budget_amount * 100);
+      }
+
+      // Campaign hard-stop spend cap, in minor units (cents), forwarded verbatim — the same
+      // way CAMPAIGN UPDATE has always sent it. This allow-list used to omit spend_cap
+      // entirely, so a create that asked for a cap produced an UNCAPPED campaign and still
+      // reported success (ENG-1018). The caller verifies the applied value with a read-back;
+      // this only guarantees the request reaches Meta.
+      if (params.spend_cap !== undefined && params.spend_cap !== null) {
+        finalParams.spend_cap = params.spend_cap;
       }
 
       this.log(`Attempting createCampaign with literal keys:`, finalParams);

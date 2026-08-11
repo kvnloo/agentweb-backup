@@ -15773,15 +15773,91 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     }
   }
 
+  /**
+   * Write-then-verify read-back for the campaign spend cap (ENG-1018) — the same shape of
+   * check AD UPDATE already does after a creative swap. spend_cap is the campaign's hard
+   * money stop, so the write response is never trusted on its own: the campaign is re-read
+   * and the applied value compared against what was requested.
+   *
+   * Three outcomes, deliberately distinct: applied (proven), NOT applied (proven wrong — the
+   * silent-drop case), and unverified (the read-back itself failed, so nothing is proven
+   * either way). "Unverified" must never be reported as applied.
+   */
+  private async verifyCampaignSpendCap(
+    accountId: string,
+    accessToken: string,
+    campaignId: string | undefined,
+    requestedSpendCap: number
+  ): Promise<{ verified: boolean; readFailed: boolean; applied?: number; detail: string }> {
+    if (!campaignId) {
+      return { verified: false, readFailed: true, detail: 'Meta returned no campaign id to read back' };
+    }
+    try {
+      const fresh: any = await metaService.getCampaign(accountId, accessToken, campaignId);
+      const raw = fresh?.spend_cap;
+      // Graph returns numeric fields as strings; an absent cap means there is no cap at all.
+      const applied = raw === undefined || raw === null || raw === '' ? undefined : Number(raw);
+      if (applied !== undefined && Number.isFinite(applied) && applied === Number(requestedSpendCap)) {
+        return { verified: true, readFailed: false, applied, detail: `spend cap is ${applied}` };
+      }
+      return {
+        verified: false,
+        readFailed: false,
+        applied,
+        detail: applied === undefined
+          ? 'the campaign has NO spend cap set'
+          : `the campaign's spend cap is ${applied}`,
+      };
+    } catch (error: any) {
+      return { verified: false, readFailed: true, detail: error?.message || 'unknown error' };
+    }
+  }
+
   public async createMetaAdsCampaign(userId: string, params: MetaAdsCampaignParams & { account_id?: string }): Promise<any> {
     try {
       const { accountId, accessToken } = await this.getMetaCredentials(userId, params.account_id);
       const campaign = await metaService.createCampaign(accountId, accessToken, params);
 
-      return {
+      const created = {
         success: true,
         message: `Campaign "${campaign.name}" created successfully`,
         campaign: campaign
+      };
+
+      if (params.spend_cap === undefined || params.spend_cap === null) return created;
+
+      // A requested spend cap is verified independently — a create used to drop it silently
+      // and still report success, leaving the operator believing there was a money backstop
+      // when there was none (ENG-1018).
+      const check = await this.verifyCampaignSpendCap(accountId, accessToken, campaign?.id, params.spend_cap);
+      if (check.verified) {
+        return {
+          ...created,
+          message: `${created.message} (spend cap verified: ${check.applied})`,
+          spend_cap: check.applied,
+          spend_cap_verified: true,
+        };
+      }
+      if (check.readFailed) {
+        return {
+          ...created,
+          message: `Campaign "${campaign.name}" was created, but its spend cap could not be verified ` +
+            `(${check.detail}). Do NOT tell the user a spend cap is in place — re-read it with ` +
+            `CAMPAIGN LIST (campaign_id + params.fields="id,name,spend_cap") first.`,
+          spend_cap_requested: params.spend_cap,
+          spend_cap_verified: false,
+        };
+      }
+      return {
+        ...created,
+        message: `⚠️ Campaign "${campaign.name}" was created, but the requested spend cap of ` +
+          `${params.spend_cap} was NOT applied — ${check.detail}. This campaign has no hard spend stop. ` +
+          `Apply it with CAMPAIGN UPDATE (campaign_id=${campaign?.id}, params.spend_cap=${params.spend_cap}) ` +
+          `and tell the user the cap is not yet in place. Do NOT create the campaign again.`,
+        spend_cap_requested: params.spend_cap,
+        spend_cap_applied: check.applied,
+        spend_cap_verified: false,
+        error: 'SPEND_CAP_NOT_APPLIED',
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
@@ -16226,16 +16302,52 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
   public async updateMetaAdsCampaign(userId: string, campaignId: string, params: any, account_id?: string): Promise<any> {
     try {
-      const { accessToken } = await this.getMetaCredentials(userId, account_id);
+      const { accountId, accessToken } = await this.getMetaCredentials(userId, account_id);
       const normalizedParams = { ...params };
       if (normalizedParams.budget_amount !== undefined) {
         normalizedParams.daily_budget = Math.round(normalizedParams.budget_amount * 100);
         delete normalizedParams.budget_amount;
       }
       await metaService.updateCampaign(accessToken, campaignId, normalizedParams);
+
+      if (normalizedParams.spend_cap === undefined || normalizedParams.spend_cap === null) {
+        return {
+          success: true,
+          message: `Campaign updated successfully`
+        };
+      }
+
+      // "Campaign updated successfully" with no way to check was the exact reported failure
+      // mode for this money-affecting field — verify the applied cap by re-reading the
+      // campaign before claiming the change took effect (ENG-1018).
+      const check = await this.verifyCampaignSpendCap(accountId, accessToken, campaignId, normalizedParams.spend_cap);
+      if (check.verified) {
+        return {
+          success: true,
+          message: `Campaign updated successfully (spend cap verified: ${check.applied})`,
+          spend_cap: check.applied,
+          spend_cap_verified: true,
+        };
+      }
+      if (check.readFailed) {
+        return {
+          success: true,
+          message: `Campaign update was sent, but the spend cap could not be verified (${check.detail}). ` +
+            `Do NOT tell the user the cap is in place — re-read it with CAMPAIGN LIST ` +
+            `(campaign_id + params.fields="id,name,spend_cap") first.`,
+          spend_cap_requested: normalizedParams.spend_cap,
+          spend_cap_verified: false,
+        };
+      }
       return {
-        success: true,
-        message: `Campaign updated successfully`
+        success: false,
+        message: `⚠️ The requested spend cap of ${normalizedParams.spend_cap} was NOT applied to campaign ` +
+          `${campaignId} — ${check.detail}. The campaign does not have the hard spend stop you asked for; ` +
+          `tell the user it is not in place.`,
+        spend_cap_requested: normalizedParams.spend_cap,
+        spend_cap_applied: check.applied,
+        spend_cap_verified: false,
+        error: 'SPEND_CAP_NOT_APPLIED',
       };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
