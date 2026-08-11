@@ -10407,12 +10407,13 @@ export class AgentModeService {
         };
       }
 
-      const hasAccessAddLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessAddLeads = await canDestructiveCrmList(userId, list);
       if (!hasAccessAddLeads) {
         return {
           success: false,
           message: 'Access denied',
-          error: 'You do not have permission to add leads to this list'
+          error: CRM_EDITOR_REQUIRED_MESSAGE
         };
       }
 
@@ -10761,21 +10762,25 @@ export class AgentModeService {
       }
 
       // Resolve and access-check each list. In single-list mode an inaccessible
-      // list_id is a hard error; in multi-list mode we silently skip so the
-      // caller still gets results from the lists they CAN see.
+      // list_id is a hard error; in multi-list mode we skip and record the list ID
+      // in skipped_list_ids so callers can distinguish a permission skip from an
+      // empty result.
       type ListEntry = { listId: string; list: any } | null;
       const lists: ListEntry[] = [];
+      const skippedListIds: string[] = [];
       for (let i = 0; i < cursorListIds.length; i++) {
         const id = cursorListIds[i];
         const list = await crmDb.getLeadListById(id);
         if (!list) {
           if (!isMultiList) return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+          skippedListIds.push(id);
           lists.push(null);
           continue;
         }
         const access = await crmDb.canOrgMemberAccessList(userId, list);
         if (!access) {
           if (!isMultiList) return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+          skippedListIds.push(id);
           lists.push(null);
           continue;
         }
@@ -10879,6 +10884,7 @@ export class AgentModeService {
         ...(isMultiList ? {
           listsScanned: lists.filter((e: ListEntry): e is { listId: string; list: any } => !!e)
             .map((e) => ({ listId: e.listId, listName: e.list.name })),
+          skipped_list_ids: skippedListIds,
         } : {}),
         has_more: !!cursorOut,
         ...(nextCursor && { next_cursor: nextCursor }),
@@ -11243,9 +11249,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -11351,9 +11358,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const now = new Date().toISOString();
@@ -11414,9 +11422,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       if (!leadIds || leadIds.length === 0) {
@@ -11464,9 +11473,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       if (!filters || filters.length === 0) {
@@ -11637,9 +11647,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Filter out undefined values
@@ -11697,9 +11708,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccessUpdateStatus = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessUpdateStatus = await canDestructiveCrmList(userId, list);
       if (!hasAccessUpdateStatus) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Fetch current lead
@@ -11792,9 +11804,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Validate statusConfig entries
@@ -11836,9 +11849,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const listName = list.name;
@@ -11927,9 +11941,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -11964,9 +11979,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccessSend = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessSend = await canDestructiveCrmList(userId, list);
       if (!hasAccessSend) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to send emails from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -12450,12 +12466,13 @@ export class AgentModeService {
         };
       }
 
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
         return {
           success: false,
           message: 'Access denied',
-          error: 'You do not have permission to access this lead list'
+          error: CRM_EDITOR_REQUIRED_MESSAGE
         };
       }
 
@@ -30382,7 +30399,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
               const { crmDb } = await import('./db');
               const mirrorList = await crmDb.getLeadListById(mirrorListId);
-              if (!mirrorList || !(await crmDb.canOrgMemberAccessList(userId, mirrorList))) {
+              const { canDestructiveCrmList } = await import('./crmAccessControl');
+              if (!mirrorList || !(await canDestructiveCrmList(userId, mirrorList))) {
                 console.warn(`[AgentMode] send-invite: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
                 return;
               }
@@ -31663,6 +31681,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       || location || location_id || industry || industry_id || school || school_id);
     if (!keywords && !search_url && !cursor && !hasFilter) {
       return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
+    }
+
+    // Access check (ENG-1049): this function creates leads (batchCreateLeads
+    // below), and is called directly by the import_leads_from_search Emma tool
+    // — bypassing the canDestructiveCrmList check that crm.ts's POST
+    // /lists/:listId/leads/find route applies before calling this same method.
+    // Without this, any same-org member could import leads into another
+    // member's list via Emma chat.
+    try {
+      const { crmDb: accessCrmDb } = await import('./db');
+      const accessList = await accessCrmDb.getLeadListById(listId);
+      if (!accessList) {
+        return { success: false, error: 'The specified lead list does not exist' };
+      }
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      if (!(await canDestructiveCrmList(userId, accessList))) {
+        return { success: false, error: CRM_EDITOR_REQUIRED_MESSAGE };
+      }
+    } catch (err) {
+      // Fail closed — an access-check failure must never silently allow the
+      // write. Distinct from the cosmetic, fail-soft list lookups below.
+      return { success: false, error: 'Failed to verify list access' };
     }
 
     // Resolve account: user's own or platform-wide fallback
