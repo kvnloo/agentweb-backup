@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { getAzureClient } from "../utils/llmClients";
+import { getAzureClient, meterUsageFromResponse } from "../utils/llmClients";
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -21,7 +21,6 @@ import { isTransientLLMError } from '../utils/agentModeErrors';
 import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { withKeyedMutex } from '../utils/keyedMutex';
-import { incrementUserTokenUsage } from './tokenUsageService';
 import { computeCostMicroUsd } from './usageRecorderService';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
@@ -926,14 +925,16 @@ export class ChatbotDB {
       // Incrementally update token usage on the session
       await this.incrementTokenUsage(sessionId, [message]);
 
-      // Increment user-level token usage for allowance tracking
-      if (currentSession.userId && message.usage) {
-        await incrementUserTokenUsage(
-          currentSession.userId,
-          message.usage.total_tokens || 0,
-          message.usage.estimated_cost || 0
-        );
-      }
+      // ENG-1134: NO per-user quota charge here. Persisting a message is not a
+      // spend event — the LLM call that produced it already charged the counter
+      // and wrote the ledger row at its metering chokepoint. Charging again here
+      // double-billed every agent-mode turn (measured at exactly 2.000x cost).
+      //
+      // It also hid itself: `usage.total_tokens` is prompt+completion only, while
+      // the real charge includes cache tokens (~73% of traffic), so the token
+      // totals stayed plausible while the dollars silently doubled. And it wrote
+      // no ledger row, breaking ENG-200's rule that nothing is deducted without
+      // also being recorded. Charge where you record: at the call site.
 
       // Return session with updated messages (no need to update session table)
       return {
@@ -976,20 +977,8 @@ export class ChatbotDB {
       // Incrementally update token usage on the session
       await this.incrementTokenUsage(sessionId, messages);
 
-      // Increment user-level token usage for allowance tracking
-      if (currentSession.userId) {
-        let batchTokens = 0;
-        let batchCost = 0;
-        for (const msg of messages) {
-          if (msg.usage) {
-            batchTokens += msg.usage.total_tokens || 0;
-            batchCost += msg.usage.estimated_cost || 0;
-          }
-        }
-        if (batchTokens > 0 || batchCost > 0) {
-          await incrementUserTokenUsage(currentSession.userId, batchTokens, batchCost);
-        }
-      }
+      // ENG-1134: no per-user quota charge here either — same reasoning as the
+      // single-message path above. The batch variant double-charged identically.
 
       // Return session with updated messages (no need to update session table)
       return {
@@ -4540,6 +4529,15 @@ export async function generateChatResponse(
       }
     }
 
+    // ENG-1134: which of these clients meters itself. The Azure factory client
+    // records and charges on every call; the Bedrock and Gemini wrappers do NOT
+    // (only agentModeService.callLLM meters those, and Emma does not go through
+    // it). Until now that gap was masked because message persistence charged the
+    // counter for every path — which double-charged the metered ones. With that
+    // charge removed, these two must meter at the call site or Emma's Claude and
+    // Gemini spend would leave no ledger row and draw down no quota at all.
+    const clientSelfMeters = !isClaudeModel && !isGeminiModel;
+
     if (isClaudeModel) {
       activeClient = await agentModeService!.getBedrockClient(model!);
     } else if (isGeminiModel) {
@@ -4611,6 +4609,23 @@ export async function generateChatResponse(
         response,
         `Iteration ${iteration + 1}${contextInfo ? `, used ${contextInfo.length} chars of context` : ''}`
       );
+
+      // ENG-1134: meter this turn for the clients that do not meter themselves.
+      // Runs per iteration, because each loop pass is a separate billable call —
+      // metering only the final one would undercount every tool-using turn.
+      // Fire-and-forget and fail-open by contract, like every other meter.
+      if (!clientSelfMeters) {
+        meterUsageFromResponse(
+          {
+            userId,
+            sessionId,
+            model: activeDeployment,
+            provider: isClaudeModel ? 'bedrock' : 'gemini',
+            feature: 'chat',
+          },
+          response
+        );
+      }
 
       // Add assistant message to messages array (for next iteration)
       const assistantMsg: any = {
