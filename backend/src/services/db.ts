@@ -396,6 +396,15 @@ export interface User {
     }>;
     createdAt: string;
     updatedAt: string;
+    /**
+     * Opaque identity of the write that produced this value, stamped only by
+     * the asset-delete path's conditional writes. `updatedAt` is millisecond
+     * granular and every other brand writer mints its own, so two writes can
+     * share a stamp; pairing it with a revision lets a conditional write
+     * identify the exact value it read. Absent on anything written by another
+     * path, which those conditions match explicitly.
+     */
+    rev?: string;
   };
   marketStrategy?: {
     businessOverview: string;
@@ -749,6 +758,7 @@ export interface OrgShareSettings {
   workPlans: { enabled: boolean; editors: string[] };
   skills: { enabled: boolean; editors: string[] };
   analytics: { enabled: boolean; editors: string[] };
+  crm?: { enabled: boolean; editors: string[] };
   // Always shared with org—only editors are configurable, enabled is implicit
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
@@ -2958,6 +2968,13 @@ export const waitlistDb = {
   },
 };
 
+// Legacy recurring task schedules predate the `type: scheduled_chat` discriminator.
+// Direct polling for those rows was removed from agent-engine in fb83fc151, but old
+// active rows can remain indefinitely overdue. Keep a per-process record so the
+// scheduled-chat poll makes each newly observed orphan visible without emitting the
+// same warning every five seconds.
+const reportedUnsupportedLegacyScheduleIds = new Set<string>();
+
 export const scheduleDb = {
   async createSchedule(schedule: {
     scheduleId: string;
@@ -3166,20 +3183,41 @@ export const scheduleDb = {
         TableName: `${TABLE_PREFIX}AW-TaskSchedules`,
         IndexName: 'StatusStartTimeIndex',
         KeyConditionExpression: '#status = :status AND #nextRunTime <= :now',
-        FilterExpression: '#type = :type',
         ExpressionAttributeNames: {
           '#status': 'status',
           '#nextRunTime': 'nextRunTime',
-          '#type': 'type',
         },
         ExpressionAttributeValues: {
           ':status': 'active',
           ':now': now,
-          ':type': 'scheduled_chat',
         },
       };
 
-      return await paginatedQuery(dynamodb, params);
+      const dueSchedules = await paginatedQuery(dynamodb, params);
+      const newlyDetectedLegacyIds: string[] = [];
+
+      for (const schedule of dueSchedules) {
+        const isLegacyTaskSchedule = !schedule.type && Boolean(schedule.taskId);
+        if (
+          isLegacyTaskSchedule &&
+          typeof schedule.scheduleId === 'string' &&
+          !reportedUnsupportedLegacyScheduleIds.has(schedule.scheduleId)
+        ) {
+          reportedUnsupportedLegacyScheduleIds.add(schedule.scheduleId);
+          newlyDetectedLegacyIds.push(schedule.scheduleId);
+        }
+      }
+
+      if (newlyDetectedLegacyIds.length > 0) {
+        console.warn(JSON.stringify({
+          event: 'scheduled_chat_schedule_skipped',
+          reason: 'legacy_task_schedule_unsupported',
+          count: newlyDetectedLegacyIds.length,
+          scheduleIds: newlyDetectedLegacyIds.sort(),
+        }));
+      }
+
+      return dueSchedules.filter((schedule: any) => schedule.type === 'scheduled_chat');
     } catch (error) {
       handleDynamoDbError(error, "getSchedulesReadyToRun");
       return [];
@@ -4622,21 +4660,37 @@ export const crmDb = {
     return items;
   },
 
-  // Returns true if userId owns the list OR is an org member of the same org as the list owner.
+  // Returns true if userId owns the list OR has CRM read access to the owner's org lists.
+  // Respects shareSettings.crm.enabled: when false, only the list owner, the org owner,
+  // and listed crm.editors retain cross-member read access.
   async canOrgMemberAccessList(userId: string, list: { userId?: string } | Record<string, any>): Promise<boolean> {
     if (list.userId === userId) return true;
     const [user, owner] = await Promise.all([
       userDb.getUserById(userId),
       userDb.getUserById(list.userId),
     ]);
-    return !!(user?.orgId && owner?.orgId && user.orgId === owner.orgId);
+    if (!user?.orgId || !owner?.orgId || user.orgId !== owner.orgId) return false;
+    const org = await orgDb.getOrgById(user.orgId);
+    const crmCfg = org?.shareSettings?.crm;
+    const crmEnabled = typeof crmCfg?.enabled === "boolean" ? crmCfg.enabled : true;
+    if (crmEnabled) return true;
+    if (org?.ownerUserId === userId) return true;
+    return !!(crmCfg?.editors && crmCfg.editors.includes(userId));
   },
 
   // Org-aware version: returns the user's own lists plus all org members' lists.
+  // When shareSettings.crm.enabled is false the fan-out is suppressed for plain
+  // members; org owners and crm.editors still receive the full org list.
   async getLeadListsForUser(userId: string) {
     const ownLists = await this.getLeadListsByUserId(userId);
     const user = await userDb.getUserById(userId);
     if (!user?.orgId) return ownLists;
+    const org = await orgDb.getOrgById(user.orgId);
+    const crmCfg = org?.shareSettings?.crm;
+    const crmEnabled = typeof crmCfg?.enabled === "boolean" ? crmCfg.enabled : true;
+    const isPrivileged =
+      org?.ownerUserId === userId || !!(crmCfg?.editors && crmCfg.editors.includes(userId));
+    if (!crmEnabled && !isPrivileged) return ownLists;
     const members = await orgDb.getOrgMembers(user.orgId);
     const memberListArrays = await Promise.all(
       members
@@ -5049,6 +5103,19 @@ export const crmDb = {
       handleDynamoDbError(error, 'setLeadListSearchCursor');
       throw error;
     }
+  },
+
+  async transferLeadListOwner(listId: string, newUserId: string): Promise<void> {
+    const TABLE_PREFIX = process.env.NODE_ENV === "production" ? "" : "Dev-";
+    await dynamodb.update({
+      TableName: `${TABLE_PREFIX}AW-LeadLists`,
+      Key: { listId },
+      UpdateExpression: "SET userId = :uid, updatedAt = :ts",
+      ExpressionAttributeValues: {
+        ":uid": newUserId,
+        ":ts": new Date().toISOString(),
+      },
+    }).promise();
   },
 
   async deleteLeadList(listId: string) {
@@ -6430,7 +6497,10 @@ export const crmDb = {
         // IDs of newly created leads (excludes merged updates). Used by callers
         // that need to act on freshly-imported leads — e.g., the CSV importer
         // queues these for enrich.so email validation when the user opts in.
-        created: [] as Array<{ leadId: string; email?: string }>,
+        // `sourceIndex` is the position in the input `leads` array the record
+        // was written from, so callers can join a created leadId back to the
+        // row it came from even when the row carries no email (ENG-1002).
+        created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
       };
 
       // Get existing leads to check for duplicates by email
@@ -6462,7 +6532,9 @@ export const crmDb = {
       const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
 
       // Deduplicate leads within the upload by email AND by normalized LinkedIn URL.
-      const uniqueLeads = new Map<string, typeof leads[0]>();
+      // The map value carries the row's original index so `results.created` can
+      // report which input row each written lead came from (ENG-1002).
+      const uniqueLeads = new Map<string, { lead: typeof leads[0]; index: number }>();
       const seenLinkedIn = new Set<string>();
       leads.forEach((lead, index) => {
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
@@ -6502,12 +6574,14 @@ export const crmDb = {
           seenLinkedIn.add(liKey);
         }
 
-        uniqueLeads.set(emailKey, lead);
+        uniqueLeads.set(emailKey, { lead, index });
       });
 
-      // Add unique new leads
-      uniqueLeads.forEach((lead) => {
+      // Add unique new leads (keeping each one's input-array position aligned).
+      const newLeadSourceIndices: number[] = [];
+      uniqueLeads.forEach(({ lead, index }) => {
         newLeads.push(lead);
+        newLeadSourceIndices.push(index);
       });
 
       // Process new leads in batches of 25 (DynamoDB batch write limit)
@@ -6515,11 +6589,11 @@ export const crmDb = {
       for (let i = 0; i < newLeads.length; i += batchSize) {
         const batch = newLeads.slice(i, i + batchSize);
 
-        const batchCreated: Array<{ leadId: string; email?: string }> = [];
-        const writeRequests = batch.map(lead => {
+        const batchCreated: Array<{ leadId: string; email?: string; sourceIndex: number }> = [];
+        const writeRequests = batch.map((lead, batchIndex) => {
           const leadId = `lead_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
           const emailValue = lead.email?.trim().toLowerCase();
-          batchCreated.push({ leadId, email: emailValue });
+          batchCreated.push({ leadId, email: emailValue, sourceIndex: newLeadSourceIndices[i + batchIndex] });
 
           const item: any = {
             listId,
@@ -6777,7 +6851,7 @@ export const crmDb = {
         mergedCount: 0,
         errorCount: leads.length,
         errors: [`Batch upload failed: ${error.message}`],
-        created: [] as Array<{ leadId: string; email?: string }>,
+        created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
       };
     }
   },
@@ -9082,7 +9156,23 @@ export const orgDb = {
     }
   },
 
-  async updateOrg(orgId: string, updates: Partial<Organization>): Promise<Organization> {
+  /**
+   * `options.condition` mirrors `userDb.updateUser`'s: an optional guard so a
+   * caller doing read-modify-write on an org can refuse to clobber a value that
+   * moved underneath it. Unmet conditions are rethrown verbatim so the caller
+   * can tell "my guard fired" apart from a real DynamoDB fault.
+   */
+  async updateOrg(
+    orgId: string,
+    updates: Partial<Organization>,
+    options?: {
+      condition?: {
+        expression: string;
+        names?: { [key: string]: string };
+        values?: { [key: string]: any };
+      };
+    }
+  ): Promise<Organization> {
     const { orgId: _, createdAt: __, ...updatableFields } = updates;
 
     if (Object.keys(updatableFields).length === 0) {
@@ -9125,7 +9215,7 @@ export const orgDb = {
     updateExpressionParts.push(`SET ${setExpressions.join(", ")}`);
     if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
 
-    const params = {
+    const params: any = {
       TableName: ORGS_TABLE,
       Key: { orgId },
       UpdateExpression: updateExpressionParts.join(" "),
@@ -9133,6 +9223,11 @@ export const orgDb = {
       ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW" as const,
     };
+    if (options?.condition) {
+      params.ConditionExpression = options.condition.expression;
+      Object.assign(expressionAttributeNames, options.condition.names || {});
+      Object.assign(expressionAttributeValues, options.condition.values || {});
+    }
 
     const result = await dynamodb.update(params).promise();
     return result.Attributes as Organization;
@@ -9295,38 +9390,76 @@ export const orgDb = {
     throw new Error(`removeDomainJoinRequest: exceeded ${MAX_ATTEMPTS} retry attempts for org ${orgId}`);
   },
 
-  async updateShareSettings(orgId: string, settings: OrgShareSettings): Promise<void> {
+  // Optimistic-concurrency guard is MANDATORY: every caller does a
+  // read-modify-write of the whole shareSettings document, so every caller
+  // must pass the updatedAt it read (or `undefined` for a legacy org record
+  // that has no updatedAt yet). An overlapping writer then surfaces as a
+  // ConditionalCheckFailedException instead of a silent last-writer-wins
+  // that erases the other writer's grants.
+  async updateShareSettings(
+    orgId: string,
+    settings: OrgShareSettings,
+    expectedUpdatedAt: string | undefined,
+  ): Promise<string> {
+    const nowMs = Date.now();
+    const expectedMs = expectedUpdatedAt === undefined ? Number.NaN : Date.parse(expectedUpdatedAt);
+    // `updatedAt` is the compare-and-swap revision for this whole-document
+    // write. It must advance even when two writes land in the same millisecond
+    // (or this process's clock trails the stored revision), otherwise the next
+    // stale writer can match the old token and silently overwrite this write.
+    const nextUpdatedAt = new Date(
+      Number.isFinite(expectedMs) && expectedMs >= nowMs ? expectedMs + 1 : nowMs,
+    ).toISOString();
     await dynamodb.update({
       TableName: ORGS_TABLE,
       Key: { orgId },
       UpdateExpression: "SET shareSettings = :s, updatedAt = :u",
+      ConditionExpression:
+        expectedUpdatedAt !== undefined
+          ? "updatedAt = :expected"
+          : "attribute_not_exists(updatedAt)",
       ExpressionAttributeValues: {
         ":s": settings,
-        ":u": new Date().toISOString(),
+        ":u": nextUpdatedAt,
+        ...(expectedUpdatedAt !== undefined ? { ":expected": expectedUpdatedAt } : {}),
       },
     }).promise();
+    return nextUpdatedAt;
   },
 
   async pruneEditorListsForUser(orgId: string, removedUserId: string): Promise<void> {
-    const got = await dynamodb.get({
-      TableName: ORGS_TABLE,
-      Key: { orgId },
-    }).promise();
-    const org = got.Item as Organization | undefined;
-    if (!org?.shareSettings) return;
-    const ss = org.shareSettings;
-    const strip = (arr: string[]) => arr.filter((uid) => uid !== removedUserId);
-    const next: OrgShareSettings = {
-      knowledgeBase:     { ...ss.knowledgeBase,     editors: strip(ss.knowledgeBase.editors) },
-      htmlTemplates:     { ...ss.htmlTemplates,     editors: strip(ss.htmlTemplates.editors) },
-      landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
-      workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
-      skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
-      analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
-      brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
-      marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
-    };
-    await this.updateShareSettings(orgId, next);
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      const got = await dynamodb.get({
+        TableName: ORGS_TABLE,
+        Key: { orgId },
+      }).promise();
+      const org = got.Item as Organization | undefined;
+      if (!org?.shareSettings) return;
+      const ss = org.shareSettings;
+      const strip = (arr: string[]) => arr.filter((uid) => uid !== removedUserId);
+      const next: OrgShareSettings = {
+        knowledgeBase:     { ...ss.knowledgeBase,     editors: strip(ss.knowledgeBase.editors) },
+        htmlTemplates:     { ...ss.htmlTemplates,     editors: strip(ss.htmlTemplates.editors) },
+        landingPages:      { ...ss.landingPages,      editors: strip(ss.landingPages.editors) },
+        workPlans:         { ...ss.workPlans,         editors: strip(ss.workPlans.editors) },
+        skills:            { ...ss.skills,            editors: strip(ss.skills.editors) },
+        analytics:         { ...(ss.analytics ?? { enabled: false, editors: [] }), editors: strip((ss.analytics?.editors) ?? []) },
+        crm:               { ...(ss.crm ?? { enabled: true, editors: [] }), editors: strip((ss.crm?.editors) ?? []) },
+        brandGuidelines:   { editors: strip(ss.brandGuidelines.editors) },
+        marketingStrategy: { editors: strip(ss.marketingStrategy.editors) },
+      };
+      try {
+        await this.updateShareSettings(orgId, next, org.updatedAt);
+        return;
+      } catch (error: any) {
+        if (error.code === "ConditionalCheckFailedException") {
+          continue; // Org changed concurrently — re-read and retry.
+        }
+        throw error;
+      }
+    }
+    throw new Error(`pruneEditorListsForUser: exceeded ${MAX_ATTEMPTS} retry attempts for org ${orgId}`);
   },
 
 

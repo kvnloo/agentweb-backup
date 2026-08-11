@@ -33,7 +33,7 @@ jest.mock('../config/aws', () => ({
 }));
 
 import { Request, Response } from 'express';
-import { crmDb, userDb } from '../services/db';
+import { crmDb, userDb, orgDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
 import { resendService } from '../services/resendService';
 import { agentModeService } from '../services/agentModeService';
@@ -74,6 +74,10 @@ jest.mock('../services/db', () => ({
   },
   userDb: {
     getUserById: jest.fn(),
+  },
+  orgDb: {
+    getOrgById: jest.fn(),
+    getOrgMembers: jest.fn(),
   },
 }));
 
@@ -178,14 +182,94 @@ describe('CRM Routes', () => {
 
     it('should return 401 if user is not authenticated', async () => {
       mockRequest.user = undefined;
-      
+
       // The middleware would handle this, but we test the handler logic
       const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.get);
       if (handler && handler.route) {
         await handler.route.stack[0].handle(mockRequest as Request, mockResponse as Response, mockNext);
       }
-      
+
       expect(mockResponse.status).toHaveBeenCalledWith(401);
+    });
+
+    // ENG-686 follow-up (found via live QA): this route pre-dated the
+    // org-share model and unconditionally merged in every org member's
+    // lists regardless of shareSettings.crm.enabled. It must now respect
+    // the toggle the same way crmDb.getLeadListsForUser already does.
+    describe('org-share fan-out honours crm.enabled (ENG-686 follow-up)', () => {
+      const ownLists = [{ listId: 'own-1', name: 'Mine', userId: 'test-user-id' }];
+      const memberLists = [{ listId: 'member-1', name: 'Theirs', userId: 'other-member' }];
+
+      const getHandler = () => {
+        const handler = router.stack.find((r: any) => r.route?.path === '/lists' && r.route?.methods?.get);
+        return (req: any, res: any) => handler!.route!.stack[0].handle(req, res, mockNext);
+      };
+
+      beforeEach(() => {
+        (crmDb.getLeadListsByUserId as jest.Mock).mockImplementation((id: string) =>
+          Promise.resolve(id === 'test-user-id' ? ownLists : memberLists)
+        );
+        (orgDb.getOrgMembers as jest.Mock).mockResolvedValue([
+          { userId: 'test-user-id' },
+          { userId: 'other-member' },
+        ]);
+      });
+
+      afterEach(() => {
+        // jest.clearAllMocks() (outer beforeEach) clears call history but not
+        // mockResolvedValue/mockImplementation — reset explicitly so these
+        // org fixtures don't leak into unrelated tests later in this file.
+        (userDb.getUserById as jest.Mock).mockReset();
+        (orgDb.getOrgById as jest.Mock).mockReset();
+        (orgDb.getOrgMembers as jest.Mock).mockReset();
+      });
+
+      it('a plain member sees only their own lists when crm.enabled is false', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-id', orgId: 'org-A' });
+        (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+          orgId: 'org-A',
+          ownerUserId: 'org-owner-id',
+          shareSettings: { crm: { enabled: false, editors: [] } },
+        });
+
+        await getHandler()(mockRequest as Request, mockResponse as Response);
+
+        expect(mockResponse.json).toHaveBeenCalledWith(ownLists);
+      });
+
+      it('the org owner still sees every member\'s lists when crm.enabled is false', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-id', orgId: 'org-A' });
+        (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+          orgId: 'org-A',
+          ownerUserId: 'test-user-id',
+          shareSettings: { crm: { enabled: false, editors: [] } },
+        });
+
+        await getHandler()(mockRequest as Request, mockResponse as Response);
+
+        const jsonArg = (mockResponse.json as jest.Mock).mock.calls[0][0];
+        expect(jsonArg).toEqual(expect.arrayContaining([
+          expect.objectContaining({ listId: 'own-1' }),
+          expect.objectContaining({ listId: 'member-1', fromOrgMember: true }),
+        ]));
+      });
+
+      it('a plain member sees every member\'s lists when crm.enabled is true (default)', async () => {
+        (userDb.getUserById as jest.Mock).mockResolvedValue({ userId: 'test-user-id', orgId: 'org-A' });
+        (orgDb.getOrgById as jest.Mock).mockResolvedValue({
+          orgId: 'org-A',
+          ownerUserId: 'org-owner-id',
+          shareSettings: { crm: { enabled: true, editors: [] } },
+        });
+
+        await getHandler()(mockRequest as Request, mockResponse as Response);
+
+        const jsonArg = (mockResponse.json as jest.Mock).mock.calls[0][0];
+        expect(jsonArg).toEqual(expect.arrayContaining([
+          expect.objectContaining({ listId: 'own-1' }),
+          expect.objectContaining({ listId: 'member-1', fromOrgMember: true }),
+        ]));
+      });
     });
   });
 

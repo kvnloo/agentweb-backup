@@ -149,7 +149,6 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // ── Google Gemini ────────────────────────────────────────────────────────────
   // All Gemini rates verified against ai.google.dev/gemini-api/docs/pricing (Jul 2026).
   // Standard (≤200K prompt) rates; gemini-3.1-pro doubles above 200K (not modeled here).
-  'gemini-3-pro-preview': withDerivedCache(1.25, 10), // DEPRECATED 2026-03-09 (migrate to 3.1-pro); rate left as last-known
   'gemini-3-flash-preview': withDerivedCache(0.5, 3), // was 0.15/0.6 — stale
   'gemini-3.1-pro-preview': withDerivedCache(2, 12), // was 1.25/10 — stale
   'gemini-3.1-flash-lite': withDerivedCache(0.25, 1.5), // was 0.075/0.3 — stale

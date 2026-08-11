@@ -18,6 +18,13 @@ jest.mock('../utils/secretsManager', () => ({
   getSecret: jest.fn().mockResolvedValue(JSON.stringify({ apiKey: 'lin_api_test' })),
 }));
 
+// This file asserts the PRODUCTION behaviour of the Linear rail. Since ENG-1099, filing is guarded
+// by `NODE_ENV === 'production'` (matching sendOncallAlert), so the production path must be pinned
+// explicitly here. The non-production suppression is covered by linearService.nonProdIntakeGuard.test.ts.
+const ORIGINAL_NODE_ENV = process.env.NODE_ENV;
+beforeAll(() => { process.env.NODE_ENV = 'production'; });
+afterAll(() => { process.env.NODE_ENV = ORIGINAL_NODE_ENV; });
+
 const TEAM_RESPONSE = {
   data: {
     teams: {
@@ -58,8 +65,9 @@ describe('linearService.createInternalLinearIssue', () => {
       return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as any);
     });
     const r = await createInternalLinearIssue({ title: 'auto thing', description: 'd', labelNames: ['Auto', 'Bug'] });
-    expect(r.identifier).toBe('ENG-50');
-    expect(r.id).toBe('uuid-50'); // uuid returned for commenting
+    expect(r).not.toBeNull(); // production files for real (ENG-1099 guard is env-gated, not blanket)
+    expect(r!.identifier).toBe('ENG-50');
+    expect(r!.id).toBe('uuid-50'); // uuid returned for commenting
     const input = lastCreateInput();
     expect(input.labelIds.sort()).toEqual(['lab_auto', 'lab_bug'].sort());
     expect(input.labelIds).not.toContain('lab_fb'); // no Featurebase label -> never public
