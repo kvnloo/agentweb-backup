@@ -2410,6 +2410,21 @@ describe('CRM Database Service', () => {
       expect(result.created[0].sourceIndex).toBe(1);
     });
 
+    // Greptile P1 on #2362: a refused row is neither a success nor an error,
+    // so every caller that reports totals must be able to account for it —
+    // otherwise a 100-row CSV reports 97 and the other 3 just vanish.
+    it('leaves every input row accounted for across the reported counts', async () => {
+      const result = await crmDb.batchCreateLeads(listId, [
+        { firstName: 'LinkedIn', lastName: 'Member' },
+        { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves-acct' },
+        { firstName: 'LinkedIn', lastName: 'User' },
+      ]);
+
+      const accountedFor = result.successCount + result.errorCount + result.anonymizedSkipped;
+      expect(accountedFor).toBe(3);
+      expect(result.anonymizedSkipped).toBe(2);
+    });
+
     it('imports a clean batch untouched', async () => {
       const result = await crmDb.batchCreateLeads(listId, [
         { firstName: 'Dana', lastName: 'Reeves', linkedin: 'https://www.linkedin.com/in/danareeves' },
