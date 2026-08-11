@@ -17,8 +17,18 @@ describe('isUnusableSynthesis', () => {
   });
 
   it('flags other structural-punctuation-only remnants', () => {
-    for (const residue of ['}', ']', '}}', '"}]', '},{', '  }]\n', '{"', ':', '[{}]', '",']) {
+    for (const residue of ['}', ']', '}}', '"}]', '},{', '  }]\n', '{"', ':', '",']) {
       expect(isUnusableSynthesis(residue)).toBe(true);
+    }
+  });
+
+  // Greptile P1: punctuation-only is not the same as unusable. A COMPLETE value is
+  // a legitimate answer to "return an empty object" or "show me the list", and
+  // discarding it would replace the user's answer with the synthesis-failure recap.
+  // Residue never parses; a complete value always does.
+  it('does NOT flag short but COMPLETE JSON values', () => {
+    for (const valid of ['{}', '[]', '[{}]', '{ }', '[ ]', '[{},{}]', '""', '[""]']) {
+      expect(isUnusableSynthesis(valid)).toBe(false);
     }
   });
 

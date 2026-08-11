@@ -86,7 +86,24 @@ export function isUnusableSynthesis(content: unknown): boolean {
   if (HISTORY_ECHO_PREFIX.test(trimmed)) return true;
   if (isDegenerateRepetition(trimmed)) return true;
   if (trimmed.length > MAX_RESIDUE_LENGTH) return false;
-  return STRUCTURAL_ONLY.test(trimmed);
+  if (!STRUCTURAL_ONLY.test(trimmed)) return false;
+  // Punctuation-only, but it might still be a COMPLETE value the user asked for:
+  // `{}`, `[]` and `[{}]` are legitimate answers to "return an empty object" or
+  // "show me the list". Residue is by definition the tail of a structure the model
+  // never finished, so it does not parse — `}]`, `},{` and `"}` all fail here while
+  // every complete value succeeds. Parsing is the exact discriminator, so use it
+  // rather than discarding on shape alone.
+  return !isCompleteJsonValue(trimmed);
+}
+
+/** True when `trimmed` is a whole, parseable JSON value rather than a fragment. */
+function isCompleteJsonValue(trimmed: string): boolean {
+  try {
+    JSON.parse(trimmed);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** The subset of a loop tool-call ledger entry this module reads. */
