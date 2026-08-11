@@ -4,6 +4,7 @@ import axios from "axios";
 import { authenticateToken, AuthenticatedRequest } from "../middleware/auth";
 import { settingsService } from "../services/settingsService";
 import { userDb, orgDb, crmDb } from "../services/db";
+import { resolveOrgProfileField } from "../services/orgProfileResolver";
 import {
   generateLandingPage,
   deployLandingPage,
@@ -466,10 +467,13 @@ router.post("/generate", rateLimiter, async (req, res: Response) => {
     // Brand guidelines + market strategy for maximum context. The shared
     // projection resolves the persisted brand logo attachments-first and
     // org-aware — an org member's brand (incl. the uploaded logo) lives on
-    // the ORG record (ENG-326). Pure projection off records already loaded.
+    // the ORG record (ENG-326), falling back to the org owner's record when
+    // the org was never populated (ENG-927). Pure projection otherwise.
     const brandContext: BrandContext = buildBrandContextFromUser(
       caller,
-      callerOrg?.brandGuidelines,
+      callerOrg
+        ? await resolveOrgProfileField(caller, callerOrg, "brandGuidelines")
+        : undefined,
     );
     const userSiteMode: "unified" | "separate" | undefined = caller?.landingSiteMode;
 
@@ -842,7 +846,10 @@ router.post("/generated/:id/duplicate", rateLimiter, async (req, res: Response) 
     // ENG-326 projection — org-aware, persisted logo attachments-first).
     const user = await userDb.getUserById(userId);
     const org = user?.orgId ? await orgDb.getOrgById(user.orgId) : null;
-    const brandContext = buildBrandContextFromUser(user, org?.brandGuidelines);
+    const brandContext = buildBrandContextFromUser(
+      user,
+      org ? await resolveOrgProfileField(user, org, "brandGuidelines") : undefined,
+    );
 
     // ENG-326 AC-3: duplicating re-generates the page — same gate as
     // /generate. Without a persisted logo v0 would invent a wordmark.
