@@ -95,8 +95,27 @@ export interface ChildProcessHandle {
   terminate(signal: QaTerminationSignal): void;
 }
 
+/** Emitted when a grant never becomes visible on the auth read path. */
+export interface GrantVisibilityReport {
+  verdict: 'block';
+  phase: 'grant-visibility';
+  userId: string;
+  attempts: number;
+  detail: string;
+}
+
 export interface TemporaryAdminAdapters {
   grantConditional(request: AdminGrantRequest): Promise<AdminGrantToken>;
+  /**
+   * Reads `isAdmin` back through the SAME eventually-consistent path the
+   * product's auth middleware uses — `getUserById`, i.e. a `UserIdIndex` query
+   * — and NOT the base table. A strongly-consistent base-table read would
+   * always report the grant we just wrote and prove nothing about what the
+   * child's first authenticated request will actually see.
+   */
+  readGrantVisibility(grant: AdminGrantToken): Promise<boolean>;
+  /** Delay between visibility attempts. Injected so tests never sleep for real. */
+  waitBeforeRetry(attempt: number): Promise<void>;
   revokeIfCurrent(grant: AdminGrantToken): Promise<boolean>;
   startChild(command: string[]): Promise<ChildProcessHandle>;
   onSignal(
@@ -118,6 +137,20 @@ export class TemporaryAdminCleanupError extends Error {
     this.name = 'TemporaryAdminCleanupError';
   }
 }
+
+/**
+ * The grant succeeded on the base table but never surfaced on the read path
+ * auth uses. Fail closed: the child would 403 on its first protected request.
+ */
+export class AdminGrantNotVisibleError extends Error {
+  constructor(public readonly report: GrantVisibilityReport) {
+    super(JSON.stringify(report));
+    this.name = 'AdminGrantNotVisibleError';
+  }
+}
+
+/** Bounded by attempt count, never wall-clock, so the poll is deterministic in tests. */
+export const DEFAULT_GRANT_VISIBILITY_ATTEMPTS = 10;
 
 function blockPreflight(
   adapters: QaFixturePreflightAdapters,
@@ -195,10 +228,16 @@ export async function preflightFixtures(
   return report;
 }
 
+export interface TemporaryAdminOptions {
+  /** Max visibility reads before failing closed. Defaults to DEFAULT_GRANT_VISIBILITY_ATTEMPTS. */
+  visibilityAttempts?: number;
+}
+
 export async function runWithTemporaryAdmin(
   userId: string,
   command: string[],
   adapters: TemporaryAdminAdapters,
+  _options: TemporaryAdminOptions = {},
 ): Promise<number> {
   if (command.length === 0) {
     throw new Error('with-admin requires a command after --');
@@ -329,6 +368,9 @@ export interface TemporaryAdminTarget {
 /** Structural slice of DocumentClient so tests can inject a fake without aws-sdk machinery. */
 export interface DynamoUpdatePort {
   update(params: AWS.DynamoDB.DocumentClient.UpdateItemInput): { promise(): Promise<unknown> };
+  query(params: AWS.DynamoDB.DocumentClient.QueryInput): {
+    promise(): Promise<{ Items?: Array<Record<string, unknown>> }>;
+  };
 }
 
 /**

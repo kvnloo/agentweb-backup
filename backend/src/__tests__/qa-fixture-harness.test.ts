@@ -1,4 +1,5 @@
 import {
+  AdminGrantNotVisibleError,
   AdminGrantToken,
   AdminGrantRequest,
   AuthSession,
@@ -54,8 +55,11 @@ function adminAdapters(exitCode = 0): {
   grant: AdminGrantToken;
   handlers: Map<QaTerminationSignal, () => Promise<void>>;
   child: jest.Mocked<ChildProcessHandle>;
+  /** Ordered adapter call log — proves the child starts only AFTER the grant is visible. */
+  calls: string[];
 } {
   const handlers = new Map<QaTerminationSignal, () => Promise<void>>();
+  const calls: string[] = [];
   const grant: AdminGrantToken = {
     userId: 'user-1',
     previousValue: false,
@@ -70,10 +74,29 @@ function adminAdapters(exitCode = 0): {
     grant,
     handlers,
     child,
+    calls,
     adapters: {
-      grantConditional: jest.fn(async (_request: AdminGrantRequest) => grant),
-      revokeIfCurrent: jest.fn(async (_grant: AdminGrantToken) => true),
-      startChild: jest.fn(async (_command: string[]) => child),
+      grantConditional: jest.fn(async (_request: AdminGrantRequest) => {
+        calls.push('grant');
+        return grant;
+      }),
+      // Default: the GSI has already caught up. Tests that exercise the race
+      // override this to return stale reads first.
+      readGrantVisibility: jest.fn(async (_grant: AdminGrantToken) => {
+        calls.push('visibility');
+        return true;
+      }),
+      waitBeforeRetry: jest.fn(async (_attempt: number) => {
+        calls.push('wait');
+      }),
+      revokeIfCurrent: jest.fn(async (_grant: AdminGrantToken) => {
+        calls.push('revoke');
+        return true;
+      }),
+      startChild: jest.fn(async (_command: string[]) => {
+        calls.push('startChild');
+        return child;
+      }),
       onSignal: jest.fn((signal, handler) => {
         handlers.set(signal, handler);
         return () => handlers.delete(signal);
@@ -205,6 +228,70 @@ describe('temporary admin lifecycle', () => {
       grantedValue: true,
     });
     expect(adapters.revokeIfCurrent).toHaveBeenCalledWith(grant);
+  });
+
+  it('does not start the child until the grant is visible on the auth read path', async () => {
+    const { adapters, calls, child } = adminAdapters();
+    // The base-table write succeeded, but UserIdIndex still serves isAdmin=false
+    // for the first two reads — exactly the window that 403s the child today.
+    adapters.readGrantVisibility
+      .mockImplementationOnce(async () => { calls.push('visibility'); return false; })
+      .mockImplementationOnce(async () => { calls.push('visibility'); return false; });
+
+    await expect(runWithTemporaryAdmin('user-1', ['node', 'qa.js'], adapters)).resolves.toBe(0);
+
+    expect(adapters.readGrantVisibility).toHaveBeenCalledTimes(3);
+    expect(adapters.startChild).toHaveBeenCalledTimes(1);
+    // The child must appear only after a TRUE visibility read, never between stale ones.
+    expect(calls.slice(0, calls.indexOf('startChild'))).toEqual([
+      'grant',
+      'visibility',
+      'wait',
+      'visibility',
+      'wait',
+      'visibility',
+    ]);
+    expect(child.wait).toHaveBeenCalled();
+  });
+
+  it('fails closed without starting the child when the grant never becomes visible', async () => {
+    const { adapters, grant, calls } = adminAdapters();
+    adapters.readGrantVisibility.mockImplementation(async () => {
+      calls.push('visibility');
+      return false;
+    });
+
+    await expect(
+      runWithTemporaryAdmin('user-1', ['node', 'qa.js'], adapters, { visibilityAttempts: 4 }),
+    ).rejects.toMatchObject({
+      report: {
+        verdict: 'block',
+        phase: 'grant-visibility',
+        userId: 'user-1',
+        attempts: 4,
+      },
+    });
+
+    expect(adapters.startChild).not.toHaveBeenCalled();
+    // The grant must still be handed back even though we never used it.
+    expect(adapters.revokeIfCurrent).toHaveBeenCalledWith(grant);
+    expect(adapters.readGrantVisibility).toHaveBeenCalledTimes(4);
+  });
+
+  it('bounds the visibility poll by attempts and never waits after the final read', async () => {
+    const { adapters, calls } = adminAdapters();
+    adapters.readGrantVisibility.mockImplementation(async () => {
+      calls.push('visibility');
+      return false;
+    });
+
+    await expect(
+      runWithTemporaryAdmin('user-1', ['node', 'qa.js'], adapters, { visibilityAttempts: 3 }),
+    ).rejects.toBeInstanceOf(AdminGrantNotVisibleError);
+
+    // 3 reads, 2 waits between them — a trailing sleep would burn time for nothing.
+    expect(adapters.waitBeforeRetry).toHaveBeenCalledTimes(2);
+    expect(calls[calls.length - 1]).toBe('revoke');
   });
 
   it.each(QA_TERMINATION_SIGNALS)(
@@ -424,6 +511,24 @@ describe('qa-fixture-harness CLI: with-admin', () => {
     expect(stderr.join('\n')).toContain('user-1');
   });
 
+  it('exits 1 with a structured grant-visibility block, no child, and a completed revoke', async () => {
+    const { io, stdout } = cliIo();
+    const { adapters, grant } = adminAdapters();
+    adapters.readGrantVisibility.mockResolvedValue(false);
+
+    await expect(
+      runCli(['with-admin', '--', 'node', 'qa.js'], adminEnv(), { adminAdapters: adapters, io }),
+    ).resolves.toBe(1);
+
+    expect(JSON.parse(stdout[stdout.length - 1])).toMatchObject({
+      verdict: 'block',
+      phase: 'grant-visibility',
+      userId: 'user-1',
+    });
+    expect(adapters.startChild).not.toHaveBeenCalled();
+    expect(adapters.revokeIfCurrent).toHaveBeenCalledWith(grant);
+  });
+
   it('exits 2 with usage on an unknown subcommand', async () => {
     const { io, stderr } = cliIo();
 
@@ -490,6 +595,7 @@ describe('DynamoDB compare-and-set adapters', () => {
   };
 
   type UpdateParams = Parameters<DynamoUpdatePort['update']>[0];
+  type QueryParams = Parameters<DynamoUpdatePort['query']>[0];
 
   function fakeDocClient(impl: (params: UpdateParams) => Promise<unknown>) {
     const update = jest.fn((params: UpdateParams) => ({ promise: () => impl(params) }));
@@ -544,6 +650,70 @@ describe('DynamoDB compare-and-set adapters', () => {
         version: 'run-abc',
       }),
     ).rejects.toThrow('throughput exceeded');
+  });
+
+  it('reads visibility through UserIdIndex, mirroring the auth path getUserById uses', async () => {
+    const queried: QueryParams[] = [];
+    const docClient = {
+      ...fakeDocClient(async () => ({})),
+      query: jest.fn((params: QueryParams) => ({
+        promise: async () => {
+          queried.push(params);
+          return { Items: [{ userId: 'user-1', isAdmin: true }] };
+        },
+      })),
+    };
+    const adapters = createDynamoTemporaryAdminAdapters(target, docClient);
+
+    await expect(
+      adapters.readGrantVisibility({
+        userId: 'user-1',
+        previousValue: false,
+        expectedGrantedValue: true,
+        version: 'run-abc',
+      }),
+    ).resolves.toBe(true);
+
+    expect(queried[0].TableName).toBe('Dev-AW-Users');
+    expect(queried[0].IndexName).toBe('UserIdIndex');
+    expect(String(queried[0].KeyConditionExpression)).toContain('userId');
+    expect(queried[0].ExpressionAttributeValues).toMatchObject({ ':userId': 'user-1' });
+  });
+
+  it('reports the grant as not yet visible when the index still serves the old isAdmin', async () => {
+    const docClient = {
+      ...fakeDocClient(async () => ({})),
+      query: jest.fn(() => ({
+        promise: async () => ({ Items: [{ userId: 'user-1', isAdmin: false }] }),
+      })),
+    };
+    const adapters = createDynamoTemporaryAdminAdapters(target, docClient);
+
+    await expect(
+      adapters.readGrantVisibility({
+        userId: 'user-1',
+        previousValue: false,
+        expectedGrantedValue: true,
+        version: 'run-abc',
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it('treats a missing row on the index as not visible rather than assuming the grant landed', async () => {
+    const docClient = {
+      ...fakeDocClient(async () => ({})),
+      query: jest.fn(() => ({ promise: async () => ({ Items: [] }) })),
+    };
+    const adapters = createDynamoTemporaryAdminAdapters(target, docClient);
+
+    await expect(
+      adapters.readGrantVisibility({
+        userId: 'user-1',
+        previousValue: false,
+        expectedGrantedValue: true,
+        version: 'run-abc',
+      }),
+    ).resolves.toBe(false);
   });
 
   it('revoke pins the exact row and run: email key, userId + granted value + run id condition', async () => {
