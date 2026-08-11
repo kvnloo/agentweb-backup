@@ -71,3 +71,20 @@ describe('sealTruncatedPayload — property tests (ENG-1054)', () => {
     expect(perCallMs).toBeLessThan(25);
   });
 });
+
+describe('sealTruncatedPayload — fail-safe wrapper (ENG-1054)', () => {
+  const NOISY = jest.spyOn(console, 'error').mockImplementation(() => {});
+  afterAll(() => NOISY.mockRestore());
+
+  it('falls back to the unsealed slice instead of throwing into tool dispatch', () => {
+    // A String subclass whose trimStart explodes — stands in for any unforeseen
+    // input that could make the pure path throw once it is live on the hot path.
+    const hostile: any = new String('{"a":1');
+    hostile.trimStart = () => { throw new Error('boom'); };
+    hostile.trim = () => { throw new Error('boom'); };
+
+    const out = sealTruncatedPayload(hostile as unknown as string);
+    expect(out).toContain(TRUNCATION_NOTICE);
+    expect(NOISY).toHaveBeenCalled();
+  });
+});

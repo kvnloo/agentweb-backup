@@ -34,6 +34,26 @@
 export const TRUNCATION_NOTICE = '[Content truncated — full response in S3]';
 
 /**
+ * Fail-safe entry point. `sealTruncatedPayloadUnsafe` is pure string work and the
+ * seeded property test drives 20k random cuts through it without a throw — but it
+ * now sits on the path EVERY large tool response takes, for every provider, so an
+ * unforeseen input must not be able to take tool dispatch down with it.
+ *
+ * On any unexpected error, fall back to the bare slice plus the notice: exactly the
+ * pre-ENG-1054 behaviour. That reinstates the original defect for that one payload
+ * rather than failing the user's whole turn — the right trade, and loud in the logs
+ * so it cannot rot silently.
+ */
+export function sealTruncatedPayload(slice: string): string {
+  try {
+    return sealTruncatedPayloadUnsafe(slice);
+  } catch (e) {
+    console.error('AgentMode: sealTruncatedPayload failed, emitting the unsealed slice (ENG-1054):', e);
+    return `${slice}\n\n${TRUNCATION_NOTICE}`;
+  }
+}
+
+/**
  * Seal a slice with a caller-supplied notice instead of the S3 one.
  *
  * The storage cap below the S3 preview is a SECOND bare `substring` on the same
@@ -131,7 +151,7 @@ function isParseable(candidate: string): boolean {
  * notice appended and are otherwise left exactly as they are — never worse than the
  * bare substring this replaced.
  */
-export function sealTruncatedPayload(slice: string): string {
+function sealTruncatedPayloadUnsafe(slice: string): string {
   const withNotice = (body: string) => `${body}\n\n${TRUNCATION_NOTICE}`;
   if (scanOpenStructure(slice) === null) return withNotice(slice);
 

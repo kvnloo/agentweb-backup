@@ -3592,6 +3592,17 @@ export class AgentModeService {
       // blank reply — turning one silent-output bug into another would be no fix.
       let synthesisResidueDropped = false;
 
+      // ENG-1054 kill switch — ON by default; set AGENT_SYNTHESIS_RESIDUE_GUARD=false
+      // to disable the guard and its recap.
+      //
+      // This guard DISCARDS model output it judges unusable, and its failure mode is
+      // silent: a false positive costs the user their answer and only shows up as a
+      // log line, never as an error. Merging here deploys straight to production, so
+      // there needs to be a way to stand it down from config rather than waiting on a
+      // revert — matching how AGENT_FINALIZE_GUARD gates the other output-rewriting
+      // seam. Off restores the exact pre-ENG-1054 behaviour.
+      const synthesisResidueGuardEnabled = process.env.AGENT_SYNTHESIS_RESIDUE_GUARD !== 'false';
+
       let wasCancelled = false;
       // ENG-244: set true when the loop exits because the step budget (maxIterations)
       // was exhausted. This is the deterministic signal a long data-gathering
@@ -3890,7 +3901,7 @@ export class AgentModeService {
         // for the summary. Blanking responseMessage.content too keeps the debris out
         // of the persisted transcript AND out of the history sent on the retry (this
         // runs before the message is appended to `messages` below).
-        const residueDroppedThisTurn = isUnusableSynthesis(responseContent);
+        const residueDroppedThisTurn = synthesisResidueGuardEnabled && isUnusableSynthesis(responseContent);
         if (residueDroppedThisTurn) {
           console.warn(`AgentMode: Discarding unusable final synthesis ${JSON.stringify(responseContent.trim())} in session ${sessionId} — treating as an empty turn`);
           synthesisResidueDropped = true;
@@ -4013,7 +4024,7 @@ export class AgentModeService {
           // Report that ledger instead — tool names and outcome counts only, so it can
           // never claim a false success. Gated on the per-turn flag, not on `content`:
           // `content` still holds any earlier turn's text and would suppress this.
-          if (synthesisResidueDropped) {
+          if (synthesisResidueGuardEnabled && synthesisResidueDropped) {
             if (!turnHadUsableText) {
               console.warn(`AgentMode: Synthesis unrecoverable after residue in session ${sessionId} — falling back to the executed-action ledger (${toolCalls.length} tool call(s))`);
               content = buildExecutedActionsFallback(toolCalls);
