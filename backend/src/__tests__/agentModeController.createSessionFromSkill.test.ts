@@ -10,6 +10,7 @@ jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
     createChatSession: jest.fn(), addAssociatedSkills: jest.fn().mockResolvedValue(undefined),
     updateSessionLlmModel: jest.fn().mockResolvedValue({}), addMessageToSession: jest.fn().mockResolvedValue({}),
+    deleteSession: jest.fn().mockResolvedValue(undefined),
   },
 }));
 jest.mock('../services/skillService', () => ({ skillService: { getSkill: jest.fn() } }));
@@ -82,7 +83,17 @@ describe('createSessionFromSkill authenticated static brief', () => {
     expect(db.addMessageToSession).toHaveBeenCalledWith('session-1', expect.objectContaining({
       role: 'assistant', content: skill.welcomeMessage,
     }));
+    expect(db.deleteSession).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(201);
+  });
+
+  it.each(['model', 'association', 'welcome'] as const)('removes the partial Skill session when %s persistence fails', async (stage) => {
+    if (stage === 'model') db.updateSessionLlmModel.mockRejectedValueOnce(new Error('write failed'));
+    if (stage === 'association') db.addAssociatedSkills.mockRejectedValueOnce(new Error('write failed'));
+    if (stage === 'welcome') db.addMessageToSession.mockRejectedValueOnce(new Error('write failed'));
+    const res = response(); await agentModeController.createSession(request('skill-1'), res);
+    expect(db.deleteSession).toHaveBeenCalledWith('session-1');
+    expect(res.status).toHaveBeenCalledWith(500);
   });
 
   it.each([

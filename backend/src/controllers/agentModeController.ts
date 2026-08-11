@@ -4559,6 +4559,7 @@ export const agentModeController = {
     // ~30 create-session calls on 6/27). Hoisted so the catch block can
     // release a held claim after an error unwinds.
     let createIdemKeyHeld: string | undefined;
+    let partialSkillSessionId: string | undefined;
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
@@ -4624,6 +4625,7 @@ export const agentModeController = {
         finalSessionType as "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation",
         delegateInfo // Pass delegate info for admin delegation tracking
       );
+      if (skillId) partialSkillSessionId = session.sessionId;
 
       // Set default model for new sessions
       // Use reports model for report_generation sessions, customer support model for emma-sidebar, otherwise use default model
@@ -4661,9 +4663,11 @@ export const agentModeController = {
       } : sessionWithModel);
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
-      // Release the claim so the client's retry is accepted — a failed create
-      // must not lock the user out for the idem ttl.
-      if (createIdemKeyHeld) {
+      let cleanupSucceeded = true;
+      if (partialSkillSessionId) try { await chatbotDb.deleteSession(partialSkillSessionId); }
+      catch (cleanupError) { cleanupSucceeded = false; console.error('AgentMode: Partial Skill session cleanup failed:', cleanupError); }
+      // Retry only after cleanup; a retained claim prevents duplicates until TTL.
+      if (createIdemKeyHeld && cleanupSucceeded) {
         await releaseIdempotency(createIdemKeyHeld);
       }
       res.status(500).json({ error: 'Failed to create session' });
