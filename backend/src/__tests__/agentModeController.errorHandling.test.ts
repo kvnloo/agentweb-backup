@@ -971,6 +971,207 @@ describe('AgentModeController - Error Handling', () => {
     });
   });
 
+  /**
+   * ENG-971. In the production session the false-failure sentence came from HERE —
+   * the diagnosis agent on the error path — not from the model's closing narrative.
+   * The turn hit the 600s generation timeout three minutes AFTER
+   * publish_landing_page_changes had already landed and been verified live, so every
+   * truthful-reporting guard inside generateMarketingResponse's success path was
+   * bypassed. The diagnosis agent, handed only the error and failedFunctions, wrote
+   * "The system timed out while attempting to update the shared /api/capture route,
+   * so your changes were not saved. Please try your request again."
+   */
+  describe('generateResponse - false-failure guard on the diagnosis path (ENG-971)', () => {
+    const PROD_FALSE_FAILURE =
+      'The system timed out while attempting to update the shared /api/capture route, '
+      + 'so your changes were not saved. Please try your request again, and I will pick up '
+      + 'where the process left off.';
+
+    const generationTimeout = () => {
+      const err: any = new Error(
+        `Generation timed out after 600000ms for session ${mockSessionId}.`
+      );
+      err.isGenerationTimeout = true;
+      return err;
+    };
+
+    const runTurn = async () => {
+      const mockReq = {
+        user: { userId: mockUserId, email: 'test@example.com' },
+        body: {
+          sessionId: mockSessionId,
+          userMessage: 'Go ahead. Fix the shared /api/capture route.',
+          llmModel: 'gpt-5-chat-2',
+          attachments: [],
+        },
+        method: 'POST',
+        path: '/api/agent-mode/generate',
+        ip: '127.0.0.1',
+        socket: { remoteAddress: '127.0.0.1' },
+        on: jest.fn(),
+      } as unknown as Request;
+
+      const mockRes = {
+        json: jest.fn(),
+        status: jest.fn().mockReturnThis(),
+      } as unknown as Response;
+
+      await agentModeController.generateResponse(mockReq, mockRes);
+
+      return mockChatbotDb.addMessageToSession.mock.calls.find(
+        (call) => call[1]?.metadata?.isErrorMessage === true
+      );
+    };
+
+    /**
+     * Stage a turn the way production actually runs it. calledFunctions is
+     * session-cumulative, so the controller snapshots it BEFORE the turn and diffs
+     * against the value at failure time. A mock that returns one fixed session for
+     * both reads makes every turn look like it accomplished nothing — and, worse,
+     * would hide the bug where an EARLIER turn's publish is credited to this one.
+     * `before` is what the session already carried; `after` is what it carries once
+     * the turn has run.
+     */
+    const stageTurn = (
+      after: Record<string, number>,
+      opts: { before?: Record<string, number>; error?: any } = {}
+    ) => {
+      const before = opts.before ?? {};
+      let turnRan = false;
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockImplementation(async () => {
+        turnRan = true;
+        throw opts.error ?? generationTimeout();
+      });
+      mockChatbotDb.getChatSession.mockImplementation(async () => ({
+        ...mockSession,
+        messages: [{ role: 'user', content: 'prior message' }],
+        calledFunctions: turnRan ? after : before,
+        failedFunctions: { save_memory: 1, coding_agent: 1 },
+      }) as any);
+    };
+
+    it('passes the run\'s successful calls to the diagnosis agent, not just the failures', async () => {
+      stageTurn({ publish_landing_page_changes: 1, get_deployment_status: 2 });
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue('diagnosed');
+
+      await runTurn();
+
+      expect(mockAgentModeService.generateDiagnosticMessage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          succeededFunctions: { publish_landing_page_changes: 1, get_deployment_status: 2 },
+          failedFunctions: { save_memory: 1, coding_agent: 1 },
+        })
+      );
+    });
+
+    it('appends the true outcome when the diagnosis claims unsaved work after a confirmed publish', async () => {
+      stageTurn({ publish_landing_page_changes: 1, generate_landing_page: 1, save_memory: 1 });
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(PROD_FALSE_FAILURE);
+
+      const errorCall = await runTurn();
+
+      expect(errorCall).toBeDefined();
+      // Append-only: the diagnosis text survives verbatim, the truth follows it.
+      expect(errorCall![1].content).toContain(PROD_FALSE_FAILURE);
+      expect(errorCall![1].content).toContain('published your landing-page changes');
+      expect(errorCall![1].content).toContain('do NOT re-run it');
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBe(true);
+    });
+
+    /**
+     * The regression this nearly shipped with. calledFunctions accumulates for the
+     * LIFE of the session, so a publish from turn 1 would otherwise be announced as
+     * this turn's work when turn 7 fails for an unrelated reason.
+     */
+    it('does not credit an EARLIER turn\'s publish to this turn\'s failure', async () => {
+      stageTurn(
+        { publish_landing_page_changes: 1, you_search_web: 4 },
+        { before: { publish_landing_page_changes: 1 } }
+      );
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(PROD_FALSE_FAILURE);
+
+      const errorCall = await runTurn();
+
+      // Nothing was published THIS turn, so there is nothing to correct.
+      expect(errorCall![1].content).toBe(PROD_FALSE_FAILURE);
+      expect(mockAgentModeService.generateDiagnosticMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ succeededFunctions: { you_search_web: 4 } })
+      );
+    });
+
+    it('leaves the diagnosis untouched when the run published nothing', async () => {
+      stageTurn({ you_search_web: 3, get_leads: 1 });
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(PROD_FALSE_FAILURE);
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toBe(PROD_FALSE_FAILURE);
+    });
+
+    it('leaves a truthful diagnosis untouched even after a confirmed publish', async () => {
+      const truthful =
+        'Your landing page is published and live. The run was cut short before I could save a memory note.';
+      stageTurn({ publish_landing_page_changes: 1 });
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(truthful);
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toBe(truthful);
+    });
+
+    // The diagnosis agent races a 20s timeout and returns null under load, and the
+    // static fallback that replaces it still says "please try sending your message
+    // again" — the same double-deploy advice, minus the false claim. There is no
+    // prose to judge, so a confirmed publish alone earns the notice.
+    it('adds the true outcome to the generic fallback when the diagnosis agent is unavailable', async () => {
+      stageTurn({ publish_landing_page_changes: 1 });
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(null);
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toContain('I encountered an error processing your request');
+      expect(errorCall![1].content).toContain('published your landing-page changes');
+      expect(errorCall![1].content).toContain('do NOT re-run it');
+      // Still not a diagnosis — the flag tracks who WROTE the message.
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBeUndefined();
+    });
+
+    // A deploy restarts the box mid-run often enough that this is not a corner case
+    // (ENG-657). "Please send your message again" after a landed publish is the same
+    // double-deploy advice as the generic fallback, so it earns the same notice.
+    it('adds the true outcome to the server-restart message after a confirmed publish', async () => {
+      stageTurn({ publish_landing_page_changes: 1 }, { error: new Error('Worker shutdown') });
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toContain('server restarted');
+      expect(errorCall![1].content).toContain('published your landing-page changes');
+      expect(errorCall![1].content).toContain('do NOT re-run it');
+      expect(errorCall![1].metadata!.isDiagnosticMessage).toBe(true);
+    });
+
+    it('leaves the server-restart message bare when the run published nothing', async () => {
+      stageTurn({ get_leads: 1 }, { error: new Error('Worker shutdown') });
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toBe(
+        'The server restarted while processing your request. Please send your message again.'
+      );
+    });
+
+    it('leaves the generic fallback bare when the run published nothing', async () => {
+      stageTurn({ get_leads: 2 });
+      mockAgentModeService.generateDiagnosticMessage.mockResolvedValue(null);
+
+      const errorCall = await runTurn();
+
+      expect(errorCall![1].content).toBe(
+        'I encountered an error processing your request. Please try sending your message again.'
+      );
+    });
+  });
+
   describe('generateResponse - context limit auto-report to Linear', () => {
     const contextError = new Error('The request exceeded the maximum context length');
 

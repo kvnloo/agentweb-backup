@@ -13,6 +13,7 @@ import { rankMemoriesByRelevance, buildMemoryContextMessage } from '../utils/mem
 import { embedText } from '../utils/embeddings';
 import { toolResultError } from '../utils/toolResultError';
 import { reconcileLandingDeploymentReport } from '../utils/landingDeploymentReport';
+import { isBookkeepingTool, reconcileFalseFailureReport } from '../utils/falseFailureReport';
 import { computeTermination } from './agentMode/core/agentStep';
 import { createGeminiNativeClient } from './agentMode/core/geminiNativeClient';
 import {
@@ -53,7 +54,8 @@ import path from 'path';
 import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
-import { skillService } from './skillService';
+import { skillService, Skill } from './skillService';
+import { resolveUserSkillAccess } from './userSkillAccessService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
@@ -859,6 +861,14 @@ export interface DiagnosisContext {
   userMessage: string;
   workPlanSummary: string | null;
   failedFunctions: Record<string, number> | null;
+  /**
+   * ENG-971: the calls that SUCCEEDED before the turn died (session.calledFunctions).
+   * Without it the diagnosis agent sees a failure-only view of the run and answers
+   * "be specific about what was accomplished" by asserting nothing was — which is how
+   * a 600s timeout AFTER a landed production publish became "your changes were not
+   * saved. Please try your request again." Optional so older callers still compile.
+   */
+  succeededFunctions?: Record<string, number> | null;
 }
 
 /**
@@ -4361,8 +4371,17 @@ export class AgentModeService {
       // the URL. It only ADDS the true deliverable, never rewrites the model's text, so it
       // cannot invent a false success. Mirrors the finalize guard's in-place last-assistant
       // patch so the persisted transcript matches what the user sees.
+      // ENG-971: the INVERSION of the above — a false FAILURE report. Same shape of
+      // guard (deterministic, always-on, append-only, applied at the same seam): when
+      // the closing narrative claims the session timed out AND that the user's changes
+      // were not saved, while the ledger holds a CONFIRMED successful publish/deploy,
+      // append the true outcome so the user does not re-run a production deploy that
+      // already landed. Runs after the landing reconciler so both corrections compose.
       if (content && !wasCancelled) {
-        const reconciledContent = reconcileLandingDeploymentReport(content, toolCalls);
+        const reconciledContent = reconcileFalseFailureReport(
+          reconcileLandingDeploymentReport(content, toolCalls),
+          toolCalls,
+        );
         if (reconciledContent !== content) {
           content = reconciledContent;
           for (let i = messages.length - 1; i >= 0; i--) {
@@ -5059,58 +5078,13 @@ export class AgentModeService {
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
-      // Best-effort org fanout: only attach orgId when `shareSettings.skills`
-      // is effectively enabled for this caller (plain members need
-      // enabled=true; editors and the org owner always get fanout). Any
-      // lookup failure degrades to non-org behavior.
-      let sessionUserOrgId: string | undefined;
-      try {
-        const { userDb: uDb, orgDb } = await import('./db');
-        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
-        const sessionUser = await uDb.getUserById(userId);
-        const candidateOrgId = sessionUser?.orgId;
-        if (candidateOrgId) {
-          const org = await orgDb.getOrgById(candidateOrgId);
-          const effectivelyEnabled = isFeatureEffectivelyEnabled(
-            { userId, orgId: candidateOrgId, orgRole: sessionUser?.orgRole },
-            org,
-            'skills',
-          );
-          if (effectivelyEnabled) sessionUserOrgId = candidateOrgId;
-        }
-      } catch { /* skip — org-sharing is best-effort */ }
-      const publishedSkills = await skillService.getSkillsAvailableToUser(userId, sessionUserOrgId);
-
-      if (!publishedSkills.length)
-        return { message: "No skills available in the library." };
-
       const session = await chatbotDb.getChatSession(sessionId);
-      const currentAssociated = session?.associatedSkills || [];
-      const associatedSkillIds = new Set(currentAssociated);
-
-      const availableSkills = publishedSkills.filter(s => !associatedSkillIds.has(s.skillId));
-
-      // Add admin skill for admin users (if not already installed)
-      if (!associatedSkillIds.has(ADMIN_SKILL_VIRTUAL_ID)) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          if (user?.isAdmin) {
-            availableSkills.push({
-              skillId: ADMIN_SKILL_VIRTUAL_ID,
-              name: 'Admin Tools',
-              description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
-              toolNames: ADMIN_SKILL_TOOL_NAMES,
-              isPublished: true,
-            } as any);
-          }
-        } catch (e) {
-          console.warn('[listSkills] Error checking admin status:', (e as Error).message);
-        }
-      }
-
-      if (!availableSkills.length)
+      const skills = await this.getSkillsForDisplay(session?.associatedSkills || [], userId);
+      if (!skills.length) return { message: "No skills available in the library." };
+      const availableSkills = skills.filter(skill => !skill.installed);
+      if (!availableSkills.length) {
         return { message: "All available skills are already installed." };
+      }
 
       return {
         message: `Found ${availableSkills.length} available skill(s).`,
@@ -5484,25 +5458,28 @@ export class AgentModeService {
   /**
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
-  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
-    let userOrgId: string | undefined;
-    if (userId) {
-      try {
-        const { userDb: uDb } = await import('./db');
-        const u = await uDb.getUserById(userId);
-        userOrgId = u?.orgId;
-      } catch { /* skip */ }
-    }
+  private async loadAuthorizedSkillCatalog(userId?: string): Promise<{ skills: Skill[]; allowedIds: string[] }> {
+    const userOrgId = userId ? (await resolveUserSkillAccess(userId)).sharedOrgId : undefined;
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
     ]);
+    const isWildcard = userAllowedSkillIds.includes("*");
+    const allowedSet = new Set(userAllowedSkillIds);
+    return { skills: publishedSkills.filter(s => (s.visibility !== 'pending_review' || s.ownerId === userId) && (isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId))), allowedIds: userAllowedSkillIds };
+  }
+
+  public async getAuthorizedSkill(skillId: string, userId: string): Promise<Skill | undefined> {
+    return (await this.loadAuthorizedSkillCatalog(userId)).skills.find(skill => skill.skillId === skillId);
+  }
+
+  public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
+    const { skills: publishedSkills, allowedIds: userAllowedSkillIds } = await this.loadAuthorizedSkillCatalog(userId);
     const installedIds = new Set(associatedSkillIds);
     const isWildcard = userAllowedSkillIds.includes("*");
     const allowedSet = new Set(userAllowedSkillIds);
 
     const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = publishedSkills
-      .filter(s => isWildcard || allowedSet.has(s.skillId) || (s.ownerId && s.ownerId === userId))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
@@ -5554,40 +5531,10 @@ export class AgentModeService {
         return { message: "skillIds must be a non-empty array of skill IDs." };
       }
 
-      let installUserOrgId: string | undefined;
-      try {
-        const { userDb: uDb } = await import('./db');
-        const installUser = await uDb.getUserById(userId);
-        installUserOrgId = installUser?.orgId;
-      } catch { /* skip — org-sharing is best-effort */ }
-      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getSkillsAvailableToUser(userId, installUserOrgId),
-        getAllowedSkills(userId)
-      ]);
-
-      const isWildcard = userAllowedSkillIds.includes("*");
-      const allowedSkillSet = new Set(userAllowedSkillIds);
-
-      // Check admin status for admin skill gating
-      let isAdmin = false;
-      if (skillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          isAdmin = user?.isAdmin === true;
-        } catch (e) {
-          console.warn('[installSkills] Error checking admin status:', (e as Error).message);
-        }
-      }
-
-      // Filter valid IDs: exists in published/user skills OR is a virtual skill ID
-      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill, or org-shared private skill)
+      const availableSkills = await this.getSkillsForDisplay([], userId);
+      const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
       const validSkillIds = skillIds.filter(id => {
-        const skill = publishedSkills.find(s => s.skillId === id);
-        const isOwnSkill = skill && skill.ownerId === userId;
-        const isOrgSkill = skill && skill.orgId && skill.orgId === installUserOrgId;
-        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && (isAdmin || isDelegatedAccess)) || skill) &&
-          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isOrgSkill || isWildcard || allowedSkillSet.has(id));
+        return availableById.has(id) || (id === ADMIN_SKILL_VIRTUAL_ID && isDelegatedAccess);
       });
 
       const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
@@ -5604,7 +5551,7 @@ export class AgentModeService {
           } else if (id === ADMIN_SKILL_VIRTUAL_ID) {
             installedNames.push('Admin Tools');
           } else {
-            const skill = publishedSkills.find(s => s.skillId === id);
+            const skill = availableById.get(id);
             if (skill) installedNames.push(skill.name);
           }
         });
@@ -14492,7 +14439,18 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    */
   async generateDiagnosticMessage(context: DiagnosisContext): Promise<string | null> {
     try {
-      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.`;
+      // ENG-971: the truthfulness rules exist because this agent wrote "the system
+      // timed out ... so your changes were not saved. Please try your request again"
+      // for a run whose production publish had already landed and been verified. It
+      // is told what succeeded (below) and forbidden from turning an interruption
+      // into a claim of lost work.
+      const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.
+
+TRUTHFULNESS RULES (these override tone):
+- The "Succeeded operations" list is what actually happened. Anything on it completed — say so, and name it.
+- An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
+- Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
+- Do not attribute a failure to an operation that appears in the succeeded list.`;
 
       const parts: string[] = [
         `Error type: ${context.errorType}`,
@@ -14503,6 +14461,9 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
         parts.push(`Work plan status:\n${context.workPlanSummary}`);
       } else {
         parts.push('No work plan.');
+      }
+      if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
+        parts.push(`Succeeded operations (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);
@@ -19984,6 +19945,17 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       if (safeMessage.includes('Scheduled chat not found')) {
         return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nFix: The schedule_id doesn't exist or doesn't belong to this user. Call list_scheduled_chats to get a valid schedule_id before retrying update/toggle/delete.`;
       }
+    }
+    // ENG-971: bookkeeping / side-effect tools (save_memory, save_org_memory, …)
+    // record a note ABOUT the work — they are not the work. A trailing save_memory
+    // schema rejection got the generic "adjust the plan" guidance below, read like a
+    // failure of the primary task, and was generalized into "the system timed out and
+    // your changes were not saved. Please try again." — after a landing-page publish
+    // that had already gone live in production. Give the criticality verdict
+    // explicitly, and keep it accurate even when the memory note WAS what the user
+    // asked for: the failure is real and must be reported, it is just SCOPED to the note.
+    if (isBookkeepingTool(toolName)) {
+      return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nIMPORTANT: ${toolName} is a NON-CRITICAL bookkeeping call — it only stores a note for future sessions. Its failure is scoped to that note: it did not undo, roll back, or lose any work already completed in this session, and it is NOT a session, system, or connection timeout. Do NOT tell the user that the system timed out, that their changes were not saved, or that they should re-run work that already succeeded — re-running a publish or deploy that already landed is the worst outcome here. Say in one line that the note could not be saved, then report the true outcome of the rest of the session exactly as the earlier tool results confirmed it.`;
     }
     return `⚠️ Tool Error: ${toolName}\nReason: ${safeMessage}\nNext: Adjust the plan or ask the user for missing info.`;
   }

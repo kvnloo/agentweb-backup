@@ -23,6 +23,25 @@ router.get('/me/onboarding', authenticateToken, async (req, res) => {
   }
 });
 
+// ENG-1124: self-service display-name persistence.
+router.patch('/me/profile', authenticateToken, async (req, res) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ message: 'User not authenticated' });
+
+    const displayName = req.body?.displayName;
+    if (typeof displayName !== 'string' || !displayName.trim() || displayName.length > 100) {
+      return res.status(400).json({ message: 'displayName must be 1–100 characters' });
+    }
+
+    await userDb.updateUser(userId, { displayName: displayName.trim() });
+    return res.json({ ok: true });
+  } catch (error) {
+    console.error('Error saving profile:', error);
+    return res.status(500).json({ message: 'Failed to save profile' });
+  }
+});
+
 // PATCH /api/users/me/onboarding
 router.patch('/me/onboarding', authenticateToken, async (req, res) => {
   try {
