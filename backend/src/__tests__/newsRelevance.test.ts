@@ -55,6 +55,46 @@ describe('isRelevantToQuery (ENG-1050)', () => {
     expect(isRelevantToQuery(result('Best Southern California vacation resorts'), terms)).toBe(false);
   });
 
+  it('keeps a headline that names only the entity, with no descriptor word', () => {
+    // The headlines a competitor digest exists to find name the company and
+    // nothing else — requiring a second term match would drop every one of them.
+    expect(isRelevantToQuery(result('Guesty acquires Rentals United'), terms)).toBe(true);
+    expect(
+      isRelevantToQuery(result('Stripe launches Tempo'), extractSignificantTerms('Stripe payments news')),
+    ).toBe(true);
+    expect(
+      isRelevantToQuery(
+        result('UpKeep raises $50M Series C'),
+        extractSignificantTerms('UpKeep CMMS maintenance management software company'),
+      ),
+    ).toBe(true);
+    expect(
+      isRelevantToQuery(result('Surfer acquires ContentGecko'), extractSignificantTerms('Surfer SEO tool')),
+    ).toBe(true);
+    expect(
+      isRelevantToQuery(
+        result('Zenoti names new CFO'),
+        extractSignificantTerms('Zenoti spa salon med-spa software funding OR acquisition OR launch'),
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects trending-feed noise that matches only descriptor terms', () => {
+    // Same digest queries as above, with the entity term absent.
+    expect(
+      isRelevantToQuery(
+        result('Fire department buys new ladder', 'Santa Rosa approves the purchase.'),
+        extractSignificantTerms('Zenoti spa salon med-spa software funding OR acquisition OR launch'),
+      ),
+    ).toBe(false);
+    expect(
+      isRelevantToQuery(
+        result('Maintenance backlog grows at city facilities', 'Management weighs software options.'),
+        extractSignificantTerms('UpKeep CMMS maintenance management software company'),
+      ),
+    ).toBe(false);
+  });
+
   it('accepts an article that matches several query terms', () => {
     expect(
       isRelevantToQuery(
