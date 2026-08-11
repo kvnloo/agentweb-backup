@@ -32,6 +32,11 @@
  *   npx ts-node src/scripts/backfill-eng923-attribution-repos.ts --repo=lp-free-ai-seo-geo-audit-37343865 --apply  # write, one target
  *   npx ts-node src/scripts/backfill-eng923-attribution-repos.ts --apply               # write, BOTH targets
  *
+ * `--repo=` is fail-closed (see resolveTargets): once passed, it must be nonempty and match
+ * EXACTLY ONE target's "owner/name" string, in both dry-run and --apply, or the script exits
+ * non-zero with an error instead of silently matching zero/multiple targets. Omitting --repo
+ * entirely is the only way to target both — that's intentional, not a filter defaulting open.
+ *
  * Per this repo's CLAUDE.md, this is a production-data-repair backfill — requires Harsha's
  * sign-off before merge, independent of who owns ENG-885/ENG-923 in Linear. Use --repo= to make
  * the first real write against RankAI alone, observable and reviewable, before ever running
@@ -72,6 +77,51 @@ export const TARGETS: BackfillTarget[] = [
     mode: "narrow",
   },
 ];
+
+/**
+ * Resolve which TARGETS a --repo= filter selects — fails closed instead of the bug Greptile
+ * flagged on PR #2333: `REPO_FILTER ? TARGETS.filter(...) : TARGETS` treated `--repo=` (empty
+ * string) as falsy and silently ran ALL targets, and a substring filter that happened to match
+ * more than one hardcoded repo (e.g. `--repo=AgentWebPro`, which both targets' "owner/name"
+ * strings contain) silently ran against both — an ostensibly scoped command modifying every
+ * production repo it was meant to exclude. A typo that matched zero targets used to exit 0
+ * having done nothing, indistinguishable from a successful no-op run.
+ *
+ * When `--repo=` is not passed at all, both targets run — that's the intentional, documented
+ * "--apply with no --repo = both targets" flow (see this file's header comment) and is left
+ * untouched. The moment a filter IS provided, it must be nonempty and resolve to exactly one
+ * target or this throws — in both dry-run and --apply, so a bad filter is never silently
+ * "previewed" as fine in dry-run and then misbehaves for real under --apply.
+ */
+export function resolveTargets(
+  repoFilterProvided: boolean,
+  repoFilter: string | undefined,
+  targets: BackfillTarget[] = TARGETS
+): BackfillTarget[] {
+  if (!repoFilterProvided) {
+    return targets;
+  }
+  if (!repoFilter) {
+    throw new Error(
+      `--repo= was passed with an empty value. Provide a nonempty substring that resolves to ` +
+        `exactly one target repo (${targets.map((t) => t.repo).join(", ")}).`
+    );
+  }
+  const matched = targets.filter((t) => t.repo.includes(repoFilter));
+  if (matched.length === 0) {
+    throw new Error(
+      `--repo=${repoFilter} matched no target repo. Known targets: ${targets.map((t) => t.repo).join(", ")}.`
+    );
+  }
+  if (matched.length > 1) {
+    throw new Error(
+      `--repo=${repoFilter} matched ${matched.length} target repos (${matched
+        .map((t) => t.repo)
+        .join(", ")}) — refusing to run ambiguously. Pass a filter that resolves to exactly one target.`
+    );
+  }
+  return matched;
+}
 
 function parseRepoFullName(githubRepoUrl: string): string | null {
   const m = githubRepoUrl.match(/github\.com\/([^/]+)\/([^/]+)/);
@@ -145,15 +195,23 @@ export async function runBackfillForTarget(
 }
 
 const APPLY = process.argv.includes("--apply");
-const REPO_FILTER = process.argv.find((a) => a.startsWith("--repo="))?.slice("--repo=".length);
+const REPO_FILTER_ARG = process.argv.find((a) => a.startsWith("--repo="));
+const REPO_FILTER_PROVIDED = REPO_FILTER_ARG !== undefined;
+const REPO_FILTER = REPO_FILTER_ARG?.slice("--repo=".length);
 
 async function main() {
   console.log("ENG-923 attribution-capture backfill", {
     mode: APPLY ? "APPLY (will write)" : "DRY RUN (no writes — pass --apply to write)",
-    repoFilter: REPO_FILTER ?? "(none — all targets)",
+    repoFilter: REPO_FILTER_PROVIDED ? REPO_FILTER : "(none — all targets)",
   });
 
-  const targets = REPO_FILTER ? TARGETS.filter((t) => t.repo.includes(REPO_FILTER)) : TARGETS;
+  let targets: BackfillTarget[];
+  try {
+    targets = resolveTargets(REPO_FILTER_PROVIDED, REPO_FILTER);
+  } catch (err) {
+    console.error(`Fatal: ${(err as Error).message}`);
+    process.exit(1);
+  }
   console.log(`\n${targets.length} target(s): ${targets.map((t) => `${t.client} (${t.mode})`).join(", ")}\n`);
 
   let synced = 0;
