@@ -44,6 +44,42 @@ describe('buildExecutedActionsFallback — outcome bucketing (ENG-1054)', () => 
     expect(text).toContain('were never executed');
   });
 
+  // Only a THROWN failure reaches the dispatcher's error path (toolDispatch.ts:440).
+  // A handler that REPORTS failure by returning `{success:false}` is pushed through
+  // the success path (toolDispatch.ts:849) with no `error` key — so without this it
+  // would be recapped as applied, on the one message the user has left to trust.
+  it('never claims a returned {success:false} call was applied', () => {
+    const text = buildExecutedActionsFallback([
+      { name: 'call_meta_marketing_api', result: { success: false, error: 'User request limit reached' } },
+    ]);
+
+    expect(text).toContain('- call_meta_marketing_api — 1 failed');
+    expect(text).not.toContain('succeeded');
+    expect(text).not.toContain('already been applied');
+  });
+
+  it('splits succeeded from returned-failure calls of the same tool', () => {
+    const text = buildExecutedActionsFallback([
+      { name: 'call_meta_marketing_api', result: { success: true } },
+      { name: 'call_meta_marketing_api', result: { success: false } },
+    ]);
+
+    expect(text).toContain('- call_meta_marketing_api — 1 succeeded, 1 failed');
+  });
+
+  // The mirror-image error: most results carry no `success` key at all, and
+  // treating a missing flag as failure would under-report actions that really ran.
+  it('still counts a result with no success flag as succeeded', () => {
+    const text = buildExecutedActionsFallback([
+      { name: 'call_meta_marketing_api', result: {} },
+      { name: 'list_knowledge_base_files', result: { knowledge_bases: [] } },
+    ]);
+
+    expect(text).toContain('- call_meta_marketing_api — 1 succeeded');
+    expect(text).toContain('- list_knowledge_base_files — 1 succeeded');
+    expect(text).not.toContain('failed');
+  });
+
   it('does not double-count a duplicate-suppressed call', () => {
     const text = buildExecutedActionsFallback([
       { name: 'meta_ads_manage', result: { ok: true } },

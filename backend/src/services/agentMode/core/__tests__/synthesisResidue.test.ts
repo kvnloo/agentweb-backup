@@ -38,6 +38,32 @@ describe('isUnusableSynthesis', () => {
     expect(isUnusableSynthesis('I paused both campaigns. Here is the JSON I used: {"status":"PAUSED"}')).toBe(false);
   });
 
+  // Message 163 of the production session: the model transcribed the preceding
+  // tool result back as its own answer — 20,081 chars opening with the loop's own
+  // degraded-history marker. Too long for the punctuation rule, same failure.
+  it('flags a reply that echoes the loop\'s degraded tool history', () => {
+    const echo =
+      '[Result of call_meta_marketing_api: {"success":true,"message":"Found 25 ad(s)","ads":['
+      + '{"id":"120248669405960585","name":"P3 A1"}'.repeat(200)
+      + '\n\n[Content truncated — full response in S3]}}';
+    expect(echo.length).toBeGreaterThan(1000);
+    expect(isUnusableSynthesis(echo)).toBe(true);
+  });
+
+  it('flags a reply that opens with the degraded tool-call marker', () => {
+    expect(isUnusableSynthesis('[Previously called call_meta_marketing_api({"action":"UPDATE"})]')).toBe(true);
+  });
+
+  it('does NOT flag prose that merely mentions a tool result', () => {
+    for (const real of [
+      'The result of call_meta_marketing_api was a success — both campaigns are paused.',
+      'Here is what I found. [Result data is summarized below.]',
+      '[Note] I previously called the Meta API to pause both campaigns.',
+    ]) {
+      expect(isUnusableSynthesis(real)).toBe(false);
+    }
+  });
+
   it('does NOT flag a large brace blob (only short remnants are residue)', () => {
     expect(isUnusableSynthesis('}'.repeat(200))).toBe(false);
   });
