@@ -30,6 +30,10 @@ const FULL = {
   brandGuidelines: { editors: [] },
   marketingStrategy: { editors: [] },
 };
+const withRevision = <T extends Record<string, unknown>>(settings: T) => ({
+  ...settings,
+  _revision: null,
+});
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -40,7 +44,9 @@ beforeEach(() => {
 
 test("owner can save settings including analytics", async () => {
   const res = await request(app).patch("/api/org-share-settings/")
-    .set("x-uid", "owner-1").send({ shareSettings: { ...FULL, analytics: { enabled: true, editors: ["m-1"] } } });
+    .set("x-uid", "owner-1").send({
+      shareSettings: withRevision({ ...FULL, analytics: { enabled: true, editors: ["m-1"] } }),
+    });
   expect(res.status).toBe(200);
   expect(mockOrgDb.updateShareSettings).toHaveBeenCalled();
 });
@@ -48,7 +54,7 @@ test("owner can save settings including analytics", async () => {
 test("body omitting analytics is back-filled from existing org settings (old client)", async () => {
   const { analytics, ...withoutAnalytics } = FULL;
   const res = await request(app).patch("/api/org-share-settings/")
-    .set("x-uid", "owner-1").send({ shareSettings: withoutAnalytics });
+    .set("x-uid", "owner-1").send({ shareSettings: { ...withoutAnalytics, _revision: null } });
   expect(res.status).toBe(200);
   const saved = mockOrgDb.updateShareSettings.mock.calls[0][1];
   expect(saved.analytics).toEqual({ enabled: true, editors: [] });
@@ -57,13 +63,15 @@ test("body omitting analytics is back-filled from existing org settings (old cli
 test("non-owner editor cannot change settings → 403", async () => {
   mockUserDb.getUserById.mockResolvedValue({ userId: "m-1", orgId: "org-1", orgRole: "member" } as any);
   const res = await request(app).patch("/api/org-share-settings/")
-    .set("x-uid", "m-1").send({ shareSettings: FULL });
+    .set("x-uid", "m-1").send({ shareSettings: withRevision(FULL) });
   expect(res.status).toBe(403);
 });
 
 test("analytics editor not in org → 400", async () => {
   const res = await request(app).patch("/api/org-share-settings/")
     .set("x-uid", "owner-1")
-    .send({ shareSettings: { ...FULL, analytics: { enabled: true, editors: ["stranger"] } } });
+    .send({
+      shareSettings: withRevision({ ...FULL, analytics: { enabled: true, editors: ["stranger"] } }),
+    });
   expect(res.status).toBe(400);
 });

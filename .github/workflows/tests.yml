@@ -32,6 +32,9 @@ jobs:
       partner: ${{ steps.filter.outputs.partner }}
       workflows: ${{ steps.filter.outputs.workflows }}
       ebconfig: ${{ steps.filter.outputs.ebconfig }}
+      # ENG-1041: "should this be tested" and "should this reach staging" are
+      # different questions and were one boolean. See the filter step below.
+      backend_deployable: ${{ steps.filter_deploy.outputs.backend_src == 'true' || steps.filter_deploy.outputs.deploy_ci == 'true' }}
     steps:
       # ENG-729: shallow. This workflow only ever runs on `pull_request`, and on
       # that event dorny/paths-filter reads the changed-file list from the
@@ -87,6 +90,60 @@ jobs:
               - '**/.platform/**'
               - '.github/scripts/eb-config-conflict.sh'
               - '.github/workflows/tests.yml'
+
+      # ENG-1041: the DEPLOY decision, which is not the same question as the
+      # test decision above.
+      #
+      # `backend` answers "should this diff be tested" and is deliberately
+      # broad. `backend-staging-deploy` also read it, so a PR touching only
+      # `backend/src/**/__tests__/**` ran the full build → package → S3 → EB
+      # deploy. The runner minutes (569 billable over 99 executions) are the
+      # cheap half. The expensive half is that this job holds
+      # `concurrency: backend-staging-deploy` — a group keyed on nothing but its
+      # own name, so unlike every other job here it is one GLOBAL lane, and with
+      # `cancel-in-progress: false` an occupant is never preempted. A test-only
+      # PR took that single slot and every real backend PR in the repo queued
+      # behind it.
+      #
+      # WHY THIS IS A SEPARATE STEP and not two more patterns in the filter
+      # above: dorny/paths-filter compiles EACH pattern into its own picomatch
+      # matcher and OR-combines them (`patterns.some(...)`, quantifier defaults
+      # to `some`). A `!`-negated pattern there is therefore not an exclusion —
+      # picomatch returns true for every path OUTSIDE the named one, so
+      # `'backend/**'` + `'!backend/**/__tests__/**'` matches README.md and the
+      # filter is permanently true. The narrowing would read correctly and
+      # silently become a widening that deploys staging on every PR in the repo.
+      # `predicate-quantifier: 'every'` is what makes the negations mean
+      # exclusion, and it is per-step, which is why the broad filter above
+      # cannot host them. Pinned by staging-deploy-gate.test.sh, which fails on
+      # any negated pattern that is not under an `every` step.
+      - name: Paths filter (deployable backend)
+        id: filter_deploy
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # EVERY pattern must match, so the `!` lines below are exclusions.
+          predicate-quantifier: 'every'
+          filters: |
+            backend_src:
+              - 'backend/**'
+              # All 23 test directories are `__tests__`, nested throughout the
+              # tree (backend/src/__tests__, backend/src/services/__tests__,
+              # backend/src/services/agentMode/core/__tests__, …) — excluding
+              # only backend/src/__tests__ would miss most of them. The
+              # *.test.ts globs match nothing today (there are zero colocated
+              # test files); they keep the rule true if that convention changes.
+              - '!backend/**/__tests__/**'
+              - '!backend/**/*.test.ts'
+              - '!backend/**/*.test.js'
+            # ENG-743, carried forward: a change to the deploy path must be
+            # exercised by the deploy path on its own PR, or the next
+            # backend-staging-deploy fix ships unexercised and the first thing
+            # to exercise it is somebody else's backend PR. One brace pattern
+            # rather than two entries because under `every` a second entry would
+            # require BOTH files to change.
+            deploy_ci:
+              - '.github/{workflows/tests.yml,scripts/eb-deploy.sh}'
 
   # Job A: heavy agentMode files (~150 files, ~half the test time)
   backend-tests-a:
@@ -155,8 +212,12 @@ jobs:
       # ts-jest is transpile-only and reports no type errors at all. This step
       # is therefore the ONLY thing type-checking the backend on a PR; deleting
       # it (rather than narrowing it) would have silently removed that gate.
-      # `npm run typecheck` is `tsc --noEmit` over the same tsconfig.json as
-      # `npm run build`, so the diagnostics are identical — only the emit goes.
+      # `npm run typecheck` is `tsc --noEmit` over `tsconfig.json`, which spans
+      # the whole `src/` tree including `__tests__`. ENG-1059 pointed the deploy
+      # build at `tsconfig.build.json` (same options, tests excluded) so compiled
+      # tests stop shipping to Elastic Beanstalk — which makes this step a strict
+      # SUPERSET of `npm run build`'s diagnostics, never a subset. The test files
+      # are type-checked here and nowhere else, so this stays over tsconfig.json.
       - name: Type-check
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run typecheck --if-present
@@ -501,7 +562,7 @@ jobs:
     if: >-
       github.event.pull_request.draft == false
       && github.event.pull_request.user.login != 'dependabot[bot]'
-      && needs.detect-changes.outputs.backend == 'true'
+      && needs.detect-changes.outputs.backend_deployable == 'true'
       && needs.backend-tests-a.result == 'success'
       && needs.backend-tests-b.result == 'success'
       && needs.greptile-review.result == 'success'

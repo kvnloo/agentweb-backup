@@ -186,7 +186,14 @@ describe('AgentModeService - updateEmailDraftForLead', () => {
       expect(result.success).toBe(true);
       expect(crmDb.getLeadEngagements).toHaveBeenCalledWith(listId, leadId, userId);
       expect(mockReadBrandGuidelines).toHaveBeenCalledWith(userId);
-      expect(mockReadMarketStrategy).toHaveBeenCalledWith(userId);
+      // ENG-945: this prompt embeds formattedContent wholesale, so it must ask
+      // for the pre-ENG-945 coverage (40 competitors in full) and must NOT be
+      // given the tool-result paging instructions — there is no tool to call
+      // here, and offset chatter could leak into customer-facing copy.
+      expect(mockReadMarketStrategy).toHaveBeenCalledWith(
+        userId,
+        expect.objectContaining({ minCompetitorsInFull: 40, pagingHints: false }),
+      );
       // list.userId === userId here (same user), so listOwnerId === userId
       expect(mockGetSenderForLead).toHaveBeenCalledWith(userId, undefined, undefined, userId);
       expect(crmDb.updateLead).toHaveBeenCalled();

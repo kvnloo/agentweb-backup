@@ -228,16 +228,29 @@ router.patch("/orgs/:orgId/analytics-sharing", async (req, res) => {
     if (typeof enabled !== "boolean") {
       return res.status(400).json({ message: "Body field 'enabled' must be a boolean" });
     }
-    const org = await orgDb.getOrgById(orgId);
-    if (!org) {
-      return res.status(404).json({ message: "Organization not found" });
+    // Guarded read-modify-write with retry: an overlapping share-settings
+    // writer fails the conditional write and we re-apply the toggle on top of
+    // the fresh document instead of clobbering its changes.
+    const MAX_ATTEMPTS = 5;
+    for (let attempt = 0; ; attempt++) {
+      const org = await orgDb.getOrgById(orgId);
+      if (!org) {
+        return res.status(404).json({ message: "Organization not found" });
+      }
+      const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
+      const shareSettings = {
+        ...(org.shareSettings ?? {}),
+        analytics: { enabled, editors: existing.editors ?? [] },
+      };
+      try {
+        await orgDb.updateShareSettings(orgId, shareSettings as any, org.updatedAt);
+        break;
+      } catch (writeError: any) {
+        if (writeError?.code !== "ConditionalCheckFailedException" || attempt >= MAX_ATTEMPTS - 1) {
+          throw writeError;
+        }
+      }
     }
-    const existing = org.shareSettings?.analytics ?? { enabled: false, editors: [] };
-    const shareSettings = {
-      ...(org.shareSettings ?? {}),
-      analytics: { enabled, editors: existing.editors ?? [] },
-    };
-    await orgDb.updateShareSettings(orgId, shareSettings as any);
     return res.json({ orgId, analyticsSharingEnabled: enabled });
   } catch (error: any) {
     console.error("Error updating org analytics-sharing:", error.message);
@@ -1249,15 +1262,24 @@ router.put("/users/:userId/email-sender", async (req, res) => {
 router.get("/slack/channel-info", async (req, res) => {
   try {
     const { channelId } = req.query;
-    if (!channelId || typeof channelId !== "string") {
+    if (typeof channelId !== "string") {
+      return res.status(400).json({ message: "channelId query param required" });
+    }
+    const configuredChannelId = channelId.trim();
+    if (!configuredChannelId) {
       return res.status(400).json({ message: "channelId query param required" });
     }
     const { getSlackChannelInfo } = await import("../services/slackService");
-    const info = await getSlackChannelInfo(channelId.trim());
+    const info = await getSlackChannelInfo(configuredChannelId);
     if (!info) {
-      return res.status(404).json({ message: "Channel not found or bot not a member" });
+      return res.json({
+        channelId: configuredChannelId,
+        displayName: configuredChannelId,
+        resolved: false,
+        message: "Channel not found or bot not a member",
+      });
     }
-    res.json(info);
+    res.json({ ...info, channelId: configuredChannelId, resolved: true });
   } catch (error: any) {
     console.error("Error fetching Slack channel info:", error);
     res.status(500).json({ message: "Error fetching channel info", details: error.message });
