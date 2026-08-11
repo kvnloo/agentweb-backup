@@ -103,10 +103,24 @@ const ADMIN_SKILL_TOOL_NAMES = ['manage_linear_governance_label', 'manage_predef
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
 const MAX_TOOL_CONTENT_SIZE = 300_000;
 
+// Floor above which trimToolMessagesForContext compresses an OLD tool result down to a
+// 200-char preview (per-tool allowances in LARGE_TOOL_RESULT_LIMIT may raise it, never lower it).
+export const CONTEXT_TRIM_TOOL_CONTENT_LIMIT = 8_000;
+
 // Threshold above which a tool response is saved in full to S3 so the LLM can search it later.
-// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed 8KB context-trim limit and
+// Large API responses (e.g. Meta ad creatives with 25+ objects) exceed the context-trim limit and
 // get compressed to a 200-char preview. Storing them in S3 lets the LLM call search_tool_response
 // to retrieve specific fields from the original payload without needing the full text in context.
+//
+// ENG-940: this MUST stay at (or below) the context-trim floor. It used to be 10_000 while the
+// trim floor was 8_000, which opened a dead zone: a response of 8,000–10,000 chars was big enough
+// to be compressed to a 200-char preview on the next turn, yet too small to be offloaded — so the
+// payload was destroyed with no S3 key to recover it. A Daily PR Digest run lost its entire
+// get_pr_digest payload (~8,981 chars) that way. Note the actual harm, since the ticket reports
+// it backwards: the model had ALREADY summarized the payload correctly while it was readable, then
+// saw only the preview a few turns later, concluded its own accurate summary must have been
+// invented, deleted the correct memory and reported the digest as unproducible. Losing the key
+// does not just hide data — it makes a run repudiate correct work it has already done.
 
 // extractToolContent now lives in ../utils/extractToolContent (pure, monolith-free)
 // so the tool-output contract validator and the toolDispatch unit suite can wire
@@ -114,6 +128,7 @@ const MAX_TOOL_CONTENT_SIZE = 300_000;
 // existing `from '../services/agentModeService'` importers are unaffected.
 export { extractToolContent } from '../utils/extractToolContent';
 import { extractToolContent } from '../utils/extractToolContent';
+import { extractToolResponseHeader } from '../utils/toolResponseS3Ref';
 
 /**
  * Normalize a video timecode to a numeric number of seconds.
@@ -157,7 +172,7 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 // re-exported so any importer of the old path keeps working.
 export { normalizeMetaCampaignIds };
 
-const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
+export const TOOL_RESPONSE_S3_THRESHOLD = CONTEXT_TRIM_TOOL_CONTENT_LIMIT;
 
 // Max output tokens for agent-mode LLM turns. Must be large enough to hold a
 // single big tool-call argument (e.g. create_html_file's content_draft, which
@@ -5190,7 +5205,8 @@ export class AgentModeService {
     'send_email_from_sender',
 
     // S3 overflow retrieval — always available so the LLM can read large tool
-    // responses that were offloaded to S3 by the 10KB overflow mechanism.
+    // responses that were offloaded to S3 by the TOOL_RESPONSE_S3_THRESHOLD
+    // overflow mechanism (pinned to CONTEXT_TRIM_TOOL_CONTENT_LIMIT).
     // Without these, the LLM sees the "[Full response stored at S3 key: ...]"
     // header but has no tool to retrieve the full content.
     'search_tool_response',
@@ -10411,6 +10427,13 @@ export class AgentModeService {
       if (result.errorCount > 0) {
         messageParts.push(`${result.errorCount} lead(s) failed`);
       }
+      // ENG-1002 (follow-up): say so when rows were refused as anonymized
+      // placeholders, so the agent cannot report a clean import that silently
+      // wrote fewer records than the caller handed over.
+      const anonymizedSkipped = result.anonymizedSkipped || 0;
+      if (anonymizedSkipped > 0) {
+        messageParts.push(`${anonymizedSkipped} out-of-network LinkedIn placeholder(s) skipped`);
+      }
 
       return {
         success: result.successCount > 0,
@@ -10421,6 +10444,7 @@ export class AgentModeService {
         newCount: result.newCount || 0,
         mergedCount: result.mergedCount || 0,
         errorCount: result.errorCount,
+        anonymizedSkipped,
         errors: result.errors.length > 0 ? result.errors : undefined
       };
     } catch (error) {
@@ -22607,7 +22631,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     'update_html_file': { fields: ['html_content', 'css_content'], limit: 200 },
   };
 
-  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = 8000): any[] {
+  trimToolMessagesForContext(messages: any[], recentToPreserve: number = 3, maxToolContentLength: number = CONTEXT_TRIM_TOOL_CONTENT_LIMIT): any[] {
     // Single linear scan: collect tool-role indices and map each tool_call_id to
     // the index of its (first) resolving tool message. This map replaces the
     // original per-assistant nested forward scan (O(n^2) per call) with O(1)
@@ -22627,8 +22651,30 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
     if (toolIndices.length <= recentToPreserve) return messages;
 
-    // Most recent N tool results: keep at full size
+    // Most recent N tool results by pure recency. This drives the "old assistant
+    // message" test below ONLY — an assistant whose call was just answered must
+    // keep its arguments intact, and that is a question about recency, not size.
     const preserveSet = new Set(toolIndices.slice(-recentToPreserve));
+
+    // Size at which THIS tool's result would be compressed (per-tool allowances
+    // may raise the default floor, never lower it).
+    const trimLimitFor = (msg: any): number =>
+      AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+
+    // ENG-940: which results the preserve window actually protects. A result at
+    // or below its trim limit is passed through untouched whether or not it is
+    // preserved, so spending a slot on it protects nothing while evicting a
+    // result that the trimmer really would destroy. The reported run died on
+    // exactly that: three 488-char save_memory schema rejections landed after an
+    // 8,981-char get_pr_digest payload and pushed it out of a 3-slot window
+    // inside one logical turn. So the window keeps the N most recent AT-RISK
+    // results. The worst-case context cost is unchanged — it was always up to N
+    // full-size results — this only stops the window being wasted on results
+    // that were never in danger.
+    const atRiskIndices = toolIndices.filter(
+      (i) => typeof messages[i].content === 'string' && messages[i].content.length > trimLimitFor(messages[i]),
+    );
+    const atRiskPreserveSet = new Set(atRiskIndices.slice(-recentToPreserve));
 
     // Track which assistant messages are "old" (none of their tool_calls resolve
     // to a preserved tool result after them). We trim large argument fields on these.
@@ -22658,14 +22704,22 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     const result = messages.map((msg, idx) => {
       if (
         msg.role === 'tool' &&
-        !preserveSet.has(idx) &&
+        !atRiskPreserveSet.has(idx) &&
         typeof msg.content === 'string'
       ) {
-        const limit = AgentModeService.LARGE_TOOL_RESULT_LIMIT[msg.name] || maxToolContentLength;
+        const limit = trimLimitFor(msg);
         if (msg.content.length > limit) {
+          // ENG-940: an offloaded response carries its "[Full response stored at S3 key: …]"
+          // header at the very front — or, when the offload failed, the "could NOT be stored"
+          // notice. Preview the payload separately from that header, otherwise the 200-char
+          // slice spends its whole budget on (and can cut in half) the only thing telling the
+          // model how much of this result it is still allowed to trust.
+          const s3Ref = extractToolResponseHeader(msg.content);
+          const body = s3Ref ? msg.content.slice(s3Ref.length) : msg.content;
           // Summarize to a short preview instead of keeping 8KB
-          const preview = msg.content.slice(0, 200).replace(/\n/g, ' ').trim();
-          return { ...msg, content: `[Tool: ${msg.name} — ${preview}...]` };
+          const preview = body.slice(0, 200).replace(/\n/g, ' ').trim();
+          const compressed = `[Tool: ${msg.name} — ${preview}...]`;
+          return { ...msg, content: s3Ref ? `${s3Ref.trim()}\n${compressed}` : compressed };
         }
       }
 
