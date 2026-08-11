@@ -7082,6 +7082,9 @@ const adminToolNames = [
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
   'get_registration_status',
+  'resolve_landing_page_by_url',
+  'share_landing_page_with_org',
+  'get_landing_page_effective_view',
 ];
 
 for (const toolName of bridgedToolNames) {
