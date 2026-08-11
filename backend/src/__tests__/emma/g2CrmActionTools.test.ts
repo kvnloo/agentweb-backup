@@ -36,8 +36,10 @@ const mockUpdateLead = jest.fn();
 const mockGetLeadListsByUserId = jest.fn();
 const mockGetLeadsByListId = jest.fn();
 
+const mockGetOrgById = jest.fn();
 jest.mock('../../services/db', () => ({
   userDb: { getUserById: jest.fn() },
+  orgDb: { getOrgById: (...args: any[]) => mockGetOrgById(...args) },
   accountMemoryDb: {
     getMemories: jest.fn().mockResolvedValue([]),
     putMemory: jest.fn().mockResolvedValue(undefined),
@@ -107,6 +109,9 @@ jest.mock('../../mcp/server/registry', () => ({
 jest.mock('../../mcp/server/apiTools', () => ({ adminToolNames: [] }));
 
 import { emmaToolRegistry } from '../../emma/registry';
+import { userDb } from '../../services/db';
+
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 
 const USER = 'user_1';
 const LIST = 'list_1';
@@ -182,6 +187,76 @@ describe('G2 — assign_lead tool', () => {
       { userId: USER }
     );
     expect(result.success).toBe(true);
+  });
+
+  // ENG-1049: resolveLeadForAction previously did a strict list.userId !==
+  // userId check — over-blocking the org owner/editors — instead of the
+  // shared canDestructiveCrmList guard used by every other CRM write surface.
+  describe('org-share access (ENG-1049)', () => {
+    const OWNER = 'owner_1';
+    const ORG_MEMBER = 'org_member_1';
+
+    function setSameOrgUsers() {
+      mockUserDb.getUserById.mockImplementation((id: string) =>
+        Promise.resolve(id === OWNER ? ({ userId: OWNER, orgId: 'org-A' } as any) : ({ userId: id, orgId: 'org-A' } as any))
+      );
+    }
+    function orgWithCrm(overrides: Record<string, any> = {}) {
+      return {
+        orgId: 'org-A',
+        ownerUserId: 'org-owner-id',
+        shareSettings: { crm: { enabled: true, editors: [] as string[] } },
+        ...overrides,
+      };
+    }
+
+    beforeEach(() => {
+      mockGetLeadListById.mockResolvedValue({ listId: LIST, userId: OWNER, name: 'Pipeline' });
+      mockGetLeadById.mockResolvedValue({ leadId: 'l1', email: 'a@b.com', accountOwnerUserId: null });
+      mockUpdateLead.mockResolvedValue(undefined);
+    });
+
+    it('denies a same-org member who is not the owner and not a CRM editor', async () => {
+      setSameOrgUsers();
+      mockGetOrgById.mockResolvedValue(orgWithCrm());
+
+      const tool = await getTool('assign_lead');
+      const result = await tool.execute(
+        { list_id: LIST, lead_id: 'l1', account_owner_user_id: 'user_2' },
+        { userId: ORG_MEMBER }
+      );
+
+      expect(result.error).toMatch(/CRM editor/i);
+      expect(mockUpdateLead).not.toHaveBeenCalled();
+    });
+
+    it('allows a listed crm.editor to act on a list they do not own', async () => {
+      setSameOrgUsers();
+      mockGetOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: [ORG_MEMBER] } } }));
+
+      const tool = await getTool('assign_lead');
+      const result = await tool.execute(
+        { list_id: LIST, lead_id: 'l1', account_owner_user_id: 'user_2' },
+        { userId: ORG_MEMBER }
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockUpdateLead).toHaveBeenCalledWith(LIST, 'l1', { accountOwnerUserId: 'user_2' });
+    });
+
+    it('allows the org owner to act on a list they do not personally own', async () => {
+      setSameOrgUsers();
+      mockGetOrgById.mockResolvedValue(orgWithCrm({ ownerUserId: ORG_MEMBER }));
+
+      const tool = await getTool('assign_lead');
+      const result = await tool.execute(
+        { list_id: LIST, lead_id: 'l1', account_owner_user_id: 'user_2' },
+        { userId: ORG_MEMBER }
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockUpdateLead).toHaveBeenCalledWith(LIST, 'l1', { accountOwnerUserId: 'user_2' });
+    });
   });
 });
 
