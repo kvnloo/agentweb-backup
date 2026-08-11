@@ -619,7 +619,22 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
           ? (await userDb.getUserByEmailConsistent(indexed.email)) ?? indexed
           : indexed;
       }
-      const ownerAttachments: any[] = ownerRecord?.brandGuidelines?.attachments || [];
+      // The resolver just read this owner's brand to answer the request, so a
+      // miss on this second lookup means the GSI briefly stopped returning the
+      // row, not that the owner is gone. Spreading `ownerRecord.brandGuidelines`
+      // below would throw on undefined and surface as a blanket 500 — after
+      // which nothing at all is deleted. Abort explicitly instead, while the S3
+      // object and both records are still untouched, and say it is retryable.
+      if (!ownerRecord?.brandGuidelines) {
+        console.error(
+          `[BRAND] Owner ${fallbackOwnerUserId} of org ${user.orgId} resolved a brand for the read but no record for the write — aborting the delete`
+        );
+        return res.status(409).json({
+          error: "Brand guidelines are being updated. Please refresh and try again.",
+        });
+      }
+
+      const ownerAttachments: any[] = ownerRecord.brandGuidelines.attachments || [];
       const prunedOwnerAttachments = ownerAttachments.filter((attachment: any) =>
         isValidKey ? attachment.key !== key : attachment.url !== urlFallback
       );
