@@ -58,6 +58,19 @@ function mockLLM(response: string) {
   return { generateRaw };
 }
 
+// ENG-1111: the company_firmographic waterfall step always runs a company_name
+// confirmation call through generateJSONContent (enrichmentV3RealDeps.ts's non-web-tier
+// extraction branch) after the Unipile lookup, regardless of what this file's tests are
+// actually exercising -- mockLLM() above stubs the wrong method (generateRaw) for that
+// call, so without this it silently fell through to the real, unmocked LLM client.
+// Resolving to {} matches an already-exercised "LLM found nothing" path (see "returns
+// company_name from work_experience when no company_id").
+function mockLLMNoData() {
+  const generateJSONContent = jest.fn().mockResolvedValue({});
+  jest.spyOn(llmServiceModule, 'createLLMService').mockReturnValue({ generateJSONContent } as any);
+  return { generateJSONContent };
+}
+
 jest.mock('../services/linkedInOutreachService', () => ({
   linkedInOutreachService: {
     resolveAccountIdForEnrichment: jest.fn(),
@@ -448,6 +461,7 @@ describe('findUnipilePerson — Case B (no linkedin → searchPeople + LLM)', ()
 describe('findUnipileCompany — Tier 5 (company group, after web)', () => {
   it('fetches profile → company_id → getCompany', async () => {
     mockApolloDisabled();
+    mockLLMNoData();
     const li = await getLinkedInOutreachServiceMock();
     (li.resolveAccountIdForEnrichment as jest.Mock).mockResolvedValue('acc-1');
     mockProfileService({ found: true, rawData: PERSON_PROFILE_RAW });
@@ -620,6 +634,7 @@ describe('findUnipilePerson — 429 rotation', () => {
 describe('findUnipileCompany — 429 rotation', () => {
   it('rotates to next account on 429 and succeeds on second attempt', async () => {
     mockApolloDisabled();
+    mockLLMNoData();
     const li = await getLinkedInOutreachServiceMock();
     (li.resolveAccountIdForEnrichment as jest.Mock)
       .mockResolvedValueOnce('acc-1')
