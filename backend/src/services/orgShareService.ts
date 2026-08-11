@@ -3,7 +3,7 @@ import type { OrgRole } from "./orgAuthz";
 import { can } from "./orgAuthz";
 
 export type ToggleableFeature =
-  | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills" | "analytics";
+  | "knowledgeBase" | "htmlTemplates" | "landingPages" | "workPlans" | "skills" | "analytics" | "crm";
 export type AlwaysOnFeature = "brandGuidelines" | "marketingStrategy";
 export type Feature = ToggleableFeature | AlwaysOnFeature;
 
@@ -51,6 +51,7 @@ const DEFAULT_ENABLED: Readonly<Record<ToggleableFeature, boolean>> = {
   workPlans: true,
   skills: true,
   analytics: true,
+  crm: true,
 };
 
 // The effective `enabled` default for a feature when no explicit value exists.
@@ -68,6 +69,7 @@ export function defaultShareSettings(): {
   workPlans: { enabled: boolean; editors: string[] };
   skills: { enabled: boolean; editors: string[] };
   analytics: { enabled: boolean; editors: string[] };
+  crm: { enabled: boolean; editors: string[] };
   brandGuidelines: { editors: string[] };
   marketingStrategy: { editors: string[] };
 } {
@@ -78,6 +80,7 @@ export function defaultShareSettings(): {
     workPlans:         { enabled: DEFAULT_ENABLED.workPlans,     editors: [] },
     skills:            { enabled: DEFAULT_ENABLED.skills,        editors: [] },
     analytics:         { enabled: DEFAULT_ENABLED.analytics,     editors: [] },
+    crm:               { enabled: DEFAULT_ENABLED.crm,           editors: [] },
     brandGuidelines:   { editors: [] },
     marketingStrategy: { editors: [] },
   };
@@ -205,7 +208,7 @@ export const ORG_ITEMS_CAP     = 2000;
 export const RESPONSE_CAP      = 1000;
 
 export const TOGGLEABLE_FEATURES: ReadonlyArray<ToggleableFeature> = [
-  "knowledgeBase", "htmlTemplates", "landingPages", "workPlans", "skills", "analytics",
+  "knowledgeBase", "htmlTemplates", "landingPages", "workPlans", "skills", "analytics", "crm",
 ];
 export const ALWAYS_ON_FEATURES: ReadonlyArray<AlwaysOnFeature> = [
   "brandGuidelines", "marketingStrategy",

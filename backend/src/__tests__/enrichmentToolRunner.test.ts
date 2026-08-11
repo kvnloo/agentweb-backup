@@ -13,6 +13,8 @@ jest.mock('../services/enrichmentV3RealDeps', () => ({
 }));
 jest.mock('../services/db', () => ({
   crmDb: { getLeadsByListId: jest.fn(), getLeadListById: jest.fn() },
+  userDb: { getUserById: jest.fn() },
+  orgDb: { getOrgById: jest.fn() },
 }));
 
 import { processEnrichmentConfig } from '../services/enrichmentConfigService';
@@ -37,8 +39,9 @@ const PROCESSED_CONFIG = {
 beforeEach(() => {
   jest.clearAllMocks();
   (processEnrichmentConfig as jest.Mock).mockResolvedValue({ config: PROCESSED_CONFIG, warnings: [] });
-  // Default: list has no existing custom fields (normalization is a no-op for existing tests)
-  (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ fieldNames: [] });
+  // Default: list owned by the caller (ENG-1049 access check short-circuits on
+  // this), no existing custom fields (normalization is a no-op for existing tests).
+  (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ userId: 'user-1', fieldNames: [] });
 });
 
 describe('runEmmaEnrichment', () => {
@@ -244,7 +247,7 @@ describe('runEmmaEnrichment', () => {
       durationMs: 100,
     });
     // List has no existing custom fields — normalization applies standard synonym only
-    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ fieldNames: [] });
+    (crmDb.getLeadListById as jest.Mock).mockResolvedValue({ userId: 'user-1', fieldNames: [] });
 
     const summary = await runEmmaEnrichment({
       listId: 'list-1',
@@ -263,29 +266,23 @@ describe('runEmmaEnrichment', () => {
     ]);
   });
 
-  it('proceeds with original output_fields when getLeadListById throws (fail-soft)', async () => {
+  // ENG-1049: getLeadListById now backs the up-front access check too, which
+  // must fail closed — a lookup failure can no longer silently fall through to
+  // "proceed with unnormalized fields" the way the old cosmetic-only
+  // normalization lookup did (unauthorized enrichment must never slip through
+  // just because the DB blipped).
+  it('fails closed when getLeadListById throws instead of silently proceeding', async () => {
     (crmDb.getLeadListById as jest.Mock).mockRejectedValue(new Error('DynamoDB timeout'));
-    (runEnrichment as jest.Mock).mockResolvedValue({
-      runId: 'run-fallback',
-      processed: 1,
-      failed: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
-      tierFillBreakdown: {},
-      durationMs: 50,
-    });
 
-    const summary = await runEmmaEnrichment({
+    await expect(runEmmaEnrichment({
       listId: 'list-1',
       userId: 'user-1',
       outputFields: [{ name: 'company_name', instruction: 'find the company' }],
       mode: 'enrich',
-    });
+    })).rejects.toThrow(/verify list access/i);
 
-    // Should have called processEnrichmentConfig with the original (unnormalized) field
-    const calledConfig = (processEnrichmentConfig as jest.Mock).mock.calls[0][0].config;
-    expect(calledConfig.fields[0].name).toBe('company_name');
-
-    // No remaps — normalization was skipped
-    expect(summary.fieldRemaps).toBeUndefined();
+    expect(processEnrichmentConfig).not.toHaveBeenCalled();
+    expect(runEnrichment).not.toHaveBeenCalled();
   });
 });
 
@@ -380,6 +377,7 @@ describe('resolveExecuteLeadIds', () => {
 describe('runEmmaEnrichment — listContext propagation', () => {
   it('forwards the list name + description as listContext into the V3 run', async () => {
     (crmDb.getLeadListById as jest.Mock).mockResolvedValue({
+      userId: 'user-1',
       fieldNames: [],
       name: 'YC Poker Night',
       description: 'YC alumni',
@@ -404,26 +402,20 @@ describe('runEmmaEnrichment — listContext propagation', () => {
     );
   });
 
-  it('passes listContext=undefined when the list lookup fails', async () => {
+  // ENG-1049: a failed list lookup now fails the whole call closed (it backs
+  // the access check, not just listContext) rather than degrading to
+  // listContext=undefined while still running the enrichment.
+  it('fails closed when the list lookup fails, rather than running with no listContext', async () => {
     (crmDb.getLeadListById as jest.Mock).mockRejectedValue(new Error('ddb down'));
-    (runEnrichment as jest.Mock).mockResolvedValue({
-      runId: 'run-ctx2',
-      processed: 0,
-      failed: { identityResolutionFailed: 0, apolloFailed: 0, llmOrParseFailed: 0, updateFailed: 0, searchWebFailed: 0 },
-      tierFillBreakdown: {},
-      durationMs: 5,
-    });
-    await runEmmaEnrichment({
+
+    await expect(runEmmaEnrichment({
       listId: 'list-1',
       userId: 'user-1',
       outputFields: [{ name: 'company', instruction: 'find company' }],
       mode: 'enrich',
-    });
-    expect(runEnrichment).toHaveBeenCalledWith(
-      expect.objectContaining({ listContext: undefined }),
-      expect.anything(),
-      expect.anything(),
-    );
+    })).rejects.toThrow(/verify list access/i);
+
+    expect(runEnrichment).not.toHaveBeenCalled();
   });
 });
 
