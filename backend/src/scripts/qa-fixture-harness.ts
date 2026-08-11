@@ -288,7 +288,8 @@ export async function runWithTemporaryAdmin(
   });
   let child: ChildProcessHandle | undefined;
   let cleanupPromise: Promise<void> | undefined;
-  let aborted = false;
+  /** Set by the signal handler; doubles as the abort flag and the signal to kill with. */
+  let abortedWith: QaTerminationSignal | undefined;
   const unsubscribe: Array<() => void> = [];
   const cleanup = (): Promise<void> => {
     cleanupPromise ??= adapters.revokeIfCurrent(grant).then(revoked => {
@@ -302,7 +303,9 @@ export async function runWithTemporaryAdmin(
   try {
     for (const signal of QA_TERMINATION_SIGNALS) {
       unsubscribe.push(adapters.onSignal(signal, async () => {
-        aborted = true;
+        abortedWith = signal;
+        // `child` is undefined while startChild is in flight; the post-spawn
+        // check below is what covers that window.
         child?.terminate(signal);
         await cleanup();
       }));
@@ -316,15 +319,23 @@ export async function runWithTemporaryAdmin(
       grant,
       adapters,
       options.visibilityAttempts ?? DEFAULT_GRANT_VISIBILITY_ATTEMPTS,
-      () => aborted,
+      () => abortedWith !== undefined,
     );
-    if (!visible || aborted) {
+    if (!visible || abortedWith) {
       // Terminated while waiting; the grant is already revoked. Never start the
       // child against a grant that no longer exists.
       return 1;
     }
 
     child = await adapters.startChild(command);
+    if (abortedWith) {
+      // The signal landed while the spawn was in flight: the process exists but
+      // the handler saw `child` as undefined and could only revoke the grant.
+      // Kill it the moment the handle resolves — assignment and this check share
+      // a tick, so no signal can slip between them — otherwise the command
+      // outlives its own termination signal and 403s on every request after.
+      child.terminate(abortedWith);
+    }
     return await child.wait();
   } finally {
     for (const removeListener of unsubscribe) {
