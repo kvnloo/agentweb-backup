@@ -14,7 +14,8 @@
  *   npx ts-node src/scripts/qa-fixture-harness.ts with-admin -- <command...>
  *
  * Configuration is environment/secret injection ONLY (no hardcoded secrets):
- *   preflight:  QA_FIXTURE_BASE_URL, QA_USER_EMAIL, QA_USER_PASSWORD,
+ *   preflight:  QA_FIXTURE_BASE_URL, QA_FIXTURE_PORTAL_ROLE,
+ *               QA_USER_EMAIL, QA_USER_PASSWORD,
  *               QA_TIER_EMAIL, QA_TIER_PASSWORD
  *   with-admin: QA_USERS_TABLE, QA_ADMIN_FIXTURE_EMAIL, QA_ADMIN_FIXTURE_USER_ID
  *               (+ standard AWS credential/region chain)
@@ -38,7 +39,11 @@ export interface QaFixture {
   secretRef: string;
   expectedLoginStatus: number;
   expectedAdminStatus: number;
+  /** Portal this fixture must actually be able to enter for the current QA run. */
+  expectedPortalRole?: QaPortalRole;
 }
+
+export type QaPortalRole = 'partner' | 'customer' | 'contractor';
 
 export interface FixtureCredentials {
   email: string;
@@ -49,14 +54,18 @@ export interface AuthSession {
   status: number;
   userId?: string;
   token?: string;
+  roles?: string[];
+  isAdmin?: boolean;
 }
 
 export interface FixturePreflightReport {
   verdict: 'pass' | 'block';
-  phase?: 'config' | 'credentials' | 'login' | 'privilege';
+  phase?: 'config' | 'credentials' | 'login' | 'role' | 'privilege';
   account?: string;
   status?: number;
   expectedStatus?: number;
+  expectedRole?: QaPortalRole;
+  actualRoles?: string[];
   detail?: string;
   fixtures?: Array<{ account: string; loginStatus: number; adminStatus: number }>;
 }
@@ -145,6 +154,23 @@ export async function preflightFixtures(
         status: session.status,
         expectedStatus: fixture.expectedLoginStatus,
       });
+    }
+
+    if (fixture.expectedPortalRole) {
+      const actualRoles = session.roles ?? [];
+      // Match the product's legacy-role fallback exactly; admins may enter any portal.
+      const effectiveRoles = actualRoles.length > 0 ? actualRoles : ['partner'];
+      const hasPortalAccess =
+        session.isAdmin === true || effectiveRoles.includes(fixture.expectedPortalRole);
+      if (!hasPortalAccess) {
+        blockPreflight(adapters, {
+          verdict: 'block',
+          phase: 'role',
+          account: fixture.account,
+          expectedRole: fixture.expectedPortalRole,
+          actualRoles,
+        });
+      }
     }
 
     const adminStatus = await adapters.checkAdminAccess(baseUrl, session);
@@ -266,8 +292,17 @@ export function createAxiosHttpPort(timeoutMs = 15_000): HttpAuthPort {
         { email: credentials.email, password: credentials.password },
         { timeout: timeoutMs, validateStatus: () => true },
       );
-      const body = response.data as { token?: string; user?: { userId?: string } } | undefined;
-      return { status: response.status, token: body?.token, userId: body?.user?.userId };
+      const body = response.data as {
+        token?: string;
+        user?: { userId?: string; roles?: string[]; isAdmin?: boolean };
+      } | undefined;
+      return {
+        status: response.status,
+        token: body?.token,
+        userId: body?.user?.userId,
+        roles: body?.user?.roles,
+        isAdmin: body?.user?.isAdmin,
+      };
     },
     async checkAdminAccess(baseUrl, session) {
       const response = await axios.get(`${baseUrl}/api/admin/users`, {
@@ -437,6 +472,15 @@ async function runPreflightCommand(
     });
     return 1;
   }
+  const portalRole = env.QA_FIXTURE_PORTAL_ROLE;
+  if (portalRole !== 'partner' && portalRole !== 'customer' && portalRole !== 'contractor') {
+    emit({
+      verdict: 'block',
+      phase: 'config',
+      detail: 'QA_FIXTURE_PORTAL_ROLE must be partner, customer, or contractor',
+    });
+    return 1;
+  }
   const http = overrides.http ?? createAxiosHttpPort();
   const adapters: QaFixturePreflightAdapters = {
     loadCredentials: createEnvCredentialsLoader(env),
@@ -445,7 +489,11 @@ async function runPreflightCommand(
     emit,
   };
   try {
-    await preflightFixtures(baseUrl, DEFAULT_FIXTURES, adapters);
+    const fixtures = DEFAULT_FIXTURES.map(fixture => ({
+      ...fixture,
+      expectedPortalRole: portalRole as QaPortalRole,
+    }));
+    await preflightFixtures(baseUrl, fixtures, adapters);
     return 0;
   } catch (error) {
     if (!(error instanceof QaFixturePreflightError)) {

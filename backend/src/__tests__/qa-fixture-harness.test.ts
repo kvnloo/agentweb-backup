@@ -11,12 +11,14 @@ import {
   TemporaryAdminAdapters,
   DynamoUpdatePort,
   createDynamoTemporaryAdminAdapters,
+  createAxiosHttpPort,
   createEnvCredentialsLoader,
   createProcessChildAdapters,
   preflightFixtures,
   runCli,
   runWithTemporaryAdmin,
 } from '../scripts/qa-fixture-harness';
+import axios from 'axios';
 
 const fixtures: QaFixture[] = [
   {
@@ -40,7 +42,7 @@ function preflightAdapters(): jest.Mocked<QaFixturePreflightAdapters> {
       password: 'injected-secret',
     })),
     authenticate: jest.fn(async (_baseUrl: string, _credentials: FixtureCredentials): Promise<AuthSession> => (
-      { status: 200, userId: 'user-1', token: 'token' }
+      { status: 200, userId: 'user-1', token: 'token', roles: ['customer'] }
     )),
     checkAdminAccess: jest.fn(async (_baseUrl: string, _session: AuthSession) => 403),
     emit: jest.fn(),
@@ -81,6 +83,49 @@ function adminAdapters(exitCode = 0): {
 }
 
 describe('QA fixture preflight', () => {
+  const partnerFixtures = fixtures.map(fixture => ({
+    ...fixture,
+    expectedPortalRole: 'partner',
+  })) as QaFixture[];
+
+  it('blocks a healthy login that lacks the portal role required by the QA run', async () => {
+    const adapters = preflightAdapters();
+
+    await expect(
+      preflightFixtures('https://example.test', partnerFixtures, adapters),
+    ).rejects.toMatchObject({
+      report: {
+        verdict: 'block',
+        phase: 'role',
+        account: 'qa-user',
+        expectedRole: 'partner',
+        actualRoles: ['customer'],
+      },
+    });
+    expect(adapters.checkAdminAccess).not.toHaveBeenCalled();
+  });
+
+  it('blocks when a required customer role is missing from the login response', async () => {
+    const adapters = preflightAdapters();
+    adapters.authenticate.mockResolvedValueOnce({ status: 200, userId: 'user-1', token: 'token' });
+    const customerFixtures = fixtures.map(fixture => ({
+      ...fixture,
+      expectedPortalRole: 'customer',
+    })) as QaFixture[];
+
+    await expect(
+      preflightFixtures('https://example.test', customerFixtures, adapters),
+    ).rejects.toMatchObject({
+      report: {
+        verdict: 'block',
+        phase: 'role',
+        account: 'qa-user',
+        expectedRole: 'customer',
+        actualRoles: [],
+      },
+    });
+  });
+
   it('blocks immediately and names a dead fixture login and status', async () => {
     const adapters = preflightAdapters();
     adapters.authenticate.mockResolvedValueOnce({ status: 403 });
@@ -207,6 +252,7 @@ function cliIo(): CliHarness {
 function healthyEnv(): NodeJS.ProcessEnv {
   return {
     QA_FIXTURE_BASE_URL: 'https://qa.example.test',
+    QA_FIXTURE_PORTAL_ROLE: 'customer',
     QA_USER_EMAIL: 'qa-user@agentweb.pro',
     QA_USER_PASSWORD: 'user-secret-from-env',
     QA_TIER_EMAIL: 'qa-tier@agentweb.pro',
@@ -214,16 +260,39 @@ function healthyEnv(): NodeJS.ProcessEnv {
   };
 }
 
-function httpPort(overrides: Partial<{ loginStatus: number; adminStatus: number }> = {}) {
+function httpPort(overrides: Partial<{ loginStatus: number; adminStatus: number; roles: string[] }> = {}) {
   return {
     authenticate: jest.fn(async (_baseUrl: string, _credentials: FixtureCredentials): Promise<AuthSession> => (
-      { status: overrides.loginStatus ?? 200, userId: 'user-1', token: 'token' }
+      {
+        status: overrides.loginStatus ?? 200,
+        userId: 'user-1',
+        token: 'token',
+        roles: overrides.roles ?? ['customer'],
+      }
     )),
     checkAdminAccess: jest.fn(async (_baseUrl: string, _session: AuthSession) => overrides.adminStatus ?? 403),
   };
 }
 
 describe('qa-fixture-harness CLI: preflight', () => {
+  it('exits 1 before the admin probe when login succeeds without the requested portal role', async () => {
+    const { io, stdout } = cliIo();
+    const env = healthyEnv();
+    env.QA_FIXTURE_PORTAL_ROLE = 'partner';
+    const http = httpPort({ roles: ['customer'] });
+
+    await expect(runCli(['preflight'], env, { http, io })).resolves.toBe(1);
+
+    expect(JSON.parse(stdout[stdout.length - 1])).toMatchObject({
+      verdict: 'block',
+      phase: 'role',
+      account: 'qa-user',
+      expectedRole: 'partner',
+      actualRoles: ['customer'],
+    });
+    expect(http.checkAdminAccess).not.toHaveBeenCalled();
+  });
+
   it('exits 1 and emits a blocking JSON report naming the dead account and status, never reaching later fixtures', async () => {
     const { io, stdout } = cliIo();
     const http = httpPort({ loginStatus: 401 });
@@ -379,6 +448,36 @@ describe('env credentials loader', () => {
     const load = createEnvCredentialsLoader(env);
 
     await expect(load('QA_USER')).rejects.toThrow('QA_USER_EMAIL');
+  });
+});
+
+describe('HTTP fixture adapter', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('preserves portal roles and admin state from the login response', async () => {
+    jest.spyOn(axios, 'post').mockResolvedValueOnce({
+      status: 200,
+      data: {
+        token: 'token',
+        user: {
+          userId: 'user-1',
+          roles: ['customer'],
+          isAdmin: false,
+        },
+      },
+    } as never);
+    const http = createAxiosHttpPort();
+
+    await expect(http.authenticate('https://qa.example.test', {
+      email: 'qa-user@agentweb.pro',
+      password: 'injected-secret',
+    })).resolves.toEqual({
+      status: 200,
+      token: 'token',
+      userId: 'user-1',
+      roles: ['customer'],
+      isAdmin: false,
+    });
   });
 });
 
