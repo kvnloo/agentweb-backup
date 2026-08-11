@@ -80,12 +80,17 @@ export const createTask = async (req: AuthRequest, res: Response) => {
         // Values from req.body (name, prompt, isInteractive, etc.) are used directly or as overrides.
 
         // For deep research tasks, email notification is automatically enabled or taken from request.
-        const finalEmailNotification = emailNotification !== undefined 
-          ? emailNotification 
-          : isDeepResearch !== undefined 
-            ? isDeepResearch 
+        const finalEmailNotification = emailNotification !== undefined
+          ? emailNotification
+          : isDeepResearch !== undefined
+            ? isDeepResearch
             : template.isDeepResearch;
-        
+
+        const requestedDeepResearch = isDeepResearch !== undefined ? isDeepResearch : template.isDeepResearch;
+        if (requestedDeepResearch) {
+          console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, templateId, source: 'createTask(fromTemplate)' });
+        }
+
         // Create task using template values, allowing overrides from request body for most fields.
         // name and prompt from req.body are already fully processed by the frontend.
         const task = {
@@ -96,7 +101,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
           status: 'active',
           emailNotification: finalEmailNotification,
           isInteractive: isInteractive !== undefined ? Boolean(isInteractive) : template.isInteractive,
-          isDeepResearch: isDeepResearch !== undefined ? Boolean(isDeepResearch) : template.isDeepResearch,
+          // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
+          // never persist true, even if an older template still has it set.
+          isDeepResearch: false,
           isComplexTask: isComplexTask !== undefined ? Boolean(isComplexTask) : template.isComplexTask,
           extractPageContent: extractPageContent !== undefined ? Boolean(extractPageContent) : template.extractPageContent, // Uses template.extractPageContent if extractPageContent is undefined in req.body
           outputAsJson: outputAsJson !== undefined ? Boolean(outputAsJson) : template.outputAsJson,
@@ -135,6 +142,10 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       return res.status(400).json({ message: 'Name and prompt are required' });
     }
 
+    if (isDeepResearch) {
+      console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, source: 'createTask' });
+    }
+
     const task = {
       taskId: Date.now().toString(),
       userId,
@@ -143,7 +154,9 @@ export const createTask = async (req: AuthRequest, res: Response) => {
       status: 'active',
       emailNotification: emailNotification ?? isDeepResearch,  // Use provided value or default to isDeepResearch
       isInteractive: Boolean(isInteractive),  // Convert to boolean
-      isDeepResearch: Boolean(isDeepResearch),  // Convert to boolean
+      // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
+      // never persist true.
+      isDeepResearch: false,
       isComplexTask: Boolean(isComplexTask),  // Convert to boolean
       extractPageContent: extractPageContent ?? isDeepResearch,  // Convert to boolean
       outputAsJson: Boolean(outputAsJson),
@@ -329,7 +342,12 @@ export const updateTask = async (req: AuthRequest, res: Response) => {
     }
 
     if (req.body.isDeepResearch !== undefined) {
-      updates.isDeepResearch = Boolean(req.body.isDeepResearch);
+      // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
+      // never allow it to be turned back on, only ever off.
+      updates.isDeepResearch = false;
+      if (req.body.isDeepResearch) {
+        console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, taskId, source: 'updateTask' });
+      }
     }
 
     if (req.body.isComplexTask !== undefined) {

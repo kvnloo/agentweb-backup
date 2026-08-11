@@ -492,7 +492,7 @@ emmaToolRegistry.register({
     description: `LinkedIn outreach tool via a connected Unipile account. To find the account_id, call list_connected_accounts(platform='unipile') tool.
 
 Actions:
-- search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person.
+- search-people: Search LinkedIn for people by any combination of: keywords (free-text), title, company, location, industry, school. Free-text company/location/industry/school are auto-resolved to LinkedIn entity IDs by the backend. Alternatively pass search_url with a LinkedIn search URL copied from the browser. The backend handles Unipile's classic-search keyword requirement automatically — you can pass just structured filters (e.g. {title: "CTO", company: "Microsoft"}) without specifying keywords. Returns paginated results with provider_id for each person. OUT-OF-NETWORK RESULTS: LinkedIn anonymizes hits outside the connected account's network — they come back with no public_identifier/public_profile_url and a placeholder name ("LinkedIn Member", "LinkedIn User", or its localized equivalent). Those are not people you can contact or dedup: never write them to the CRM (via add_leads_to_list or otherwise) and never present them to the user as found leads. Skip them, or use import_leads_from_search, which drops them for you and reports the count as anonymizedSkipped.
 - get-profile: Get detailed profile info (headline, About, location, network_distance, is_open_profile, etc.) for a LinkedIn user by profile_url or provider_id. This reads the LIVE profile from the connected/platform-wide Unipile account — it is the ONLY authoritative source for a person's current headline/About. NEVER take a headline, About, or other profile-identity field from a you_search_web snippet or a page-source scrape: search caches lag LinkedIn edits by many months and will report a stale headline as if current. When you specifically need the CURRENT profile — a founder/profile readiness audit, or a "what is my headline right now?" question — pass force_refresh=true to bypass the profile cache and read live. If no LinkedIn account can be resolved, get-profile fails with an explicit connect-LinkedIn error; surface that and prompt the user to connect LinkedIn rather than substituting search-snippet text.
 - list-connections: List the user's 1st-degree LinkedIn connections. Returns paginated results.
 - list-sent-invitations: List pending/sent connection requests with status. Returns paginated results.
@@ -1948,16 +1948,28 @@ emmaToolRegistry.register({
   requiresUserAccount: true,
   definition: {
     name: 'read_market_strategy',
-    description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set.',
+    description: 'Read the current user\'s market strategy (business overview, competitors, and ideal customer profiles). Returns exists=false if not set. The response is size-bounded: full competitor descriptions come one page at a time, further competitors are listed by name with a bracketed offset where space allows, and on a very large roster some stored competitors are NOT named at all (the response says how many). totalCompetitors is always the true stored count. NEVER conclude a competitor is absent because it does not appear in the response — before adding any competitor, verify with competitorNames, which answers stored/not-stored regardless of what this page shows. Use competitorOffset (or the returned nextCompetitorOffset) to read further descriptions.',
     inputSchema: {
       type: 'object',
       properties: {
+        competitorOffset: {
+          type: 'number',
+          description: 'Optional 0-based index of the first competitor to return with its full description. As many competitors as fit the page budget are returned in full from there; further ones are listed by name where space allows. Defaults to 0. Pass the offset printed in brackets beside a name-only competitor to read that entry in full, or the nextCompetitorOffset value from a previous response to read the next page.'
+        },
+        competitorNames: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Optional. Names to check against the stored competitor list. The response answers stored/not-stored for each (with its offset when stored), regardless of whether that competitor appears in this page. ALWAYS use this before adding competitors to a large market strategy — it is the reliable way to avoid re-adding one that already exists. Up to 50 names per call.'
+        }
       },
       required: []
     }
   },
   execute: async (args, context) => {
-    return await agentModeService.readMarketStrategy(context?.userId);
+    return await agentModeService.readMarketStrategy(context?.userId, {
+      competitorOffset: args?.competitorOffset,
+      competitorNames: args?.competitorNames,
+    });
   }
 });
 
@@ -4829,9 +4841,14 @@ emmaToolRegistry.register({
         confirm: {
           type: 'boolean',
           description: 'EDITING existing images only (when inputImages is set): on the first call, omit (or false) — the tool returns the source image(s) it will edit and asks the user to confirm. Set true ONLY after the user has seen those images and approved. Ignored for text-to-image (no inputImages), which never needs confirmation.'
+        },
+        category: {
+          type: 'string',
+          enum: ['ad', 'organic_post'],
+          description: "REQUIRED use-case declaration for the human eval queue: 'ad' when the image is a paid ad creative (Meta/Google/LinkedIn ads, retargeting creatives), 'organic_post' when it is organic social/content imagery (feed posts, blog headers, non-paid content). Reviewer feedback differs entirely between the two, so declare it from the request's context — never guess randomly; if the user's intent is genuinely unclear, ask them which use case the image is for before generating."
         }
       },
-      required: ['prompt', 'filename']
+      required: ['prompt', 'filename', 'category']
     }
   },
   execute: async (args: any, context?: any) => {
@@ -4851,7 +4868,8 @@ emmaToolRegistry.register({
       context?.sessionId,
       args.imageModel,
       args.logo_image,
-      args.confirm
+      args.confirm,
+      args.category
     );
   }
 });
@@ -7064,6 +7082,9 @@ const adminToolNames = [
   'manage_user_notes',
   'get_users_by_lifecycle_stage',
   'get_registration_status',
+  'resolve_landing_page_by_url',
+  'share_landing_page_with_org',
+  'get_landing_page_effective_view',
 ];
 
 for (const toolName of bridgedToolNames) {
@@ -7771,8 +7792,13 @@ async function resolveLeadForAction(
   if (!listId || !leadId) return { error: 'list_id and lead_id are required' };
   const list = await crmDb.getLeadListById(listId);
   if (!list) return { error: `Lead list ${listId} not found` };
-  if ((list as any).userId && (list as any).userId !== userId) {
-    return { error: 'Not authorized for this lead list' };
+  // ENG-1049: was a strict `list.userId !== userId` owner-only check, which
+  // over-blocked the org owner and listed crm.editors from acting on lists
+  // they don't personally own — inconsistent with every other CRM write
+  // surface. Delegate to the shared destructive guard instead.
+  const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('../services/crmAccessControl');
+  if (!(await canDestructiveCrmList(userId, list as any))) {
+    return { error: CRM_EDITOR_REQUIRED_MESSAGE };
   }
   const lead = await crmDb.getLeadById(listId, leadId);
   if (!lead) return { error: `Lead ${leadId} not found in list ${listId}` };
@@ -8409,7 +8435,8 @@ Response keys:
 - imported / skipped / errors / total — per-call counts (do not sum across calls)
 - list_total_after_import — actual post-import list size (trust this for cumulative counts)
 - cursor — pagination cursor for the next page of the same query (null when no more results)
-- importedLeads — array of the first 5 imported lead summaries (firstName, lastName, linkedin, title, company), useful for rendering a quick preview without a follow-up read
+- anonymizedSkipped — count of out-of-network placeholder results ("LinkedIn Member", "LinkedIn User" and their localized equivalents) that were discarded before writing (they carry no usable name, email or profile URL, so they are not importable). A high value means the search reached beyond the connected account's network.
+- importedLeads — summaries (firstName, lastName, linkedin, title, company) of up to the first 5 leads ACTUALLY WRITTEN by this call. It never includes results that were deduplicated into an existing lead, trimmed to honour the requested limit, or discarded as anonymized — report only from this array, and never describe a search result as imported unless it appears here.
 - autoEnrichJobId — present only when auto_enrich=true AND at least 1 new lead was imported AND the background job was successfully queued`,
     inputSchema: {
       type: 'object',

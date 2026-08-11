@@ -28,6 +28,9 @@ jest.mock('../services/db', () => ({
   userDb: {
     getUserById: jest.fn(),
   },
+  orgDb: {
+    getOrgById: jest.fn(),
+  },
 }));
 
 jest.mock('../services/enrichSoLeadValidation', () => ({
@@ -52,7 +55,7 @@ jest.mock('../services/enrichmentV3RealDeps', () => ({
 }));
 
 import enrichSoRouter, { setQuotaTrackerForLookupRoute } from '../routes/crmEnrichSo';
-import { crmDb } from '../services/db';
+import { crmDb, userDb, orgDb } from '../services/db';
 import { authenticateToken } from '../middleware/auth';
 import { LookupByEmailQuotaExceededError } from '../services/enrichSoQuota';
 import { resolveIdentity } from '../services/enrichmentIdentityResolver';
@@ -60,6 +63,8 @@ import { resolveIdentity } from '../services/enrichmentIdentityResolver';
 const mockResolveIdentity = resolveIdentity as jest.Mock;
 
 const mockCrmDb = crmDb as jest.Mocked<typeof crmDb>;
+const mockUserDb = userDb as jest.Mocked<typeof userDb>;
+const mockOrgDb = orgDb as jest.Mocked<typeof orgDb>;
 
 const app = express();
 app.use(express.json());
@@ -885,5 +890,175 @@ describe('POST /api/crm/leads/lookup-by-email', () => {
       expect(tracker.checkLookupByEmailQuota).toHaveBeenCalledWith('u1');
       expect(tracker.recordLookupByEmailUsage).toHaveBeenCalledWith('u1');
     });
+  });
+});
+
+// ─── Org-aware access control (ENG-686) ──────────────────────────────────────
+// authenticateToken (mocked above) always authenticates as 'u1'. These cases
+// cover the same-org-but-not-owner-and-not-editor gap that Greptile flagged:
+// crmDb.getLeadListById here always returns a list owned by 'owner-2'.
+
+function setSameOrgUsers() {
+  mockUserDb.getUserById.mockImplementation((id: string) =>
+    Promise.resolve(id === 'owner-2' ? ({ userId: 'owner-2', orgId: 'org-A' } as any) : ({ userId: 'u1', orgId: 'org-A' } as any))
+  );
+}
+function orgWithCrm(overrides: Record<string, any> = {}) {
+  return {
+    orgId: 'org-A',
+    ownerUserId: 'org-owner-id',
+    shareSettings: { crm: { enabled: true, editors: [] as string[] } },
+    ...overrides,
+  };
+}
+
+describe('Org-aware access control on enrich.so mutating routes (ENG-686)', () => {
+  const mutatingEndpoints: Array<{
+    name: string;
+    path: string;
+    body?: Record<string, any>;
+    successStatus: number;
+    setupSuccess: () => void;
+  }> = [
+    {
+      name: 'validate-email',
+      path: '/api/crm/lists/L1/leads/LD1/validate-email',
+      successStatus: 200,
+      setupSuccess: () => {
+        mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'LD1', email: 'a@b.com', customFields: {}, enrichmentMetadata: {} } as any);
+        mockEnrichSo.validateEmail.mockResolvedValue({
+          status: 'deliverable', confidence: 'high', isCatchAll: false,
+          provider: 'GOOGLE', message: 'ok', fromCache: false, checkedAt: '2026-05-04T00:00:00Z',
+        });
+      },
+    },
+    {
+      name: 'find-emails (bulk)',
+      path: '/api/crm/lists/L1/leads/find-emails',
+      successStatus: 202,
+      setupSuccess: () => {
+        mockCrmDb.getLeadsByListId.mockResolvedValue({
+          items: [{ leadId: '1', firstName: 'A', lastName: 'B', company: 'Acme' }],
+          lastEvaluatedKey: undefined,
+        } as any);
+      },
+    },
+    {
+      name: 'lookup-emails (bulk)',
+      path: '/api/crm/lists/L1/leads/lookup-emails',
+      successStatus: 202,
+      setupSuccess: () => {
+        mockCrmDb.getLeadsByListId.mockResolvedValue({
+          items: [{ leadId: '2', email: 'c@d.com', firstName: 'C' }],
+          lastEvaluatedKey: undefined,
+        } as any);
+      },
+    },
+    {
+      name: 'validate-emails (bulk)',
+      path: '/api/crm/lists/L1/leads/validate-emails',
+      successStatus: 202,
+      setupSuccess: () => {
+        mockCrmDb.getLeadsByListId.mockResolvedValue({
+          items: [{ leadId: 'L1', email: 'a@b.com' }],
+          lastEvaluatedKey: undefined,
+        } as any);
+      },
+    },
+  ];
+
+  describe.each(mutatingEndpoints)('$name', ({ path, body, successStatus, setupSuccess }) => {
+    it('returns 403 for a same-org member who is not the owner and not a CRM editor', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+      setSameOrgUsers();
+      mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm() as any);
+
+      const res = await request(app).post(path).send(body ?? {});
+      expect(res.status).toBe(403);
+    });
+
+    it('allows a listed crm.editor', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+      setSameOrgUsers();
+      mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: ['u1'] } } }) as any);
+      setupSuccess();
+
+      const res = await request(app).post(path).send(body ?? {});
+      expect(res.status).toBe(successStatus);
+    });
+
+    it('allows the org owner', async () => {
+      mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+      setSameOrgUsers();
+      mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ ownerUserId: 'u1' }) as any);
+      setupSuccess();
+
+      const res = await request(app).post(path).send(body ?? {});
+      expect(res.status).toBe(successStatus);
+    });
+  });
+});
+
+describe('POST /api/crm/leads/find-email — persistTo* org-aware access control (ENG-686)', () => {
+  const persistBody = {
+    firstName: 'A', lastName: 'B', domain: 'acme.com',
+    persistToListId: 'L1', persistToLeadId: 'LD1',
+  };
+
+  function mockResolveIdentitySuccess() {
+    mockResolveIdentity.mockResolvedValue({ ok: true, resolved: { email: 'a@acme.com' }, siblings: [] });
+    mockCrmDb.getLeadById.mockResolvedValue({ leadId: 'LD1', email: '', customFields: {}, enrichmentMetadata: {} } as any);
+  }
+
+  it('returns 403 for a same-org member who is not the owner and not a CRM editor', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+    setSameOrgUsers();
+    mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm() as any);
+
+    const res = await request(app).post('/api/crm/leads/find-email').send(persistBody);
+
+    expect(res.status).toBe(403);
+    expect(mockResolveIdentity).not.toHaveBeenCalled();
+  });
+
+  it('allows a listed crm.editor', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+    setSameOrgUsers();
+    mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: true, editors: ['u1'] } } }) as any);
+    mockResolveIdentitySuccess();
+
+    const res = await request(app).post('/api/crm/leads/find-email').send(persistBody);
+    expect(res.status).toBe(200);
+  });
+
+  it('allows the org owner', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+    setSameOrgUsers();
+    mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ ownerUserId: 'u1' }) as any);
+    mockResolveIdentitySuccess();
+
+    const res = await request(app).post('/api/crm/leads/find-email').send(persistBody);
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('GET /api/crm/lists/:listId/leads/enrichment-counts — crm.enabled toggle (ENG-686)', () => {
+  it('denies a same-org member reading counts when crm.enabled is false and they are not owner/editor', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+    setSameOrgUsers();
+    mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm({ shareSettings: { crm: { enabled: false, editors: [] } } }) as any);
+
+    const res = await request(app).get('/api/crm/lists/L1/leads/enrichment-counts');
+    expect(res.status).toBe(403);
+  });
+
+  it('allows a same-org member to read counts when crm.enabled is true', async () => {
+    mockCrmDb.getLeadListById.mockResolvedValue({ userId: 'owner-2' } as any);
+    mockCrmDb.getLeadsByListId.mockResolvedValue({ items: [], lastEvaluatedKey: undefined } as any);
+    setSameOrgUsers();
+    mockOrgDb.getOrgById.mockResolvedValue(orgWithCrm() as any);
+
+    const res = await request(app).get('/api/crm/lists/L1/leads/enrichment-counts');
+    expect(res.status).toBe(200);
   });
 });

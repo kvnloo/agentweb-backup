@@ -27,7 +27,13 @@ import { computeCheckpointBatch } from './agentMode/incrementalPersist';
 import { runFinalizeGuard, type ClaimClass, type FinalizeLedgerEntry, type JudgedClaim, CLAIM_CLASSES } from './agentMode/core/finalizeGuard';
 import { getAccessToken as getClickUpAccessToken, getWorkspaces as getClickUpWorkspaces, listDocs as listClickUpDocs, readDocContent as readClickUpDocContent, listTasks as listClickUpTasks, readTaskContent as readClickUpTaskContent, createDoc as createClickUpDoc, createPageInDoc as createClickUpPageInDoc, listSpaces as listClickUpSpaces, listFolders as listClickUpFolders } from './clickupService';
 import { getAccessToken as getForeplayAccessToken, listBoards as listForeplayBoards, getAllBoardAds as getAllForeplayBoardAds, getSwipefileAds as getForeplaySwipefileAds, searchDiscoveryAds as searchForeplayDiscoveryAds, getAd as getForeplayAd, formatAdAsMarkdown as formatForeplayAdAsMarkdown, ForeplayAd } from './foreplayService';
-import { taskDb, taskTemplateDb, accountMemoryDb, userDb } from './db';
+import { taskDb, taskTemplateDb, accountMemoryDb, userDb, scheduleDb } from './db';
+import { resolveOrgProfileField } from './orgProfileResolver';
+import { resolvePublishAuthorized, extractScheduleId, classifySessionForPublishGate, isExternalContentPublish } from '../utils/schedulePublishApproval';
+import { toolCallNeverExecuted } from '../utils/toolCallOutcome';
+// ENG-1002: the anonymized-hit rule lives in one place so the import tool and
+// the outreach-onboarding prospect preview cannot drift apart.
+import { isAnonymizedSearchLead } from '../utils/anonymizedLinkedInLead';
 import {
   applyAnswer,
   buildPendingUserQuestion,
@@ -89,7 +95,7 @@ const ADMIN_SKILL_VIRTUAL_ID = '__admin_tools__';
 // foundation tool that returns published/launchable templates for non-admins and
 // the full management list for admins (role-aware in apiTools.ts). The admin-only
 // mutation tool remains manage_predefined_work_plan.
-const ADMIN_SKILL_TOOL_NAMES = ['manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status'];
+const ADMIN_SKILL_TOOL_NAMES = ['manage_linear_governance_label', 'manage_predefined_work_plan', 'list_skills', 'manage_skill', 'get_chat_history', 'list_all_clients', 'assess_client_health', 'get_pr_digest', 'freeze_user_account', 'manage_scoring_judges', 'manage_user_notes', 'get_users_by_lifecycle_stage', 'get_registration_status', 'resolve_landing_page_by_url', 'share_landing_page_with_org', 'get_landing_page_effective_view'];
 
 // Max tool result content size for persistence. DynamoDB items are limited to 400KB;
 // MCP tools (e.g. Playwright screenshots) can return huge base64 payloads that exceed this.
@@ -841,6 +847,25 @@ export interface DiagnosisContext {
 }
 
 /**
+ * ENG-975. Shared by every agent-facing surface that can hit a LinkedIn
+ * people-search outage: the `search-people` and `search-parameters` actions and
+ * the find-leads top-up loop. Wording matters as much as the detection — the
+ * failure it describes is one an agent has already been observed to misread as
+ * "no one matches", so it names the outage, rules out the two signals that
+ * wrongly suggest health (a working get-profile, an HTTP 200), and forbids the
+ * retry-with-another-variant loop that burned ten calls in the reported session.
+ */
+const LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE = [
+  'LinkedIn returned zero results for a maximally broad control query on this account, so the people-search endpoint is NOT working for it right now. This is not "no one matches your filters" — the search itself is unavailable.',
+  '',
+  'This is account-scoped and specific to search: profile lookups, connection lists and invitation lists on the same account keep working, so a successful get-profile does NOT mean search is healthy. As of 2026-08-10 the known cause is an open Unipile incident — LinkedIn is rolling out changes to Classic Search account by account, and an affected account returns zero results for every query until Unipile ships its adapted integration. The same symptom also appears when an account hits its commercial-use search limit or is temporarily restricted.',
+  '',
+  'DO NOT retry with different keywords, filters, or a search URL — every variant returns the same empty result and burns attempts. Stop searching now.',
+  '',
+  'Report to the user that LinkedIn search is currently unavailable for their account and that no prospects could be sourced this run — never report this as "no matching people were found". Their account is not broken and reconnecting it will not help, so do not tell them to reconnect. Do not promise a specific recovery time: say the outage is upstream at LinkedIn/Unipile and the run will resume sourcing once search returns for their account.',
+].join('\n');
+
+/**
  * Build a short, human-readable audit string describing why a lead was
  * discovered. Written to lead.system.findReason (NOT customFields, which
  * leaks into CSV exports and email-template variables). Returns null when
@@ -870,6 +895,7 @@ function buildFindReason(filters: {
   const joined = parts.join('; ');
   return joined.length > 200 ? joined.slice(0, 197) + '...' : joined;
 }
+
 
 /**
  * ENG-182: extract a LinkedIn public identifier from a profile URL, e.g.
@@ -3067,6 +3093,47 @@ export class AgentModeService {
     );
   }
 
+  /**
+   * ENG-803: does this scheduled run's schedule allow it to publish externally?
+   *
+   * The default lives in the FIELD, not in this lookup. A schedule we read that has
+   * no `requirePublishApproval` is authorized (every existing row, so nothing
+   * changes behaviour) — but a schedule we could not read AT ALL is not, because an
+   * owner who did set it would otherwise be overridden by a transient DynamoDB blip
+   * and a public post cannot be taken back (Greptile review #16). Withholding is the
+   * recoverable error: the run still does the work, saves the drafts, and tells the
+   * owner what is waiting.
+   *
+   * Every scheduled session is stamped `"<title>|scheduleId:<id>"` by
+   * runScheduledChat — which is also the path a "Test run" takes — so a scheduled
+   * session with no parseable id is an unverifiable state, and is withheld for the
+   * same reason.
+   *
+   * Non-scheduled sessions short-circuit to true and never reach a lookup; the value
+   * is only ever consumed by getScheduledSessionOverride, which self-guards on
+   * sessionType and emits nothing for them.
+   */
+  private async resolveScheduledPublishAuthorized(currentSession: any): Promise<boolean> {
+    if (currentSession?.sessionType !== 'scheduled') return true;
+    const scheduleId = extractScheduleId(currentSession?.pageIdentifier);
+    if (!scheduleId) {
+      console.warn(
+        `AgentMode: scheduled session ${currentSession?.sessionId} has no parseable scheduleId; withholding publish authorization rather than assuming it.`
+      );
+      return false;
+    }
+    try {
+      // resolvePublishAuthorized returns false for a null/deleted schedule too.
+      return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId));
+    } catch (error) {
+      console.error(
+        `AgentMode: failed to read schedule ${scheduleId} for session ${currentSession?.sessionId}; withholding publish authorization for this turn rather than publishing unverified:`,
+        error
+      );
+      return false;
+    }
+  }
+
   private getVisionFallbackModel(primaryModel: string): string | undefined {
     const fallbackOrder = ['anthropic.claude-opus-4-8', 'gemini-3-flash-preview', 'gpt-5.4-nano'];
     return fallbackOrder.find((model) => model !== primaryModel && this.llmModels[model]?.supportsVision === true);
@@ -3206,7 +3273,16 @@ export class AgentModeService {
       let availableSkillContextMsg = this.buildAvailableSkillsMessage(publishedSkills, sessionAssociatedSkillIds, userAllowedSkillIds, hasAdminAccess);
 
       const today = new Date().toISOString().split('T')[0];
-      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType);
+      // ENG-803: resolve this scheduled run's publish authorization from the schedule
+      // record so the directive states a DECISION rather than leaving one for the
+      // model to guess — guessing is what produced the fabricated "X publishing gate".
+      // Resolved here rather than in the controller so ENG-803 stays clear of the
+      // regions ENG-827 (PR #2263) rewrites. Never derived from the schedule's prompt
+      // text. This is the UNATTENDED run path, so it always passes a resolved
+      // boolean; the other caller, getEmmaSystemContext, is the attended sidebar and
+      // deliberately passes nothing (see the tri-state note on the override).
+      const publishAuthorized = await this.resolveScheduledPublishAuthorized(currentSession);
+      const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
       const messages: any[] = [
         { role: 'system', content: `${baseSystemPrompt}\nCurrent date: ${today}${sessionTypeLabel}` }
       ];
@@ -4197,7 +4273,9 @@ export class AgentModeService {
             // 'deferred' (non-backing) rather than 'success'.
             status: tc.error !== undefined
               ? 'error'
-              : (tc.duplicateOf || (tc.result && (tc.result as any).deferred === true) ? 'deferred' : 'success'),
+              // ENG-803: shared with the title-evidence filter so the two cannot
+              // drift — they encode the same "never executed, cannot back a claim".
+              : (toolCallNeverExecuted(tc) ? 'deferred' : 'success'),
             result: tc.result,
           }));
           const guardOutcome = await runFinalizeGuard({
@@ -7105,6 +7183,109 @@ export class AgentModeService {
     );
   }
 
+  /**
+   * ENG-803: ENFORCE the owner's publish-approval setting at dispatch, not just in
+   * the prompt (Greptile review #21).
+   *
+   * A directive is guidance; this ticket is literally a report of a model reasoning
+   * its way around instructions. So the setting an owner ticks has to be a real
+   * boundary: if the schedule requires approval, the publishing call does not
+   * execute, whatever the model decided.
+   *
+   * The refusal is returned as a normal tool error on purpose. It gives the model a
+   * REAL, quotable failure — satisfying the directive's "reason (2): a tool call you
+   * ACTUALLY made returned an error" — so the run reports an accurate blocker
+   * instead of inventing one. That is the same ticket's other half.
+   *
+   * FAILS CLOSED for scheduled runs (Greptile review #22). An earlier revision
+   * allowed the call when a lookup threw, reasoning that a blip should not stop
+   * publishing — but that let a transient DynamoDB error publish irreversibly past
+   * an owner's explicit setting, and it contradicted the same asymmetry argument
+   * this fix already applies at the prompt layer: when the answer cannot be
+   * verified, take the RECOVERABLE outcome. A blocked publish saves the drafts and
+   * retries next run; a published post cannot be withdrawn.
+   *
+   * A session we can read that is NOT scheduled returns immediately, so the attended
+   * paths that share this dispatcher (the Emma sidebar via chatbotService, and
+   * liveVoiceService) are unaffected — there is no owner schedule setting to apply
+   * to them, and a human is present.
+   */
+  private static publishApprovalBlock(toolName: string, reason: 'required' | 'unverifiable') {
+    const detail =
+      reason === 'required'
+        ? `this schedule has "Require approval before publishing" turned ON, so ${toolName} cannot publish on the owner's behalf in an unattended run.`
+        : `${toolName} cannot publish in this unattended run because its schedule's publish-approval setting could not be verified, and publishing is irreversible.`;
+    return {
+      success: false as const,
+      error:
+        `Blocked: ${detail} ` +
+        `This is an account-level setting on the schedule — it is NOT a platform, X/Twitter, LinkedIn, API, or credential limit. ` +
+        `Save the drafts, report plainly that nothing was published and why, and tell the owner they can turn "Require approval before publishing" OFF for this schedule to let the next run post.`,
+      publishApprovalRequired: true as const,
+    };
+  }
+
+  private async blockedByScheduledPublishApproval(
+    toolName: string,
+    args: any,
+    sessionId: string
+  ): Promise<{ success: false; error: string; publishApprovalRequired: true } | null> {
+    if (!sessionId || !isExternalContentPublish(toolName, args)) return null;
+
+    let session: any;
+    try {
+      session = await chatbotDb.getChatSession(sessionId);
+    } catch (firstError) {
+      // One retry absorbs a single throttled read before we resort to blocking.
+      try {
+        session = await chatbotDb.getChatSession(sessionId);
+      } catch (retryError) {
+        console.error(
+          `AgentMode ENG-803: could not read session ${sessionId} to verify publish approval for ${toolName}; blocking rather than publishing unverified:`,
+          retryError
+        );
+        return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+      }
+    }
+
+    // A NULL session is unverifiable, not attended: deleting a scheduled session
+    // does not cancel its in-flight worker, so the worker runs on and its lookup
+    // starts returning null (Greptile review #23).
+    const sessionClass = classifySessionForPublishGate(session);
+    if (sessionClass === 'unverifiable') {
+      console.warn(
+        `AgentMode ENG-803: session ${sessionId} not found while verifying publish approval for ${toolName}; blocking rather than assuming it was attended.`
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+    // Attended / non-scheduled sessions have no owner schedule setting to enforce.
+    if (sessionClass === 'allow') return null;
+
+    const scheduleId = extractScheduleId(session?.pageIdentifier);
+    if (!scheduleId) {
+      console.warn(
+        `AgentMode ENG-803: scheduled session ${sessionId} has no parseable scheduleId; blocking ${toolName} rather than assuming approval.`
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+
+    try {
+      // resolvePublishAuthorized also returns false for a missing/deleted schedule.
+      if (resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId))) return null;
+    } catch (scheduleError) {
+      console.error(
+        `AgentMode ENG-803: could not read schedule ${scheduleId} to verify publish approval for ${toolName}; blocking rather than publishing unverified:`,
+        scheduleError
+      );
+      return AgentModeService.publishApprovalBlock(toolName, 'unverifiable');
+    }
+
+    console.warn(
+      `AgentMode ENG-803: blocked ${toolName} on scheduled session ${sessionId} — schedule ${scheduleId} requires approval before publishing.`
+    );
+    return AgentModeService.publishApprovalBlock(toolName, 'required');
+  }
+
   public async executeTool(llmModel: string, toolName: string, args: any, userId: string, sessionId: string, mockMode: boolean = false, extraContext?: Record<string, any>): Promise<any> {
     const toolDefinition = this.toolRegistry.getTool(toolName)?.definition;
     const inputSchema = toolDefinition?.function?.parameters || toolDefinition?.parameters || toolDefinition?.inputSchema;
@@ -7148,6 +7329,12 @@ export class AgentModeService {
         policy: policyDecision,
       };
     }
+
+    // ENG-803: the owner's publish-approval setting is enforced HERE, so it holds
+    // even if the model ignores the directive. Checked after arg repair so the
+    // action is read from the same args the tool would have run with.
+    const publishApprovalBlock = await this.blockedByScheduledPublishApproval(toolName, preparedArgs, sessionId);
+    if (publishApprovalBlock) return publishApprovalBlock;
 
     // In mock mode, only session-state tools (install_skills) execute for real
     // because they modify DynamoDB session state with no external side effects
@@ -8655,12 +8842,15 @@ export class AgentModeService {
         };
       }
 
-      // If user belongs to an org, read from org data instead
+      // If user belongs to an org, read from org data instead — falling back to
+      // the org owner's record when the org was created without copying the
+      // profile over, so Emma sees the same brand the settings page shows a
+      // member of an un-copied org (ENG-927).
       let brand = user.brandGuidelines;
       if (user.orgId) {
         const org = await orgDb.getOrgById(user.orgId);
-        if (org && org.brandGuidelines) {
-          brand = org.brandGuidelines;
+        if (org) {
+          brand = await resolveOrgProfileField(user, org, 'brandGuidelines');
         }
       }
       if (!brand) {
@@ -8790,7 +8980,15 @@ export class AgentModeService {
   }
 
   // Read current user's market strategy
-  public async readMarketStrategy(userId: string): Promise<any> {
+  public async readMarketStrategy(
+    userId: string,
+    options: {
+      competitorOffset?: number;
+      minCompetitorsInFull?: number;
+      pagingHints?: boolean;
+      competitorNames?: string[];
+    } = {}
+  ): Promise<any> {
     try {
       const { userDb, orgDb } = await import('./db');
       const user = await userDb.getUserById(userId);
@@ -8803,12 +9001,13 @@ export class AgentModeService {
         };
       }
 
-      // If user belongs to an org, read from org data instead
+      // Same owner-record fallback as the brand read: an un-copied org must not
+      // hide the owner's strategy from a member (ENG-927).
       let marketStrategy = user.marketStrategy;
       if (user.orgId) {
         const org = await orgDb.getOrgById(user.orgId);
-        if (org && org.marketStrategy) {
-          marketStrategy = org.marketStrategy;
+        if (org) {
+          marketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy');
         }
       }
       if (!marketStrategy) {
@@ -8820,17 +9019,64 @@ export class AgentModeService {
         };
       }
 
-      // Cap competitors at 40
-      const MAX_COMPETITORS = 40;
-      if (marketStrategy.competitors && marketStrategy.competitors.length > MAX_COMPETITORS) {
-        console.log(`AgentMode: Capping competitors from ${marketStrategy.competitors.length} to ${MAX_COMPETITORS}`);
-        marketStrategy.competitors = marketStrategy.competitors.slice(0, MAX_COMPETITORS);
-      }
+      // Bound the size of the tool result WITHOUT hiding entries (ENG-945).
+      // This used to slice the competitor list down to 40 and drop the rest
+      // silently, so a caller that wrote 49 competitors read back 40 and
+      // concluded the write had discarded records. Now the first
+      // COMPETITOR_DETAIL_LIMIT competitors are rendered in full and the
+      // remainder are listed by name only — every stored competitor is still
+      // visible, and the true count is reported alongside.
+      const competitors: any[] = Array.isArray(marketStrategy.competitors) ? marketStrategy.competitors : [];
+      const competitorCount = competitors.length;
+
+      // `competitorOffset` slides the detail window over the stored list, so a
+      // caller that needs the description of a name-only entry can fetch it
+      // instead of being stuck with a partial record. Clamped into range: an
+      // out-of-range offset lands on the last entry rather than rendering an
+      // empty window, because a silently empty result is the failure mode this
+      // whole ticket was about.
+      const requestedOffset = Number(options?.competitorOffset);
+      const competitorDetailOffset = Number.isFinite(requestedOffset)
+        ? Math.min(Math.max(Math.floor(requestedOffset), 0), Math.max(0, competitorCount - 1))
+        : 0;
+      // The character budget protects the TOOL result's context window. Callers
+      // that embed formattedContent in their own prompt instead (the CRM email
+      // drafter) pass minCompetitorsInFull to keep the coverage they had before
+      // ENG-945, so paging can't silently shrink an unrelated prompt.
+      const requestedMin = Number(options?.minCompetitorsInFull);
+      const minInFull = Number.isFinite(requestedMin) && requestedMin > 0 ? Math.floor(requestedMin) : 1;
+      // Competitor sections get the room the overview and ICP leave, not a fixed
+      // slice on top of them (ENG-945 / Greptile: per-section budgets do not
+      // compose into a bound on the whole response).
+      // Membership check (ENG-945): the name index is bounded, so on a large
+      // roster it cannot show every name. A caller deciding whether to ADD a
+      // competitor must still be able to find out if it already exists — that
+      // is the contract this whole ticket is about. Answer it directly instead
+      // of making them page the list.
+      const competitorLookup = this.lookupCompetitors(competitors, options?.competitorNames);
+      // Dropping part of the REQUEST silently is the same failure as dropping
+      // part of the data: unanswered names would read as "not stored" and get
+      // re-added. Report the shortfall instead (ENG-945).
+      const competitorNamesNotChecked = Array.isArray(options?.competitorNames)
+        ? Math.max(0, options!.competitorNames!.length - AgentModeService.COMPETITOR_LOOKUP_MAX)
+        : 0;
+      const budgets = this.competitorCharBudgets(marketStrategy);
+      const window = this.resolveCompetitorDetailWindow(competitors, competitorDetailOffset, minInFull, budgets.detail);
 
       // Format the market strategy for LLM consumption
       const formattedContent = this.formatMarketStrategy({
         exists: true,
-        marketData: marketStrategy
+        marketData: marketStrategy,
+        competitorDetailStart: window.start,
+        competitorDetailEnd: window.end,
+        nameIndexCharBudget: budgets.nameIndex,
+        competitorLookup,
+        competitorNamesNotChecked,
+        // Paging instructions only make sense in a tool result. A caller that
+        // embeds this in its own prompt has no read_market_strategy to call, so
+        // the offsets are noise there — and noise that can leak into generated
+        // customer copy.
+        pagingHints: options?.pagingHints !== false
       });
 
       // Return structured response — no raw marketData to keep tool result size manageable
@@ -8838,6 +9084,12 @@ export class AgentModeService {
         success: true,
         message: `Market strategy retrieved successfully`,
         exists: true,
+        totalCompetitors: competitorCount,
+        ...(competitorLookup ? { competitorLookup, competitorNamesNotChecked } : {}),
+        competitorDetailOffset: window.start,
+        competitorsWithFullDetail: window.end - window.start,
+        // Explicit next page, so paging never depends on the model doing arithmetic.
+        nextCompetitorOffset: window.end < competitorCount ? window.end : null,
         createdAt: marketStrategy.createdAt,
         updatedAt: marketStrategy.updatedAt,
         formattedContent
@@ -8885,7 +9137,9 @@ export class AgentModeService {
             error: 'Permission denied'
           };
         }
-        existingMarketStrategy = org?.marketStrategy;
+        // Same owner-record fallback as the brand path — merging onto an
+        // unpopulated org record would drop the owner's competitors/ICPs.
+        existingMarketStrategy = await resolveOrgProfileField(user, org, 'marketStrategy', { forWrite: true });
       } else {
         existingMarketStrategy = user.marketStrategy;
       }
@@ -10160,12 +10414,13 @@ export class AgentModeService {
         };
       }
 
-      const hasAccessAddLeads = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessAddLeads = await canDestructiveCrmList(userId, list);
       if (!hasAccessAddLeads) {
         return {
           success: false,
           message: 'Access denied',
-          error: 'You do not have permission to add leads to this list'
+          error: CRM_EDITOR_REQUIRED_MESSAGE
         };
       }
 
@@ -10514,21 +10769,25 @@ export class AgentModeService {
       }
 
       // Resolve and access-check each list. In single-list mode an inaccessible
-      // list_id is a hard error; in multi-list mode we silently skip so the
-      // caller still gets results from the lists they CAN see.
+      // list_id is a hard error; in multi-list mode we skip and record the list ID
+      // in skipped_list_ids so callers can distinguish a permission skip from an
+      // empty result.
       type ListEntry = { listId: string; list: any } | null;
       const lists: ListEntry[] = [];
+      const skippedListIds: string[] = [];
       for (let i = 0; i < cursorListIds.length; i++) {
         const id = cursorListIds[i];
         const list = await crmDb.getLeadListById(id);
         if (!list) {
           if (!isMultiList) return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
+          skippedListIds.push(id);
           lists.push(null);
           continue;
         }
         const access = await crmDb.canOrgMemberAccessList(userId, list);
         if (!access) {
           if (!isMultiList) return { success: false, message: 'Access denied', error: 'You do not have permission to access this list' };
+          skippedListIds.push(id);
           lists.push(null);
           continue;
         }
@@ -10632,6 +10891,7 @@ export class AgentModeService {
         ...(isMultiList ? {
           listsScanned: lists.filter((e: ListEntry): e is { listId: string; list: any } => !!e)
             .map((e) => ({ listId: e.listId, listName: e.list.name })),
+          skipped_list_ids: skippedListIds,
         } : {}),
         has_more: !!cursorOut,
         ...(nextCursor && { next_cursor: nextCursor }),
@@ -10996,9 +11256,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -11104,9 +11365,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const now = new Date().toISOString();
@@ -11167,9 +11429,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       if (!leadIds || leadIds.length === 0) {
@@ -11217,9 +11480,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete leads from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       if (!filters || filters.length === 0) {
@@ -11390,9 +11654,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Filter out undefined values
@@ -11450,9 +11715,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccessUpdateStatus = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessUpdateStatus = await canDestructiveCrmList(userId, list);
       if (!hasAccessUpdateStatus) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Fetch current lead
@@ -11545,9 +11811,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       // Validate statusConfig entries
@@ -11589,9 +11856,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to delete this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const listName = list.name;
@@ -11680,9 +11948,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to modify leads in this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -11717,9 +11986,10 @@ export class AgentModeService {
       if (!list) {
         return { success: false, message: 'Lead list not found', error: 'The specified lead list does not exist' };
       }
-      const hasAccessSend = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccessSend = await canDestructiveCrmList(userId, list);
       if (!hasAccessSend) {
-        return { success: false, message: 'Access denied', error: 'You do not have permission to send emails from this list' };
+        return { success: false, message: 'Access denied', error: CRM_EDITOR_REQUIRED_MESSAGE };
       }
 
       const lead = await crmDb.getLeadById(listId, leadId);
@@ -12203,12 +12473,13 @@ export class AgentModeService {
         };
       }
 
-      const hasAccess = await crmDb.canOrgMemberAccessList(userId, list);
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      const hasAccess = await canDestructiveCrmList(userId, list);
       if (!hasAccess) {
         return {
           success: false,
           message: 'Access denied',
-          error: 'You do not have permission to access this lead list'
+          error: CRM_EDITOR_REQUIRED_MESSAGE
         };
       }
 
@@ -12240,8 +12511,14 @@ export class AgentModeService {
       // Get brand guidelines
       const brandGuidelines = await this.readBrandGuidelines(userId);
 
-      // Get market strategy
-      const marketStrategy = await this.readMarketStrategy(userId);
+      // Get market strategy. This prompt embeds formattedContent wholesale, so
+      // it is NOT bounded by the tool-result page budget — before ENG-945 it
+      // received 40 competitors in full and it still must (plus, now, the names
+      // of any beyond that).
+      const marketStrategy = await this.readMarketStrategy(userId, {
+        minCompetitorsInFull: AgentModeService.PROMPT_EMBEDDED_COMPETITOR_DETAIL,
+        pagingHints: false
+      });
 
       // Get sender information (from lead record, or default sender from CRM configuration)
       // Pass list.userId so org members use the list owner's sender config
@@ -12625,7 +12902,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
             error: 'Permission denied'
           };
         }
-        existingBrand = org?.brandGuidelines;
+        // Fall back to the org owner's record when the org record was never
+        // populated, so a tweak merges onto the existing brand instead of
+        // building a fresh empty structure over it (ENG-927).
+        existingBrand = await resolveOrgProfileField(user, org, 'brandGuidelines', { forWrite: true });
       } else {
         existingBrand = user.brandGuidelines;
       }
@@ -12862,7 +13142,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
     if (user?.orgId) {
       const { orgDb } = await import('./db');
       const org = await orgDb.getOrgById(user.orgId);
-      if (org && org.marketStrategy) return org.marketStrategy;
+      // Owner-record fallback for an org that was never populated (ENG-927), so
+      // the re-setup offer and the regenerate flow count what the user actually
+      // has rather than offering to build a strategy that already exists.
+      if (org) return resolveOrgProfileField(user, org, 'marketStrategy');
     }
     return user?.marketStrategy;
   }
@@ -13900,6 +14183,10 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
       // Convert file URLs to attachments
       const attachments = this.convertUrlsToAttachments(attachedFileUrls);
 
+      if (templateData.isDeepResearch) {
+        console.warn('[ENG-805] isDeepResearch requested but forced false', { userId, templateId: templateData.templateId, source: 'createTaskFromTemplate' });
+      }
+
       // Create task using template
       const task = {
         taskId: Date.now().toString(),
@@ -13909,7 +14196,9 @@ Reply with ONLY valid JSON: {"content": "the note text"}`;
         status: 'active',
         emailNotification: templateData.isDeepResearch || false,
         isInteractive: templateData.isInteractive || false,
-        isDeepResearch: templateData.isDeepResearch || false,
+        // Deep research was deprecated in agent-engine 2026-01-01 (e94a8e4a) -
+        // never persist true, even from an older template that still has it.
+        isDeepResearch: false,
         isComplexTask: templateData.isComplexTask || false,
         extractPageContent: false,
         outputAsJson: templateData.outputAsJson || false,
@@ -14234,16 +14523,25 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
    * Uses gemini-3.1-flash-lite for fast, low-cost summarization.
    * Returns null if generation fails (caller should keep existing title).
    */
-  async generateScheduledChatSummary(startingMessage: string, response: string): Promise<string | null> {
+  async generateScheduledChatSummary(startingMessage: string, response: string, succeededToolNames?: string[]): Promise<string | null> {
     try {
+      // ENG-803: the summary becomes the run's title suffix, so it must describe
+      // what the run DID, not what its prose claimed. Previously this saw only the
+      // request and the response text, which let a run that posted nothing be
+      // titled "Replies queued". Ground it in the tools that actually SUCCEEDED —
+      // the caller filters out errored and preflight-rejected calls, because a
+      // failed twitter_manage_post is evidence that nothing was posted, not
+      // evidence that something was (Greptile review #19).
+      const succeeded = Array.from(new Set((succeededToolNames || []).filter(Boolean))).slice(0, 40);
+      const evidence = succeeded.length > 0 ? succeeded.join(', ') : 'none';
       const response_ = await this.callLLM(DIAGNOSIS_MODEL, [
         {
           role: 'system',
-          content: `You are a task summarizer. Given a user's request and the agent's response, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). Return ONLY the summary, nothing else.`
+          content: `You are a task summarizer. Given a user's request, the agent's response, and the list of tools that ran SUCCESSFULLY, output a 2-3 word summary of what was accomplished (e.g. "Blog Post Published", "Leads Enriched", "Report Generated"). The summary must reflect that list, not the response's claims. The list contains ONLY calls that succeeded — a tool that was attempted and failed is absent from it, so treat it as not having happened. If no tool that posts, publishes, or sends appears in the list, do NOT use words like "Posted", "Published", "Sent", or "Queued" — describe what actually happened instead (e.g. "Drafts Prepared", "Nothing Posted", "Posting Failed"). Return ONLY the summary, nothing else.`
         },
         {
           role: 'user',
-          content: `Request: ${startingMessage.slice(0, 300)}\n\nResult: ${response.slice(0, 500)}`
+          content: `Request: ${startingMessage.slice(0, 300)}\n\nTools that ran SUCCESSFULLY (failed calls are excluded): ${evidence}\n\nResult: ${response.slice(0, 500)}`
         }
       ], {
         max_completion_tokens: 20,
@@ -22687,6 +22985,192 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     return formattedSummary;
   }
 
+  // How many characters of competitor descriptions one read_market_strategy page
+  // may render. This is a CHARACTER budget rather than a fixed entry count on
+  // purpose (ENG-945): competitor descriptions on real accounts run from ~60 to
+  // ~2,100 chars, so any fixed count either wastes the page or overflows it.
+  // A tool result over 20,000 chars is offloaded to S3 and only its first 20,000
+  // chars stay in the model's context, so an oversized page pushes its own
+  // competitor list out of context — the failure this ticket is about. 8,000
+  // leaves room for the business overview, the ICP section (8,000+ on some
+  // accounts), the name index and the closing notes, and still keeps the whole
+  // response inline.
+  private static readonly COMPETITOR_DETAIL_CHAR_BUDGET = 8000;
+
+  // Coverage guaranteed to callers that embed formattedContent directly in their
+  // own prompt rather than returning it as a tool result. 40 is exactly what
+  // readMarketStrategy rendered in full before ENG-945, so those prompts are
+  // unchanged by the introduction of paging.
+  private static readonly PROMPT_EMBEDDED_COMPETITOR_DETAIL = 40;
+
+  // Ceiling on the name-only index. Without one it grows with the roster and can
+  // push the very tail it exists to expose past the 20,000-char in-context cap
+  // (and it is embedded verbatim in the CRM email prompt). Anything beyond this
+  // is still counted, still in the stated total, and still reachable by offset —
+  // bounded, never silent.
+  private static readonly COMPETITOR_NAME_INDEX_CHAR_BUDGET = 3000;
+
+  // Aggregate target for the whole formatted response, sized under the
+  // 20,000-char in-context cap with headroom for the notice and closing note.
+  private static readonly RESPONSE_CHAR_TARGET = 18500;
+  private static readonly RESPONSE_FIXED_CHROME = 900;
+  private static readonly MIN_COMPETITOR_DETAIL_CHARS = 1200;
+  private static readonly MIN_COMPETITOR_NAME_INDEX_CHARS = 400;
+  // Per-field ceiling. Names and descriptions are unbounded on write, so one
+  // record could otherwise dominate the whole response.
+  private static readonly COMPETITOR_FIELD_MAX_CHARS = 3000;
+  // Hard ceiling for a TOOL response, under the 20,000-char in-context cap.
+  // Callers that embed the text in their own prompt are not clamped — they have
+  // no transport cap, and clamping them would undo the ENG-945 non-regression.
+  private static readonly RESPONSE_HARD_CAP = 19000;
+  private static readonly BUSINESS_OVERVIEW_MAX_CHARS = 2500;
+  private static readonly ICP_SECTION_MAX_CHARS = 6000;
+  private static readonly COMPETITOR_LOOKUP_MAX = 50;
+  private static readonly LOOKUP_NAME_MAX_CHARS = 120;
+  private static readonly LOOKUP_BLOCK_MAX_CHARS = 3000;
+
+  // Rendered separately from formatMarketStrategy so its true cost can be
+  // measured BEFORE the competitor budgets are allocated (ENG-945 / Greptile):
+  // the overview and ICP share the same response, so competitor sections must
+  // fit the room those leave rather than spending a fixed budget on top.
+  private formatIcpSection(icp: any): string {
+    let out = `<strong>🎯 Ideal Customer Profile (ICP)</strong><br>`;
+    if (Array.isArray(icp) && icp.length > 0) {
+      icp.forEach((entry: any) => {
+        if (typeof entry === 'object' && entry && entry.title) {
+          out += `• <strong>${entry.title}:</strong> ${entry.description || 'No description provided'}<br>`;
+          if (entry.valueProposition) out += `  <em>Value Proposition:</em> ${entry.valueProposition}<br>`;
+          if (Array.isArray(entry.buyerPersonas) && entry.buyerPersonas.length > 0) {
+            out += `  <em>Buyer Personas:</em> ${entry.buyerPersonas.join(', ')}<br>`;
+          }
+        } else {
+          out += `• ${entry}<br>`;
+        }
+      });
+    } else {
+      out += `• No ideal customer profiles defined yet<br>`;
+    }
+    return out;
+  }
+
+  /**
+   * Room left for competitor detail + the name index once the parts of the
+   * response we do NOT control (business overview, ICP, headers, closing note)
+   * have taken their share of the in-context cap. Never returns less than
+   * MIN, so a pathological ICP degrades the competitor sections instead of
+   * emptying them.
+   */
+  private competitorCharBudgets(marketData: any): { detail: number; nameIndex: number } {
+    const fixed =
+      String(marketData?.businessOverview || '').length +
+      this.formatIcpSection(marketData?.icp).length +
+      AgentModeService.RESPONSE_FIXED_CHROME;
+    const room = AgentModeService.RESPONSE_CHAR_TARGET - fixed;
+    const detail = Math.max(
+      AgentModeService.MIN_COMPETITOR_DETAIL_CHARS,
+      Math.min(AgentModeService.COMPETITOR_DETAIL_CHAR_BUDGET, Math.floor(room * 0.7)),
+    );
+    const nameIndex = Math.max(
+      AgentModeService.MIN_COMPETITOR_NAME_INDEX_CHARS,
+      Math.min(AgentModeService.COMPETITOR_NAME_INDEX_CHAR_BUDGET, room - detail),
+    );
+    return { detail, nameIndex };
+  }
+
+  /**
+   * Cut `text` to `allowed` characters, ALWAYS saying how much was removed.
+   * ENG-945's rule is "never hide silently", not "never bound" — an explicit
+   * marker is what separates this from the bug this ticket fixed.
+   */
+  private truncateWithNotice(text: string, allowed: number): string {
+    if (text.length <= allowed) return text;
+    if (allowed <= 0) return '';
+    const marker = (n: number) => ` …<em>[truncated — ${n} characters omitted; open the Market Strategy page to read the full text]</em>`;
+    const full = marker(text.length);
+    // The marker itself must fit inside the allowance, or the "hard" bound
+    // would be breached by the very notice that announces the cut.
+    if (full.length >= allowed) {
+      const short = '…[truncated]';
+      return short.length <= allowed ? short : text.slice(0, allowed);
+    }
+    // marker(text.length) is an upper bound on marker(text.length - keep) — the
+    // omitted count can only have fewer digits — so the result never exceeds
+    // `allowed`.
+    const keep = allowed - full.length;
+    return text.slice(0, keep) + marker(text.length - keep);
+  }
+
+  /**
+   * "Is this competitor already stored?" — answered directly, so a bounded name
+   * index can never leave a caller guessing (ENG-945). Matching mirrors
+   * updateMarketStrategy's merge-by-name, loosened to ignore case and padding so
+   * a near-miss does not read as "not stored" and cause a duplicate.
+   */
+  private lookupCompetitors(
+    competitors: any[],
+    names?: string[],
+  ): Array<{ name: string; stored: boolean; offset: number | null }> | undefined {
+    if (!Array.isArray(names) || names.length === 0) return undefined;
+    const norm = (v: any) => String(v ?? '').trim().toLowerCase();
+    const byName = new Map<string, number>();
+    competitors.forEach((competitor: any, index: number) => {
+      const key = norm(typeof competitor === 'object' && competitor ? competitor.name : competitor);
+      if (key && !byName.has(key)) byName.set(key, index);
+    });
+    return names
+      .slice(0, AgentModeService.COMPETITOR_LOOKUP_MAX)
+      .map((requested) => {
+        const offset = byName.get(norm(requested));
+        return {
+          name: String(requested),
+          stored: offset !== undefined,
+          offset: offset === undefined ? null : offset,
+        };
+      });
+  }
+
+  private formatCompetitorDetailLine(competitor: any): string {
+    if (typeof competitor === 'object' && competitor && competitor.name) {
+      const name = this.truncateWithNotice(String(competitor.name), AgentModeService.COMPETITOR_FIELD_MAX_CHARS);
+      const description = this.truncateWithNotice(
+        String(competitor.description || 'No description provided'),
+        AgentModeService.COMPETITOR_FIELD_MAX_CHARS,
+      );
+      return `• <strong>${name}:</strong> ${description}<br>`;
+    }
+    return `• ${this.truncateWithNotice(String(competitor), AgentModeService.COMPETITOR_FIELD_MAX_CHARS)}<br>`;
+  }
+
+  /**
+   * Fill a page of full-detail competitors starting at `offset`, stopping when
+   * the character budget is spent.
+   *
+   * `minEntries` is a floor the budget cannot undercut: the first `minEntries`
+   * are always rendered in full, however long they are. It defaults to 1 so a
+   * single oversized description can still be read — an empty page would be the
+   * same silent-nothing failure mode the budget exists to prevent — and
+   * non-tool callers raise it to preserve their pre-ENG-945 coverage.
+   */
+  private resolveCompetitorDetailWindow(
+    competitors: any[],
+    offset: number,
+    minEntries: number = 1,
+    charBudget: number = AgentModeService.COMPETITOR_DETAIL_CHAR_BUDGET,
+  ): { start: number; end: number } {
+    const start = Math.min(Math.max(Math.floor(offset) || 0, 0), Math.max(0, competitors.length - 1));
+    const floor = Math.max(1, Math.floor(minEntries) || 1);
+    let used = 0;
+    let end = start;
+    while (end < competitors.length) {
+      const cost = this.formatCompetitorDetailLine(competitors[end]).length;
+      const withinFloor = end - start < floor;
+      if (!withinFloor && used + cost > charBudget) break;
+      used += cost;
+      end++;
+    }
+    return { start, end };
+  }
+
   // Helper function to format market strategy for AI analysis
   private formatMarketStrategy(marketResult: any): string {
     if (!marketResult.exists) {
@@ -22697,53 +23181,175 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     let formattedSummary = `<strong>📊 Market Strategy Retrieved</strong><br>`;
     formattedSummary += `I've successfully retrieved your market strategy. Here's what I found:<br><br>`;
 
-    // Business Overview Section (matches UI structure)
+    // Rendered FIRST, deliberately: this is the answer to "should I add this
+    // competitor?", so it must sit ahead of everything the response clamp can
+    // trim (ENG-945).
+    const lookup: Array<{ name: string; stored: boolean; offset: number | null }> | undefined =
+      marketResult.competitorLookup;
+    if (lookup && lookup.length > 0) {
+      formattedSummary += `<strong>🔎 Competitor check — already stored?</strong><br>`;
+      // Names are unbounded on write AND in the request, so the block is bounded
+      // by characters as well as by entry count — otherwise the answer could
+      // swallow the response it is rendered in front of.
+      let lookupChars = 0;
+      let rendered = 0;
+      for (const entry of lookup) {
+        const name = this.truncateWithNotice(String(entry.name), AgentModeService.LOOKUP_NAME_MAX_CHARS);
+        const line = entry.stored
+          ? `• <strong>${name}</strong>: ALREADY STORED at offset ${entry.offset} — do NOT add it again.<br>`
+          : `• <strong>${name}</strong>: not stored — safe to add.<br>`;
+        if (rendered > 0 && lookupChars + line.length > AgentModeService.LOOKUP_BLOCK_MAX_CHARS) break;
+        formattedSummary += line;
+        lookupChars += line.length;
+        rendered++;
+      }
+      if (rendered < lookup.length) {
+        formattedSummary += `<strong>⚠️ ${lookup.length - rendered} further answer(s) omitted here</strong> — re-ask about those names in a smaller batch; do NOT assume they are absent.<br>`;
+      }
+      const notChecked: number = marketResult.competitorNamesNotChecked || 0;
+      if (notChecked > 0) {
+        formattedSummary += `<strong>⚠️ ${notChecked} further requested name(s) were NOT checked</strong> (only ${AgentModeService.COMPETITOR_LOOKUP_MAX} names are checked per call). Do NOT assume those are absent — call read_market_strategy again with the remaining names before adding any of them.<br>`;
+      }
+      formattedSummary += `<br>`;
+    }
+
+    // Business Overview Section (matches UI structure). Bounded on the tool path
+    // only — see RESPONSE_HARD_CAP.
+    const clamp = marketResult.pagingHints !== false;
     formattedSummary += `<strong>🏢 Business Overview</strong><br>`;
     if (marketData.businessOverview) {
-      formattedSummary += `${marketData.businessOverview}<br><br>`;
+      const overview = clamp
+        ? this.truncateWithNotice(String(marketData.businessOverview), AgentModeService.BUSINESS_OVERVIEW_MAX_CHARS)
+        : String(marketData.businessOverview);
+      formattedSummary += `${overview}<br><br>`;
     } else {
       formattedSummary += `No business overview provided yet.<br><br>`;
     }
 
     // Competitors Section (matches UI structure)
-    formattedSummary += `<strong>🏆 Competitors</strong><br>`;
-    if (marketData.competitors && marketData.competitors.length > 0) {
-      marketData.competitors.forEach((competitor: any, index: number) => {
-        if (typeof competitor === 'object' && competitor.name) {
-          formattedSummary += `• <strong>${competitor.name}:</strong> ${competitor.description || 'No description provided'}<br>`;
-        } else {
-          formattedSummary += `• ${competitor}<br>`;
-        }
+    // ENG-945: entries outside the [competitorDetailStart, competitorDetailEnd)
+    // window are rendered by name only rather than dropped, so the reader always
+    // sees the complete roster. With no window supplied the whole list is
+    // rendered in full, which is what non-tool callers get.
+    const competitors: any[] = Array.isArray(marketData.competitors) ? marketData.competitors : [];
+    const detailStart = typeof marketResult.competitorDetailStart === 'number' ? marketResult.competitorDetailStart : 0;
+    const detailEnd = typeof marketResult.competitorDetailEnd === 'number' ? marketResult.competitorDetailEnd : competitors.length;
+    const nameOf = (competitor: any) =>
+      (typeof competitor === 'object' && competitor && competitor.name) ? competitor.name : String(competitor);
+    const inWindow = (index: number) => index >= detailStart && index < detailEnd;
+    const nameOnlyCount = competitors.filter((_, index) => !inWindow(index)).length;
+    // How many stored competitors this response could not even name. Tracked so
+    // the closing note cannot claim completeness the body does not deliver.
+    let unnamedCount = 0;
+    const pagingHints = marketResult.pagingHints !== false;
+    const nameIndexBudget = typeof marketResult.nameIndexCharBudget === 'number'
+      ? marketResult.nameIndexCharBudget
+      : AgentModeService.COMPETITOR_NAME_INDEX_CHAR_BUDGET;
+
+    formattedSummary += `<strong>🏆 Competitors (${competitors.length} total)</strong><br>`;
+    if (competitors.length > 0) {
+      competitors.forEach((competitor: any, index: number) => {
+        if (!inWindow(index)) return;
+        formattedSummary += this.formatCompetitorDetailLine(competitor);
       });
+      if (nameOnlyCount > 0) {
+        // The name index is bounded too, or a large enough roster would push the
+        // tail out of the response it is meant to make visible. Bounded is fine;
+        // SILENT is not — anything not listed is still counted, still included in
+        // the stated total, and still reachable by offset.
+        const nameOnly: Array<{ index: number; name: string }> = [];
+        competitors.forEach((competitor: any, index: number) => {
+          if (!inWindow(index)) nameOnly.push({ index, name: nameOf(competitor) });
+        });
+        let indexChars = 0;
+        let listed = 0;
+        for (const entry of nameOnly) {
+          const cost = (pagingHints ? `• [offset ${entry.index}] ${entry.name}<br>` : `• ${entry.name}<br>`).length;
+          // Strict: a single pathological name must not blow the index. Competitor
+          // names are unbounded on write, so admitting the first entry regardless
+          // of size would let one record overflow the whole response. The index
+          // may end up empty — the remainder line below then accounts for
+          // everyone, so nobody is hidden either way.
+          if (indexChars + cost > nameIndexBudget) break;
+          indexChars += cost;
+          listed++;
+        }
+        const unlisted = nameOnly.slice(listed);
+        unnamedCount = unlisted.length;
+
+        if (pagingHints) {
+          // Lead with the random-access affordance, not the next page: every entry
+          // below carries its own offset, so any single competitor is one call
+          // away. Teaching "next page" first would have the model walk the list in
+          // order to reach entry 48 (ENG-945).
+          // With a strict cap the index can be empty, so the worked example must
+          // fall back to the first unlisted entry rather than indexing off the end.
+          const exampleOffset = listed > 0 ? nameOnly[listed - 1].index : nameOnly[0].index;
+          // Only advertise a next page when one actually exists — otherwise the
+          // prose contradicts nextCompetitorOffset: null and restarts the reader.
+          const walkHint = detailEnd < competitors.length
+            ? ` To walk the entire list in order instead, use the nextCompetitorOffset value returned with each page (currently ${detailEnd}).`
+            : '';
+          formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored and shown by name only</strong> (full details omitted to keep this response small). These ARE part of the market strategy — do not treat them as missing and do not add them again. To read any one of them in full, call read_market_strategy again with competitorOffset set to the number in brackets beside that name — you can jump straight to the entry you want, there is no need to page through in order (e.g. <code>competitorOffset: ${exampleOffset}</code> reads the entry marked [offset ${exampleOffset}]).${walkHint}<br>`;
+          nameOnly.slice(0, listed).forEach(e => {
+            formattedSummary += `• [offset ${e.index}] ${e.name}<br>`;
+          });
+          if (unlisted.length > 0) {
+            formattedSummary += `<strong>…and ${unlisted.length} more stored competitor(s) not named in this response</strong> (the account holds ${competitors.length} in total — none have been deleted). Read them with <code>competitorOffset: ${unlisted[0].index}</code> and onwards. To check whether a specific competitor is among them BEFORE adding it, call read_market_strategy with <code>competitorNames: ["Name A", "Name B"]</code> — it answers stored/not-stored for each.<br>`;
+          }
+        } else {
+          // Prompt-embedding caller: name the rest, no tool directives, no offsets.
+          formattedSummary += `<br><strong>ℹ️ ${nameOnlyCount} further competitor(s) are stored (names only):</strong><br>`;
+          nameOnly.slice(0, listed).forEach(e => {
+            formattedSummary += `• ${e.name}<br>`;
+          });
+          if (unlisted.length > 0) {
+            formattedSummary += `<strong>…and ${unlisted.length} more stored competitor(s) not named here</strong> (the account holds ${competitors.length} in total — none have been deleted).<br>`;
+          }
+        }
+      }
     } else {
       formattedSummary += `• No competitors identified yet<br>`;
     }
     formattedSummary += `<br>`;
 
     // Ideal Customer Profile (ICP) Section (matches UI structure)
-    formattedSummary += `<strong>🎯 Ideal Customer Profile (ICP)</strong><br>`;
-    if (marketData.icp && marketData.icp.length > 0) {
-      marketData.icp.forEach((icp: any, index: number) => {
-        if (typeof icp === 'object' && icp.title) {
-          formattedSummary += `• <strong>${icp.title}:</strong> ${icp.description || 'No description provided'}<br>`;
-          if (icp.valueProposition) {
-            formattedSummary += `  <em>Value Proposition:</em> ${icp.valueProposition}<br>`;
-          }
-          if (icp.buyerPersonas && Array.isArray(icp.buyerPersonas) && icp.buyerPersonas.length > 0) {
-            formattedSummary += `  <em>Buyer Personas:</em> ${icp.buyerPersonas.join(', ')}<br>`;
-          }
-        } else {
-          formattedSummary += `• ${icp}<br>`;
-        }
-      });
-    } else {
-      formattedSummary += `• No ideal customer profiles defined yet<br>`;
-    }
+    const icpSection = this.formatIcpSection(marketData.icp);
+    formattedSummary += clamp
+      ? this.truncateWithNotice(icpSection, AgentModeService.ICP_SECTION_MAX_CHARS)
+      : icpSection;
 
     formattedSummary += `<br><em>💡 I'll use this market strategy information to inform marketing campaigns, content strategy, and business development decisions.</em>`;
-    formattedSummary += `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`;
+    // Only tell the model the read is exhaustive when it actually is. With a
+    // name-only tail, a second call is the supported way to read the rest —
+    // unless the caller has no tools to call, in which case say nothing about
+    // tools at all.
+    // The note must describe what the body actually delivered. Claiming "every
+    // competitor is listed above" while the index omitted some is the same
+    // false-completeness signal ENG-945 was filed for.
+    const closingNote = unnamedCount > 0
+      ? (pagingHints
+        ? `<br><br><strong>⚠️ Note:</strong> This account stores ${competitors.length} competitors. ${unnamedCount} of them are NOT named anywhere in this response — nothing has been deleted, this response is simply size-bounded. Do NOT conclude a competitor is absent because it does not appear here: call read_market_strategy with competitorNames: ["Name"] to check a specific one, or competitorOffset to page through the rest.`
+        // Prompt-embedded caller: state the shortfall, but never name a tool it
+        // cannot call — the same rule the rest of this path follows.
+        : `<br><br><strong>⚠️ Note:</strong> This account stores ${competitors.length} competitors. ${unnamedCount} of them are NOT named anywhere in this response — nothing has been deleted, this response is simply size-bounded. Do not conclude a competitor is absent because it does not appear here.`)
+      : !pagingHints
+        ? (nameOnlyCount > 0
+          ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above; ${nameOnlyCount} of them by name only. Nothing is missing.`
+          : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete.`)
+        : (nameOnlyCount > 0
+          ? `<br><br><strong>⚠️ Note:</strong> Every competitor stored on this account is listed above, but ${nameOnlyCount} of them are shown by name only. Nothing is missing. To read any of those in full, call read_market_strategy again with competitorOffset set to the offset shown beside the name.`
+          : `<br><br><strong>⚠️ Note:</strong> This market strategy data is current and complete. Please do not call read_market_strategy again in this conversation as it will return the same information.`);
 
-    return formattedSummary;
+    if (!clamp) return formattedSummary + closingNote;
+
+    // Final guarantee. Every section above is individually bounded, but the only
+    // way to PROVE the tool result fits the transport's in-context cap is to
+    // clamp the assembled string — while reserving the closing note, because the
+    // "nothing is missing" guidance is exactly what must never be the thing that
+    // gets cut (that would be ENG-945 all over again).
+    const room = AgentModeService.RESPONSE_HARD_CAP - closingNote.length;
+    return this.truncateWithNotice(formattedSummary, room) + closingNote;
   }
 
   // Helper function to format market strategy update feedback for AI analysis
@@ -23244,8 +23850,24 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     sessionId: string,
     imageModel?: string,
     logoImage?: string,
-    confirm?: boolean
+    confirm?: boolean,
+    category?: string
   ): Promise<any> {
+    // ENG-343: the producing flow must self-declare the eval use case — Matt's
+    // review feedback differs entirely between ads and organic posts, and a
+    // prompt-text classifier was explicitly ruled out. Missing/invalid input
+    // fails visibly (recorded decision 2026-07-27 on ENG-343) so the caller gets
+    // fixed instead of a falsely categorized candidate reaching the eval queue.
+    if (category !== 'ad' && category !== 'organic_post') {
+      return {
+        success: false,
+        error: 'invalid_category',
+        message:
+          `generate_image requires category: 'ad' | 'organic_post' (got ${JSON.stringify(category)}). ` +
+          `Declare the use case: 'ad' for paid ad creatives, 'organic_post' for organic social content.`
+      };
+    }
+
     // Human-in-the-loop gate for image EDITING (inputImages present). Editing the
     // wrong source images is the wrong-set mistake from the satisfaction incident,
     // so before regenerating/editing existing images we surface the exact source
@@ -23465,6 +24087,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           reviewType: 'creative_image',
           userId,
           sessionId,
+          category,
           artifactUrl: result.imageUrl,
           originalRequest: prompt,
           outputSummary:
@@ -26446,7 +27069,8 @@ IMPORTANT: Return ONLY the JSON object, no additional text or explanations.`;
         console.log('AgentMode: create_html_file — draft is already complete HTML, uploading directly (skipping render)');
         const { uploadFileToS3 } = await import('../utils/s3Utils');
         const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
-        const uploadResult = await uploadFileToS3(contentDraft, filename, userId, 'text/html');
+        const uploadableHtml = await this.inlinePrivateS3Images(contentDraft, documentType, userId);
+        const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
         if (!uploadResult.success || !uploadResult.url) {
           throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
         }
@@ -26679,7 +27303,8 @@ Please generate a complete, professional HTML document that properly formats and
       // Upload to S3
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
-      const uploadResult = await uploadFileToS3(htmlContent, filename, userId, 'text/html');
+      const uploadableHtml = await this.inlinePrivateS3Images(htmlContent, documentType, userId);
+      const uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
 
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
@@ -26704,6 +27329,25 @@ Please generate a complete, professional HTML document that properly formats and
         error: error instanceof Error ? error.message : 'Unknown error'
       };
     }
+  }
+
+  /**
+   * Embed private, same-bucket S3 images in downloadable HTML documents. The
+   * image fetcher intentionally ignores all other URLs, and the inliner fully
+   * validates byte limits before returning HTML so callers can never upload a
+   * partially transformed document. Email keeps absolute image URLs because
+   * email clients have materially different payload constraints.
+   */
+  private async inlinePrivateS3Images(
+    html: string,
+    documentType: 'document' | 'email',
+    userId: string,
+  ): Promise<string> {
+    if (documentType === 'email') return html;
+    const { createDefaultS3ImageFetcher, inlineS3ImagesAsDataUris } =
+      await import('../utils/inlineS3Images');
+    const result = await inlineS3ImagesAsDataUris(html, createDefaultS3ImageFetcher(userId));
+    return result.html;
   }
 
   /**
@@ -26826,8 +27470,9 @@ Return the HTML body fragment for this section only.`;
       const { renderMarkdownReportDocumentAsync } = await import('../utils/markdownHtmlReport');
       const { uploadFileToS3 } = await import('../utils/s3Utils');
       const fallbackHtml = await renderMarkdownReportDocumentAsync(title, contentDraft);
+      const uploadableHtml = await this.inlinePrivateS3Images(fallbackHtml, documentType, userId);
       const filename = `html_${Date.now()}_${title.replace(/[^a-z0-9]/gi, '_').substring(0, 50)}.html`;
-      uploadResult = await uploadFileToS3(fallbackHtml, filename, userId, 'text/html');
+      uploadResult = await uploadFileToS3(uploadableHtml, filename, userId, 'text/html');
       if (!uploadResult.success || !uploadResult.url) {
         throw new Error(uploadResult.error || 'Failed to upload HTML file to S3');
       }
@@ -26845,6 +27490,9 @@ Return the HTML body fragment for this section only.`;
       };
     } catch (fallbackError) {
       console.error('AgentMode: create_html_file — deterministic fallback also failed:', fallbackError);
+      if ((fallbackError as { code?: string })?.code === 'INLINE_S3_IMAGE_ERROR') {
+        throw fallbackError;
+      }
       throw renderFailure;
     }
   }
@@ -29434,6 +30082,23 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     };
   }
 
+  /**
+   * ENG-975. A LinkedIn people search that returns zero because the ACCOUNT has
+   * lost its search capability is indistinguishable from one that returns zero
+   * because nobody matches — Unipile relays both as HTTP 200 with `items: []`
+   * and `paging.total_count: 0`. Once `probeSearchCapability` has proven it is
+   * the former, say so in the terms the agent needs: this is an outage, more
+   * query variants will not help, and reporting "no matches" would be a lie.
+   */
+  private linkedInSearchUnavailableResponse() {
+    return {
+      success: false,
+      message: 'LinkedIn people search is unavailable',
+      error: LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE,
+      searchUnavailable: true,
+    };
+  }
+
   async linkedinOutreach(userId: string, args: any): Promise<any> {
     let { account_id } = args;
     const action = (args.action as string)?.replace(/_/g, '-');
@@ -29530,6 +30195,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             company_id, location, location_id,
             industry, industry_id, school, school_id,
           });
+          // ENG-975: an empty FIRST page is ambiguous — it means either "nobody
+          // matches" or "this account can no longer search". Only a broad control
+          // query can tell those apart, so run one before reporting an empty
+          // result the agent would otherwise pass on to the user as fact. A
+          // cursor'd continuation is skipped: running out of pages is exhaustion,
+          // not an outage.
+          if (Array.isArray(searchResult?.items) && searchResult.items.length === 0 && !cursor) {
+            if (await linkedInOutreachService.probeSearchCapability(account_id) === 'degraded') {
+              console.log(`[AgentMode] linkedinOutreach: search-people returned 0 and the control query also returned 0 — account ${account_id} cannot search`);
+              return this.linkedInSearchUnavailableResponse();
+            }
+          }
           // Trim to essential fields only — full profiles (skills, education, photos, etc.)
           // inflate context by 10x and degrade LLM output quality in long sessions.
           if (Array.isArray(searchResult?.items)) {
@@ -29735,7 +30412,8 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
 
               const { crmDb } = await import('./db');
               const mirrorList = await crmDb.getLeadListById(mirrorListId);
-              if (!mirrorList || !(await crmDb.canOrgMemberAccessList(userId, mirrorList))) {
+              const { canDestructiveCrmList } = await import('./crmAccessControl');
+              if (!mirrorList || !(await canDestructiveCrmList(userId, mirrorList))) {
                 console.warn(`[AgentMode] send-invite: skipping CRM mirror — list ${mirrorListId} not accessible to user ${userId}`);
                 return;
               }
@@ -30058,6 +30736,16 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
             keywords,
             limit,
           });
+          // ENG-975: the same account-scoped search outage empties entity
+          // resolution too — the reported session got `candidates: []` for
+          // INDUSTRY 'hospital health care'. An empty list here silently drops
+          // the filter downstream, so confirm the account can search before
+          // handing back "no such entity".
+          if ((resolveResult.candidates || []).length === 0
+            && await linkedInOutreachService.probeSearchCapability(account_id) === 'degraded') {
+            console.log(`[AgentMode] linkedinOutreach: search-parameters returned 0 candidates and account ${account_id} cannot search`);
+            return this.linkedInSearchUnavailableResponse();
+          }
           // Trim each candidate to id/title/subtitle so the LLM doesn't see internal
           // resolver fields (mirrors the trimming pattern used by search-people above).
           const trimmedCandidates = (resolveResult.candidates || []).map((c: any) => ({
@@ -31008,6 +31696,28 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       return { success: false, error: 'At least one search filter is required: keywords, search_url, cursor, or a structured filter (title, company, location, industry, school)' };
     }
 
+    // Access check (ENG-1049): this function creates leads (batchCreateLeads
+    // below), and is called directly by the import_leads_from_search Emma tool
+    // — bypassing the canDestructiveCrmList check that crm.ts's POST
+    // /lists/:listId/leads/find route applies before calling this same method.
+    // Without this, any same-org member could import leads into another
+    // member's list via Emma chat.
+    try {
+      const { crmDb: accessCrmDb } = await import('./db');
+      const accessList = await accessCrmDb.getLeadListById(listId);
+      if (!accessList) {
+        return { success: false, error: 'The specified lead list does not exist' };
+      }
+      const { canDestructiveCrmList, CRM_EDITOR_REQUIRED_MESSAGE } = await import('./crmAccessControl');
+      if (!(await canDestructiveCrmList(userId, accessList))) {
+        return { success: false, error: CRM_EDITOR_REQUIRED_MESSAGE };
+      }
+    } catch (err) {
+      // Fail closed — an access-check failure must never silently allow the
+      // write. Distinct from the cosmetic, fail-soft list lookups below.
+      return { success: false, error: 'Failed to verify list access' };
+    }
+
     // Resolve account: user's own or platform-wide fallback
     const accountId = await linkedInOutreachService.resolveAccountId(userId);
     if (!accountId) {
@@ -31062,9 +31772,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     let lastFetchCursor: string | null | undefined = nextCursor;
     let safetyCapHit = false;
     let searchError: string | null = null;
+    let searchUnavailable = false;
     const allErrors: string[] = [];
-    const allCreated: Array<{ leadId: string; email?: string }> = [];
-    const allMappedLeadsPreview: any[] = []; // first-5 preview only
+    // `lead` is the mapped payload the record was written from — the response
+    // preview is derived from this so it can only ever describe real writes.
+    const allCreated: Array<{ leadId: string; email?: string; lead?: any }> = [];
+    // Out-of-network "LinkedIn Member" hits dropped before the write.
+    let anonymizedSkipped = 0;
 
     while (iterationCount < MAX_ITERATIONS) {
       iterationCount++;
@@ -31096,7 +31810,27 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       const items = Array.isArray(searchResult?.items) ? searchResult.items : [];
       nextCursor = searchResult?.cursor ?? null;
 
-      if (items.length === 0) break;
+      if (items.length === 0) {
+        // ENG-975: breaking here with nothing imported reports "No results found
+        // for the given search criteria." — which is also exactly what a schedule
+        // whose account has lost people-search capability produces, making a
+        // silent no-op look like an honest empty. Only the FIRST fetch of this
+        // call is ambiguous; a later page running dry is normal exhaustion.
+        //
+        // That first fetch is ambiguous even when it resumes from a cursor. A
+        // recurring schedule persists its cursor per (list, criteria) and picks
+        // it up on the next run without the caller ever passing one, so keying
+        // off "no cursor" would exempt precisely the repeat-schedule case this
+        // bug was reported from. The probe settles it either way: an exhausted
+        // search on a healthy account answers 'ok' and still reports the plain
+        // empty, at the cost of one broad query per account per 10 minutes.
+        if (iterationCount === 1
+          && await linkedInOutreachService.probeSearchCapability(accountId) === 'degraded') {
+          searchUnavailable = true;
+          searchError = LINKEDIN_SEARCH_UNAVAILABLE_GUIDANCE;
+        }
+        break;
+      }
       totalFetched += items.length;
 
       // Map Unipile search result fields → CRM lead fields, then resolve
@@ -31151,14 +31885,35 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return lead;
       });
 
+      // Phase 1b (ENG-1002): drop anonymized / identity-less hits BEFORE any
+      // further work. LinkedIn returns out-of-network profiles as the
+      // placeholder "LinkedIn Member" with no public identifier; persisting
+      // one produces a nameless, emailless, un-linkable record that can never
+      // be dedup'd — so every subsequent run of the same search creates
+      // another copy. Skipping them also means the top-up loop keeps
+      // paginating until it finds `limit` genuinely usable leads.
+      const candidates: Array<{ lead: any; item: any }> = [];
+      for (let i = 0; i < leads.length; i++) {
+        if (isAnonymizedSearchLead(leads[i])) {
+          anonymizedSkipped++;
+          continue;
+        }
+        candidates.push({ lead: leads[i], item: items[i] });
+      }
+      const importable: any[] = candidates.map((c) => c.lead);
+      if (importable.length === 0) {
+        if (!nextCursor) break;
+        continue;
+      }
+
       // Phase 2: Tier 3 — one batched Gemini Flash call for all titles still
       // missing a company. Skipped entirely when no candidates remain.
       const llmIndices: number[] = [];
       const llmTitles: string[] = [];
-      for (let i = 0; i < leads.length; i++) {
-        if (!leads[i].company && typeof leads[i].title === 'string' && leads[i].title) {
+      for (let i = 0; i < importable.length; i++) {
+        if (!importable[i].company && typeof importable[i].title === 'string' && importable[i].title) {
           llmIndices.push(i);
-          llmTitles.push(leads[i].title);
+          llmTitles.push(importable[i].title);
         }
       }
       if (llmTitles.length > 0) {
@@ -31167,7 +31922,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           const results = await batchParseCompaniesFromTitlesWithLLM(llmTitles, llmClient, userId);
           for (let k = 0; k < llmIndices.length; k++) {
             const v = results[k];
-            if (v && v !== 'NONE') leads[llmIndices[k]].company = v;
+            if (v && v !== 'NONE') importable[llmIndices[k]].company = v;
           }
         } catch (e: any) {
           console.warn('[importLeadsFromSearch] LLM batch company-parse failed:', e?.message ?? String(e));
@@ -31175,8 +31930,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       }
 
       // Phase 3: Tier 4 — Unipile getProfile for still-empty leads, parallel.
-      await Promise.all(items.map(async (item: any, idx: number) => {
-        const lead = leads[idx];
+      await Promise.all(candidates.map(async ({ lead, item }) => {
         if (lead.company || !item.public_identifier || !accountId) return;
         try {
           const { getUnipileProfileService } = await import('./unipileProfileServiceFactory');
@@ -31192,18 +31946,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         }
       }));
 
-      const result = await crmDb.batchCreateLeads(listId, leads);
+      const result = await crmDb.batchCreateLeads(listId, importable);
       cumulativeNew += result.newCount ?? 0;
       cumulativeMerged += result.mergedCount ?? 0;
       if (Array.isArray(result.errors) && result.errors.length) allErrors.push(...result.errors);
       const created = Array.isArray((result as any).created) ? (result as any).created : [];
-      if (created.length) allCreated.push(...created);
-
-      if (allMappedLeadsPreview.length < 5) {
-        for (const lead of leads) {
-          if (allMappedLeadsPreview.length >= 5) break;
-          allMappedLeadsPreview.push(lead);
-        }
+      // Carry the source row alongside each created id so the response preview
+      // is built from the records that were actually written — not from every
+      // candidate we looked at (ENG-1002). Rows that dedup'd into an existing
+      // lead, or that were unchanged no-ops, never appear in `created`.
+      for (const entry of created) {
+        const source = typeof entry?.sourceIndex === 'number' ? importable[entry.sourceIndex] : undefined;
+        allCreated.push({ ...entry, lead: source });
       }
 
       if (cumulativeNew >= limit) break;
@@ -31270,13 +32024,18 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       cursor: resumeCursor,
       iterations: iterationCount,
       trimmed: trimmedCount,
+      anonymizedSkipped,
       safetyCapHit,
     };
     if (searchError) response.searchError = searchError;
+    if (searchUnavailable) response.searchUnavailable = true;
     if (cumulativeNew === 0 && totalFetched === 0 && !searchError) {
       response.message = 'No results found for the given search criteria.';
+    } else if (cumulativeNew === 0 && anonymizedSkipped > 0 && !searchError) {
+      response.message = `${anonymizedSkipped} search result(s) were out-of-network LinkedIn profiles with no name or profile URL and were not imported. Widen the search or connect a LinkedIn account with closer network reach.`;
     }
-    response.importedLeads = allMappedLeadsPreview;
+    // Preview strictly the records that were written and survived trimming.
+    response.importedLeads = allCreated.slice(0, 5).map((c) => c.lead).filter(Boolean);
 
     if (auto_enrich && cumulativeNew > 0) {
       const newLeadIds: string[] = allCreated.map((c) => c.leadId);

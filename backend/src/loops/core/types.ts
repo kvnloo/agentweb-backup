@@ -374,6 +374,13 @@ export interface LoopRunResult {
   eventsScanned: number;
   /** Proposals the policy layer produced. */
   proposals: readonly MutationProposal<unknown>[];
+  /**
+   * How many proposals the per-cycle cap dropped (ENG-820). Surfaced so a digest
+   * can say "showing 8 of N" instead of rendering a truncated slice that reads
+   * as the complete set — every digest said "Failing tools: 8" and none of them
+   * mentioned that 8 was a ceiling.
+   */
+  proposalsTruncated?: number;
   /** Mutations the tools layer materialized. May be fewer than proposals if
    * business rules filtered some out. */
   mutations: readonly Mutation[];

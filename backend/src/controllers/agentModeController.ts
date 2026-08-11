@@ -22,6 +22,8 @@ import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } fro
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
 import { MAX_PUBLISH_PRESS_ATTEMPTS, isPublishOnlyUnmet, shouldStopPressingForPublish } from '../utils/publishPressCircuitBreaker';
+import { resolvePublishAuthorized } from '../utils/schedulePublishApproval';
+import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
   isRunStoreEnabled,
@@ -903,6 +905,8 @@ const CADENCE_SKIP_PATTERNS: RegExp[] = [
   /\btoday\s+is\s+(?:not\s+a\s+(?:publishing|posting)\s+day|a\s+(?:non-?publishing|skip|rest|off)\s+day)\b/i,
   /\b(?:rest|off|skip|non-?publishing)\s+day\s+for\s+this\s+(?:schedule|cadence)\b/i,
   /\bcreat(?:e|ing)\s+and\s+publish(?:ing)?\s+nothing\b/i,
+  // Self-contained because it names the publishing window itself (ENG-844 audit).
+  /\boutside\s+(?:the\s+|its\s+|this\s+)?(?:publish(?:ing)?|post(?:ing)?)\s+(?:window|cadence|days?|schedule)\b/i,
 ];
 
 // A bare skip declaration. On its own this is ambiguous (a failure can be worded
@@ -912,6 +916,12 @@ const SKIP_DECLARATION_PATTERNS: RegExp[] = [
   /\bskipp?(?:ing|ed)?\s+(?:today|this\s+(?:run|cycle|schedule|post))\b/i,
   /\bno\s+(?:post|publishing|publish)\s+(?:today|scheduled\s+(?:for\s+)?today)\b/i,
   /\bnothing\s+to\s+(?:post|publish)\s+today\b/i,
+  // Real phrasings a model reaches for that the original set missed (audited against
+  // production skip transcripts, ENG-844). Each still requires a CADENCE_RATIONALE
+  // match in the same turn, so none of these can authorize a skip on its own.
+  /\bstanding\s+down\b/i,
+  /\bno\s+action\s+(?:taken|needed|required)\b/i,
+  /\b(?:no\s+(?:content|posts?|images?)\s+(?:was|were)\s+(?:produced|created|generated|published)|nothing\s+(?:was|were)\s+(?:produced|created|generated|published))\b/i,
 ];
 
 // Evidence the skip is driven by the schedule's PUBLISHING CADENCE (a weekday
@@ -929,16 +939,49 @@ const CADENCE_RATIONALE_PATTERNS: RegExp[] = [
 
 // A run that hit a FAILURE (missing access, auth, timeout, tool error) is NOT a
 // cadence skip — it must still retry + alert. Any of these veto the carve-out.
-const SKIP_FAILURE_SIGNAL_PATTERNS: RegExp[] = [
-  // Contractions only fire on a real apostrophe so words like "current" (…nt) do
-  // not false-veto: couldn't, wasn't, isn't, can't, don't, won't, …
-  /\b\w+n['’]t\b/i,
-  /\b(?:cannot|could\s+not|was\s+not\s+able|were\s+not\s+able|not\s+able\s+to|unable\s+to)\b/i,
+// HARD failure signals: unambiguous evidence something broke. These veto wherever
+// they appear (after the zero-ledger neutralisation below).
+const HARD_FAILURE_PATTERNS: RegExp[] = [
   /\b(?:failed(?:\s+to)?|failure|errored?|an?\s+error|timed?\s*out|time[\s-]?out)\b/i,
-  /\b(?:unauthori[sz]ed|not\s+authori[sz]ed|no\s+access|access\s+denied|permission\s+denied|forbidden|rate[\s-]?limit)\b/i,
+  /\b(?:unauthori[sz]ed|not\s+authori[sz]ed|access\s+denied|permission\s+denied|forbidden|rate[\s-]?limit)\b/i,
   /\bauth(?:entication|orization)?\s+(?:fail(?:ed|ure)?|error|issue|problem)\b/i,
   /\b(?:token\s+expired|invalid\s+(?:token|credential))/i,
+  /\bdid\s+not\s+work\b/i,
 ];
+
+// INABILITY / REFUSAL phrasing. This is genuinely ambiguous: on a skip day
+// "I cannot post today because the cadence forbids it" is a correct REFUSAL, while
+// "I could not access LinkedIn" is a FAILURE. The original rule vetoed on ANY
+// `\w+n't` contraction, which silently rejected the most natural ways to describe a
+// legitimate skip — "today isn't a publishing day", "I won't publish anything
+// today", "I didn't create anything" — the same phrasing-fragility class that caused
+// the 2026-08-06 production regression (ENG-844). So these veto ONLY when the
+// sentence does not justify itself by the cadence, or when it names an external
+// resource (which turns a refusal into a report of a broken dependency).
+const INABILITY_PATTERNS: RegExp[] = [
+  /\b(?:cannot|could\s+not|was\s+not\s+able|were\s+not\s+able|not\s+able\s+to|unable\s+to|would\s+not|refused)\b/i,
+];
+
+// An external dependency named alongside an inability means it is a failure report
+// ("LinkedIn would not accept the post"), not a cadence refusal.
+const FAILURE_RESOURCE_PATTERN =
+  /\b(?:linkedin|instagram|twitter|facebook|api|endpoint|server|network|gateway|upstream|http|token|credential|account)\b/i;
+
+// "no access" is only an auth failure when it is about an external resource
+// ("no access to the LinkedIn account"). On its own it is ordinary prose — e.g.
+// "no access to the calendar was needed" — and must not veto a legitimate skip.
+const NO_ACCESS_PATTERN = /\bno\s+access\b/i;
+
+// Expand contractions so the veto reasons about words, not apostrophes: "couldn't"
+// → "could not" (still an inability), while "isn't"/"didn't"/"won't" become plain
+// negations that no longer trip anything by themselves.
+function expandContractions(text: string): string {
+  return text
+    .replace(/\bcan['’]t\b/gi, 'cannot')
+    .replace(/\bwon['’]t\b/gi, 'will not')
+    .replace(/\bshan['’]t\b/gi, 'shall not')
+    .replace(/\b(\w+)n['’]t\b/gi, '$1 not');
+}
 
 const WEEKDAY_NAMES = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
 
@@ -969,11 +1012,18 @@ const SCHEDULE_SKIP_AUTHORIZATION_PATTERNS: RegExp[] = [
   /\bnot\s+a\s+(?:publishing|posting)\s+day\b/i,
   /\bif\b[^.]*\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post))/i,
   /\b(?:skip|publish\s+nothing|post\s+nothing|no\s+post)\b[^.]*\b(?:mon|tue|wed|thu|fri|sat|sun|weekend|weekday)/i,
+  // A negative cadence stated directly — "DO NOT create or publish anything on
+  // Tue/Thu", "doesn't publish on weekends" (contractions are expanded first). The
+  // object between the negation and the verb is why the `if …` pattern above missed
+  // these (ENG-844 audit).
+  /\b(?:do|does|will|should)\s+not\b[^.]{0,40}?\b(?:publish|post|create|generate)\b/i,
 ];
 
 function instructionAuthorizesConditionalSkip(instruction: string): boolean {
   if (!instruction || typeof instruction !== 'string') return false;
-  const text = instruction.replace(/<[^>]+>/g, ' ');
+  // Expand contractions here too, so an owner who wrote "doesn't publish on
+  // weekends" is read the same as "does not publish on weekends" (ENG-844 audit).
+  const text = expandContractions(instruction.replace(/<[^>]+>/g, ' '));
   return SCHEDULE_SKIP_AUTHORIZATION_PATTERNS.some((re) => re.test(text));
 }
 
@@ -1065,17 +1115,34 @@ function parseScheduleCadence(instruction: string): { publishDays: Set<number>; 
   const publishDays = new Set<number>();
   const skipDays = new Set<number>();
   if (!instruction || typeof instruction !== 'string') return { publishDays, skipDays };
-  const text = instruction.replace(/<[^>]+>/g, ' ');
-  const skipKeyword = /\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|do\s*n['’o]?t\s+(?:publish|post)|don['’]t\s+(?:publish|post)|non-?publishing|not\s+a\s+(?:publishing|posting)\s+day)\b/i;
-  const publishOnlyKeyword = /\b(?:publish|post|publishing)\s+only\b|\bonly\s+(?:publish|post|on)\b/i;
+  const text = expandContractions(instruction.replace(/<[^>]+>/g, ' '));
+  // "do not publish" must tolerate an intervening object — real instructions say
+  // "DO NOT create or publish anything" (ENG-844 audit). Contractions are already
+  // expanded above, so only the "do not" form needs matching here.
+  const skipKeyword =
+    /\b(?:skip|publish\s+nothing|post\s+nothing|create\s+(?:and\s+publish\s+)?nothing|non-?publishing|not\s+a\s+(?:publishing|posting)\s+day)\b|\b(?:do|does|will|should)\s+not\b[^.;\n]{0,40}?\b(?:publish|post|create|generate)\b/i;
+  // NB the inflections: `only\s+(?:publish|post)\b` does NOT match "only publishes",
+  // which is the single most common way owners write a cadence. That omission left
+  // publishDays EMPTY for the LUCAS schedule; it only ever corroborated because its
+  // skip clause happened to quote the words "non-publishing day". Any owner who
+  // wrote just "only publishes on Mon/Wed/Fri" got no cadence at all and every skip
+  // failed closed into the retry press (ENG-844 audit).
+  const publishOnlyKeyword =
+    /\b(?:publish|post|publishing)(?:es|s)?\s+only\b|\bonly\s+(?:publish|post)(?:es|ing|s)?\b|\bonly\s+on\b/i;
   for (const clause of text.split(/[.;\n]+/)) {
     const days = weekdaysInFragment(clause);
     if (days.length === 0) continue;
     const isSkip = skipKeyword.test(clause);
     const isPublishOnly = publishOnlyKeyword.test(clause);
     // A "publish only on <days>" clause names the PUBLISH days; a skip clause names
-    // the SKIP days. Publish-only wins a tie (its days are the positive cadence).
-    if (isPublishOnly) days.forEach((d) => publishDays.add(d));
+    // the SKIP days. A clause naming the verb ("publish only" / "only publishes") is
+    // an unambiguous positive cadence and wins. A bare "only on <days>" is a WEAK
+    // signal — "skip only on Saturday" also contains it — so when the clause also
+    // reads as a skip, the skip interpretation wins (otherwise Saturday would be
+    // recorded as a PUBLISH day and every legitimate Saturday skip rejected).
+    const strongPublishOnly =
+      /\b(?:publish|post|publishing)(?:es|s)?\s+only\b|\bonly\s+(?:publish|post)(?:es|ing|s)?\b/i.test(clause);
+    if (strongPublishOnly || (isPublishOnly && !isSkip)) days.forEach((d) => publishDays.add(d));
     else if (isSkip) days.forEach((d) => skipDays.add(d));
   }
   return { publishDays, skipDays };
@@ -1214,7 +1281,12 @@ export function scheduledRunSignalsConditionalSkip(
   // weekday assertion and a "<td>Failed</td><td>0</td>" completion ledger is read
   // as prose. Verified against the real ENG-844 session (442e7880…): both
   // happened, and without this the carve-out never fired on the actual skip.
-  const text = content.replace(/<[^>]+>/g, ' ');
+  // Contractions are expanded up-front so EVERY stage reasons about words rather
+  // than apostrophes. Without this, the most natural skip phrasing of all —
+  // "today isn't a publishing day" — never even matched the cadence-skip patterns
+  // (which look for "not a publishing day"), so the run was never recognised as a
+  // skip (ENG-844 audit).
+  const text = expandContractions(content.replace(/<[^>]+>/g, ' '));
 
   // (1) Must be a cadence-anchored skip, not a bare "skip today".
   const isCadenceSkip =
@@ -1226,17 +1298,49 @@ export function scheduledRunSignalsConditionalSkip(
   // (2) A failure worded as a skip is not a cadence skip. But FIRST neutralize a
   // zero/none-valued failure ledger — a clean run routinely reports "Failed: 0" /
   // "Failed  0" (a "<td>Failed</td><td>0</td>" cell) / "failures: none", which is
-  // a SUCCESS signal, not a failure. Only the ledger's own value is dropped
-  // (label THEN count); a nonzero or asserted failure ("Failed 1", "post failed",
-  // "auth failed", "couldn't reach the API") is untouched and still vetoes. NB:
-  // matching a zero that PRECEDES the word (`0 failed`) is deliberately avoided —
-  // once tags are stripped, the prior ledger row's count ("Succeeded 0") sits
-  // right before the next row's "Failed" and would falsely neutralize it.
-  const failureScan = text.replace(
-    /\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi,
-    ' '
+  // a SUCCESS signal, not a failure. A nonzero or asserted failure ("Failed 1",
+  // "post failed", "auth failed", "couldn't reach the API") is untouched and still
+  // vetoes.
+  //
+  // BOTH orders must be neutralized (prod regression, session 25ec4670 on
+  // 2026-08-06): agents also write the count FIRST, as an inline ledger —
+  // "Ledger: 0 attempted / 0 succeeded / 0 failed / 0 queued." Only handling
+  // label-then-count let the bare word "failed" survive there and veto a perfectly
+  // legitimate cadence skip, sending the run into the full 20-attempt retry press
+  // this ticket exists to prevent.
+  //
+  // The count-then-label rule carries a negative lookahead for a FOLLOWING nonzero
+  // count, which is what makes it safe: a stripped HTML table renders as
+  // "Succeeded 0 Failed 1", where the "0" belongs to the PREVIOUS row — there,
+  // "Failed" is followed by "1", so it is left intact and still vetoes.
+  //
+  // That lookahead must tolerate PUNCTUATION between the label and its own count
+  // (Greptile P1): "Succeeded 0 Failed, 1" / "… Failed; 1" / "… Failed | 1" all bind
+  // the 1 to "Failed", but a separator class of only [:=-] failed to see it, so the
+  // "0 Failed" was neutralised and a reported failure was waived as a clean skip.
+  // Widening the class is strictly fail-CLOSED — it can only make the veto fire more
+  // often, never less — and the real production ledger is unaffected because every
+  // count after "0 failed" there is itself a zero ("0 failed / 0 queued").
+  const failureScan = expandContractions(
+    text
+      .replace(/\b(?:failed|failures?|errors?|errored)\b\s*[:=-]?\s*(?:0+|zero|none)\b/gi, ' ')
+      .replace(/\b(?:0+|zero|none)\s*[:=-]?\s*(?:failed|failures?|errors?|errored)\b(?!\s*[,;:=|/–—-]?\s*\d*[1-9])/gi, ' ')
   );
-  if (SKIP_FAILURE_SIGNAL_PATTERNS.some((re) => re.test(failureScan))) return false;
+  // (2a) Hard failure evidence vetoes anywhere in the turn.
+  if (HARD_FAILURE_PATTERNS.some((re) => re.test(failureScan))) return false;
+  // (2b) Inability/refusal is judged PER SENTENCE: it only vetoes when the sentence
+  // does not justify itself by the cadence, or when it names an external resource
+  // (a broken dependency rather than a deliberate refusal).
+  for (const sentence of failureScan.split(/[.;!?\n]+/)) {
+    // "no access" + a named external resource is an auth failure.
+    if (NO_ACCESS_PATTERN.test(sentence) && FAILURE_RESOURCE_PATTERN.test(sentence)) return false;
+    if (!INABILITY_PATTERNS.some((re) => re.test(sentence))) continue;
+    const cadenceJustified =
+      CADENCE_RATIONALE_PATTERNS.some((re) => re.test(sentence)) ||
+      CADENCE_SKIP_PATTERNS.some((re) => re.test(sentence));
+    if (cadenceJustified && !FAILURE_RESOURCE_PATTERN.test(sentence)) continue;
+    return false;
+  }
 
   // (3) Non-spoofable ledger check: a legitimate cadence skip makes NO write calls
   // AND no tool errors. Any tool error means this was a failure, not a skip; any
@@ -1467,15 +1571,59 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 // write-back now"). Budget truncation comes next (also a hard state signal); a
 // confirmation halt takes precedence over a plain unfinished-work admission so
 // the continuation message can be tailored to "proceed best-effort".
+// ENG-803: the terminal marker a publish-withheld run is instructed to end on (see
+// the approval-required branch of getScheduledSessionOverride).
+//
+// Without this the fix would loop the very runs it protects. A withheld run
+// correctly ends by saying its drafts are saved and nothing was posted — wording
+// that the confirmation detector reads as "awaiting … approval", i.e. a run halting
+// for a human answer. It would then be nudged to continue, on a schedule whose owner
+// asked it NOT to publish, which is the ~21-turn nudge loop this whole area exists to
+// avoid. The marker is emitted only on the withheld branch, so it distinguishes a
+// deliberate, complete withhold from a genuine mid-run halt.
+const PUBLISH_WITHHELD_MARKER = /PUBLISH WITHHELD:\s*this schedule requires approval before publishing/i;
+
+// NOTE: this matches MODEL-AUTHORED text, so on its own it proves nothing. Callers
+// must confirm the run was actually withheld before honouring it — see the
+// publishAuthorized parameter on the classifiers below (Greptile review #20).
+export function scheduledRunWithheldPublish(content?: string): boolean {
+  if (!content || typeof content !== 'string') return false;
+  return PUBLISH_WITHHELD_MARKER.test(content);
+}
+
+/**
+ * ENG-803: may this run's publish-withheld marker be honoured?
+ *
+ * The marker is text the MODEL wrote, so trusting it alone re-opens the exact hole
+ * this ticket is about (Greptile review #20): an AUTHORIZED run that simply does not
+ * want to post can emit the sentence, suppress its own corrective continuation, and
+ * finish "successfully" having published nothing. That is the fabricated publishing
+ * constraint again, except this time the platform hands it a machine-readable way to
+ * escape the nudge.
+ *
+ * So the marker is only honoured when the schedule ACTUALLY withheld authorization —
+ * an explicit `false` resolved from the record. `undefined` (a caller with no
+ * schedule to read) deliberately does NOT exempt: the two failure modes are not
+ * symmetric. Refusing the exemption costs a genuinely-withheld run one extra
+ * continuation, bounded by completionGateMaxContinuations; granting it on an unknown
+ * lets any run talk its way out of a mandated publish.
+ */
+function withholdIsGenuine(content: string, publishAuthorized?: boolean): boolean {
+  return publishAuthorized === false && scheduledRunWithheldPublish(content);
+}
+
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}): ScheduledContinuationReason | null {
+}, publishAuthorized?: boolean): ScheduledContinuationReason | null {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
-  if (scheduledRunAwaitsConfirmation(content)) return 'confirmation';
+  // ENG-803: a deliberate publish-withhold is a COMPLETE terminal state, not a halt
+  // awaiting an answer. Suppress only 'confirmation' — a withheld run can still be
+  // genuinely truncated or leave other work unfinished, and those must still continue.
+  if (!withholdIsGenuine(content, publishAuthorized) && scheduledRunAwaitsConfirmation(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
@@ -1541,6 +1689,40 @@ export async function scheduledTurnDefersToUser(content: string): Promise<boolea
   }
 }
 
+/**
+ * ENG-803: resolve the publish authorization that is true RIGHT NOW.
+ *
+ * A scheduled run lives for minutes, and the owner can flip "Require approval before
+ * publishing" while it is in flight. The prompt builder
+ * (agentModeService.resolveScheduledPublishAuthorized) and the dispatch guard
+ * (blockedByScheduledPublishApproval) both re-read the record at the moment they act,
+ * so a snapshot taken when the worker loaded the schedule can disagree with both
+ * (Greptile review #30). The disagreement is not cosmetic: with a stale `false`, an
+ * owner who has just AUTHORIZED publishing gets a run whose model-authored
+ * `PUBLISH WITHHELD` marker is still believed, suppressing the corrective
+ * continuation — ENG-803's original "finished without posting" failure, rebuilt out
+ * of a cache. So this reads the record, exactly like the other two consumers, and
+ * feeds the same pure `resolvePublishAuthorized`.
+ *
+ * A READ FAILURE RETURNS undefined, NOT false. `false` is the one value that makes
+ * the marker believable, so inventing it from a DynamoDB blip would let an unverified
+ * model-authored sentence end the run. `undefined` withholds the exemption instead:
+ * the run spends one more bounded continuation, and any genuinely unauthorized
+ * publish it then attempts is still refused by the dispatch guard, which does its own
+ * independent read. The two layers fail in opposite directions on purpose.
+ */
+async function resolveLivePublishAuthorized(scheduleId: string): Promise<boolean | undefined> {
+  try {
+    return resolvePublishAuthorized(await scheduleDb.getScheduleById(scheduleId) as any);
+  } catch (error) {
+    console.error(
+      `AgentMode ENG-803: could not re-read schedule ${scheduleId} to verify a publish-withheld marker; refusing the exemption rather than trusting model-authored text:`,
+      error
+    );
+    return undefined;
+  }
+}
+
 // Async classifier used at the completion-gate decision points. Identical to the
 // sync classifier except the 'confirmation' case also consults the LLM judge when
 // the regex misses — so an unanticipated halt phrasing still triggers the
@@ -1549,11 +1731,20 @@ export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
   toolCalls?: any[];
-}): Promise<ScheduledContinuationReason | null> {
+}, resolvePublishAuthorizedNow?: () => Promise<boolean | undefined>): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
   if (response?.truncatedByStepBudget === true) return 'budget';
   const content = response?.content || '';
-  if (await scheduledTurnDefersToUser(content)) return 'confirmation';
+  // ENG-803: resolve authorization LAZILY — only a turn that actually emitted the
+  // marker can be exempted, so a turn without one must not pay for a schedule read.
+  // Absent resolver (callers with no schedule) stays `undefined`, which never exempts.
+  const publishAuthorized = scheduledRunWithheldPublish(content)
+    ? await resolvePublishAuthorizedNow?.()
+    : undefined;
+  // ENG-803: same withhold exemption as the sync classifier above — and it must be
+  // checked BEFORE the LLM judge, which would otherwise be asked to rule on text
+  // that is deliberately shaped like a deferral.
+  if (!withholdIsGenuine(content, publishAuthorized) && await scheduledTurnDefersToUser(content)) return 'confirmation';
   if (scheduledRunSignalsIncompleteWork(content)) return 'unfinished';
   return null;
 }
@@ -1637,6 +1828,13 @@ export async function runVerifiedChat(
     // rather than dropped into a void no one will ever action. Fail-safe default
     // means a NEW headless caller is covered automatically (no drift).
     parkNotifiable?: boolean;
+    // ENG-803: reads this run's publish authorization AS IT IS NOW. Used ONLY to
+    // decide whether the model's publish-withheld marker may be believed — see
+    // withholdIsGenuine. Deliberately a resolver rather than a value: the owner can
+    // change the setting mid-run, and a snapshot would disagree with the prompt
+    // builder and the dispatch guard, which both re-read it (Greptile review #30).
+    // Undefined for callers with no schedule, which never honour the marker.
+    publishAuthorized?: () => Promise<boolean | undefined>;
     // ENG-657: tool calls already made in a PRIOR (abandoned) portion of this
     // session that this run is RESUMING. Seeded into the run's accumulated tool
     // calls so keyword/required-function verification counts the whole task, not
@@ -1668,7 +1866,8 @@ export async function runVerifiedChat(
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
-    parkNotifiable = false
+    parkNotifiable = false,
+    publishAuthorized
   } = params;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
@@ -2005,7 +2204,7 @@ export async function runVerifiedChat(
         const continuationReason = await classifyScheduledContinuationAsync({
           ...continuationResponse,
           toolCalls: allToolCalls,
-        });
+        }, publishAuthorized);
         if (
           completionGateContinuationsUsed < completionGateMaxContinuations &&
           attempt < maxAttempts &&
@@ -2334,7 +2533,7 @@ export async function runVerifiedChat(
             // (name + arguments + result), not just this turn's — an earlier attempt
             // may hold the unmatched, still-uncommitted preview.
             toolCalls: allToolCalls,
-          })
+          }, publishAuthorized)
         : null;
       if (gateEligible && responseContinuationReason !== null) {
         completionGateContinuationsUsed++;
@@ -3134,6 +3333,11 @@ export async function runScheduledChat(
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
       fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-803: re-read at the moment the marker is evaluated, so the continuation
+      // classifier uses the SAME live decision as the prompt builder and the dispatch
+      // guard. A snapshot taken here would go stale the moment the owner toggles the
+      // setting mid-run (Greptile review #30).
+      publishAuthorized: () => resolveLivePublishAuthorized(schedule.scheduleId),
       // ENG-636: a scheduled park IS notifiable — the block below emails the owner
       // and records a `pending_user_input` outcome, so a park reaches a human.
       parkNotifiable: true,
@@ -3211,7 +3415,24 @@ export async function runScheduledChat(
 
     // Generate a 2-3 word summary and update the session title
     try {
-      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content);
+      // ENG-803: ground the title suffix in the tools that actually ran, so a run
+      // that posted nothing cannot be titled "Replies queued".
+      //
+      // SUCCEEDED, not merely ATTEMPTED (Greptile review #19). The ledger keeps
+      // failed and preflight-rejected calls too, so passing every name through would
+      // hand the summarizer a `twitter_manage_post` entry for a call that errored —
+      // and it would faithfully title the run "Replies Posted". That is precisely
+      // ENG-803's false-success title, re-created by the fix meant to prevent it.
+      //
+      // A call counts only when it has no top-level `error` (the repo-wide failure
+      // marker — see countFailedToolCalls) and its result did not report
+      // success:false, which is how preflight rejections come back while still
+      // looking like a completed call.
+      const succeededToolNames = (result.toolCalls || [])
+        .filter(toolCallSucceeded)
+        .map((call: any) => call?.name)
+        .filter(Boolean);
+      const summary = await agentModeService.generateScheduledChatSummary(resolvedStartingMessage, result.content, succeededToolNames);
       if (summary) {
         generatedSummary = summary;
         const summaryTitle = `${sessionTitle} — ${summary}`;
@@ -6817,6 +7038,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
+        requirePublishApproval,
         timezone
       } = req.body;
 
@@ -6897,6 +7119,13 @@ export const agentModeController = {
         // blocking question (incl. immutable) instead of parking — an opt-in waiver
         // of the human gate on irreversible decisions. Default off.
         fullAutonomy: fullAutonomy === true,
+        // ENG-803: owner opt-OUT that holds this schedule's runs at the publish step.
+        // Default false = publish, which is what scheduled runs have always done, so
+        // no existing schedule changes behaviour. Kept distinct from fullAutonomy
+        // (consent to decide unaided is a different question from consent to post)
+        // and absent from the manage_scheduled_chat MCP allowlist, so only a human
+        // can set it.
+        requirePublishApproval: requirePublishApproval === true,
         // ENG-844: owner's IANA timezone for cadence evaluation (omitted when the
         // client didn't send one — the cadence check then falls back to UTC).
         ...(isValidIanaTimeZone(timezone) ? { timezone } : {}),
@@ -7022,6 +7251,7 @@ export const agentModeController = {
         frequencyIntervalDays,
         selfImprove,
         fullAutonomy,
+        requirePublishApproval,
         timezone
       } = req.body;
 
@@ -7094,6 +7324,11 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
+        // ENG-803: owner opt-out from unattended publishing. Partial-update safe — an
+        // update that omits the field must never silently set or clear it.
+        requirePublishApproval: requirePublishApproval !== undefined
+          ? (requirePublishApproval === true)
+          : ((existingSchedule as any).requirePublishApproval || false),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),

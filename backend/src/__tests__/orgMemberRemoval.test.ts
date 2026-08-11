@@ -42,6 +42,9 @@ const mockGetOrgMembers = jest.fn();
 const mockUpdateOrg = jest.fn();
 const mockDynamoGet = jest.fn();
 const mockDynamoPut = jest.fn();
+const mockGetLeadListsByUserId = jest.fn();
+const mockDeleteLeadList = jest.fn();
+const mockTransferLeadListOwner = jest.fn();
 
 // ── Jest mocks ──────────────────────────────────────────────────────────────
 jest.mock("../services/db", () => ({
@@ -62,6 +65,11 @@ jest.mock("../services/db", () => ({
     getTasksByUserId: mockGetTasksByUserId,
     deleteTask: mockDeleteTask,
     updateTaskOwner: mockUpdateTaskOwner,
+  },
+  crmDb: {
+    getLeadListsByUserId:  (...a: any[]) => mockGetLeadListsByUserId(...a),
+    deleteLeadList:        (...a: any[]) => mockDeleteLeadList(...a),
+    transferLeadListOwner: (...a: any[]) => mockTransferLeadListOwner(...a),
   },
 }));
 
@@ -159,6 +167,7 @@ const allDelete = {
   skills: "delete",
   funnels: "leave",
   analytics: "leave",
+  crm: "leave",
 };
 
 /** All-transfer decisions */
@@ -170,6 +179,7 @@ const allTransfer = {
   skills: "transfer",
   funnels: "leave",
   analytics: "leave",
+  crm: "leave",
 };
 
 /** All-leave decisions */
@@ -181,6 +191,7 @@ const allLeave = {
   skills: "leave",
   funnels: "leave",
   analytics: "leave",
+  crm: "leave",
 };
 
 /** Setup normal user mocks (items empty by default) */
@@ -209,6 +220,9 @@ function setupNormalUsers() {
   mockSkillTransferOwner.mockResolvedValue(undefined);
   mockDynamoGet.mockResolvedValue({ Item: undefined });
   mockDynamoPut.mockResolvedValue({});
+  mockGetLeadListsByUserId.mockResolvedValue([]);
+  mockDeleteLeadList.mockResolvedValue(undefined);
+  mockTransferLeadListOwner.mockResolvedValue(undefined);
 }
 
 // ── GET removal-preview tests ────────────────────────────────────────────────
@@ -234,6 +248,7 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
     mockGetWorkPlansByOwner.mockResolvedValue(makeItems(1));
     mockGetSkillsByOwner.mockResolvedValue(makeItems(4));
     mockDynamoGet.mockResolvedValue({ Item: undefined });
+    mockGetLeadListsByUserId.mockResolvedValue([]);
 
     const res = await request(app).get(
       `/api/orgs/me/members/${targetUserId}/removal-preview`
@@ -248,6 +263,7 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
       workPlans: 1,
       skills: 4,
       funnels: 0,
+      crm: 0,
     });
   });
 
@@ -262,6 +278,7 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
     mockGetLandingPagesByOwner.mockResolvedValue([]);
     mockGetWorkPlansByOwner.mockResolvedValue([]);
     mockGetSkillsByOwner.mockResolvedValue([]);
+    mockGetLeadListsByUserId.mockResolvedValue([]);
     // AW-Settings item keyed funnels_<targetUserId> with two funnels
     mockDynamoGet.mockImplementation((params: any) => {
       if (params?.Key?.settingName === `funnels_${targetUserId}`) {
@@ -363,6 +380,7 @@ describe("GET /api/orgs/me/members/:userId/removal-preview", () => {
     mockGetLandingPagesByOwner.mockResolvedValue([]);
     mockGetWorkPlansByOwner.mockResolvedValue([]);
     mockGetSkillsByOwner.mockResolvedValue([]);
+    mockGetLeadListsByUserId.mockResolvedValue([]);
 
     const res = await request(app).get(
       `/api/orgs/me/members/${targetUserId}/removal-preview`
@@ -609,6 +627,7 @@ describe("POST /api/orgs/me/members/:userId/remove", () => {
           skills: "transfer",
           funnels: "leave",
           analytics: "leave",
+          crm: "leave",
         },
       });
 

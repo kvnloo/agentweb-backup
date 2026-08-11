@@ -31,6 +31,10 @@ jobs:
       backend: ${{ steps.filter.outputs.backend }}
       partner: ${{ steps.filter.outputs.partner }}
       workflows: ${{ steps.filter.outputs.workflows }}
+      ebconfig: ${{ steps.filter.outputs.ebconfig }}
+      # ENG-1041: "should this be tested" and "should this reach staging" are
+      # different questions and were one boolean. See the filter step below.
+      backend_deployable: ${{ steps.filter_deploy.outputs.backend_src == 'true' || steps.filter_deploy.outputs.deploy_ci == 'true' }}
     steps:
       # ENG-729: shallow. This workflow only ever runs on `pull_request`, and on
       # that event dorny/paths-filter reads the changed-file list from the
@@ -74,64 +78,105 @@ jobs:
               - 'partner-portal/**'
             workflows:
               - '.github/**'
+            # ENG-1039: the EB config-conflict job classifies only
+            # `.platform/*` and `.ebextensions/*.config` paths (see
+            # eb-config-conflict.sh), yet it ran on every PR — 397 runs /
+            # 480 min in 2026-08-01..10 with no path filter at all. Gate it on
+            # the only paths that can produce a hit, plus its own script and
+            # this workflow (whatever gates merges has to gate its own
+            # changes — ENG-743).
+            ebconfig:
+              - '**/.ebextensions/**'
+              - '**/.platform/**'
+              - '.github/scripts/eb-config-conflict.sh'
+              - '.github/workflows/tests.yml'
+
+      # ENG-1041: the DEPLOY decision, which is not the same question as the
+      # test decision above.
+      #
+      # `backend` answers "should this diff be tested" and is deliberately
+      # broad. `backend-staging-deploy` also read it, so a PR touching only
+      # `backend/src/**/__tests__/**` ran the full build → package → S3 → EB
+      # deploy. The runner minutes (569 billable over 99 executions) are the
+      # cheap half. The expensive half is that this job holds
+      # `concurrency: backend-staging-deploy` — a group keyed on nothing but its
+      # own name, so unlike every other job here it is one GLOBAL lane, and with
+      # `cancel-in-progress: false` an occupant is never preempted. A test-only
+      # PR took that single slot and every real backend PR in the repo queued
+      # behind it.
+      #
+      # WHY THIS IS A SEPARATE STEP and not two more patterns in the filter
+      # above: dorny/paths-filter compiles EACH pattern into its own picomatch
+      # matcher and OR-combines them (`patterns.some(...)`, quantifier defaults
+      # to `some`). A `!`-negated pattern there is therefore not an exclusion —
+      # picomatch returns true for every path OUTSIDE the named one, so
+      # `'backend/**'` + `'!backend/**/__tests__/**'` matches README.md and the
+      # filter is permanently true. The narrowing would read correctly and
+      # silently become a widening that deploys staging on every PR in the repo.
+      # `predicate-quantifier: 'every'` is what makes the negations mean
+      # exclusion, and it is per-step, which is why the broad filter above
+      # cannot host them. Pinned by staging-deploy-gate.test.sh, which fails on
+      # any negated pattern that is not under an `every` step.
+      - name: Paths filter (deployable backend)
+        id: filter_deploy
+        uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # EVERY pattern must match, so the `!` lines below are exclusions.
+          predicate-quantifier: 'every'
+          filters: |
+            backend_src:
+              - 'backend/**'
+              # All 23 test directories are `__tests__`, nested throughout the
+              # tree (backend/src/__tests__, backend/src/services/__tests__,
+              # backend/src/services/agentMode/core/__tests__, …) — excluding
+              # only backend/src/__tests__ would miss most of them. The
+              # *.test.ts globs match nothing today (there are zero colocated
+              # test files); they keep the rule true if that convention changes.
+              - '!backend/**/__tests__/**'
+              - '!backend/**/*.test.ts'
+              - '!backend/**/*.test.js'
+            # ENG-743, carried forward: a change to the deploy path must be
+            # exercised by the deploy path on its own PR, or the next
+            # backend-staging-deploy fix ships unexercised and the first thing
+            # to exercise it is somebody else's backend PR. One brace pattern
+            # rather than two entries because under `every` a second entry would
+            # require BOTH files to change.
+            deploy_ci:
+              - '.github/{workflows/tests.yml,scripts/eb-deploy.sh}'
 
   # Job A: heavy agentMode files (~150 files, ~half the test time)
   backend-tests-a:
     name: Backend tests (agentMode)
-    needs: [detect-changes, greptile-review]
+    needs: [detect-changes]
     # Skip the heavy suite while the PR is a draft: intermediate pushes to a
     # draft (e.g. the autofix pipeline's re-fix/revise commits) shouldn't burn
     # ~26 runner-min they can't gate a merge with. Flipping the PR to Ready
     # fires `ready_for_review` (see triggers) → one authoritative full run.
     #
-    # ENG-915: and hold it behind the Greptile gate. Both used to fire together
-    # on `ready_for_review`, so a review returning below 5/5 burned a complete
-    # sharded run whose result the fix-up push invalidated seconds later —
-    # measured at 212 of 1424 sampled runner-minutes (15%) over 2026-07-21..08-05,
-    # with the gate returning non-success on 15 of 50 completed runs.
+    # ENG-1039: DECOUPLED from the Greptile gate, reversing ENG-915's ordering.
+    # ENG-915 serialized these jobs behind `greptile-review` to save the
+    # runner-minutes a below-5/5 review invalidated. Measured 2026-08-01..10,
+    # the coupling cost more than it saved: the Greptile check failed 61% of
+    # the time (247 failures / 160 successes, 947 min billed on failed polls),
+    # and every failure skipped the test jobs entirely — 303 skipped
+    # executions. Each skip destroyed the run's test evidence, so authors
+    # re-pushed to recover, costing a whole fresh ~31-min backend pair plus
+    # another Greptile poll. A flaky *reviewer* check was deciding whether
+    # *test* evidence exists.
     #
-    # The second saving is larger and less obvious. 42 of the 96 sampled
-    # backend-test jobs ended `cancelled` — 340 runner-minutes, 24% of the
-    # total — because a PR averages 6.6 runs and `cancel-in-progress` kills the
-    # superseded one only once the next push arrives, by which point the tests
-    # have been running for minutes. Waiting on `needs` costs no runner time,
-    # so a push landing inside the gate's ~2 min window now cancels these jobs
-    # before they have consumed anything. Same six lines, both savings.
+    # The merge gate is unchanged: `greptile-review` remains a required check
+    # and still fails on anything but a true 5/5 (ENG-754/757 fail-closed
+    # shape intact). Only the execution ordering is gone — tests now produce
+    # evidence independently of whether Greptile answered.
     #
-    # The cost of serialising is the gate's own runtime, which is ~2 min in
-    # practice; the 20 minutes in greptile-gate.sh is its TIMEOUT, not its
-    # latency. `backend-staging-deploy` below has been gated this way since
-    # ENG-743, so this only extends an existing ordering to the jobs that
-    # actually dominate the bill.
-    #
-    # The outage bypass. Holding the suite behind a third party would otherwise
-    # mean a Greptile outage costs every PR in both repos its test feedback, so
-    # `unavailable` — the deadline passing with no landed Greptile verdict for
-    # ANY commit on this PR — lets the suite run anyway.
-    #
-    # This is not a conditional pass, and that distinction is the whole safety
-    # argument. `greptile-review` still FAILS on `unavailable`, so merge
-    # evidence is bit-for-bit what it was: nothing becomes mergeable that was
-    # not mergeable before, and the ENG-754/757 fail-closed shape is intact.
-    # The bypass decides one thing only — whether tests execute — so the worst
-    # case if it ever fires wrongly is runner minutes, never a bad merge.
-    #
-    # It cannot fire on a review Greptile actually scored: every path that
-    # observes a verdict for this head exits before the deadline is consulted,
-    # and a landed verdict for any OTHER commit is treated as proof of life and
-    # explicitly refused the `unavailable` label. See greptile-gate.sh.
-    #
-    # This makes a `skipped` here ambiguous — path filter, draft, or a gate that
-    # did not pass — so merge-evidence.sh no longer infers the reason. It demands
-    # a positive `success` from these two jobs whenever the diff touches the
-    # backend paths (ENG-915 acceptance criterion 4). Renaming either job means
+    # A `skipped` here is still ambiguous — path filter or draft — so
+    # merge-evidence.sh keeps demanding a positive `success` from these two
+    # jobs whenever the diff touches backend paths. Renaming either job means
     # updating MERGE_EVIDENCE_BACKEND_JOBS there.
     if: >-
-      !cancelled()
-      && needs.detect-changes.outputs.backend == 'true'
+      needs.detect-changes.outputs.backend == 'true'
       && github.event.pull_request.draft == false
-      && (needs.greptile-review.result == 'success'
-          || needs.greptile-review.outputs.verdict == 'unavailable')
     runs-on: ubuntu-latest
     # Distinct group from backend-tests-b so the two still run in parallel; a
     # newer commit on the same PR cancels this job's superseded run.
@@ -167,8 +212,12 @@ jobs:
       # ts-jest is transpile-only and reports no type errors at all. This step
       # is therefore the ONLY thing type-checking the backend on a PR; deleting
       # it (rather than narrowing it) would have silently removed that gate.
-      # `npm run typecheck` is `tsc --noEmit` over the same tsconfig.json as
-      # `npm run build`, so the diagnostics are identical — only the emit goes.
+      # `npm run typecheck` is `tsc --noEmit` over `tsconfig.json`, which spans
+      # the whole `src/` tree including `__tests__`. ENG-1059 pointed the deploy
+      # build at `tsconfig.build.json` (same options, tests excluded) so compiled
+      # tests stop shipping to Elastic Beanstalk — which makes this step a strict
+      # SUPERSET of `npm run build`'s diagnostics, never a subset. The test files
+      # are type-checked here and nowhere else, so this stays over tsconfig.json.
       - name: Type-check
         working-directory: backend
         run: NODE_OPTIONS="--max-old-space-size=4096" npm run typecheck --if-present
@@ -183,16 +232,13 @@ jobs:
   # Job B: everything else + coverage reporting
   backend-tests-b:
     name: Backend tests (all other + coverage)
-    needs: [detect-changes, greptile-review]
-    # Same draft and Greptile gates as backend-tests-a (see above): drafts skip
-    # the heavy suite, and a review below 5/5 stops it before it starts; the run
-    # happens once the PR is Ready and the gate has passed on this head.
+    needs: [detect-changes]
+    # Same gates as backend-tests-a (see above): drafts skip the heavy suite;
+    # per ENG-1039 the suite is no longer held behind the Greptile gate — test
+    # evidence is produced independently of the reviewer check.
     if: >-
-      !cancelled()
-      && needs.detect-changes.outputs.backend == 'true'
+      needs.detect-changes.outputs.backend == 'true'
       && github.event.pull_request.draft == false
-      && (needs.greptile-review.result == 'success'
-          || needs.greptile-review.outputs.verdict == 'unavailable')
     runs-on: ubuntu-latest
     # Distinct group from backend-tests-a so the two still run in parallel; a
     # newer commit on the same PR cancels this job's superseded run.
@@ -333,6 +379,12 @@ jobs:
       - name: Run eb-config-conflict.sh regression suite
         run: bash .github/scripts/eb-config-conflict.test.sh
 
+      # No script under test — this one asserts the `backend-staging-deploy`
+      # job condition in this same file, so the gate in front of the staging
+      # deploy cannot lose a clause without a red check (ENG-991).
+      - name: Run staging-deploy gate contract suite
+        run: bash .github/scripts/staging-deploy-gate.test.sh
+
   # ENG-836: prod deploys immutable, which forbids changing resource config and
   # instance config in one operation. PR #2237 did exactly that, EB accepted the
   # request then refused it, and production sat undeployable for ~29 hours while
@@ -346,7 +398,11 @@ jobs:
   # filter: the files it guards are under `backend/`, not `.github/`.
   eb-config-conflict:
     name: EB resource/instance config conflict
-    if: github.event_name == 'pull_request'
+    needs: detect-changes
+    # ENG-1039: gated on the `ebconfig` filter — the classifier only reacts to
+    # `.platform/*` and `.ebextensions/*.config` paths, so PRs touching neither
+    # cannot produce a hit and were paying 397 runs / 480 min for nothing.
+    if: needs.detect-changes.outputs.ebconfig == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     concurrency:
@@ -395,18 +451,25 @@ jobs:
     needs: detect-changes
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    # The script's own deadline is 20 minutes, leaving 5 minutes of runner
-    # budget so the gate fails with a diagnosable message instead of being
-    # killed mid-poll — the ENG-734 shape of a step timeout undercutting the
-    # budget it is supposed to contain.
-    timeout-minutes: 25
+    # ENG-1039: the poll deadline is 10 minutes (GREPTILE_GATE_TIMEOUT_SECONDS
+    # below), down from 20. Greptile reviews land in ~2 min when it answers at
+    # all, and failed polls billed 947 runner-minutes over 2026-08-01..10 —
+    # most of the timeout window was buying nothing. A false timeout is also
+    # far cheaper than it used to be: since the test jobs no longer wait on
+    # this gate (see backend-tests-a), a timeout re-runs only this ~free poll
+    # on the next push, never a 31-min test pair. The 2-minute headroom keeps
+    # the ENG-734 shape: the script's deadline stays under the job timeout so
+    # the gate fails with a diagnosable message instead of being killed
+    # mid-poll.
+    timeout-minutes: 12
     # A newer commit on the same PR cancels this superseded Greptile-wait job.
     concurrency:
       group: ${{ github.workflow }}-greptile-review-${{ github.ref }}
       cancel-in-progress: true
     # `verdict` is pass | refused | unavailable. The job still FAILS on anything
-    # but pass — this output only lets the test jobs tell "Greptile said no"
-    # from "Greptile never answered". Nothing downstream may treat it as a pass.
+    # but pass. Since ENG-1039 nothing downstream consumes this output (the
+    # test jobs no longer wait on this gate); it is kept for the job log and
+    # any future consumer. Nothing may ever treat a non-pass as a pass.
     outputs:
       verdict: ${{ steps.gate.outputs.verdict }}
     steps:
@@ -423,6 +486,8 @@ jobs:
       - name: Require a true Greptile 5/5 on this head
         id: gate
         env:
+          # ENG-1039 fail-fast: see the job comment above.
+          GREPTILE_GATE_TIMEOUT_SECONDS: '600'
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -448,10 +513,59 @@ jobs:
             '${{ steps.gate.outputs.verdict }}' '${{ steps.gate.outputs.exit_code }}' >&2
           exit 1
 
+  # The `dependabot[bot]` clause is the only addition to a gate that is otherwise
+  # unchanged (ENG-991). GitHub isolates repository secrets from Dependabot on
+  # `pull_request`: `secrets.AWS_ACCESS_KEY_ID` and `secrets.AWS_SECRET_ACCESS_KEY`
+  # resolve to the empty string unless they are ALSO stored as Dependabot secrets,
+  # which they deliberately are not — these are production deploy credentials and
+  # an automated dependency PR is the last place to widen their reach. So
+  # `Configure AWS credentials` below cannot succeed on a Dependabot PR under any
+  # circumstances, and re-running never changes that.
+  #
+  # Measured on the three open bumps (runs 31349777138 / 31349778959 / 31349790654,
+  # 2026-08-10): every other job passed — including both backend suites and the
+  # Greptile gate — and only this job failed, twice with "Could not load credentials
+  # from any providers" after 5m01s and 4m01s of checkout, npm ci, build and
+  # packaging done before reaching the credentials step. 12 runs over 7 days, 0
+  # successes.
+  #
+  # The wasted runner minutes are the smaller half. This job holds
+  # `concurrency: backend-staging-deploy`, the single shared staging lane, with
+  # `cancel-in-progress: false` — so a Dependabot PR queues for a deploy it can
+  # never perform and can evict a real PR's deploy. That is exactly what happened
+  # to the third run above: cancelled after 15s with "a higher priority waiting
+  # request for backend-staging-deploy exists", which then reported the whole PR
+  # red and invited a re-run of the ~30 runner-minute suite that had just passed.
+  #
+  # Author identity, not paths. Skipping the deploy for `.github/**`-only diffs
+  # would look equivalent and is not: the `backend` filter deliberately counts
+  # `.github/workflows/tests.yml` and `.github/scripts/eb-deploy.sh` as backend
+  # changes so the deploy path gates its own changes (ENG-743), and a path-based
+  # skip would silently delete that. The thing that makes this job impossible is
+  # who opened the PR, so that is what the condition tests.
+  #
+  # `github.event.pull_request.user.login` (the PR's author) rather than
+  # `github.actor` (whoever triggered this run): a human pushing to or reopening a
+  # Dependabot branch makes `github.actor` a human while the PR still runs without
+  # secrets, so the actor-based form would reintroduce the failure on exactly the
+  # push someone made trying to fix it.
+  #
+  # This removes no merge evidence. merge-evidence.sh requires a positive
+  # `success` from "Backend tests (agentMode)" and "Backend tests (all other +
+  # coverage)" only (MERGE_EVIDENCE_BACKEND_JOBS); the staging deploy has never
+  # been in that set, so a Dependabot PR still has to pass the same tests and the
+  # same Greptile 5/5 as anything else. Contract pinned by
+  # .github/scripts/staging-deploy-gate.test.sh.
   backend-staging-deploy:
     name: Backend deploy to staging (after tests pass)
     needs: [detect-changes, backend-tests-a, backend-tests-b, greptile-review]
-    if: github.event.pull_request.draft == false && needs.detect-changes.outputs.backend == 'true' && needs.backend-tests-a.result == 'success' && needs.backend-tests-b.result == 'success' && needs.greptile-review.result == 'success'
+    if: >-
+      github.event.pull_request.draft == false
+      && github.event.pull_request.user.login != 'dependabot[bot]'
+      && needs.detect-changes.outputs.backend_deployable == 'true'
+      && needs.backend-tests-a.result == 'success'
+      && needs.backend-tests-b.result == 'success'
+      && needs.greptile-review.result == 'success'
     runs-on: ubuntu-latest
     environment: staging
     concurrency:
