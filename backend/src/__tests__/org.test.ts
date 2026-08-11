@@ -1,6 +1,5 @@
 import request from 'supertest';
 import express from 'express';
-import orgRoutes from '../routes/org';
 
 // Mock user state
 let mockUser: any = {
@@ -102,13 +101,13 @@ jest.mock('../services/db', () => ({
 // guard installed in `beforeEach` is the belt to this mock's braces: it asserts the
 // absence of traffic rather than trusting that the mock registered.
 jest.mock('../services/emailService', () => ({
-  __esModule: true,
   emailService: {
     sendEmail: jest.fn().mockResolvedValue(undefined),
   },
 }));
 
 import { emailService } from '../services/emailService';
+import orgRoutes from '../routes/org';
 
 const mockSendEmail = emailService.sendEmail as jest.Mock;
 
