@@ -265,13 +265,16 @@ describe('recoverAbandonedScheduledRun', () => {
     const schedule = scheduleWithLease();
     // Unresumable transcript that nonetheless contains a publish from THIS attempt.
     mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([
-      { role: 'assistant', content: '', tool_calls: [{ id: 'x1', function: { name: 'publish_landing_page_changes' } }] },
+      { role: 'assistant', content: 'Publishing.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
       {
         role: 'tool',
+        tool_call_id: 'p1',
         name: 'publish_landing_page_changes',
         content: '{"success":true}',
         timestamp: new Date(NOW - 10 * 60 * 1000).toISOString(),
       },
+      // Died mid-tool-execution: no result for d1, so the run is NOT resumable.
+      { role: 'assistant', content: '', tool_calls: [{ id: 'd1', function: { name: 'enrich_leads_execute' } }] },
     ] as any);
 
     await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
@@ -342,6 +345,56 @@ describe('recoverAbandonedScheduledRun', () => {
       mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.status === 'paused')
     ).toBeUndefined();
     expect(mockScheduleDb.claimAbandonedRun.mock.calls[0][2]).not.toBeNull();
+  });
+
+  // The mirror of the runScheduledChat lease-hold: claimAbandonedRun is what REMOVES
+  // the stale lease, so a pause attempted after it has already given away the only
+  // guard. If the pause will not persist we must not claim at all.
+  it('does not claim (so the lease stands) when the pause will not persist', async () => {
+    const schedule = scheduleWithLease();
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([
+      { role: 'assistant', content: 'Publishing.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+      {
+        role: 'tool',
+        tool_call_id: 'p1',
+        name: 'publish_landing_page_changes',
+        content: '{"success":true}',
+        timestamp: new Date(NOW - 10 * 60 * 1000).toISOString(),
+      },
+      // Died mid-tool-execution: no result for d1, so the run is NOT resumable.
+      { role: 'assistant', content: '', tool_calls: [{ id: 'd1', function: { name: 'enrich_leads_execute' } }] },
+    ] as any);
+    (mockScheduleDb.updateSchedule as jest.Mock).mockRejectedValue(new Error('DynamoDB unavailable'));
+
+    const won = await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    expect(won).toBe(false);
+    // Never claimed: the lease remains, so no fresh run can start and repeat the publish.
+    expect(mockScheduleDb.claimAbandonedRun).not.toHaveBeenCalled();
+  });
+
+  it('claims normally once the pause has persisted', async () => {
+    const schedule = scheduleWithLease();
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([
+      { role: 'assistant', content: 'Publishing.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+      {
+        role: 'tool',
+        tool_call_id: 'p1',
+        name: 'publish_landing_page_changes',
+        content: '{"success":true}',
+        timestamp: new Date(NOW - 10 * 60 * 1000).toISOString(),
+      },
+      // Died mid-tool-execution: no result for d1, so the run is NOT resumable.
+      { role: 'assistant', content: '', tool_calls: [{ id: 'd1', function: { name: 'enrich_leads_execute' } }] },
+    ] as any);
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    expect(
+      mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.status === 'paused')
+    ).toBeDefined();
+    expect(mockScheduleDb.claimAbandonedRun).toHaveBeenCalled();
+    expect(mockScheduleDb.claimAbandonedRun.mock.calls[0][2]).toBeNull();
   });
 
   it('does not annotate the session or alert when the claim is lost', async () => {

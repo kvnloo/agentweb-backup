@@ -4100,7 +4100,7 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
   // Set when this run published (or may have) and cannot be continued: suppressing
   // the requeue alone leaves the schedule ACTIVE, so its next ORDINARY fire would
   // still restart from scratch and repeat that work. Only pausing prevents it.
-  let pauseAfterClaim = false;
+  let pauseBeforeClaim = false;
   if (willRequeue && lease.sessionId) {
     try {
       const priorMessages = await chatbotDb.getMessagesFromMessagesTable(lease.sessionId);
@@ -4158,7 +4158,43 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
         failedAttempts: nextRetryCount,
         failureClass: 'system',
       });
-      pauseAfterClaim = true;
+      pauseBeforeClaim = true;
+    }
+  }
+
+  // ENG-971: pause BEFORE claiming. claimAbandonedRun is what REMOVES the stale
+  // lease, and that lease is the only thing stopping a due schedule starting a
+  // fresh run — so a pause attempted afterwards has already given away the guard
+  // it was meant to replace. Pausing first is safe to repeat: a losing instance
+  // simply writes status='paused' twice. If the pause will not persist we do not
+  // claim at all, leaving the lease in place; a later reconciler pass retries once
+  // the datastore is healthy.
+  if (pauseBeforeClaim) {
+    let paused = false;
+    for (let attempt = 1; attempt <= 3 && !paused; attempt++) {
+      try {
+        await scheduleDb.updateSchedule(schedule.scheduleId, {
+          status: 'paused',
+          updatedAt: new Date().toISOString(),
+        });
+        paused = true;
+        console.error(
+          `recoverAbandonedScheduledRun: PAUSED schedule ${schedule.scheduleId} — ${noRequeueReason}.`
+        );
+      } catch (pauseError) {
+        console.error(
+          `CRITICAL: failed to pause schedule ${schedule.scheduleId} (attempt ${attempt}/3):`,
+          pauseError
+        );
+      }
+    }
+    if (!paused) {
+      console.error(
+        `recoverAbandonedScheduledRun: leaving the stale lease on ${schedule.scheduleId} in place — `
+        + `this run may already have published and the pause would not persist, so the lease is the `
+        + `only thing preventing a repeat. A later reconciler pass will retry.`
+      );
+      return false;
     }
   }
 
@@ -4173,29 +4209,6 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
   );
   if (!won) return false;
 
-  // Paused only after winning the claim — a lost claim means another instance owns
-  // this recovery and must not have the schedule changed underneath it.
-  if (pauseAfterClaim) {
-    let paused = false;
-    for (let attempt = 1; attempt <= 3 && !paused; attempt++) {
-      try {
-        await scheduleDb.updateSchedule(schedule.scheduleId, {
-          status: 'paused',
-          updatedAt: new Date().toISOString(),
-        });
-        paused = true;
-        console.error(
-          `recoverAbandonedScheduledRun: PAUSED schedule ${schedule.scheduleId} — ${noRequeueReason}.`
-        );
-      } catch (pauseError) {
-        console.error(
-          `CRITICAL: failed to pause schedule ${schedule.scheduleId} after an abandoned run that `
-          + `may already have published (attempt ${attempt}/3) — its next fire may repeat completed work:`,
-          pauseError
-        );
-      }
-    }
-  }
 
   // We own the recovery. Make the orphaned session self-explanatory (best-effort).
   // When the run will RESUME, do NOT append the "job incomplete" placeholder — the
