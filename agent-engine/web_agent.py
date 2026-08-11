@@ -1897,7 +1897,6 @@ class WebAgent:
                                 
                                 if task and hasattr(task, 'output') and task.output:
                                     # Download the video
-                                    import requests
                                     response = requests.get(task.output[0])
                                     with open(output_path, 'wb') as f:
                                         f.write(response.content)
@@ -1917,11 +1916,13 @@ class WebAgent:
                             return ActionResult(error="Runway AI gen4_turbo only supports image-to-video generation. Please provide an input image.")
                     
                     elif video_model == "kling-v2.1-std":
-                        # Use ReelMind API for Kling V2.1 Std
-                        import requests
-                        import json
-                        import time
-                        
+                        # Use ReelMind API for Kling V2.1 Std.
+                        # requests/json/time/uuid are already imported at module level (ENG-1122:
+                        # redundant local imports here silently made those names LOCAL for this
+                        # entire closure -- including the Veo branch's time.sleep() polling loop
+                        # below, which raised UnboundLocalError since that local import statement
+                        # never executes on the Veo path).
+
                         # Get API key
                         api_key = secrets_manager.get_reelmind_api_key()
                         if not api_key:
@@ -1944,7 +1945,6 @@ class WebAgent:
                                 return ActionResult(error="AWS_S3_BUCKET environment variable is not set (Do not retry - this is a permanent failure)")
                             
                             # Generate unique S3 key for the image
-                            import uuid
                             image_ext = Path(params.image_file_name).suffix.lower()
                             unique_filename = f"kling_input_{uuid.uuid4()}{image_ext}"
                             s3_key = f"video_inputs/{unique_filename}"
