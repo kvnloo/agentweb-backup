@@ -742,7 +742,22 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedBrandGuidelines });
       console.log(`[BRAND DEBUG] Successfully updated org brand guidelines after asset deletion`);
       rollbackPrune = async () => {
-        await orgDb.updateOrg(user.orgId!, { brandGuidelines });
+        // Conditioned on the value this request wrote, exactly like the owner
+        // branch. The S3 delete retries for a few hundred ms before we get
+        // here, which is plenty of room for another authorized editor to save
+        // the brand — and an unconditional restore would silently erase them
+        // while telling the caller nothing changed. If the guard fires, the
+        // caller reports the orphan rather than clobbering the newer value.
+        await orgDb.updateOrg(
+          user.orgId!,
+          { brandGuidelines },
+          {
+            condition: {
+              expression: "brandGuidelines.updatedAt = :justWritten",
+              values: { ":justWritten": updatedBrandGuidelines.updatedAt },
+            },
+          }
+        );
       };
     } else {
       await dynamodb
@@ -759,15 +774,19 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
         .promise();
       console.log(`[BRAND DEBUG] Successfully updated user brand guidelines after asset deletion`);
       rollbackPrune = async () => {
+        // Same guard as the org and owner branches — restore only if this
+        // request's write is still the current value.
         await dynamodb
           .update({
             TableName: `${TABLE_PREFIX}AW-Users`,
             Key: { email: user.email },
             UpdateExpression:
               "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
+            ConditionExpression: "brandGuidelines.updatedAt = :justWritten",
             ExpressionAttributeValues: {
               ":brandGuidelines": brandGuidelines,
               ":updatedAt": new Date().toISOString(),
+              ":justWritten": updatedBrandGuidelines.updatedAt,
             },
           })
           .promise();
@@ -796,12 +815,16 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
             error:
               "The stored file could not be deleted, so nothing was changed. Please try again.",
           });
-        } catch (rollbackError) {
-          // Both the delete and its compensation failed. This is the one case
-          // that still strands bytes, so name the key loudly — it is now only
-          // reclaimable out of band.
+        } catch (rollbackError: any) {
+          // The delete failed and its compensation did not apply — either it
+          // errored, or its guard fired because someone else has since changed
+          // the brand and restoring would erase them. Both leave the object
+          // stranded, so name the key loudly: it is only reclaimable out of band.
           console.error(
-            `[BRAND] Rollback failed after a failed S3 delete — object ${s3Key} is orphaned and needs manual cleanup`,
+            `[BRAND] Rollback did not apply after a failed S3 delete — object ${s3Key} is orphaned and needs manual cleanup. ` +
+              (rollbackError?.code === "ConditionalCheckFailedException"
+                ? "The brand was updated by someone else in the meantime, so the restore was deliberately skipped rather than erase their change."
+                : "The restore itself failed."),
             rollbackError
           );
           return res.status(500).json({
