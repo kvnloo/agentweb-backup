@@ -106,6 +106,16 @@ function lastBoundary(body: string): number {
   return Math.max(body.lastIndexOf(','), body.lastIndexOf('{'), body.lastIndexOf('['));
 }
 
+/** True when `candidate` is valid JSON — the only acceptance test we trust. */
+function isParseable(candidate: string): boolean {
+  try {
+    JSON.parse(candidate);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Close whatever `slice` left open so the payload reads as complete JSON, then
  * append the truncation notice.
@@ -128,19 +138,29 @@ export function sealTruncatedPayload(slice: string): string {
   let body = slice;
   for (let attempt = 0; attempt < MAX_REWINDS; attempt++) {
     const candidate = closeOpenStructures(body);
-    if (candidate !== null) {
-      try {
-        JSON.parse(candidate);
-        return withNotice(candidate);
-      } catch {
-        // fall through and rewind
-      }
-    }
+    if (candidate !== null && isParseable(candidate)) return withNotice(candidate);
+
     const cut = lastBoundary(body);
-    if (cut <= 0) break;
-    // Cut BEFORE the boundary char so a rewind onto `{`/`[` drops the empty
-    // container instead of closing it into a junk `{}` entry.
-    body = body.slice(0, cut);
+    if (cut < 0) break;
+
+    // Prefer cutting BEFORE the boundary char, so a rewind onto `{`/`[` drops the
+    // empty container rather than closing it into a junk `{}` entry.
+    const dropped = body.slice(0, cut);
+    if (cut > 0) {
+      const droppedCandidate = closeOpenStructures(dropped);
+      if (droppedCandidate !== null && isParseable(droppedCandidate)) return withNotice(droppedCandidate);
+    }
+
+    // But dropping can expose something unclosable — a dangling key, as in
+    // `{"deep":{"n":{"n":` rewinding down to `{"deep"`, where no set of closers
+    // yields valid JSON. Keeping the boundary lets that container close empty
+    // instead. This also covers the outermost container (`{"a":` -> `{}`), which
+    // is why cut === 0 is tried before giving up rather than skipped.
+    const keptCandidate = closeOpenStructures(body.slice(0, cut + 1));
+    if (keptCandidate !== null && isParseable(keptCandidate)) return withNotice(keptCandidate);
+
+    if (cut === 0) break;
+    body = dropped;
   }
 
   return withNotice(slice);
