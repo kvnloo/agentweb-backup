@@ -5810,6 +5810,67 @@ export async function getLandingPageById(id: string): Promise<GeneratedLandingPa
 }
 
 /**
+ * Admin-only reverse lookup: find landing pages whose deployed/custom URL
+ * matches the given URL's host (and, when present, first path segment as the
+ * slug). ENG-721: there is no domain GSI on AW-LandingPages, and adding one is
+ * a data-plane change, so this is a capped paginated scan — acceptable because
+ * it runs only from the rare admin discovery path, never on a customer path.
+ * `scannedAll: false` means the cap was hit and a non-match is inconclusive.
+ */
+export const ADMIN_URL_SCAN_ITEM_CAP = 5000;
+export const ADMIN_URL_SCAN_MATCH_CAP = 20;
+
+export async function adminFindLandingPagesByUrl(
+  url: string
+): Promise<{ matches: GeneratedLandingPage[]; scannedAll: boolean }> {
+  const parsed = new URL(url.includes("://") ? url : `https://${url}`);
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, "");
+  const slug = parsed.pathname.split("/").filter(Boolean)[0]?.toLowerCase();
+
+  const hostOf = (value: string | undefined): string | null => {
+    if (!value) return null;
+    try {
+      return new URL(value.includes("://") ? value : `https://${value}`)
+        .hostname.toLowerCase().replace(/^www\./, "");
+    } catch {
+      return null;
+    }
+  };
+
+  const matches: GeneratedLandingPage[] = [];
+  let scanned = 0;
+  let lastEvaluatedKey: AWS.DynamoDB.DocumentClient.Key | undefined;
+  do {
+    const result = await dynamodb
+      .scan({
+        TableName: TABLE_NAME,
+        ExclusiveStartKey: lastEvaluatedKey,
+        ProjectionExpression:
+          "id, userId, #n, #s, deployedUrl, customDomainUrl, leadListId, slug, siteId, vercelProjectId, archived, createdAt, updatedAt",
+        ExpressionAttributeNames: { "#n": "name", "#s": "status" },
+      })
+      .promise();
+    const items = (result.Items ?? []) as GeneratedLandingPage[];
+    scanned += items.length;
+    for (const item of items) {
+      const hostMatch =
+        hostOf(item.customDomainUrl) === host || hostOf(item.deployedUrl) === host;
+      if (!hostMatch) continue;
+      // A slug in the query narrows multi-page sites; a page with no slug of
+      // its own still matches on host so stale records remain discoverable.
+      if (slug && item.slug && item.slug.toLowerCase() !== slug) continue;
+      matches.push(item);
+      if (matches.length >= ADMIN_URL_SCAN_MATCH_CAP) {
+        return { matches, scannedAll: false };
+      }
+    }
+    lastEvaluatedKey = result.LastEvaluatedKey;
+  } while (lastEvaluatedKey && scanned < ADMIN_URL_SCAN_ITEM_CAP);
+
+  return { matches, scannedAll: !lastEvaluatedKey };
+}
+
+/**
  * Transfer ownership of a landing page to a new user (used when removing a member from an org).
  */
 export async function transferLandingPageOwner(id: string, newOwnerId: string): Promise<void> {

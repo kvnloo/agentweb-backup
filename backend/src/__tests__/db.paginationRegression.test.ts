@@ -3,12 +3,13 @@
 
 const queryPromiseMock = jest.fn();
 const scanPromiseMock = jest.fn();
+const queryMock = jest.fn((_params?: any) => ({ promise: queryPromiseMock }));
 
 jest.mock('aws-sdk', () => ({
   config: { update: jest.fn() },
   DynamoDB: {
     DocumentClient: jest.fn(() => ({
-      query: jest.fn(() => ({ promise: queryPromiseMock })),
+      query: queryMock,
       scan: jest.fn(() => ({ promise: scanPromiseMock })),
       get: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
       put: jest.fn(() => ({ promise: jest.fn().mockResolvedValue({}) })),
@@ -193,6 +194,45 @@ describe('P0 pagination regression tests', () => {
   });
 
   describe('getSchedulesReadyToRun', () => {
+    it('queries the full active-due partition so unsupported legacy rows cannot be silently filtered by DynamoDB', async () => {
+      queryPromiseMock.mockResolvedValueOnce({ Items: [] });
+
+      await scheduleDb.getSchedulesReadyToRun();
+
+      const params = queryMock.mock.calls[0][0]!;
+      expect(params.FilterExpression).toBeUndefined();
+      expect(params.ExpressionAttributeNames).not.toHaveProperty('#type');
+      expect(params.ExpressionAttributeValues).not.toHaveProperty(':type');
+    });
+
+    it('returns scheduled chats but not due legacy task schedules', async () => {
+      queryPromiseMock.mockResolvedValueOnce({
+        Items: [
+          { scheduleId: 'chat-1', type: 'scheduled_chat' },
+          { scheduleId: 'legacy-1', taskId: 'task-1' },
+        ],
+      });
+
+      const result = await scheduleDb.getSchedulesReadyToRun();
+
+      expect(result).toEqual([{ scheduleId: 'chat-1', type: 'scheduled_chat' }]);
+    });
+
+    it('emits one structured warning naming a newly detected overdue legacy schedule and the skip reason', async () => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      queryPromiseMock.mockResolvedValue({
+        Items: [{ scheduleId: 'legacy-observable-1', taskId: 'task-1' }],
+      });
+
+      await scheduleDb.getSchedulesReadyToRun();
+      await scheduleDb.getSchedulesReadyToRun();
+
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('legacy-observable-1'));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('legacy_task_schedule_unsupported'));
+      warn.mockRestore();
+    });
+
     it('should collect all ready schedules across pages', async () => {
       queryPromiseMock
         .mockResolvedValueOnce({

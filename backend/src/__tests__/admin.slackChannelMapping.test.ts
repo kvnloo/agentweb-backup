@@ -23,6 +23,9 @@ jest.mock('../services/settingsService', () => ({
     invalidateSlackChannelMappings: jest.fn().mockResolvedValue(undefined),
   },
 }));
+jest.mock('../services/slackService', () => ({
+  getSlackChannelInfo: jest.fn(),
+}));
 jest.mock('../middleware/auth', () => ({
   authenticateToken: (req: any, _res: any, next: any) => {
     req.user = { userId: 'admin-user-1', email: 'admin@example.com', isAdmin: true };
@@ -51,9 +54,11 @@ jest.mock('aws-sdk', () => ({
 
 import { userDb } from '../services/db';
 import { settingsService } from '../services/settingsService';
+import { getSlackChannelInfo } from '../services/slackService';
 
 const mockUserDb = userDb as jest.Mocked<typeof userDb>;
 const mockSettings = settingsService as jest.Mocked<typeof settingsService>;
+const mockGetSlackChannelInfo = getSlackChannelInfo as jest.MockedFunction<typeof getSlackChannelInfo>;
 
 const app = express();
 app.use(express.json());
@@ -66,6 +71,48 @@ const existingUser = {
   isActive: true,
   slackChannels: ['C_OLD'],
 };
+
+describe('GET /api/admin/slack/channel-info — unresolved configured channels', () => {
+  beforeEach(() => jest.clearAllMocks());
+
+  it('keeps a stale configured channel lookup on the handled 200 path', async () => {
+    mockGetSlackChannelInfo.mockResolvedValue(null);
+
+    const res = await request(app).get('/api/admin/slack/channel-info?channelId=C_STALE');
+
+    expect(res.status).toBe(200);
+  });
+
+  it('marks an unresolved configured channel explicitly', async () => {
+    mockGetSlackChannelInfo.mockResolvedValue(null);
+
+    const res = await request(app).get('/api/admin/slack/channel-info?channelId=C_STALE');
+
+    expect(res.body).toMatchObject({ channelId: 'C_STALE', resolved: false });
+  });
+
+  it('provides the configured id as the deliberate visible fallback', async () => {
+    mockGetSlackChannelInfo.mockResolvedValue(null);
+
+    const res = await request(app).get('/api/admin/slack/channel-info?channelId=C_STALE');
+
+    expect(res.body.displayName).toBe('C_STALE');
+  });
+
+  it('still rejects a request with no configured channel id', async () => {
+    const res = await request(app).get('/api/admin/slack/channel-info');
+
+    expect(res.status).toBe(400);
+    expect(mockGetSlackChannelInfo).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whitespace-only configured channel id', async () => {
+    const res = await request(app).get('/api/admin/slack/channel-info?channelId=%20%20%20');
+
+    expect(res.status).toBe(400);
+    expect(mockGetSlackChannelInfo).not.toHaveBeenCalled();
+  });
+});
 
 describe('PUT /api/admin/users/:userId/slack-channel — cache invalidation', () => {
   beforeEach(() => jest.clearAllMocks());
