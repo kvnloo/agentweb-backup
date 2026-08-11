@@ -1157,6 +1157,52 @@ describe('agentToolGatewayService', () => {
         expect(validate({ campaign_id: '123' }).status).toBe('valid');
       });
 
+      it('normalizes a JSON-encoded campaign_ids array at the gateway boundary', () => {
+        expect(validate({ campaign_ids: '["123","456"]' }).args).toEqual({
+          campaign_ids: ['123', '456'],
+        });
+      });
+
+      it('normalizes the legacy singular campaign_id at the gateway boundary', () => {
+        expect(validate({ campaign_id: '789' }).args).toEqual({
+          campaign_ids: ['789'],
+        });
+      });
+
+      it('trims and de-duplicates campaign_ids at the gateway boundary', () => {
+        expect(validate({ campaign_ids: [' 123 ', '123', '456'] }).args).toEqual({
+          campaign_ids: ['123', '456'],
+        });
+      });
+
+      it('preserves unknown keys and nullable optionals while normalizing the legacy id', () => {
+        expect(validate({
+          campaign_ids: null,
+          campaign_id: '789',
+          timeframe: null,
+          account_id: null,
+          future_option: true,
+        }).args).toEqual({
+          campaign_ids: ['789'],
+          timeframe: null,
+          account_id: null,
+          future_option: true,
+        });
+      });
+
+      it('preserves the legacy normalized-key alias repair contract', () => {
+        const result = validate({ campaignIds: '789' });
+        expect(result).toEqual(expect.objectContaining({
+          status: 'repaired',
+          args: { campaign_ids: ['789'] },
+          repairs: ['campaignIds->campaign_ids'],
+        }));
+      });
+
+      it('preserves malformed JSON as a bare campaign id', () => {
+        expect(validate({ campaign_ids: '[123' }).args).toEqual({ campaign_ids: ['[123'] });
+      });
+
       it('rejects a call with no campaign id at all', () => {
         const result = validate({ timeframe: '7d' });
         expect(result.status).toBe('invalid');
@@ -1171,7 +1217,35 @@ describe('agentToolGatewayService', () => {
       });
 
       it('rejects an empty campaign_ids array', () => {
-        expect(validate({ campaign_ids: [] }).status).toBe('invalid');
+        const result = validate({ campaign_ids: [] });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues).toEqual([
+            expect.objectContaining({ path: '$.campaign_ids', message: 'Argument "campaign_ids" must contain at least 1 item(s).' }),
+            expect.objectContaining({ path: '$.campaign_ids', message: expect.stringContaining('Provide at least one campaign id') }),
+          ]);
+        }
+      });
+
+      it('preserves item-level errors and semantic issue ordering for numeric ids', () => {
+        const result = validate({ campaign_ids: [123] });
+        expect(result.status).toBe('invalid');
+        if (result.status === 'invalid') {
+          expect(result.issues).toEqual([
+            { code: 'type_mismatch', path: '$.campaign_ids[0]', message: 'Argument "campaign_ids[0]" has the wrong type. Expected string.' },
+            expect.objectContaining({ code: 'invalid_args', path: '$.campaign_ids' }),
+          ]);
+          expect(result.modelMessage).toContain('Argument "campaign_ids[0]" has the wrong type. Expected string. Provide at least one campaign id');
+        }
+      });
+
+      it('preserves repaired args and repairs when a normalized-key alias is invalid', () => {
+        const result = validate({ campaignIds: [123] });
+        expect(result).toEqual(expect.objectContaining({
+          status: 'invalid',
+          args: { campaign_ids: [123] },
+          repairs: ['campaignIds->campaign_ids'],
+        }));
       });
     });
   });

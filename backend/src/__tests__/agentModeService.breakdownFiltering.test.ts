@@ -500,7 +500,7 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
   });
 
   describe('Campaign filtering edge cases', () => {
-    it('should accept legacy single campaign ID string input', async () => {
+    it('should accept a canonical campaign ID array', async () => {
       const mockUser = {
         id: 'user123',
         adAccount: '123456789',
@@ -529,12 +529,41 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
         });
       });
 
-      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', 'camp1');
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', ['camp1']);
 
       expect(result.success).toBe(true);
       const insightsUrl = capturedUrls.find(url => url.includes('insights?fields='));
-      expect(insightsUrl).toContain('filtering=');
-      expect(insightsUrl).toContain('camp1');
+      const filtering = JSON.parse(new URL(insightsUrl!).searchParams.get('filtering')!);
+      expect(filtering).toEqual([{ field: 'campaign.id', operator: 'IN', value: ['camp1'] }]);
+    });
+
+    it('JSON-encodes and URL-encodes quote/control characters in nonnumeric campaign IDs', async () => {
+      const { userDb } = await import('../services/db');
+      (userDb.getUserById as jest.Mock).mockResolvedValue({
+        id: 'user123',
+        adAccount: '123456789',
+        connected_accounts: [{
+          platform: 'facebook',
+          config: { account_type: 'ad_account', ad_account_id: '123456789', access_token: 'mock-access-token' },
+        }],
+      });
+      const capturedUrls: string[] = [];
+      global.fetch = jest.fn().mockImplementation((url: string) => {
+        capturedUrls.push(url);
+        return Promise.resolve({ json: () => Promise.resolve({ data: [] }) });
+      });
+      const hostileId = 'campaign"quoted\n&access_token=attacker';
+
+      const result = await (agentModeService as any).getMetaAdsMetrics('7d', 'user123', [hostileId]);
+
+      expect(result.success).toBe(true);
+      const insightsUrl = capturedUrls.find(url => url.includes('insights?fields='))!;
+      const url = new URL(insightsUrl);
+      expect(JSON.parse(url.searchParams.get('filtering')!)).toEqual([
+        { field: 'campaign.id', operator: 'IN', value: [hostileId] },
+      ]);
+      expect(url.searchParams.getAll('access_token')).toEqual(['mock-access-token']);
+      expect(insightsUrl).not.toContain('\n');
     });
 
     it('should filter by campaign_id when provided', async () => {
@@ -579,9 +608,9 @@ describe('AgentModeService - Breakdown Data Filtering', () => {
       // Verify that filtering parameter is included in API calls
       const insightsUrl = capturedUrls.find(url => url.includes('insights?fields='));
       expect(insightsUrl).toBeDefined();
-      expect(insightsUrl).toContain('filtering=');
-      expect(insightsUrl).toContain('campaign.id');
-      expect(insightsUrl).toContain('camp1');
+      expect(JSON.parse(new URL(insightsUrl!).searchParams.get('filtering')!)).toEqual([
+        { field: 'campaign.id', operator: 'IN', value: ['camp1'] },
+      ]);
     });
 
     it('should handle case when breakdown data has no campaign_id field', async () => {

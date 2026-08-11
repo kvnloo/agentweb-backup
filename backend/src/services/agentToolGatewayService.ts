@@ -1,6 +1,8 @@
 import { toolResultError } from '../utils/toolResultError';
 import { classifyToolErrorClass } from '../utils/toolErrorClassifier';
+import { getMetaAdsMetricsArgsSchema, repairMetaAdsMetricsAlias } from '../utils/metaCampaignIds';
 import { isFastTripErrorClass } from './agentMode/core/errorRetryability';
+import type { ZodIssue } from 'zod';
 
 export type AgentToolEffect =
   | 'read'
@@ -605,6 +607,20 @@ export function evaluateAgentToolPolicy(input: AgentToolPolicyInput): AgentToolP
 export function validateAndRepairToolArgs(
   input: AgentToolContractValidationInput,
 ): AgentToolContractValidationResult {
+  const typedSchema = TYPED_READ_TOOL_SCHEMAS.get(input.toolName);
+  if (typedSchema) {
+    const preparedArgs = repairMetaAdsMetricsAlias(input.args);
+    const parsed = typedSchema.safeParse(preparedArgs);
+    const alias = preparedArgs === input.args ? undefined : Object.keys(input.args as object)
+      .find((key) => normalizeArgName(key) === 'campaignids');
+    const repairs = alias ? [`${alias}->campaign_ids`] : [];
+    if (parsed.success) {
+      return { status: repairs.length ? 'repaired' : 'valid', args: parsed.data, issues: [], repairs };
+    }
+    const issues = parsed.error.issues.map((issue) => zodIssueToContractIssue(input.toolName, issue));
+    return { status: 'invalid', args: preparedArgs, issues, repairs, modelMessage: buildSchemaRetryMessage(input.toolName, issues) };
+  }
+
   const schema = input.inputSchema;
   const issues: AgentToolContractIssue[] = [];
   const repairs: string[] = [];
@@ -759,6 +775,14 @@ export function validateAndRepairToolArgs(
     issues,
     repairs,
   };
+}
+const TYPED_READ_TOOL_SCHEMAS = new Map([['get_meta_ads_metrics', getMetaAdsMetricsArgsSchema]]);
+
+function zodIssueToContractIssue(toolName: string, issue: ZodIssue): AgentToolContractIssue {
+  const path = issue.path.reduce<string>((value, part) => value + (typeof part === 'number' ? `[${part}]` : `.${part}`), '$');
+  if (path === '$') return { code: 'invalid_args', path, message: `Tool "${toolName}" arguments must be a JSON object.` };
+  const code = (issue as ZodIssue & { params?: { contractCode?: AgentToolContractIssue['code'] } }).params?.contractCode ?? 'invalid_args';
+  return { code, path, message: issue.message };
 }
 
 export function summarizeAgentToolPolicyFlags(
@@ -1258,24 +1282,6 @@ function validateSemanticToolContract(toolName: string, args: Record<string, unk
       code: 'invalid_args',
       path: '$.body',
       message: 'Provide a non-empty email body via html, text, or body.',
-    }];
-  }
-
-  // ENG-106: get_meta_ads_metrics drops the hard `required: [campaign_ids]` so
-  // legacy scalar/string id shapes the impl normalizes pass static validation.
-  // Restore the "at least one usable campaign id" guarantee here, accepting every
-  // shape execute() normalizes: non-empty array campaign_ids, non-empty string
-  // campaign_ids, or non-empty string campaign_id.
-  if (toolName === 'get_meta_ads_metrics') {
-    const hasArrayIds = Array.isArray(args.campaign_ids)
-      && args.campaign_ids.some((id) => isNonEmptyString(id));
-    const hasStringIds = isNonEmptyString(args.campaign_ids);
-    const hasLegacyId = isNonEmptyString(args.campaign_id);
-    if (hasArrayIds || hasStringIds || hasLegacyId) return [];
-    return [{
-      code: 'invalid_args',
-      path: '$.campaign_ids',
-      message: 'Provide at least one campaign id via campaign_ids (array or string) or campaign_id. Use list_meta_ads_campaigns to find campaign IDs.',
     }];
   }
 

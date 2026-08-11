@@ -82,7 +82,7 @@ import { YouSearchProvider } from '../search/youSearchProvider';
 import { GoogleSearchProvider } from '../search/googleSearchProvider';
 import { SearchResultSource } from '../search/searchProvider';
 import { CitationRegistry } from '../utils/citations';
-import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
+import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
 
 // Constant for the virtual "other skills" identifier
 const OTHER_SKILLS_VIRTUAL_ID = '__other_skills__';
@@ -144,12 +144,6 @@ export function parseTimecodeToSeconds(value: unknown): number | undefined {
 
   return undefined;
 }
-
-// Moved to utils/metaCampaignIds.ts (ENG-821) — it is pure, and emma/tools.ts
-// needs it at dispatch time while 140 test files jest.mock this module.
-// Imported (not just re-exported) because this module calls it internally too;
-// re-exported so any importer of the old path keeps working.
-export { normalizeMetaCampaignIds };
 
 const TOOL_RESPONSE_S3_THRESHOLD = 10_000;
 
@@ -6263,10 +6257,8 @@ export class AgentModeService {
         };
 
       case 'get_meta_ads_metrics':
-        const normalizedCampaignIds = normalizeMetaCampaignIds(
-          args.campaign_ids,
-          args.campaign_id,
-        );
+        const parsedMetricsArgs = getMetaAdsMetricsArgsSchema.safeParse(args);
+        const normalizedCampaignIds = parsedMetricsArgs.success ? parsedMetricsArgs.data.campaign_ids : [];
 
         if (normalizedCampaignIds.length === 0) {
           return {
@@ -16892,11 +16884,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
   public async getMetaAdsMetrics(
     timeframe: string,
     userId: string,
-    campaign_ids: string[] | string,
+    campaignFilterIds: string[],
     requestedAccountId?: string,
   ): Promise<any> {
     try {
-      const campaignFilterIds = normalizeMetaCampaignIds(campaign_ids);
       console.log('AgentMode: Filtering metrics by campaign IDs:', campaignFilterIds);
       if (campaignFilterIds.length === 0) {
         return {
@@ -16949,7 +16940,7 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
 
       // Build filtering parameter for API calls
       const filteringParam = campaignFilterIds.length > 0
-        ? `&filtering=[{"field":"campaign.id","operator":"IN","value":["${campaignFilterIds.join('","')}"]}]`
+        ? `&filtering=${encodeURIComponent(JSON.stringify([{ field: 'campaign.id', operator: 'IN', value: campaignFilterIds }]))}`
         : '';
 
 

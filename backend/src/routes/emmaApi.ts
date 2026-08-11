@@ -8,6 +8,7 @@ import { Router, Request, Response } from 'express';
 import { authenticateToken, AuthenticatedRequest } from '../middleware/auth';
 import { requireEmmaTokenBudget } from '../middleware/emmaTokenBudget';
 import { chatbotDb } from '../services/chatbotService';
+import { getMetaAdsMetricsArgsSchema } from '../utils/metaCampaignIds';
 
 const router = Router();
 
@@ -402,12 +403,15 @@ router.post('/meta-ads/insights', async (req: Request, res: Response) => {
 
 router.post('/meta-ads/metrics', async (req: Request, res: Response) => {
   try {
+    const parsed = getMetaAdsMetricsArgsSchema.safeParse(req.body);
+    if (!parsed.success) return res.json({ success: false,
+      message: 'campaign_ids is required and must contain at least one campaign ID.', error: 'Invalid campaign_ids' });
     const svc = await getAgentModeService();
     const result = await svc.getMetaAdsMetrics(
-      req.body.timeframe || '7d',
+      parsed.data.timeframe || '7d',
       userId(req),
-      req.body.campaign_ids,
-      req.body.account_id,
+      parsed.data.campaign_ids,
+      parsed.data.account_id as string | undefined,
     );
     res.json(result);
   } catch (err: any) {

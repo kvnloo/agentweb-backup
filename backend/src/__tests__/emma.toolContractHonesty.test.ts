@@ -41,6 +41,18 @@ describe('Emma tool contracts match dispatch behavior', () => {
     mockGetMetaAdsMetrics.mockReset().mockResolvedValue({ success: true });
   });
 
+  const dispatchMetaMetrics = async (args: Record<string, unknown>) => {
+    const tool = emmaToolRegistry.getTool('get_meta_ads_metrics')!;
+    const validation = validateAndRepairToolArgs({
+      toolName: 'get_meta_ads_metrics',
+      args,
+      inputSchema: tool.definition.inputSchema,
+      effect: 'read',
+    });
+    expect(validation.status).not.toBe('invalid');
+    await tool.execute(validation.args as Record<string, unknown>, { userId: 'user-1' });
+  };
+
   it('declares the enforced 2000-character save_memory limit in JSON Schema', () => {
     const contentSchema = emmaToolRegistry.getTool('save_memory')!
       .definition.inputSchema.properties.content;
@@ -105,10 +117,7 @@ describe('Emma tool contracts match dispatch behavior', () => {
 
 
   it('normalizes a JSON-encoded campaign_ids array before dispatch', async () => {
-    await emmaToolRegistry.getTool('get_meta_ads_metrics')!.execute(
-      { campaign_ids: '["campaign-1","campaign-2"]', timeframe: '14d' },
-      { userId: 'user-1' },
-    );
+    await dispatchMetaMetrics({ campaign_ids: '["campaign-1","campaign-2"]', timeframe: '14d' });
 
     expect(mockGetMetaAdsMetrics).toHaveBeenCalledWith(
       '14d',
@@ -119,10 +128,7 @@ describe('Emma tool contracts match dispatch behavior', () => {
   });
 
   it('preserves an already-valid bare campaign id string', async () => {
-    await emmaToolRegistry.getTool('get_meta_ads_metrics')!.execute(
-      { campaign_ids: 'campaign-1' },
-      { userId: 'user-1' },
-    );
+    await dispatchMetaMetrics({ campaign_ids: 'campaign-1' });
 
     expect(mockGetMetaAdsMetrics).toHaveBeenCalledWith(
       '7d',
@@ -133,10 +139,7 @@ describe('Emma tool contracts match dispatch behavior', () => {
   });
 
   it('preserves an already-valid campaign id array', async () => {
-    await emmaToolRegistry.getTool('get_meta_ads_metrics')!.execute(
-      { campaign_ids: ['campaign-1', 'campaign-2'] },
-      { userId: 'user-1' },
-    );
+    await dispatchMetaMetrics({ campaign_ids: ['campaign-1', 'campaign-2'] });
 
     expect(mockGetMetaAdsMetrics).toHaveBeenCalledWith(
       '7d',

@@ -1,5 +1,4 @@
 import { agentModeService } from '../services/agentModeService';
-import { normalizeMetaCampaignIds } from '../utils/metaCampaignIds';
 import { emmaToolRegistry } from './registry';
 import { auditCampaigns } from '../services/adUtmAuditService';
 import type { AdPlatform } from '../utils/adUtm';
@@ -1412,16 +1411,10 @@ emmaToolRegistry.register({
     }
   },
   execute: async (args, context) => {
-    // Backward-compatible normalization: accept legacy campaign_id or string campaign_ids.
-    const normalizedCampaignIds = normalizeMetaCampaignIds(
-      args.campaign_ids,
-      args.campaign_id,
-    );
-
     return await agentModeService.getMetaAdsMetrics(
       args.timeframe || '7d',
       context?.userId,
-      normalizedCampaignIds,
+      args.campaign_ids,
       args.account_id,
     );
   }

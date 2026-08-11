@@ -53,6 +53,7 @@ const mockService = {
   searchLeads: jest.fn(),
   repairBlogArticle: jest.fn(),
   callMetaMarketingApi: jest.fn(),
+  getMetaAdsMetrics: jest.fn(),
 };
 
 jest.mock('../services/agentModeService', () => ({
@@ -335,6 +336,33 @@ describe('Emma API Routes', () => {
 
       expect(res.status).toBe(403);
       expect(mockService.callMetaMarketingApi).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /api/emma/meta-ads/metrics — typed gateway parity', () => {
+    it.each([
+      [{ campaign_ids: [' 123 ', '123'] }, ['123']],
+      [{ campaign_ids: '["123","456"]' }, ['123', '456']],
+      [{ campaign_id: '789' }, ['789']],
+    ])('normalizes supported campaign-id shapes before service dispatch', async (body, expectedIds) => {
+      mockService.getMetaAdsMetrics.mockResolvedValue({ success: true });
+
+      const res = await request(app).post('/api/emma/meta-ads/metrics').send(body);
+
+      expect(res.status).toBe(200);
+      expect(mockService.getMetaAdsMetrics).toHaveBeenCalledWith('7d', 'user-123', expectedIds, undefined);
+    });
+
+    it('preserves the HTTP-200 invalid campaign_ids envelope', async () => {
+      const res = await request(app).post('/api/emma/meta-ads/metrics').send({ timeframe: '7d' });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        success: false,
+        message: 'campaign_ids is required and must contain at least one campaign ID.',
+        error: 'Invalid campaign_ids',
+      });
+      expect(mockService.getMetaAdsMetrics).not.toHaveBeenCalled();
     });
   });
 });
