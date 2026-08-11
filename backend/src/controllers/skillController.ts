@@ -1,7 +1,8 @@
 import { Request, Response } from "express";
-import { skillService, SkillOpeningAction } from "../services/skillService";
+import { skillService } from "../services/skillService";
 import { userDb } from "../services/db";
 import { findTiersAllowingSkill } from "../services/subscriptionService";
+import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
 
 // ENG-173: a published skill that is in no subscription tier's allowedSkills is
 // invisible to every non-wildcard user (list_available_skills filters it out), so the
@@ -16,67 +17,19 @@ async function entitlementWarnings(skill: any): Promise<string[] | undefined> {
   ];
 }
 
-// ENG-712: shape-validate an optional openingAction before it reaches persistence.
-// Returns a human-readable error string, or null when valid (including when absent).
-export const validateOpeningAction = (openingAction: any): string | null => {
-  if (openingAction === undefined || openingAction === null) return null;
-  if (typeof openingAction !== 'object' || Array.isArray(openingAction)) {
-    return "openingAction must be an object";
-  }
-  if (openingAction.type !== 'brief' && openingAction.type !== 'prefetch') {
-    return 'openingAction.type must be "brief" or "prefetch"';
-  }
-  if (openingAction.type === 'brief') {
-    if (typeof openingAction.content !== 'string' || !openingAction.content.trim()) {
-      return 'openingAction of type "brief" requires non-empty content';
-    }
-  }
-  if (openingAction.type === 'prefetch') {
-    if (!Array.isArray(openingAction.toolCalls) || openingAction.toolCalls.length === 0) {
-      return 'openingAction of type "prefetch" requires a non-empty toolCalls array';
-    }
-    for (const call of openingAction.toolCalls) {
-      if (!call || typeof call.toolName !== 'string' || !call.toolName.trim()) {
-        return 'each toolCalls entry in openingAction requires a non-empty toolName';
-      }
-    }
-  }
-  return null;
-};
-
 export const createSkill = async (req: Request, res: Response) => {
   try {
-    const { name, description, toolNames, systemPrompt, isPublished, openingAction } = req.body;
+    const { name, description, toolNames, systemPrompt, isPublished, welcomeMessage } = req.body;
 
     if (!name || !description) {
       return res.status(400).json({ message: "Name and description are required" });
     }
+    const validationError = validateWelcomeMessage(welcomeMessage);
+    if (validationError) return res.status(400).json({ message: validationError });
 
-    const openingActionError = validateOpeningAction(openingAction);
-    if (openingActionError) {
-      return res.status(400).json({ message: openingActionError });
-    }
-
-    // Call with the exact pre-ENG-712 arg shape when no openingAction is
-    // given, so a skill create/update with no opening action is provably
-    // identical to before this change (AC5) — not just "same effect" but
-    // the same call.
-    const skill = openingAction !== undefined
-      ? await skillService.createSkill(
-            name,
-            description,
-            toolNames || [],
-            systemPrompt,
-            isPublished,
-            openingAction as SkillOpeningAction
-        )
-      : await skillService.createSkill(
-            name,
-            description,
-            toolNames || [],
-            systemPrompt,
-            isPublished
-        );
+    const args: Parameters<typeof skillService.createSkill> = [name, description, toolNames || [], systemPrompt, isPublished];
+    if (welcomeMessage !== undefined) args.push(welcomeMessage);
+    const skill = await skillService.createSkill(...args);
 
     const warnings = await entitlementWarnings(skill);
     res.status(201).json(warnings ? { ...skill, warnings } : skill);
@@ -132,16 +85,14 @@ export const getSkill = async (req: Request, res: Response) => {
 export const updateSkill = async (req: Request, res: Response) => {
   try {
     const { skillId } = req.params;
-    const { name, description, toolNames, systemPrompt, isPublished, openingAction } = req.body;
+    const { name, description, toolNames, systemPrompt, isPublished, welcomeMessage } = req.body;
+
+    const validationError = validateWelcomeMessage(welcomeMessage);
+    if (validationError) return res.status(400).json({ message: validationError });
 
     const existingSkill = await skillService.getSkill(skillId);
     if (!existingSkill) {
       return res.status(404).json({ message: "Skill not found" });
-    }
-
-    const openingActionError = validateOpeningAction(openingAction);
-    if (openingActionError) {
-      return res.status(400).json({ message: openingActionError });
     }
 
     const updatedSkill = {
@@ -151,7 +102,7 @@ export const updateSkill = async (req: Request, res: Response) => {
       ...(toolNames !== undefined && { toolNames }),
       ...(systemPrompt !== undefined && { systemPrompt }),
       ...(isPublished !== undefined && { isPublished }),
-      ...(openingAction !== undefined && { openingAction }),
+      ...(welcomeMessage !== undefined && { welcomeMessage }),
       skillId,
     };
     await skillService.updateSkill(updatedSkill);

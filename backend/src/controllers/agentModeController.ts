@@ -45,6 +45,7 @@ import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
 import { fileAutoIssue } from '../services/intakeService';
 import { skillService } from '../services/skillService';
+import { validateWelcomeMessage } from '../utils/welcomeMessageValidation';
 import { normalizeEmailList } from '../utils/validation';
 import { getAllowedSkills } from '../services/subscriptionService';
 import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageService';
@@ -4561,7 +4562,21 @@ export const agentModeController = {
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
-      const { portalType = 'agent', pageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
+      const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
+      const skillId = req.params.skillId;
+      const portalType = skillId ? 'agent' : requestedPortalType;
+      let skill;
+      if (skillId) {
+        const available = await agentModeService.getSkillsForDisplay([], user.userId);
+        if (!available.some(candidate => candidate.skillId === skillId)) {
+          return res.status(404).json({ error: 'Skill not found' });
+        }
+        skill = await skillService.getSkill(skillId);
+        if (!skill) return res.status(404).json({ error: 'Skill not found' });
+        const validationError = validateWelcomeMessage(skill.welcomeMessage);
+        if (validationError) return res.status(400).json({ error: validationError });
+      }
+      const pageIdentifier = skillId ? `skill-${skillId}` : requestedPageIdentifier;
 
       // Cross-restart duplicate-submit lock, keyed by the client-provided
       // idempotencyKey scoped to this user. The conditional idem#… put means
@@ -4592,7 +4607,7 @@ export const agentModeController = {
       // Determine sessionType: if explicitly provided, use it; otherwise default to 'regular'
       // For ad image generation from Images page, sessionType should be 'image-generation'
       // For ad video generation from Videos page, sessionType should be 'video-generation'
-      const finalSessionType = sessionType || 'regular';
+      const finalSessionType = skillId ? 'regular' : sessionType || 'regular';
 
       // Pass delegate info if this is a delegated access session
       const delegateInfo = authReq.delegateInfo;
@@ -4622,6 +4637,17 @@ export const agentModeController = {
       }
       const sessionWithModel = await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
 
+      if (skillId && skill) {
+        await chatbotDb.addAssociatedSkills(session.sessionId, [skillId]);
+        const welcomeMessage = skill.welcomeMessage?.trim();
+        if (welcomeMessage) {
+          await chatbotDb.addMessageToSession(session.sessionId, {
+            role: 'assistant', content: welcomeMessage,
+            metadata: { timestamp: new Date().toISOString(), kind: 'skill-welcome' },
+          });
+        }
+      }
+
       // Stamp the winner's sessionId on the idem claim so duplicate losers
       // attach to THIS session instead of getting 409 (best-effort by design —
       // on failure losers 409 until the 10m ttl bounds the staleness).
@@ -4629,7 +4655,10 @@ export const agentModeController = {
         await recordIdempotencySessionId(createIdemKeyHeld, session.sessionId);
       }
 
-      res.status(201).json(sessionWithModel);
+      res.status(201).json(skillId ? {
+        ...sessionWithModel,
+        redirectUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${session.sessionId}`,
+      } : sessionWithModel);
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
       // Release the claim so the client's retry is accepted — a failed create
@@ -4638,74 +4667,6 @@ export const agentModeController = {
         await releaseIdempotency(createIdemKeyHeld);
       }
       res.status(500).json({ error: 'Failed to create session' });
-    }
-  },
-
-  // ENG-712 — Create a session directly from a Skill (public, one call), so a
-  // deep link (e.g. a task from the recap surface) lands on a primed chat
-  // instead of a blank one (AC6). If the skill carries an `openingAction`,
-  // it is applied before this returns, so the very first turn is already in
-  // the session by the time the client navigates to `redirectUrl`. Mirrors
-  // the shape of createSessionWithPlan for work plans, simplified — no plan
-  // step/progress machinery, since a skill isn't a plan.
-  async createSessionFromSkill(req: Request, res: Response) {
-    try {
-      const { skillId } = req.params;
-      if (!skillId) {
-        return res.status(400).json({ error: 'Skill ID is required' });
-      }
-
-      const skill = await skillService.getSkill(skillId);
-      if (!skill) {
-        return res.status(404).json({ error: `Skill "${skillId}" not found` });
-      }
-
-      // Route is public (anonymous callers get their own session), but a
-      // private skill is only usable by its owner — mirrors the intent of
-      // the work-plan private-visibility gate, applied per-skill since this
-      // endpoint looks a skill up directly by ID rather than from a
-      // pre-authorized owned/org/public/system list.
-      const result = await getUserFromToken(req);
-      const userId = result.user ? result.user.userId : `anon_${uuidv4()}`;
-
-      if (skill.visibility === 'private' && (!result.user || skill.ownerId !== result.user.userId)) {
-        return res.status(403).json({ error: 'Not authorized to use this skill' });
-      }
-
-      const session = await chatbotDb.createChatSession(
-        userId,
-        undefined, // pageContent
-        'agent', // portalType
-        `skill-${skillId}`, // pageIdentifier
-        undefined, // selectedStartupId
-        undefined, // workflowId
-        undefined, // executionId
-        undefined, // emailCampaignTaskId
-        'regular' // sessionType
-      );
-
-      await chatbotDb.addAssociatedSkills(session.sessionId, [skillId]);
-
-      const modelToUse = await agentModeService.getDefaultModel();
-      await chatbotDb.updateSessionLlmModel(session.sessionId, modelToUse);
-
-      // AC1-5: applies the container's opening move (or is a costless no-op
-      // when the skill has none) before the client ever navigates in.
-      const openingResult = await agentModeService.applyOpeningAction(skill, session.sessionId, userId);
-
-      const customerFrontendUrl = process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174';
-      const redirectUrl = `${customerFrontendUrl}/agent-mode/${session.sessionId}`;
-
-      res.status(201).json({
-        sessionId: session.sessionId,
-        redirectUrl,
-        userId: session.userId,
-        openingActionApplied: openingResult.applied,
-        openingActionDegraded: !!openingResult.degraded,
-      });
-    } catch (error) {
-      console.error('AgentMode: Create session from skill error:', error);
-      res.status(500).json({ error: 'Failed to create session from skill' });
     }
   },
 

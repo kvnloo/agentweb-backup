@@ -49,7 +49,8 @@ import path from 'path';
 import { Readable } from 'stream';
 import { ToolRegistry } from '../mcp/client/toolRegistry';
 import { McpClientService } from '../mcp/client/mcpClientService';
-import { skillService, Skill } from './skillService';
+import { skillService } from './skillService';
+import { resolveUserSkillAccess } from './userSkillAccessService';
 import { extractVariables } from '../utils/templateParser';
 import { renderHtmlToPdf } from './pdfRenderService';
 import { getAllowedSkills, getPublicAllowedSkills, resolveSkillsToToolNames, filterFunctionCalls } from './subscriptionService';
@@ -5039,58 +5040,13 @@ export class AgentModeService {
 
   public async listSkills(userId: string, sessionId: string): Promise<any> {
     try {
-      // Best-effort org fanout: only attach orgId when `shareSettings.skills`
-      // is effectively enabled for this caller (plain members need
-      // enabled=true; editors and the org owner always get fanout). Any
-      // lookup failure degrades to non-org behavior.
-      let sessionUserOrgId: string | undefined;
-      try {
-        const { userDb: uDb, orgDb } = await import('./db');
-        const { isFeatureEffectivelyEnabled } = await import('./orgShareService');
-        const sessionUser = await uDb.getUserById(userId);
-        const candidateOrgId = sessionUser?.orgId;
-        if (candidateOrgId) {
-          const org = await orgDb.getOrgById(candidateOrgId);
-          const effectivelyEnabled = isFeatureEffectivelyEnabled(
-            { userId, orgId: candidateOrgId, orgRole: sessionUser?.orgRole },
-            org,
-            'skills',
-          );
-          if (effectivelyEnabled) sessionUserOrgId = candidateOrgId;
-        }
-      } catch { /* skip — org-sharing is best-effort */ }
-      const publishedSkills = await skillService.getSkillsAvailableToUser(userId, sessionUserOrgId);
-
-      if (!publishedSkills.length)
-        return { message: "No skills available in the library." };
-
       const session = await chatbotDb.getChatSession(sessionId);
-      const currentAssociated = session?.associatedSkills || [];
-      const associatedSkillIds = new Set(currentAssociated);
-
-      const availableSkills = publishedSkills.filter(s => !associatedSkillIds.has(s.skillId));
-
-      // Add admin skill for admin users (if not already installed)
-      if (!associatedSkillIds.has(ADMIN_SKILL_VIRTUAL_ID)) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          if (user?.isAdmin) {
-            availableSkills.push({
-              skillId: ADMIN_SKILL_VIRTUAL_ID,
-              name: 'Admin Tools',
-              description: 'Manage predefined work plans and skill definitions (list, create, update, delete). WARNING: These tools modify production configuration — use with extra care as incorrect changes could cause outages.',
-              toolNames: ADMIN_SKILL_TOOL_NAMES,
-              isPublished: true,
-            } as any);
-          }
-        } catch (e) {
-          console.warn('[listSkills] Error checking admin status:', (e as Error).message);
-        }
-      }
-
-      if (!availableSkills.length)
+      const skills = await this.getSkillsForDisplay(session?.associatedSkills || [], userId);
+      if (!skills.length) return { message: "No skills available in the library." };
+      const availableSkills = skills.filter(skill => !skill.installed);
+      if (!availableSkills.length) {
         return { message: "All available skills are already installed." };
+      }
 
       return {
         message: `Found ${availableSkills.length} available skill(s).`,
@@ -5464,14 +5420,7 @@ export class AgentModeService {
    * Get skills with installed status for UI display, filtered by user's subscription.
    */
   public async getSkillsForDisplay(associatedSkillIds: string[], userId?: string): Promise<{ skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[]> {
-    let userOrgId: string | undefined;
-    if (userId) {
-      try {
-        const { userDb: uDb } = await import('./db');
-        const u = await uDb.getUserById(userId);
-        userOrgId = u?.orgId;
-      } catch { /* skip */ }
-    }
+    const userOrgId = userId ? (await resolveUserSkillAccess(userId)).sharedOrgId : undefined;
     const [publishedSkills, userAllowedSkillIds] = await Promise.all([
       userId ? skillService.getSkillsAvailableToUser(userId, userOrgId) : skillService.getPublishedSkills(),
       userId ? getAllowedSkills(userId) : getPublicAllowedSkills()
@@ -5481,7 +5430,7 @@ export class AgentModeService {
     const allowedSet = new Set(userAllowedSkillIds);
 
     const skills: { skillId: string; name: string; description: string; installed: boolean; toolNames: string[]; visibility?: string }[] = publishedSkills
-      .filter(s => isWildcard || allowedSet.has(s.skillId) || (s.ownerId && s.ownerId === userId))
+      .filter(s => isWildcard || allowedSet.has(s.skillId) || (userId !== undefined && s.ownerId === userId) || (userOrgId !== undefined && s.orgId === userOrgId))
       .map(s => ({
         skillId: s.skillId,
         name: s.name,
@@ -5533,40 +5482,10 @@ export class AgentModeService {
         return { message: "skillIds must be a non-empty array of skill IDs." };
       }
 
-      let installUserOrgId: string | undefined;
-      try {
-        const { userDb: uDb } = await import('./db');
-        const installUser = await uDb.getUserById(userId);
-        installUserOrgId = installUser?.orgId;
-      } catch { /* skip — org-sharing is best-effort */ }
-      const [publishedSkills, userAllowedSkillIds] = await Promise.all([
-        skillService.getSkillsAvailableToUser(userId, installUserOrgId),
-        getAllowedSkills(userId)
-      ]);
-
-      const isWildcard = userAllowedSkillIds.includes("*");
-      const allowedSkillSet = new Set(userAllowedSkillIds);
-
-      // Check admin status for admin skill gating
-      let isAdmin = false;
-      if (skillIds.includes(ADMIN_SKILL_VIRTUAL_ID)) {
-        try {
-          const { userDb } = await import('./db');
-          const user = await userDb.getUserById(userId);
-          isAdmin = user?.isAdmin === true;
-        } catch (e) {
-          console.warn('[installSkills] Error checking admin status:', (e as Error).message);
-        }
-      }
-
-      // Filter valid IDs: exists in published/user skills OR is a virtual skill ID
-      // AND is allowed by user's subscription (or admin for admin skill, or user's own skill, or org-shared private skill)
+      const availableSkills = await this.getSkillsForDisplay([], userId);
+      const availableById = new Map(availableSkills.map(skill => [skill.skillId, skill]));
       const validSkillIds = skillIds.filter(id => {
-        const skill = publishedSkills.find(s => s.skillId === id);
-        const isOwnSkill = skill && skill.ownerId === userId;
-        const isOrgSkill = skill && skill.orgId && skill.orgId === installUserOrgId;
-        return (id === OTHER_SKILLS_VIRTUAL_ID || (id === ADMIN_SKILL_VIRTUAL_ID && (isAdmin || isDelegatedAccess)) || skill) &&
-          (id === ADMIN_SKILL_VIRTUAL_ID || isOwnSkill || isOrgSkill || isWildcard || allowedSkillSet.has(id));
+        return availableById.has(id) || (id === ADMIN_SKILL_VIRTUAL_ID && isDelegatedAccess);
       });
 
       const rejectedSkillIds = skillIds.filter(id => !validSkillIds.includes(id));
@@ -5583,7 +5502,7 @@ export class AgentModeService {
           } else if (id === ADMIN_SKILL_VIRTUAL_ID) {
             installedNames.push('Admin Tools');
           } else {
-            const skill = publishedSkills.find(s => s.skillId === id);
+            const skill = availableById.get(id);
             if (skill) installedNames.push(skill.name);
           }
         });
@@ -7386,84 +7305,6 @@ export class AgentModeService {
       console.error(`AgentMode: Error executing tool ${toolName}:`, error);
       throw error;
     }
-  }
-
-  // ENG-712 — Opening actions. When a session is created from a Skill that
-  // carries an `openingAction`, this renders the container's first move as a
-  // synthetic assistant turn before the user's first input:
-  //   - 'brief': static text (the ritual reminder).
-  //   - 'prefetch': runs the declared tool calls and renders their raw
-  //     results — never LLM-narrated, so it can't read as a generic
-  //     auto-draft. A failed/thrown tool call degrades LOUDLY into a plain,
-  //     honest statement; it never fabricates placeholder material and never
-  //     leaves the session silently blank (AC4).
-  // A skill with no `openingAction` costs nothing here: this returns
-  // `{ applied: false }` without touching the session or calling any tool
-  // (AC5) — the caller (createSessionFromSkill) still creates a perfectly
-  // normal session either way.
-  public async applyOpeningAction(
-    skill: Skill,
-    sessionId: string,
-    userId: string
-  ): Promise<{ applied: boolean; degraded?: boolean }> {
-    const openingAction = skill.openingAction;
-    if (!openingAction) {
-      return { applied: false };
-    }
-
-    let content: string;
-    let degraded = false;
-
-    if (openingAction.type === 'brief') {
-      content = openingAction.content || '';
-    } else if (openingAction.type === 'prefetch') {
-      try {
-        const toolCalls = openingAction.toolCalls || [];
-        const results: Array<{ toolName: string; result: any }> = [];
-        for (const call of toolCalls) {
-          const toolResult = await this.executeTool(
-            skill.llmModel || this.default_model,
-            call.toolName,
-            call.args || {},
-            userId,
-            sessionId,
-            false
-          );
-          if (!toolResult || toolResult.success === false) {
-            throw new Error(
-              (toolResult && toolResult.error) || `Tool "${call.toolName}" returned no result`
-            );
-          }
-          results.push({ toolName: call.toolName, result: toolResult });
-        }
-        content = this.formatOpeningActionPrefetchResults(results);
-      } catch (error) {
-        console.error(`AgentMode: Opening action prefetch failed for skill ${skill.skillId}:`, error);
-        degraded = true;
-        content =
-          "I couldn't fetch the material for this yet — you can still tell me what you're working on and I'll help from here.";
-      }
-    } else {
-      // Unknown/unsupported type — defensive no-op, never fabricate a turn.
-      return { applied: false };
-    }
-
-    await chatbotDb.addMessageToSession(sessionId, {
-      role: 'assistant',
-      content,
-      metadata: {
-        timestamp: new Date().toISOString(),
-        kind: degraded ? 'opening-action-degraded' : `opening-action-${openingAction.type}`,
-      },
-    });
-
-    return { applied: true, degraded };
-  }
-
-  private formatOpeningActionPrefetchResults(results: Array<{ toolName: string; result: any }>): string {
-    return results
-      .map(({ toolName, result }) => `### ${toolName}\n${JSON.stringify(result, null, 2)}`)
-      .join('\n\n');
   }
 
   /**

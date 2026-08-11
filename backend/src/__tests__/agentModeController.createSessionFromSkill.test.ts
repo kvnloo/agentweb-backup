@@ -1,164 +1,133 @@
-import { Request, Response } from 'express';
+import { Response } from 'express';
 import { agentModeController } from '../controllers/agentModeController';
 import { chatbotDb } from '../services/chatbotService';
 import { skillService } from '../services/skillService';
 import { agentModeService } from '../services/agentModeService';
-import { getUserFromToken } from '../middleware/auth';
+import { AuthenticatedRequest, authenticateToken } from '../middleware/auth';
+import agentModeRouter from '../routes/agentMode';
 
 jest.mock('../services/chatbotService', () => ({
   chatbotDb: {
-    createChatSession: jest.fn(),
-    addAssociatedSkills: jest.fn().mockResolvedValue(undefined),
-    updateSessionLlmModel: jest.fn().mockResolvedValue({}),
-    addMessageToSession: jest.fn().mockResolvedValue({}),
+    createChatSession: jest.fn(), addAssociatedSkills: jest.fn().mockResolvedValue(undefined),
+    updateSessionLlmModel: jest.fn().mockResolvedValue({}), addMessageToSession: jest.fn().mockResolvedValue({}),
   },
 }));
-
-jest.mock('../services/skillService', () => ({
-  skillService: {
-    getSkill: jest.fn(),
-  },
-}));
-
+jest.mock('../services/skillService', () => ({ skillService: { getSkill: jest.fn() } }));
 jest.mock('../services/agentModeService', () => ({
   agentModeService: {
-    getDefaultModel: jest.fn().mockResolvedValue('claude-sonnet-4-20250514'),
-    applyOpeningAction: jest.fn(),
+    getDefaultModel: jest.fn().mockResolvedValue('gpt-5-chat'),
+    getReportsModel: jest.fn(), getCustomerSupportDefaultModel: jest.fn(), getSkillsForDisplay: jest.fn(),
+    applyOpeningAction: jest.fn(), executeTool: jest.fn(),
   },
   AgentModeService: jest.fn(),
 }));
+jest.mock('../services/generateMarketingResponseWorkerService', () => ({ generateMarketingResponseWorkerService: {} }));
 
-jest.mock('../middleware/auth', () => ({
-  getUserFromToken: jest.fn(),
-  authenticateToken: jest.fn((req, res, next) => next()),
-}));
+const db = chatbotDb as jest.Mocked<typeof chatbotDb>;
+const skills = skillService as jest.Mocked<typeof skillService>;
+const agent = agentModeService as jest.Mocked<typeof agentModeService> & {
+  applyOpeningAction: jest.Mock; executeTool: jest.Mock;
+};
+const response = () => {
+  const res: any = {};
+  res.status = jest.fn().mockReturnValue(res); res.json = jest.fn().mockReturnValue(res);
+  return res as Response;
+};
+const request = (skillId: string, body: Record<string, unknown> = {}): AuthenticatedRequest => ({
+  params: { skillId }, user: { userId: 'user-1', email: 'user@example.com' },
+  body,
+} as unknown as AuthenticatedRequest);
+const skill = {
+  skillId: 'skill-1', name: 'Static brief', description: 'd', toolNames: [], isPublished: true,
+  createdAt: '2026-01-01', updatedAt: '2026-01-01', welcomeMessage: 'Bring the artifact and the context.',
+};
 
-jest.mock('uuid', () => ({
-  v4: jest.fn(() => 'mock-anon-uuid-712'),
-}));
+describe('createSessionFromSkill authenticated static brief', () => {
+  it('exposes no public skill-session route and mounts the replacement behind authentication', () => {
+    const layers = (agentModeRouter as any).stack as any[];
+    const authIndex = layers.findIndex(layer => layer.handle === authenticateToken);
+    const routeIndex = layers.findIndex(layer => layer.route?.path === '/skill/:skillId/session');
 
-const mockChatbotDb = chatbotDb as jest.Mocked<typeof chatbotDb>;
-const mockSkillService = skillService as jest.Mocked<typeof skillService>;
-const mockAgentModeService = agentModeService as jest.Mocked<typeof agentModeService>;
-const mockGetUserFromToken = getUserFromToken as jest.MockedFunction<typeof getUserFromToken>;
-
-describe('AgentModeController - createSessionFromSkill (ENG-712)', () => {
-  const mockSession = {
-    sessionId: 'session-from-skill-1',
-    userId: 'user-1',
-    title: 'New Chat Session',
-    messages: [],
-    createdAt: '2026-08-10T00:00:00.000Z',
-    updatedAt: '2026-08-10T00:00:00.000Z',
-  };
-
-  const mockRequest = (skillId: string) =>
-    ({
-      params: { skillId },
-      headers: {},
-    } as unknown as Request);
-
-  const mockResponse = () => {
-    const res: Partial<Response> = {};
-    res.status = jest.fn().mockReturnValue(res);
-    res.json = jest.fn().mockReturnValue(res);
-    return res as Response;
-  };
+    expect(layers.some(layer => layer.route?.path === '/public/skill/:skillId/session')).toBe(false);
+    expect(authIndex).toBeGreaterThanOrEqual(0);
+    expect(routeIndex).toBeGreaterThan(authIndex);
+  });
 
   beforeEach(() => {
     jest.clearAllMocks();
-    mockChatbotDb.createChatSession.mockResolvedValue(mockSession as any);
-    mockAgentModeService.getDefaultModel.mockResolvedValue('claude-sonnet-4-20250514');
-    mockAgentModeService.applyOpeningAction.mockResolvedValue({ applied: false });
+    (agent.getSkillsForDisplay as jest.Mock).mockResolvedValue([{ ...skill, installed: false }]);
+    skills.getSkill.mockResolvedValue(skill as any);
+    db.createChatSession.mockResolvedValue({ sessionId: 'session-1', userId: 'user-1' } as any);
   });
 
-  it('FAIL: returns 404 when the skill does not exist', async () => {
-    mockSkillService.getSkill.mockResolvedValue(null);
-    mockGetUserFromToken.mockResolvedValue({ user: null } as any);
-
-    const req = mockRequest('missing-skill');
-    const res = mockResponse();
-
-    await agentModeController.createSessionFromSkill(req, res);
-
+  it.each([
+    'cross-org private skill',
+    'same-org private skill with sharing disabled',
+  ])('fails closed with 404 before writes for an inaccessible %s', async () => {
+    (agent.getSkillsForDisplay as jest.Mock).mockResolvedValue([]);
+    const res = response();
+    await agentModeController.createSession(request('skill-1'), res);
     expect(res.status).toHaveBeenCalledWith(404);
-    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
+    expect(skills.getSkill).not.toHaveBeenCalled();
+    expect(db.createChatSession).not.toHaveBeenCalled();
+    expect(db.addMessageToSession).not.toHaveBeenCalled();
   });
 
-  it('FAIL: returns 403 for a private skill when the requester is not the owner', async () => {
-    mockSkillService.getSkill.mockResolvedValue({
-      skillId: 'private-skill',
-      name: 'Private',
-      description: 'd',
-      toolNames: [],
-      isPublished: true,
-      createdAt: '2026-01-01T00:00:00.000Z',
-      updatedAt: '2026-01-01T00:00:00.000Z',
-      visibility: 'private',
-      ownerId: 'owner-1',
-    } as any);
-    mockGetUserFromToken.mockResolvedValue({ user: { userId: 'someone-else' } } as any);
-
-    const req = mockRequest('private-skill');
-    const res = mockResponse();
-
-    await agentModeController.createSessionFromSkill(req, res);
-
-    expect(res.status).toHaveBeenCalledWith(403);
-    expect(mockChatbotDb.createChatSession).not.toHaveBeenCalled();
-  });
-
-  it('FAIL: happy path creates a session, installs the skill, applies the opening action, and returns a navigable deep link (AC6)', async () => {
-    const skill = {
-      skillId: 'reply-guy',
-      name: 'Reply Guy',
-      description: 'd',
-      toolNames: ['find_reply_candidates'],
-      isPublished: true,
-      createdAt: '2026-01-01T00:00:00.000Z',
-      updatedAt: '2026-01-01T00:00:00.000Z',
-      openingAction: { type: 'prefetch' as const, toolCalls: [{ toolName: 'find_reply_candidates' }] },
-    };
-    mockSkillService.getSkill.mockResolvedValue(skill as any);
-    mockGetUserFromToken.mockResolvedValue({ user: { userId: 'user-1' } } as any);
-    mockAgentModeService.applyOpeningAction.mockResolvedValue({ applied: true, degraded: false });
-
-    const req = mockRequest('reply-guy');
-    const res = mockResponse();
-
-    await agentModeController.createSessionFromSkill(req, res);
-
-    expect(mockChatbotDb.createChatSession).toHaveBeenCalled();
-    expect(mockChatbotDb.addAssociatedSkills).toHaveBeenCalledWith(mockSession.sessionId, ['reply-guy']);
-    expect(mockAgentModeService.applyOpeningAction).toHaveBeenCalledWith(skill, mockSession.sessionId, 'user-1');
+  it('uses the authenticated principal and writes the static brief as the first assistant turn', async () => {
+    const res = response();
+    await agentModeController.createSession(request('skill-1'), res);
+    expect(db.createChatSession).toHaveBeenCalledWith(
+      'user-1', undefined, 'agent', 'skill-skill-1', undefined, undefined, undefined, undefined, 'regular', undefined
+    );
+    expect(db.addMessageToSession).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      role: 'assistant', content: skill.welcomeMessage,
+    }));
     expect(res.status).toHaveBeenCalledWith(201);
-    const jsonArg = (res.json as jest.Mock).mock.calls[0][0];
-    expect(jsonArg.sessionId).toBe(mockSession.sessionId);
-    expect(jsonArg.redirectUrl).toContain(mockSession.sessionId);
-    expect(jsonArg.openingActionApplied).toBe(true);
   });
 
-  it('SUCCESS: a skill with no openingAction still creates a usable session (no regression)', async () => {
-    const skill = {
-      skillId: 'plain-skill',
-      name: 'Plain',
-      description: 'd',
-      toolNames: [],
-      isPublished: true,
-      createdAt: '2026-01-01T00:00:00.000Z',
-      updatedAt: '2026-01-01T00:00:00.000Z',
-    };
-    mockSkillService.getSkill.mockResolvedValue(skill as any);
-    mockGetUserFromToken.mockResolvedValue({ user: null } as any);
-    mockAgentModeService.applyOpeningAction.mockResolvedValue({ applied: false });
+  it.each([
+    '<script>alert(1)</script>',
+    '<iframe src="https://evil.test"></iframe>',
+    '<form action="https://evil.test"><input></form>',
+    '<img src=x onerror="alert(1)">',
+    'hello\u0000world',
+    null,
+  ])('rejects unsafe persisted welcomeMessage before any write: %s', async (welcomeMessage) => {
+    skills.getSkill.mockResolvedValue({ ...skill, welcomeMessage } as any);
+    const res = response();
 
-    const req = mockRequest('plain-skill');
-    const res = mockResponse();
+    await agentModeController.createSession(request('skill-1'), res);
 
-    await agentModeController.createSessionFromSkill(req, res);
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(db.createChatSession).not.toHaveBeenCalled();
+    expect(db.addMessageToSession).not.toHaveBeenCalled();
+  });
 
+  it('never executes a tool, opening-action dispatcher, or LLM for the static slice', async () => {
+    await agentModeController.createSession(request('skill-1'), response());
+    expect(agent.applyOpeningAction).not.toHaveBeenCalled();
+    expect(agent.executeTool).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { portalType: 'emma-sidebar' },
+    { sessionType: 'scheduled' },
+    { sessionType: 'report_generation', portalType: 'emma-sidebar' },
+  ])('ignores hostile session classification overrides: %j', async (body) => {
+    await agentModeController.createSession(request('skill-1', body), response());
+    expect(db.createChatSession).toHaveBeenCalledWith(
+      'user-1', undefined, 'agent', 'skill-skill-1', undefined, undefined, undefined, undefined, 'regular', undefined
+    );
+    expect(agent.getReportsModel).not.toHaveBeenCalled();
+    expect(agent.getCustomerSupportDefaultModel).not.toHaveBeenCalled();
+    expect(agent.getDefaultModel).toHaveBeenCalled();
+  });
+
+  it('keeps an authorized skill without a welcome message usable', async () => {
+    skills.getSkill.mockResolvedValue({ ...skill, welcomeMessage: undefined } as any);
+    const res = response();
+    await agentModeController.createSession(request('skill-1'), res);
+    expect(db.addMessageToSession).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(201);
-    const jsonArg = (res.json as jest.Mock).mock.calls[0][0];
-    expect(jsonArg.openingActionApplied).toBe(false);
   });
 });

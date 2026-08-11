@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from "uuid";
 import dotenv from "dotenv";
 import path from "path";
 import { paginatedScan } from "../utils/dynamoPagination";
+import { validateWelcomeMessage } from "../utils/welcomeMessageValidation";
 
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, "../../.env") });
@@ -36,24 +37,6 @@ export interface SkillSyncInfo {
   changedFields: string[];
 }
 
-export type SkillOpeningActionType = 'brief' | 'prefetch';
-
-export interface SkillOpeningActionToolCall {
-  toolName: string;
-  args?: Record<string, any>;
-}
-
-// ENG-712: an optional first move for a Skill-backed session. `brief` renders
-// static text as the first assistant turn (the "ritual" reminder); `prefetch`
-// runs tool calls and renders their raw results — never LLM-narrated — before
-// yielding to the user. Absent on a skill, this changes nothing about how
-// that skill behaves today.
-export interface SkillOpeningAction {
-  type: SkillOpeningActionType;
-  content?: string; // required for type 'brief'
-  toolCalls?: SkillOpeningActionToolCall[]; // required for type 'prefetch'
-}
-
 export interface Skill {
   skillId: string;
   name: string;
@@ -76,7 +59,6 @@ export interface Skill {
   orgId?: string;
   visibility?: SkillVisibility;
   reviewFeedback?: string;
-  openingAction?: SkillOpeningAction; // ENG-712, optional, all-backward-compatible
 }
 
 export class SkillService {
@@ -111,8 +93,10 @@ export class SkillService {
     toolNames: string[],
     systemPrompt?: string,
     isPublished?: boolean,
-    openingAction?: SkillOpeningAction
+    welcomeMessage?: string
   ): Promise<Skill> {
+    const welcomeMessageError = validateWelcomeMessage(welcomeMessage);
+    if (welcomeMessageError) throw new Error(welcomeMessageError);
     const timestamp = new Date().toISOString();
     const skill: Skill = {
       skillId: uuidv4(),
@@ -123,7 +107,7 @@ export class SkillService {
       isPublished: isPublished || false, // Default to Draft (not published)
       createdAt: timestamp,
       updatedAt: timestamp,
-      ...(openingAction ? { openingAction } : {}),
+      ...(welcomeMessage ? { welcomeMessage } : {}),
     };
 
     const skillItem: any = {
@@ -254,6 +238,8 @@ export class SkillService {
   }
 
   async updateSkill(skill: Skill): Promise<void> {
+    const welcomeMessageError = validateWelcomeMessage(skill.welcomeMessage);
+    if (welcomeMessageError) throw new Error(welcomeMessageError);
     const skillItem: any = {
       ...skill,
       updatedAt: new Date().toISOString()
