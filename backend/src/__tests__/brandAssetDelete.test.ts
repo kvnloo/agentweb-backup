@@ -714,6 +714,53 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     expect(prune.ConditionExpression).toBe("attribute_not_exists(brandGuidelines.updatedAt)");
   });
 
+  it.each([
+    ["a different region", `https://${BUCKET}.s3.eu-west-1.amazonaws.com/users/me/brand/assets/x.png`],
+    ["no region at all", `https://${BUCKET}.s3.amazonaws.com/users/me/brand/assets/x.png`],
+    ["the s3-<region> spelling", `https://${BUCKET}.s3-ap-southeast-2.amazonaws.com/users/me/brand/assets/x.png`],
+    ["path style", `https://s3.us-east-2.amazonaws.com/${BUCKET}/users/me/brand/assets/x.png`],
+  ])("derives the legacy key from a URL using %s", async (_label, assetUrl) => {
+    // Uploads build their URL from AWS_REGION while this path hardcoded
+    // us-west-2, so any other region wrote URLs it could not parse — the object
+    // delete was skipped and the attachment dereferenced anyway.
+    mockDynamoGet.mockResolvedValue({
+      Item: {
+        ...soloUser,
+        brandGuidelines: {
+          ...ownBrand,
+          attachments: [{ type: "asset", url: assetUrl, filename: "x.png" }],
+        },
+      },
+    });
+
+    const res = await del(soloUser, "undefined", `?url=${encodeURIComponent(assetUrl)}`);
+
+    expect(res.status).toBe(200);
+    expect(mockS3Delete).toHaveBeenCalledWith(
+      expect.objectContaining({ Key: "users/me/brand/assets/x.png" })
+    );
+  });
+
+  it("does not try to delete an externally hosted asset", async () => {
+    // Not in our bucket, so there is no object of ours to remove — dropping the
+    // reference is the whole operation.
+    const external = "https://cdn.example.com/brand/guide.pdf";
+    mockDynamoGet.mockResolvedValue({
+      Item: {
+        ...soloUser,
+        brandGuidelines: {
+          ...ownBrand,
+          attachments: [{ type: "brandGuide", url: external, filename: "guide.pdf" }],
+        },
+      },
+    });
+
+    const res = await del(soloUser, "undefined", `?url=${encodeURIComponent(external)}`);
+
+    expect(res.status).toBe(200);
+    expect(mockS3Delete).not.toHaveBeenCalled();
+  });
+
   it("refuses a foreign key even on an un-copied org", async () => {
     const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
     mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
