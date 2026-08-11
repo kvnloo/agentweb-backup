@@ -595,6 +595,67 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     (console.error as jest.Mock).mockRestore();
   });
 
+  it("guards the solo rollback so a concurrent brand save is not erased", async () => {
+    // The S3 delete retries for a few hundred ms before rollback, which is
+    // plenty of room for another save to land. An unconditional restore would
+    // erase it while telling the caller nothing changed.
+    mockDynamoGet.mockResolvedValue({ Item: soloUser });
+    mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
+    jest.spyOn(console, "error").mockImplementation(() => {});
+
+    await del(soloUser, OWN_ASSET_KEY);
+
+    const rollback = mockDynamoUpdate.mock.calls.at(-1)![0];
+    const pruneWrite = mockDynamoUpdate.mock.calls[0][0];
+    expect(rollback.ConditionExpression).toBe("brandGuidelines.updatedAt = :justWritten");
+    expect(rollback.ExpressionAttributeValues[":justWritten"]).toBe(
+      pruneWrite.ExpressionAttributeValues[":brandGuidelines"].updatedAt
+    );
+    (console.error as jest.Mock).mockRestore();
+  });
+
+  it("guards the org rollback the same way", async () => {
+    const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "me",
+      brandGuidelines: ownBrand,
+      shareSettings: { brandGuidelines: { editors: [] }, marketingStrategy: { editors: [] } },
+    });
+    mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
+    jest.spyOn(console, "error").mockImplementation(() => {});
+
+    await del(orgUser, OWN_ASSET_KEY);
+
+    const [, , options] = mockUpdateOrg.mock.calls.at(-1)!;
+    const prunedWrite = mockUpdateOrg.mock.calls[0][1];
+    expect(options.condition.expression).toBe("brandGuidelines.updatedAt = :justWritten");
+    expect(options.condition.values[":justWritten"]).toBe(
+      prunedWrite.brandGuidelines.updatedAt
+    );
+    (console.error as jest.Mock).mockRestore();
+  });
+
+  it("reports the orphan rather than erasing a brand that moved under the rollback", async () => {
+    mockDynamoGet.mockResolvedValue({ Item: soloUser });
+    mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
+    mockDynamoUpdate
+      .mockResolvedValueOnce({ Attributes: {} })
+      .mockRejectedValueOnce(
+        Object.assign(new Error("The conditional request failed"), {
+          code: "ConditionalCheckFailedException",
+        })
+      );
+    jest.spyOn(console, "error").mockImplementation(() => {});
+
+    const res = await del(soloUser, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(500);
+    expect(res.body.objectDeleted).toBe(false);
+    (console.error as jest.Mock).mockRestore();
+  });
+
   it("refuses a foreign key even on an un-copied org", async () => {
     const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
     mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
