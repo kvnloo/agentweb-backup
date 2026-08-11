@@ -111,6 +111,21 @@ describe('inlineS3ImagesAsDataUris — ENG-278 bounded contract', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it('keeps markup after a self-closing template start tag inert per HTML semantics', async () => {
+    const url = 'https://agentweb-user-files.s3.amazonaws.com/users/u1/inert-after-template.png';
+    const html = `<template/><img src="${url}">`;
+    const fetcher: InlineImageFetcher = jest.fn().mockRejectedValue(
+      new Error('template content must not be fetched'),
+    );
+
+    await expect(inlineS3ImagesAsDataUris(html, fetcher)).resolves.toEqual({
+      html,
+      inlined: 0,
+      decodedBytes: 0,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it('fetches only same-bucket S3 assets with the per-image byte ceiling', async () => {
     const getObject = jest.spyOn(s3Utils, 'getS3ObjectAsBuffer').mockResolvedValue({
       buffer: Buffer.from('image'),
