@@ -521,7 +521,8 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
       expect.anything(),
       expect.objectContaining({
         condition: expect.objectContaining({
-          expression: "brandGuidelines.updatedAt = :expectedBrandUpdatedAt",
+          expression:
+            "brandGuidelines.updatedAt = :expectedBrandUpdatedAt AND attribute_not_exists(brandGuidelines.rev)",
           values: { ":expectedBrandUpdatedAt": "2026-08-10T00:00:00.000Z" },
         }),
       })
@@ -607,7 +608,9 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
 
     const rollback = mockDynamoUpdate.mock.calls.at(-1)![0];
     const pruneWrite = mockDynamoUpdate.mock.calls[0][0];
-    expect(rollback.ConditionExpression).toBe("brandGuidelines.updatedAt = :justWritten");
+    expect(rollback.ConditionExpression).toBe(
+      "brandGuidelines.updatedAt = :justWritten AND brandGuidelines.rev = :justWrittenRev"
+    );
     expect(rollback.ExpressionAttributeValues[":justWritten"]).toBe(
       pruneWrite.ExpressionAttributeValues[":brandGuidelines"].updatedAt
     );
@@ -630,7 +633,9 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
 
     const [, , options] = mockUpdateOrg.mock.calls.at(-1)!;
     const prunedWrite = mockUpdateOrg.mock.calls[0][1];
-    expect(options.condition.expression).toBe("brandGuidelines.updatedAt = :justWritten");
+    expect(options.condition.expression).toBe(
+      "brandGuidelines.updatedAt = :justWritten AND brandGuidelines.rev = :justWrittenRev"
+    );
     expect(options.condition.values[":justWritten"]).toBe(
       prunedWrite.brandGuidelines.updatedAt
     );
@@ -666,7 +671,9 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     await del(soloUser, OWN_ASSET_KEY);
 
     const prune = mockDynamoUpdate.mock.calls[0][0];
-    expect(prune.ConditionExpression).toBe("brandGuidelines.updatedAt = :expectedBrandUpdatedAt");
+    expect(prune.ConditionExpression).toBe(
+      "brandGuidelines.updatedAt = :expectedBrandUpdatedAt AND attribute_not_exists(brandGuidelines.rev)"
+    );
     expect(prune.ExpressionAttributeValues[":expectedBrandUpdatedAt"]).toBe(
       "2026-08-10T00:00:00.000Z"
     );
@@ -711,7 +718,9 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     await del(soloUser, OWN_ASSET_KEY);
 
     const prune = mockDynamoUpdate.mock.calls[0][0];
-    expect(prune.ConditionExpression).toBe("attribute_not_exists(brandGuidelines.updatedAt)");
+    expect(prune.ConditionExpression).toBe(
+      "attribute_not_exists(brandGuidelines.updatedAt) AND attribute_not_exists(brandGuidelines.rev)"
+    );
   });
 
   it.each([
@@ -775,5 +784,201 @@ describe("DELETE /api/brand/guidelines/asset/:key — ownership", () => {
     expect(res.status).toBe(404);
     expect(mockS3Delete).not.toHaveBeenCalled();
     expect(mockUpdateOrg).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * `updatedAt` alone cannot identify the write a guard is protecting. The stamp
+ * is millisecond-granular and every other brand writer mints its own (`POST
+ * /guidelines` stamps a plain `new Date().toISOString()`), so a save landing in
+ * the same millisecond as a delete's prune produces a byte-identical token —
+ * and the delete's rollback then passes its guard against a record it never
+ * read, restoring a stale attachment list over the other writer's save. Pairing
+ * the stamp with an opaque per-write revision makes the comparison identify one
+ * specific write instead of one millisecond.
+ */
+describe("DELETE /api/brand/guidelines/asset/:key — write identity", () => {
+  it("stamps an opaque revision on the solo prune", async () => {
+    const stamped = { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...soloUser, brandGuidelines: stamped } });
+
+    await del(soloUser, OWN_ASSET_KEY);
+
+    const written =
+      mockDynamoUpdate.mock.calls[0][0].ExpressionAttributeValues[":brandGuidelines"];
+    expect(typeof written.rev).toBe("string");
+    expect(written.rev.length).toBeGreaterThan(0);
+  });
+
+  it("mints a different revision on every delete", async () => {
+    const stamped = { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...soloUser, brandGuidelines: stamped } });
+
+    await del(soloUser, OWN_ASSET_KEY);
+    const first =
+      mockDynamoUpdate.mock.calls[0][0].ExpressionAttributeValues[":brandGuidelines"].rev;
+    mockDynamoUpdate.mockClear();
+    await del(soloUser, OWN_ASSET_KEY);
+    const second =
+      mockDynamoUpdate.mock.calls[0][0].ExpressionAttributeValues[":brandGuidelines"].rev;
+
+    expect(second).not.toBe(first);
+  });
+
+  it("guards the prune on the revision it read, not just the timestamp", async () => {
+    const stamped = { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z", rev: "rev-abc" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...soloUser, brandGuidelines: stamped } });
+
+    await del(soloUser, OWN_ASSET_KEY);
+
+    const prune = mockDynamoUpdate.mock.calls[0][0];
+    expect(prune.ConditionExpression).toBe(
+      "brandGuidelines.updatedAt = :expectedBrandUpdatedAt AND brandGuidelines.rev = :expectedBrandRev"
+    );
+    expect(prune.ExpressionAttributeValues[":expectedBrandRev"]).toBe("rev-abc");
+  });
+
+  it("matches the absence of a revision on a record last written by another path", async () => {
+    // `POST /guidelines` and the agent-mode brand writers rebuild the value
+    // without a revision, so the guard has to require its absence — otherwise a
+    // stale revision left behind by an earlier delete would still match.
+    const stamped = { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...soloUser, brandGuidelines: stamped } });
+
+    await del(soloUser, OWN_ASSET_KEY);
+
+    expect(mockDynamoUpdate.mock.calls[0][0].ConditionExpression).toBe(
+      "brandGuidelines.updatedAt = :expectedBrandUpdatedAt AND attribute_not_exists(brandGuidelines.rev)"
+    );
+  });
+
+  it("guards a legacy record on the absence of both markers", async () => {
+    const legacy = { brandData: { brandName: "Acme" }, attachments: ownBrand.attachments };
+    mockDynamoGet.mockResolvedValue({ Item: { ...soloUser, brandGuidelines: legacy } });
+
+    await del(soloUser, OWN_ASSET_KEY);
+
+    expect(mockDynamoUpdate.mock.calls[0][0].ConditionExpression).toBe(
+      "attribute_not_exists(brandGuidelines.updatedAt) AND attribute_not_exists(brandGuidelines.rev)"
+    );
+  });
+
+  it("rolls back only against the exact revision this request wrote", async () => {
+    mockDynamoGet.mockResolvedValue({ Item: soloUser });
+    mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
+    jest.spyOn(console, "error").mockImplementation(() => {});
+
+    await del(soloUser, OWN_ASSET_KEY);
+
+    const pruneWrite = mockDynamoUpdate.mock.calls[0][0];
+    const rollback = mockDynamoUpdate.mock.calls.at(-1)![0];
+    expect(rollback.ConditionExpression).toBe(
+      "brandGuidelines.updatedAt = :justWritten AND brandGuidelines.rev = :justWrittenRev"
+    );
+    expect(rollback.ExpressionAttributeValues[":justWrittenRev"]).toBe(
+      pruneWrite.ExpressionAttributeValues[":brandGuidelines"].rev
+    );
+    (console.error as jest.Mock).mockRestore();
+  });
+
+  it("carries the same identity through the org prune and its rollback", async () => {
+    const orgUser = { userId: "me", email: "me@test.com", orgId: "org-1", orgRole: "owner" };
+    const stamped = { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z", rev: "rev-org" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...orgUser, brandGuidelines: ownBrand } });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "me",
+      brandGuidelines: stamped,
+      shareSettings: { brandGuidelines: { editors: [] }, marketingStrategy: { editors: [] } },
+    });
+    mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
+    jest.spyOn(console, "error").mockImplementation(() => {});
+
+    await del(orgUser, OWN_ASSET_KEY);
+
+    const [, prunedWrite, pruneOptions] = mockUpdateOrg.mock.calls[0];
+    expect(pruneOptions.condition.expression).toBe(
+      "brandGuidelines.updatedAt = :expectedBrandUpdatedAt AND brandGuidelines.rev = :expectedBrandRev"
+    );
+    expect(pruneOptions.condition.values[":expectedBrandRev"]).toBe("rev-org");
+
+    const [, , rollbackOptions] = mockUpdateOrg.mock.calls.at(-1)!;
+    expect(rollbackOptions.condition.expression).toBe(
+      "brandGuidelines.updatedAt = :justWritten AND brandGuidelines.rev = :justWrittenRev"
+    );
+    expect(rollbackOptions.condition.values[":justWrittenRev"]).toBe(
+      prunedWrite.brandGuidelines.rev
+    );
+    (console.error as jest.Mock).mockRestore();
+  });
+
+  it("carries the same identity through the owner-fallback prune and its rollback", async () => {
+    const editor = { userId: "editor-u", email: "editor@test.com", orgId: "org-1", orgRole: "member" };
+    mockDynamoGet.mockResolvedValue({ Item: editor });
+    mockGetOrgById.mockResolvedValue({
+      orgId: "org-1",
+      ownerUserId: "owner-u",
+      shareSettings: {
+        brandGuidelines: { editors: ["editor-u"] },
+        marketingStrategy: { editors: [] },
+      },
+    });
+    mockGetUserById.mockResolvedValue({
+      userId: "owner-u",
+      email: "owner@test.com",
+      brandGuidelines: { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z", rev: "rev-owner" },
+    });
+    mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
+    jest.spyOn(console, "error").mockImplementation(() => {});
+
+    await del(editor, OWN_ASSET_KEY);
+
+    const [, prunedWrite, pruneOptions] = mockUpdateUser.mock.calls[0];
+    expect(pruneOptions.condition.expression).toBe(
+      "brandGuidelines.updatedAt = :expectedBrandUpdatedAt AND brandGuidelines.rev = :expectedBrandRev"
+    );
+    expect(pruneOptions.condition.values[":expectedBrandRev"]).toBe("rev-owner");
+    expect(typeof prunedWrite.brandGuidelines.rev).toBe("string");
+    expect(prunedWrite.brandGuidelines.rev).not.toBe("rev-owner");
+
+    const [, , rollbackOptions] = mockUpdateUser.mock.calls.at(-1)!;
+    expect(rollbackOptions.condition.expression).toBe(
+      "brandGuidelines.updatedAt = :justWritten AND brandGuidelines.rev = :justWrittenRev"
+    );
+    expect(rollbackOptions.condition.values[":justWrittenRev"]).toBe(
+      prunedWrite.brandGuidelines.rev
+    );
+    (console.error as jest.Mock).mockRestore();
+  });
+
+  it("409s and destroys nothing when only the revision has moved", async () => {
+    // Same millisecond, different write: the timestamp alone would have passed.
+    const stamped = { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z", rev: "rev-read" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...soloUser, brandGuidelines: stamped } });
+    mockDynamoUpdate.mockRejectedValue(
+      Object.assign(new Error("The conditional request failed"), {
+        code: "ConditionalCheckFailedException",
+      })
+    );
+
+    const res = await del(soloUser, OWN_ASSET_KEY);
+
+    expect(res.status).toBe(409);
+    expect(mockS3Delete).not.toHaveBeenCalled();
+  });
+
+  it("restores the revision the record had before the prune, not the one it wrote", async () => {
+    // The rollback puts the pre-delete value back verbatim, so a later delete
+    // guards against the identity that value actually carries.
+    const stamped = { ...ownBrand, updatedAt: "2026-08-10T00:00:00.000Z", rev: "rev-read" };
+    mockDynamoGet.mockResolvedValue({ Item: { ...soloUser, brandGuidelines: stamped } });
+    mockS3Delete.mockRejectedValue(new Error("AccessDenied"));
+    jest.spyOn(console, "error").mockImplementation(() => {});
+
+    await del(soloUser, OWN_ASSET_KEY);
+
+    const rollback = mockDynamoUpdate.mock.calls.at(-1)![0];
+    expect(rollback.ExpressionAttributeValues[":brandGuidelines"].rev).toBe("rev-read");
+    (console.error as jest.Mock).mockRestore();
   });
 });
