@@ -29,6 +29,7 @@ import {
   getS3ObjectStream,
   getS3ObjectMetadata,
   getS3ObjectAsString,
+  getS3ObjectAsBuffer,
   uploadScreenshotToS3,
 } from '../../utils/s3Utils';
 
@@ -360,6 +361,22 @@ describe('s3Utils', () => {
       expect(key).toBeNull();
     });
 
+    it('should return null for a bucket-lookalike hostname', () => {
+      const key = extractS3KeyFromUrl(
+        'https://test-bucket.evil.example/users/123/file.txt',
+        'test-bucket'
+      );
+      expect(key).toBeNull();
+    });
+
+    it('should return null for a path-style key on a non-S3 hostname', () => {
+      const key = extractS3KeyFromUrl(
+        'https://example.com/test-bucket/users/123/file.txt',
+        'test-bucket'
+      );
+      expect(key).toBeNull();
+    });
+
     it('should return null for invalid URL', () => {
       const key = extractS3KeyFromUrl('not-a-url', 'test-bucket');
       expect(key).toBeNull();
@@ -602,6 +619,41 @@ describe('s3Utils', () => {
       // initial attempt + 2 retries = 3 calls
       expect(mockGetObject).toHaveBeenCalledTimes(3);
       expect(noSleep).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('getS3ObjectAsBuffer', () => {
+    it('uses a bounded range and accepts an object exactly at the byte limit', async () => {
+      mockGetObject.mockReturnValue({
+        promise: () => Promise.resolve({ Body: Buffer.alloc(5), ContentType: 'image/png' }),
+      });
+
+      const result = await getS3ObjectAsBuffer('private/chart.png', 'test-bucket', 5);
+
+      expect(mockGetObject).toHaveBeenCalledWith({
+        Bucket: 'test-bucket',
+        Key: 'private/chart.png',
+        Range: 'bytes=0-5',
+      });
+      expect(result).toEqual({ buffer: Buffer.alloc(5), contentType: 'image/png' });
+    });
+
+    it('rejects the max-plus-one sentinel returned by the bounded range', async () => {
+      mockGetObject.mockReturnValue({
+        promise: () => Promise.resolve({ Body: Buffer.alloc(6), ContentType: 'image/png' }),
+      });
+
+      await expect(getS3ObjectAsBuffer('private/huge.png', 'test-bucket', 5)).rejects.toThrow(
+        /exceeds the 5 bytes limit/i,
+      );
+    });
+
+    it('rejects an absent body instead of treating it as an empty image', async () => {
+      mockGetObject.mockReturnValue({ promise: () => Promise.resolve({}) });
+
+      await expect(getS3ObjectAsBuffer('private/missing.png', 'test-bucket', 5)).rejects.toThrow(
+        /empty body/i,
+      );
     });
   });
 
