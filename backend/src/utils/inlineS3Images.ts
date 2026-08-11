@@ -112,12 +112,13 @@ export async function inlineS3ImagesAsDataUris(
 }
 
 export function createDefaultS3ImageFetcher(
+  userId: string,
   buckets: string[] = [process.env.AWS_S3_BUCKET || 'agentweb-user-files'],
 ): InlineImageFetcher {
   return async (url) => {
     for (const bucket of buckets) {
       const key = extractS3KeyFromUrl(url, bucket);
-      if (!key) continue;
+      if (!key || !key.startsWith(`users/${userId}/`)) continue;
       const result = await getS3ObjectAsBuffer(key, bucket, MAX_INLINE_IMAGE_BYTES);
       return { buffer: result.buffer, contentType: result.contentType };
     }

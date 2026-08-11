@@ -361,6 +361,22 @@ describe('s3Utils', () => {
       expect(key).toBeNull();
     });
 
+    it('should return null for a bucket-lookalike hostname', () => {
+      const key = extractS3KeyFromUrl(
+        'https://test-bucket.evil.example/users/123/file.txt',
+        'test-bucket'
+      );
+      expect(key).toBeNull();
+    });
+
+    it('should return null for a path-style key on a non-S3 hostname', () => {
+      const key = extractS3KeyFromUrl(
+        'https://example.com/test-bucket/users/123/file.txt',
+        'test-bucket'
+      );
+      expect(key).toBeNull();
+    });
+
     it('should return null for invalid URL', () => {
       const key = extractS3KeyFromUrl('not-a-url', 'test-bucket');
       expect(key).toBeNull();

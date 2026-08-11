@@ -23,15 +23,22 @@ export function extractS3KeyFromUrl(
   try {
     const url = new URL(fileUrl);
     const host = url.hostname.toLowerCase();
+    const normalizedBucket = bucket.toLowerCase();
     const path = url.pathname.replace(/^\/+/, '');
 
     // Virtual-hosted style: bucket.s3.amazonaws.com/key or bucket.s3.region.amazonaws.com/key
-    if (host.startsWith(`${bucket}.`)) {
+    const virtualHost = `${normalizedBucket}.s3.amazonaws.com`;
+    const regionalVirtualHost = new RegExp(
+      `^${normalizedBucket.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.s3[.-][a-z0-9-]+\\.amazonaws\\.com$`,
+    );
+    if (host === virtualHost || regionalVirtualHost.test(host)) {
       return path || null;
     }
 
     // Path-style: s3.amazonaws.com/bucket/key
-    if (path.startsWith(`${bucket}/`)) {
+    const pathStyleHost = host === 's3.amazonaws.com'
+      || /^s3[.-][a-z0-9-]+\.amazonaws\.com$/.test(host);
+    if (pathStyleHost && path.startsWith(`${bucket}/`)) {
       return path.substring(bucket.length + 1) || null;
     }
 

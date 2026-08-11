@@ -81,7 +81,7 @@ describe('inlineS3ImagesAsDataUris — ENG-278 bounded contract', () => {
       buffer: Buffer.from('image'),
       contentType: 'image/png',
     });
-    const fetcher = createDefaultS3ImageFetcher(['private-assets']);
+    const fetcher = createDefaultS3ImageFetcher('u1', ['private-assets']);
 
     await expect(fetcher('https://private-assets.s3.us-west-2.amazonaws.com/users/u1/chart.png'))
       .resolves.toEqual({ buffer: Buffer.from('image'), contentType: 'image/png' });
@@ -95,9 +95,20 @@ describe('inlineS3ImagesAsDataUris — ENG-278 bounded contract', () => {
 
   it('does not fetch or sign foreign image URLs', async () => {
     const getObject = jest.spyOn(s3Utils, 'getS3ObjectAsBuffer');
-    const fetcher = createDefaultS3ImageFetcher(['private-assets']);
+    const fetcher = createDefaultS3ImageFetcher('u1', ['private-assets']);
 
     await expect(fetcher('https://cdn.example.com/chart.png')).resolves.toBeNull();
+    expect(getObject).not.toHaveBeenCalled();
+    getObject.mockRestore();
+  });
+
+  it('does not fetch another user\'s object from the shared bucket', async () => {
+    const getObject = jest.spyOn(s3Utils, 'getS3ObjectAsBuffer');
+    const fetcher = createDefaultS3ImageFetcher('u1', ['private-assets']);
+
+    await expect(fetcher(
+      'https://private-assets.s3.us-west-2.amazonaws.com/users/u2/chart.png',
+    )).resolves.toBeNull();
     expect(getObject).not.toHaveBeenCalled();
     getObject.mockRestore();
   });

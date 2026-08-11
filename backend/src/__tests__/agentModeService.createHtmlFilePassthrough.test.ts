@@ -96,6 +96,8 @@ describe('AgentModeService.createHtmlFile — ENG-472 (skip redundant render / f
     const res = await service.createHtmlFile('Acme Insight', COMPLETE_HTML, '', 'user-1', 'sess-1', 'document');
 
     expect(res.success).toBe(true);
+    expect(require('../utils/inlineS3Images').createDefaultS3ImageFetcher)
+      .toHaveBeenCalledWith('user-1');
     expect(mockInlineImages).toHaveBeenCalledWith(COMPLETE_HTML, expect.any(Function));
     expect(mockUpload).toHaveBeenCalledWith(inlined, expect.any(String), 'user-1', 'text/html');
   });
