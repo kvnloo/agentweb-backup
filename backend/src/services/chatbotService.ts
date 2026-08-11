@@ -550,7 +550,8 @@ export class ChatbotDB {
     executionId?: string,
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
-    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
+    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -589,6 +590,7 @@ export class ChatbotDB {
       sessionType: sessionType || "regular", // Default to regular if not specified
       delegateInfo, // Store delegate access info if provided
       ...(portalType === "agent" ? { associatedSkills: [] } : {}), // Initialize for agent sessions so skill enforcement applies
+      ...initialState,
     };
 
     if (pageContent) {
@@ -4061,7 +4063,11 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         const content = segment.structValue.fields.content.stringValue;
         results.push({
           id: `kb-public-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          content: content,
+          // ENG-1057: cap here, at the shared source, so every consumer of
+          // this function is protected uniformly instead of relying on each
+          // one to remember to truncate independently (which is exactly how
+          // one uncapped path crashed the backend with ERR_STRING_TOO_LONG).
+          content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
           metadata: {
             source: 'public-knowledge-base',
             ...(fileName && { fileName })
@@ -4108,7 +4114,8 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         const content = segment.structValue.fields.content.stringValue;
         results.push({
           id: `kb-private-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          content: content,
+          // ENG-1057: same cap as the public branch above.
+          content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
           metadata: {
             source: 'private-knowledge-base',
             taskId: taskId,
