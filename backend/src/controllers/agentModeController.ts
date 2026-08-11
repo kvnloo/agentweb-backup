@@ -4569,11 +4569,10 @@ export const agentModeController = {
       let skill;
       if (skillId) {
         const available = await agentModeService.getSkillsForDisplay([], user.userId);
-        if (!available.some(candidate => candidate.skillId === skillId)) {
+        skill = available.find(candidate => candidate.skillId === skillId);
+        if (!skill) {
           return res.status(404).json({ error: 'Skill not found' });
         }
-        skill = await skillService.getSkill(skillId);
-        if (!skill) return res.status(404).json({ error: 'Skill not found' });
         const validationError = validateWelcomeMessage(skill.welcomeMessage);
         if (validationError) return res.status(400).json({ error: validationError });
       }

@@ -57,7 +57,6 @@ describe('createSessionFromSkill authenticated static brief', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     (agent.getSkillsForDisplay as jest.Mock).mockResolvedValue([{ ...skill, installed: false }]);
-    skills.getSkill.mockResolvedValue(skill as any);
     db.createChatSession.mockResolvedValue({ sessionId: 'session-1', userId: 'user-1' } as any);
   });
 
@@ -74,16 +73,18 @@ describe('createSessionFromSkill authenticated static brief', () => {
     expect(db.addMessageToSession).not.toHaveBeenCalled();
   });
 
-  it('uses the authenticated principal and writes the static brief as the first assistant turn', async () => {
-    const res = response();
-    await agentModeController.createSession(request('skill-1'), res);
+  it.each([
+    { isPublished: false, welcomeMessage: 'unpublished secret' }, { reviewStatus: 'pending_review', welcomeMessage: 'pending secret' }, { isPublic: false, ownerId: 'other-user', welcomeMessage: 'private secret' },
+  ])('uses the authorized catalog snapshot when a later unfiltered read changes: %j', async (changed) => {
+    skills.getSkill.mockResolvedValue({ ...skill, ...changed } as any);
+    const res = response(); await agentModeController.createSession(request('skill-1'), res);
     expect(db.createChatSession).toHaveBeenCalledWith(
       'user-1', undefined, 'agent', 'skill-skill-1', undefined, undefined, undefined, undefined, 'regular', undefined
     );
     expect(db.addMessageToSession).toHaveBeenCalledWith('session-1', expect.objectContaining({
       role: 'assistant', content: skill.welcomeMessage,
     }));
-    expect(db.deleteSession).not.toHaveBeenCalled();
+    expect(skills.getSkill).not.toHaveBeenCalled(); expect(db.deleteSession).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(201);
   });
 
@@ -104,7 +105,7 @@ describe('createSessionFromSkill authenticated static brief', () => {
     'hello\u0000world',
     null,
   ])('rejects unsafe persisted welcomeMessage before any write: %s', async (welcomeMessage) => {
-    skills.getSkill.mockResolvedValue({ ...skill, welcomeMessage } as any);
+    (agent.getSkillsForDisplay as jest.Mock).mockResolvedValue([{ ...skill, welcomeMessage }]);
     const res = response();
 
     await agentModeController.createSession(request('skill-1'), res);
@@ -135,7 +136,7 @@ describe('createSessionFromSkill authenticated static brief', () => {
   });
 
   it('keeps an authorized skill without a welcome message usable', async () => {
-    skills.getSkill.mockResolvedValue({ ...skill, welcomeMessage: undefined } as any);
+    (agent.getSkillsForDisplay as jest.Mock).mockResolvedValue([{ ...skill, welcomeMessage: undefined }]);
     const res = response();
     await agentModeController.createSession(request('skill-1'), res);
     expect(db.addMessageToSession).not.toHaveBeenCalled();
