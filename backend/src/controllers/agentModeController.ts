@@ -2788,6 +2788,14 @@ export async function runScheduledChat(
   const leaseRunId: string = preGeneratedRunId || require('uuid').v4();
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let leaseAcquired = false;
+  // ENG-971: set when this run published and we could neither resume it nor
+  // persist a pause. Holding the lease is the ONLY backstop that needs no
+  // successful write: `setRunInFlight` is conditional on
+  // `attribute_not_exists(runInFlight)`, so while the lease stands the schedule
+  // physically cannot start a fresh run and repeat the publish. The stale
+  // heartbeat then hands it to the reconciler, which re-checks the attempt and
+  // recovers it properly once the datastore is healthy again.
+  let holdLeaseToBlockRestart = false;
   // ENG-971: successes already on the session when THIS run started — empty for a
   // fresh session, the abandoned run's totals when resuming one. Hoisted above the
   // try because the zero-output requeue decision reads it from the CATCH.
@@ -3860,11 +3868,15 @@ export async function runScheduledChat(
             } catch (pauseError) {
               console.error(
                 `CRITICAL: failed to pause schedule ${schedule.scheduleId} after a published, `
-                + `non-resumable run (attempt ${attempt}/3) — its next fire may repeat completed work:`,
+                + `non-resumable run (attempt ${attempt}/3):`,
                 pauseError
               );
             }
           }
+          // Every durable write failed. Fall back to the one guard that needs no
+          // write: keep the lease, so no fresh run can start until the reconciler
+          // re-examines this attempt.
+          if (!publishedRunPaused) holdLeaseToBlockRestart = true;
         }
 
         // Keyed on what ACTUALLY happened, not on which branch we took (Greptile P1).
@@ -4038,7 +4050,16 @@ export async function runScheduledChat(
     // if the reconciler already reaped this run (heartbeat went stale), the clear
     // no-ops and the requeue it wrote stands.
     if (heartbeatTimer) clearInterval(heartbeatTimer);
-    if (leaseAcquired) {
+    if (leaseAcquired && holdLeaseToBlockRestart) {
+      // Deliberately NOT clearing. Releasing here would free the schedule to fire
+      // normally and re-run work that already went out; keeping it is a decision
+      // not to act, so unlike a pause write it cannot fail.
+      console.error(
+        `Scheduled chat ${schedule.scheduleId}: HOLDING the in-flight lease — this run published `
+        + `and could not be resumed or paused, so the lease is the only thing preventing a repeat. `
+        + `The stale-run reconciler will recover it.`
+      );
+    } else if (leaseAcquired) {
       try {
         await scheduleDb.clearRunInFlight(schedule.scheduleId, leaseRunId);
       } catch (clearError) {

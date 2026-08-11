@@ -200,6 +200,11 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
     mockChatbotDb.getChatSession.mockResolvedValue(mockSession);
     // Reset persist implementation each test (clearAllMocks does not reset implementations)
     mockChatbotDb.addMessageToSession.mockResolvedValue(undefined as any);
+    // Same reason: tests that force schedule-write failures would otherwise leave
+    // updateSchedule/clearRunInFlight rejecting for every test that follows.
+    (mockScheduleDb.updateSchedule as jest.Mock).mockResolvedValue(undefined);
+    (mockScheduleDb.clearRunInFlight as jest.Mock).mockResolvedValue(true);
+    (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue([]);
     (mockChatbotDb as any).getMessagesFromMessagesTable.mockResolvedValue([]);
     mockChatbotDb.updateSessionLlmModel.mockResolvedValue(mockSession);
     mockAgentModeService.getMarketingSystemPrompt.mockResolvedValue('System prompt');
@@ -1070,6 +1075,63 @@ describe('AgentModeController - Scheduled Chat with 6 Iterations', () => {
         );
         expect(paused).toBeDefined();
         expect(note![1].content).toMatch(/paused this schedule/i);
+      });
+
+      /**
+       * The last backstop, and the only one that cannot fail: if every durable
+       * write is refused, the run keeps its lease. setRunInFlight is conditional
+       * on attribute_not_exists(runInFlight), so while it stands the schedule
+       * physically cannot start a fresh run and repeat the publish — no successful
+       * write required, because holding the lease is a decision NOT to act.
+       */
+      it('holds the in-flight lease when neither resume nor pause can be persisted', async () => {
+        const balanced = [
+          { role: 'system', content: 'automated run' },
+          { role: 'user', content: 'Publish the five vertical landers.' },
+          { role: 'assistant', content: 'Publishing.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+          { role: 'tool', tool_call_id: 'p1', content: '{"success":true}' },
+        ];
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(balanced);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions: { publish_landing_page_changes: 1 },
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+        // Every schedule write fails: the resume marker AND all pause retries.
+        (mockScheduleDb.updateSchedule as jest.Mock).mockRejectedValue(new Error('DynamoDB unavailable'));
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        expect(mockScheduleDb.clearRunInFlight).not.toHaveBeenCalled();
+      });
+
+      it('releases the lease normally when the run did resume', async () => {
+        const balanced = [
+          { role: 'system', content: 'automated run' },
+          { role: 'user', content: 'Publish the landers.' },
+          { role: 'assistant', content: 'Publishing.', tool_calls: [{ id: 'p1', function: { name: 'publish_landing_page_changes' } }] },
+          { role: 'tool', tool_call_id: 'p1', content: '{"success":true}' },
+        ];
+        (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockResolvedValue(balanced);
+        mockChatbotDb.getChatSession.mockResolvedValue({
+          ...mockSession,
+          calledFunctions: { publish_landing_page_changes: 1 },
+        } as any);
+        mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue(zeroOutput);
+
+        await runScheduledChat(
+          { ...baseSchedule, keywords: [], requiredFunctionCalls: [], zeroAssistantRetryCount: 0 } as any,
+          mockUserId,
+          false
+        );
+
+        // A resumed run is recovered by its own requeue; holding the lease would
+        // block the very run we just scheduled.
+        expect(mockScheduleDb.clearRunInFlight).toHaveBeenCalled();
       });
 
       // Nothing may claim an action we cannot confirm — the owner alert is
