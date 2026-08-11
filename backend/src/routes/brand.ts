@@ -617,11 +617,38 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
       }, after: ${updatedAttachments.length}`
     );
 
+    // The value this prune is derived from, and a replacement token guaranteed
+    // to differ from it (see the owner branch: a same-millisecond write would
+    // otherwise leave the token unchanged and make the guards below decorative).
+    const sourceUpdatedAt = brandGuidelines?.updatedAt;
+    const sourceNowMs = Date.now();
+    const prunedUpdatedAt =
+      new Date(sourceNowMs).toISOString() === sourceUpdatedAt
+        ? new Date(sourceNowMs + 1).toISOString()
+        : new Date(sourceNowMs).toISOString();
+
+    // Only write if the brand still holds the value this prune was computed
+    // from. Without it, two concurrent deletes each write a full snapshot and
+    // the later one restores the attachment the earlier one removed — whose
+    // object is already gone — and a brand save overlapping a delete is erased
+    // outright. Legacy records carry no updatedAt, so match on its absence.
+    const pruneCondition = sourceUpdatedAt
+      ? {
+          expression: "brandGuidelines.updatedAt = :expectedBrandUpdatedAt",
+          values: { ":expectedBrandUpdatedAt": sourceUpdatedAt },
+        }
+      : { expression: "attribute_not_exists(brandGuidelines.updatedAt)" };
+
+    const brandMovedResponse = () =>
+      res.status(409).json({
+        error: "Brand guidelines changed while deleting this asset. Please refresh and try again.",
+      });
+
     // Update brand guidelines
     const updatedBrandGuidelines = {
       ...brandGuidelines,
       attachments: updatedAttachments,
-      updatedAt: new Date().toISOString(),
+      updatedAt: prunedUpdatedAt,
     };
 
     // Set by whichever branch below actually writes, so a failed S3 delete can
@@ -739,7 +766,16 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
         );
       };
     } else if (isOrgLevel) {
-      await orgDb.updateOrg(user.orgId!, { brandGuidelines: updatedBrandGuidelines });
+      try {
+        await orgDb.updateOrg(
+          user.orgId!,
+          { brandGuidelines: updatedBrandGuidelines },
+          { condition: pruneCondition }
+        );
+      } catch (casError: any) {
+        if (casError?.code === "ConditionalCheckFailedException") return brandMovedResponse();
+        throw casError;
+      }
       console.log(`[BRAND DEBUG] Successfully updated org brand guidelines after asset deletion`);
       rollbackPrune = async () => {
         // Conditioned on the value this request wrote, exactly like the owner
@@ -760,18 +796,25 @@ router.delete("/guidelines/asset/:key", authenticateToken, async (req, res) => {
         );
       };
     } else {
-      await dynamodb
-        .update({
-          TableName: `${TABLE_PREFIX}AW-Users`,
-          Key: { email: user.email },
-          UpdateExpression:
-            "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
-          ExpressionAttributeValues: {
-            ":brandGuidelines": updatedBrandGuidelines,
-            ":updatedAt": new Date().toISOString(),
-          },
-        })
-        .promise();
+      try {
+        await dynamodb
+          .update({
+            TableName: `${TABLE_PREFIX}AW-Users`,
+            Key: { email: user.email },
+            UpdateExpression:
+              "SET brandGuidelines = :brandGuidelines, updatedAt = :updatedAt",
+            ConditionExpression: pruneCondition.expression,
+            ExpressionAttributeValues: {
+              ":brandGuidelines": updatedBrandGuidelines,
+              ":updatedAt": new Date().toISOString(),
+              ...(pruneCondition.values || {}),
+            },
+          })
+          .promise();
+      } catch (casError: any) {
+        if (casError?.code === "ConditionalCheckFailedException") return brandMovedResponse();
+        throw casError;
+      }
       console.log(`[BRAND DEBUG] Successfully updated user brand guidelines after asset deletion`);
       rollbackPrune = async () => {
         // Same guard as the org and owner branches — restore only if this
