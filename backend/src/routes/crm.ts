@@ -3548,7 +3548,8 @@ router.post('/lists/:listId/leads/import-linkedin', upload.single('file'), async
         anonymizedSkipped: connectionsAnonymizedSkipped,
         errors: connectionsErrors,
         messagesImported: messagesSuccessCount,
-        message: `Imported ${connectionsSuccessCount} connections${messagesSuccessCount > 0 ? ` and ${messagesSuccessCount} message events` : ''}${connectionsErrorCount > 0 ? `, ${connectionsErrorCount} errors` : ''}`,
+        message: `Imported ${connectionsSuccessCount} connections${messagesSuccessCount > 0 ? ` and ${messagesSuccessCount} message events` : ''}${connectionsErrorCount > 0 ? `, ${connectionsErrorCount} errors` : ''}`
+          + (connectionsAnonymizedSkipped > 0 ? `, ${connectionsAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped` : ''),
       });
     } else {
       res.status(400).json({ message: 'Invalid mode parameter. Use "preview" or "import"' });
@@ -5629,6 +5630,7 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
     // Batch create/merge leads (always force update)
     const results = await crmDb.batchCreateLeads(leadList.listId, leads);
 
+    const syncAnonymizedSkipped = results.anonymizedSkipped || 0;
     res.json({
       success: true,
       listId: leadList.listId,
@@ -5637,9 +5639,10 @@ router.post('/sync-subscribers', async (req: Request, res: Response) => {
       newCount: results.newCount,
       mergedCount: results.mergedCount,
       errorCount: results.errorCount,
-      anonymizedSkipped: results.anonymizedSkipped || 0,
+      anonymizedSkipped: syncAnonymizedSkipped,
       errors: results.errors,
-      message: `Synced ${results.successCount} subscriber(s) to lead list "${listName}"${results.errorCount > 0 ? `, ${results.errorCount} error(s)` : ''}`,
+      message: `Synced ${results.successCount} subscriber(s) to lead list "${listName}"${results.errorCount > 0 ? `, ${results.errorCount} error(s)` : ''}`
+        + (syncAnonymizedSkipped > 0 ? `, ${syncAnonymizedSkipped} anonymized LinkedIn placeholder(s) skipped` : ''),
     });
   } catch (error: any) {
     console.error('Error syncing subscribers to CRM:', error);
