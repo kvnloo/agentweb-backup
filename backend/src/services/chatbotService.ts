@@ -3765,17 +3765,29 @@ export async function loadKnowledgeBase(): Promise<void> {
   //printKnowledgeBase();
 }
 
-// Load knowledge base on startup and refresh periodically
-loadKnowledgeBase().catch((error) => {
-  console.error("Error loading knowledge base:", error);
-});
-
-// Refresh knowledge base every hour
-setInterval(() => {
+// Load knowledge base on startup and refresh periodically.
+//
+// Skipped under test. This is module-load network I/O, so merely IMPORTING any
+// route that transitively reaches this file fires a real fetch at the docs
+// corpus — which is what trips org.test.ts's "no route here has any business
+// touching the network" assertion (ENG-1112) even though nothing in that suite
+// asks for docs. The hourly timer has the same problem in reverse: it keeps a
+// handle open after a suite finishes, which is where "Cannot log after tests are
+// done" and the non-graceful worker exits come from. Production behaviour is
+// unchanged; the one test that needs the knowledge base calls
+// loadKnowledgeBase() itself.
+if (process.env.NODE_ENV !== "test") {
   loadKnowledgeBase().catch((error) => {
-    console.error("Error refreshing knowledge base:", error);
+    console.error("Error loading knowledge base:", error);
   });
-}, 60 * 60 * 1000);
+
+  // Refresh knowledge base every hour
+  setInterval(() => {
+    loadKnowledgeBase().catch((error) => {
+      console.error("Error refreshing knowledge base:", error);
+    });
+  }, 60 * 60 * 1000);
+}
 
 const partnerSystemMessage = `You are a helpful customer support assistant for AgentWeb, a powerful web automation platform that allows users to create and manage web-based tasks using natural language instructions. 
 
