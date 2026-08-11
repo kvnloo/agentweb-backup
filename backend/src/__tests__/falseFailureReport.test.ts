@@ -18,6 +18,7 @@ import {
   isBookkeepingTool,
   ledgerFromSucceededFunctions,
   diffSucceededFunctions,
+  collectPublishActionsSince,
   appendConfirmedPublishNotice,
   BOOKKEEPING_TOOLS,
 } from '../utils/falseFailureReport';
@@ -392,6 +393,77 @@ describe('falseFailureReport', () => {
 
     it('ignores malformed counts rather than trusting them', () => {
       expect(diffSucceededFunctions({ a: 'x' } as any, { a: 2, b: 'y' } as any)).toEqual({ a: 2 });
+    });
+  });
+
+  /**
+   * The reconciler cannot use calledFunctions: it is session-cumulative and a
+   * recovered run RESUMES the abandoned run's session, so an earlier attempt's
+   * publish would pause a schedule whose latest attempt published nothing. The
+   * lease's startedAt scopes the transcript to THIS attempt with no extra state.
+   */
+  describe('collectPublishActionsSince', () => {
+    const T = (name: string, timestamp: string, content: any = '{"success":true}') =>
+      ({ role: 'tool', name, timestamp, content });
+
+    it('counts only publishes at or after the attempt started', () => {
+      expect(
+        collectPublishActionsSince(
+          [
+            T('publish_landing_page_changes', '2026-08-10T10:00:00Z'), // earlier attempt
+            T('post_thread', '2026-08-10T12:30:00Z'), // this attempt
+          ],
+          '2026-08-10T12:00:00Z',
+        ),
+      ).toEqual(['posted your thread']);
+    });
+
+    it('ignores a failed publish call', () => {
+      expect(
+        collectPublishActionsSince(
+          [T('publish_landing_page_changes', '2026-08-10T12:30:00Z', '⚠️ Tool Error: publish_landing_page_changes')],
+          '2026-08-10T12:00:00Z',
+        ),
+      ).toEqual([]);
+    });
+
+    it('ignores non-publish tools, non-tool roles and undated messages', () => {
+      expect(
+        collectPublishActionsSince(
+          [
+            T('get_leads', '2026-08-10T12:30:00Z'),
+            { role: 'assistant', name: 'publish_landing_page_changes', timestamp: '2026-08-10T12:30:00Z' } as any,
+            { role: 'tool', name: 'publish_landing_page_changes' } as any,
+          ],
+          '2026-08-10T12:00:00Z',
+        ),
+      ).toEqual([]);
+    });
+
+    it('reads the timestamp from metadata when the top level has none', () => {
+      expect(
+        collectPublishActionsSince(
+          [{ role: 'tool', name: 'send_dm', content: '{}', metadata: { timestamp: '2026-08-10T12:30:00Z' } } as any],
+          '2026-08-10T12:00:00Z',
+        ),
+      ).toEqual(['sent your direct message']);
+    });
+
+    // FAIL cases: an unusable window must never over-count — that pauses a schedule.
+    it('returns nothing when the attempt start is missing or unparseable', () => {
+      const msgs = [T('publish_landing_page_changes', '2026-08-10T12:30:00Z')];
+      expect(collectPublishActionsSince(msgs, null)).toEqual([]);
+      expect(collectPublishActionsSince(msgs, 'not-a-date')).toEqual([]);
+      expect(collectPublishActionsSince(null, '2026-08-10T12:00:00Z')).toEqual([]);
+    });
+
+    it('does not treat a draft generation as a publish', () => {
+      expect(
+        collectPublishActionsSince(
+          [T('generate_landing_page', '2026-08-10T12:30:00Z')],
+          '2026-08-10T12:00:00Z',
+        ),
+      ).toEqual([]);
     });
   });
 

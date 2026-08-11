@@ -262,12 +262,17 @@ describe('recoverAbandonedScheduledRun', () => {
    * would have its production side effect repeated.
    */
   it('does not restart from scratch when the abandoned run already published', async () => {
-    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([]); // not resumable
-    mockChatbotDb.getChatSession.mockResolvedValue({
-      sessionId: 'sess-1',
-      calledFunctions: { publish_landing_page_changes: 1 },
-    } as any);
     const schedule = scheduleWithLease();
+    // Unresumable transcript that nonetheless contains a publish from THIS attempt.
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([
+      { role: 'assistant', content: '', tool_calls: [{ id: 'x1', function: { name: 'publish_landing_page_changes' } }] },
+      {
+        role: 'tool',
+        name: 'publish_landing_page_changes',
+        content: '{"success":true}',
+        timestamp: new Date(NOW - 10 * 60 * 1000).toISOString(),
+      },
+    ] as any);
 
     await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
 
@@ -281,12 +286,11 @@ describe('recoverAbandonedScheduledRun', () => {
     expect(paused).toBeDefined();
   });
 
-  it('does not pause on a single transient ledger read failure', async () => {
-    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([]);
-    // One blip, then a clean read showing nothing published.
-    (mockChatbotDb.getChatSession as jest.Mock)
+  it('does not pause on a single transient transcript read failure', async () => {
+    // One blip, then a clean read showing nothing published this attempt.
+    (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock)
       .mockRejectedValueOnce(new Error('transient'))
-      .mockResolvedValue({ sessionId: 'sess-1', calledFunctions: { you_search_web: 1 } } as any);
+      .mockResolvedValue([] as any);
     const schedule = scheduleWithLease();
 
     await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
@@ -297,9 +301,8 @@ describe('recoverAbandonedScheduledRun', () => {
     expect(mockScheduleDb.claimAbandonedRun.mock.calls[0][2]).not.toBeNull();
   });
 
-  it('does not restart from scratch when the publish ledger cannot be read', async () => {
-    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([]);
-    mockChatbotDb.getChatSession.mockRejectedValue(new Error('DynamoDB timeout'));
+  it('does not restart from scratch when the transcript cannot be read at all', async () => {
+    (mockChatbotDb.getMessagesFromMessagesTable as jest.Mock).mockRejectedValue(new Error('DynamoDB timeout'));
     const schedule = scheduleWithLease();
 
     await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
@@ -309,11 +312,7 @@ describe('recoverAbandonedScheduledRun', () => {
   });
 
   it('still restarts a run that published nothing', async () => {
-    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([]);
-    mockChatbotDb.getChatSession.mockResolvedValue({
-      sessionId: 'sess-1',
-      calledFunctions: { you_search_web: 2 },
-    } as any);
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([] as any);
     const schedule = scheduleWithLease();
 
     await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
@@ -321,6 +320,28 @@ describe('recoverAbandonedScheduledRun', () => {
     const requeue = mockScheduleDb.claimAbandonedRun.mock.calls[0][2] as any;
     expect(requeue).not.toBeNull();
     expect(requeue.nextRunTime).toEqual(expect.any(String));
+  });
+
+  it('ignores a publish that belongs to an EARLIER attempt of the same session', async () => {
+    const schedule = scheduleWithLease();
+    // Publish timestamped BEFORE this attempt's lease.startedAt (20 min ago).
+    mockChatbotDb.getMessagesFromMessagesTable.mockResolvedValue([
+      {
+        role: 'tool',
+        name: 'publish_landing_page_changes',
+        content: '{"success":true}',
+        timestamp: new Date(NOW - 90 * 60 * 1000).toISOString(),
+      },
+    ] as any);
+
+    await recoverAbandonedScheduledRun(schedule, schedule.runInFlight);
+
+    // Recovery proceeds: this attempt published nothing, so pausing would strand a
+    // live schedule over an earlier run's work.
+    expect(
+      mockScheduleDb.updateSchedule.mock.calls.find((c: any[]) => c[1]?.status === 'paused')
+    ).toBeUndefined();
+    expect(mockScheduleDb.claimAbandonedRun.mock.calls[0][2]).not.toBeNull();
   });
 
   it('does not annotate the session or alert when the claim is lost', async () => {

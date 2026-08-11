@@ -70,8 +70,6 @@ export function isBookkeepingTool(toolName: string | undefined | null): boolean 
 const CONFIRMED_PUBLISH_TOOLS: ReadonlySet<string> = new Set<string>([
   'publish_landing_page_changes',
   'deploy_landing_page',
-  'generate_landing_page',
-  'duplicate_landing_page',
   'publish_blog_article',
   // A duplicate social post or a duplicate outreach email is as unrecoverable as a
   // duplicate deploy, so a false failure after one is just as costly.
@@ -297,6 +295,55 @@ export function ledgerFromSucceededFunctions(
   return Object.entries(calledFunctions)
     .filter(([name, count]) => !!name && typeof count === 'number' && count > 0)
     .map(([name]) => ({ name }));
+}
+
+/** A persisted transcript message, as the scheduled paths read it. */
+export interface TranscriptToolMessage {
+  role?: string;
+  name?: string;
+  content?: unknown;
+  timestamp?: string;
+  metadata?: { timestamp?: string; [k: string]: unknown };
+}
+
+/**
+ * Publish/deploy actions this ATTEMPT completed, read from the transcript rather
+ * than from `calledFunctions`.
+ *
+ * The counters are session-cumulative and a recovered run RESUMES the abandoned
+ * run's session, so on the reconciler path they cannot tell an earlier attempt's
+ * publish from this one's — which would wrongly pause a schedule whose latest
+ * attempt published nothing. The lease already carries `startedAt`, so the
+ * transcript gives a precisely-scoped answer with no extra state to persist:
+ * successful publish tool results timestamped at or after this attempt began.
+ *
+ * A tool result carrying the "⚠️ Tool Error" envelope is a FAILED call and never
+ * counts. Messages with no usable timestamp are ignored rather than assumed
+ * in-window — over-counting here pauses a live schedule.
+ */
+export function collectPublishActionsSince(
+  messages: TranscriptToolMessage[] | null | undefined,
+  sinceIso: string | null | undefined,
+): string[] {
+  if (!Array.isArray(messages)) return [];
+  const since = sinceIso ? new Date(sinceIso).getTime() : NaN;
+  if (!Number.isFinite(since)) return [];
+
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of messages) {
+    if (!m || m.role !== 'tool' || !m.name || !CONFIRMED_PUBLISH_TOOLS.has(m.name)) continue;
+    const stamp = m.timestamp || m.metadata?.timestamp;
+    const at = stamp ? new Date(stamp).getTime() : NaN;
+    if (!Number.isFinite(at) || at < since) continue;
+    const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+    if (text.includes('⚠️ Tool Error')) continue;
+    const label = PUBLISH_ACTION_LABELS[m.name];
+    if (!label || seen.has(label)) continue;
+    seen.add(label);
+    out.push(label);
+  }
+  return out;
 }
 
 /** Plain-language labels of every publish/deploy confirmed this run, de-duplicated. */

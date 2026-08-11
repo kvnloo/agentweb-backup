@@ -48,6 +48,7 @@ import {
   diffSucceededFunctions,
   appendConfirmedPublishNotice,
   collectConfirmedPublishActions,
+  collectPublishActionsSince,
   FalseFailureLedgerEntry,
 } from '../utils/falseFailureReport';
 import * as loopEventsEmitter from '../services/loopEventsEmitter';
@@ -4098,14 +4099,37 @@ export async function recoverAbandonedScheduledRun(schedule: any, lease: any): P
   // published; a confirmed publish or an unreadable ledger stops the restart and
   // tells the owner instead, matching the zero-output path in runScheduledChat.
   if (willRequeue && !resumeSessionId && lease.sessionId) {
-    const ledger = await loadPublishLedger(lease.sessionId);
-    const mayHavePublished = ledger === null || collectConfirmedPublishActions(ledger).length > 0;
+    // Scoped to THIS attempt via lease.startedAt. calledFunctions is
+    // session-cumulative and a recovered run resumes the abandoned run's session,
+    // so reading the counters here would let an EARLIER attempt's publish pause a
+    // schedule whose latest attempt published nothing — a live workflow stopped for
+    // a run that did nothing wrong. The transcript answers precisely, using state
+    // the lease already carries.
+    let attemptPublished: string[] = [];
+    let transcriptUnreadable = true;
+    // Retried for the same reason the ledger read is: an unreadable transcript can
+    // PAUSE a live schedule, so one transient failure must not be enough to decide it.
+    for (let attempt = 1; attempt <= 3 && transcriptUnreadable; attempt++) {
+      try {
+        const priorMessages = await chatbotDb.getMessagesFromMessagesTable(lease.sessionId);
+        attemptPublished = collectPublishActionsSince(priorMessages as any, lease.startedAt);
+        transcriptUnreadable = false;
+      } catch (readError) {
+        if (attempt === 3) {
+          console.error(
+            `recoverAbandonedScheduledRun: transcript unreadable for ${lease.sessionId} after 3 attempts:`,
+            readError
+          );
+        }
+      }
+    }
+    const mayHavePublished = transcriptUnreadable || attemptPublished.length > 0;
     if (mayHavePublished) {
       willRequeue = false;
       requeuedAt = undefined;
-      noRequeueReason = ledger === null
-        ? 'publish ledger unreadable — a fresh restart could repeat completed work'
-        : 'run already published — a fresh restart would repeat it';
+      noRequeueReason = transcriptUnreadable
+        ? 'transcript unreadable — a fresh restart could repeat completed work'
+        : `this attempt already ${attemptPublished.join('; ')} — a fresh restart would repeat it`;
       console.error(
         `recoverAbandonedScheduledRun: NOT restarting schedule ${schedule.scheduleId} — ${noRequeueReason}.`
       );
