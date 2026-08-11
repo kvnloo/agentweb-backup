@@ -54,6 +54,36 @@ describe('isUnusableSynthesis', () => {
     expect(isUnusableSynthesis('[Previously called call_meta_marketing_api({"action":"UPDATE"})]')).toBe(true);
   });
 
+  // Observed live: driving the synthesis retry into a failure state made the model
+  // collapse into a repetition loop and ship 180,180 chars — 30,791 words built
+  // from 65 unique tokens — straight into the transcript.
+  it('flags a degenerate repetition collapse', () => {
+    const collapse = 'If you need to output a code block ensure it is properly enclosed. '
+      + 'group '.repeat(20000);
+    expect(collapse.length).toBeGreaterThan(100_000);
+    expect(isUnusableSynthesis(collapse)).toBe(true);
+  });
+
+  it('does NOT flag long genuine prose with a normal vocabulary', () => {
+    // ~600 words of varied text — the shape the guard must never touch.
+    const words: string[] = [];
+    for (let i = 0; i < 600; i++) words.push(`campaign${i} spend${i} result${i}`.split(' ')[i % 3]);
+    const prose = words.join(' ');
+    expect(prose.split(/\s+/).length).toBeGreaterThan(300);
+    expect(isUnusableSynthesis(prose)).toBe(false);
+  });
+
+  it('does NOT flag a long but legitimately repetitive status list', () => {
+    // A real answer can repeat heavily — 10-15% unique is normal for a table.
+    const rows: string[] = [];
+    for (let i = 0; i < 400; i++) rows.push(`- Campaign ${i} status PAUSED budget 3000 daily`);
+    expect(isUnusableSynthesis(rows.join('\n'))).toBe(false);
+  });
+
+  it('does NOT flag a short repetitive answer below the word floor', () => {
+    expect(isUnusableSynthesis('yes '.repeat(50))).toBe(false);
+  });
+
   it('does NOT flag prose that merely mentions a tool result', () => {
     for (const real of [
       'The result of call_meta_marketing_api was a success — both campaigns are paused.',

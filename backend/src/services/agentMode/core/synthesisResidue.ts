@@ -45,6 +45,31 @@ const STRUCTURAL_ONLY = /^[\s{}[\],:"']+$/;
 const HISTORY_ECHO_PREFIX = /^\[(?:Result of \S+:|Previously called )/;
 
 /**
+ * Degenerate-repetition thresholds. A model that collapses into a repetition loop
+ * emits a huge message with almost no vocabulary: the live probe that drove the
+ * ENG-1054 retry into this state produced 30,791 words built from just 65 unique
+ * tokens (0.2% unique; `group` alone was 72.7% of it) and shipped all 180 KB of it
+ * into the transcript.
+ *
+ * Genuine prose does not come close — even a repetitive status table runs 10-15%
+ * unique — so the bar is set far below anything real and only applies to messages
+ * long enough for the ratio to mean something. A false positive costs one synthesis
+ * retry, never a silently dropped answer.
+ */
+const DEGENERATE_MIN_WORDS = 300;
+const DEGENERATE_MAX_UNIQUE_RATIO = 0.03;
+
+/** True when `trimmed` is a repetition collapse rather than an answer. */
+function isDegenerateRepetition(trimmed: string): boolean {
+  // 300 words cannot fit in fewer than ~1000 chars — skip the split for anything
+  // shorter so the common case never pays for the scan.
+  if (trimmed.length < 1000) return false;
+  const words = trimmed.split(/\s+/);
+  if (words.length < DEGENERATE_MIN_WORDS) return false;
+  return new Set(words).size / words.length < DEGENERATE_MAX_UNIQUE_RATIO;
+}
+
+/**
  * True when `content` is non-empty but carries no answer at all — either leftover
  * JSON structure such as `}]`, `},{` or `"}`, or a transcription of the loop's own
  * degraded tool history.
@@ -56,8 +81,10 @@ export function isUnusableSynthesis(content: unknown): boolean {
   if (typeof content !== 'string') return false;
   const trimmed = content.trim();
   if (trimmed.length === 0) return false;
-  // Checked before the length cap: a history echo is long by nature.
+  // Both checked before the length cap: a history echo and a repetition collapse
+  // are long by nature.
   if (HISTORY_ECHO_PREFIX.test(trimmed)) return true;
+  if (isDegenerateRepetition(trimmed)) return true;
   if (trimmed.length > MAX_RESIDUE_LENGTH) return false;
   return STRUCTURAL_ONLY.test(trimmed);
 }
