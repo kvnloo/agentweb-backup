@@ -76,6 +76,41 @@ describe('inlineS3ImagesAsDataUris — ENG-278 bounded contract', () => {
     });
   });
 
+  it('inlines a valid unquoted image src', async () => {
+    const bytes = Buffer.from('private-image');
+    const url = 'https://agentweb-user-files.s3.amazonaws.com/users/u1/unquoted.png';
+    const fetcher: InlineImageFetcher = jest.fn().mockResolvedValue({
+      buffer: bytes,
+      contentType: 'image/png',
+    });
+
+    const result = await inlineS3ImagesAsDataUris(`<img alt=chart src=${url}>`, fetcher);
+
+    expect(result.html).toBe(
+      `<img alt=chart src="data:image/png;base64,${bytes.toString('base64')}">`,
+    );
+    expect(result.inlined).toBe(1);
+  });
+
+  it('ignores img-like text in comments, scripts, and templates', async () => {
+    const inertUrl = 'https://agentweb-user-files.s3.amazonaws.com/users/u1/inert.png';
+    const html = [
+      `<!-- <img src="${inertUrl}"> -->`,
+      `<script>const example = '<img src="${inertUrl}">';</script>`,
+      `<template><img src="${inertUrl}"></template>`,
+    ].join('');
+    const fetcher: InlineImageFetcher = jest.fn().mockRejectedValue(
+      new Error('inert image must not be fetched'),
+    );
+
+    await expect(inlineS3ImagesAsDataUris(html, fetcher)).resolves.toEqual({
+      html,
+      inlined: 0,
+      decodedBytes: 0,
+    });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it('fetches only same-bucket S3 assets with the per-image byte ceiling', async () => {
     const getObject = jest.spyOn(s3Utils, 'getS3ObjectAsBuffer').mockResolvedValue({
       buffer: Buffer.from('image'),
