@@ -921,8 +921,16 @@ AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including
 
 READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimize for (use to verify after a CREATE/UPDATE):
   AD_SET LIST returns optimization_goal, billing_event, destination_type, promoted_object (pixel_id + custom_event_type), bid_strategy, and budgets per ad set. Pass ad_set_id to read a single ad set; pass campaign_id to scope to one campaign's ad sets.
-  CAMPAIGN LIST returns objective plus daily_budget / lifetime_budget / budget_remaining / bid_strategy. Pass campaign_id to read a single campaign.
+  CAMPAIGN LIST returns objective plus daily_budget / lifetime_budget / budget_remaining / spend_cap / bid_strategy. Pass campaign_id to read a single campaign.
   Optional params.fields (comma-separated) narrows the read to specific supported fields. Requesting an unsupported field returns a loud error — it is never silently dropped.
+
+SPEND CAP (campaign hard money stop):
+  params.spend_cap sets the campaign's lifetime hard stop, in CENTS (e.g. 300000 = $3,000). Writable on CAMPAIGN CREATE and CAMPAIGN UPDATE.
+  Every spend_cap write is verified server-side by re-reading the campaign, and the result says which happened:
+    spend_cap_verified:true  → the cap is really on the campaign (the value is echoed back as spend_cap). Only then may you tell the user a cap is in place.
+    spend_cap_verified:false with error SPEND_CAP_NOT_APPLIED → the cap is NOT on the campaign. On CREATE the campaign still exists — repair it with CAMPAIGN UPDATE using the returned campaign id, do NOT create it again. Tell the user the cap is not in place.
+    spend_cap_verified:false with no error → the read-back itself failed; nothing is proven. Re-read with CAMPAIGN LIST (campaign_id + params.fields="id,name,spend_cap") before saying anything about the cap.
+  Never report a spend cap as set based on the write response alone.
 
 DATASET USAGE:
   LIST              → Returns every pixel on the ad account with its id, name and last_fired_time. Meta unified pixels and datasets, so each pixel id IS its dataset id (returned as dataset_id).
@@ -950,6 +958,8 @@ AD RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad that's missing them
 
 REQUIRED PARAMS PER ENTITY + ACTION:
   CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
+                        Optional: status, spend_cap (cents), advantage_campaign_budget + budget_amount (dollars).
+                        Any OTHER param is REJECTED before the campaign is created (it would not be applied) — ad-set fields such as daily_budget, lifetime_budget, bid_strategy, targeting, optimization_goal and billing_event belong on AD_SET CREATE, and campaign-level budget goes through advantage_campaign_budget + budget_amount.
   AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
                         Optional but WRITABLE on create: bid_strategy (LOWEST_COST_WITHOUT_CAP | LOWEST_COST_WITH_BID_CAP | COST_CAP) and bid_amount.
                         Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
@@ -1093,6 +1103,7 @@ GETTING DESTINATION URLS / CREATIVE DETAILS:
             },
             special_ad_categories: { type: "array", items: { type: "string" }, description: 'Special ad categories. Use ["NONE"] if not applicable.' },
             advantage_campaign_budget: { type: "boolean", description: "Enable Advantage Campaign Budget." },
+            spend_cap: { type: "number", description: "CAMPAIGN CREATE/UPDATE: lifetime hard-stop spend cap for the campaign, in CENTS (e.g. 300000 = $3,000). The write is verified by an independent read-back — see SPEND CAP in the tool description; only claim the cap is set when spend_cap_verified is true. Read it back any time via CAMPAIGN LIST with params.fields including spend_cap." },
             budget_amount: { type: "number", description: "Campaign-level daily budget in dollars (when advantage_campaign_budget is true)." },
 
             // --- Ad Set ---
