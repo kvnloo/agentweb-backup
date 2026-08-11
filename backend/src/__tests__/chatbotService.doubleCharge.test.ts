@@ -73,13 +73,19 @@ jest.mock('../services/tokenUsageService', () => ({
   incrementUserTokenUsage: (...args: unknown[]) => mockIncrementUserTokenUsage(...args),
 }));
 
-const mockMeterUsageFromResponse = jest.fn();
 const mockGetAzureClient = jest.fn(() => ({
   chat: { completions: { create: jest.fn() } },
 }));
 jest.mock('../utils/llmClients', () => ({
   getAzureClient: (...args: unknown[]) => mockGetAzureClient(...(args as [])),
-  meterUsageFromResponse: (...args: unknown[]) => mockMeterUsageFromResponse(...args),
+}));
+
+const mockMeterUserUsage = jest.fn();
+jest.mock('../services/usageRecorderService', () => ({
+  // Keep the real module — chatbotService also imports computeCostMicroUsd from
+  // here for calculateCost. Only the meter is stubbed.
+  ...jest.requireActual('../services/usageRecorderService'),
+  meterUserUsage: (...args: unknown[]) => mockMeterUserUsage(...args),
 }));
 
 jest.mock('openai', () => jest.fn().mockImplementation(() => ({
@@ -107,7 +113,16 @@ import { chatbotDb, generateChatResponse, __resetEmmaSystemContextCache } from '
 function completion(content = 'Hi') {
   return {
     choices: [{ message: { role: 'assistant', content, tool_calls: null } }],
-    usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+    usage: {
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      total_tokens: 30,
+      // Bedrock Converse answers in OpenAI shape but carries Anthropic-style
+      // cache fields. normalizeOpenAIUsage does NOT read these, which is why the
+      // meter reads them explicitly.
+      cache_read_input_tokens: 5000,
+      cache_creation_input_tokens: 700,
+    },
     model: 'test-model',
   };
 }
@@ -170,9 +185,13 @@ describe('ENG-1134: Emma meters its own un-metered clients exactly once', () => 
       model: 'anthropic.claude-sonnet-4-6',
     } as never);
 
-    expect(mockMeterUsageFromResponse).toHaveBeenCalledTimes(1);
-    const [ctx] = mockMeterUsageFromResponse.mock.calls[0];
+    expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
+    const [ctx] = mockMeterUserUsage.mock.calls[0];
     expect(ctx).toMatchObject({ userId: 'user-1', feature: 'chat', provider: 'bedrock' });
+    // The regression this guards: routing through meterUsageFromResponse would
+    // take normalizeOpenAIUsage and record both of these as 0, under-counting
+    // Bedrock spend by ~4x since cache is the bulk of the traffic.
+    expect(ctx).toMatchObject({ cacheReadTokens: 5000, cacheWriteTokens: 700 });
   });
 
   it('meters the Gemini path, which no client wrapper covers', async () => {
@@ -184,8 +203,8 @@ describe('ENG-1134: Emma meters its own un-metered clients exactly once', () => 
       model: 'gemini-2.5-flash',
     } as never);
 
-    expect(mockMeterUsageFromResponse).toHaveBeenCalledTimes(1);
-    const [ctx] = mockMeterUsageFromResponse.mock.calls[0];
+    expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
+    const [ctx] = mockMeterUserUsage.mock.calls[0];
     expect(ctx).toMatchObject({ userId: 'user-1', feature: 'chat', provider: 'gemini' });
   });
 
@@ -199,6 +218,6 @@ describe('ENG-1134: Emma meters its own un-metered clients exactly once', () => 
       userId: 'user-1',
     } as never);
 
-    expect(mockMeterUsageFromResponse).not.toHaveBeenCalled();
+    expect(mockMeterUserUsage).not.toHaveBeenCalled();
   });
 });

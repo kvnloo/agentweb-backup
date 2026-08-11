@@ -1,5 +1,6 @@
 import OpenAI from "openai";
-import { getAzureClient, meterUsageFromResponse } from "../utils/llmClients";
+import { getAzureClient } from "../utils/llmClients";
+import { meterUserUsage } from "./usageRecorderService";
 import { v4 as uuidv4 } from "uuid";
 import AWS from "aws-sdk";
 import dotenv from "dotenv";
@@ -4615,16 +4616,29 @@ export async function generateChatResponse(
       // metering only the final one would undercount every tool-using turn.
       // Fire-and-forget and fail-open by contract, like every other meter.
       if (!clientSelfMeters) {
-        meterUsageFromResponse(
-          {
+        // Tokens are read exactly the way callLLM reads them, NOT via
+        // meterUsageFromResponse. That helper dispatches on response shape, and
+        // the Bedrock Converse wrapper answers in OpenAI shape — so it would take
+        // normalizeOpenAIUsage, which only knows `prompt_tokens_details.cached_tokens`
+        // and would silently record Bedrock's cache tokens as zero. Cache is ~73%
+        // of traffic, so that would under-count this spend by roughly 4x, in the
+        // very ledger the cost cap is about to be enforced against.
+        const u: any = response?.usage;
+        if (u) {
+          meterUserUsage({
             userId,
             sessionId,
             model: activeDeployment,
             provider: isClaudeModel ? 'bedrock' : 'gemini',
             feature: 'chat',
-          },
-          response
-        );
+            inputTokens: u.prompt_tokens || 0,
+            outputTokens: u.completion_tokens || 0,
+            cacheReadTokens: u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
+            cacheWriteTokens: u.cache_creation_input_tokens || 0,
+            // ENG-893: bill writes at the TTL Bedrock actually applied.
+            cacheWriteByTtl: u.cache_creation_by_ttl,
+          });
+        }
       }
 
       // Add assistant message to messages array (for next iteration)
