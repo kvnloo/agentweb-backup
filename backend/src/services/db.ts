@@ -3056,6 +3056,8 @@ export const scheduleDb = {
     try {
       return await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
     } catch (error) {
+      // Rethrows. A scan that dies halfway must not read as "no schedules" — that
+      // would turn a transient failure into a migration that silently grants nothing.
       handleDynamoDbError(error, "getAllSchedules");
       return [];
     }

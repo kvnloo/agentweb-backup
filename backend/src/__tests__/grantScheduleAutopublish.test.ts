@@ -8,7 +8,7 @@
  * reading a single schedule. The wiring is therefore asserted here against the real
  * db module, not a mock: a mock would have been just as happy with the broken name.
  */
-import { scheduleDb } from "../services/db";
+import { scheduleDb, taskDb } from "../services/db";
 import { backfillPublishConsent } from "../scripts/grant-schedule-autopublish";
 
 const PUBLISHING = { requiredFunctionCalls: ["post_on_connected_account"] };
@@ -43,6 +43,15 @@ describe("ENG-827 grant-schedule-autopublish — enumeration wiring", () => {
     expect(spy).toHaveBeenCalledTimes(1);
     expect(result.scanned).toBe(1);
     expect(result.granted.map((g) => g.scheduleId)).toEqual(["sched-1"]);
+  });
+
+  it("lets a failed scan surface instead of reading as an empty table", async () => {
+    // A scan that dies partway must not reach the migration as zero schedules: that
+    // is a transient failure wearing the face of "nothing to grant", and the operator
+    // would walk away believing the backfill was a no-op.
+    jest.spyOn(taskDb, "scanAllItems").mockRejectedValue(new Error("ProvisionedThroughputExceeded"));
+
+    await expect(scheduleDb.getAllSchedules()).rejects.toThrow("ProvisionedThroughputExceeded");
   });
 
   it("survives an empty table without inventing rows", async () => {
