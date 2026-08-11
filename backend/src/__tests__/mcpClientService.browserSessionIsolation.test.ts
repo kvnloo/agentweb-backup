@@ -142,6 +142,47 @@ describe('McpClientService browser session isolation (ENG-1118)', () => {
     expect((service as any).sessionClientPools.size).toBe(1);
   });
 
+  it('releases a per-session browser client when released by the bare chat session id', async () => {
+    await registerServer('playwright', { transport: 'sse', url: 'http://browser.example.com/sse' }, 'playwright');
+
+    const client = await (service as any).getSessionClient('playwright', 'chat-session-a', 'user-1');
+
+    await service.releaseSessionClients('chat-session-a');
+
+    expect(client.close).toHaveBeenCalled();
+    expect((service as any).sessionClientPools.size).toBe(0);
+  });
+
+  it('leaves a concurrent session\'s browser client alone when releasing one session', async () => {
+    await registerServer('playwright', { transport: 'sse', url: 'http://browser.example.com/sse' }, 'playwright');
+
+    const clientA = await (service as any).getSessionClient('playwright', 'chat-session-a', 'user-1');
+    const clientB = await (service as any).getSessionClient('playwright', 'chat-session-b', 'user-1');
+
+    await service.releaseSessionClients('chat-session-a');
+
+    expect(clientA.close).toHaveBeenCalled();
+    expect(clientB.close).not.toHaveBeenCalled();
+    expect((service as any).sessionClientPools.size).toBe(1);
+  });
+
+  it('does not release a per-user browser pool when a stale sibling pool is swept', async () => {
+    await registerServer('playwright', { transport: 'sse', url: 'http://browser.example.com/sse' }, 'playwright');
+    await registerServer('notion', { transport: 'sse', url: 'http://notion.example.com/sse' }, 'notion');
+
+    const browserClient = await (service as any).getSessionClient('playwright', 'chat-session-a', 'user-1');
+    const notionClient = await (service as any).getSessionClient('notion', 'chat-session-a', 'user-1');
+
+    // The per-user pool ("user-1") goes stale while the browser pool
+    // ("user-1::chat-session-a") is still active; the sweep must not touch it.
+    (service as any).sessionClientPools.get('user-1').lastActivity = 0;
+    await (service as any).cleanupStaleSessions();
+
+    expect(notionClient.close).toHaveBeenCalled();
+    expect(browserClient.close).not.toHaveBeenCalled();
+    expect((service as any).sessionClientPools.has('user-1::chat-session-a')).toBe(true);
+  });
+
   it('evicts a dead browser client from its own session pool, leaving the sibling session untouched', async () => {
     mockGetSetting.mockResolvedValue({
       settingValue: JSON.stringify([{ name: 'playwright', transport: 'sse', url: 'http://browser.example.com/sse' }]),
