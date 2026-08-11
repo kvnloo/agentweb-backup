@@ -1,8 +1,10 @@
 /**
  * Emma chatbot cost accounting (calculateCost).
  *
- * calculateCost feeds `estimated_cost` on each message's usage, which flows into
- * incrementUserTokenUsage() — i.e. the user's real per-month cost accounting.
+ * calculateCost feeds `estimated_cost` on each message's usage, which drives the
+ * session-level cost display. It no longer charges the per-user quota: ENG-1134
+ * moved that to the LLM call site, because charging at message-persist time
+ * double-billed every agent-mode turn and wrote no ledger row.
  * It previously carried a hardcoded per-1K table whose gpt-4o prompt rate was
  * 10x the published list price ($25/1M vs the real $2.50/1M), silently
  * overcharging chatbot cost. It must instead price from the single source of
