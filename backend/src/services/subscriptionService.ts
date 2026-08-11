@@ -10,6 +10,7 @@ export interface SubscriptionType {
   hiddenPages?: string[]; // Array of page paths to hide entirely (not shown as locked); subset of pages not in allowedPages
   allowedSkills: string[]; // Array of skill IDs (e.g., ["skill-uuid-1", "skill-uuid-2"]) or ["*"] for all
   allowedConnectedAccounts?: string[]; // Array of platform types (e.g., ["linkedin", "gmail"]) or ["*"] for all; undefined = all
+  allowedFeatures?: string[]; // Stable product feature IDs or ["*"]; undefined = legacy row (all current features)
   allowedFunctionCalls?: string[]; // Deprecated — kept for on-read migration from old configs
   monthlyTokenAllowance?: number | null; // Monthly token limit; null/undefined = unlimited
   monthlyCostAllowance?: number | null; // Monthly LLM spend limit in USD (cost-based cap; guards higher-cost models); null/undefined = unlimited
@@ -37,6 +38,26 @@ const FREE_TIER_FALLBACK: SubscriptionType = {
   allowedSkills: [], // No premium skills on Free tier
 };
 
+export const SUBSCRIPTION_FEATURES = {
+  SCHEDULED_CHATS: "scheduled_chats",
+} as const;
+
+export type SubscriptionFeatureId = typeof SUBSCRIPTION_FEATURES[keyof typeof SUBSCRIPTION_FEATURES];
+
+const AVAILABLE_SUBSCRIPTION_FEATURES: ReadonlyArray<{
+  id: SubscriptionFeatureId;
+  label: string;
+  description: string;
+}> = [{
+  id: SUBSCRIPTION_FEATURES.SCHEDULED_CHATS,
+  label: "Scheduled chats",
+  description: "Create, edit, test, resume, and execute recurring Agent Mode chats.",
+}];
+
+export function getAllAvailableSubscriptionFeatures() {
+  return AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => ({ ...feature }));
+}
+
 /**
  * Get tier configuration by name — reads from DynamoDB first, falls back
  * to a minimal Free config if the DB is unreachable or the tier is not
@@ -55,9 +76,13 @@ export async function getTierConfig(tierName: string): Promise<SubscriptionType 
 /**
  * Get subscription type for a user (defaults to "Free" if not set)
  */
-export async function getUserSubscriptionType(userId: string): Promise<string> {
+async function resolveUserSubscriptionType(userId: string): Promise<{
+  subscriptionType: string;
+  resolved: boolean;
+}> {
   try {
     const user = await userDb.getUserById(userId);
+    const ownSubscriptionType = user?.subscriptionType || "Free";
     // Org members inherit the org owner's tier dynamically — the org's effective
     // tier is whatever the owner currently holds (orgs carry no tier field).
     // Resolving at read time (instead of snapshotting the owner's tier onto the
@@ -104,17 +129,61 @@ export async function getUserSubscriptionType(userId: string): Promise<string> {
           // updated) would propagate as-is — an accepted limitation of the
           // current data model, not something this function can detect.
           const owner = await userDb.getUserById(org.ownerUserId);
-          return owner?.subscriptionType || "Free";
+          if (!owner) {
+            return { subscriptionType: ownSubscriptionType, resolved: false };
+          }
+          return { subscriptionType: owner.subscriptionType || "Free", resolved: true };
         }
       } catch (orgLookupError) {
         console.error("Error resolving org owner for subscription type:", orgLookupError);
+        return { subscriptionType: ownSubscriptionType, resolved: false };
       }
     }
-    return user?.subscriptionType || "Free";
+    return { subscriptionType: ownSubscriptionType, resolved: true };
   } catch (error) {
     console.error("Error getting user subscription type:", error);
-    return "Free";
+    return { subscriptionType: "Free", resolved: false };
   }
+}
+
+export async function getUserSubscriptionType(userId: string): Promise<string> {
+  return (await resolveUserSubscriptionType(userId)).subscriptionType;
+}
+
+/** Return product features for the user's effective, org-aware subscription. */
+export async function getAllowedFeatures(userId: string): Promise<string[]> {
+  const subscriptionTypeName = await getUserSubscriptionType(userId);
+  const config = await getTierConfig(subscriptionTypeName);
+  if (!config) return [];
+
+  // Existing subscription rows predate feature entitlements. Preserve their
+  // behavior until an admin explicitly saves this field.
+  if (!Array.isArray(config.allowedFeatures) || config.allowedFeatures.includes("*")) {
+    return AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => feature.id);
+  }
+
+  const knownFeatures = new Set(AVAILABLE_SUBSCRIPTION_FEATURES.map((feature) => feature.id));
+  return config.allowedFeatures.filter((feature) => knownFeatures.has(feature as SubscriptionFeatureId));
+}
+
+export async function isSubscriptionFeatureEnabled(
+  userId: string,
+  feature: SubscriptionFeatureId
+): Promise<boolean | null> {
+  const subscriptionResolution = await resolveUserSubscriptionType(userId);
+  if (!subscriptionResolution.resolved) return null;
+
+  const config = await getSubscriptionTypeConfig(subscriptionResolution.subscriptionType);
+
+  // Keep explicit denial distinct from an unavailable/malformed admin setting.
+  // Interactive entry points still fail closed on null, while background jobs
+  // can retry later without permanently pausing a permitted schedule.
+  if (!config) return null;
+  if (!Array.isArray(config.allowedFeatures) || config.allowedFeatures.includes("*")) {
+    return true;
+  }
+
+  return config.allowedFeatures.includes(feature);
 }
 
 /**

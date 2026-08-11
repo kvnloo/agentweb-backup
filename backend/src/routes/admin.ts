@@ -4695,6 +4695,7 @@ router.get("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // If no subscription types exist, return default Basic type with actual lists
     if (subscriptionTypes.length === 0) {
@@ -4703,6 +4704,7 @@ router.get("/subscription-types", async (req, res) => {
         allowedPages: allAvailablePages, // All available pages (expanded)
         allowedSkills: allAvailableSkills, // All available skills (expanded)
         allowedConnectedAccounts: allAvailableConnectedAccounts, // All platforms (expanded)
+        allowedFeatures: allAvailableFeatures,
       }];
     }
 
@@ -4735,6 +4737,11 @@ router.get("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      let normalizedFeatures = Array.isArray(type.allowedFeatures)
+        ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
+        : allAvailableFeatures;
+      if (normalizedFeatures.includes('*')) normalizedFeatures = allAvailableFeatures;
+
       // Pass through hiddenPages as-is (these are never wildcarded)
       const hiddenPages: string[] = Array.isArray(type.hiddenPages) ? type.hiddenPages : [];
 
@@ -4744,6 +4751,7 @@ router.get("/subscription-types", async (req, res) => {
         ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
+        allowedFeatures: normalizedFeatures,
         ...(type.monthlyTokenAllowance != null ? { monthlyTokenAllowance: type.monthlyTokenAllowance } : {}),
         // ENG-200 per-user cost cap: round-trip it so the Users-tab "LLM Cost $X / $cap"
         // display can show the cap. Absent = unlimited.
@@ -4772,6 +4780,7 @@ router.post("/subscription-types", async (req, res) => {
     const allAvailablePages = subscriptionService.getAllAvailablePages();
     const allAvailableSkills = await subscriptionService.getAllAvailableSkills();
     const allAvailableConnectedAccounts = subscriptionService.getAllAvailableConnectedAccounts();
+    const allAvailableFeatures: string[] = subscriptionService.getAllAvailableSubscriptionFeatures().map((feature) => feature.id);
 
     // Validate subscription types structure, normalize paths, and expand "*" to actual lists
     const normalizedTypes = await Promise.all(subscriptionTypes.map(async (type: any) => {
@@ -4783,6 +4792,9 @@ router.post("/subscription-types", async (req, res) => {
       }
       if (!Array.isArray(type.allowedSkills)) {
         throw new Error("Each subscription type must have allowedSkills array");
+      }
+      if (type.allowedFeatures !== undefined && !Array.isArray(type.allowedFeatures)) {
+        throw new Error("allowedFeatures must be an array when provided");
       }
 
       // Remove "/marketing" prefix from allowedPages if present
@@ -4812,6 +4824,11 @@ router.post("/subscription-types", async (req, res) => {
         normalizedConnectedAccounts = allAvailableConnectedAccounts;
       }
 
+      let normalizedFeatures = Array.isArray(type.allowedFeatures)
+        ? type.allowedFeatures.filter((feature: unknown) => typeof feature === 'string' && allAvailableFeatures.includes(feature as string))
+        : allAvailableFeatures;
+      if (type.allowedFeatures?.includes('*')) normalizedFeatures = allAvailableFeatures;
+
       // Parse monthlyTokenAllowance (preserve null for unlimited)
       const parsedAllowance = type.monthlyTokenAllowance != null
         ? Number(type.monthlyTokenAllowance)
@@ -4835,6 +4852,7 @@ router.post("/subscription-types", async (req, res) => {
         ...(hiddenPages.length > 0 ? { hiddenPages } : {}),
         allowedSkills: normalizedSkills,
         allowedConnectedAccounts: normalizedConnectedAccounts,
+        allowedFeatures: normalizedFeatures,
         ...(parsedAllowance != null && !isNaN(parsedAllowance) ? { monthlyTokenAllowance: parsedAllowance } : {}),
         ...(parsedCostAllowance != null && !isNaN(parsedCostAllowance) ? { monthlyCostAllowance: parsedCostAllowance } : {}),
       };
@@ -4853,6 +4871,11 @@ router.post("/subscription-types", async (req, res) => {
     console.error("Error saving subscription types:", error);
     res.status(400).json({ message: error.message || "Error saving subscription types" });
   }
+});
+
+router.get("/subscription-features", async (_req, res) => {
+  const subscriptionService = await import('../services/subscriptionService');
+  res.json({ features: subscriptionService.getAllAvailableSubscriptionFeatures() });
 });
 
 // Add or remove a single skill from a subscription type
