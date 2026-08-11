@@ -190,8 +190,35 @@ function isConnectionError(error: unknown): boolean {
 const BROWSER_TOOL_MAX_RETRIES = 2;
 const BROWSER_TOOL_RETRY_DELAY_MS = 2000;
 
+// How often idle session client pools are swept (the idle TTL itself is SESSION_TIMEOUT_MS).
+const SESSION_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
 function isBrowserTool(toolName: string): boolean {
   return toolName.startsWith('playwright_') || toolName.startsWith('browser_');
+}
+
+/**
+ * True when a server drives a real browser (Playwright MCP and friends).
+ *
+ * A browser MCP process owns ONE browser with one live page, so its client can
+ * never be shared by two chat sessions: whichever session navigates last owns
+ * the page, and the other session's evaluate() silently reads the wrong site
+ * (ENG-1118). Detected from the server name, tool prefix and launch command so
+ * a renamed or DB-configured browser server is still recognised.
+ */
+function isBrowserServer(serverName: string, entry?: { config: McpServerConfig; toolPrefix?: string }): boolean {
+  const config = entry?.config as Record<string, any> | undefined;
+  const haystack = [
+    serverName,
+    entry?.toolPrefix,
+    config?.command,
+    config?.url,
+    ...(Array.isArray(config?.args) ? config!.args : []),
+  ]
+    .filter((part): part is string => typeof part === 'string')
+    .join(' ')
+    .toLowerCase();
+  return haystack.includes('playwright') || haystack.includes('browser');
 }
 
 function sleep(ms: number): Promise<void> {
@@ -408,12 +435,16 @@ export class McpClientService {
   }
 
   /**
-   * Start periodic cleanup of stale session client pools
+   * Start periodic cleanup of stale session client pools.
+   * Sweeps at most every 5 minutes: browser servers pool per chat session, so an
+   * ended session's browser process must be reclaimed soon after its idle TTL
+   * expires rather than up to a full TTL later.
    */
   private startSessionCleanup() {
+    const sweepIntervalMs = Math.min(this.SESSION_TIMEOUT_MS, SESSION_SWEEP_INTERVAL_MS);
     this.cleanupInterval = setInterval(() => {
       this.cleanupStaleSessions();
-    }, this.SESSION_TIMEOUT_MS);
+    }, sweepIntervalMs);
     // Don't let this periodic timer keep the process (or a test run) alive on its own.
     this.cleanupInterval.unref?.();
   }
@@ -438,15 +469,32 @@ export class McpClientService {
   }
 
   /**
+   * Pool key for a session client.
+   *
+   * Default: userId, so the same user shares one MCP process across chat
+   * sessions. Different users always get separate clients (security isolation).
+   *
+   * Browser servers are the exception: they are pooled per chat session, because
+   * one browser process has one live page and two concurrent sessions sharing it
+   * steal each other's navigation (ENG-1118). Playwright MCP runs with
+   * --isolated (its own temp profile per process), so concurrent processes do
+   * not fight over a user-data-dir lock.
+   */
+  private getPoolKey(serverName: string, chatSessionId: string, userId?: string): string {
+    const owner = userId || chatSessionId;
+    if (isBrowserServer(serverName, this.serverConfigs.get(serverName))) {
+      return `${owner}::${chatSessionId}`;
+    }
+    return owner;
+  }
+
+  /**
    * Get or create a client for a specific chat session.
-   * Uses userId as pool key so the same user shares MCP clients (e.g. browser)
-   * across chat sessions, avoiding "browser in use" lock conflicts.
-   * Different users still get separate clients for security isolation.
+   * Pool key comes from getPoolKey(): per user for ordinary servers, per chat
+   * session for browser servers.
    */
   private async getSessionClient(serverName: string, chatSessionId: string, userId?: string): Promise<Client> {
-    // Pool by userId so same user shares one browser/MCP process across sessions.
-    // Fall back to chatSessionId if userId not available.
-    const poolKey = userId || chatSessionId;
+    const poolKey = this.getPoolKey(serverName, chatSessionId, userId);
 
     // Get or create session pool
     let sessionPool = this.sessionClientPools.get(poolKey);
@@ -685,7 +733,7 @@ export class McpClientService {
                   // Evict dead client from session pool so the next call reconnects
                   if (isConnectionError(error)) {
                     console.warn(`[MCP-SESSION] Evicting dead client for "${serverName}" from pool due to connection error`);
-                    await this.evictSessionClient(context.userId || context.sessionId, serverName, sessionClient);
+                    await this.evictSessionClient(this.getPoolKey(serverName, context.sessionId, context.userId), serverName, sessionClient);
                   }
                   if (attempt < maxAttempts) {
                     console.warn(JSON.stringify(buildMcpToolTelemetry({
@@ -1301,7 +1349,7 @@ export class McpClientService {
               // Evict dead client from session pool so the next call reconnects
               if (isConnectionError(error)) {
                 console.warn(`[MCP-SESSION] Evicting dead client for "${name}" from pool due to connection error`);
-                await this.evictSessionClient(context.userId || context.sessionId, name, sessionClient);
+                await this.evictSessionClient(this.getPoolKey(name, context.sessionId, context.userId), name, sessionClient);
               }
               if (attempt < maxAttempts) {
                 console.warn(JSON.stringify(buildMcpToolTelemetry({
