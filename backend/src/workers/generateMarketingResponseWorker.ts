@@ -73,7 +73,7 @@ process.on('message', async (message: any) => {
       // Ensure initialization completed (should already be done)
       await ensureInitialized();
 
-      const { messageContent, sessionHistory, userId, llmModel, sessionId, mockMode, isInteractiveShare, isDelegatedAccess, excludeTools, screenshotUrl, persistIncrementally } = message.params;
+      const { messageContent, sessionHistory, userId, llmModel, sessionId, mockMode, isInteractiveShare, isDelegatedAccess, excludeTools, screenshotUrl, persistIncrementally, publishAuthorizationOverride } = message.params;
 
       // Progress callback to forward progress updates to parent process
       const onProgress = (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[]; suggestions?: string[] }) => {
@@ -106,7 +106,8 @@ process.on('message', async (message: any) => {
         excludeTools,
         screenshotUrl,
         isDelegatedAccess,
-        persistIncrementally
+        persistIncrementally,
+        publishAuthorizationOverride
       );
 
       // Clean up cancelled flag

@@ -3194,7 +3194,12 @@ export class AgentModeService {
     excludeTools?: string[],
     screenshotUrl?: string,
     isDelegatedAccess: boolean = false,
-    persistIncrementally: boolean = false
+    persistIncrementally: boolean = false,
+    // ENG-827 (Greptile): publish authorization the caller already resolved. Supplied
+    // by the scheduled path so the system prompt is built from the SAME value the
+    // required-function checker holds; absent on the interactive path, which resolves
+    // per turn below.
+    publishAuthorizationOverride?: SchedulePublishAuthorization
   ): Promise<{ content: string; toolCalls: any[]; knowledgeBaseQueries: string[]; sources: string[]; responseMessages: any[]; cancelled?: boolean; backupModelUsed?: boolean; originalModel?: string; backupModel?: string; truncatedByStepBudget?: boolean; persistedResponseCount?: number }> {
     // Hoisted so the catch block can extract partial usage from messages accumulated before an error
     let _messages: any[] | null = null;
@@ -3300,7 +3305,15 @@ export class AgentModeService {
       // ENG-827: resolved ONCE per turn and reused for both the ENG-803 override below
       // and the publish directive appended after the conversation, so a single read
       // backs every statement the model sees about publishing.
-      const publishAuthorization = await this.resolveScheduledPublishAuthorization(currentSession);
+      // ENG-827 (Greptile): prefer the caller's resolved value. Two independent reads
+      // can straddle a revocation, and the disagreement that bites is a prompt saying
+      // "draft only" while the checker still requires a publishing tool — the agent is
+      // then told not to publish and marked incomplete for not publishing, which is the
+      // retry loop this ticket is about. Using one value makes that unrepresentable.
+      // Mid-run withdrawal is not lost by this: it arrives as an explicit notice on the
+      // turn message, and the publish sinks re-read live consent at the write itself.
+      const publishAuthorization =
+        publishAuthorizationOverride ?? (await this.resolveScheduledPublishAuthorization(currentSession));
       const publishAuthorized = publishAuthorization.authorized;
       const sessionTypeLabel = getScheduledSessionOverride(currentSession?.sessionType, publishAuthorized);
       const messages: any[] = [

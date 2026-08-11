@@ -4551,7 +4551,11 @@ export async function generateSessionResponse(
       // ENG-473: persist each settled turn as it completes so a hard process kill
       // (OOM/SIGKILL/force-exit past drain) leaves a visible partial transcript
       // instead of a silent zero-output session.
-      persistIncrementally: true
+      persistIncrementally: true,
+      // ENG-827: forward the caller's resolved authorization so the prompt and the
+      // checker are built from one value. Absent on the interactive path, where the
+      // service resolves it per turn instead.
+      publishAuthorizationOverride
     },
     (progress) => {
       // Emit progress updates via SSE

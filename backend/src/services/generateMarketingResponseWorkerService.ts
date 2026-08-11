@@ -22,6 +22,13 @@ interface GenerateMarketingResponseParams {
   // ENG-473: when set, the worker persists each settled turn to the session as it
   // completes so a hard process kill leaves a visible partial transcript.
   persistIncrementally?: boolean;
+  // ENG-827 (Greptile): the publish authorization the CALLER already resolved, carried
+  // across the worker boundary so the system prompt is built from the same value the
+  // required-function checker uses. Two independent reads can land either side of a
+  // revocation and disagree — and the disagreement that matters is a prompt saying
+  // "draft only" while the checker still demands a publishing tool, which is the retry
+  // loop this ticket exists to fix. Plain data, so it survives serialization.
+  publishAuthorizationOverride?: { authorized: boolean; tools: string[] };
 }
 
 interface GenerateMarketingResponseResult {
