@@ -23,15 +23,22 @@ export function extractS3KeyFromUrl(
   try {
     const url = new URL(fileUrl);
     const host = url.hostname.toLowerCase();
+    const normalizedBucket = bucket.toLowerCase();
     const path = url.pathname.replace(/^\/+/, '');
 
     // Virtual-hosted style: bucket.s3.amazonaws.com/key or bucket.s3.region.amazonaws.com/key
-    if (host.startsWith(`${bucket}.`)) {
+    const virtualHost = `${normalizedBucket}.s3.amazonaws.com`;
+    const regionalVirtualHost = new RegExp(
+      `^${normalizedBucket.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.s3[.-][a-z0-9-]+\\.amazonaws\\.com$`,
+    );
+    if (host === virtualHost || regionalVirtualHost.test(host)) {
       return path || null;
     }
 
     // Path-style: s3.amazonaws.com/bucket/key
-    if (path.startsWith(`${bucket}/`)) {
+    const pathStyleHost = host === 's3.amazonaws.com'
+      || /^s3[.-][a-z0-9-]+\.amazonaws\.com$/.test(host);
+    if (pathStyleHost && path.startsWith(`${bucket}/`)) {
       return path.substring(bucket.length + 1) || null;
     }
 
@@ -164,6 +171,32 @@ export async function getS3ObjectAsString(
     }
   }
   throw lastError;
+}
+
+/** Read binary S3 content with an optional hard byte ceiling. */
+export async function getS3ObjectAsBuffer(
+  key: string,
+  bucket: string = DEFAULT_BUCKET,
+  maxBytes?: number,
+): Promise<{ buffer: Buffer; contentType?: string }> {
+  const request: AWS.S3.GetObjectRequest = { Bucket: bucket, Key: key };
+  // S3 byte ranges are inclusive. Reading at most maxBytes + 1 lets the caller
+  // distinguish an exact-limit object from an oversized one without loading an
+  // unbounded asset into process memory.
+  if (maxBytes !== undefined) request.Range = `bytes=0-${maxBytes}`;
+
+  const result = await s3.getObject(request).promise();
+  if (result.Body === undefined || result.Body === null) {
+    throw new Error(`S3 object ${bucket}/${key} returned an empty body`);
+  }
+  const buffer = Buffer.isBuffer(result.Body) ? result.Body : Buffer.from(result.Body as any);
+  if (maxBytes !== undefined && buffer.byteLength > maxBytes) {
+    const limit = maxBytes % (1024 * 1024) === 0
+      ? `${maxBytes / (1024 * 1024)} MB`
+      : `${maxBytes} bytes`;
+    throw new Error(`decoded image exceeds the ${limit} limit`);
+  }
+  return { buffer, contentType: result.ContentType };
 }
 
 export interface S3UploadResult {

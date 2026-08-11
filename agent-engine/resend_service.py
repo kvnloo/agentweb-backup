@@ -4,6 +4,7 @@ import resend
 import logging
 import time
 from typing import Optional, Dict, Any
+import secrets_manager
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +18,7 @@ class ResendService:
         """Initialize Resend service with API key from environment variable"""
         try:
             # Get API key from environment variable
-            self.api_key = os.getenv('RESEND_API_KEY')
+            self.api_key = secrets_manager.get_resend_api_key()
             
             if self.api_key:
                 resend.api_key = self.api_key
