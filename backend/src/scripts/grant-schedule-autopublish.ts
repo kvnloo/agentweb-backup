@@ -60,7 +60,11 @@ export async function backfillPublishConsent(opts: {
   listSchedules?: () => Promise<any[]>;
   update?: (scheduleId: string, patch: any) => Promise<any>;
 }): Promise<BackfillResult> {
-  const listSchedules = opts.listSchedules ?? (() => (scheduleDb as any).getAllSchedules());
+  // Not `(scheduleDb as any)` — the cast is what let this default point at a method
+  // that did not exist. Every test injects `listSchedules`, so the only caller of the
+  // default is the operator running the CLI, and they would have got a TypeError
+  // before a single schedule was read. Keep it typed so the compiler holds the wiring.
+  const listSchedules = opts.listSchedules ?? (() => scheduleDb.getAllSchedules());
   const update = opts.update ?? ((id: string, patch: any) => scheduleDb.updateSchedule(id, patch));
 
   const all = (await listSchedules()) || [];

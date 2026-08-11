@@ -3046,6 +3046,21 @@ export const scheduleDb = {
     }
   },
 
+  /**
+   * Every schedule in the table, paginated. A full scan, so this is for one-off
+   * operator work (the ENG-827 consent migration) — never a request path. The
+   * prefixed table name stays inside this module, which is the only reason a
+   * script can enumerate schedules without knowing about TABLE_PREFIX.
+   */
+  async getAllSchedules(): Promise<any[]> {
+    try {
+      return await taskDb.scanAllItems(`${TABLE_PREFIX}AW-TaskSchedules`);
+    } catch (error) {
+      handleDynamoDbError(error, "getAllSchedules");
+      return [];
+    }
+  },
+
   async updateSchedule(
     scheduleId: string,
     updates: Partial<{
