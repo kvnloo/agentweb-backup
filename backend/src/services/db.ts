@@ -396,6 +396,15 @@ export interface User {
     }>;
     createdAt: string;
     updatedAt: string;
+    /**
+     * Opaque identity of the write that produced this value, stamped only by
+     * the asset-delete path's conditional writes. `updatedAt` is millisecond
+     * granular and every other brand writer mints its own, so two writes can
+     * share a stamp; pairing it with a revision lets a conditional write
+     * identify the exact value it read. Absent on anything written by another
+     * path, which those conditions match explicitly.
+     */
+    rev?: string;
   };
   marketStrategy?: {
     businessOverview: string;
@@ -9147,7 +9156,23 @@ export const orgDb = {
     }
   },
 
-  async updateOrg(orgId: string, updates: Partial<Organization>): Promise<Organization> {
+  /**
+   * `options.condition` mirrors `userDb.updateUser`'s: an optional guard so a
+   * caller doing read-modify-write on an org can refuse to clobber a value that
+   * moved underneath it. Unmet conditions are rethrown verbatim so the caller
+   * can tell "my guard fired" apart from a real DynamoDB fault.
+   */
+  async updateOrg(
+    orgId: string,
+    updates: Partial<Organization>,
+    options?: {
+      condition?: {
+        expression: string;
+        names?: { [key: string]: string };
+        values?: { [key: string]: any };
+      };
+    }
+  ): Promise<Organization> {
     const { orgId: _, createdAt: __, ...updatableFields } = updates;
 
     if (Object.keys(updatableFields).length === 0) {
@@ -9190,7 +9215,7 @@ export const orgDb = {
     updateExpressionParts.push(`SET ${setExpressions.join(", ")}`);
     if (removeExpressions.length > 0) updateExpressionParts.push(`REMOVE ${removeExpressions.join(", ")}`);
 
-    const params = {
+    const params: any = {
       TableName: ORGS_TABLE,
       Key: { orgId },
       UpdateExpression: updateExpressionParts.join(" "),
@@ -9198,6 +9223,11 @@ export const orgDb = {
       ExpressionAttributeValues: expressionAttributeValues,
       ReturnValues: "ALL_NEW" as const,
     };
+    if (options?.condition) {
+      params.ConditionExpression = options.condition.expression;
+      Object.assign(expressionAttributeNames, options.condition.names || {});
+      Object.assign(expressionAttributeValues, options.condition.values || {});
+    }
 
     const result = await dynamodb.update(params).promise();
     return result.Attributes as Organization;
