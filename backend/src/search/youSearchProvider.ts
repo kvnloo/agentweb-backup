@@ -103,18 +103,28 @@ export class YouSearchProvider implements SearchProvider {
    *      freshness window and does rank against the query.
    * Web-sourced entries keep sourceType 'web' so callers can tell a news article
    * from a recent web page, and an empty result now genuinely means "no coverage".
+   *
+   * The same relevance guard applies to both buckets. The `web` bucket ranks
+   * against the query but still pads thin entity queries with matches on the
+   * descriptor alone — "Zenoti" also returns a Las Vegas restaurant and a
+   * Zendaya page, "Guesty vacation rental software" also returns Capterra and
+   * Lodgify — which is the reported irrelevance failure arriving by another
+   * route. Filtering the fallback too is what makes an empty result trustworthy:
+   * a query for a company nobody covered comes back empty instead of padded.
    */
   private buildNewsResponse(data: any, request: SearchRequest): SearchProviderResponse {
     const limit = normalizeSearchCount(request.count);
-    const rawNews = this.normalizeResults(data?.results?.news, 'news');
     const significantTerms = extractSignificantTerms(request.query);
-    const relevantNews = rawNews.filter((result) => isRelevantToQuery(result, significantTerms));
+    const isRelevant = (result: NormalizedSearchResult) => isRelevantToQuery(result, significantTerms);
 
+    const rawNews = this.normalizeResults(data?.results?.news, 'news');
+    const relevantNews = rawNews.filter(isRelevant);
+
+    const rawWeb = this.normalizeResults(data?.results?.web, 'web');
     const seenUrls = new Set(relevantNews.map((result) => result.url));
-    const webFallback = this.normalizeResults(data?.results?.web, 'web')
-      .filter((result) => !seenUrls.has(result.url));
+    const relevantWeb = rawWeb.filter((result) => isRelevant(result) && !seenUrls.has(result.url));
 
-    const results = [...relevantNews, ...webFallback].slice(0, limit);
+    const results = [...relevantNews, ...relevantWeb].slice(0, limit);
     const newsResultCount = results.filter((result) => result.sourceType === 'news').length;
 
     return {
@@ -127,6 +137,7 @@ export class YouSearchProvider implements SearchProvider {
         resultSource: 'news' as const,
         newsResultCount,
         irrelevantNewsDropped: rawNews.length - relevantNews.length,
+        irrelevantWebDropped: rawWeb.length - relevantWeb.length,
         webFallbackCount: results.length - newsResultCount,
       },
     };
