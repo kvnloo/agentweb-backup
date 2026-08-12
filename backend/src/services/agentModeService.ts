@@ -3602,23 +3602,37 @@ export class AgentModeService {
       // can wrap itself up: nudge to stop new discovery at 70% of the budget, then stop
       // honouring tool calls and force one final synthesis turn while there is still time
       // to deliver.
-      // Unlike `generationHardCapMs` above this is NOT tied to the media switch — it guards
-      // every turn. Set AGENT_MODE_GENERATION_TIMEOUT_MS=0 to disable.
+      // Unlike `generationHardCapMs` above this is NOT tied to the media switch — but it is
+      // strictly scoped to callers that actually impose a deadline. Set
+      // AGENT_MODE_GENERATION_TIMEOUT_MS=0 to disable it everywhere.
       //
-      // The deadline belongs to the CALLER, not to this loop: the controller starts
-      // withGenerationTimeout right after it stamps `turnStartMs`, and the session and
-      // message reads, the title LLM call, the fork IPC hop and the memory embedding
-      // backfill all run before control reaches here. Anchoring on a local Date.now()
-      // would put our cap strictly later than the one actually enforced and silently
-      // spend that setup latency out of the synthesis reserve. Use the caller's stamp
-      // when we have one (clamped so a skewed/future value can't extend the budget),
-      // and fall back to now for callers that run without a cap (Slack, benchmarks,
-      // direct service calls).
-      const turnStartedAtMs =
-        Number.isFinite(turnStartMs as number) && (turnStartMs as number) > 0
-          ? Math.min(turnStartMs as number, Date.now())
-          : Date.now();
-      const turnHardCapMs = generationTimeoutMs > 0 ? turnStartedAtMs + generationTimeoutMs : undefined;
+      // The deadline belongs to the CALLER, and `turnStartMs` is the ONLY evidence that one
+      // exists. `withGenerationTimeout` wraps exactly two call sites — the interactive
+      // generate endpoint and the ishare endpoint — and both stamp `turnStartMs` right
+      // before arming it. Every other caller (scheduled runs, Slack, GTM plan, admin
+      // replay, email, benchmarks) invokes this loop with NO wall-clock cap whatsoever.
+      // Defaulting those to `Date.now() + generationTimeoutMs` would invent a 10-minute
+      // ceiling that production does not have and truncate work that completes today:
+      // session bd733cb4 (the 5/5/5 LinkedIn queue run ENG-907's own report holds up as
+      // the pattern to copy) spent 683s on a single scheduled turn and would have been
+      // forced into synthesis at ~520s, losing the knowledge-base write that WAS the
+      // deliverable. So: no caller stamp, no budget — behave exactly as before.
+      //
+      // When we do have a stamp, anchor on it rather than on a local Date.now(): the
+      // session and message reads, the title LLM call, the fork IPC hop and the memory
+      // embedding backfill all run before control reaches here, and anchoring locally
+      // would put our cap later than the one actually enforced and silently spend that
+      // setup latency out of the synthesis reserve. Clamped, so a skewed/future stamp
+      // cannot extend the budget past now.
+      const callerDeadlineStamped =
+        Number.isFinite(turnStartMs as number) && (turnStartMs as number) > 0;
+      const turnStartedAtMs = callerDeadlineStamped
+        ? Math.min(turnStartMs as number, Date.now())
+        : Date.now();
+      const turnHardCapMs =
+        callerDeadlineStamped && generationTimeoutMs > 0
+          ? turnStartedAtMs + generationTimeoutMs
+          : undefined;
       let longestLlmCallMsThisRun = 0;
       let timeBudgetWrapUpWarned = false;
       // Sticky: once the loop switches to synthesis it never offers tools again this turn.

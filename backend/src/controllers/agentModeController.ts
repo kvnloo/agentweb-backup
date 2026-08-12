@@ -6433,7 +6433,14 @@ export const agentModeController = {
           true, // isInteractiveShare - block admin tools for security
           undefined, // pageContext
           undefined, // isDelegatedAccess
-          ishareSenderInfo
+          ishareSenderInfo,
+          undefined, // answerAck
+          undefined, // answeredQuestionMeta
+          // ENG-907: this endpoint enforces the same whole-turn cap as the interactive
+          // one (withGenerationTimeout is armed on the next line), so hand the loop the
+          // deadline too — otherwise an ishare turn is guillotined with nothing to show
+          // for it, exactly as ENG-907 described.
+          sharedTurnStartMs
         ),
         session.sessionId
       );
