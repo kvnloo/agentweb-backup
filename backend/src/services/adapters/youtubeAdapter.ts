@@ -1,7 +1,8 @@
 import axios from 'axios';
 import { ConnectedAccount, YouTubeConfig, updateAccountTokens } from '../connectedAccountsDb';
-import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics } from './socialPlatformTypes';
+import { SocialPlatformAdapter, PostResult, PostMetric, AccountMetrics, PostAnalytics, AssertStillAuthorized } from './socialPlatformTypes';
 import { getYouTubeConfig } from '../../config/integrations';
+import { PublishConsentWithdrawn, isPublishConsentWithdrawn } from '../../utils/publishConsentWithdrawn';
 
 const YOUTUBE_API_BASE = 'https://www.googleapis.com/youtube/v3';
 const YOUTUBE_UPLOAD_URL = 'https://www.googleapis.com/upload/youtube/v3/videos';
@@ -62,7 +63,7 @@ async function withTokenRefresh<T>(
 
 export class YouTubeAdapter implements SocialPlatformAdapter {
 
-  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string): Promise<PostResult> {
+  async createPost(account: ConnectedAccount, content: string, mediaUrls?: string[], userId?: string, assertStillAuthorized?: AssertStillAuthorized): Promise<PostResult> {
     const config = account.config;
     if (!isYouTubeChannel(config)) {
       throw new Error('Account must be a YouTube channel to post.');
@@ -74,10 +75,23 @@ export class YouTubeAdapter implements SocialPlatformAdapter {
 
     const videoUrl = mediaUrls[0];
 
-    const result: any = await withTokenRefresh(account, async (token) => {
+    let result: any;
+    try {
+      result = await withTokenRefresh(account, async (token) => {
       // Download the video to upload
       const videoResponse = await axios.get(videoUrl, { responseType: 'arraybuffer' });
       const videoBuffer = Buffer.from(videoResponse.data as ArrayBuffer);
+
+      // ENG-827: the download above pulls the whole video into memory and can take
+      // minutes; the dispatcher's consent check ran before this method was entered.
+      // This upload IS the irreversible act — it creates the video on the channel —
+      // so re-check immediately before it. Longest gap of any adapter, which is why
+      // the hook exists at all.
+      const withdrawn = await assertStillAuthorized?.();
+      if (withdrawn) {
+        console.warn('[YouTubeAdapter] ENG-827: abandoning upload — publish consent was withdrawn while the video was being fetched.');
+        throw new PublishConsentWithdrawn(withdrawn.error);
+      }
 
       // Use simple upload with metadata
       const uploadResponse = await axios.post(
@@ -94,6 +108,24 @@ export class YouTubeAdapter implements SocialPlatformAdapter {
 
       // Update video metadata in a separate call
       const videoId = (uploadResponse.data as any).id;
+
+      // ENG-827 (Greptile): uploading is not what makes the video visible — THIS call
+      // is. The upload just moved bytes, and for a large video that can run minutes
+      // longer than the check above. So decide the privacy of the finished video from
+      // consent as it stands right now, not as it stood when the bytes started moving.
+      //
+      // On withdrawal we still send the update, forced to `private`. Returning early
+      // would leave an untitled video sitting on the channel under whatever default
+      // the API applied — and that default is public for verified projects, which is
+      // the exact outcome we are trying to prevent. Publishing privately is the only
+      // reachable state that is both safe and not a silent loss of the upload.
+      const withdrawnAfterUpload = await assertStillAuthorized?.();
+      if (withdrawnAfterUpload) {
+        console.warn(
+          `[YouTubeAdapter] ENG-827: publish consent withdrawn during upload — pinning video ${videoId} to private instead of publishing it.`
+        );
+      }
+
       const updateResponse = await axios.put(
         `${YOUTUBE_API_BASE}/videos`,
         {
@@ -103,7 +135,7 @@ export class YouTubeAdapter implements SocialPlatformAdapter {
             description: content,
             categoryId: '22',
           },
-          status: { privacyStatus: 'public' },
+          status: { privacyStatus: withdrawnAfterUpload ? 'private' : 'public' },
         },
         {
           params: { part: 'snippet,status' },
@@ -111,8 +143,20 @@ export class YouTubeAdapter implements SocialPlatformAdapter {
         }
       );
 
+      if (withdrawnAfterUpload) {
+        throw new PublishConsentWithdrawn(
+          `${withdrawnAfterUpload.error} The video finished uploading before consent was withdrawn, so it was left PRIVATE on the channel (id ${videoId}) rather than published — make it public from YouTube Studio if you still want it live.`
+        );
+      }
+
       return updateResponse.data;
-    }, userId);
+      }, userId);
+    } catch (error) {
+      if (isPublishConsentWithdrawn(error)) {
+        return { success: false, message: error.message };
+      }
+      throw error;
+    }
 
     return {
       success: true,
