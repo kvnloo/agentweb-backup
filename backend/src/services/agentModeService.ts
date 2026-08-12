@@ -3638,6 +3638,9 @@ export class AgentModeService {
       // Sticky: once the loop switches to synthesis it never offers tools again this turn.
       let forceFinalSynthesis = false;
       let truncatedByTimeBudget = false;
+      // Set when the forced synthesis call failed with no room left to retry it — the loop
+      // then stops instead of starting a second full call it cannot afford (see below).
+      let synthesisRetryUnaffordable = false;
 
       // Single loop for LLM calls and tool execution
       let maxIterations = 40; // Prevent infinite loops
@@ -3934,7 +3937,37 @@ export class AgentModeService {
             humanPaced: humanPacedTurn
           });
         } catch (callError) {
-          if (isTransientLLMError(callError) && !backupModelUsed) {
+          // ENG-907: the backup-model retry below issues a SECOND full call of the same
+          // size. During the forced synthesis the only time left is the reserve held for
+          // that one call, so starting a retry it cannot afford runs the turn past the
+          // controller's cap — and the cap discards the answer, which is the failure this
+          // whole change exists to prevent. The attempt that just failed is the best
+          // available estimate of what the retry would cost, so require at least that much
+          // still on the clock. When there is not enough, end the turn here and deliver
+          // what was already gathered (TURN_TIME_BUDGET_FALLBACK_CONTENT covers an empty
+          // one) rather than throwing the turn away. Scoped to the forced synthesis: an
+          // ordinary transient failure keeps its retry untouched.
+          if (forceFinalSynthesis && turnHardCapMs !== undefined) {
+            const retryBudget = evaluateTurnTimeBudget({
+              startedAtMs: turnStartedAtMs,
+              hardCapMs: turnHardCapMs,
+              longestLlmCallMs: longestLlmCallMsThisRun,
+            });
+            const failedCallMs = Date.now() - llmStart;
+            if (retryBudget.remainingMs <= failedCallMs) {
+              console.warn(
+                `AgentMode: forced synthesis call failed in session ${sessionId} with only ` +
+                `${Math.round(retryBudget.remainingMs / 1000)}s left (the attempt itself took ` +
+                `${Math.round(failedCallMs / 1000)}s) — not starting a retry that would run past the ` +
+                'turn cap; delivering the work gathered so far'
+              );
+              recordSpanError(chatSpan, callError);
+              synthesisRetryUnaffordable = true;
+            }
+          }
+          if (synthesisRetryUnaffordable) {
+            // handled above — fall through to the break after the span is closed
+          } else if (isTransientLLMError(callError) && !backupModelUsed) {
             const backup = await this.getBackupModel(llmModel);
             if (backup) {
               console.warn(`AgentMode: Primary model "${llmModel}" failed with transient error in session ${sessionId}, switching to backup model "${backup}"`);
@@ -3967,6 +4000,17 @@ export class AgentModeService {
           }
         } finally {
           endChatSpan(chatSpan, { model: llmModel, response, inputMessages: trimmedMessages });
+        }
+        // ENG-907: the forced synthesis failed and there was no time to retry it. Leave the
+        // loop instead of raising — the caller is milliseconds from its cap, and an
+        // exception here loses everything. `content` at this point can only hold an earlier
+        // tool-calling turn's progress narration ("Scanned batch 9."), never an answer, so
+        // returning it would hand the user stale narration as the deliverable (the ENG-1054
+        // hazard). Say plainly that the time ran out and point at the work in the steps
+        // above, which is what the user can actually act on.
+        if (synthesisRetryUnaffordable) {
+          content = TURN_TIME_BUDGET_FALLBACK_CONTENT;
+          break;
         }
         const llmDurationMs = Date.now() - llmStart;
         // ENG-907: size the synthesis reserve off the slowest call actually observed —
