@@ -76,9 +76,14 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
      * The caller's whole-turn deadline stamp (ENG-907). The controller takes it right
      * before it starts `withGenerationTimeout`, i.e. BEFORE the session/message reads,
      * the title LLM call and the fork IPC hop — so by the time the loop runs it is
-     * already in the past. Omitted here means "no cap enforced by the caller".
+     * already in the past.
+     *
+     * It is also the ONLY signal that a deadline exists at all: only the two capped
+     * endpoints stamp it. Pass `null` to model an UNCAPPED caller (a scheduled run,
+     * Slack, GTM) — the budget must then stay completely out of the way. Defaults to
+     * "stamped at the moment the loop starts", the capped-caller case.
      */
-    turnStartMs?: number,
+    turnStartMs: number | null | undefined = undefined,
   ) {
     let call = 0;
     const toolsOfferedPerCall: boolean[] = [];
@@ -106,6 +111,9 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
 
     const startedAt = nowMs;
+    // `undefined` here means "the test did not choose" → behave like a capped caller and
+    // stamp now. `null` means "the caller genuinely has no deadline" → pass nothing.
+    const effectiveTurnStartMs = turnStartMs === undefined ? nowMs : (turnStartMs ?? undefined);
     const result = (await service.generateMarketingResponse(
       'Find me the 10 best X posts about agentic wallets, 10 more to reply to, 5 accounts to monitor, and the order to reply in.',
       [] as any,
@@ -121,7 +129,7 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       undefined, // screenshotUrl
       false, // isDelegatedAccess
       false, // persistIncrementally
-      turnStartMs,
+      effectiveTurnStartMs,
     )) as any;
     return {
       result,
@@ -252,7 +260,8 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
 
     const SETUP_LATENCY_MS = 180_000; // 3 min burned before the loop starts
 
-    const withoutStamp = await runRealLoop(keepSearching, 30_000);
+    // Stamped at the moment the loop starts (no setup latency).
+    const promptStamp = await runRealLoop(keepSearching, 30_000);
 
     // Same run, but the caller's cap started SETUP_LATENCY_MS ago.
     jest.clearAllMocks();
@@ -260,18 +269,53 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     installStandardMockDeps();
     const callerTurnStartMs = nowMs;
     nowMs += SETUP_LATENCY_MS;
-    const withStamp = await runRealLoop(keepSearching, 30_000, callerTurnStartMs);
+    const lateStamp = await runRealLoop(keepSearching, 30_000, callerTurnStartMs);
 
-    // Both deliver a partial answer, but the stamped run stops sooner because it knows
-    // it has 3 fewer minutes — and it finishes before the caller's REAL deadline.
-    expect(withStamp.result.truncatedByTimeBudget).toBe(true);
-    expect(withStamp.result.content).toMatch(/Partial results/);
-    expect(withStamp.endedAtMs).toBeLessThanOrEqual(callerTurnStartMs + CAP_MS);
-    expect(withStamp.finalSynthesisPerCall.length)
-      .toBeLessThan(withoutStamp.finalSynthesisPerCall.length);
-    // Without the stamp the loop would have run SETUP_LATENCY_MS past that deadline.
-    expect(callerTurnStartMs + SETUP_LATENCY_MS + withoutStamp.elapsedMs)
-      .toBeGreaterThan(callerTurnStartMs + CAP_MS);
+    // Both deliver a partial answer, but the late-stamped run stops sooner because it
+    // knows it has 3 fewer minutes — and it finishes before the caller's REAL deadline.
+    expect(lateStamp.result.truncatedByTimeBudget).toBe(true);
+    expect(lateStamp.result.content).toMatch(/Partial results/);
+    expect(lateStamp.endedAtMs).toBeLessThanOrEqual(callerTurnStartMs + CAP_MS);
+    expect(lateStamp.finalSynthesisPerCall.length)
+      .toBeLessThan(promptStamp.finalSynthesisPerCall.length);
+  });
+
+  it('stays out of the way entirely when the caller enforces NO deadline', async () => {
+    // Regression guard for the uncapped call paths. `withGenerationTimeout` wraps only
+    // the interactive and ishare endpoints; scheduled runs, Slack, GTM, admin replay and
+    // email all call this loop with no wall-clock cap at all. Deriving a cap from
+    // AGENT_MODE_GENERATION_TIMEOUT_MS regardless would invent a ceiling production does
+    // not have.
+    //
+    // The concrete casualty is session bd733cb4 — the 5/5/5 "LinkedIn Engagement Queue"
+    // scheduled run that ENG-907's own report holds up as the pattern to copy. Its first
+    // turn ran 683s (14:00:04 → 14:11:27) and only wrote its knowledge-base queue, the
+    // actual deliverable, at ~630s. A 600s-derived budget would have forced synthesis at
+    // ~520s and thrown that away, converting a top-scoring run into a truncated partial.
+    const TURN_MS = 683_000;
+    const CALLS = 12;
+    const { result, elapsedMs, finalSynthesisPerCall, executedTools } = await runRealLoop(
+      (call) =>
+        call < CALLS - 1
+          ? {
+              content: `Scanned batch ${call + 1}.`,
+              tool_calls: [
+                { id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` },
+              ],
+            }
+          : { content: 'Queue prepared: 10 items written to the knowledge base.' },
+      Math.floor(TURN_MS / CALLS),
+      null, // uncapped caller — a scheduled run
+    );
+
+    // It ran well past the 600s cap, exactly as it does in production today...
+    expect(elapsedMs).toBeGreaterThan(CAP_MS);
+    // ...and was never truncated, nudged, or flagged for continuation.
+    expect(result.truncatedByTimeBudget).toBeFalsy();
+    expect(finalSynthesisPerCall.some(Boolean)).toBe(false);
+    // Every tool call ran — including the late ones that carry the deliverable.
+    expect(executedTools).toHaveLength(CALLS - 1);
+    expect(result.content).toMatch(/Queue prepared/);
   });
 
   it('does NOT fire on a fast run that finishes well inside the budget (no false positive)', async () => {
