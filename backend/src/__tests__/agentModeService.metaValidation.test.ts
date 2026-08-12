@@ -189,6 +189,20 @@ describe('AgentModeService - Meta validation & error enrichment', () => {
       expect(result.message).toContain('campaign_id');
     });
 
+    it('rejects a malformed spend_cap on CAMPAIGN UPDATE before writing to Meta', async () => {
+      // UPDATE forwards params verbatim, so without this guard a fractional cap reaches
+      // Meta and comes back as an opaque "Invalid parameter".
+      const result = await callApi(service, 'CAMPAIGN', 'UPDATE', {
+        campaign_id: 'camp_1',
+        params: { spend_cap: 1000.5 },
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/^PARAM_VALIDATION_ERROR/);
+      expect(result.message).toMatch(/positive whole number of cents/i);
+      expect(metaService.updateCampaign).not.toHaveBeenCalled();
+    });
+
     it('returns PARAM_VALIDATION_ERROR for CAMPAIGN DELETE without campaign_id', async () => {
       const result = await callApi(service, 'CAMPAIGN', 'DELETE', {});
 

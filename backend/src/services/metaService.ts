@@ -305,7 +305,28 @@ export class MetaService {
     if (params.special_ad_categories !== undefined && !Array.isArray(params.special_ad_categories)) {
       throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
     }
+    MetaService.assertValidSpendCap(params.spend_cap);
     MetaService.assertNoUnappliedCampaignCreateParams(params);
+  }
+
+  /**
+   * `spend_cap` is a whole number of minor currency units, so anything else is a caller
+   * mistake we should catch rather than forward: a fraction (1000.5), a negative, a NaN from
+   * a bad parse, or a string. Meta would reject most of these, but as an opaque "Invalid
+   * parameter" — and on CREATE that rejection arrives AFTER the campaign question is settled,
+   * where a clear pre-flight message costs nothing. 0 is rejected here too, matching Meta,
+   * which refuses it explicitly ("Spend Cap Can't Be Zero", subcode 1885099): removing a cap
+   * is a different operation, not a cap of nothing.
+   */
+  public static assertValidSpendCap(value: unknown): void {
+    if (value === undefined || value === null) return;
+    if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+      throw new Error(
+        `Campaign "spend_cap" must be a positive whole number of cents (e.g. 300000 = $3,000) — got ${JSON.stringify(value)}. ` +
+        `It is NOT in dollars: multiply the amount the user asked for by 100. ` +
+        `To remove an existing cap, do not send 0 — Meta rejects that.`
+      );
+    }
   }
 
   /**
@@ -394,6 +415,7 @@ export class MetaService {
       throw new Error('Campaign "special_ad_categories" must be an array (e.g. ["NONE"]).');
     }
 
+    MetaService.assertValidSpendCap(params.spend_cap);
     MetaService.assertNoUnappliedCampaignCreateParams(params);
   }
 

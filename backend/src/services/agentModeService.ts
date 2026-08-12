@@ -17789,6 +17789,10 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           MetaService.validateCampaignParams('CREATE', params);
         } else if (action === 'UPDATE' && !campaign_id) {
           throw new Error('CAMPAIGN UPDATE requires "campaign_id".');
+        } else if (action === 'UPDATE') {
+          // UPDATE passes params through verbatim, so the spend-cap shape has to be checked
+          // here or a fractional/negative cap reaches Meta as an opaque "Invalid parameter".
+          MetaService.assertValidSpendCap(params?.spend_cap);
         } else if (action === 'DELETE' && !campaign_id) {
           throw new Error('CAMPAIGN DELETE requires "campaign_id".');
         }
