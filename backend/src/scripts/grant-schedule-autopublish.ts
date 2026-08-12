@@ -129,14 +129,16 @@ export async function backfillPublishConsent(opts: {
   confirmedBy: string;
   allowlist?: ConsentConfirmation[];
   listSchedules?: () => Promise<any[]>;
-  update?: (scheduleId: string, patch: any) => Promise<any>;
+  update?: (scheduleId: string, patch: any, expect?: Record<string, any>) => Promise<any>;
 }): Promise<BackfillResult> {
   // Not `(scheduleDb as any)` — the cast is what let this default point at a method
   // that did not exist. Every test injects `listSchedules`, so the only caller of the
   // default is the operator running the CLI, and they would have got a TypeError
   // before a single schedule was read. Keep it typed so the compiler holds the wiring.
   const listSchedules = opts.listSchedules ?? (() => scheduleDb.getAllSchedules());
-  const update = opts.update ?? ((id: string, patch: any) => scheduleDb.updateSchedule(id, patch));
+  const update =
+    opts.update ??
+    ((id: string, patch: any, expect?: Record<string, any>) => scheduleDb.updateSchedule(id, patch, expect));
   const allowlist = opts.allowlist ?? [];
 
   if (opts.apply && allowlist.length === 0) {
@@ -178,7 +180,7 @@ export async function backfillPublishConsent(opts: {
   }
 
   const eligible = new Map(candidates.map((c) => [c.scheduleId, c]));
-  const granted: Candidate[] = [];
+  const confirmed: Candidate[] = [];
   const rejected: BackfillResult['rejected'] = [];
   const seen = new Set<string>();
 
@@ -212,23 +214,66 @@ export async function backfillPublishConsent(opts: {
       continue;
     }
 
-    granted.push(candidate);
+    confirmed.push(candidate);
   }
 
+  // Not granted until the write actually lands: a schedule edited between the scan and
+  // the write is reported, not authorized.
+  let granted: Candidate[] = confirmed;
+
   if (opts.apply) {
-    for (const c of granted) {
+    granted = [];
+    for (const c of confirmed) {
+      const source = byId.get(c.scheduleId);
       const now = new Date().toISOString();
-      await update(c.scheduleId, {
-        autopublishAuthorized: true,
-        autopublishAuthorizedTools: c.tools,
-        autopublishAuthorizedAt: now,
-        // The owner, exactly as the consent endpoint records it — a migrated row must
-        // be indistinguishable from one where they ticked the box themselves. The
-        // operator who ran the migration is named in the run log, not here: this field
-        // answers "who authorized this", and the answer is never the operator.
-        autopublishAuthorizedBy: c.userId,
-        updatedAt: now,
-      });
+      try {
+        await update(
+          c.scheduleId,
+          {
+            autopublishAuthorized: true,
+            autopublishAuthorizedTools: c.tools,
+            autopublishAuthorizedAt: now,
+            // The owner, exactly as the consent endpoint records it — a migrated row must
+            // be indistinguishable from one where they ticked the box themselves. The
+            // operator who ran the migration is named in the run log, not here: this field
+            // answers "who authorized this", and the answer is never the operator.
+            autopublishAuthorizedBy: c.userId,
+            updatedAt: now,
+          },
+          // Everything this grant was DERIVED from, as it read a moment ago. The apply
+          // pass can run long — one write per schedule, sequentially — and the owner can
+          // be revoking, renaming or re-scoping throughout it. Writing unconditionally
+          // would record a decision against a schedule that no longer looks like the one
+          // the owner answered about: a re-scoped `requiredFunctionCalls` would leave the
+          // grant pointing at tools they never saw, and an approval hold set in the
+          // window would be silently overridden — the one thing this migration must
+          // never do. The interactive endpoint conditions its grant the same way.
+          // `undefined` compiles to attribute_not_exists, which is exactly the state
+          // eligibility required of `autopublishAuthorized`.
+          {
+            userId: source.userId,
+            status: source.status,
+            requiredFunctionCalls: source.requiredFunctionCalls,
+            requirePublishApproval: source.requirePublishApproval,
+            autopublishAuthorized: source.autopublishAuthorized,
+          },
+        );
+        granted.push(c);
+      } catch (writeError: any) {
+        if (
+          writeError?.code !== 'ConditionalCheckFailedException' &&
+          writeError?.name !== 'ConditionalCheckFailedException'
+        ) {
+          throw writeError;
+        }
+        // One moved schedule must not abort the run and leave the rest unmigrated.
+        // Report it and carry on; the operator re-surveys and re-asks that owner.
+        rejected.push({
+          scheduleId: c.scheduleId,
+          ownerUserId: c.userId,
+          reason: 'schedule changed after it was read — not granted; re-run the survey for this one',
+        });
+      }
     }
   }
 

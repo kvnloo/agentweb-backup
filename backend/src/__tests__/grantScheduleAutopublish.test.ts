@@ -230,6 +230,83 @@ describe("ENG-827 grant-schedule-autopublish — the allowlist decides", () => {
     expect(result.rejected[0].reason).toBe("duplicate allowlist entry");
   });
 
+  // =========================================================================
+  // The apply pass writes one schedule at a time and can run long, while owners
+  // keep editing. A grant DERIVED from the scan must not land against a schedule
+  // that has moved since — so the write carries the state it was derived from.
+  // =========================================================================
+  const conditionalCheckFailed = () =>
+    Object.assign(new Error("The conditional request failed"), {
+      code: "ConditionalCheckFailedException",
+    });
+
+  it("conditions the grant on everything it was derived from", async () => {
+    const update = jest.fn();
+    await run([schedule()], CONFIRMED, true, update);
+
+    expect(update).toHaveBeenCalledTimes(1);
+    const [, patch, expected] = update.mock.calls[0];
+    expect(patch).toMatchObject({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ["post_on_connected_account"],
+    });
+    // The tool scope the grant points at, the owner it is recorded against, and the
+    // two settings that made it eligible at all.
+    expect(expected).toEqual({
+      userId: "user-1",
+      status: "active",
+      requiredFunctionCalls: ["post_on_connected_account"],
+      // Absent at scan time, and `undefined` compiles to attribute_not_exists — so an
+      // approval hold or a consent decision made in the window fails the write.
+      requirePublishApproval: undefined,
+      autopublishAuthorized: undefined,
+    });
+  });
+
+  it("does not report a grant that the condition rejected", async () => {
+    // The owner re-scoped or revoked between the scan and the write. Nothing was
+    // written, so nothing may be reported as granted — the operator must be able to
+    // trust this output when deciding it is safe to deploy.
+    const update = jest.fn().mockRejectedValue(conditionalCheckFailed());
+    const result = await run([schedule()], CONFIRMED, true, update);
+
+    expect(result.granted).toEqual([]);
+    expect(result.rejected).toEqual([
+      {
+        scheduleId: "sched-1",
+        ownerUserId: "user-1",
+        reason: expect.stringMatching(/changed after it was read/),
+      },
+    ]);
+  });
+
+  it("carries on past a moved schedule instead of abandoning the rest", async () => {
+    const neighbour = schedule({ scheduleId: "sched-2", userId: "user-2", scheduleName: "X Morning Post" });
+    const update = jest
+      .fn()
+      .mockRejectedValueOnce(conditionalCheckFailed())
+      .mockResolvedValue({});
+
+    const result = await run(
+      [schedule(), neighbour],
+      [...CONFIRMED, { scheduleId: "sched-2", ownerUserId: "user-2", note: "confirmed by email" }],
+      true,
+      update,
+    );
+
+    // One moved schedule must not leave the other 24 unmigrated on deploy day.
+    expect(update).toHaveBeenCalledTimes(2);
+    expect(result.granted.map((g) => g.scheduleId)).toEqual(["sched-2"]);
+    expect(result.rejected.map((r) => r.scheduleId)).toEqual(["sched-1"]);
+  });
+
+  it("still surfaces a real write failure rather than logging it as a rejection", async () => {
+    // A throttle or a credentials problem is not "the owner changed their mind", and
+    // swallowing it would report a migration as done when most of it never ran.
+    const update = jest.fn().mockRejectedValue(new Error("ProvisionedThroughputExceededException"));
+    await expect(run([schedule()], CONFIRMED, true, update)).rejects.toThrow(/Throughput/i);
+  });
+
   it("writes nothing on a dry run against a real allowlist", async () => {
     const update = jest.fn();
     const result = await run([schedule()], CONFIRMED, false, update);
