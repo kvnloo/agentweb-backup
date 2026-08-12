@@ -9,14 +9,8 @@
 import fs from 'fs';
 import AWS from 'aws-sdk';
 
-// Configure credentials before dynamically loading service modules, several of
-// which construct DynamoDB clients at import time. Production uses environment
-// or instance-role credentials; local dry-runs may use the standard AWS profile.
-if (!process.env.AWS_ACCESS_KEY_ID || !process.env.AWS_SECRET_ACCESS_KEY) {
-  AWS.config.credentials = new AWS.SharedIniFileCredentials({
-    profile: process.env.AWS_PROFILE || 'default',
-  });
-}
+// Keep the SDK's default provider chain intact: environment credentials,
+// shared profiles, workload identity, and instance roles remain available.
 AWS.config.update({ region: process.env.AWS_REGION || 'us-west-2' });
 
 const apply = process.argv.includes('--apply');

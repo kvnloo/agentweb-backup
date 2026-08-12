@@ -10,4 +10,13 @@ describe('LLM usage rollout scripts', () => {
     expect(source).not.toMatch(/\.scan\s*\(/);
     expect(source).toMatch(/--user-id|--billing-user-id/);
   });
+
+  it('preserves the AWS default credential chain for instance-role production hosts', () => {
+    const source = fs.readFileSync(
+      path.resolve(__dirname, '../scripts/resetLlmUsageForPolicyRollout.ts'),
+      'utf8',
+    );
+    expect(source).not.toContain('SharedIniFileCredentials');
+    expect(source).not.toMatch(/AWS\.config\.credentials\s*=/);
+  });
 });
