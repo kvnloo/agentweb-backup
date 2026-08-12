@@ -18275,7 +18275,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
         return {
           success: false,
           message: validationError.message,
-          error: 'PARAM_VALIDATION_ERROR',
+          // The code alone is useless to the model: a success:false result is rewritten at
+          // the dispatch boundary into ONE reason string taken from `error` before `message`
+          // (utils/toolResultError), so the explanation of WHICH param is wrong and where it
+          // belongs — the entire value of rejecting instead of silently dropping — was being
+          // dropped on the floor. Keep the code as the prefix so callers still match on it.
+          error: `PARAM_VALIDATION_ERROR: ${validationError.message}`,
           hint: 'Fix the listed parameters and retry.'
         } as any;
       }
@@ -18301,7 +18306,8 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       return {
         success: false,
         message: validationError.message,
-        error: 'PARAM_VALIDATION_ERROR',
+        // Same reason as the pre-gate site above: `error` is what the model actually reads.
+        error: `PARAM_VALIDATION_ERROR: ${validationError.message}`,
         hint: 'Fix the listed parameters and retry.'
       } as any;
     }
