@@ -15260,6 +15260,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
     if (!isMetaAdsScopeRefusal(error)) return;
 
     if (connection?.account_id && connection?.platform) {
+      // Is this the FIRST time we are learning it? Read before the write, because
+      // the write is what makes it no longer new. Only the transition notifies —
+      // after it, the pre-flight gate short-circuits every later run anyway.
+      const alreadyRecorded = !!connection.config?.ads_scope_revoked_at;
+      let persisted = false;
+
       try {
         const previous: unknown = connection.config?.granted_scopes;
         const retained = (Array.isArray(previous) ? previous : [])
@@ -15273,10 +15279,32 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           granted_scopes: retained,
           ads_scope_revoked_at: new Date().toISOString(),
         });
+        persisted = true;
       } catch (persistError: any) {
         console.warn(
           `[AgentMode] ENG-629: could not persist missing Meta ads scope for user ${userId}: ${persistError?.message ?? persistError}`
         );
+      }
+
+      // Tell the owner. Reconnecting is work only they can do, and this detection
+      // happens inside an unattended run — without this, a scheduled report just
+      // keeps returning nothing and nobody is told why (ENG-1158). Gated on the
+      // persist succeeding so a failed write leaves the next run free to alert
+      // instead of the notice being spent on an episode we never recorded.
+      if (persisted && !alreadyRecorded) {
+        try {
+          const { notifyMetaAdsScopeLost } = await import('./metaAdsScopeAlertService');
+          await notifyMetaAdsScopeLost({
+            ownerUserId: userId,
+            accountId: connection.account_id,
+            accountName: (connection as any).account_name,
+          });
+        } catch (alertError: any) {
+          // Best-effort: the actionable error below is what the caller must see.
+          console.warn(
+            `[AgentMode] ENG-1158: could not alert owner ${userId} about the missing Meta ads scope: ${alertError?.message ?? alertError}`
+          );
+        }
       }
     }
 
