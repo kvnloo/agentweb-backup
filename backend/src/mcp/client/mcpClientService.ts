@@ -240,6 +240,10 @@ export class McpClientService {
   // Servers that have {{...}} secret placeholders and need per-user resolution
   private serversWithSecretPlaceholders: Set<string> = new Set();
 
+  // Generated Playwright --config / stealth-script files, by pool key, so they can be
+  // deleted along with the pool that owns them.
+  private playwrightConfigFiles: Map<string, Set<string>> = new Map();
+
   // Session cleanup timeout (default: 1 hour)
   private readonly SESSION_TIMEOUT_MS = parseInt(process.env.MCP_CLIENT_SESSION_TIMEOUT_MS || '3600000', 10);
   private cleanupInterval?: NodeJS.Timeout;
@@ -262,6 +266,11 @@ export class McpClientService {
 
   // Playwright browser pre-install: shared Promise so concurrent sessions wait on the same install
   private static readonly PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp';
+  // Generated --config / stealth-script files for Playwright MCP processes.
+  private static readonly PLAYWRIGHT_CONFIG_DIR = '/tmp/playwright-mcp-configs';
+  // Orphans older than this (left by a hard kill) are swept at startup. Deliberately not
+  // "anything not ours": another process may be mid-launch with a config we didn't write.
+  private static readonly PLAYWRIGHT_CONFIG_MAX_AGE_MS = 24 * 60 * 60 * 1000;
   private static playwrightBrowsersInstall: Promise<void> | null = null;
 
   constructor() {
@@ -370,6 +379,9 @@ export class McpClientService {
     if (!this.cleanupInterval) {
       this.startSessionCleanup();
     }
+    // Clear Playwright configs orphaned by a previous process that died without releasing
+    // its pools; the per-pool cleanup can't reach those.
+    this.sweepStalePlaywrightConfigs();
     try {
       // 1. Load Internal Config (from code)
       // Skip servers marked isInternal: true — they connect back to ourselves
@@ -482,6 +494,65 @@ export class McpClientService {
     for (const sessionId of staleSessionIds) {
       console.log(`[MCP-CLEANUP] Removing stale session client pool: ${sessionId.substring(0, 8)}`);
       await this.releasePool(sessionId);
+    }
+  }
+
+  /**
+   * Remember the generated Playwright config files belonging to a pool so releasing the
+   * pool can delete them. Startup/shared clients pass no pool key — those are keyed by
+   * server name, are created once, and live as long as the process does.
+   */
+  private trackPlaywrightConfigFiles(poolKey: string | undefined, files: string[]): void {
+    if (!poolKey) return;
+    const tracked = this.playwrightConfigFiles.get(poolKey) || new Set<string>();
+    files.forEach(file => tracked.add(file));
+    this.playwrightConfigFiles.set(poolKey, tracked);
+  }
+
+  /** Best-effort delete of a pool's generated Playwright config files. */
+  private removePlaywrightConfigFiles(poolKey: string): void {
+    const tracked = this.playwrightConfigFiles.get(poolKey);
+    if (!tracked) return;
+    this.playwrightConfigFiles.delete(poolKey);
+    for (const file of tracked) {
+      try {
+        fs.unlinkSync(file);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT') {
+          console.warn(`MCP: Could not remove Playwright config file ${file}:`, (error as Error).message);
+        }
+      }
+    }
+  }
+
+  /**
+   * Sweep Playwright config files old enough that no live process can still be reading them.
+   * Covers the case our per-pool cleanup cannot: a hard kill (SIGKILL/OOM) that leaves the
+   * files with no pool to release them.
+   */
+  private sweepStalePlaywrightConfigs(): void {
+    const dir = McpClientService.PLAYWRIGHT_CONFIG_DIR;
+    try {
+      if (!fs.existsSync(dir)) return;
+      const cutoff = Date.now() - McpClientService.PLAYWRIGHT_CONFIG_MAX_AGE_MS;
+      let removed = 0;
+      for (const entry of fs.readdirSync(dir)) {
+        const file = path.join(dir, entry);
+        try {
+          if (fs.statSync(file).mtimeMs < cutoff) {
+            fs.unlinkSync(file);
+            removed++;
+          }
+        } catch {
+          // Raced with another process cleaning the same file — nothing to do.
+        }
+      }
+      if (removed > 0) {
+        console.log(`MCP: Swept ${removed} stale Playwright MCP config file(s) from ${dir}`);
+      }
+    } catch (error) {
+      console.warn('MCP: Failed to sweep stale Playwright MCP config files:', (error as Error).message);
     }
   }
 
@@ -922,6 +993,10 @@ export class McpClientService {
     await Promise.allSettled(sessionPool.pendingClients.values());
     sessionPool.pendingClients.clear();
     sessionPool.clients.clear();
+
+    // Only once every client is closed — the subprocess reads its --config at launch,
+    // but deleting underneath a still-starting one would be a race.
+    this.removePlaywrightConfigFiles(poolKey);
   }
 
   /**
@@ -1124,7 +1199,7 @@ export class McpClientService {
       // The --launch-options CLI flag was removed in @playwright/mcp@0.0.68+, so we write
       // a config file and pass --config instead.
       if (!resolvedArgs.some(arg => arg.startsWith('--config'))) {
-        const configDir = '/tmp/playwright-mcp-configs';
+        const configDir = McpClientService.PLAYWRIGHT_CONFIG_DIR;
         if (!fs.existsSync(configDir)) {
           fs.mkdirSync(configDir, { recursive: true });
         }
@@ -1185,6 +1260,9 @@ export class McpClientService {
         };
         fs.writeFileSync(configPath, JSON.stringify(config));
         resolvedArgs.push('--config', configPath);
+        // Remembered so the pair dies with its pool — since ENG-1118 these are written per
+        // chat session, not per user, so leaving them behind grows /tmp without bound.
+        this.trackPlaywrightConfigFiles(poolKey, [configPath, stealthScriptPath]);
       }
       console.log(`MCP: Auto-configured Playwright MCP with --headless --no-sandbox --isolated and --config for ${name}`);
     }
