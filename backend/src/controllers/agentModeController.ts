@@ -22,7 +22,8 @@ import { isContextLimitError, isSessionLimitError, isTransientLLMError, isWorker
 import { findInFlightJobForSession, claimCompletion, markAwaitingReconnect } from '../services/durableLandingService';
 import { formatAttachmentUrls } from '../utils/attachmentFormatting';
 import { isCronEnabled } from '../utils/instanceState';
-import { resolvePublishAuthorized } from '../utils/schedulePublishApproval';
+import { resolveSchedulePublishAuthorization, getRequiredPublishTools, filterRequiredFunctionsToAuthorizedScope, narrowPublishAuthorization, SchedulePublishAuthorization } from '../utils/schedulePublishAuthorization';
+import { resolvePublishAuthorized, extractScheduleId } from '../utils/schedulePublishApproval';
 import { toolCallSucceeded } from '../utils/toolCallOutcome';
 import { trackScheduledRun } from '../utils/scheduledRunTracker';
 import {
@@ -90,6 +91,123 @@ async function rejectWhenScheduledChatsDisabled(userId: string, res: Response): 
   if ((await userCanUseScheduledChats(userId)) === true) return false;
   res.status(403).json(SCHEDULED_CHATS_NOT_INCLUDED_ERROR);
   return true;
+}
+
+/** Raised when a schedule edit could not be committed together with its consent narrowing. */
+class ScheduleConsentRaceError extends Error {}
+
+const MAX_CONSENT_NARROWING_ATTEMPTS = 3;
+
+/**
+ * ENG-827 — commit a schedule edit and the consent narrowing it implies as ONE write.
+ *
+ * Consent is recorded against a SPECIFIC set of publishing tools, which is the whole
+ * reason a grant carries a scope. An edit that drops one of those tools must not leave
+ * publishing authority attached to a tool the owner has removed.
+ *
+ * The two cannot be separated, in either direction, and both failure modes are real:
+ *
+ *   - Fold them into one UNCONDITIONAL write and a grant the owner made in between is
+ *     silently clobbered by a decision derived from a stale read — they got their 200
+ *     and lost their consent.
+ *   - Split them and acknowledge the edit first, and any failure of the follow-up
+ *     leaves the acknowledged edit sitting next to a grant scoped to the tool it just
+ *     removed.
+ *
+ * So: one write, carrying the edit AND the narrowing, conditioned on the consent it was
+ * derived from. If that condition fails, consent moved under us — re-read, re-derive
+ * against what is actually stored now, and try again. The retry is what makes this
+ * converge instead of having to choose which of the two failures to accept.
+ *
+ * Nothing partial is ever acknowledged. If the attempts are exhausted the caller reports
+ * a conflict and the owner retries; the schedule is left exactly as it was.
+ *
+ * Narrowing only, and only for a grant that is actually STORED. A legacy row carries no
+ * consent field, so its scope is re-derived from the required tools on every read and
+ * follows the edit by itself; stamping `false` on one would record a refusal the owner
+ * never gave. `true` is never written from here — granting is the consent endpoint's job
+ * and nobody else's, so a rename racing a revocation can never put a grant back.
+ */
+async function applyScheduleEditWithConsentNarrowing(
+  scheduleId: string,
+  updates: any,
+  firstRead: any
+): Promise<void> {
+  // An edit that does not move the required tools cannot move the scope: plain write.
+  if (updates.requiredFunctionCalls === undefined) {
+    await scheduleDb.updateSchedule(scheduleId, updates);
+    return;
+  }
+
+  let snapshot = firstRead;
+
+  for (let attempt = 1; attempt <= MAX_CONSENT_NARROWING_ATTEMPTS; attempt++) {
+    const consentUpdates: any = {};
+    let expectation: Record<string, any> | undefined;
+
+    if (snapshot?.autopublishAuthorized === true) {
+      const stored = resolveSchedulePublishAuthorization(snapshot);
+      if (stored.authorized) {
+        const stillRequired = getRequiredPublishTools(updates.requiredFunctionCalls);
+        const narrowed = narrowPublishAuthorization(stored, {
+          authorized: stillRequired.length > 0,
+          tools: stillRequired,
+        });
+        if (!narrowed.authorized || narrowed.tools.length !== stored.tools.length) {
+          consentUpdates.autopublishAuthorizedTools = narrowed.tools;
+          if (!narrowed.authorized) {
+            consentUpdates.autopublishAuthorized = false;
+            consentUpdates.autopublishAuthorizedAt = null;
+            consentUpdates.autopublishAuthorizedBy = null;
+          }
+          // Bind the write to BOTH halves of what it was derived from: the consent, and
+          // the tool list that consent was granted against. Asserting only the consent
+          // leaves a concurrent edit free to move the required tools underneath this
+          // one, so the grant would be narrowed — or dropped — against a list that is
+          // no longer the schedule's. A failure here is not fatal: the loop re-reads and
+          // re-derives against whatever actually landed. Same binding the grant endpoint
+          // uses, so the two paths cannot disagree about what they are asserting.
+          expectation = {
+            autopublishAuthorized: true,
+            autopublishAuthorizedTools: snapshot.autopublishAuthorizedTools,
+            requiredFunctionCalls: snapshot.requiredFunctionCalls,
+          };
+          console.log(
+            `AgentMode: ENG-827 publish consent narrowing on edit for schedule ${scheduleId}: ` +
+            `[${stored.tools.join(', ')}] -> [${narrowed.tools.join(', ')}]` +
+            `${narrowed.authorized ? '' : ' (revoked — no approved publishing tool remains)'}.`
+          );
+        }
+      }
+    }
+
+    try {
+      if (expectation) {
+        await scheduleDb.updateSchedule(scheduleId, { ...updates, ...consentUpdates }, expectation);
+      } else {
+        // Nothing to narrow — no condition to assert, and no reason to make an ordinary
+        // edit fail because somebody touched consent at the same moment.
+        await scheduleDb.updateSchedule(scheduleId, updates);
+      }
+      return;
+    } catch (writeError: any) {
+      const conditionFailed =
+        writeError?.code === 'ConditionalCheckFailedException' ||
+        writeError?.name === 'ConditionalCheckFailedException';
+      if (!conditionFailed) throw writeError;
+
+      console.warn(
+        `AgentMode: ENG-827 schedule ${scheduleId} edit lost its consent condition ` +
+        `(attempt ${attempt}/${MAX_CONSENT_NARROWING_ATTEMPTS}); re-reading consent and retrying.`
+      );
+      snapshot = await scheduleDb.getScheduleById(scheduleId);
+      if (!snapshot) throw new ScheduleConsentRaceError('The schedule no longer exists.');
+    }
+  }
+
+  throw new ScheduleConsentRaceError(
+    `Publish consent for schedule ${scheduleId} changed on every attempt to apply this edit.`
+  );
 }
 
 // ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
@@ -1996,6 +2114,25 @@ export async function runVerifiedChat(
     // this zone so a run near a midnight boundary is judged on the owner's calendar
     // day, not UTC. Undefined falls back to UTC.
     scheduleTimezone?: string;
+    // ENG-827: the publish authorization this run was ADMITTED under, resolved ONCE
+    // by the caller from the SAME schedule snapshot it used to build
+    // `requiredFunctions`. Threaded into every turn's system prompt so the prompt
+    // states the identical decision the required-function checker is enforcing,
+    // instead of independently re-reading the schedule per attempt and risking a
+    // split verdict (Greptile P1). Undefined for callers with no schedule, which
+    // fall back to the per-turn lookup inside generateSessionResponse.
+    publishAuthorization?: SchedulePublishAuthorization;
+    /**
+     * ENG-827: re-reads the schedule's CURRENT publish authorization. Called at the
+     * top of each attempt and combined with the admitted value via
+     * narrowPublishAuthorization, which can only ever remove authorization. This is
+     * what makes revoking consent take effect on a run that is already in flight —
+     * without it the owner's kill switch does nothing until the next run, which for
+     * a multi-minute publishing run is exactly when they need it. Resolution stays
+     * single-source: one refreshed value narrows the prompt directive and the
+     * required-function list together, so they still cannot disagree.
+     */
+    refreshPublishAuthorization?: () => Promise<SchedulePublishAuthorization | null>;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -2003,15 +2140,45 @@ export async function runVerifiedChat(
     userId,
     startingMessage,
     keywords = [],
-    requiredFunctions = [],
     maxAttempts = 20,
     attachments = [],
     completionGate = false,
     completionGateMaxContinuations = 2,
     fullAutonomy = false,
     parkNotifiable = false,
+    publishAuthorization,
+    refreshPublishAuthorization,
     publishAuthorized
   } = params;
+
+  // ENG-827: both of these NARROW mid-run when the owner revokes consent, and are
+  // always narrowed together from one value so the checker can never demand a tool
+  // the prompt forbids. Not `const`, because revocation must bite during a live run
+  // — a snapshot taken at admission would publish minutes after the owner said stop.
+  let livePublishAuthorization = publishAuthorization;
+  let requiredFunctions = params.requiredFunctions ?? [];
+  /** Set when consent narrows mid-run; prepended to every subsequent turn message. */
+  let publishRevocationNotice: string | null = null;
+  /**
+   * ENG-827: the system prompt — and with it the PUBLISH AUTHORIZATION directive — is
+   * assembled and persisted ONCE, on the session's first message. Narrowing
+   * `livePublishAuthorization` therefore reaches the required-function checker but NOT
+   * the model, which would keep reading its admission-time "you are authorized to
+   * publish" instruction for the rest of the run: revocation would stop the nudging
+   * without stopping the publishing. Carry the withdrawal in the turn message instead,
+   * where it lands in context immediately and persists in the transcript for every
+   * later turn. The prohibition wording is single-sourced from the same directive
+   * builder the system prompt uses.
+   *
+   * This helper is the ONLY way a turn message reaches the model in this loop — both
+   * `generateSessionResponse` call sites below go through it. That is deliberate: the
+   * completion-gate CONTINUATION turn built its own message and called the model
+   * directly, so a revocation that landed while a run was mid-continuation narrowed
+   * the checker but left the model still reading "you are authorized to publish" —
+   * i.e. it could publish after the owner had already said stop.
+   */
+  const withPublishRevocationNotice = (message: string): string =>
+    publishRevocationNotice ? `${publishRevocationNotice}\n\n${message}` : message;
 
   // ENG-396: bound how many times a single full-autonomy run may auto-take a
   // question, so a model that keeps re-asking cannot loop until maxAttempts. Once
@@ -2259,6 +2426,56 @@ export async function runVerifiedChat(
   while (attempt < maxAttempts) {
     attempt++;
 
+    // ENG-827: re-check consent before every turn so a revocation lands mid-run
+    // instead of a run publishing from an admission-time snapshot minutes after the
+    // owner switched it off. narrowPublishAuthorization only ever REMOVES rights, so
+    // this can neither re-authorize a run nor widen its scope. The prompt directive
+    // and the checker's required list are narrowed from that one value in the same
+    // step — the invariant that stops the checker nudging for a tool the prompt
+    // forbids (the ~21-turn loop this ticket is about) holds turn by turn, not just
+    // at admission. A failed re-read keeps the admitted value rather than downgrading
+    // an authorized run on a throttled query.
+    if (refreshPublishAuthorization && livePublishAuthorization) {
+      try {
+        // The CALLER applies narrowPublishAuthorization and owns the running value,
+        // so the rule lives in exactly one place and the caller still holds the final
+        // effective authorization to report the run against. Here we only consume it.
+        const narrowed = (await refreshPublishAuthorization()) ?? livePublishAuthorization;
+        if (narrowed.tools.length !== livePublishAuthorization.tools.length) {
+          // Sticky: once consent is withdrawn it must stay withdrawn for the rest of
+          // the run, and narrowing is monotonic so this can never be un-set.
+          publishRevocationNotice =
+            '[PUBLISH AUTHORIZATION WITHDRAWN] The owner has revoked this schedule\'s ' +
+            'permission to publish without review while this run was in progress. Any ' +
+            'authorization to publish stated earlier in this conversation is now VOID' +
+            (narrowed.tools.length > 0
+              ? ` except for: ${narrowed.tools.join(', ')}.`
+              : ' — you are no longer authorized to publish with any tool.') +
+            '\n' +
+            getUnattendedExecutionDirective('scheduled', false, narrowed.authorized ? 'authorized' : 'withheld', narrowed.tools);
+          console.log(
+            `AgentMode: publish consent narrowed mid-run for session ${sessionId} — ` +
+            `authorized tools [${livePublishAuthorization.tools.join(', ') || 'none'}] -> ` +
+            `[${narrowed.tools.join(', ') || 'none'}]`
+          );
+          requiredFunctions = requiredFunctions.filter(rf =>
+            filterRequiredFunctionsToAuthorizedScope([rf.functionName], narrowed).length > 0
+          );
+        }
+        livePublishAuthorization = narrowed;
+      } catch (err) {
+        // The supplied refresher absorbs its own read failures and fails closed, so
+        // reaching here means the callback itself is broken. Withhold rather than
+        // publish while blind — consistent with every other ambiguous case.
+        console.error('AgentMode: publish-consent refresher threw; withholding publish authorization:', err);
+        const withheld = narrowPublishAuthorization(livePublishAuthorization, null);
+        livePublishAuthorization = withheld;
+        requiredFunctions = requiredFunctions.filter(rf =>
+          filterRequiredFunctionsToAuthorizedScope([rf.functionName], withheld).length > 0
+        );
+      }
+    }
+
     try {
       // Prepare user message for this attempt
       let userMessage = startingMessage;
@@ -2308,10 +2525,13 @@ export async function runVerifiedChat(
         completionGateReason = 'unfinished';
         const continuationResponse = await generateSessionResponse(
           sessionId,
-          userMessage,
+          withPublishRevocationNotice(userMessage),
           userId,
           defaultModel,
-          []
+          [],
+          undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
+          livePublishAuthorization
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -2435,10 +2655,13 @@ export async function runVerifiedChat(
       console.log(`AgentMode runVerifiedChat: Attempt ${attempt}, passing ${attachmentsForThisAttempt.length} attachments to generateSessionResponse`);
       const response = await generateSessionResponse(
         sessionId,
-        userMessage,
+        withPublishRevocationNotice(userMessage),
         userId,
         defaultModel,
-        attachmentsForThisAttempt
+        attachmentsForThisAttempt,
+        undefined, undefined, undefined, undefined, undefined, undefined,
+        undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
+        livePublishAuthorization
       );
 
       if (!hasAssistantOutput(response)) {
@@ -3456,10 +3679,63 @@ export async function runScheduledChat(
     const expectedKeywords = schedule.keywords || [];
     const functionCallMinCalls = schedule.functionCallMinCalls || {};
 
-    const requiredFunctions = expectedFunctionCalls.map((funcName: string) => ({
-      functionName: funcName,
-      minCount: functionCallMinCalls[funcName] || 1
-    }));
+    // ENG-827: resolve this run's publish authorization exactly ONCE, here, from the
+    // schedule snapshot this run was admitted under. The SAME object drives both
+    // consumers — the deterministic required-function checker below, and (threaded
+    // through runVerifiedChat) the PUBLISH AUTHORIZATION directive in every turn's
+    // system prompt. Deriving them from one value is what makes the invariant
+    // structural: the checker can never nudge for a publish tool the prompt told the
+    // model not to call, which is the contradiction that looped the reported runs ~21
+    // times. Two independent reads could disagree — that was Greptile's P1.
+    //
+    // Filter on the authorized TOOL SET, not the boolean. Consent is bound to the
+    // scope the owner approved, so a run can be authorized for one publish tool
+    // while the schedule also requires another that is outside that scope. Keying
+    // the filter on `authorized` alone would keep BOTH — and the prompt names only
+    // the approved one and forbids the rest, so the checker would nudge for a tool
+    // the prompt prohibits: the original contradiction, reintroduced by partial
+    // scope. `tools` is empty when unauthorized, so this still drops every publish
+    // requirement in that case.
+    let publishAuthorization = resolveSchedulePublishAuthorization(schedule);
+    // ENG-827: stamp the admitted authorization on the session before the first turn.
+    //
+    // The dispatch-time guard re-reads the schedule so a revocation stops an in-flight
+    // publish, but a re-read on its own would also let a grant made DURING the run
+    // widen it — publishing content a draft-only run had already generated under a
+    // prompt telling it not to. The guard intersects live state with this stamp
+    // instead, so a run keeps the permissions it began with and consent can only ever
+    // narrow. Only an authorized run is stamped: the guard reads an absent stamp as
+    // not authorized, which is exactly right for every draft-only run and costs a
+    // schedule that publishes nothing no extra write at all. A legacy schedule that
+    // resolves authorized by the shipped opt-out default IS stamped, so the write-time
+    // guard has a scope to intersect against rather than refusing it for want of one.
+    //
+    // If the stamp cannot be written we downgrade THIS value rather than carry on,
+    // because it is the one the prompt and the required-function filter below are both
+    // derived from. Proceeding would tell the model to publish and demand the call
+    // while the guard refused it — the exact prompt-versus-checker contradiction that
+    // produced the reported nudge loop. Downgrading costs a draft; the alternative
+    // costs a burned run.
+    if (publishAuthorization.authorized) {
+      try {
+        await chatbotDb.updateSessionPublishAdmission(sessionId, publishAuthorization);
+      } catch (admissionWriteError) {
+        console.error(
+          `AgentMode: could not record the publish admission for session ${sessionId} on schedule ` +
+          `${schedule.scheduleId}; running draft-only (fail-closed):`, admissionWriteError
+        );
+        publishAuthorization = narrowPublishAuthorization(publishAuthorization, null);
+      }
+    }
+    // ENG-827: the authorization this run is CURRENTLY operating under. Starts at the
+    // admitted value and is narrowed — never widened — by each mid-run re-check, so it
+    // also ends up holding the final state the run's record must be reported against.
+    let effectivePublishAuthorization = publishAuthorization;
+    const requiredFunctions = filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, publishAuthorization)
+      .map((funcName: string) => ({
+        functionName: funcName,
+        minCount: functionCallMinCalls[funcName] || 1
+      }));
 
     // On a resume, the original task prompt is already the first message of the
     // session being continued; re-sending it would make the model start over. Send
@@ -3503,6 +3779,31 @@ export async function runScheduledChat(
       // option on a blocking question instead of parking (waives the human gate on
       // irreversible decisions; default off).
       fullAutonomy: schedule.fullAutonomy === true,
+      // ENG-827: same object that filtered `requiredFunctions` above, so the prompt
+      // and the checker state one decision rather than two independent reads.
+      publishAuthorization,
+      // ENG-827: consent can be withdrawn while this run is still executing, and a
+      // run lasts minutes. Re-read it each turn so revoking actually stops an
+      // in-flight publish instead of taking effect only on the NEXT run. Narrowing
+      // is monotonic, so this can never grant rights the admission snapshot lacked.
+      refreshPublishAuthorization: async () => {
+        // Never throws: a failed read resolves to null, which narrows to UNAUTHORIZED.
+        // Absorbing the failure HERE rather than in runVerifiedChat's catch is what
+        // keeps the two values in step — if this threw, the loop would withhold while
+        // `effectivePublishAuthorization` stayed authorized, and the run record would
+        // once again report requirements the run was never held to.
+        let latest: SchedulePublishAuthorization | null = null;
+        try {
+          latest = resolveSchedulePublishAuthorization(await scheduleDb.getScheduleById(schedule.scheduleId));
+        } catch (err) {
+          console.error(
+            `AgentMode: publish-consent re-check failed for schedule ${schedule.scheduleId}; ` +
+            'withholding publish authorization for the rest of this run (fail-closed):', err
+          );
+        }
+        effectivePublishAuthorization = narrowPublishAuthorization(effectivePublishAuthorization, latest);
+        return effectivePublishAuthorization;
+      },
       // ENG-803: re-read at the moment the marker is evaluated, so the continuation
       // classifier uses the SAME live decision as the prompt builder and the dispatch
       // guard. A snapshot taken here would go stale the moment the owner toggles the
@@ -3622,14 +3923,28 @@ export async function runScheduledChat(
       actualFunctionCallCounts[call] = (actualFunctionCallCounts[call] || 0) + 1;
     });
 
-    expectedFunctionCalls.forEach((funcCall: string) => {
-      const actualCount = actualFunctionCallCounts[funcCall] || 0;
-      const requiredCount = functionCallMinCalls[funcCall] || 1;
-      finalFunctionCallDetails[funcCall] = {
-        actual: actualCount,
-        required: requiredCount
-      };
-    });
+    // ENG-827: report the requirements this run was actually HELD TO, which is the
+    // publish-scope-filtered list the checker used above — not the raw schedule
+    // config. Reading the unfiltered config here persisted a self-contradicting
+    // record on an unauthorized run: `post_on_connected_account {required: 1,
+    // actual: 0}` sitting next to an empty functionCallMisses and passed: true.
+    // Nothing downstream can tell that apart from a genuine silent miss, which is
+    // the false-failure shape ENG-479/ENG-764 had to unpick. One filtered source
+    // feeds the checker, the prompt and this record.
+    // ENG-827: report against `effectivePublishAuthorization` — the authorization the
+    // run FINISHED under, which differs from the admitted one when the owner revoked
+    // consent mid-run. Reading the raw schedule config here instead persisted a
+    // self-contradicting record: post_on_connected_account {required: 1, actual: 0}
+    // next to an empty functionCallMisses on a passing run. Nothing downstream can
+    // tell that apart from a genuine silent miss — the false-failure shape ENG-479 /
+    // ENG-764 had to unpick.
+    filterRequiredFunctionsToAuthorizedScope(expectedFunctionCalls, effectivePublishAuthorization)
+      .forEach((functionName: string) => {
+        finalFunctionCallDetails[functionName] = {
+          actual: actualFunctionCallCounts[functionName] || 0,
+          required: functionCallMinCalls[functionName] || 1
+        };
+      });
 
     // ENG-635: a run that met its requirements but still deferred to an absent human
     // (deferredUnresolved) produced no real deliverable — record it as a failure so it
@@ -4596,7 +4911,13 @@ export async function generateSessionResponse(
   // does first (session/message reads, the title LLM call, the fork IPC hop, the memory
   // embedding backfill) would otherwise be silently subtracted from the synthesis
   // reserve. Omitted by callers that run without a whole-turn cap.
-  turnStartMs?: number
+  turnStartMs?: number,
+  // ENG-827: publish authorization already resolved by the caller (runVerifiedChat,
+  // from runScheduledChat's single schedule snapshot). When supplied it is used
+  // verbatim, so the prompt and the required-function checker can never disagree.
+  // When absent — the interactive route, or a resumed run entered directly — fall
+  // back to reading the schedule for this turn.
+  publishAuthorizationOverride?: SchedulePublishAuthorization
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -4715,9 +5036,14 @@ export async function generateSessionResponse(
 
         // For scheduled chat sessions, inject schedule context so Emma can reference/update the schedule
         if (session.sessionType === 'scheduled' && session.pageIdentifier) {
-          const scheduleIdMatch = session.pageIdentifier.match(/scheduleId:([a-f0-9-]+)/);
+          // ANCHORED parser (ENG-803's shared helper): the schedule NAME precedes the
+          // authoritative id in `"<name>|scheduleId:<id>"`, so an unanchored match lets
+          // a schedule named `Evil scheduleId:deadbeef` select a DIFFERENT schedule's
+          // record — which this same value then uses to resolve publish authorization
+          // below. One parser for both gates.
+          const scheduleIdMatch = extractScheduleId(session.pageIdentifier);
           if (scheduleIdMatch) {
-            systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch[1]}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
+            systemPrompt += `\n\n[Schedule Context] This session was created by a scheduled chat (scheduleId: ${scheduleIdMatch}). If the user asks to update this schedule, first call list_scheduled_chats to get the current schedule details, then use manage_scheduled_chat with action "update" and the schedule_id. You can do partial updates — only include the fields you want to change.`;
           }
           // Resolve the schedule owner's admin status so the directive only
           // injects its admin-only (get_chat_history / list_all_clients) identity
@@ -4731,7 +5057,14 @@ export async function generateSessionResponse(
           } catch (adminLookupError) {
             console.error(`AgentMode: failed to resolve owner admin status for scheduled session ${session.sessionId}; omitting admin-only directive slice:`, adminLookupError);
           }
-          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin);
+          // ENG-827: the unattended directive WITHOUT its publish block. This system
+          // prompt is stored as the session's first message, and buildMarketingContext
+          // slices that message off before the model ever sees it — so a publish
+          // decision stated here would be a decision nobody reads. The publish block is
+          // emitted by AgentModeService instead, appended after the conversation where
+          // it is both delivered and salient. Verified on the preview: the copy written
+          // here had no effect on the run's behaviour.
+          systemPrompt += getUnattendedExecutionDirective(session.sessionType, ownerIsAdmin, 'unknown', []);
         }
 
         // For Slack sessions (including scheduled scans), inject team identity context so Emma
@@ -4851,6 +5184,10 @@ export async function generateSessionResponse(
       // (OOM/SIGKILL/force-exit past drain) leaves a visible partial transcript
       // instead of a silent zero-output session.
       persistIncrementally: true,
+      // ENG-827: forward the caller's resolved authorization so the prompt and the
+      // checker are built from one value. Absent on the interactive path, where the
+      // service resolves it per turn instead.
+      publishAuthorizationOverride,
       // ENG-907: the caller's whole-turn deadline stamp (undefined when the caller
       // enforces no cap), so the loop wraps itself up against the real deadline.
       turnStartMs
@@ -7744,6 +8081,14 @@ export const agentModeController = {
       // flag consecutive failures on the card without fetching full history.
       const scheduledChatsWithHealth = scheduledChats.map(({ runResults, ...rest }: any) => ({
         ...rest,
+        // Whether an EXPLICIT grant exists — not whether this schedule will publish.
+        // The two differ, and conflating them is the trap here: a legacy schedule
+        // reports false and still publishes, because the resolver treats a never-asked
+        // row as authorized under ENG-803's opt-out. Read `requirePublishApproval` for
+        // "will it publish"; read this only to decide whether there is a grant to
+        // revoke. Emitted as a present boolean rather than an absent key so a consumer
+        // never has to guess what "missing" meant.
+        autopublishAuthorized: rest.autopublishAuthorized === true,
         runHealth: computeScheduleRunHealth(runResults),
       }));
 
@@ -7852,11 +8197,19 @@ export const agentModeController = {
         selfImprove: selfImprove !== undefined ? (selfImprove === true) : ((existingSchedule as any).selfImprove || false),
         // ENG-396: opt-in full autonomy (auto-take on blocking questions). Partial-update safe.
         fullAutonomy: fullAutonomy !== undefined ? (fullAutonomy === true) : ((existingSchedule as any).fullAutonomy || false),
-        // ENG-803: owner opt-out from unattended publishing. Partial-update safe — an
-        // update that omits the field must never silently set or clear it.
-        requirePublishApproval: requirePublishApproval !== undefined
-          ? (requirePublishApproval === true)
-          : ((existingSchedule as any).requirePublishApproval || false),
+        // ENG-803/ENG-827 (Greptile): the publish opt-out is written ONLY when this
+        // request actually carries it. Copying it forward from `existingSchedule` is a
+        // read-modify-write, and this field decides whether an unattended run may post
+        // publicly: an owner who switches the hold ON between this handler's read and
+        // its write would have it silently overwritten back to OFF by an unrelated
+        // update — a rename or a cadence change re-enabling publishing they had just
+        // stopped. `updateSchedule` builds a PARTIAL SET expression, so omitting the
+        // key leaves the stored value untouched, which is the only race-free way to
+        // preserve it. Every other field here is last-writer-wins and recoverable;
+        // this one authorizes an irreversible public post, so it is not.
+        ...(requirePublishApproval !== undefined
+          ? { requirePublishApproval: requirePublishApproval === true }
+          : {}),
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
@@ -7953,13 +8306,27 @@ export const agentModeController = {
         updates.runCount = runCount;
       }
 
-      await scheduleDb.updateSchedule(scheduleId, updates);
+      // ENG-827: the edit and the consent narrowing it implies go in as ONE write, so
+      // neither can be acknowledged without the other. See
+      // applyScheduleEditWithConsentNarrowing.
+      await applyScheduleEditWithConsentNarrowing(scheduleId, updates, existingSchedule);
 
       res.json({
         message: 'Scheduled chat updated successfully',
         nextRunTime: scheduledNextRunTime
       });
     } catch (error) {
+      // ENG-827: consent moved on every attempt, so nothing was written. Say so instead
+      // of reporting a save that did not happen — the alternative is acknowledging an
+      // edit whose consent narrowing never landed.
+      if (error instanceof ScheduleConsentRaceError) {
+        console.warn(`AgentMode: ENG-827 schedule update abandoned — ${error.message}`);
+        return res.status(409).json({
+          error:
+            'This schedule\'s publishing permission changed while you were saving, so nothing was ' +
+            'saved. Reopen the schedule to see its current settings, then apply your change again.',
+        });
+      }
       console.error('AgentMode: Update scheduled chat error:', error);
       res.status(500).json({ error: 'Failed to update scheduled chat' });
     }
@@ -8376,6 +8743,138 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Test scheduled chat error:', error);
       res.status(500).json({ error: 'Failed to test scheduled chat' });
+    }
+  },
+
+
+  /**
+   * POST /api/agent-mode/scheduled-chats/:scheduleId/publish-consent
+   *
+   * ENG-827 (Greptile): a REVOKE-ONLY lever for a schedule's unattended publishing.
+   *
+   * The setting itself is not writable from the generic update body or the MCP
+   * allowlist, because a model that could GRANT it would be manufacturing standing
+   * consent to post under the owner's name. Revoking is the opposite: it can only ever
+   * make a schedule safer, and it is what lets an owner (or Emma acting on their spoken
+   * instruction — "stop auto-posting on this one") stop future unattended publishing
+   * without hunting through the schedule form.
+   *
+   * The asymmetry is enforced here rather than trusted to the caller: `authorized: true`
+   * is REJECTED outright. There is no request shape that turns publishing on.
+   *
+   * ENG-803's concern is real and is why this stays revoke-only: a model able to switch
+   * the hold ON could quietly stop a schedule publishing and then truthfully cite the
+   * block, recreating that ticket's bug through a legitimate mechanism. That failure is
+   * visible, durable and reversible by the owner — a stray grant would be an
+   * irreversible public post — so the two directions do not deserve the same treatment.
+   */
+  async revokeScheduledChatPublishConsent(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const { scheduleId } = req.params;
+      const { authorized } = req.body || {};
+
+      if (typeof authorized !== 'boolean') {
+        return res.status(400).json({ error: 'Invalid body: `authorized` must be a boolean' });
+      }
+
+      const schedule = await scheduleDb.getScheduleById(scheduleId);
+      if (!schedule || schedule.userId !== user.userId) {
+        return res.status(404).json({ error: 'Scheduled chat not found' });
+      }
+
+      // GRANTING is the owner's decision and nobody else's. A delegated admin session
+      // acts as the customer everywhere else in this API, but it must not be able to
+      // hand out this one — the whole point is that a specific human accepted that
+      // posts go out unseen under their name. Revoking stays open to delegation: it
+      // only ever makes a schedule safer.
+      if (authorized && (req as any).delegateInfo?.isDelegated) {
+        return res.status(403).json({
+          error:
+            'Unattended publishing can only be enabled by the account owner themselves, not from a ' +
+            'delegated session. Ask them to turn on "Publish without my review" on the schedule.',
+        });
+      }
+
+      // Consent is bound to the tools the owner could see when they gave it, so a grant
+      // needs a designated publishing tool. Without one the scope is unknown, and an
+      // unknown scope would either authorize nothing (a silent no-op that looks like it
+      // worked) or everything (a mandate they never gave).
+      const approvedTools = getRequiredPublishTools(schedule.requiredFunctionCalls);
+      if (authorized && approvedTools.length === 0) {
+        return res.status(400).json({
+          error:
+            'This schedule does not require a publishing tool, so there is nothing to authorize. ' +
+            'Add the publishing tool this schedule should use (e.g. post_on_connected_account) to its ' +
+            'required functions first — consent is recorded against the specific tool it covers.',
+        });
+      }
+
+      try {
+        await scheduleDb.updateSchedule(
+          scheduleId,
+          {
+            autopublishAuthorized: authorized,
+            autopublishAuthorizedTools: authorized ? approvedTools : [],
+            autopublishAuthorizedAt: authorized ? new Date().toISOString() : null,
+            autopublishAuthorizedBy: authorized ? user.userId : null,
+            updatedAt: new Date().toISOString(),
+          } as any,
+          // ENG-827 (Greptile): a GRANT writes a scope DERIVED from the required tools
+          // read a few lines up. If a concurrent edit changes those tools in between,
+          // an unconditional write records consent for a tool set the owner never saw.
+          // Bind the write to the read: same tools, or no grant.
+          //
+          // The consent field itself is part of that read and is bound too. Without it a
+          // grant that lost the race still lands: the owner revokes, the revoke completes,
+          // and this older grant then overwrites it — permission they withdrew, restored
+          // by a request that predates the withdrawal. `undefined` compiles to
+          // `attribute_not_exists`, so a grant derived from a never-asked row lands only
+          // while that row is still never-asked.
+          //
+          // A REVOKE is not conditioned. It narrows permission no matter what else
+          // changed, and making it fail on a concurrent edit would be a refusal to
+          // take away a permission — the one direction that must always be available.
+          authorized
+            ? {
+                requiredFunctionCalls: schedule.requiredFunctionCalls,
+                autopublishAuthorized: schedule.autopublishAuthorized,
+              }
+            : undefined
+        );
+      } catch (writeError: any) {
+        if (writeError?.code === 'ConditionalCheckFailedException' || writeError?.name === 'ConditionalCheckFailedException') {
+          console.warn(
+            `AgentMode: ENG-827 publish consent grant for schedule ${scheduleId} refused — its required ` +
+            'tools or its consent state changed during the request.'
+          );
+          return res.status(409).json({
+            error:
+              'This schedule changed while you were authorizing it, so nothing was saved — either its ' +
+              'required functions moved, so the authorization would have covered a different set of tools ' +
+              'than the one you approved, or its publishing permission was changed from somewhere else. ' +
+              'Reopen the schedule to see where it stands, then turn on "Publish without my review" again ' +
+              'if it still looks right.',
+          });
+        }
+        throw writeError;
+      }
+
+      console.log(
+        `AgentMode: ENG-827 publish consent ${authorized ? 'GRANTED' : 'REVOKED'} for schedule ` +
+        `${scheduleId} by user ${user.userId}${authorized ? ` (tools: ${approvedTools.join(', ')})` : ''}.`
+      );
+
+      res.json({
+        autopublishAuthorized: authorized,
+        autopublishAuthorizedTools: authorized ? approvedTools : [],
+        message: authorized
+          ? 'This schedule will now publish to your connected accounts without showing you the content first.'
+          : 'This schedule will now draft content and tell you what is waiting, instead of publishing.',
+      });
+    } catch (error) {
+      console.error('AgentMode: Set scheduled chat publish consent error:', error);
+      res.status(500).json({ error: 'Failed to update publish consent' });
     }
   },
 

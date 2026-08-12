@@ -88,6 +88,109 @@ describe('Scheduled Chat MCP Tools', () => {
     });
   });
 
+  // ─── Publish consent is NOT agent-settable (ENG-827, Greptile P1 #6) ────
+  // Consent to publish unreviewed to a live account must come from a deterministic
+  // owner action — the "Publish without my review" checkbox in the portal. An MCP
+  // argument would let the MODEL mint standing publishing consent from its own
+  // reading of a conversation, which is the same inferred-consent failure that
+  // already sank three earlier signals. Keep this surface closed.
+  describe('manage_scheduled_chat - publish consent is not agent-settable', () => {
+    it('exposes a REVOKE lever only — never a grant', () => {
+      const def = mcpToolRegistry.getTool('manage_scheduled_chat')?.definition as any;
+      const props = def?.inputSchema?.properties || {};
+      expect(Object.keys(props)).toContain('revoke_autopublish');
+      // The grant direction must not exist under ANY spelling. A model able to turn
+      // publishing on would be manufacturing standing consent to post under the
+      // owner's name from its own reading of a conversation.
+      for (const forbidden of [
+        'autopublish_authorized', 'autopublishAuthorized',
+        'grant_autopublish', 'publish_without_review',
+      ]) {
+        expect(Object.keys(props)).not.toContain(forbidden);
+      }
+      expect(props.revoke_autopublish.description).toMatch(/cannot turn it back on/i);
+    });
+
+    it('REVOKES via the dedicated endpoint, before the ordinary update', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        revoke_autopublish: true,
+      } as any, context);
+
+      const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
+      const put = calls.find(c => c.method === 'PUT');
+      const consent = calls.find(c => String(c.path).endsWith('/publish-consent'));
+
+      expect(consent).toBeDefined();
+      expect(consent.method).toBe('POST');
+      expect(consent.path).toBe('/api/agent-mode/scheduled-chats/sc-1/publish-consent');
+      // Revoke-only by construction: the body can never ask to enable publishing.
+      expect(consent.body).toEqual({ authorized: false });
+
+      // ORDER matters. Revoke first, so a failure of the ordinary update leaves the
+      // schedule in the safer (not publishing) state rather than the riskier one.
+      expect(calls.indexOf(consent)).toBeLessThan(calls.indexOf(put));
+    });
+
+    it('does not touch consent at all when revoke_autopublish is absent or false', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        revoke_autopublish: false,
+      } as any, context);
+      const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
+      expect(calls.find(c => c.path.endsWith('/publish-consent'))).toBeUndefined();
+    });
+
+    it('never sends a GRANT, whatever the model passes', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        revoke_autopublish: false,
+        autopublish_authorized: true,
+        autopublishAuthorized: true,
+      } as any, context);
+      const calls = mockMcpFetch.mock.calls.map(c => c[0] as any);
+      expect(calls[0].body.autopublishAuthorized).toBeUndefined();
+      // Nothing may reach the consent endpoint asking to ENABLE publishing — and with
+      // revoke_autopublish false, nothing may reach it at all.
+      const consent = calls.find(c => String(c.path).endsWith('/publish-consent'));
+      expect(consent).toBeUndefined();
+    });
+
+    it('never forwards an autopublish field to the API on create, even if passed', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'create',
+        schedule_name: 'Daily post',
+        starting_message: 'Write and post it',
+        schedule_frequency: 'daily',
+        autopublish_authorized: true,
+        autopublishAuthorized: true,
+      } as any, context);
+      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(body).not.toHaveProperty('autopublishAuthorized');
+      expect(body).not.toHaveProperty('autopublish_authorized');
+    });
+
+    it('never forwards an autopublish field to the API on update, even if passed', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-1' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-1',
+        autopublish_authorized: true,
+        autopublishAuthorized: true,
+      } as any, context);
+      const body = (mockMcpFetch.mock.calls[0][0] as any).body;
+      expect(body).not.toHaveProperty('autopublishAuthorized');
+      expect(body).not.toHaveProperty('autopublish_authorized');
+    });
+  });
+
   // ─── SUCCESS tests ─────────────────────────────────────────────────────
 
   describe('list_scheduled_chats', () => {
