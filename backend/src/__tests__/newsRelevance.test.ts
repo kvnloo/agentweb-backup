@@ -307,13 +307,24 @@ describe('isCoverageCandidate (ENG-1050)', () => {
   });
 
   it('keeps a dated or news-sectioned article whose slug happens to contain an evergreen word', () => {
-    // The evergreen markers are substring matches over the whole path, which is
-    // right for a listicle slug and wrong for a story that merely uses the word.
+    // The weak markers are substring matches over the whole path, which is right
+    // for a listicle slug and wrong for a story that merely uses the word.
     // An article signal in the path wins over them (Greptile review, PR #2364).
     expect(isCoverageCandidate('https://techcrunch.com/2026/08/11/stripe-pricing-overhaul-for-platforms/')).toBe(true);
     expect(isCoverageCandidate('https://www.reuters.com/technology/2026-08-11-upkeep-raises-series-c-after-strategic-review/')).toBe(true);
     expect(isCoverageCandidate('https://www.zdnet.com/article/surfer-seo-review-tool-acquires-contentgecko/')).toBe(true);
-    expect(isCoverageCandidate('https://www.guesty.com/press-release/guesty-vs-market-expansion/')).toBe(true);
+    expect(isCoverageCandidate('https://www.guesty.com/press-release/guesty-2026-pricing-update/')).toBe(true);
+  });
+
+  it('still rejects the evergreen genre when it is filed under a news section or a date', () => {
+    // Filing a listicle at /news/ does not make it a story, so the
+    // genre-defining shapes are checked before the article signal.
+    expect(isCoverageCandidate('https://hoteltechreport.com/news/guesty-vs-hostaway-2026')).toBe(false);
+    expect(isCoverageCandidate('https://www.saasworthy.com/2026/08/11/best-cmms-software-2026/')).toBe(false);
+    expect(isCoverageCandidate('https://www.forbes.com/article/top-stripe-alternatives-for-platforms/')).toBe(false);
+    expect(isCoverageCandidate('https://coupondunia.com/news/2026/surfer-seo-coupon-codes/')).toBe(false);
+    // A vendor surface under a dated path is still a vendor surface.
+    expect(isCoverageCandidate('https://www.guesty.com/news/2026/pricing/')).toBe(false);
   });
 });
 
