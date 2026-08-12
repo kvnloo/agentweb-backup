@@ -794,14 +794,21 @@ export class McpClientService {
     const pendingClient = sessionPool.pendingClients.get(serverName);
     if (pendingClient) return pendingClient;
 
-    // Take a slot BEFORE spawning, so a burst waits for capacity instead of adding to it.
+    // Waiting for a browser slot has to happen INSIDE the memoised creation, not before it.
+    // An agent issues parallel browser calls in one turn, and anything awaited between the
+    // pendingClients lookup above and its registration below lets both callers build their
+    // own client — the second overwrites the first in the pool, orphaning a browser nothing
+    // will close and splitting the session's page across two of them.
     let slotReserved = false;
-    if (this.isBrowserBacked(serverName, toolName)) {
-      await this.acquireBrowserSlot(poolKey);
-      slotReserved = true;
-    }
-
-    const creation = this.createSessionClient(serverName, poolKey, userId, sessionPool);
+    const creation = (async () => {
+      if (this.isBrowserBacked(serverName, toolName)) {
+        await this.acquireBrowserSlot(poolKey);
+        slotReserved = true;
+      }
+      return this.createSessionClient(serverName, poolKey, userId, sessionPool);
+    })();
+    // Runs in the same synchronous turn as the call above (which yields at its first await),
+    // so a concurrent caller cannot slip between them.
     sessionPool.pendingClients.set(serverName, creation);
     try {
       return await creation;
