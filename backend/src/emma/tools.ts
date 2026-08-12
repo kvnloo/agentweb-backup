@@ -959,7 +959,8 @@ AD RETAG_UTM (ENG-239 — retrofit UTMs onto ONE existing ad that's missing them
 REQUIRED PARAMS PER ENTITY + ACTION:
   CAMPAIGN CREATE:      name, objective, special_ad_categories (e.g. ["NONE"])
                         Optional: status, spend_cap (cents), advantage_campaign_budget + budget_amount (dollars).
-                        Any OTHER param is REJECTED before the campaign is created (it would not be applied) — ad-set fields such as daily_budget, lifetime_budget, bid_strategy, targeting, optimization_goal and billing_event belong on AD_SET CREATE, and campaign-level budget goes through advantage_campaign_budget + budget_amount.
+                        Any other field Meta models on a campaign (start_time, stop_time, buying_type, special_ad_category_country, …) is passed through to Meta and validated there.
+                        A param that could NOT be applied is REJECTED before the campaign is created, naming the field: ad-set fields (bid_strategy, targeting, optimization_goal, billing_event) belong on AD_SET CREATE, and campaign-level budget goes through advantage_campaign_budget + budget_amount, never a bare daily_budget/lifetime_budget. Nothing is ever accepted and silently dropped.
   AD_SET CREATE:        name, optimization_goal, billing_event, targeting (with geo_locations), daily_budget OR lifetime_budget (not both; lifetime_budget requires end_time)
                         Optional but WRITABLE on create: bid_strategy (LOWEST_COST_WITHOUT_CAP | LOWEST_COST_WITH_BID_CAP | COST_CAP) and bid_amount.
                         Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
