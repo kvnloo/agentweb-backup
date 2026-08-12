@@ -290,8 +290,9 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
       modelsCalled.push(model);
       nowMs += 60_000;
       if (isFinalSynthesis) {
-        // A transient failure, raised after the call burned the rest of the reserve.
-        throw new Error('Connection error.');
+        // A transient failure — the only kind the backup retry would have handled —
+        // raised after the call burned the rest of the reserve.
+        throw new Error('Too many requests, please try again later');
       }
       return buildLLMResponse({
         content: `Scanned batch ${++call}.`,
@@ -320,6 +321,58 @@ describe('ENG-907 — real loop wraps up before the whole-turn wall-clock cap', 
     expect(result.content).toMatch(/time limit/i);
     // Only one model was ever used — no backup retry was started.
     expect(new Set(modelsCalled).size).toBe(1);
+  });
+
+  it('lets a NON-transient synthesis failure propagate instead of reporting a timeout', async () => {
+    // The affordability guard above must not become a catch-all. A context-limit,
+    // content-policy or malformed-request failure has no retry to skip, and dressing one
+    // up as "I hit the time limit — reply continue" would invite the user straight back
+    // into the same error. Those keep their existing classification path.
+    let call = 0;
+    jest.spyOn(service as any, 'callLLM').mockImplementation(async (...args: any[]) => {
+      const messages = args[1] || [];
+      const isFinalSynthesis = messages.some(
+        (m: any) =>
+          m?.role === 'user' &&
+          typeof m.content === 'string' &&
+          /\[SYSTEM WARNING\][^\n]*time limit/i.test(m.content),
+      );
+      nowMs += 60_000;
+      if (isFinalSynthesis) {
+        throw new Error('This model\'s maximum context length is 200000 tokens');
+      }
+      return buildLLMResponse({
+        content: `Scanned batch ${++call}.`,
+        tool_calls: [{ id: `c${call}`, name: 'twitter_outreach', arguments: `{"cursor":${call}}` }],
+      });
+    });
+    jest.spyOn(service as any, 'executeTool').mockResolvedValue(
+      JSON.stringify({ success: true, data: 'mock' }),
+    );
+    jest.spyOn(service as any, 'generateSuggestedReplies').mockResolvedValue([]);
+
+    // It raises instead of returning, so the error reaches the controller's existing
+    // classification path (isContextLimitError et al. read `originalMessage`) rather than
+    // coming back as a successful time-budget truncation whose "continue" invitation would
+    // just re-run the same failing call.
+    const rejection = await service
+      .generateMarketingResponse(
+        'Find me the 10 best X posts about agentic wallets, 10 more to reply to, 5 accounts to monitor, and the order to reply in.',
+        [] as any,
+        'test-user',
+        service.default_model,
+        'test-session',
+        false, undefined, undefined, false, undefined, undefined, undefined, false, false,
+        nowMs,
+      )
+      .then(
+        (value: any) => ({ resolved: value }),
+        (error: any) => ({ error }),
+      );
+
+    expect((rejection as any).resolved).toBeUndefined();
+    expect((rejection as any).error.originalMessage).toMatch(/context length/i);
+    expect((rejection as any).error.message).not.toMatch(/time limit/i);
   });
 
   it('still honours the max-tokens continuation when the time budget is NOT spent', async () => {
