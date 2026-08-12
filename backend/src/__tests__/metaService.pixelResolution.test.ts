@@ -106,4 +106,69 @@ describe('resolveMetaPixelForUser', () => {
     const datasetCalls = mockFetch.mock.calls.filter((c: any[]) => String(c[0]).includes('/datasets'));
     expect(datasetCalls).toHaveLength(0);
   });
+
+  describe('ENG-1141 — account-level attribution default (tier 2)', () => {
+    it('short-circuits to the stored default when its account is still connected, skipping the ambiguity checks entirely', async () => {
+      const userWithDefault = {
+        connected_accounts: user.connected_accounts,
+        metaAttributionDefault: { pixelId: 'defaultPixel', accountId: 'defaultAcc' },
+      };
+      (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([
+        { accountId: 'defaultAcc' },
+        { accountId: 'otherAcc' },
+      ]);
+
+      const result = await metaService.resolveMetaPixelForUser(userWithDefault, 'user1');
+
+      expect(result).toEqual({ pixelId: 'defaultPixel', accountId: 'defaultAcc' });
+      // Proves the ambiguity checks (which would otherwise fire on 2 connected accounts)
+      // were genuinely skipped, not just coincidentally passed.
+      expect(getMetaAccountCredentials).not.toHaveBeenCalled();
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+
+    it('falls through to a clean tier-3 resolve when the default account was disconnected', async () => {
+      const userWithStaleDefault = {
+        connected_accounts: user.connected_accounts,
+        metaAttributionDefault: { pixelId: 'staleDefaultPixel', accountId: 'staleAcc' },
+      };
+      (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'acc1' }]);
+      (getMetaAccountCredentials as jest.Mock).mockResolvedValue({ accountId: 'acc1', accessToken: 'tok', accountName: 'Acc 1' });
+      mockFetch.mockResolvedValue({
+        ok: true,
+        json: jest.fn().mockResolvedValue({ data: [{ id: 'freshPixel' }] }),
+      });
+
+      const result = await metaService.resolveMetaPixelForUser(userWithStaleDefault, 'user1');
+
+      expect(result).toEqual({ pixelId: 'freshPixel', accountId: 'acc1' });
+    });
+
+    it('falls through to unresolved when the default account was disconnected and what remains is still ambiguous', async () => {
+      const userWithStaleDefault = {
+        connected_accounts: user.connected_accounts,
+        metaAttributionDefault: { pixelId: 'staleDefaultPixel', accountId: 'staleAcc' },
+      };
+      (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([
+        { accountId: 'acc1' },
+        { accountId: 'acc2' },
+      ]);
+
+      const result = await metaService.resolveMetaPixelForUser(userWithStaleDefault, 'user1');
+
+      expect('unresolved' in result && result.unresolved).toBe(true);
+    });
+
+    it('makes zero network calls to validate the default (no live Graph re-validation)', async () => {
+      const userWithDefault = {
+        connected_accounts: user.connected_accounts,
+        metaAttributionDefault: { pixelId: 'defaultPixel', accountId: 'defaultAcc' },
+      };
+      (getConnectedMetaAccountsList as jest.Mock).mockReturnValue([{ accountId: 'defaultAcc' }]);
+
+      await metaService.resolveMetaPixelForUser(userWithDefault, 'user1');
+
+      expect(mockFetch).not.toHaveBeenCalled();
+    });
+  });
 });

@@ -2369,6 +2369,20 @@ export class MetaService {
       const { getConnectedMetaAccountsList, getMetaAccountCredentials } = await import('./metaAccountCredentials');
 
       const accounts = getConnectedMetaAccountsList(user);
+
+      // ENG-1141, tier 2: an explicit account-level default always wins over the
+      // ambiguity checks below — but only while its account is still actually connected.
+      // No live Graph call here (never re-validate the pixel/token on every resolution) —
+      // just a free check against the already-in-memory connected-accounts list, so a
+      // disconnected default degrades to tier 3 below instead of returning a dead
+      // reference for the caller to fail on one layer further from the source.
+      if (user.metaAttributionDefault) {
+        const { pixelId, accountId } = user.metaAttributionDefault;
+        if (accounts.some((acc: any) => acc.accountId === accountId)) {
+          return { pixelId, accountId };
+        }
+      }
+
       if (accounts.length === 0) {
         return { unresolved: true, reason: 'No Meta ad account connected' };
       }
