@@ -39,6 +39,12 @@ export interface MetaAdsScopeConfigLike {
   granted_scopes?: unknown;
   scopes?: unknown;
   /**
+   * Which kind of Meta connection this is. Only 'ad_account' records can have an
+   * Ads capability at all — a page or Instagram business connection lacking
+   * ads_read is not degraded, it simply never needed the scope.
+   */
+  account_type?: unknown;
+  /**
    * Set when Meta authoritatively refused an ads read for lack of permission.
    *
    * Load-bearing: for a legacy record the retained grant collapses to `[]`, which
@@ -99,6 +105,51 @@ export const getMetaAdsScopeState = (
 export const hasMetaAdsReadScope = (
   config: MetaAdsScopeConfigLike | null | undefined
 ): boolean => getMetaAdsScopeState(config) === 'granted';
+
+/** Minimal structural shape of a connected-account record. */
+export interface MetaAdsAccountLike {
+  platform?: unknown;
+  config?: MetaAdsScopeConfigLike | null;
+}
+
+/**
+ * The capability annotation carried by an ad-account connection.
+ *
+ * Deliberately sparse: fields are present only when we actually know the answer,
+ * so an unprovable legacy record stays silent instead of accusing a working
+ * connection of being broken.
+ */
+export interface MetaAdsCapabilityAnnotation {
+  ads_capable?: boolean;
+  capability_warning?: string;
+}
+
+/** Only Meta *ad account* records can have an ads capability at all. */
+export const isMetaAdAccountRecord = (account: MetaAdsAccountLike | null | undefined): boolean =>
+  (account?.platform === 'meta' || account?.platform === 'facebook') &&
+  account?.config?.account_type === 'ad_account';
+
+/**
+ * The single capability annotation for a Meta ad-account connection.
+ *
+ * Shared on purpose (ENG-1158). The agent tool (`list_connected_accounts`) and
+ * the Settings → Connected accounts API both render from this, so a connection
+ * can never read as "degraded" to the model while its owner is still shown a
+ * green "Connected" badge — the split that let account 922903076601160 produce
+ * zero-data reports for days without anyone being told.
+ */
+export const describeMetaAdsCapability = (
+  account: MetaAdsAccountLike | null | undefined
+): MetaAdsCapabilityAnnotation => {
+  if (!isMetaAdAccountRecord(account)) return {};
+
+  const state = getMetaAdsScopeState(account?.config);
+  if (state === 'granted') return { ads_capable: true };
+  if (state === 'missing') {
+    return { ads_capable: false, capability_warning: META_ADS_RECONSENT_MESSAGE };
+  }
+  return {};
+};
 
 /**
  * Read a nested value by path, yielding undefined the moment the chain breaks.
