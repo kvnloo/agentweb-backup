@@ -4,7 +4,7 @@ import path from "path";
 import { S3 } from "aws-sdk";
 import { Task } from "../types/task";
 import { paginatedQuery, paginatedScan, paginatedCount } from "../utils/dynamoPagination";
-import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey } from "../utils/leadSchema";
+import { buildLeadCrmFields, buildLeadAttributionFields, computeNameCompanyKey, LeadImportRowOutcome } from "../utils/leadSchema";
 import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGuard";
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
@@ -6526,6 +6526,15 @@ export const crmDb = {
       // Rows refused because they are LinkedIn's anonymized placeholder
       // rather than a person (ENG-1002). Reported, never dropped silently.
       anonymizedSkipped: 0,
+      // Rows that matched a lead already in the list and needed no change.
+      // They used to fall out of every counter, so an import re-sent after a
+      // partial run reported "No leads were processed" even though every row
+      // was safely in place (ENG-1133).
+      alreadyPresentCount: 0,
+      // What happened to each input row, aligned to the input array. Lets a
+      // caller resume a truncated import from the rows that never landed
+      // rather than replaying the whole file (ENG-1133).
+      rowOutcomes: leads.map(() => 'unprocessed' as LeadImportRowOutcome),
     };
 
     try {
@@ -6545,23 +6554,33 @@ export const crmDb = {
       // imports inflate the list with duplicates.
       const existingLeadsByEmail = new Map<string, any>();
       const existingLeadsByLinkedIn = new Map<string, any>();
+      // ENG-1133: last-resort identity for rows that carry neither an email nor
+      // a LinkedIn URL. Computed from the stored fields rather than read from
+      // the persisted `nameCompanyKey` attribute so legacy rows written before
+      // that attribute existed still dedupe.
+      const existingLeadsByNameCompany = new Map<string, any>();
       allExistingLeads.forEach(lead => {
         if (lead.email && lead.email.trim()) {
           existingLeadsByEmail.set(lead.email.trim().toLowerCase(), lead);
         }
         const liKey = normalizeLinkedInUrl(lead.linkedin);
         if (liKey) existingLeadsByLinkedIn.set(liKey, lead);
+        const nameCompanyKey = computeNameCompanyKey(lead.firstName, lead.lastName, lead.company);
+        if (nameCompanyKey && !existingLeadsByNameCompany.has(nameCompanyKey)) {
+          existingLeadsByNameCompany.set(nameCompanyKey, lead);
+        }
       });
 
       // Separate leads into new leads and leads to update
       const newLeads: typeof leads = [];
-      const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0] }> = [];
+      const leadsToUpdate: Array<{ existingLead: any; newData: typeof leads[0]; index: number }> = [];
 
       // Deduplicate leads within the upload by email AND by normalized LinkedIn URL.
       // The map value carries the row's original index so `results.created` can
       // report which input row each written lead came from (ENG-1002).
       const uniqueLeads = new Map<string, { lead: typeof leads[0]; index: number }>();
       const seenLinkedIn = new Set<string>();
+      const seenNameCompany = new Set<string>();
       leads.forEach((lead, index) => {
         // ENG-1002 (follow-up): refuse LinkedIn's anonymized placeholder at the
         // one point every write path converges, so no caller can reintroduce
@@ -6570,6 +6589,7 @@ export const crmDb = {
         // sourceIndex pointing at its ORIGINAL position for callers joining on it.
         if (isLinkedInPlaceholderName(lead)) {
           results.anonymizedSkipped++;
+          results.rowOutcomes[index] = 'anonymized_skipped';
           return;
         }
         const emailKey = lead.email?.trim().toLowerCase() || `__no_email_${index + 1}__`;
@@ -6579,13 +6599,14 @@ export const crmDb = {
           if (uniqueLeads.has(emailKey)) {
             results.errorCount++;
             results.errors.push(`Row ${index + 1}: Duplicate email "${lead.email}" found in upload data`);
+            results.rowOutcomes[index] = 'duplicate_in_request';
             return;
           }
 
           // Check against existing leads — if exists, mark for update instead of error
           const existingLead = existingLeadsByEmail.get(emailKey);
           if (existingLead) {
-            leadsToUpdate.push({ existingLead, newData: lead });
+            leadsToUpdate.push({ existingLead, newData: lead, index });
             return;
           }
         }
@@ -6597,16 +6618,43 @@ export const crmDb = {
           if (seenLinkedIn.has(liKey)) {
             results.errorCount++;
             results.errors.push(`Row ${index + 1}: Duplicate LinkedIn URL "${lead.linkedin}" found in upload data`);
+            results.rowOutcomes[index] = 'duplicate_in_request';
             return;
           }
           // Existing-list dedup: same URL → merge into existing lead.
           const existingByLi = existingLeadsByLinkedIn.get(liKey);
           if (existingByLi) {
-            leadsToUpdate.push({ existingLead: existingByLi, newData: lead });
+            leadsToUpdate.push({ existingLead: existingByLi, newData: lead, index });
             seenLinkedIn.add(liKey);
             return;
           }
           seenLinkedIn.add(liKey);
+        }
+
+        // ENG-1133: a row with neither an email nor a LinkedIn URL has no
+        // identity to dedupe on, so re-sending a file after a truncated import
+        // wrote it a second time. Fall back to the name+company key — but ONLY
+        // for those rows: a row that carries its own identity keeps the
+        // behaviour above, or two different people who happen to share a name
+        // at one company would be silently merged.
+        const nameCompanyKey =
+          !lead.email?.trim() && !liKey
+            ? computeNameCompanyKey(lead.firstName, lead.lastName, lead.company)
+            : undefined;
+        if (nameCompanyKey) {
+          if (seenNameCompany.has(nameCompanyKey)) {
+            results.errorCount++;
+            results.errors.push(`Row ${index + 1}: Duplicate name/company "${lead.firstName} ${lead.lastName} @ ${lead.company}" found in upload data`);
+            results.rowOutcomes[index] = 'duplicate_in_request';
+            return;
+          }
+          const existingByName = existingLeadsByNameCompany.get(nameCompanyKey);
+          if (existingByName) {
+            leadsToUpdate.push({ existingLead: existingByName, newData: lead, index });
+            seenNameCompany.add(nameCompanyKey);
+            return;
+          }
+          seenNameCompany.add(nameCompanyKey);
         }
 
         uniqueLeads.set(emailKey, { lead, index });
@@ -6696,10 +6744,18 @@ export const crmDb = {
           // Promote batch IDs into the global created list only after the write
           // succeeds — keeps results.created in sync with what's actually persisted.
           results.created.push(...batchCreated);
+          batchCreated.forEach(({ sourceIndex }) => {
+            results.rowOutcomes[sourceIndex] = 'created';
+          });
         } catch (batchError: any) {
           batch.forEach((lead, index) => {
             results.errorCount++;
-            results.errors.push(`Row ${i + index + 1}: ${lead.email || 'Unknown'} - ${batchError.message}`);
+            // Report the row's position in the CALLER's array, not in the
+            // filtered new-lead array — otherwise the row a resume is told to
+            // retry is not the row that failed (ENG-1133).
+            const sourceIndex = newLeadSourceIndices[i + index];
+            results.errors.push(`Row ${sourceIndex + 1}: ${lead.email || 'Unknown'} - ${batchError.message}`);
+            results.rowOutcomes[sourceIndex] = 'failed';
           });
         }
       }
@@ -6755,7 +6811,7 @@ export const crmDb = {
       }
 
       // Process leads to update (merge existing leads with new data)
-      for (const { existingLead, newData } of leadsToUpdate) {
+      for (const { existingLead, newData, index: sourceIndex } of leadsToUpdate) {
         try {
           // Helper to normalize values for comparison
           const normalize = (value: any): string => {
@@ -6864,11 +6920,18 @@ export const crmDb = {
             await this.updateLead(listId, existingLead.leadId, updates);
             results.successCount++;
             results.mergedCount++;
+            results.rowOutcomes[sourceIndex] = 'merged';
+          } else {
+            // No changes needed — the row is already in the list exactly as
+            // supplied. Still an accounted-for outcome, not a silent drop
+            // (ENG-1133): a resume re-sending completed rows lands here.
+            results.alreadyPresentCount++;
+            results.rowOutcomes[sourceIndex] = 'already_present';
           }
-          // If no changes, skip the update (don't count as merged)
         } catch (updateError: any) {
           results.errorCount++;
-          results.errors.push(`Row: Email "${newData.email}" - Failed to update: ${updateError.message}`);
+          results.errors.push(`Row ${sourceIndex + 1}: Email "${newData.email}" - Failed to update: ${updateError.message}`);
+          results.rowOutcomes[sourceIndex] = 'failed';
         }
       }
 
@@ -6896,6 +6959,13 @@ export const crmDb = {
         errors: [`Batch upload failed: ${error.message}`],
         created: [] as Array<{ leadId: string; email?: string; sourceIndex: number }>,
         anonymizedSkipped: results.anonymizedSkipped,
+        alreadyPresentCount: 0,
+        // Nothing survived the failure, so every row that was not refused
+        // outright is reported as failed rather than left `unprocessed` —
+        // a resume must retry them, not assume they were never reached.
+        rowOutcomes: results.rowOutcomes.map((outcome) =>
+          outcome === 'anonymized_skipped' ? outcome : ('failed' as LeadImportRowOutcome),
+        ),
       };
     }
   },
