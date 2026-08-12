@@ -3916,14 +3916,24 @@ Be helpful, concise, and accurate. Focus on actionable growth marketing advice. 
 export function calculateCost(
   promptTokens: number,
   completionTokens: number,
-  model: string
+  model: string,
+  // ENG-1134: cache tokens were omitted entirely, so this under-reported Emma's
+  // cost by the cache share — the bulk of a cached conversation. It no longer
+  // drives billing (that moved to the call-site meter), but it still drives the
+  // per-session cost the admin UI shows, and a display that disagrees with the
+  // ledger is how the last three metering tickets started.
+  cacheReadTokens: number = 0,
+  cacheWriteTokens: number = 0
 ): number {
   // Price from the single source of truth (llmPricing via computeCostMicroUsd)
   // so chatbot cost stays consistent with the shadow usage book and ENG-207
   // normalization. This replaced a stale hardcoded per-1K table whose gpt-4o
   // prompt rate was 10x the published list price ($25/1M vs $2.50/1M), which
   // silently overcharged Emma chatbot usage. Unknown models → 0 (unchanged).
-  return computeCostMicroUsd(model, promptTokens, completionTokens) / 1_000_000;
+  return (
+    computeCostMicroUsd(model, promptTokens, completionTokens, cacheReadTokens, cacheWriteTokens) /
+    1_000_000
+  );
 }
 
 // Helper function to log token usage
@@ -3934,10 +3944,13 @@ function logTokenUsage(
   const usage = response.usage;
   if (!usage) return;
 
+  const u: any = usage;
   const cost = calculateCost(
     usage.prompt_tokens,
     usage.completion_tokens,
-    response.model
+    response.model,
+    u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
+    u.cache_creation_input_tokens || 0
   );
 
   console.log(
