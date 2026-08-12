@@ -33,6 +33,7 @@ const mockGetLeadListById = jest.fn();
 const mockGetLeadById = jest.fn();
 const mockGetUserById = jest.fn();
 const mockUpdateLead = jest.fn().mockResolvedValue(undefined);
+const mockGetOrgById = jest.fn();
 
 jest.mock('../services/db', () => ({
   crmDb: {
@@ -44,6 +45,7 @@ jest.mock('../services/db', () => ({
   taskDb: { getTaskById: jest.fn() },
   subscriberDb: { getAllTaskSubscribers: jest.fn() },
   userDb: { getUserById: (...args: any[]) => mockGetUserById(...args) },
+  orgDb: { getOrgById: (...args: any[]) => mockGetOrgById(...args) },
 }));
 
 const mockAddLinkedInMessageEvent = jest.fn();
@@ -184,8 +186,10 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     expect(res.status).toHaveBeenCalledWith(404);
   });
 
-  it('allows an org member (same orgId, different userId) to send — not 404', async () => {
-    // List owned by a teammate; requester is in the same org.
+  it('returns 404 when org member is not the list owner and not a CRM editor (ENG-686)', async () => {
+    // ENG-686: send-linkedin-message is a destructive write. A plain org member
+    // (same org, not the owner, not in crm.editors) is denied. This endpoint
+    // deliberately returns 404 (not 403) to avoid leaking list existence.
     mockGetLeadListById.mockResolvedValue({ listId: 'list-123', userId: 'owner-id' });
     mockGetUserById.mockImplementation((id: string) =>
       Promise.resolve(
@@ -194,6 +198,11 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
           : { userId: 'owner-id', orgId: 'org-1' },
       ),
     );
+    mockGetOrgById.mockResolvedValue({
+      orgId: 'org-1',
+      ownerUserId: 'owner-id',
+      shareSettings: { crm: { enabled: true, editors: [] } },
+    });
     const req: any = {
       user: { userId: 'test-user-id' },
       params: { listId: 'list-123', leadId: 'lead-456' },
@@ -201,9 +210,8 @@ describe('POST /api/crm/lists/:listId/leads/:leadId/send-linkedin-message', () =
     };
     const res = makeRes();
     await handler!(req, res);
-    // Must NOT be rejected as "Lead list not found"; the send proceeds.
-    expect(res.status).not.toHaveBeenCalledWith(404);
-    expect(mockSendMessage).toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(404);
+    expect(mockSendMessage).not.toHaveBeenCalled();
   });
 
   it('returns 404 when lead not found', async () => {
