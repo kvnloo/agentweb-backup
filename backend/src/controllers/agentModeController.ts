@@ -43,7 +43,12 @@ import { stripImageDataForPersistence } from '../services/agentMode/incrementalP
 import { MarketingActionCarrier, normalizeMarketingActions } from '../services/marketingActionEnvelope';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
-import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
+import {
+  collectMediaGeneratedSince,
+  buildTimeoutContinuationMessage,
+  collectTurnWorkSince,
+  buildTimeoutPartialWorkMessage,
+} from '../utils/timeoutContinuation';
 import {
   reconcileFalseFailureReport,
   ledgerFromSucceededFunctions,
@@ -1788,7 +1793,10 @@ export type ScheduledContinuationReason = 'preview-only' | 'budget' | 'confirmat
 //       tool loop hits maxIterations, so it fires whether the final content is
 //       the canned "reached the maximum steps" apology OR the model's own
 //       partial text (the model usually complies with the "wrap up" nudge and
-//       writes non-report text, so text-pattern matching alone misses it);
+//       writes non-report text, so text-pattern matching alone misses it).
+//       ENG-907 adds the wall-clock twin, `truncatedByTimeBudget`: the run hit
+//       the whole-turn time cap and delivered a forced partial synthesis. Same
+//       meaning for the gate — real partial work that needs one more turn;
 //   (b) 'confirmation' — the turn halted to ask a human to confirm/approve
 //       before proceeding, with no human present to answer (ENG-369); or
 //   (c) 'unfinished' — the final text explicitly admits it left work unfinished
@@ -1844,10 +1852,11 @@ function withholdIsGenuine(content: string, publishAuthorized?: boolean): boolea
 export function classifyScheduledContinuation(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
 }, publishAuthorized?: boolean): ScheduledContinuationReason | null {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
-  if (response?.truncatedByStepBudget === true) return 'budget';
+  if (response?.truncatedByStepBudget === true || response?.truncatedByTimeBudget === true) return 'budget';
   const content = response?.content || '';
   // ENG-803: a deliberate publish-withhold is a COMPLETE terminal state, not a halt
   // awaiting an answer. Suppress only 'confirmation' — a withheld run can still be
@@ -1862,6 +1871,7 @@ export function classifyScheduledContinuation(response: {
 export function scheduledRunSignalsIncompleteResponse(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
 }): boolean {
   return classifyScheduledContinuation(response) !== null;
@@ -1959,10 +1969,11 @@ async function resolveLivePublishAuthorized(scheduleId: string): Promise<boolean
 export async function classifyScheduledContinuationAsync(response: {
   content?: string;
   truncatedByStepBudget?: boolean;
+  truncatedByTimeBudget?: boolean;
   toolCalls?: any[];
 }, resolvePublishAuthorizedNow?: () => Promise<boolean | undefined>): Promise<ScheduledContinuationReason | null> {
   if (scheduledRunPreviewedWithoutExecute(response?.toolCalls || [])) return 'preview-only';
-  if (response?.truncatedByStepBudget === true) return 'budget';
+  if (response?.truncatedByStepBudget === true || response?.truncatedByTimeBudget === true) return 'budget';
   const content = response?.content || '';
   // ENG-803: resolve authorization LAZILY — only a turn that actually emitted the
   // marker can be exempted, so a turn without one must not pay for a schedule read.
@@ -2492,6 +2503,7 @@ export async function runVerifiedChat(
           defaultModel,
           [],
           undefined, undefined, undefined, undefined, undefined, undefined,
+          undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
           livePublishAuthorization
         );
         if (continuationResponse.content) {
@@ -2621,6 +2633,7 @@ export async function runVerifiedChat(
         defaultModel,
         attachmentsForThisAttempt,
         undefined, undefined, undefined, undefined, undefined, undefined,
+        undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
         livePublishAuthorization
       );
 
@@ -4865,6 +4878,13 @@ export async function generateSessionResponse(
   // ENG-396: the structured selection stamped on this reply's metadata, so a card can
   // show which option was CLICKED (never inferred from the message text).
   answeredQuestionMeta?: { questionId: string; optionId: string; delegated: boolean },
+  // ENG-907: epoch ms stamped by the caller immediately before it wraps this promise in
+  // withGenerationTimeout. Threaded down to the tool loop so its wall-clock budget is
+  // measured against the deadline that is actually enforced — everything this function
+  // does first (session/message reads, the title LLM call, the fork IPC hop, the memory
+  // embedding backfill) would otherwise be silently subtracted from the synthesis
+  // reserve. Omitted by callers that run without a whole-turn cap.
+  turnStartMs?: number,
   // ENG-827: publish authorization already resolved by the caller (runVerifiedChat,
   // from runScheduledChat's single schedule snapshot). When supplied it is used
   // verbatim, so the prompt and the required-function checker can never disagree.
@@ -4886,6 +4906,9 @@ export async function generateSessionResponse(
   // and was truncated before emitting the final deliverable. The scheduled-run
   // completion gate uses this flag (not response text) to force a synthesis turn.
   truncatedByStepBudget?: boolean;
+  // ENG-907: the wall-clock counterpart — the turn ran out of time and delivered a
+  // partial answer from a forced synthesis turn instead of the full deliverable.
+  truncatedByTimeBudget?: boolean;
 }> {
   // Clear any stale cancel from a previous request on this session
   clearCancel(sessionId);
@@ -5137,7 +5160,10 @@ export async function generateSessionResponse(
       // ENG-827: forward the caller's resolved authorization so the prompt and the
       // checker are built from one value. Absent on the interactive path, where the
       // service resolves it per turn instead.
-      publishAuthorizationOverride
+      publishAuthorizationOverride,
+      // ENG-907: the caller's whole-turn deadline stamp (undefined when the caller
+      // enforces no cap), so the loop wraps itself up against the real deadline.
+      turnStartMs
     },
     (progress) => {
       // Emit progress updates via SSE
@@ -5802,6 +5828,9 @@ export const agentModeController = {
 
       // ENG-510: stamp when this turn's generation began so that, if the whole-turn cap
       // kills it mid-flight, we count only the media THIS turn saved (not prior turns').
+      // ENG-907: this is also the base of the cap itself (withGenerationTimeout starts
+      // in the same tick, just below), so it is threaded into the run as the anchor for
+      // the loop's own wall-clock budget.
       const turnStartMs = Date.now();
 
       // Capture the generation promise so the durable path can reattach to it if the
@@ -5817,7 +5846,8 @@ export const agentModeController = {
         isDelegatedAccessForMessage,
         undefined, // ishareSenderInfo
         answerAck, // ENG-396: make Emma name the chosen option in her reply
-        answeredQuestionMeta // ENG-396: structured click record stamped on the reply
+        answeredQuestionMeta, // ENG-396: structured click record stamped on the reply
+        turnStartMs // ENG-907: the deadline withGenerationTimeout below enforces
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -5907,6 +5937,33 @@ export const agentModeController = {
                 void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_media' });
               }
               res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+              return;
+            }
+
+            // ENG-907: no images, but the turn may still have done real research before the
+            // cap fired — ENG-473 has already persisted it. The loop's own time budget tries
+            // to wrap up first, but it can only re-check between iterations, so a long tool
+            // call can leave too little time for the forced synthesis (measured live: budget
+            // fired with 27s left, synthesis still guillotined). This is the backstop that
+            // makes the outcome deterministic: acknowledge the saved work and invite
+            // "continue" instead of putting a red error on top of it. Still returns null —
+            // and so still 504s — when the turn genuinely produced nothing.
+            const salvagedWork = collectTurnWorkSince(timedOutSession?.messages, turnStartMs);
+            const partialWorkMsg = buildTimeoutPartialWorkMessage(salvagedWork);
+            if (partialWorkMsg) {
+              markProgressComplete(sessionId);
+              await chatbotDb.addMessageToSession(sessionId, {
+                role: 'assistant',
+                content: partialWorkMsg,
+                timestamp: new Date().toISOString(),
+                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+              }).catch((persistErr) =>
+                console.error('AgentMode: failed to persist timeout partial-work message:', persistErr),
+              );
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_work' });
+              }
+              res.json({ content: partialWorkMsg, partialWorkDelivery: true });
               return;
             }
           } catch (continuationErr) {
@@ -6728,7 +6785,14 @@ export const agentModeController = {
           true, // isInteractiveShare - block admin tools for security
           undefined, // pageContext
           undefined, // isDelegatedAccess
-          ishareSenderInfo
+          ishareSenderInfo,
+          undefined, // answerAck
+          undefined, // answeredQuestionMeta
+          // ENG-907: this endpoint enforces the same whole-turn cap as the interactive
+          // one (withGenerationTimeout is armed on the next line), so hand the loop the
+          // deadline too — otherwise an ishare turn is guillotined with nothing to show
+          // for it, exactly as ENG-907 described.
+          sharedTurnStartMs
         ),
         session.sessionId
       );
@@ -6791,6 +6855,24 @@ export const agentModeController = {
             // Progress was already completed above; the session lock is released in the
             // inner finally, so this early return is safe.
             res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+            return;
+          }
+
+          // ENG-907: same backstop as the regular /generate path — a timed-out ishare turn
+          // that did real work reports it and invites "continue" rather than surfacing a
+          // bare timeout over research that is already saved in the thread.
+          const partialWorkMsg = buildTimeoutPartialWorkMessage(
+            collectTurnWorkSince(timedOutSession?.messages, sharedTurnStartMs),
+          );
+          if (partialWorkMsg) {
+            await chatbotDb.addMessageToSession(shareId, {
+              role: 'assistant',
+              content: partialWorkMsg,
+              timestamp: new Date().toISOString(),
+              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+            });
+            handledPartialTimeout = true;
+            res.json({ content: partialWorkMsg, partialWorkDelivery: true });
             return;
           }
         } catch (persistErr) {

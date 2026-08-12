@@ -29,6 +29,10 @@ interface GenerateMarketingResponseParams {
   // "draft only" while the checker still demands a publishing tool, which is the retry
   // loop this ticket exists to fix. Plain data, so it survives serialization.
   publishAuthorizationOverride?: { authorized: boolean; tools: string[] };
+  // ENG-907: epoch ms at which the caller started this turn's whole-turn wall-clock
+  // cap. Passed through to the loop so its time budget uses the SAME deadline the
+  // caller enforces, rather than one that starts after the fork IPC hop.
+  turnStartMs?: number;
 }
 
 interface GenerateMarketingResponseResult {

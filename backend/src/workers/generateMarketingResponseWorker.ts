@@ -73,7 +73,7 @@ process.on('message', async (message: any) => {
       // Ensure initialization completed (should already be done)
       await ensureInitialized();
 
-      const { messageContent, sessionHistory, userId, llmModel, sessionId, mockMode, isInteractiveShare, isDelegatedAccess, excludeTools, screenshotUrl, persistIncrementally, publishAuthorizationOverride } = message.params;
+      const { messageContent, sessionHistory, userId, llmModel, sessionId, mockMode, isInteractiveShare, isDelegatedAccess, excludeTools, screenshotUrl, persistIncrementally, publishAuthorizationOverride, turnStartMs } = message.params;
 
       // Progress callback to forward progress updates to parent process
       const onProgress = (progress: { iteration: number; status: string; toolCalls?: any[]; pendingTools?: string[]; suggestions?: string[] }) => {
@@ -107,7 +107,10 @@ process.on('message', async (message: any) => {
         screenshotUrl,
         isDelegatedAccess,
         persistIncrementally,
-        publishAuthorizationOverride
+        publishAuthorizationOverride,
+        // ENG-907: the caller's whole-turn deadline stamp, so the loop's time budget
+        // measures against the same cap (the fork/IPC hop happens before we get here).
+        turnStartMs
       );
 
       // Clean up cancelled flag
