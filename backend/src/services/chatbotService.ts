@@ -24,6 +24,7 @@ import { uploadFileToS3, uploadScreenshotToS3 } from '../utils/s3Utils';
 import { scanMessagesForAssets } from '../utils/scanMessagesForAssets';
 import { withKeyedMutex } from '../utils/keyedMutex';
 import { computeCostMicroUsd } from './usageRecorderService';
+import type { CacheWriteByTtl } from '../utils/llmPricing';
 import { approvalDb } from './approvalDb';
 import { PendingUserQuestion } from './agentMode/core/askUserQuestion';
 // Load environment variables from .env file
@@ -3932,7 +3933,13 @@ export function calculateCost(
   // per-session cost the admin UI shows, and a display that disagrees with the
   // ledger is how the last three metering tickets started.
   cacheReadTokens: number = 0,
-  cacheWriteTokens: number = 0
+  cacheWriteTokens: number = 0,
+  // ENG-893 splits cache writes by the TTL Bedrock actually applied: 1.25x input
+  // at 5 minutes, 2x at one hour. Dropping it prices every write at the 5-minute
+  // rate, so an Emma-on-Claude session with 1h writes shows a cost materially
+  // below the ledger figure for the same call — the display/ledger disagreement
+  // this whole ticket exists to eliminate.
+  cacheWriteByTtl?: CacheWriteByTtl
 ): number {
   // Price from the single source of truth (llmPricing via computeCostMicroUsd)
   // so chatbot cost stays consistent with the shadow usage book and ENG-207
@@ -3940,8 +3947,14 @@ export function calculateCost(
   // prompt rate was 10x the published list price ($25/1M vs $2.50/1M), which
   // silently overcharged Emma chatbot usage. Unknown models → 0 (unchanged).
   return (
-    computeCostMicroUsd(model, promptTokens, completionTokens, cacheReadTokens, cacheWriteTokens) /
-    1_000_000
+    computeCostMicroUsd(
+      model,
+      promptTokens,
+      completionTokens,
+      cacheReadTokens,
+      cacheWriteTokens,
+      cacheWriteByTtl
+    ) / 1_000_000
   );
 }
 
@@ -3959,7 +3972,8 @@ function logTokenUsage(
     usage.completion_tokens,
     response.model,
     u.cache_read_input_tokens || u.prompt_tokens_details?.cached_tokens || 0,
-    u.cache_creation_input_tokens || 0
+    u.cache_creation_input_tokens || 0,
+    u.cache_creation_by_ttl
   );
 
   console.log(
