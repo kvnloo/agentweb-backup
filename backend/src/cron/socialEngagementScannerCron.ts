@@ -230,6 +230,7 @@ export class SocialEngagementScanner {
                     commentId: params.commentId,
                     engagingAccountId: params.engagingAccountId,
                     actionType: params.actionType,
+                    scheduleId,
                 });
             } catch (deleteErr) {
                 console.error(`[Scanner] Failed to roll back tracking record for "${params.actionType}" on ${params.postId}:`, deleteErr);

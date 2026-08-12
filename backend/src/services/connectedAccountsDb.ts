@@ -526,18 +526,25 @@ export const updateAccountTokens = async (
   },
   accountId?: string
 ): Promise<void> => {
-  const user = await userDb.getUserById(userId);
+  // Token refresh is an external-credential write. Resolve the primary record
+  // strongly so a just-disconnected account cannot be refreshed from a stale
+  // UserIdIndex result and restored to connected_accounts.
+  const user = await userDb.getUserByIdConsistent(userId);
   if (!user) {
     throw new Error('User not found');
   }
 
-  const accounts = normalizeAccounts((user as User).connected_accounts);
+  const storedAccounts = (user as User).connected_accounts;
+  const accounts = normalizeAccounts(storedAccounts);
   const accountIndex = accountId
     ? accounts.findIndex(acc => acc.platform === platform && acc.account_id === accountId)
     : accounts.findIndex(acc => acc.platform === platform);
 
   if (accountIndex < 0) {
-    throw new Error(`No ${platform} account${accountId ? ` with id "${accountId}"` : ''} connected`);
+    throw Object.assign(
+      new Error(`${platform === 'linkedin' ? 'LinkedIn' : 'Connected'} account changed or disconnected while refreshing; retry`),
+      { code: 'ConnectedAccountChanged' },
+    );
   }
 
   const existingAccount = accounts[accountIndex];
@@ -555,9 +562,27 @@ export const updateAccountTokens = async (
   const updatedAccounts = [...accounts];
   updatedAccounts[accountIndex] = updatedAccount;
 
-  await userDb.updateUser(userId, {
-    connected_accounts: updatedAccounts,
-  } as Partial<User>);
+  try {
+    await userDb.updateUser(userId, {
+      connected_accounts: updatedAccounts,
+    } as Partial<User>, {
+      // Carry the strong-read decision into the write. Otherwise a disconnect
+      // between the read and update could be overwritten with the stale account.
+      condition: {
+        expression: '#expectedConnectedAccounts = :expectedConnectedAccounts',
+        names: { '#expectedConnectedAccounts': 'connected_accounts' },
+        values: { ':expectedConnectedAccounts': storedAccounts },
+      },
+    });
+  } catch (error: any) {
+    if (error?.code === 'ConditionalCheckFailedException') {
+      throw Object.assign(
+        new Error(`${platform === 'linkedin' ? 'LinkedIn' : 'Connected'} account changed or disconnected while refreshing; retry`),
+        { code: 'ConnectedAccountChanged' },
+      );
+    }
+    throw error;
+  }
 };
 
 /**
@@ -663,6 +688,23 @@ export interface ConnectedAccountWithUser extends ConnectedAccount {
   userId: string;
 }
 
+const findAccountForUser = (
+  user: User | undefined,
+  accountId: string,
+  userId: string,
+  platform?: PlatformType | PlatformType[]
+): ConnectedAccountWithUser | null => {
+  const platforms = platform === undefined ? null : ([] as PlatformType[]).concat(platform);
+  if (!user) return null;
+
+  const accounts = normalizeAccounts(user.connected_accounts);
+  const account = accounts.find(
+    acc => acc.account_id === accountId && (platforms === null || platforms.includes(acc.platform))
+  );
+
+  return account ? { ...account, userId } : null;
+};
+
 /**
  * Get a specific connected account by account_id and userId.
  * Directly looks up the user to find the account, avoiding full table scan.
@@ -679,25 +721,29 @@ export const getAccountById = async (
 ): Promise<ConnectedAccountWithUser | null> => {
   try {
     const user = await userDb.getUserById(userId);
-    const platforms = platform === undefined ? null : ([] as PlatformType[]).concat(platform);
-
-    if (user) {
-      const accounts = normalizeAccounts((user as User).connected_accounts);
-      const account = accounts.find(
-        acc => acc.account_id === accountId && (platforms === null || platforms.includes(acc.platform))
-      );
-
-      if (account) {
-        return {
-          ...account,
-          userId: (user as User).userId,
-        };
-      }
-    }
-
-    return null;
+    return findAccountForUser(user as User | undefined, accountId, userId, platform);
   } catch (error) {
     console.error('Error in getAccountById:', error);
+    return null;
+  }
+};
+
+/**
+ * Strongly current account lookup for external writes. This avoids the
+ * eventually consistent UserIdIndex briefly returning an OAuth account after
+ * it was disconnected, without adding an extra base-table read to ordinary
+ * account listing and analytics paths.
+ */
+export const getAccountByIdConsistent = async (
+  accountId: string,
+  userId: string,
+  platform?: PlatformType | PlatformType[]
+): Promise<ConnectedAccountWithUser | null> => {
+  try {
+    const user = await userDb.getUserByIdConsistent(userId);
+    return findAccountForUser(user as User | undefined, accountId, userId, platform);
+  } catch (error) {
+    console.error('Error in getAccountByIdConsistent:', error);
     return null;
   }
 };

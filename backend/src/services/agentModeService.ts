@@ -29577,7 +29577,7 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountsWithOwnerIncludingOrgShared } = await import('./connectedAccountsDb');
+      const { getAccountsWithOwnerIncludingOrgShared, getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       // Fetch all accessible accounts (own + org-shared) once, so org-shared accounts
@@ -29629,6 +29629,20 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
       // account.userId is the token owner (equals userId for own accounts,
       // the org member's userId for org-shared accounts).
       const ownerUserId: string = (account as any).userId || userId;
+
+      // A listing is not an authorization grant for an irreversible LinkedIn
+      // write. Re-read the owner record immediately before posting so a
+      // concurrent disconnect cannot leave this request with a usable token.
+      if (account.platform === 'linkedin') {
+        const currentAccount = await getAccountByIdConsistent(account.account_id, ownerUserId, 'linkedin');
+        if (!currentAccount) {
+          return { success: false, message: 'LinkedIn account is no longer connected' };
+        }
+        if (ownerUserId !== userId && currentAccount.sharedWithOrg !== true) {
+          return { success: false, message: 'Account not found or access denied' };
+        }
+        account = currentAccount;
+      }
 
       // The adapter handles token refresh internally before making API calls.
       console.log('[AgentMode] Getting adapter for platform:', account.platform);
@@ -29695,10 +29709,10 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     console.log('[AgentMode] linkedinRepost called:', { userId, accountId, postUrn, hasCommentary: !!commentary });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
+      const { getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
-      const account = await getAccountById(accountId, userId);
+      const account = await getAccountByIdConsistent(accountId, userId, 'linkedin');
       if (!account) {
         return { success: false, message: 'Account not found or access denied' };
       }
@@ -29712,7 +29726,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
         return { success: false, message: 'Repost is not supported for this platform' };
       }
 
-      const result = await adapter.createRepost(account, postUrn, commentary, userId);
+      // A prior lookup is only an eligibility check. Re-read immediately before
+      // the provider write so a concurrent disconnect cannot leave a usable token
+      // in memory for the remainder of this request.
+      const currentAccount = await getAccountByIdConsistent(accountId, userId, 'linkedin');
+      if (!currentAccount) {
+        return { success: false, message: 'LinkedIn account is no longer connected' };
+      }
+
+      const result = await adapter.createRepost(currentAccount, postUrn, commentary, userId);
 
       return {
         success: true,
@@ -29738,12 +29760,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
+      const { getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       try {
         console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
+        const account = await getAccountByIdConsistent(accountId, userId, 'linkedin');
         console.log('[AgentMode] Account lookup result:', account ? {
           found: true,
           platform: account.platform,
@@ -29804,8 +29826,15 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           console.warn('[AgentMode] commentOnLinkedInPost: could not check existing comments, proceeding anyway:', checkError.message);
         }
 
+        // The duplicate check above can be slow. Re-read the account immediately
+        // before the irreversible write so disconnect wins over an in-flight run.
+        const currentAccount = await getAccountByIdConsistent(accountId, userId, 'linkedin');
+        if (!currentAccount) {
+          return { success: false, message: 'LinkedIn account is no longer connected' };
+        }
+
         console.log('[AgentMode] Calling adapter.createComment (adapter will handle token refresh if needed)...');
-        const result = await adapter.createComment(account, postUrn, commentText, userId, parentCommentUrn);
+        const result = await adapter.createComment(currentAccount, postUrn, commentText, userId, parentCommentUrn);
 
         return {
           success: true,
@@ -29890,12 +29919,12 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
     });
 
     try {
-      const { getAccountById } = await import('./connectedAccountsDb');
+      const { getAccountByIdConsistent } = await import('./connectedAccountsDb');
       const { socialPlatformService } = await import('./socialPlatformService');
 
       try {
         console.log('[AgentMode] Looking up account:', accountId);
-        const account = await getAccountById(accountId, userId);
+        const account = await getAccountByIdConsistent(accountId, userId, 'linkedin');
         console.log('[AgentMode] Account lookup result:', account ? {
           found: true,
           platform: account.platform,
@@ -29930,8 +29959,13 @@ IMPORTANT: Always respond with valid JSON. Escape quotes in the content properly
           };
         }
 
+        const currentAccount = await getAccountByIdConsistent(accountId, userId, 'linkedin');
+        if (!currentAccount) {
+          return { success: false, message: 'LinkedIn account is no longer connected' };
+        }
+
         console.log('[AgentMode] Calling adapter.createReaction (adapter will handle token refresh if needed)...');
-        const result = await adapter.createReaction(account, postUrn, reactionType, userId);
+        const result = await adapter.createReaction(currentAccount, postUrn, reactionType, userId);
 
         return {
           success: true,
