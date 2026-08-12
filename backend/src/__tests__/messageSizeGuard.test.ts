@@ -99,6 +99,30 @@ describe('shrinkMessageForPersistence (ENG-946)', () => {
     expect(shrunk.role).toBe('assistant');
   });
 
+  // The guard this replaced sliced content to MAX_MESSAGE_CONTENT_SIZE *characters*
+  // and called it done. JSON escaping can double that: 350,000 quote characters
+  // serialize to 700,000, so an escape-heavy tool payload stayed over DynamoDB's
+  // 400KB limit even AFTER "truncation", and batchWrite threw anyway. Budget must be
+  // measured on the serialized form, which is why fitContent converges instead of
+  // trusting its first estimate.
+  it('fits escape-heavy content, where a character-count slice would not', () => {
+    const message = {
+      role: 'tool',
+      name: 'search_tool_response',
+      tool_call_id: 'x',
+      content: '"'.repeat(50_000),
+    };
+    // The naive slice-to-budget a caller might reach for still blows past it.
+    expect(JSON.stringify({ ...message, content: message.content.slice(0, MAX) }).length)
+      .toBeGreaterThan(MAX);
+
+    const shrunk: any = shrinkMessageForPersistence(message, MAX);
+
+    expect(size(shrunk)).toBeLessThanOrEqual(MAX);
+    expect(shrunk.role).toBe('tool');
+    expect(shrunk.content).toContain('Truncated');
+  });
+
   it('is a no-op for non-object input', () => {
     expect(shrinkMessageForPersistence(null as any, MAX)).toBeNull();
     expect(shrinkMessageForPersistence('nope' as any, MAX)).toBe('nope');
