@@ -93,9 +93,11 @@ describe('ENG-1054 CRM record counts', () => {
   });
 
   describe('diagnosis agent prompt', () => {
-    // The succeeded-operations map is a histogram of tool CALLS. Presented without
-    // that label it reads as a count of the things the tool acts on — which is how a
-    // 3-batch, 75-lead import became "the 3 leads".
+    // The succeeded-operations map is a histogram of tool CALLS, and read as a count
+    // of the things the tool acts on it is how a 3-batch, 75-lead import became "the
+    // 3 leads". Labelling the numbers was not enough — a label is only as good as the
+    // model's compliance, and nothing on this path needs the values — so the numbers
+    // are no longer passed at all.
     const buildPrompt = async (context: any) => {
       const captured: any[] = [];
       (agentModeService as any).callLLM = async (_model: string, messages: any[]) => {
@@ -115,21 +117,28 @@ describe('ENG-1054 CRM record counts', () => {
       succeededFunctions: { add_leads_to_list: 3, create_lead_list: 1, get_lead_lists: 1 },
     };
 
-    it('labels the succeeded-operations numbers as call counts', async () => {
+    it('never hands the model the call-count numbers', async () => {
       const prompt = await buildPrompt(CONTEXT);
-      expect(prompt).toMatch(/number of (?:times|calls)|times the tool ran|tool CALLS/i);
-      expect(prompt).toMatch(/not\b[^\n]*\b(?:records?|rows?|leads?|items?)/i);
+      const succeededLine = prompt
+        .split('\n')
+        .find((line) => /Succeeded operations/i.test(line)) as string;
+
+      expect(succeededLine).toBeDefined();
+      // The "3" of "the 3 leads" is not in the prompt at all.
+      expect(succeededLine).not.toMatch(/\d/);
+      expect(succeededLine).not.toContain('{');
     });
 
-    it('forbids restating a call count as a record count', async () => {
+    it('forbids stating a quantity of items at all', async () => {
       const prompt = await buildPrompt(CONTEXT);
-      // The agent must be told to name WHAT succeeded without quoting the number.
-      expect(prompt).toMatch(/do not\b[^\n]*\bnumber/i);
+      expect(prompt).toMatch(/never state a quantity|never how many/i);
+      expect(prompt).toMatch(/no counts/i);
     });
 
-    it('still tells the agent the operations completed', async () => {
+    it('still tells the agent which operations completed', async () => {
       const prompt = await buildPrompt(CONTEXT);
       expect(prompt).toContain('add_leads_to_list');
+      expect(prompt).toContain('create_lead_list');
       expect(prompt).toMatch(/COMPLETED/);
     });
   });

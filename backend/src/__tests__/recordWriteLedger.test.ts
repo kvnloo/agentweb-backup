@@ -25,6 +25,7 @@ import {
   appendConfirmedPublishNotice,
   collectConfirmedPublishActions,
   collectConfirmedRecordWrites,
+  recordWriteLedgerFromTranscript,
   reconcileRecordCountReport,
   CONFIRMED_RECORD_WRITE_TOOLS,
 } from '../utils/falseFailureReport';
@@ -60,6 +61,31 @@ describe('ENG-1054 record-write ledger', () => {
       ]);
       expect(writes.leadsWritten).toBe(25);
       expect(writes.calls).toBe(1);
+    });
+
+    it('ignores a batch the handler itself reported as failed', () => {
+      // toolDispatch pushes a handler return of `success: false` as a RESULTED entry
+      // (no `error` field), and add_leads_to_list returns exactly that on a missing
+      // list or an access denial. Counting it would announce a failed import as
+      // confirmed work and invite the user not to re-run it.
+      const writes = collectConfirmedRecordWrites([
+        { name: 'add_leads_to_list', result: { success: false, message: 'Lead list not found' } },
+        { name: 'create_lead_list', result: { success: false, message: 'Access denied' } },
+      ]);
+      expect(writes.leadsWritten).toBe(0);
+      expect(writes.calls).toBe(0);
+      expect(writes.listCreated).toBe(false);
+      expect(writes.actions).toEqual([]);
+    });
+
+    it('ignores a call deferred by the media time budget', () => {
+      // A deferral is neither success nor failure — the call never ran.
+      const writes = collectConfirmedRecordWrites([
+        { name: 'add_leads_to_list', result: { deferred: true, reason: 'media_generation_time_budget' } },
+      ]);
+      expect(writes.leadsWritten).toBe(0);
+      expect(writes.calls).toBe(0);
+      expect(writes.actions).toEqual([]);
     });
 
     it('counts a batch that wrote nothing as no records written', () => {
@@ -215,6 +241,111 @@ describe('ENG-1054 record-write ledger', () => {
       const text = 'I successfully added the 3 leads to your CRM list.';
       const once = reconcileRecordCountReport(text, LEDGER_75);
       expect(reconcileRecordCountReport(once, LEDGER_75)).toBe(once);
+    });
+  });
+
+  // The diagnosis path — the one that actually wrote "successfully added the 3
+  // leads" — has no toolCalls[]: it rebuilds the ledger from the session's success
+  // HISTOGRAM, which carries names only, so the count reconciler had nothing to
+  // check against there. The persisted transcript is the counted record it needs.
+  describe('recordWriteLedgerFromTranscript', () => {
+    const turn = (extra: any[] = []) => [
+      { role: 'user', content: 'Import the prospects from this sheet' },
+      ...extra,
+    ];
+
+    it('rebuilds real record counts from the persisted tool messages', () => {
+      const ledger = recordWriteLedgerFromTranscript(
+        turn([
+          { role: 'assistant', content: 'Creating the list…' },
+          { role: 'tool', name: 'create_lead_list', content: JSON.stringify({ success: true, listId: 'l1' }) },
+          { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify({ success: true, successCount: 25 }) },
+          { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify({ success: true, successCount: 25 }) },
+          { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify({ success: true, successCount: 25 }) },
+        ]),
+      );
+
+      const writes = collectConfirmedRecordWrites(ledger);
+      expect(writes.leadsWritten).toBe(75);
+      expect(writes.calls).toBe(3);
+      expect(writes.listCreated).toBe(true);
+    });
+
+    it('gives the diagnosis path enough to correct the production message', () => {
+      const ledger = recordWriteLedgerFromTranscript(
+        turn([
+          { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify({ success: true, successCount: 25 }) },
+          { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify({ success: true, successCount: 25 }) },
+          { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify({ success: true, successCount: 25 }) },
+        ]),
+      );
+      const out = reconcileRecordCountReport(
+        'I have successfully added the 3 leads to your CRM list. Please retry the request.',
+        ledger,
+      );
+
+      expect(out).toContain('75 leads');
+      expect(out).toMatch(/do NOT/i);
+    });
+
+    it('scopes to this turn — an earlier turn\'s import is not re-counted', () => {
+      const ledger = recordWriteLedgerFromTranscript([
+        { role: 'user', content: 'Import batch one' },
+        { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify({ success: true, successCount: 40 }) },
+        { role: 'assistant', content: 'Imported 40 leads.' },
+        { role: 'user', content: 'Now import batch two' },
+        { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify({ success: true, successCount: 25 }) },
+      ]);
+
+      expect(collectConfirmedRecordWrites(ledger).leadsWritten).toBe(25);
+    });
+
+    it('drops a failed call and a handler-reported failure', () => {
+      const ledger = recordWriteLedgerFromTranscript(
+        turn([
+          { role: 'tool', name: 'add_leads_to_list', content: '⚠️ Tool Error: add_leads_to_list failed — DynamoDB throttled' },
+          { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify({ success: false, message: 'Lead list not found' }) },
+        ]),
+      );
+
+      const writes = collectConfirmedRecordWrites(ledger);
+      expect(writes.leadsWritten).toBe(0);
+      expect(writes.calls).toBe(0);
+    });
+
+    it('degrades an unparseable result to an unnumbered entry, never a guess', () => {
+      const ledger = recordWriteLedgerFromTranscript(
+        turn([{ role: 'tool', name: 'add_leads_to_list', content: 'Successfully processed the import.' }]),
+      );
+
+      const writes = collectConfirmedRecordWrites(ledger);
+      expect(writes.leadsWritten).toBe(0);
+      expect(writes.calls).toBe(1);
+      expect(writes.actions.join(' ')).not.toMatch(/\d/);
+    });
+
+    it('ignores non-record-write tool messages', () => {
+      expect(
+        recordWriteLedgerFromTranscript(
+          turn([
+            { role: 'tool', name: 'get_lead_lists', content: JSON.stringify({ totalLists: 4 }) },
+            { role: 'assistant', content: 'Here are your lists.' },
+          ]),
+        ),
+      ).toEqual([]);
+    });
+
+    it('returns nothing without a turn boundary or a usable transcript', () => {
+      // No user message means no way to tell this turn's writes from the session's
+      // lifetime total — silence beats a correction built on an over-count.
+      expect(
+        recordWriteLedgerFromTranscript([
+          { role: 'tool', name: 'add_leads_to_list', content: JSON.stringify({ successCount: 25 }) },
+        ]),
+      ).toEqual([]);
+      expect(recordWriteLedgerFromTranscript(null)).toEqual([]);
+      expect(recordWriteLedgerFromTranscript(undefined)).toEqual([]);
+      expect(recordWriteLedgerFromTranscript('nope' as any)).toEqual([]);
     });
   });
 });
