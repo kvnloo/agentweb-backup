@@ -328,6 +328,54 @@ describe('AgentModeController - ishare Model Selection', () => {
       );
     });
 
+    it('records the approved fallback after a transient failure on an unstamped legacy shared session', async () => {
+      const approvedFallback = 'anthropic.claude-haiku-4-5-20251001-v1:0';
+      mockChatbotDb.getChatSession.mockResolvedValue(mockSessionWithModel);
+      mockAgentModeService.getSupportedModels.mockResolvedValue([
+        'gemini-3-pro-preview',
+        'gemini-3.1-flash-lite',
+        approvedFallback,
+        'gpt-5-chat-2',
+      ]);
+      mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
+        billingUserId: 'test-user-123',
+        policy: {
+          ...optimizedPolicy,
+          optimizedModelIds: ['gemini-3.1-flash-lite', approvedFallback],
+        },
+        costUsedMicroUsd: 30_000_000,
+        tokenUsed: 1,
+        mode: { usageMode: 'optimized', admissionAllowed: true, reason: 'optimization_threshold_reached' },
+      });
+      mockGenerateMarketingResponseWorkerService.runInWorker.mockResolvedValue({
+        ...mockResponse,
+        backupModelUsed: true,
+        originalModel: 'gemini-3.1-flash-lite',
+        backupModel: approvedFallback,
+      });
+
+      const req = {
+        params: { shareId: mockSessionId },
+        query: { conversable: mockConversableToken },
+        body: { userMessage: 'Test message', attachments: [] },
+        on: jest.fn(),
+      } as unknown as Request;
+      const res = { json: jest.fn(), status: jest.fn().mockReturnThis() } as unknown as Response;
+
+      await agentModeController.generateSharedResponse(req, res);
+
+      expect(mockChatbotDb.updateSessionLlmModel).toHaveBeenLastCalledWith(
+        mockSessionId,
+        approvedFallback,
+        expect.objectContaining({
+          effectiveModel: approvedFallback,
+          backupModel: approvedFallback,
+          usageMode: 'optimized',
+          modelSelectionReason: 'primary_model_transient_failure_using_policy_fallback',
+        }),
+      );
+    });
+
     it('makes no provider call when the shared-session owner is paused by cost policy', async () => {
       mockChatbotDb.getChatSession.mockResolvedValue(mockSessionWithModel);
       mockGetEffectiveLlmUsagePolicy.mockResolvedValue({
