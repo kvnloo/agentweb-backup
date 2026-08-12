@@ -219,6 +219,9 @@ async function applyScheduleEditWithConsentNarrowing(
 type EffectiveModelPolicyDecision = PolicyModelDecision & {
   usageMode: 'full_choice' | 'optimized' | 'paused';
   usagePolicyVersion: string | null;
+  // undefined keeps unrestricted requests on the global backup behavior; optimized
+  // requests always carry string|null so provider retries cannot escape the catalog.
+  transientFallbackModel?: string | null;
 };
 
 function toStoredModelPolicyDecision(decision: EffectiveModelPolicyDecision) {
@@ -275,10 +278,19 @@ async function resolveEffectiveModelForUser(input: {
     supportedModelIds,
     policy: usage.policy,
   });
+  let transientFallbackModel: string | null | undefined;
+  if (usage.mode.usageMode === 'optimized') {
+    const optimizedModels = new Set(usage.policy?.optimizedModelIds || []);
+    transientFallbackModel = [decision.backupModel, usage.policy?.optimizedDefaultModel, ...optimizedModels]
+      .find((model): model is string => Boolean(
+        model && model !== decision.effectiveModel && optimizedModels.has(model) && supportedModelIds.includes(model)
+      )) || null;
+  }
   return {
     ...decision,
     usageMode: usage.mode.usageMode,
     usagePolicyVersion: usage.policy?.version || null,
+    transientFallbackModel,
   };
 }
 
@@ -2243,6 +2255,9 @@ export async function runVerifiedChat(
      * required-function list together, so they still cannot disagree.
      */
     refreshPublishAuthorization?: () => Promise<SchedulePublishAuthorization | null>;
+    // Already resolved by the cost policy. Optimized scheduled runs pass string|null
+    // so a transient retry remains inside the approved optimized catalog.
+    transientFallbackModel?: string | null;
   }
 ): Promise<RunVerifiedChatResult> {
   const {
@@ -2641,7 +2656,8 @@ export async function runVerifiedChat(
           [],
           undefined, undefined, undefined, undefined, undefined, undefined,
           undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
-          livePublishAuthorization
+          livePublishAuthorization,
+          params.transientFallbackModel
         );
         if (continuationResponse.content) {
           allContent += (allContent ? '\n\n' : '') + continuationResponse.content;
@@ -2771,7 +2787,8 @@ export async function runVerifiedChat(
         attachmentsForThisAttempt,
         undefined, undefined, undefined, undefined, undefined, undefined,
         undefined, // ENG-907 turnStartMs — this path runs without a whole-turn cap
-        livePublishAuthorization
+        livePublishAuthorization,
+        params.transientFallbackModel
       );
 
       if (!hasAssistantOutput(response)) {
@@ -3888,6 +3905,7 @@ export async function runScheduledChat(
       maxAttempts: 20,
       attachments: fileAttachments,
       llmModel: modelToUse,
+      transientFallbackModel: scheduleModelPolicy.transientFallbackModel,
       // ENG-657: on a resume, count the abandoned portion's tool calls in
       // verification so requiredFunctionCalls isn't falsely missed (empty otherwise).
       priorToolCalls: resumePriorToolCalls,
@@ -5052,7 +5070,10 @@ export async function generateSessionResponse(
   // verbatim, so the prompt and the required-function checker can never disagree.
   // When absent — the interactive route, or a resumed run entered directly — fall
   // back to reading the schedule for this turn.
-  publishAuthorizationOverride?: SchedulePublishAuthorization
+  publishAuthorizationOverride?: SchedulePublishAuthorization,
+  // Cost-policy-owned transient retry target. Optimized callers always pass a
+  // string or null; omission preserves the unrestricted global backup behavior.
+  transientFallbackModel?: string | null,
 ): Promise<{
   content: string;
   toolCalls: any[];
@@ -5325,13 +5346,36 @@ export async function generateSessionResponse(
       publishAuthorizationOverride,
       // ENG-907: the caller's whole-turn deadline stamp (undefined when the caller
       // enforces no cap), so the loop wraps itself up against the real deadline.
-      turnStartMs
+      turnStartMs,
+      transientFallbackModel,
     },
     (progress) => {
       // Emit progress updates via SSE
       emitProgress(sessionId, progress);
     }
   );
+
+  // The admission decision is stamped before dispatch. If the provider then fails
+  // transiently and the approved optimized fallback actually answers, update the
+  // session to the model that incurred cost so audits never report the failed primary
+  // as the effective model. This is scoped to policy-owned fallbacks; unrestricted
+  // legacy retries retain their existing persistence behavior.
+  if (
+    response.backupModelUsed &&
+    response.backupModel &&
+    transientFallbackModel !== undefined &&
+    session.llmUsagePolicyDecision?.usageMode === 'optimized'
+  ) {
+    await chatbotDb.updateSessionLlmModel(sessionId, response.backupModel, {
+      ...session.llmUsagePolicyDecision,
+      effectiveModel: response.backupModel,
+      backupModel: response.backupModel,
+      backupSource: 'system',
+      modelSelection: 'corrected',
+      modelSelectionReason: 'primary_model_transient_failure_using_policy_fallback',
+      recordedAt: new Date().toISOString(),
+    });
+  }
 
   // If the user clicked Stop, drop the FINAL (in-flight) turn — we don't run the batch
   // below, so a page reload shows no ghost final response from the cancelled turn. Any
@@ -6095,7 +6139,9 @@ export const agentModeController = {
         undefined, // ishareSenderInfo
         answerAck, // ENG-396: make Emma name the chosen option in her reply
         answeredQuestionMeta, // ENG-396: structured click record stamped on the reply
-        turnStartMs // ENG-907: the deadline withGenerationTimeout below enforces
+        turnStartMs, // ENG-907: the deadline withGenerationTimeout below enforces
+        undefined, // publishAuthorizationOverride — interactive path resolves per turn
+        modelPolicyDecision.transientFallbackModel
       );
 
       let response: Awaited<ReturnType<typeof generateSessionResponse>>;
@@ -7107,7 +7153,9 @@ export const agentModeController = {
           // one (withGenerationTimeout is armed on the next line), so hand the loop the
           // deadline too — otherwise an ishare turn is guillotined with nothing to show
           // for it, exactly as ENG-907 described.
-          sharedTurnStartMs
+          sharedTurnStartMs,
+          undefined, // publishAuthorizationOverride — shared path has no schedule consent
+          modelPolicyDecision.transientFallbackModel
         ),
         session.sessionId
       );

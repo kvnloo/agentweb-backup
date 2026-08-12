@@ -33,6 +33,9 @@ interface GenerateMarketingResponseParams {
   // cap. Passed through to the loop so its time budget uses the SAME deadline the
   // caller enforces, rather than one that starts after the fork IPC hop.
   turnStartMs?: number;
+  // Explicit cost-policy fallback. `null` survives IPC and means no retry;
+  // omission preserves the global admin fallback for unrestricted requests.
+  transientFallbackModel?: string | null;
 }
 
 interface GenerateMarketingResponseResult {

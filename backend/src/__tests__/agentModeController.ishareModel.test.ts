@@ -318,7 +318,12 @@ describe('AgentModeController - ishare Model Selection', () => {
       await agentModeController.generateSharedResponse(req, res);
 
       expect(mockGenerateMarketingResponseWorkerService.runInWorker).toHaveBeenCalledWith(
-        expect.objectContaining({ llmModel: 'gemini-3.1-flash-lite' }),
+        expect.objectContaining({
+          llmModel: 'gemini-3.1-flash-lite',
+          // The optimized catalog contains only the selected model, so a transient
+          // failure must stop instead of escaping to agent_mode_backup_model.
+          transientFallbackModel: null,
+        }),
         expect.any(Function),
       );
     });
