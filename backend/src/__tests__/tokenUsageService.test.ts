@@ -250,6 +250,91 @@ describe("checkTokenUsage", () => {
   });
 });
 
+describe("checkTokenUsage - versioned cost-only policy", () => {
+  const llmUsagePolicy = {
+    version: "starter-v1",
+    enforcementState: "enforce",
+    optimizationCostThresholdMicroUsd: 30_000_000,
+    hardCostThresholdMicroUsd: 60_000_000,
+    optimizedModelIds: ["gemini-3.1-flash-lite"],
+    optimizedDefaultModel: "gemini-3.1-flash-lite",
+  };
+
+  function mockCostState(totalCost: number, totalTokens = 300_000_000, llmUsageCredits?: any, enforcementState: 'observe' | 'hard_only' | 'enforce' = 'enforce') {
+    mockGetUserById.mockResolvedValue({
+      userId: "u1",
+      email: "a@b.com",
+      tokenUsage: { month: currentMonth(), totalTokens, totalCost },
+      tokenAllowanceBonus: 0,
+      llmUsageCredits,
+    });
+    mockGetUserSubscriptionType.mockResolvedValue("Configured tier");
+    mockGetSubscriptionTypeConfig.mockResolvedValue({
+      name: "Configured tier",
+      allowedPages: ["*"],
+      allowedSkills: ["*"],
+      monthlyTokenAllowance: 1,
+      llmUsagePolicy: { ...llmUsagePolicy, enforcementState },
+    });
+  }
+
+  it("does not let a tiny legacy token allowance block cost-below-threshold usage", async () => {
+    mockCostState(1);
+    const result = await checkTokenUsage("u1");
+    expect(result.allowed).toBe(true);
+    expect(result.usageMode).toBe("full_choice");
+  });
+
+  it("enters optimized mode exactly at the configured cost threshold", async () => {
+    mockCostState(30);
+    const result = await checkTokenUsage("u1");
+    expect(result.allowed).toBe(true);
+    expect(result.usageMode).toBe("optimized");
+    expect(result.usagePolicyVersion).toBe("starter-v1");
+  });
+
+  it("pauses exactly at the configured hard cost threshold", async () => {
+    mockCostState(60, 1);
+    const result = await checkTokenUsage("u1");
+    expect(result.allowed).toBe(false);
+    expect(result.usageMode).toBe("paused");
+  });
+
+  it("enforces hard-only rollout without switching models at the soft threshold", async () => {
+    mockCostState(30, 300_000_000, undefined, 'hard_only');
+    const beforeHard = await checkTokenUsage("u1");
+    expect(beforeHard.allowed).toBe(true);
+    expect(beforeHard.usageMode).toBe("full_choice");
+
+    mockCostState(60, 300_000_000, undefined, 'hard_only');
+    const atHard = await checkTokenUsage("u1");
+    expect(atHard.allowed).toBe(false);
+    expect(atHard.usageMode).toBe("paused");
+  });
+
+  it('a rollout migration credit restarts this month from zero without deleting raw usage', async () => {
+    mockCostState(60, 300_000_000, {
+      month: currentMonth(), totalPurchasedMicroUsd: 0, totalMigrationOffsetMicroUsd: 60_000_000,
+      grantIds: ['rollout'], grants: [],
+    });
+    const result = await checkTokenUsage('u1');
+    expect(result.allowed).toBe(true);
+    expect(result.usageMode).toBe('full_choice');
+    expect(result.costUsed).toBe(0);
+  });
+
+  it('purchased credit extends the hard cap while keeping optimized mode active', async () => {
+    mockCostState(60, 300_000_000, {
+      month: currentMonth(), totalPurchasedMicroUsd: 10_000_000, totalMigrationOffsetMicroUsd: 0,
+      grantIds: ['stripe:1'], grants: [],
+    });
+    const result = await checkTokenUsage('u1');
+    expect(result.allowed).toBe(true);
+    expect(result.usageMode).toBe('optimized');
+    expect(result.costAllowance).toBe(70);
+  });
+});
+
 // ─── COST-BASED LIMIT (ENG-200) ──────────────────────────────────────────────
 
 describe("getUserTokenAllowance - cost allowance", () => {

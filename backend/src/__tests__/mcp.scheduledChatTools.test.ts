@@ -51,6 +51,17 @@ describe('Scheduled Chat MCP Tools', () => {
       expect(names).toContain('submit_scheduled_chat_variables');
     });
 
+    it('exposes an explicit backup model for scheduled chat create/update', () => {
+      const definition: any = mcpToolRegistry.getTool('manage_scheduled_chat')?.definition;
+      expect(definition.inputSchema.properties.backup_model).toBeDefined();
+    });
+
+    it('exposes a cost-policy-aware model discovery tool', () => {
+      expect(mcpToolRegistry.getTool('emma_list_models')).toBeDefined();
+      expect(mcpToolRegistry.getToolDefinitions().map((definition: any) => definition.name))
+        .toContain('emma_list_models');
+    });
+
     it('should expose scheduled chat tools to external MCP clients', () => {
       const externalDefs = mcpToolRegistry.getToolDefinitions();
       const externalNames = externalDefs.map((d: any) => d.name);
@@ -209,6 +220,27 @@ describe('Scheduled Chat MCP Tools', () => {
     });
   });
 
+  describe('emma_list_models', () => {
+    it('reads authoritative model options through the authenticated API', async () => {
+      mockMcpFetch.mockResolvedValue({
+        usageMode: 'optimized',
+        canGenerate: true,
+        selectableModels: ['gemini-3.1-flash-lite'],
+        scheduleBackupModels: ['gemini-3.1-flash-lite'],
+      });
+
+      const result = await mcpToolRegistry.execute('emma_list_models', {}, context);
+
+      expect(mockMcpFetch).toHaveBeenCalledWith({
+        method: 'GET',
+        path: '/api/agent-mode/model-options',
+        context: { userId: 'user-123', agentUserId: 'user-123' },
+      });
+      expect(result.content[0].text).toContain('optimized');
+      expect(result.content[0].text).toContain('gemini-3.1-flash-lite');
+    });
+  });
+
   describe('manage_scheduled_chat - create', () => {
     it('should call POST /api/agent-mode/scheduled-chats with body', async () => {
       mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-new', message: 'Created' });
@@ -292,6 +324,32 @@ describe('Scheduled Chat MCP Tools', () => {
         self_improve: false,
       }, context);
       expect((mockMcpFetch.mock.calls[0][0] as any).body.selfImprove).toBe(false);
+    });
+
+    it('maps the preferred and backup models on create and update', async () => {
+      mockMcpFetch.mockResolvedValue({ scheduleId: 'sc-models' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'create',
+        schedule_name: 'Model fallback',
+        starting_message: 'Do the thing',
+        schedule_frequency: 'daily',
+        llm_model: 'anthropic.claude-opus-5',
+        backup_model: 'gemini-3.1-flash-lite',
+      }, context);
+      expect((mockMcpFetch.mock.calls[0][0] as any).body).toMatchObject({
+        llmModel: 'anthropic.claude-opus-5',
+        llmBackupModel: 'gemini-3.1-flash-lite',
+      });
+
+      mockMcpFetch.mockClear();
+      mockMcpFetch.mockResolvedValue({ message: 'Updated' });
+      await mcpToolRegistry.execute('manage_scheduled_chat', {
+        action: 'update',
+        schedule_id: 'sc-models',
+        backup_model: 'anthropic.claude-haiku-4-5-20251001-v1:0',
+      }, context);
+      expect((mockMcpFetch.mock.calls[0][0] as any).body.llmBackupModel)
+        .toBe('anthropic.claude-haiku-4-5-20251001-v1:0');
     });
   });
 

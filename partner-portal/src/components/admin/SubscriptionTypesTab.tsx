@@ -26,6 +26,7 @@ import {
   Typography,
   Alert,
   CircularProgress,
+  MenuItem,
 } from '@mui/material';
 import {
   Add as AddIcon,
@@ -54,6 +55,25 @@ interface SubscriptionType {
   allowedFeatures?: string[];
   monthlyTokenAllowance?: number | null;
   monthlyCostAllowance?: number | null;
+  llmUsagePolicy?: {
+    version: string;
+    enforcementState: 'observe' | 'hard_only' | 'enforce';
+    optimizationCostThresholdMicroUsd: number;
+    hardCostThresholdMicroUsd: number;
+    optimizedModelIds: string[];
+    optimizedDefaultModel: string;
+  };
+  llmUsageTopUp?: {
+    enabled: boolean;
+    minimumMarkupBps: number;
+    packages: Array<{
+      id: string;
+      label: string;
+      priceCents: number;
+      usageCreditMicroUsd: number;
+      active: boolean;
+    }>;
+  };
 }
 
 interface AvailableFeature {
@@ -115,6 +135,15 @@ const SubscriptionTypesTab: React.FC = () => {
   });
   const [tokenAllowanceInput, setTokenAllowanceInput] = useState('');
   const [costAllowanceInput, setCostAllowanceInput] = useState('');
+  const [usagePolicyEnabled, setUsagePolicyEnabled] = useState(false);
+  const [usagePolicyEnforcement, setUsagePolicyEnforcement] = useState<'observe' | 'hard_only' | 'enforce'>('observe');
+  const [optimizationThresholdInput, setOptimizationThresholdInput] = useState('');
+  const [hardThresholdInput, setHardThresholdInput] = useState('');
+  const [optimizedModelsInput, setOptimizedModelsInput] = useState('');
+  const [optimizedDefaultInput, setOptimizedDefaultInput] = useState('');
+  const [topUpEnabled, setTopUpEnabled] = useState(false);
+  const [topUpMinimumMarkupInput, setTopUpMinimumMarkupInput] = useState('2.5');
+  const [topUpPackagesInput, setTopUpPackagesInput] = useState('');
   const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set());
 
   useEffect(() => {
@@ -266,6 +295,21 @@ const SubscriptionTypesTab: React.FC = () => {
       setFormData(expandedData);
       setTokenAllowanceInput(type.monthlyTokenAllowance != null ? String(type.monthlyTokenAllowance) : '');
       setCostAllowanceInput(type.monthlyCostAllowance != null ? String(type.monthlyCostAllowance) : '');
+      setUsagePolicyEnabled(!!type.llmUsagePolicy);
+      setUsagePolicyEnforcement(type.llmUsagePolicy?.enforcementState || 'observe');
+      setOptimizationThresholdInput(type.llmUsagePolicy ? String(type.llmUsagePolicy.optimizationCostThresholdMicroUsd / 1_000_000) : '');
+      setHardThresholdInput(type.llmUsagePolicy ? String(type.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000) : '');
+      setOptimizedModelsInput(type.llmUsagePolicy?.optimizedModelIds.join(', ') || '');
+      setOptimizedDefaultInput(type.llmUsagePolicy?.optimizedDefaultModel || '');
+      setTopUpEnabled(type.llmUsageTopUp?.enabled === true);
+      setTopUpMinimumMarkupInput(type.llmUsageTopUp ? String(type.llmUsageTopUp.minimumMarkupBps / 10_000) : '2.5');
+      setTopUpPackagesInput(type.llmUsageTopUp?.packages.map((item) => [
+        item.id,
+        item.label,
+        (item.priceCents / 100).toFixed(2),
+        (item.usageCreditMicroUsd / 1_000_000).toFixed(2),
+        item.active ? 'active' : 'inactive',
+      ].join('|')).join('\n') || '');
     } else {
       setEditingType(null);
       // When creating new, start with all pages, skills, and platforms selected
@@ -281,6 +325,15 @@ const SubscriptionTypesTab: React.FC = () => {
       });
       setTokenAllowanceInput('');
       setCostAllowanceInput('');
+      setUsagePolicyEnabled(false);
+      setUsagePolicyEnforcement('observe');
+      setOptimizationThresholdInput('');
+      setHardThresholdInput('');
+      setOptimizedModelsInput('');
+      setOptimizedDefaultInput('');
+      setTopUpEnabled(false);
+      setTopUpMinimumMarkupInput('2.5');
+      setTopUpPackagesInput('');
     }
     setExpandedSkills(new Set());
     setEditDialogOpen(true);
@@ -301,6 +354,15 @@ const SubscriptionTypesTab: React.FC = () => {
     });
     setTokenAllowanceInput('');
     setCostAllowanceInput('');
+    setUsagePolicyEnabled(false);
+    setUsagePolicyEnforcement('observe');
+    setOptimizationThresholdInput('');
+    setHardThresholdInput('');
+    setOptimizedModelsInput('');
+    setOptimizedDefaultInput('');
+    setTopUpEnabled(false);
+    setTopUpMinimumMarkupInput('2.5');
+    setTopUpPackagesInput('');
     setExpandedSkills(new Set());
   };
 
@@ -332,6 +394,71 @@ const SubscriptionTypesTab: React.FC = () => {
         return;
       }
 
+      let llmUsagePolicy: SubscriptionType['llmUsagePolicy'];
+      if (usagePolicyEnabled) {
+        const optimizationUsd = Number(optimizationThresholdInput.replace(/[$,]/g, ''));
+        const hardUsd = Number(hardThresholdInput.replace(/[$,]/g, ''));
+        const optimizedModelIds = [...new Set(
+          optimizedModelsInput.split(',').map((model) => model.trim()).filter(Boolean)
+        )];
+        const optimizedDefaultModel = optimizedDefaultInput.trim();
+        if (!Number.isFinite(optimizationUsd) || optimizationUsd < 0 || !Number.isFinite(hardUsd) || hardUsd <= optimizationUsd) {
+          setError('Hard cost threshold must be greater than the optimization threshold');
+          return;
+        }
+        if (optimizedModelIds.length === 0 || !optimizedDefaultModel || !optimizedModelIds.includes(optimizedDefaultModel)) {
+          setError('Choose at least one optimized model and make sure the optimized default is in that list');
+          return;
+        }
+        const optimizationCostThresholdMicroUsd = Math.round(optimizationUsd * 1_000_000);
+        const hardCostThresholdMicroUsd = Math.round(hardUsd * 1_000_000);
+        const previousPolicy = editingType?.llmUsagePolicy;
+        const samePolicyDefinition = !!previousPolicy
+          && previousPolicy.optimizationCostThresholdMicroUsd === optimizationCostThresholdMicroUsd
+          && previousPolicy.hardCostThresholdMicroUsd === hardCostThresholdMicroUsd
+          && previousPolicy.optimizedDefaultModel === optimizedDefaultModel
+          && JSON.stringify(previousPolicy.optimizedModelIds) === JSON.stringify(optimizedModelIds);
+        llmUsagePolicy = {
+          // Observe -> hard-only -> full enforcement is one rollout of the same
+          // policy. Preserve its version when only the enforcement state changes
+          // so the one-time usage reset cannot be applied twice under a new ID.
+          version: samePolicyDefinition ? previousPolicy.version : `policy-${Date.now()}`,
+          enforcementState: usagePolicyEnforcement,
+          optimizationCostThresholdMicroUsd,
+          hardCostThresholdMicroUsd,
+          optimizedModelIds,
+          optimizedDefaultModel,
+        };
+      }
+
+      let llmUsageTopUp: SubscriptionType['llmUsageTopUp'];
+      if (topUpEnabled || topUpPackagesInput.trim()) {
+        const minimumMarkup = Number(topUpMinimumMarkupInput);
+        const packages = topUpPackagesInput.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
+          const [id, label, priceUsdRaw, creditUsdRaw, status = 'active'] = line.split('|').map((part) => part.trim());
+          return {
+            id,
+            label,
+            priceCents: Math.round(Number(priceUsdRaw) * 100),
+            usageCreditMicroUsd: Math.round(Number(creditUsdRaw) * 1_000_000),
+            active: status.toLowerCase() !== 'inactive',
+          };
+        });
+        if (!Number.isFinite(minimumMarkup) || minimumMarkup < 1) {
+          setError('Additional usage minimum markup must be at least 1x');
+          return;
+        }
+        if (packages.some((item) => !item.id || !item.label || !Number.isInteger(item.priceCents) || item.priceCents <= 0 || !Number.isInteger(item.usageCreditMicroUsd) || item.usageCreditMicroUsd <= 0)) {
+          setError('Each additional usage package must be id|label|customer price USD|provider usage USD|active');
+          return;
+        }
+        llmUsageTopUp = {
+          enabled: topUpEnabled,
+          minimumMarkupBps: Math.round(minimumMarkup * 10_000),
+          packages,
+        };
+      }
+
       // Convert all selected items back to "*" if all are selected
       const dataToSave: SubscriptionType = {
         name: formData.name,
@@ -348,6 +475,8 @@ const SubscriptionTypesTab: React.FC = () => {
         allowedFeatures: formData.allowedFeatures || [],
         monthlyTokenAllowance: parsedAllowance,
         monthlyCostAllowance: parsedCostAllowance,
+        ...(llmUsagePolicy ? { llmUsagePolicy } : {}),
+        ...(llmUsageTopUp ? { llmUsageTopUp } : {}),
       };
 
       let updatedTypes = [...subscriptionTypes];
@@ -542,6 +671,7 @@ const SubscriptionTypesTab: React.FC = () => {
                 <TableCell>Name</TableCell>
                 <TableCell>Monthly Token Allowance</TableCell>
                 <TableCell>Monthly Cost Allowance</TableCell>
+                <TableCell>LLM Usage Policy</TableCell>
                 <TableCell>Allowed Pages</TableCell>
                 <TableCell>Allowed Skills</TableCell>
                 <TableCell>Connected Accounts</TableCell>
@@ -552,7 +682,7 @@ const SubscriptionTypesTab: React.FC = () => {
             <TableBody>
               {subscriptionTypes.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={8} align="center">
+                  <TableCell colSpan={9} align="center">
                     <Typography variant="body2" color="text.secondary">
                       No subscription types defined. Using default "Basic" type.
                     </Typography>
@@ -579,6 +709,17 @@ const SubscriptionTypesTab: React.FC = () => {
                           ? `$${type.monthlyCostAllowance.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
                           : 'Unlimited'}
                       </Typography>
+                    </TableCell>
+                    <TableCell>
+                      {type.llmUsagePolicy ? (
+                        <Chip
+                          label={`${type.llmUsagePolicy.enforcementState === 'enforce' ? 'Hard + optimized' : type.llmUsagePolicy.enforcementState === 'hard_only' ? 'Hard cap only' : 'Observe'} · $${type.llmUsagePolicy.optimizationCostThresholdMicroUsd / 1_000_000} → $${type.llmUsagePolicy.hardCostThresholdMicroUsd / 1_000_000}`}
+                          color={type.llmUsagePolicy.enforcementState === 'enforce' ? 'warning' : type.llmUsagePolicy.enforcementState === 'hard_only' ? 'error' : 'default'}
+                          size="small"
+                        />
+                      ) : (
+                        <Typography variant="body2" color="text.secondary">Legacy</Typography>
+                      )}
                     </TableCell>
                     <TableCell>
                       {type.allowedPages.includes('*') || type.allowedPages.length === 0 ? (
@@ -687,6 +828,89 @@ const SubscriptionTypesTab: React.FC = () => {
               helperText={editingType ? 'Name cannot be changed after creation' : ''}
             />
 
+            <Paper variant="outlined" sx={{ p: 2, mb: 3 }}>
+              <FormControlLabel
+                control={<Checkbox checked={usagePolicyEnabled} onChange={(e) => setUsagePolicyEnabled(e.target.checked)} />}
+                label="Enable versioned LLM usage policy"
+              />
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Cost—not raw tokens—controls full model choice, optimized model usage, and the hard pause.
+              </Typography>
+              <Collapse in={usagePolicyEnabled}>
+                <TextField
+                  select
+                  fullWidth
+                  label="Rollout state"
+                  value={usagePolicyEnforcement}
+                  onChange={(e) => setUsagePolicyEnforcement(e.target.value as 'observe' | 'hard_only' | 'enforce')}
+                  sx={{ mb: 2 }}
+                >
+                  <MenuItem value="observe">Observe only</MenuItem>
+                  <MenuItem value="hard_only">Enforce hard cap only</MenuItem>
+                  <MenuItem value="enforce">Enforce hard cap + optimized models</MenuItem>
+                </TextField>
+                <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 2, mb: 2 }}>
+                  <TextField
+                    label="Optimization threshold (USD)"
+                    value={optimizationThresholdInput}
+                    onChange={(e) => setOptimizationThresholdInput(e.target.value)}
+                    inputProps={{ inputMode: 'decimal' }}
+                  />
+                  <TextField
+                    label="Hard threshold (USD)"
+                    value={hardThresholdInput}
+                    onChange={(e) => setHardThresholdInput(e.target.value)}
+                    inputProps={{ inputMode: 'decimal' }}
+                  />
+                </Box>
+                <TextField
+                  fullWidth
+                  label="Optimized model IDs"
+                  value={optimizedModelsInput}
+                  onChange={(e) => setOptimizedModelsInput(e.target.value)}
+                  placeholder="gemini-3.1-flash-lite, anthropic.claude-haiku-4-5-20251001-v1:0"
+                  helperText="Comma-separated stable model IDs. Unknown or unpriced models are rejected by the server."
+                  sx={{ mb: 2 }}
+                />
+                <TextField
+                  fullWidth
+                  label="Optimized default model"
+                  value={optimizedDefaultInput}
+                  onChange={(e) => setOptimizedDefaultInput(e.target.value)}
+                  helperText="Used when the preferred model and user backup are unavailable or restricted."
+                />
+              </Collapse>
+            </Paper>
+
+            <Paper variant="outlined" sx={{ p: 2, mb: 3 }}>
+              <FormControlLabel
+                control={<Checkbox checked={topUpEnabled} onChange={(e) => setTopUpEnabled(e.target.checked)} />}
+                label="Allow additional AgentWeb usage purchases"
+              />
+              <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+                Customer prices and underlying provider-usage credits are admin-controlled. Customers see only the package label and price.
+              </Typography>
+              <TextField
+                fullWidth
+                label="Minimum markup multiplier"
+                value={topUpMinimumMarkupInput}
+                onChange={(e) => setTopUpMinimumMarkupInput(e.target.value)}
+                inputProps={{ inputMode: 'decimal' }}
+                helperText="For example, 2.5 requires a $25 charge for $10 of provider usage."
+                sx={{ mb: 2 }}
+              />
+              <TextField
+                fullWidth
+                multiline
+                minRows={3}
+                label="Additional usage packages"
+                value={topUpPackagesInput}
+                onChange={(e) => setTopUpPackagesInput(e.target.value)}
+                placeholder="aw-10|10 AgentWeb Credits|25.00|10.00|active"
+                helperText="One per line: id | customer label | customer price USD | provider usage USD | active/inactive"
+              />
+            </Paper>
+
             <TextField
               label="Monthly Token Allowance"
               fullWidth
@@ -706,7 +930,7 @@ const SubscriptionTypesTab: React.FC = () => {
               onChange={(e) => setCostAllowanceInput(e.target.value)}
               sx={{ mb: 3 }}
               placeholder="Leave empty for unlimited"
-              helperText="Per-user monthly LLM spend cap in USD (normalized cost). Guards higher-cost models. Leave empty for unlimited. Only enforced when ENFORCE_COST_CAP is on."
+              helperText="Legacy per-user monthly LLM spend cap. New tiers should use the versioned LLM usage policy above."
               type="text"
               inputProps={{ inputMode: 'decimal', pattern: '[0-9.,$]*' }}
             />

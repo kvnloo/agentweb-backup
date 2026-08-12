@@ -72,6 +72,12 @@ import { checkTokenUsage, deriveBlockedByCost } from '../services/tokenUsageServ
 import { transcribeSpeech } from '../services/voiceService';
 import { summarizeSessionIfNeeded } from '../services/sessionSummaryService';
 import { DynamoDB } from 'aws-sdk';
+import { getEffectiveLlmUsagePolicy } from '../services/llmUsagePolicyResolverService';
+import {
+  selectPolicyModel,
+  type ModelBackupSource,
+  type PolicyModelDecision,
+} from '../services/llmUsagePolicyService';
 
 const ZERO_ASSISTANT_REQUEUE_BASE_MS = 15 * 60 * 1000;
 const ZERO_ASSISTANT_REQUEUE_MAX_MS = 2 * 60 * 60 * 1000;
@@ -208,6 +214,82 @@ async function applyScheduleEditWithConsentNarrowing(
   throw new ScheduleConsentRaceError(
     `Publish consent for schedule ${scheduleId} changed on every attempt to apply this edit.`
   );
+type EffectiveModelPolicyDecision = PolicyModelDecision & {
+  usageMode: 'full_choice' | 'optimized' | 'paused';
+  usagePolicyVersion: string | null;
+};
+
+/**
+ * One server-owned model decision for interactive, MCP, and scheduled paths.
+ * The caller's model id is only a preference; current cost state and the
+ * admin-managed policy decide what can actually reach the provider.
+ */
+async function resolveEffectiveModelForUser(input: {
+  userId: string;
+  requestedModel?: string | null;
+  backupModel?: string | null;
+  backupSource?: ModelBackupSource | null;
+}): Promise<EffectiveModelPolicyDecision> {
+  const [usage, systemDefaultModel, supportedModelIds] = await Promise.all([
+    getEffectiveLlmUsagePolicy(input.userId),
+    agentModeService.getDefaultModel(),
+    agentModeService.getSupportedModels(false),
+  ]);
+  const requestedResolution = input.requestedModel
+    ? agentModeService.resolveGenerationModel(input.requestedModel)
+    : null;
+  const backupResolution = input.backupModel
+    ? agentModeService.resolveGenerationModel(input.backupModel)
+    : null;
+  const decision = selectPolicyModel({
+    usageMode: usage.mode.usageMode,
+    requestedModel: requestedResolution?.model || input.requestedModel,
+    backupModel: backupResolution?.fellBack ? null : (backupResolution?.model || input.backupModel),
+    backupSource: input.backupSource,
+    systemDefaultModel,
+    supportedModelIds,
+    policy: usage.policy,
+  });
+  return {
+    ...decision,
+    usageMode: usage.mode.usageMode,
+    usagePolicyVersion: usage.policy?.version || null,
+  };
+}
+
+async function resolveScheduleBackup(input: {
+  userId: string;
+  requestedBackupModel?: string | null;
+}): Promise<{ llmBackupModel: string; llmBackupSource: ModelBackupSource; llmBackupNeedsConfirmation: boolean }> {
+  const usage = await getEffectiveLlmUsagePolicy(input.userId);
+  const [supportedModelIds, systemDefaultModel] = await Promise.all([
+    agentModeService.getSupportedModels(false),
+    agentModeService.getScheduledChatsDefaultModel(),
+  ]);
+  const supported = new Set(supportedModelIds);
+  const requested = input.requestedBackupModel?.trim();
+  const optimized = new Set(usage.policy?.optimizedModelIds || []);
+  if (requested && supported.has(requested) && (!usage.policy || optimized.has(requested))) {
+    return { llmBackupModel: requested, llmBackupSource: 'user', llmBackupNeedsConfirmation: false };
+  }
+  if (requested) {
+    const error = new Error('Backup model is not available for optimized usage');
+    error.name = 'InvalidScheduledBackupModelError';
+    throw error;
+  }
+  const configuredDefault = usage.policy?.optimizedDefaultModel || systemDefaultModel;
+  if (
+    !configuredDefault ||
+    !supported.has(configuredDefault) ||
+    (usage.policy && !optimized.has(configuredDefault))
+  ) {
+    throw new Error('No valid optimized backup model is configured for this account');
+  }
+  return {
+    llmBackupModel: configuredDefault,
+    llmBackupSource: 'system',
+    llmBackupNeedsConfirmation: true,
+  };
 }
 
 // ENG-324: durable in-flight lease + reconciliation. The graceful-shutdown drain
@@ -3283,7 +3365,9 @@ export async function runScheduledChat(
       // a user with an unlimited token allowance can be blocked — render a
       // cost-based message so it doesn't misleadingly read "0 tokens used".
       const { blockedByCost } = deriveBlockedByCost(usageStatus);
-      const blockMessage = blockedByCost
+      const blockMessage = usageStatus.usageMode === 'paused'
+        ? 'Scheduled chat cannot run: AI usage is paused until the next reset or additional usage is added.'
+        : blockedByCost
         ? `Scheduled chat cannot run: Monthly cost limit reached ($${(usageStatus.costUsed ?? 0).toFixed(2)} / $${(usageStatus.costAllowance ?? 0).toFixed(2)} spent this month).`
         : `Scheduled chat cannot run: Monthly token limit reached (${usageStatus.used?.toLocaleString() ?? 0} / ${usageStatus.allowance?.toLocaleString() ?? 0} tokens used).`;
 
@@ -3640,37 +3724,37 @@ export async function runScheduledChat(
     // Set the session title to the schedule name
     await chatbotDb.updateSessionTitle(sessionId, sessionTitle);
 
-    // Update the session with the selected model from the schedule.
-    // ENG-892: schedule.llmModel is written straight from an admin request body
-    // with no allow-list check, and this is an internal db call, so it bypasses
-    // the validation on the picker endpoints. Stamping it raw recorded a model
-    // that never ran whenever generation fell back — on exactly the scheduled
-    // sessions the daily reports analyse. Resolve first so the stored value is
-    // what generation will resolve to.
+    // Resolve the stored preference at execution time. A schedule can outlive a
+    // policy/model change by months, so neither its preferred nor backup model is
+    // trusted merely because it was valid when saved.
     const defaultModel = await agentModeService.getScheduledChatsDefaultModel();
-    const requestedModel = schedule.llmModel || defaultModel;
-    const scheduleModelResolution = agentModeService.resolveGenerationModel(requestedModel);
-    const modelToUse = scheduleModelResolution.model;
-    if (scheduleModelResolution.fellBack) {
-      // Fail loud, not partial. The run still completes on the fallback, but the
-      // admin's pin is dead and the UI keeps showing the model they chose — the
-      // ENG-806 failure mode, where an alias-valued setting sat inert for two
-      // months. resolveConfiguredModel alerts for AW-Settings; schedules only
-      // console.warn'd. Fire-and-forget so the run never blocks on it.
+    const rawRequestedModel = schedule.llmModel || defaultModel;
+    const requestedModelResolution = agentModeService.resolveGenerationModel(rawRequestedModel);
+    const requestedModel = requestedModelResolution.model;
+    const scheduleModelPolicy = await resolveEffectiveModelForUser({
+      userId,
+      requestedModel,
+      backupModel: schedule.llmBackupModel,
+      backupSource: schedule.llmBackupSource,
+    });
+    if (!scheduleModelPolicy.effectiveModel) {
+      const pausedError: any = new Error('usage_paused');
+      pausedError.code = 'usage_paused';
+      throw pausedError;
+    }
+    const modelToUse = scheduleModelPolicy.effectiveModel;
+    if (requestedModelResolution.fellBack) {
       void sendAgentModeOncallAlert({
         subject: 'AgentMode: unsupported model pinned on a scheduled chat',
         message:
-          `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${requestedModel}", which is ` +
-          `not a served model even after legacy-alias resolution. The run fell back to "${modelToUse}", so the ` +
-          `pin is inert and every run of this schedule is using a model nobody chose.`,
+          `Schedule "${schedule.scheduleName}" (${schedule.scheduleId}) pins model "${rawRequestedModel}", which is ` +
+          `not a served model even after legacy-alias resolution. The policy resolver selected "${modelToUse}".`,
         context: {
           Schedule: schedule.scheduleId,
-          'Pinned Model': requestedModel,
+          'Pinned Model': rawRequestedModel,
           'Actually Used': modelToUse,
         },
-        // One alert per (schedule, bad value) per hour: a daily schedule with a
-        // permanently bad pin must not flood oncall.
-        dedupeKey: `schedule_model_invalid:${schedule.scheduleId}:${requestedModel}`,
+        dedupeKey: `schedule_model_invalid:${schedule.scheduleId}:${rawRequestedModel}`,
         dedupeWindowMs: 60 * 60 * 1000,
       }).catch((alertError) => {
         console.error('AgentMode: Failed to send unsupported schedule-model alert:', alertError);
@@ -3771,7 +3855,7 @@ export async function runScheduledChat(
       requiredFunctions,
       maxAttempts: 20,
       attachments: fileAttachments,
-      llmModel: schedule.llmModel || defaultModel,
+      llmModel: modelToUse,
       // ENG-657: on a resume, count the abandoned portion's tool calls in
       // verification so requiredFunctionCalls isn't falsely missed (empty otherwise).
       priorToolCalls: resumePriorToolCalls,
@@ -5431,7 +5515,7 @@ export const agentModeController = {
     try {
       const authReq = req as AuthenticatedRequest;
       const user = authReq.user as User;
-      const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey } = req.body;
+      const { portalType: requestedPortalType = 'agent', pageIdentifier: requestedPageIdentifier = 'agent-mode', sessionType, idempotencyKey, llmModel: requestedLlmModel } = req.body;
       const skillId = req.params?.skillId;
       const portalType = skillId ? 'agent' : requestedPortalType;
       let skill;
@@ -5489,6 +5573,16 @@ export const agentModeController = {
       } else {
         modelToUse = await agentModeService.getDefaultModel();
       }
+      let initialModelPolicy: EffectiveModelPolicyDecision | undefined;
+      if (!skillId && finalSessionType === 'regular' && portalType !== 'emma-sidebar') {
+        initialModelPolicy = await resolveEffectiveModelForUser({
+          userId: user.userId,
+          requestedModel: requestedLlmModel || modelToUse,
+        });
+        // Creating a session itself spends nothing. A paused account can still
+        // open/read the session; provider admission remains blocked on send.
+        if (initialModelPolicy.effectiveModel) modelToUse = initialModelPolicy.effectiveModel;
+      }
       const welcomeMessage = skill?.welcomeMessage?.trim();
       const initialSkillState = skillId ? {
         llmModel: modelToUse, associatedSkills: [skillId],
@@ -5520,7 +5614,16 @@ export const agentModeController = {
       res.status(201).json(skillId ? {
         ...sessionWithModel,
         redirectUrl: `${process.env.CUSTOMER_FRONTEND_URL || 'http://localhost:5174'}/agent-mode/${session.sessionId}`,
-      } : sessionWithModel);
+      } : {
+        ...sessionWithModel,
+        ...(initialModelPolicy ? {
+          requestedModel: initialModelPolicy.requestedModel,
+          effectiveModel: initialModelPolicy.effectiveModel,
+          modelSelection: initialModelPolicy.modelSelection,
+          usageMode: initialModelPolicy.usageMode,
+          usagePolicyVersion: initialModelPolicy.usagePolicyVersion,
+        } : {}),
+      });
     } catch (error) {
       console.error('AgentMode: Create session error:', error);
       if (createIdemKeyHeld) {
@@ -5620,6 +5723,7 @@ export const agentModeController = {
     // ENG-971: calledFunctions is session-cumulative, so the error path needs to know
     // where THIS turn started to tell its own successes from earlier turns'.
     let turnStartCalledFunctions: Record<string, number> | null = null;
+    let modelPolicyDecision: EffectiveModelPolicyDecision | undefined;
     try {
       const user = req.user as User;
       const { sessionId, llmModel, attachments, currentUrl, structuredContext, screenshot, audioInput, questionAnswer } = req.body;
@@ -5796,8 +5900,9 @@ export const agentModeController = {
       const usageStatus = await checkTokenUsage(user.userId);
       if (!usageStatus.allowed) {
         return res.status(429).json({
-          error: 'Monthly token limit reached. Please contact support or upgrade your plan.',
-          tokenUsage: usageStatus,
+          error: 'AI usage is paused until your next reset or additional usage is added.',
+          code: 'usage_paused',
+          usageMode: 'paused',
         });
       }
 
@@ -5832,8 +5937,21 @@ export const agentModeController = {
         }
       });
 
-      // Use llmModel from request, session, or default
-      const modelToUse = llmModel || session.llmModel || agentModeService.default_model;
+      // A request/session model is a preference, not authority. Resolve it
+      // against the current cost state immediately before dispatch so an old
+      // MCP client or stored session cannot bypass optimized mode.
+      modelPolicyDecision = await resolveEffectiveModelForUser({
+        userId: session.userId,
+        requestedModel: llmModel || session.llmModel || agentModeService.default_model,
+      });
+      if (!modelPolicyDecision.effectiveModel) {
+        return res.status(429).json({
+          error: 'AI usage is paused until your next reset or additional usage is added.',
+          code: 'usage_paused',
+          usageMode: 'paused',
+        });
+      }
+      const modelToUse = modelPolicyDecision.effectiveModel;
 
       // Build page context for emma-sidebar sessions
       const pageContext = session.portalType === 'emma-sidebar'
@@ -6074,7 +6192,15 @@ export const agentModeController = {
         workPlan: response.workPlan,
         skills: response.skills,
         ...(invalidations ? { invalidations } : {}),
-        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {})
+        ...(response.backupModelUsed ? { backupModelUsed: true, originalModel: response.originalModel, backupModel: response.backupModel } : {}),
+        ...(modelPolicyDecision ? {
+          requestedModel: modelPolicyDecision.requestedModel,
+          effectiveModel: modelPolicyDecision.effectiveModel,
+          modelSelection: modelPolicyDecision.modelSelection,
+          modelSelectionReason: modelPolicyDecision.reason,
+          usageMode: modelPolicyDecision.usageMode,
+          usagePolicyVersion: modelPolicyDecision.usagePolicyVersion,
+        } : {}),
       });
 
       // Terminal update is best-effort BY DESIGN: markRunTerminal retries once,
@@ -6351,6 +6477,37 @@ export const agentModeController = {
     } catch (error) {
       console.error('AgentMode: Get supported models error:', error);
       res.status(500).json({ error: 'Failed to get supported models' });
+    }
+  },
+
+  async getModelOptions(req: Request, res: Response) {
+    try {
+      const user = req.user as User;
+      const [usage, supportedModels] = await Promise.all([
+        getEffectiveLlmUsagePolicy(user.userId),
+        agentModeService.getSupportedModels(user.isAdmin === true),
+      ]);
+      const supported = new Set(supportedModels);
+      const optimizedModels = usage.policy
+        ? usage.policy.optimizedModelIds.filter((model) => supported.has(model))
+        : supportedModels;
+      const selectableModels = usage.mode.usageMode === 'optimized'
+        ? optimizedModels
+        : usage.mode.usageMode === 'paused'
+          ? []
+          : supportedModels;
+      res.json({
+        usageMode: usage.mode.usageMode,
+        canGenerate: usage.mode.admissionAllowed,
+        allModels: supportedModels,
+        selectableModels,
+        scheduleBackupModels: optimizedModels,
+        optimizedDefaultModel: usage.policy?.optimizedDefaultModel || null,
+        usagePolicyVersion: usage.policy?.version || null,
+      });
+    } catch (error) {
+      console.error('AgentMode: Get model options error:', error);
+      res.status(500).json({ error: 'Failed to get model options' });
     }
   },
 
@@ -7915,6 +8072,7 @@ export const agentModeController = {
         emailNotifications,
         emailCampaignTaskId,
         llmModel,
+        llmBackupModel,
         runCount,
         variables,
         variableValues,
@@ -7967,6 +8125,10 @@ export const agentModeController = {
       // Create scheduled chat using the existing scheduleDb
       const scheduleId = require('uuid').v4();
       const now = new Date();
+      const scheduleBackup = await resolveScheduleBackup({
+        userId: user.userId,
+        requestedBackupModel: llmBackupModel,
+      });
 
       // Use provided nextRunTime or calculate default
       let scheduledNextRunTime: string;
@@ -8020,6 +8182,7 @@ export const agentModeController = {
         type: 'scheduled_chat', // Distinguish from regular task schedules
         emailCampaignTaskId: emailCampaignTaskId || null,
         llmModel: llmModel || '', // Empty means "use default at runtime"
+        ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1, // Default to unlimited runs if not specified
         variables: [] as ScheduledChatVariable[],
         variableValues: {} as Record<string, string>,
@@ -8068,9 +8231,14 @@ export const agentModeController = {
       res.status(201).json({
         scheduleId,
         message: 'Scheduled chat created successfully',
-        nextRunTime: scheduledNextRunTime
+        nextRunTime: scheduledNextRunTime,
+        ...scheduleBackup,
+        backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
+        return res.status(400).json({ error: error.message });
+      }
       console.error('AgentMode: Create scheduled chat error:', error);
       res.status(500).json({ error: 'Failed to create scheduled chat' });
     }
@@ -8137,6 +8305,7 @@ export const agentModeController = {
         dailyDigest,
         emailCampaignTaskId,
         llmModel,
+        llmBackupModel,
         runCount,
         variables,
         variableValues,
@@ -8188,6 +8357,14 @@ export const agentModeController = {
       }
 
       const now = new Date();
+      const requestedBackupWasProvided = llmBackupModel !== undefined;
+      const scheduleBackup = requestedBackupWasProvided
+        ? await resolveScheduleBackup({ userId: user.userId, requestedBackupModel: llmBackupModel })
+        : {
+            llmBackupModel: (existingSchedule as any).llmBackupModel || '',
+            llmBackupSource: ((existingSchedule as any).llmBackupSource || 'system') as ModelBackupSource,
+            llmBackupNeedsConfirmation: (existingSchedule as any).llmBackupNeedsConfirmation !== false,
+          };
 
       // Determine nextRunTime: use provided value or keep existing
       let scheduledNextRunTime = existingSchedule.nextRunTime;
@@ -8232,6 +8409,7 @@ export const agentModeController = {
         updatedAt: now.toISOString(),
         emailCampaignTaskId: emailCampaignTaskId !== undefined ? emailCampaignTaskId : (existingSchedule.emailCampaignTaskId || null),
         llmModel: llmModel !== undefined ? llmModel : (existingSchedule.llmModel || ''),
+        ...scheduleBackup,
         // ENG-844: update the owner's timezone when a valid one is supplied; keep
         // the existing value otherwise (partial-update safe).
         ...(isValidIanaTimeZone(timezone)
@@ -8332,7 +8510,9 @@ export const agentModeController = {
 
       res.json({
         message: 'Scheduled chat updated successfully',
-        nextRunTime: scheduledNextRunTime
+        nextRunTime: scheduledNextRunTime,
+        ...scheduleBackup,
+        backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
       // ENG-827: consent moved on every attempt, so nothing was written. Say so instead
@@ -8345,6 +8525,9 @@ export const agentModeController = {
             'This schedule\'s publishing permission changed while you were saving, so nothing was ' +
             'saved. Reopen the schedule to see its current settings, then apply your change again.',
         });
+      }
+      if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
+        return res.status(400).json({ error: error.message });
       }
       console.error('AgentMode: Update scheduled chat error:', error);
       res.status(500).json({ error: 'Failed to update scheduled chat' });
@@ -10692,7 +10875,7 @@ export const agentModeController = {
         scheduleName, nextRunTime, scheduleFrequency,
         frequencyIntervalDays: overrideInterval,
         emailNotifications: overrideEmails,
-        variableValues, runCount, llmModel: overrideModel,
+        variableValues, runCount, llmModel: overrideModel, llmBackupModel: overrideBackupModel,
       } = req.body;
 
       const template = await scheduleTemplateDb.getTemplateById(templateId);
@@ -10746,6 +10929,10 @@ export const agentModeController = {
         : baseEmails;
 
       const scheduleId = uuidv4();
+      const scheduleBackup = await resolveScheduleBackup({
+        userId: user.userId,
+        requestedBackupModel: overrideBackupModel,
+      });
       const scheduledChat: any = {
         scheduleId,
         taskId: 'global',
@@ -10767,6 +10954,7 @@ export const agentModeController = {
         sessionId: null,
         type: 'scheduled_chat',
         llmModel: overrideModel || template.llmModel || '',
+        ...scheduleBackup,
         runCount: runCount !== undefined ? runCount : -1,
         variables: templateVars,
         variableValues: normalizedVariableValues,
@@ -10783,8 +10971,13 @@ export const agentModeController = {
         message: 'Scheduled chat created from template successfully',
         nextRunTime: scheduledNextRunTime,
         templateId,
+        ...scheduleBackup,
+        backupSelectionRequired: scheduleBackup.llmBackupNeedsConfirmation,
       });
     } catch (error) {
+      if (error instanceof Error && error.name === 'InvalidScheduledBackupModelError') {
+        return res.status(400).json({ error: error.message });
+      }
       console.error('AgentMode: Create schedule from template error:', error);
       res.status(500).json({ error: 'Failed to create schedule from template' });
     }

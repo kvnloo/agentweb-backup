@@ -9,6 +9,7 @@ import { mergeCustomFields, sanitizeCustomFields } from "../utils/customFieldsGu
 import { encryptPassword, decryptPassword } from "../utils/crypto";
 import type { AttributionTouch } from "../types/attribution";
 import type { OrgRole } from "./orgAuthz";
+import type { MonthlyLlmUsageCredits } from "./llmUsageCreditService";
 import { contactEventsDb, normalizeContactId } from "./contactEventsDb";
 import { onUserSignup } from "./crmSignalHooks";
 import { normalizeLinkedInUrl } from "./enrichmentGroups";
@@ -30,10 +31,20 @@ const CLAIM_STALE_MS = 5 * 60 * 1000;
 // Configure AWS SDK
 AWS.config.update({
   region: process.env.AWS_REGION || "us-west-2",
-  credentials: {
-    accessKeyId: process.env.AWS_ACCESS_KEY_ID || "",
-    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || "",
-  },
+  // Leave the SDK's normal credential-provider chain intact when explicit
+  // credentials are not configured. Supplying empty strings here masks valid
+  // shared-profile / instance-role credentials used by migration scripts.
+  ...(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY
+    ? {
+        credentials: {
+          accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+          secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+          ...(process.env.AWS_SESSION_TOKEN
+            ? { sessionToken: process.env.AWS_SESSION_TOKEN }
+            : {}),
+        },
+      }
+    : {}),
 });
 
 const dynamodb = new AWS.DynamoDB.DocumentClient();
@@ -478,6 +489,8 @@ export interface User {
     totalCost: number;
   }>;                    // Up to 24 past months of usage, oldest first
   tokenAllowanceBonus?: number; // One-time bonus tokens granted by admin (resets on monthly reset)
+  /** Monthly purchase/migration credits. Raw provider spend remains in tokenUsage. */
+  llmUsageCredits?: MonthlyLlmUsageCredits;
   extraCostUsage?: {
     month: string;      // "YYYY-MM" format for current tracking month
     totalCost: number;  // cumulative extra API cost in USD this month (enrichment, image gen, etc.)
@@ -3084,6 +3097,10 @@ export const scheduleDb = {
     sessionId?: string | null;
     type?: string;
     emailCampaignTaskId?: string;
+    llmModel?: string;
+    llmBackupModel?: string;
+    llmBackupSource?: 'user' | 'system';
+    llmBackupNeedsConfirmation?: boolean;
     runCount?: number; // -1 for unlimited, positive integer for limited runs
     variables?: Array<{ name: string; description?: string }>;
     variableValues?: { [variableName: string]: string };
@@ -3203,6 +3220,10 @@ export const scheduleDb = {
       updatedAt: string;
       emailCampaignTaskId: string;
       runCount: number;
+      llmModel: string;
+      llmBackupModel: string;
+      llmBackupSource: 'user' | 'system';
+      llmBackupNeedsConfirmation: boolean;
       variables: Array<{ name: string; description?: string }>;
       variableValues: { [variableName: string]: string };
       variableRequestStatus: 'idle' | 'pending' | 'provided';

@@ -6,6 +6,9 @@ import { waitlistDb, WaitlistEntry } from "../services/waitlistDb"; // Import wa
 import { authenticateToken, requireAdmin, AuthenticatedRequest } from "../middleware/auth";
 import { userDb, User } from "../services/db"; // Added userDb and User
 import * as stripeController from "../controllers/stripeController";
+import { resolveBillingUserId } from '../services/tokenUsageService';
+import { getSubscriptionTypeConfig, getUserSubscriptionType } from '../services/subscriptionService';
+import { getActiveLlmUsageTopUpPackages, resolveLlmUsageTopUpPackage } from '../services/llmUsageTopUpService';
 
 dotenv.config();
 
@@ -492,6 +495,84 @@ router.post(
     }
   }
 );
+
+/** Customer-safe package catalog. Provider-credit dollar values stay server-side. */
+router.get('/usage-top-up-options', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as AuthenticatedRequest).user?.userId;
+    if (!userId) return res.status(401).json({ error: 'User not authenticated.' });
+    const billingUserId = await resolveBillingUserId(userId);
+    const tier = await getUserSubscriptionType(billingUserId);
+    const config = (await getSubscriptionTypeConfig(tier))?.llmUsageTopUp;
+    const packages = getActiveLlmUsageTopUpPackages(config).map(({ id, label, priceCents }) => ({
+      id,
+      label,
+      priceCents,
+    }));
+    res.json({ enabled: packages.length > 0, packages });
+  } catch (error: any) {
+    console.error('Error loading usage top-up options:', error.message);
+    res.status(500).json({ error: 'Failed to load additional usage options.' });
+  }
+});
+
+router.post('/create-usage-top-up-session', authenticateToken, async (req: Request, res: Response) => {
+  const stripe = getStripe();
+  if (!stripe) return res.status(500).json({ error: 'Stripe integration is not configured correctly.' });
+  try {
+    const auth = req as AuthenticatedRequest;
+    const userId = auth.user?.userId;
+    if (!userId) return res.status(401).json({ error: 'User not authenticated.' });
+    const billingUserId = await resolveBillingUserId(userId);
+    const billingUser = await userDb.getUserById(billingUserId);
+    if (!billingUser) return res.status(404).json({ error: 'Billing user not found.' });
+
+    const tier = await getUserSubscriptionType(billingUserId);
+    const tierConfig = await getSubscriptionTypeConfig(tier);
+    const packageConfig = resolveLlmUsageTopUpPackage(tierConfig?.llmUsageTopUp, String(req.body?.packageId || ''));
+    if (!packageConfig || !tierConfig?.llmUsageTopUp) {
+      return res.status(400).json({ error: 'That additional usage option is unavailable.' });
+    }
+
+    let customerId = billingUser.stripe_customer_id || null;
+    if (!customerId) {
+      const escapedEmail = billingUser.email.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      const search = await stripe.customers.search({ query: `email:"${escapedEmail}"`, limit: 1 });
+      customerId = search.data.find((customer) => !(customer as any).deleted)?.id || null;
+      if (!customerId) {
+        customerId = (await stripe.customers.create({ email: billingUser.email, metadata: { userId: billingUserId } })).id;
+      }
+      await userDb.updateUser(billingUserId, { stripe_customer_id: customerId });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      ui_mode: 'embedded',
+      customer: customerId,
+      mode: 'payment',
+      line_items: [{
+        quantity: 1,
+        price_data: {
+          currency: 'usd',
+          unit_amount: packageConfig.priceCents,
+          product_data: { name: packageConfig.label },
+        },
+      }],
+      metadata: {
+        purchaseType: 'llm_usage_top_up',
+        billingUserId,
+        packageId: packageConfig.id,
+        usageCreditMicroUsd: String(packageConfig.usageCreditMicroUsd),
+        minimumMarkupBps: String(tierConfig.llmUsageTopUp.minimumMarkupBps),
+        usagePolicyVersion: tierConfig.llmUsagePolicy?.version || '',
+      },
+      return_url: `${CUSTOMER_FRONTEND_URL}/?usage_top_up=success&session_id={CHECKOUT_SESSION_ID}`,
+    });
+    res.json({ clientSecret: session.client_secret });
+  } catch (error: any) {
+    console.error('Error creating usage top-up checkout:', error.message);
+    res.status(500).json({ error: 'Failed to start additional usage checkout.' });
+  }
+});
 
 /**
  * @route GET /api/stripe/config
