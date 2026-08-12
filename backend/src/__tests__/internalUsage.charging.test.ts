@@ -187,3 +187,61 @@ describe("POST /api/internal/usage — charges the per-user quota", () => {
     expect(res.status).toBe(202);
   });
 });
+
+describe("POST /api/internal/usage — engine spend is separable in the ledger", () => {
+  /**
+   * The ledger's sort key is `{date}#{model}#{feature}`, so `feature` is the only
+   * component that can carry provenance. The engine reports `feature="agent_task"`
+   * — the same value agent-mode chat uses — so both merge into one row and are
+   * then arithmetically inseparable. `taskId` would have discriminated, but
+   * usageRecordDb never persists it; `provider` and `sessionId` are written
+   * if_not_exists, so they are first-write-wins and equally useless.
+   *
+   * This route is the agent-engine's endpoint by definition, so the backend knows
+   * the provenance regardless of what the caller claims and can namespace it here.
+   * Doing it in the backend rather than the Python engine also means it ships on
+   * the normal deploy pipeline instead of a manual GCP-VM procedure.
+   *
+   * Only fixes things going forward — historical rows stay merged permanently,
+   * which is why this wants to land in the SAME deploy that starts charging.
+   */
+
+  it("namespaces the generic agent_task so it cannot merge with agent-mode chat", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record()] });
+
+    expect(mockRecordUsage).toHaveBeenCalledTimes(1);
+    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({ feature: "engine:agent_task" });
+  });
+
+  it("preserves a more specific feature rather than flattening it", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ feature: "deep_research" })] });
+
+    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({ feature: "engine:deep_research" });
+  });
+
+  it("does not double-prefix an already-namespaced feature", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record({ feature: "engine:agent_task" })] });
+
+    expect(mockRecordUsage.mock.calls[0][0]).toMatchObject({ feature: "engine:agent_task" });
+  });
+
+  it("labels without changing what the user is charged", async () => {
+    await request(app)
+      .post("/api/internal/usage")
+      .set("Authorization", `Bearer ${ownerToken}`)
+      .send({ records: [record()] });
+
+    const [, tokens, cost] = mockIncrementUserTokenUsage.mock.calls[0];
+    expect(tokens).toBe(1_000_000);
+    expect(cost).toBeCloseTo(5, 5);
+  });
+});

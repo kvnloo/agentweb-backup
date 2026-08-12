@@ -54,6 +54,30 @@ function isNonNegativeFiniteNumber(value: unknown): boolean {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
+/**
+ * Provenance namespace for everything ingested here.
+ *
+ * The ledger's sort key is `{date}#{model}#{feature}`, so `feature` is the only
+ * component that can carry where the spend came from. The engine reports
+ * `feature="agent_task"` — the same value agent-mode chat writes — so the two
+ * merge into one row and become arithmetically inseparable. `taskId` would have
+ * discriminated but usageRecordDb never persists it, and `provider`/`sessionId`
+ * are written `if_not_exists` (first-write-wins), so neither can be trusted.
+ *
+ * This route is the agent-engine's endpoint by definition, so provenance is known
+ * here regardless of what the caller claims. Namespacing in the backend rather
+ * than the Python engine also means it ships on the normal deploy pipeline
+ * instead of the manual GCP-VM procedure the engine requires.
+ */
+const ENGINE_FEATURE_PREFIX = "engine:";
+
+/** Namespace a reported feature, preserving anything more specific than the default. */
+function namespaceFeature(feature: unknown): string {
+  const raw =
+    typeof feature === "string" && feature.trim() ? feature.trim() : "agent_task";
+  return raw.startsWith(ENGINE_FEATURE_PREFIX) ? raw : `${ENGINE_FEATURE_PREFIX}${raw}`;
+}
+
 /** A record is usable when it names a model and has at least valid token counts. */
 function isValidRecord(record: unknown): record is IncomingUsageRecord {
   if (!record || typeof record !== "object") return false;
@@ -144,10 +168,7 @@ router.post(
               typeof record.provider === "string" && record.provider
                 ? record.provider
                 : "unknown",
-            feature:
-              typeof record.feature === "string" && record.feature
-                ? record.feature
-                : "agent_task",
+            feature: namespaceFeature(record.feature),
             inputTokens: record.inputTokens!,
             outputTokens: record.outputTokens!,
             cacheReadTokens,
