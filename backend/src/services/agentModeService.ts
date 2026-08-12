@@ -14897,8 +14897,8 @@ TRUTHFULNESS RULES (these override tone):
 - An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
 - Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
 - Do not attribute a failure to an operation that appears in the succeeded list.
-- The numbers in "Succeeded operations" are tool CALL counts — the number of times that tool ran. They are NOT counts of leads, records, rows, files, posts or any other item the tool acted on. A batched import that ran three times may have written hundreds of records.
-- Because of that, do NOT restate any of those numbers to the user, and do not describe a quantity of items at all. Name WHAT succeeded ("your leads were imported into the list"), never how many.`;
+- "Succeeded operations" is a list of tool NAMES. You are given NO counts at all: nothing tells you how many leads, records, rows, files or posts an operation handled. A batched import may have run three times and written hundreds of records.
+- Because of that, never state a quantity of items. Name WHAT succeeded ("your leads were imported into the list"), never how many.`;
 
       const parts: string[] = [
         `Error type: ${context.errorType}`,
@@ -14911,7 +14911,12 @@ TRUTHFULNESS RULES (these override tone):
         parts.push('No work plan.');
       }
       if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
-        parts.push(`Succeeded operations, as tool name -> NUMBER OF CALLS (these COMPLETED — do not report them as lost; the numbers count tool calls, not leads/records/files, so do not repeat them to the user): ${JSON.stringify(context.succeededFunctions)}`);
+        // ENG-1054: NAMES ONLY. The map's values are tool-CALL counts, and handing
+        // them over is what let a 75-lead import run as three batches be reported as
+        // "successfully added the 3 leads". Labelling them was not enough — the model
+        // can ignore a label, and there is no legitimate use for the numbers here, so
+        // they are not passed at all.
+        parts.push(`Succeeded operations — tool names only, no counts available (these COMPLETED — do not report them as lost): ${Object.keys(context.succeededFunctions).join(', ')}`);
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
         parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);
