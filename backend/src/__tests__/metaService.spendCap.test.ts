@@ -18,7 +18,20 @@ jest.mock('facebook-nodejs-business-sdk', () => {
       getCampaigns: jest.fn(),
       createCampaign: jest.fn(),
     })),
-    Campaign: jest.fn().mockImplementation(() => ({ get: jest.fn() })),
+    // Fields mirrors the real SDK: the passthrough rule reads it to tell a genuine Meta
+    // campaign field (forward it) from one that would never be applied (reject it).
+    Campaign: Object.assign(
+      jest.fn().mockImplementation(() => ({ get: jest.fn() })),
+      {
+        Fields: {
+          id: 'id', name: 'name', objective: 'objective', status: 'status',
+          spend_cap: 'spend_cap', daily_budget: 'daily_budget', lifetime_budget: 'lifetime_budget',
+          special_ad_categories: 'special_ad_categories', start_time: 'start_time',
+          stop_time: 'stop_time', buying_type: 'buying_type',
+          special_ad_category_country: 'special_ad_category_country',
+        },
+      },
+    ),
     AdSet: jest.fn().mockImplementation(() => ({ get: jest.fn() })),
     AdCreative: Object.assign(jest.fn(), { Fields: {} }),
     Ad: Object.assign(jest.fn(), { Fields: {}, Status: {} }),
@@ -130,6 +143,36 @@ describe('MetaService campaign spend_cap (ENG-1018)', () => {
         confirm: true,
       } as any)
     ).not.toThrow();
+  });
+
+  it('forwards a real Meta campaign field we do not map, instead of rejecting it', async () => {
+    // Closing a silent-drop bug must not create a false-rejection bug: start_time is a
+    // genuine campaign field, so a caller who asks for it gets it — validated by Meta.
+    expect(() =>
+      MetaService.validateCampaignParamsExceptObjective('CREATE', {
+        name: 'C', start_time: '2026-09-01T00:00:00-0700', buying_type: 'AUCTION',
+      } as any)
+    ).not.toThrow();
+
+    const createCampaign = jest.fn().mockResolvedValue({ _data: { id: 'c1' } });
+    (AdAccount as unknown as jest.Mock).mockImplementation(() => ({ createCampaign }));
+
+    await service.createCampaign(accountId, token, {
+      name: 'C', objective: 'OUTCOME_TRAFFIC', special_ad_categories: ['NONE'],
+      start_time: '2026-09-01T00:00:00-0700',
+    } as any);
+
+    expect(createCampaign.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ start_time: '2026-09-01T00:00:00-0700' })
+    );
+  });
+
+  it('still rejects a param that is not a campaign field at all', () => {
+    expect(() =>
+      MetaService.validateCampaignParamsExceptObjective('CREATE', {
+        name: 'C', optimization_goal: 'OFFSITE_CONVERSIONS', targeting: {},
+      } as any)
+    ).toThrow(/optimization_goal|targeting/);
   });
 
   it('does not police params on UPDATE (pass-through is real there)', () => {

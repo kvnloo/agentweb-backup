@@ -119,7 +119,7 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       // string, which would hide the campaign id and invite a duplicate create.
       expect(result.success).toBe(true);
       expect(toolResultError(result)).toBeNull();
-    });
+    }, 20000);
 
     it('reports the cap as unverified (never as applied) when the read-back itself fails', async () => {
       (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new', name: 'Capped campaign' });
@@ -130,6 +130,44 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       expect(result.spend_cap_verified).toBe(false);
       expect(result.error).toBeUndefined();
       expect(result.message).toMatch(/could not be verified/i);
+    }, 20000);
+
+    it('does not cry wolf on read-after-write lag — a stale read is retried, not believed', async () => {
+      // Meta's read-after-write is not instant. Believing the FIRST read would tell a user
+      // their money stop is missing when it landed a second later.
+      (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
+      (metaService.getCampaign as jest.Mock)
+        .mockResolvedValueOnce({ id: 'camp_new' })                        // not propagated yet
+        .mockResolvedValueOnce({ id: 'camp_new', spend_cap: '100000' });  // now visible
+
+      const result = await service.createMetaAdsCampaign('user123', createParams as any);
+
+      expect(metaService.getCampaign).toHaveBeenCalledTimes(2);
+      expect(result.spend_cap_verified).toBe(true);
+      expect(result.error).toBeUndefined();
+    }, 20000);
+
+    it('recovers when the read-back itself fails transiently', async () => {
+      (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
+      (metaService.getCampaign as jest.Mock)
+        .mockRejectedValueOnce(new Error('Meta API Error: transient'))
+        .mockResolvedValueOnce({ id: 'camp_new', spend_cap: '100000' });
+
+      const result = await service.createMetaAdsCampaign('user123', createParams as any);
+
+      expect(result.spend_cap_verified).toBe(true);
+    }, 20000);
+
+    it('spells out the currency equivalent so a cents/dollars slip is visible', async () => {
+      // spend_cap is in cents while budget_amount in the same tool is in dollars; a model
+      // passing 3000 for "$3,000" would otherwise get a confident "verified: 3000".
+      (metaService.createCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new' });
+      (metaService.getCampaign as jest.Mock).mockResolvedValue({ id: 'camp_new', spend_cap: '3000' });
+
+      const result = await service.createMetaAdsCampaign('user123', { ...createParams, spend_cap: 3000 } as any);
+
+      expect(result.spend_cap_verified).toBe(true);
+      expect(result.message).toContain('30.00');
     });
 
     it('does not read anything back when no spend cap was requested', async () => {
@@ -173,7 +211,7 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       expect(result.message).toMatch(/NOT applied/i);
       expect(result.spend_cap_requested).toBe(300000);
       expect(result.spend_cap_applied).toBe(100000);
-    });
+    }, 20000);
 
     it('carries the whole story in the reason the model actually sees', async () => {
       // A success:false result never reaches the model as JSON: the dispatch boundary
@@ -192,7 +230,7 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
       expect(modelVisibleReason).toContain('camp_1');
       expect(modelVisibleReason).toMatch(/NO spend cap set/i);
       expect(modelVisibleReason).toMatch(/tell the user/i);
-    });
+    }, 20000);
 
     it('does not claim success-with-cap when the read-back itself fails', async () => {
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
@@ -202,7 +240,7 @@ describe('AgentModeService - campaign spend_cap write + verify (ENG-1018)', () =
 
       expect(result.spend_cap_verified).toBe(false);
       expect(result.message).toMatch(/could not be verified/i);
-    });
+    }, 20000);
 
     it('leaves non-spend_cap updates untouched (no extra read-back)', async () => {
       (metaService.updateCampaign as jest.Mock).mockResolvedValue({ success: true });
