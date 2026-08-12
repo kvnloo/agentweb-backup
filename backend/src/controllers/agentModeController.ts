@@ -41,7 +41,12 @@ import { stripImageDataForPersistence } from '../services/agentMode/incrementalP
 import { MarketingActionCarrier, normalizeMarketingActions } from '../services/marketingActionEnvelope';
 import { DiagnosisContext } from '../services/agentModeService';
 import { sendAgentModeOncallAlert } from '../utils/agentModeAlerts';
-import { collectMediaGeneratedSince, buildTimeoutContinuationMessage } from '../utils/timeoutContinuation';
+import {
+  collectMediaGeneratedSince,
+  buildTimeoutContinuationMessage,
+  collectTurnWorkSince,
+  buildTimeoutPartialWorkMessage,
+} from '../utils/timeoutContinuation';
 import {
   reconcileFalseFailureReport,
   ledgerFromSucceededFunctions,
@@ -5614,6 +5619,33 @@ export const agentModeController = {
               res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
               return;
             }
+
+            // ENG-907: no images, but the turn may still have done real research before the
+            // cap fired — ENG-473 has already persisted it. The loop's own time budget tries
+            // to wrap up first, but it can only re-check between iterations, so a long tool
+            // call can leave too little time for the forced synthesis (measured live: budget
+            // fired with 27s left, synthesis still guillotined). This is the backstop that
+            // makes the outcome deterministic: acknowledge the saved work and invite
+            // "continue" instead of putting a red error on top of it. Still returns null —
+            // and so still 504s — when the turn genuinely produced nothing.
+            const salvagedWork = collectTurnWorkSince(timedOutSession?.messages, turnStartMs);
+            const partialWorkMsg = buildTimeoutPartialWorkMessage(salvagedWork);
+            if (partialWorkMsg) {
+              markProgressComplete(sessionId);
+              await chatbotDb.addMessageToSession(sessionId, {
+                role: 'assistant',
+                content: partialWorkMsg,
+                timestamp: new Date().toISOString(),
+                metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+              }).catch((persistErr) =>
+                console.error('AgentMode: failed to persist timeout partial-work message:', persistErr),
+              );
+              if (runSurvivalRunId) {
+                void markRunTerminal(runSurvivalRunId, 'completed', { finishReason: 'timeout_partial_work' });
+              }
+              res.json({ content: partialWorkMsg, partialWorkDelivery: true });
+              return;
+            }
           } catch (continuationErr) {
             console.error('AgentMode: partial-media timeout continuation failed (falling through to 504):', continuationErr);
           }
@@ -6503,6 +6535,24 @@ export const agentModeController = {
             // Progress was already completed above; the session lock is released in the
             // inner finally, so this early return is safe.
             res.json({ content: continuationMsg, images: timeoutImages, partialMediaDelivery: true });
+            return;
+          }
+
+          // ENG-907: same backstop as the regular /generate path — a timed-out ishare turn
+          // that did real work reports it and invites "continue" rather than surfacing a
+          // bare timeout over research that is already saved in the thread.
+          const partialWorkMsg = buildTimeoutPartialWorkMessage(
+            collectTurnWorkSince(timedOutSession?.messages, sharedTurnStartMs),
+          );
+          if (partialWorkMsg) {
+            await chatbotDb.addMessageToSession(shareId, {
+              role: 'assistant',
+              content: partialWorkMsg,
+              timestamp: new Date().toISOString(),
+              metadata: { timestamp: new Date().toISOString(), kind: 'generation-timeout-continuation' },
+            });
+            handledPartialTimeout = true;
+            res.json({ content: partialWorkMsg, partialWorkDelivery: true });
             return;
           }
         } catch (persistErr) {
