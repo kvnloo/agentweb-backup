@@ -928,7 +928,7 @@ SPEND CAP (campaign hard money stop):
   params.spend_cap sets the campaign's lifetime hard stop, in CENTS (e.g. 300000 = $3,000). Writable on CAMPAIGN CREATE and CAMPAIGN UPDATE.
   Every spend_cap write is verified server-side by re-reading the campaign, and the result says which happened:
     spend_cap_verified:true  → the cap is really on the campaign (the value is echoed back as spend_cap). Only then may you tell the user a cap is in place.
-    spend_cap_verified:false with error SPEND_CAP_NOT_APPLIED → the cap is NOT on the campaign. On CREATE the campaign still exists — repair it with CAMPAIGN UPDATE using the returned campaign id, do NOT create it again. Tell the user the cap is not in place.
+    spend_cap_verified:false with error SPEND_CAP_NOT_APPLIED → the cap is NOT on the campaign. On CREATE the campaign still exists — repair it with CAMPAIGN UPDATE using the returned campaign id, do NOT create it again. Tell the user the cap is not in place. On UPDATE this arrives as a tool ERROR whose reason starts with SPEND_CAP_NOT_APPLIED and names the requested cap and campaign — report that to the user rather than retrying blindly.
     spend_cap_verified:false with no error → the read-back itself failed; nothing is proven. Re-read with CAMPAIGN LIST (campaign_id + params.fields="id,name,spend_cap") before saying anything about the cap.
   Never report a spend cap as set based on the write response alone.
 
