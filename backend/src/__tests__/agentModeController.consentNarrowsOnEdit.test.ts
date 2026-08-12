@@ -54,11 +54,10 @@ const res = () => {
   return r;
 };
 
-/** The owner's edit: always the first write, and it always lands. */
-const edited = () => (mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][1] as any;
-/** The consent narrowing: a SEPARATE write, made only when there is a grant to narrow. */
-const written = () => ((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[1]?.[1] ?? {}) as any;
-const narrowingCondition = () => (mockScheduleDb.updateSchedule as jest.Mock).mock.calls[1]?.[2];
+/** The edit and its consent narrowing are ONE write, so both live in the same payload. */
+const written = () => (mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][1] as any;
+const edited = written;
+const narrowingCondition = () => (mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][2];
 
 describe('ENG-827 — publish consent narrows when an edit changes the required tools', () => {
   beforeEach(() => {
@@ -220,51 +219,62 @@ describe('ENG-827 — publish consent narrows when an edit changes the required 
     });
   });
 
-  // ENG-827 (Greptile, third pass): the ordering is what makes this consistent. Derived
-  // from the read at the top of the handler, a grant that landed in between would either
-  // be clobbered or skipped — and skipping it leaves a grant scoped to a tool this edit
-  // just removed. Narrowing AFTER the edit, from a fresh read, has no such branch: the
-  // grant endpoint conditions on the required tools it read, so a racing grant either
-  // lands before the edit and is narrowed here, or after it and is already in scope.
-  it('narrows the grant as it is NOW, not as it was when the handler started', async () => {
+  // ENG-827 (Greptile, fourth pass). Two failures were on the table and they pull in
+  // opposite directions: fold the narrowing into the edit's write unconditionally and a
+  // grant made in between is clobbered; split them and acknowledge the edit first, and
+  // any failure of the follow-up leaves the edit sitting next to a grant scoped to the
+  // tool it just removed. One conditional write plus a retry is what satisfies both —
+  // nothing partial is ever acknowledged, and a racing consent change is re-read rather
+  // than either overwritten or given up on.
+  it('re-derives the narrowing against the consent that actually won the race', async () => {
     mockScheduleDb.getScheduleById
-      // The read that authorizes the request.
+      // The read that authorizes the request: a grant covering one tool.
       .mockResolvedValueOnce(existing() as any)
-      // By the time the edit has landed, the owner has granted again — this time
-      // covering both tools. Narrowing the STALE single-tool grant against this edit
-      // would empty out and revoke a grant they just made.
+      // The re-read after the condition fails: the owner re-granted in between, this
+      // time covering both tools. Narrowing the STALE single-tool grant against this
+      // edit would empty out and revoke a grant they had just made.
       .mockResolvedValueOnce(
         existing({
           autopublishAuthorizedTools: ['post_on_connected_account', 'publish_blog_article'],
         }) as any
       );
 
-    await agentModeController.updateScheduledChat(
-      req({ requiredFunctionCalls: ['publish_blog_article'] }),
-      res()
-    );
-
-    const w = written();
-    expect(w.autopublishAuthorizedTools).toEqual(['publish_blog_article']);
-    expect(w).not.toHaveProperty('autopublishAuthorized');
-    // Bound to the FRESH read, not the stale one.
-    expect(narrowingCondition()).toEqual({
-      autopublishAuthorized: true,
-      autopublishAuthorizedTools: ['post_on_connected_account', 'publish_blog_article'],
-    });
-  });
-
-  it('keeps the edit when the narrowing loses its race', async () => {
-    mockScheduleDb.getScheduleById.mockResolvedValue(existing() as any);
-
-    // The edit lands; consent then changes again before the narrowing write, so its
-    // condition fails. The narrowing is the derived consequence of a snapshot that is
-    // now wrong, so it is what gets dropped — the owner's newer decision stands.
     const conditionFailure: any = new Error('The conditional request failed');
     conditionFailure.name = 'ConditionalCheckFailedException';
     mockScheduleDb.updateSchedule
-      .mockResolvedValueOnce({} as any)
-      .mockRejectedValueOnce(conditionFailure);
+      .mockRejectedValueOnce(conditionFailure)
+      .mockResolvedValueOnce({} as any);
+
+    const r = res();
+    await agentModeController.updateScheduledChat(
+      req({ scheduleName: 'Renamed', requiredFunctionCalls: ['publish_blog_article'] }),
+      r
+    );
+
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(2);
+    const retry = (mockScheduleDb.updateSchedule as jest.Mock).mock.calls[1];
+    // The edit and the narrowing land TOGETHER, in the retry.
+    expect(retry[1].scheduleName).toBe('Renamed');
+    expect(retry[1].autopublishAuthorizedTools).toEqual(['publish_blog_article']);
+    expect(retry[1]).not.toHaveProperty('autopublishAuthorized');
+    // Bound to the consent that won, not the one the handler opened with.
+    expect(retry[2]).toEqual({
+      autopublishAuthorized: true,
+      autopublishAuthorizedTools: ['post_on_connected_account', 'publish_blog_article'],
+    });
+    expect(r.json).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'Scheduled chat updated successfully' })
+    );
+  });
+
+  // The point of the retry is convergence, not infinity. When it does not converge the
+  // one thing that must not happen is acknowledging a save that did not occur.
+  it('reports a conflict rather than acknowledging an edit it could not write', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(existing() as any);
+
+    const conditionFailure: any = new Error('The conditional request failed');
+    conditionFailure.name = 'ConditionalCheckFailedException';
+    mockScheduleDb.updateSchedule.mockRejectedValue(conditionFailure);
 
     const r = res();
     await agentModeController.updateScheduledChat(
@@ -272,37 +282,29 @@ describe('ENG-827 — publish consent narrows when an edit changes the required 
       r
     );
 
-    // The edit was written first and unconditionally, so it cannot be lost to this.
-    expect(edited().scheduleName).toBe('Renamed');
-    expect(edited().requiredFunctionCalls).toEqual(['read_brand_guidelines']);
-    expect(edited()).not.toHaveProperty('autopublishAuthorized');
-    expect((mockScheduleDb.updateSchedule as jest.Mock).mock.calls[0][2]).toBeUndefined();
-    // And the owner is told their edit worked, because it did.
+    expect(mockScheduleDb.updateSchedule).toHaveBeenCalledTimes(3);
+    expect(r.status).toHaveBeenCalledWith(409);
     expect(r.json).toHaveBeenCalledWith(
+      expect.objectContaining({ error: expect.stringContaining('nothing was saved') })
+    );
+    expect(r.json).not.toHaveBeenCalledWith(
       expect.objectContaining({ message: 'Scheduled chat updated successfully' })
     );
-    expect(r.status).not.toHaveBeenCalledWith(500);
   });
 
-  // The narrowing is best-effort — the edit is already applied and acknowledged, so a
-  // failure there must not be reported as a failed edit. The EDIT's own write is not
-  // best-effort and still surfaces.
-  it('does not fail the edit when the narrowing write errors', async () => {
-    mockScheduleDb.getScheduleById.mockResolvedValue(existing() as any);
-    mockScheduleDb.updateSchedule
-      .mockResolvedValueOnce({} as any)
-      .mockRejectedValueOnce(new Error('DynamoDB unavailable'));
+  // An ordinary edit must not be made to fail because somebody touched consent at the
+  // same moment: with nothing to narrow there is no condition to lose.
+  it('asserts nothing about consent when there is no grant to narrow', async () => {
+    mockScheduleDb.getScheduleById.mockResolvedValue(
+      existing({ autopublishAuthorized: undefined, autopublishAuthorizedTools: undefined }) as any
+    );
 
-    const r = res();
     await agentModeController.updateScheduledChat(
       req({ requiredFunctionCalls: ['read_brand_guidelines'] }),
-      r
+      res()
     );
 
-    expect(r.status).not.toHaveBeenCalledWith(500);
-    expect(r.json).toHaveBeenCalledWith(
-      expect.objectContaining({ message: 'Scheduled chat updated successfully' })
-    );
+    expect(narrowingCondition()).toBeUndefined();
   });
 
   it('does not swallow a failure of the edit itself', async () => {

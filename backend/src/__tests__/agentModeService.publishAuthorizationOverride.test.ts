@@ -48,7 +48,10 @@ describe('ENG-827 — the resolved authorization survives the worker boundary', 
 
   it('is destructured AND forwarded by the worker entry point', () => {
     const src = read('../workers/generateMarketingResponseWorker.ts');
-    expect(src).toMatch(/publishAuthorizationOverride\s*\}\s*=\s*message\.params/);
+    // Anchored on the destructuring itself rather than on being its LAST key: ENG-907
+    // added `turnStartMs` after it, which broke the old end-anchored pattern without
+    // anything being wrong. What matters is that it is unpacked from message.params.
+    expect(src).toMatch(/const\s*\{[^}]*\bpublishAuthorizationOverride\b[^}]*\}\s*=\s*message\.params/);
 
     // Forwarded into the service call, not just unpacked and discarded.
     const call = src.slice(src.indexOf('generateMarketingResponse('));
