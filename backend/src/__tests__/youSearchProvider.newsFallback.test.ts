@@ -17,8 +17,10 @@
  */
 import { YouSearchProvider } from '../search/youSearchProvider';
 
-const makeProvider = (data: any) => {
+const makeProvider = (data: any, retryData?: any) => {
   const post = jest.fn().mockResolvedValue({ data });
+  // An empty news search retries once with news intent; give that call its own payload.
+  if (retryData !== undefined) post.mockResolvedValueOnce({ data }).mockResolvedValueOnce({ data: retryData });
   return { provider: new YouSearchProvider({ apiKey: 'k', httpClient: { post } as any }), post };
 };
 
@@ -90,8 +92,7 @@ describe('YouSearchProvider news searches (ENG-1050)', () => {
     const { provider } = makeProvider({
       results: {
         web: [
-          { title: 'Zenoti Trust & Compliance Center | Powered by SafeBase', url: 'https://trust.example.com/zenoti', page_age: '2026-08-11T00:00:00' },
-          { title: 'Zenoti Mobile APK Download for Android', url: 'https://apk.example.com/zenoti', page_age: '2026-08-07T00:00:00' },
+          { title: 'Zenoti raises a Series F', url: 'https://news.example.com/zenoti-series-f', page_age: '2026-08-11T00:00:00' },
           { title: 'Fine Dining Restaurant | Las Vegas Restaurants at ARIA', url: 'https://aria.example.com/dining', page_age: '2026-08-11T00:00:00' },
           { title: 'Zendaya en EL PAÍS', url: 'https://elpais.example.com/zendaya', page_age: '2026-08-06T00:00:00' },
         ],
@@ -101,15 +102,71 @@ describe('YouSearchProvider news searches (ENG-1050)', () => {
 
     const response = await provider.search({ query: 'Zenoti', count: 10, freshness: 'week', resultSource: 'news' });
 
-    expect(response.results.map((r) => r.url)).toEqual([
-      'https://trust.example.com/zenoti',
-      'https://apk.example.com/zenoti',
-    ]);
+    expect(response.results.map((r) => r.url)).toEqual(['https://news.example.com/zenoti-series-f']);
     expect(response.metadata).toEqual(expect.objectContaining({
       newsResultCount: 0,
       irrelevantWebDropped: 2,
-      webFallbackCount: 2,
+      webFallbackCount: 1,
     }));
+  });
+
+  it('drops web-bucket pages that cannot be coverage at all', async () => {
+    // Live You.com response for "Zenoti": every page genuinely about Zenoti is a
+    // product surface, because page_age is a crawl date and does not exclude
+    // evergreen pages. Keeping them pads a weekly digest with vendor docs.
+    const { provider } = makeProvider({
+      results: {
+        web: [
+          { title: 'Zenoti Trust & Compliance Center | Powered by SafeBase', url: 'https://trust.zenoti.com/', page_age: '2026-08-11T20:40:53' },
+          { title: 'Zenoti Mobile APK Download for Android', url: 'https://apkpure.net/zenoti-mobile/com.zenoti.mpos', page_age: '2026-08-07T00:00:00' },
+        ],
+      },
+      metadata: { query: 'Zenoti' },
+    });
+
+    const response = await provider.search({ query: 'Zenoti', count: 10, freshness: 'week', resultSource: 'news' });
+
+    expect(response.results).toEqual([]);
+    expect(response.metadata).toEqual(expect.objectContaining({
+      nonCoverageWebDropped: 2,
+      irrelevantWebDropped: 0,
+      webFallbackCount: 0,
+    }));
+  });
+
+  it('requires a web-bucket page to name the entity in its title or URL', async () => {
+    const { provider } = makeProvider({
+      results: {
+        web: [
+          { title: 'Top 40 salon management startups to watch', url: 'https://example.com/list', description: 'Includes Booksy, Zenoti and Phorest.' },
+        ],
+      },
+      metadata: { query: 'Zenoti' },
+    });
+
+    const response = await provider.search({ query: 'Zenoti', count: 10, freshness: 'week', resultSource: 'news' });
+
+    expect(response.results).toEqual([]);
+    expect(response.metadata).toEqual(expect.objectContaining({ irrelevantWebDropped: 1 }));
+  });
+
+  it('requires a news article to corroborate the entity with the rest of the query', async () => {
+    // Live "Stripe payments news" news bucket: "stripes" singularizes onto the
+    // "stripe" anchor, so sports coverage survives an anchor-only test.
+    const { provider } = makeProvider({
+      results: {
+        news: [
+          { title: 'Ohio State running backs earn black stripe removal at camp', url: 'https://sports.example.com/osu' },
+          { title: 'Stripe-PayPal deal would face a regulatory test', url: 'https://news.example.com/stripe-paypal', description: 'over payments scale' },
+        ],
+      },
+      metadata: { query: 'Stripe payments' },
+    });
+
+    const response = await provider.search({ query: 'Stripe payments', count: 10, freshness: 'week', resultSource: 'news' });
+
+    expect(response.results.map((r) => r.url)).toEqual(['https://news.example.com/stripe-paypal']);
+    expect(response.metadata).toEqual(expect.objectContaining({ irrelevantNewsDropped: 1 }));
   });
 
   it('reports no coverage rather than padding when nothing matches the entity', async () => {
@@ -201,6 +258,94 @@ describe('YouSearchProvider news searches (ENG-1050)', () => {
 
     expect(response.results).toHaveLength(1);
     expect(response.results[0].sourceType).toBe('news');
+  });
+
+  it('retries with news intent when a bare entity query comes back empty', async () => {
+    // Live behaviour: "Stripe payments" is ranked navigationally and returns only
+    // Stripe's own help centre and its Wikipedia entry, so an honest filter has
+    // nothing to keep. "Stripe payments news" returns the week's real reporting.
+    const { provider, post } = makeProvider(
+      {
+        results: {
+          web: [
+            { title: 'Stripe, Inc. - Wikipedia', url: 'https://en.wikipedia.org/wiki/Stripe,_Inc.' },
+            { title: 'Payment card transactions : Stripe: Help & Support', url: 'https://support.stripe.com/questions/payment-card-transactions' },
+          ],
+        },
+        metadata: { query: 'Stripe payments' },
+      },
+      {
+        results: {
+          web: [
+            { title: "Stripe's first employee built a bank to fix payments' messy last mile", url: 'https://www.pymnts.com/news/banking/2026/stripe-bank/' },
+            { title: 'Stripe-PayPal deal would likely face regulatory test over payments scale', url: 'https://www.whitecase.com/news/media/stripe-paypal-deal/' },
+          ],
+        },
+        metadata: { query: 'Stripe payments news' },
+      },
+    );
+
+    const response = await provider.search({ query: 'Stripe payments', count: 10, freshness: 'week', resultSource: 'news' });
+
+    expect(post).toHaveBeenCalledTimes(2);
+    expect(post.mock.calls[1][1]).toEqual(expect.objectContaining({ query: 'Stripe payments news', freshness: 'week' }));
+    expect(response.results.map((r) => r.url)).toEqual([
+      'https://www.pymnts.com/news/banking/2026/stripe-bank/',
+      'https://www.whitecase.com/news/media/stripe-paypal-deal/',
+    ]);
+    // the caller's query, not the rewritten one
+    expect(response.query).toBe('Stripe payments');
+    expect(response.metadata).toEqual(expect.objectContaining({ newsIntentRetry: true, webFallbackCount: 2 }));
+  });
+
+  it('ignores the news bucket of the retry, which news intent fills with the trending feed', async () => {
+    const { provider } = makeProvider(
+      { results: { web: [] }, metadata: { query: 'Stripe payments' } },
+      {
+        results: {
+          news: [
+            { title: 'Stripe removal: Ohio State running backs earn black stripe removal', url: 'https://sports.example.com/osu', description: 'Buckeyes camp payments of dues' },
+          ],
+          web: [{ title: 'Stripe launches Tempo', url: 'https://news.example.com/tempo' }],
+        },
+        metadata: { query: 'Stripe payments news' },
+      },
+    );
+
+    const response = await provider.search({ query: 'Stripe payments', count: 10, freshness: 'week', resultSource: 'news' });
+
+    expect(response.results.map((r) => r.url)).toEqual(['https://news.example.com/tempo']);
+    expect(response.results.every((r) => r.sourceType === 'web')).toBe(true);
+  });
+
+  it('does not retry a query that already asks for news', async () => {
+    const { provider, post } = makeProvider({
+      results: { news: [], web: [] },
+      metadata: { query: 'Guesty vacation rental software company news' },
+    });
+
+    const response = await provider.search({
+      query: 'Guesty vacation rental software company news',
+      count: 10,
+      freshness: 'week',
+      resultSource: 'news',
+    });
+
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(response.results).toEqual([]);
+    expect(response.metadata).not.toHaveProperty('newsIntentRetry');
+  });
+
+  it('keeps the honest empty result when the retry itself fails', async () => {
+    const post = jest.fn()
+      .mockResolvedValueOnce({ data: { results: { web: [] }, metadata: { query: 'Zenoti' } } })
+      .mockRejectedValueOnce(new Error('429 rate limited'));
+    const provider = new YouSearchProvider({ apiKey: 'k', httpClient: { post } as any });
+
+    const response = await provider.search({ query: 'Zenoti', count: 10, freshness: 'week', resultSource: 'news' });
+
+    expect(response.results).toEqual([]);
+    expect(response.metadata).toEqual(expect.objectContaining({ resultSource: 'news', webFallbackCount: 0 }));
   });
 
   it('leaves web-only and combined searches untouched', async () => {

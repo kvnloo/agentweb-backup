@@ -59,8 +59,10 @@ describe('youSearchNews result reporting (ENG-1050)', () => {
     const result = await service.youSearchNews('Zenoti', 10);
 
     expect(result.success).toBe(true);
-    expect(result.message).toContain('0 news articles');
-    expect(result.message).toContain('0 recent web pages');
+    // "Found 0 results" reads as a broken search — the exact ambiguity reported.
+    expect(result.message).not.toContain('Found 0');
+    expect(result.message).toContain('No coverage found for "Zenoti" within the week window');
+    expect(result.message).toContain('the search itself succeeded');
     expect(result.formattedContent).toContain('no coverage found');
     expect(result.formattedContent).toContain('The search itself succeeded');
   });

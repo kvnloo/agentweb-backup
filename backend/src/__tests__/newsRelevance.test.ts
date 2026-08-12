@@ -7,7 +7,14 @@
  * King Charles' Scottish castle and Zelenskyy visiting Serbia. These helpers
  * decide whether a returned article has any lexical connection to the query.
  */
-import { extractAnchorTerms, extractSignificantTerms, isRelevantToQuery } from '../search/newsRelevance';
+import {
+  extractAnchorTerms,
+  extractSignificantTerms,
+  extractSupportTerms,
+  hasNewsIntent,
+  isCoverageCandidate,
+  isRelevantToQuery,
+} from '../search/newsRelevance';
 
 describe('extractSignificantTerms (ENG-1050)', () => {
   it('keeps entity/topic terms and drops boilerplate + news-intent words', () => {
@@ -52,6 +59,16 @@ describe('extractAnchorTerms (ENG-1050)', () => {
     expect(extractAnchorTerms('stripe payments news')).toEqual(['stripe']);
     expect(extractAnchorTerms('Stripe Payments')).toEqual(['stripe']);
     expect(extractAnchorTerms('Surfer SEO tool')).toEqual(['surfer']);
+  });
+
+  it('prefers a Title-Cased entity over a capitalised category acronym', () => {
+    // Live failure: anchoring on CMMS as well as UpKeep kept "Best CMMS Software
+    // for 2026" and "Top 10 CMMS software in Australia", which name no company.
+    expect(extractAnchorTerms('UpKeep CMMS maintenance management software company')).toEqual(['upkeep']);
+  });
+
+  it('still uses an acronym when the query Title-Cases nothing else', () => {
+    expect(extractAnchorTerms('IBM quarterly earnings')).toEqual(['ibm']);
   });
 
   it('keeps the entity of the digest-style queries from the report', () => {
@@ -157,5 +174,147 @@ describe('isRelevantToQuery (ENG-1050)', () => {
 
   it('keeps everything when the query has no significant terms to judge against', () => {
     expect(isRelevantToQuery(result('AI CEOs are in their manifesto era'), [])).toBe(true);
+  });
+});
+
+describe('non-Latin queries (ENG-1050)', () => {
+  const result = (title: string, snippet = '', url = 'https://example.com/a') => ({ title, url, snippet });
+
+  it('extracts terms from a Cyrillic query instead of silently disabling the guard', () => {
+    // Tokenizing on [a-z0-9] produced no terms at all here, so nothing could be
+    // filtered: a live "Сбербанк новости" search returned pulasan fruit, an
+    // indie band and the NHL, untouched.
+    expect(extractSignificantTerms('Сбербанк новости')).toEqual(['сбербанк', 'новости']);
+    expect(extractAnchorTerms('Сбербанк новости')).toEqual(['сбербанк']);
+  });
+
+  it('filters Cyrillic results on the Cyrillic entity', () => {
+    const anchors = extractAnchorTerms('Сбербанк новости');
+    expect(isRelevantToQuery(result('Сбербанк повысил ставки по вкладам'), anchors)).toBe(true);
+    expect(isRelevantToQuery(result('Пуласан — экзотический фрукт'), anchors)).toBe(false);
+  });
+
+  it('matches a CJK entity by containment, since the script has no word boundaries', () => {
+    // "ソニー" is not a separate token inside "ソニーグループ", so whole-token
+    // equality can never match and only containment works here.
+    const anchors = extractAnchorTerms('ソニー 決算');
+    expect(anchors).toEqual(['ソニー']);
+    expect(isRelevantToQuery(result('ソニーグループの決算発表'), anchors)).toBe(true);
+    expect(isRelevantToQuery(result('任天堂の新型ハード'), anchors)).toBe(false);
+  });
+
+  it('keeps two-character CJK company names, which the 3-character floor discarded', () => {
+    expect(extractSignificantTerms('索尼 財報')).toEqual(['索尼', '財報']);
+  });
+});
+
+describe('extractSupportTerms (ENG-1050)', () => {
+  it('returns the descriptors left over once the entity is removed', () => {
+    expect(extractSupportTerms('Guesty vacation rental software company news')).toEqual(['vacation', 'rental']);
+    expect(extractSupportTerms('Stripe payments')).toEqual(['payment']);
+  });
+
+  it('returns nothing for a bare entity query, which has nothing to corroborate with', () => {
+    expect(extractSupportTerms('Zenoti')).toEqual([]);
+  });
+});
+
+describe('isRelevantToQuery match strength (ENG-1050)', () => {
+  const result = (title: string, snippet = '', url = 'https://example.com/a') => ({ title, url, snippet });
+
+  it('rejects a common-noun anchor coincidence when the query offers corroboration', () => {
+    // Live "Stripe payments news" trending feed. "stripes" singularizes onto the
+    // "stripe" anchor, so the anchor alone is not enough for this bucket.
+    const anchors = extractAnchorTerms('Stripe payments');
+    const supportTerms = extractSupportTerms('Stripe payments');
+    expect(isRelevantToQuery(result('Ohio State running backs earn black stripe removal at camp'), anchors)).toBe(true);
+    expect(isRelevantToQuery(result('Ohio State running backs earn black stripe removal at camp'), anchors, { supportTerms })).toBe(false);
+    expect(isRelevantToQuery(result('These beaches in Sierra Leone are a surfer\'s dream'), extractAnchorTerms('Surfer SEO tool'), {
+      supportTerms: extractSupportTerms('Surfer SEO tool'),
+    })).toBe(false);
+  });
+
+  it('keeps real coverage that names the descriptor anywhere in the body', () => {
+    const anchors = extractAnchorTerms('Stripe payments');
+    const supportTerms = extractSupportTerms('Stripe payments');
+    expect(
+      isRelevantToQuery(result('Stripe-PayPal deal would face a regulatory test', 'over payment scale'), anchors, { supportTerms }),
+    ).toBe(true);
+  });
+
+  it('still accepts an entity-only match when the query has no descriptors', () => {
+    expect(
+      isRelevantToQuery(result('Zenoti names new CFO'), extractAnchorTerms('Zenoti'), {
+        supportTerms: extractSupportTerms('Zenoti'),
+      }),
+    ).toBe(true);
+  });
+
+  it('headline scope rejects a page that only mentions the entity in its body', () => {
+    // The residual web-bucket false positives were all of this shape: a YC company
+    // index, a Lodgify review page, a Tracxn profile of a different company.
+    const anchors = extractAnchorTerms('Zenoti');
+    const listing = result('Top 40 salon management startups', 'Includes Booksy, Zenoti and Phorest.', 'https://example.com/list');
+    expect(isRelevantToQuery(listing, anchors)).toBe(true);
+    expect(isRelevantToQuery(listing, anchors, { scope: 'headline' })).toBe(false);
+    expect(isRelevantToQuery(result('Zenoti names new CFO'), anchors, { scope: 'headline' })).toBe(true);
+    expect(isRelevantToQuery(result('New CFO appointed', '', 'https://news.example.com/zenoti-cfo'), anchors, { scope: 'headline' })).toBe(true);
+  });
+});
+
+describe('isCoverageCandidate (ENG-1050)', () => {
+  it('rejects evergreen reference and directory hosts', () => {
+    expect(isCoverageCandidate('https://en.wikipedia.org/wiki/Stripe,_Inc.')).toBe(false);
+    expect(isCoverageCandidate('https://tracxn.com/d/companies/stripe/abc')).toBe(false);
+    expect(isCoverageCandidate('https://www.trustpilot.com/review/stripe.com')).toBe(false);
+    expect(isCoverageCandidate('https://apkpure.net/zenoti-mobile/com.zenoti.mpos')).toBe(false);
+    expect(isCoverageCandidate('https://app.dealroom.co/companies/stripe')).toBe(false);
+  });
+
+  it('rejects vendor product surfaces rather than the vendor domain itself', () => {
+    expect(isCoverageCandidate('https://support.stripe.com/questions/payment-card-transactions')).toBe(false);
+    expect(isCoverageCandidate('https://trust.zenoti.com/')).toBe(false);
+    expect(isCoverageCandidate('https://www.guesty.com/pricing/')).toBe(false);
+    // ...but the same company's newsroom is exactly what a digest wants.
+    expect(isCoverageCandidate('https://stripe.com/newsroom/news/tempo')).toBe(true);
+    expect(isCoverageCandidate('https://www.guesty.com/blog/series-f/')).toBe(true);
+  });
+
+  it('rejects evergreen commercial listicles that rank for a company name', () => {
+    expect(isCoverageCandidate('https://www.forbes.com/advisor/business/software/top-stripe-alternatives/')).toBe(false);
+    expect(isCoverageCandidate('https://surferseo.vectortemplates.com/coupons')).toBe(false);
+  });
+
+  it('rejects the vendor-comparison genre, which is most of what a company query returns', () => {
+    expect(isCoverageCandidate('https://eworkorders.com/learn/maintainx-vs-upkeep/')).toBe(false);
+    expect(isCoverageCandidate('https://hoteltechreport.com/compare/guesty-vs-hostaway')).toBe(false);
+    expect(isCoverageCandidate('https://contentpen.ai/blog/surfer-seo-review')).toBe(false);
+    expect(isCoverageCandidate('https://www.saasworthy.com/list/best-cmms-software')).toBe(false);
+  });
+
+  it('rejects reference works, wikis and extension galleries', () => {
+    // Live "UpKeep maintenance" over a month returned three dictionary entries
+    // for the common noun; "Guesty" returned a fan wiki.
+    expect(isCoverageCandidate('https://www.merriam-webster.com/dictionary/upkeep')).toBe(false);
+    expect(isCoverageCandidate('https://darkesthours.miraheze.org/wiki/Guesty')).toBe(false);
+    expect(isCoverageCandidate('https://microsoftedge.microsoft.com/addons/detail/grammarly-ai/abc')).toBe(false);
+    expect(isCoverageCandidate('https://www.zenoti.com/lp/spa-management-software-uk')).toBe(false);
+  });
+
+  it('keeps ordinary articles, and anything it cannot parse', () => {
+    expect(isCoverageCandidate('https://www.pymnts.com/news/banking/2026/stripe-first-employee-built-bank/')).toBe(true);
+    expect(isCoverageCandidate('not a url')).toBe(true);
+  });
+});
+
+describe('hasNewsIntent (ENG-1050)', () => {
+  it('detects a query that already asks for news', () => {
+    expect(hasNewsIntent('Guesty vacation rental software company news')).toBe(true);
+    expect(hasNewsIntent('latest AI headlines')).toBe(true);
+  });
+
+  it('is false for a bare entity query, which You.com ranks navigationally', () => {
+    expect(hasNewsIntent('Stripe payments')).toBe(false);
+    expect(hasNewsIntent('Zenoti')).toBe(false);
   });
 });
