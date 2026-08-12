@@ -12,6 +12,12 @@ const mockYouSearchWeb = jest.fn().mockResolvedValue({ success: true, results: [
 jest.mock('../services/agentModeService', () => ({
   agentModeService: { youSearchWeb: (...args: any[]) => mockYouSearchWeb(...args) },
 }));
+// chatbotService loads its knowledge base at module import time. Keep this
+// enrichment test on the in-process fixture instead of fetching Mintlify docs.
+jest.mock('../services/docsKnowledgeSource', () => {
+  const actual = jest.requireActual('../services/docsKnowledgeSource');
+  return { ...actual, fetchMintlifyDocsContent: jest.fn().mockResolvedValue('') };
+});
 
 import { buildOrchestratorDeps, buildIdentityDeps, buildFieldGuidanceV3, rejectHallucinatedLinkedInUrls } from '../services/enrichmentV3RealDeps';
 import * as apolloServiceModule from '../services/apolloService';
@@ -48,8 +54,12 @@ function mockApolloService(matchPerson = makeMatchPerson()): jest.SpyInstance {
 // already rely on for their assertions (none of them assert on the LLM-derived value).
 function mockLLMNoData() {
   const generateJSONContent = jest.fn().mockResolvedValue({});
-  jest.spyOn(llmServiceModule, 'createLLMService').mockReturnValue({ generateJSONContent } as any);
-  return { generateJSONContent };
+  const generateJSONContentWithWebSearch = jest.fn().mockResolvedValue({});
+  jest.spyOn(llmServiceModule, 'createLLMService').mockReturnValue({
+    generateJSONContent,
+    generateJSONContentWithWebSearch,
+  } as any);
+  return { generateJSONContent, generateJSONContentWithWebSearch };
 }
 
 function makeLead(overrides: Partial<LeadRecord> = {}): LeadRecord {
@@ -325,6 +335,7 @@ describe('enrichSoReverseLookup adapter', () => {
     const reverseLookup = jest.fn().mockResolvedValue(null);
     mockEnrichSoService(reverseLookup);
     jest.spyOn(apolloServiceModule, 'isApolloServiceReady').mockReturnValue(false);
+    mockLLMNoData();
 
     const deps = buildOrchestratorDeps('user-1');
     await deps.resolveIdentity({

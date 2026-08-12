@@ -17,6 +17,13 @@ import * as llmServiceModule from '../utils/llmService';
 import { createApolloFetchContext, createEnrichSoFetchContext } from '../services/enrichmentGroupWaterfall';
 import type { LeadRecord } from '../services/crmEnrichmentService';
 
+// chatbotService loads its knowledge base at module import time. Keep this
+// enrichment test on the in-process fixture instead of fetching Mintlify docs.
+jest.mock('../services/docsKnowledgeSource', () => {
+  const actual = jest.requireActual('../services/docsKnowledgeSource');
+  return { ...actual, fetchMintlifyDocsContent: jest.fn().mockResolvedValue('') };
+});
+
 const PERSON_PROFILE_RAW = {
   first_name: 'Jane',
   last_name: 'Doe',
