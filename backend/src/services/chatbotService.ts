@@ -4557,14 +4557,17 @@ export async function generateChatResponse(
       }
     }
 
-    // ENG-1134: which of these clients meters itself. The Azure factory client
-    // records and charges on every call; the Bedrock and Gemini wrappers do NOT
-    // (only agentModeService.callLLM meters those, and Emma does not go through
-    // it). Until now that gap was masked because message persistence charged the
-    // counter for every path — which double-charged the metered ones. With that
-    // charge removed, these two must meter at the call site or Emma's Claude and
-    // Gemini spend would leave no ledger row and draw down no quota at all.
-    const clientSelfMeters = !isClaudeModel && !isGeminiModel;
+    // ENG-1134: NONE of these clients charges the quota. The llmClients factories
+    // fire `recordUsage` only (see fireRecord) — a ledger row, no deduction — and
+    // the Bedrock/Gemini wrappers from agentModeService do not meter at all.
+    // Message persistence used to be the single charge point for every Emma path,
+    // so removing it (it double-charged agent mode) would have left Emma spending
+    // for free on all three providers.
+    //
+    // So Emma meters explicitly below, for every provider. The Azure client is
+    // therefore requested UN-metered: leaving its factory recording while we also
+    // meter here would write two ledger rows for one call, trading a missing
+    // charge for a doubled record.
 
     if (isClaudeModel) {
       activeClient = await agentModeService!.getBedrockClient(model!);
@@ -4575,7 +4578,9 @@ export async function generateChatResponse(
       // deployment (what the module singleton used). Metered via the factory.
       activeClient = getAzureClient(
         { userId, feature: "chat", sessionId },
-        model || process.env.AZURE_OPENAI_DEPLOYMENT
+        model || process.env.AZURE_OPENAI_DEPLOYMENT,
+        // Un-metered: the meter below is the single record-and-charge point.
+        { metered: false }
       );
     }
 
@@ -4642,7 +4647,7 @@ export async function generateChatResponse(
       // Runs per iteration, because each loop pass is a separate billable call —
       // metering only the final one would undercount every tool-using turn.
       // Fire-and-forget and fail-open by contract, like every other meter.
-      if (!clientSelfMeters) {
+      {
         // Tokens are read exactly the way callLLM reads them, NOT via
         // meterUsageFromResponse. That helper dispatches on response shape, and
         // the Bedrock Converse wrapper answers in OpenAI shape — so it would take
@@ -4656,7 +4661,7 @@ export async function generateChatResponse(
             userId,
             sessionId,
             model: activeDeployment,
-            provider: isClaudeModel ? 'bedrock' : 'gemini',
+            provider: isClaudeModel ? 'bedrock' : isGeminiModel ? 'gemini' : 'azure-openai',
             feature: 'chat',
             inputTokens: u.prompt_tokens || 0,
             outputTokens: u.completion_tokens || 0,

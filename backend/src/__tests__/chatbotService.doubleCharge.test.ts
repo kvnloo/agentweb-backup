@@ -208,8 +208,11 @@ describe('ENG-1134: Emma meters its own un-metered clients exactly once', () => 
     expect(ctx).toMatchObject({ userId: 'user-1', feature: 'chat', provider: 'gemini' });
   });
 
-  it('does NOT meter the Azure path, whose factory client already meters', async () => {
-    // Metering here would recreate exactly the double-charge this ticket fixes.
+  it('meters the Azure path too, requesting the client UN-metered', async () => {
+    // The llmClients factories fire recordUsage only — a ledger row, no charge.
+    // With persistence no longer charging, skipping the meter here would have let
+    // Emma-on-Azure spend for free. The client must be asked for un-metered, or
+    // its factory record plus this meter would write two ledger rows per call.
     const azureCreate = jest.fn().mockResolvedValue(completion());
     mockGetAzureClient.mockReturnValue({ chat: { completions: { create: azureCreate } } });
 
@@ -218,6 +221,13 @@ describe('ENG-1134: Emma meters its own un-metered clients exactly once', () => 
       userId: 'user-1',
     } as never);
 
-    expect(mockMeterUserUsage).not.toHaveBeenCalled();
+    expect(mockMeterUserUsage).toHaveBeenCalledTimes(1);
+    expect(mockMeterUserUsage.mock.calls[0][0]).toMatchObject({
+      userId: 'user-1',
+      feature: 'chat',
+      provider: 'azure-openai',
+    });
+    // Third arg is the overrides object carrying the metered:false opt-out.
+    expect((mockGetAzureClient.mock.calls[0] as unknown[])[2]).toMatchObject({ metered: false });
   });
 });
