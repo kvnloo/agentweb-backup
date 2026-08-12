@@ -6194,6 +6194,39 @@ export class AgentModeService {
       };
     }
 
+    // ENG-1054: CRM record writes — preserve the small scalar counts so the tool
+    // ledger records how many LEADS were written, not just that the tool ran. The
+    // default `{}` below stripped them, which left the truthful-reporting
+    // reconcilers with no evidence: a closing message that stated a batch count as a
+    // lead count ("successfully added the 3 leads" for a 75-lead, 3-batch import)
+    // could not be contradicted, and a platform-timeout message could erase the
+    // import entirely. Same trade as ENG-736/ENG-518 — keep the scalars, drop the
+    // unbounded per-row `errors` array (the model already saw it in the tool message).
+    if (toolName === 'add_leads_to_list') {
+      const a = result || {};
+      return {
+        success: a.success ?? false,
+        ...(typeof a.successCount === 'number' ? { successCount: a.successCount } : {}),
+        ...(typeof a.newCount === 'number' ? { newCount: a.newCount } : {}),
+        ...(typeof a.mergedCount === 'number' ? { mergedCount: a.mergedCount } : {}),
+        ...(typeof a.errorCount === 'number' ? { errorCount: a.errorCount } : {}),
+        ...(typeof a.anonymizedSkipped === 'number' ? { anonymizedSkipped: a.anonymizedSkipped } : {}),
+        ...(a.message !== undefined ? { message: a.message } : {}),
+      };
+    }
+
+    // ENG-1054: the created list's identity, so a run interrupted after creating the
+    // list but before filling it can still be told apart from one that created nothing.
+    if (toolName === 'create_lead_list') {
+      const a = result || {};
+      const list = a.list || {};
+      return {
+        success: a.success ?? false,
+        ...(list.listId !== undefined ? { listId: list.listId } : {}),
+        ...(list.name !== undefined ? { name: list.name } : {}),
+      };
+    }
+
     // For playwright screenshots, result has already been processed (base64 → S3 URL)
     if (toolName === 'playwright_browser_take_screenshot') {
       return result.screenshotUrl ? { screenshotUrl: result.screenshotUrl, success: true } : { success: false };
