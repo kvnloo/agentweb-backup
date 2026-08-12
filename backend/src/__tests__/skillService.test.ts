@@ -201,6 +201,21 @@ describe('SkillService', () => {
       expect(result).toHaveLength(1);
       expect(result[0].isPublished).toBe(true);
     });
+
+    it('excludes a pending-review skill whose stale publication flag is true', async () => {
+      mockPromise.mockResolvedValueOnce({ Items: [{ skillId: 'pending', name: 'Pending', description: 'Desc', toolNames: [], isPublished: true, visibility: 'pending_review', createdAt: mockTimestamp, updatedAt: mockTimestamp }] });
+      expect(await skillService.getPublishedSkills()).toEqual([]);
+    });
+  });
+
+  describe('getSkillsAvailableToUser', () => {
+    it('preserves the owner but not another member\'s pending-review skill', async () => {
+      const owned = { skillId: 'owned', ownerId: 'member', visibility: 'pending_review', isPublished: true };
+      jest.spyOn(skillService, 'getPublishedSkills').mockResolvedValue([]);
+      jest.spyOn(skillService, 'getSkillsByOwner').mockResolvedValue([owned]);
+      jest.spyOn(skillService, 'getSkillsByOrg').mockResolvedValue([{ skillId: 'other', ownerId: 'owner', visibility: 'pending_review', isPublished: true }]);
+      expect(await skillService.getSkillsAvailableToUser('member', 'org')).toEqual([owned]);
+    });
   });
 
   describe('getSkillsByIds', () => {

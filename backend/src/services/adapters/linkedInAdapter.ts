@@ -53,12 +53,19 @@ export class LinkedInAdapter implements SocialPlatformAdapter {
           access_token: newTokens.access_token,
           refresh_token: newTokens.refresh_token,
           token_expires_at: Date.now() + (newTokens.expires_in * 1000),
-        }, account.account_id);
+        }, account.account_id, account);
       }
 
       return { token: newTokens.access_token, wasRefreshed: true };
     } catch (error: any) {
       console.error('[LinkedInAdapter] Token refresh failed:', error);
+
+      // A conditional token write lost to an account change or disconnect.
+      // Never turn that into a fresh in-memory credential for the provider
+      // call that follows.
+      if (error?.code === 'ConnectedAccountChanged') {
+        throw error;
+      }
       
       // Detect deactivated app (invalid_client error)
       const errorMessage = error?.message || '';

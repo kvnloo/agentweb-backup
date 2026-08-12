@@ -921,7 +921,7 @@ AD_CREATIVE GET — read ONE creative back by id (params.creative_id), including
 
 READING CONFIG (LIST) — read what a campaign/ad set is actually set to optimize for (use to verify after a CREATE/UPDATE):
   AD_SET LIST returns optimization_goal, billing_event, destination_type, promoted_object (pixel_id + custom_event_type), bid_strategy, and budgets per ad set. Pass ad_set_id to read a single ad set; pass campaign_id to scope to one campaign's ad sets.
-  CAMPAIGN LIST returns objective plus daily_budget / lifetime_budget / budget_remaining / bid_strategy. Pass campaign_id to read a single campaign.
+  CAMPAIGN LIST returns objective plus daily_budget / lifetime_budget / budget_remaining / spend_cap / bid_strategy. Pass campaign_id to read a single campaign. budget_remaining is only populated by Meta when the campaign itself carries the budget (CBO); for ad-set-budgeted campaigns it is absent — read the ad sets' budgets instead, do not infer 0.
   Optional params.fields (comma-separated) narrows the read to specific supported fields. Requesting an unsupported field returns a loud error — it is never silently dropped.
 
 DATASET USAGE:
@@ -955,6 +955,7 @@ REQUIRED PARAMS PER ENTITY + ACTION:
                         Omitting bid_strategy silently defaults to LOWEST_COST_WITHOUT_CAP — set it deliberately when the user expressed any cost target (ENG-838).
                         bid_amount is REQUIRED for LOWEST_COST_WITH_BID_CAP and COST_CAP, and must be OMITTED for LOWEST_COST_WITHOUT_CAP.
                         NOT SUPPORTED: dayparting / ad scheduling (adset_schedule, pacing_type). A request for scheduled delivery is REJECTED, not silently ignored — tell the user it must be set in Ads Manager after creation. start_time/end_time are the flight window, not dayparting.
+                        After a successful create the ad set is READ BACK from Meta: the result carries readBack (the settings Meta actually stored), readBackVerified, and readBackMismatches. If a mismatch is reported the call returns success:false even though the ad set exists — tell the user which parameter Meta overrode and that the ad set is live with settings nobody chose (ENG-838).
   AD_CREATIVE CREATE:   name, page_id, body, title, link_url + exactly one creative type (see below)
   AD CREATE:            name, creative_id (plus ad_set_id top-level param)
   AD COPY_AD:           ad_id = source ad ID. Optional params: name (new ad name), adset_id (target ad set; defaults to source ad's set), link_url (override destination URL), body, title, status (default PAUSED). Automatically copies images — no manual upload needed.

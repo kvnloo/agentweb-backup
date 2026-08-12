@@ -560,7 +560,8 @@ export class ChatbotDB {
     executionId?: string,
     emailCampaignTaskId?: string,
     sessionType?: "regular" | "predefined-work-plan" | "scheduled" | "image-generation" | "video-generation" | "book-generation" | "report_generation" | "result-endpoint" | "emma-email" | "meeting-intake",
-    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean }
+    delegateInfo?: { adminUserId: string; adminEmail: string; isDelegated: boolean },
+    initialState?: Partial<Pick<ChatSession, "llmModel" | "associatedSkills" | "messages">>
   ): Promise<ChatSession> {
     const sessionId = uuidv4();
     const timestamp = new Date().toISOString();
@@ -599,6 +600,7 @@ export class ChatbotDB {
       sessionType: sessionType || "regular", // Default to regular if not specified
       delegateInfo, // Store delegate access info if provided
       ...(portalType === "agent" ? { associatedSkills: [] } : {}), // Initialize for agent sessions so skill enforcement applies
+      ...initialState,
     };
 
     if (pageContent) {
@@ -3812,17 +3814,29 @@ export async function loadKnowledgeBase(): Promise<void> {
   //printKnowledgeBase();
 }
 
-// Load knowledge base on startup and refresh periodically
-loadKnowledgeBase().catch((error) => {
-  console.error("Error loading knowledge base:", error);
-});
-
-// Refresh knowledge base every hour
-setInterval(() => {
+// Load knowledge base on startup and refresh periodically.
+//
+// Skipped under test. This is module-load network I/O, so merely IMPORTING any
+// route that transitively reaches this file fires a real fetch at the docs
+// corpus — which is what trips org.test.ts's "no route here has any business
+// touching the network" assertion (ENG-1112) even though nothing in that suite
+// asks for docs. The hourly timer has the same problem in reverse: it keeps a
+// handle open after a suite finishes, which is where "Cannot log after tests are
+// done" and the non-graceful worker exits come from. Production behaviour is
+// unchanged; the one test that needs the knowledge base calls
+// loadKnowledgeBase() itself.
+if (process.env.NODE_ENV !== "test") {
   loadKnowledgeBase().catch((error) => {
-    console.error("Error refreshing knowledge base:", error);
+    console.error("Error loading knowledge base:", error);
   });
-}, 60 * 60 * 1000);
+
+  // Refresh knowledge base every hour
+  setInterval(() => {
+    loadKnowledgeBase().catch((error) => {
+      console.error("Error refreshing knowledge base:", error);
+    });
+  }, 60 * 60 * 1000);
+}
 
 const partnerSystemMessage = `You are a helpful customer support assistant for AgentWeb, a powerful web automation platform that allows users to create and manage web-based tasks using natural language instructions. 
 
@@ -4108,7 +4122,11 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         const content = segment.structValue.fields.content.stringValue;
         results.push({
           id: `kb-public-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          content: content,
+          // ENG-1057: cap here, at the shared source, so every consumer of
+          // this function is protected uniformly instead of relying on each
+          // one to remember to truncate independently (which is exactly how
+          // one uncapped path crashed the backend with ERR_STRING_TOO_LONG).
+          content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
           metadata: {
             source: 'public-knowledge-base',
             ...(fileName && { fileName })
@@ -4155,7 +4173,8 @@ export async function searchPlatformKnowledgeBase(query: string, maxResults: num
         const content = segment.structValue.fields.content.stringValue;
         results.push({
           id: `kb-private-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-          content: content,
+          // ENG-1057: same cap as the public branch above.
+          content: content.length > 5000 ? content.substring(0, 5000) + '\n\n[Content truncated]' : content,
           metadata: {
             source: 'private-knowledge-base',
             taskId: taskId,

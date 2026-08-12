@@ -14,6 +14,7 @@ jest.mock('../services/subscriptionService', () => ({
     'read_brand_guidelines',
     'post_on_connected_account',
   ]),
+  isSubscriptionFeatureEnabled: jest.fn(async () => true),
 }));
 
 jest.mock('../services/chatbotService', () => ({

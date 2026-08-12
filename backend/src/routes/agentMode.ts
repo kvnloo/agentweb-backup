@@ -135,6 +135,9 @@ router.post('/ishare/:shareId/email-report', asyncHandler(agentModeController.em
 // All other routes require authentication
 router.use(authenticateToken);
 
+// Create an authorized Skill-backed session with its existing static welcome brief.
+router.post('/skill/:skillId/session', asyncHandler(agentModeController.createSession));
+
 // PUT /api/agent-mode/session/:sessionId/transfer
 // Transfer anonymous session to authenticated user (requires authentication)
 router.put('/session/:sessionId/transfer', asyncHandlerAuth(agentModeController.transferSession));
