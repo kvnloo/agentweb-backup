@@ -305,6 +305,16 @@ describe('isCoverageCandidate (ENG-1050)', () => {
     expect(isCoverageCandidate('https://www.pymnts.com/news/banking/2026/stripe-first-employee-built-bank/')).toBe(true);
     expect(isCoverageCandidate('not a url')).toBe(true);
   });
+
+  it('keeps a dated or news-sectioned article whose slug happens to contain an evergreen word', () => {
+    // The evergreen markers are substring matches over the whole path, which is
+    // right for a listicle slug and wrong for a story that merely uses the word.
+    // An article signal in the path wins over them (Greptile review, PR #2364).
+    expect(isCoverageCandidate('https://techcrunch.com/2026/08/11/stripe-pricing-overhaul-for-platforms/')).toBe(true);
+    expect(isCoverageCandidate('https://www.reuters.com/technology/2026-08-11-upkeep-raises-series-c-after-strategic-review/')).toBe(true);
+    expect(isCoverageCandidate('https://www.zdnet.com/article/surfer-seo-review-tool-acquires-contentgecko/')).toBe(true);
+    expect(isCoverageCandidate('https://www.guesty.com/press-release/guesty-vs-market-expansion/')).toBe(true);
+  });
 });
 
 describe('hasNewsIntent (ENG-1050)', () => {
