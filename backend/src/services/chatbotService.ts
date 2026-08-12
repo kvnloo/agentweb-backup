@@ -671,6 +671,37 @@ export class ChatbotDB {
     return chatSession;
   }
 
+  /**
+   * Bound a message to the per-item persistence budget.
+   *
+   * Check serialized item size in UTF-8 BYTES — covers both string content and
+   * content-block arrays. DynamoDB's hard limit is 400KB per item; we use 350KB as a
+   * safety margin. Bytes, not `.length`: JSON.stringify leaves non-ASCII literal, so
+   * a CJK/emoji-heavy message is far bigger encoded than its character count.
+   *
+   * ENG-946: bound the WHOLE item, not just `content`. The final assistant turn of a
+   * long run carries the run's tool-call ledger on `metadata.toolCalls`, which is
+   * routinely 20x the answer — truncating `content` shed nothing, the item stayed
+   * over 400KB, batchWrite threw, and the report was lost from the transcript while
+   * the run still reported success. shrinkMessageForPersistence sheds the ledger
+   * first and the answer last, and guarantees the item fits.
+   *
+   * ENG-1048: this lives here, rather than inline in one writer, because EVERY path
+   * that writes a message item is subject to the same ceiling. ENG-946 guarded only
+   * the append path, so the session→table migration, the repair pass and the
+   * single-message update still wrote raw messages and still threw on an oversized one.
+   *
+   * Returns the ORIGINAL reference when the message already fits.
+   */
+  private fitMessageForPersistence(message: any, label: string): any {
+    const serializedLen = Buffer.byteLength(JSON.stringify(message) ?? '', 'utf8');
+    const safeMessage = shrinkMessageForPersistence(message, MAX_MESSAGE_CONTENT_SIZE);
+    if (safeMessage !== message) {
+      console.warn(`${label} has oversized serialized size (${serializedLen} bytes), truncating to ${Buffer.byteLength(JSON.stringify(safeMessage) ?? '', 'utf8')} bytes`);
+    }
+    return safeMessage;
+  }
+
   // Add messages to AW-ChatMessages table
   private async addMessagesToMessagesTable(sessionId: string, messages: ChatMessage[], startIndex: number): Promise<void> {
     if (messages.length === 0) {
@@ -683,22 +714,10 @@ export class ChatbotDB {
       for (let i = 0; i < messages.length; i += batchSize) {
         const batch = messages.slice(i, i + batchSize);
         const writeRequests = batch.map((message, index) => {
-          // Check serialized item size in UTF-8 BYTES — covers both string content and
-          // content-block arrays. DynamoDB hard limit is 400KB per item; we use 350KB as a
-          // safety margin. Bytes, not `.length`: JSON.stringify leaves non-ASCII literal, so
-          // a CJK/emoji-heavy message is far bigger encoded than its character count.
-          //
-          // ENG-946: bound the WHOLE item, not just `content`. The final assistant turn of a
-          // long run carries the run's tool-call ledger on `metadata.toolCalls`, which is
-          // routinely 20x the answer — truncating `content` shed nothing, the item stayed
-          // over 400KB, batchWrite threw, and the report was lost from the transcript while
-          // the run still reported success. shrinkMessageForPersistence sheds the ledger
-          // first and the answer last, and guarantees the item fits.
-          const serializedLen = Buffer.byteLength(JSON.stringify(message) ?? '', 'utf8');
-          const safeMessage = shrinkMessageForPersistence(message, MAX_MESSAGE_CONTENT_SIZE);
-          if (safeMessage !== message) {
-            console.warn(`Message ${startIndex + i + index} for session ${sessionId} has oversized serialized size (${serializedLen} bytes), truncating to ${Buffer.byteLength(JSON.stringify(safeMessage) ?? '', 'utf8')} bytes`);
-          }
+          const safeMessage = this.fitMessageForPersistence(
+            message,
+            `Message ${startIndex + i + index} for session ${sessionId}`,
+          );
           return {
             PutRequest: {
               Item: {
@@ -1041,7 +1060,11 @@ export class ChatbotDB {
           '#message': 'message',
         },
         ExpressionAttributeValues: {
-          ':message': updatedMessage,
+          // ENG-1048: adding feedback grows an item that may already sit at the ceiling.
+          ':message': this.fitMessageForPersistence(
+            updatedMessage,
+            `Message ${messageIndex} feedback for session ${sessionId}`,
+          ),
         },
         ReturnValues: 'ALL_NEW',
       };
@@ -1290,7 +1313,11 @@ export class ChatbotDB {
             Item: {
               sessionId,
               messageIndex: i + index,
-              message,
+              // ENG-1048: same 400KB ceiling as the append path.
+              message: this.fitMessageForPersistence(
+                message,
+                `Migrated message ${i + index} for session ${sessionId}`,
+              ),
             },
           },
         }));
@@ -1495,7 +1522,12 @@ export class ChatbotDB {
           Item: {
             sessionId,
             messageIndex,
-            message
+            // ENG-1048: a repaired message is subject to the same 400KB ceiling —
+            // without this the repair pass throws on exactly the messages it exists to fix.
+            message: this.fitMessageForPersistence(
+              message,
+              `Repaired message ${messageIndex} for session ${sessionId}`,
+            )
           }
         }
       }));
@@ -3587,7 +3619,11 @@ export class ChatbotDB {
         },
         UpdateExpression: "SET message = :message",
         ExpressionAttributeValues: {
-          ":message": updatedMessage,
+          // ENG-1048: same 400KB ceiling as every other message write.
+          ":message": this.fitMessageForPersistence(
+            updatedMessage,
+            `Message ${messageIndex} for session ${sessionId}`,
+          ),
         },
       };
 
