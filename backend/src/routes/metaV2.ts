@@ -4,7 +4,6 @@ import { authenticateToken } from '../middleware/auth';
 import { userDb, taskDb } from '../services/db';
 import { metaService } from '../services/metaService';
 import {
-  cleanAccountId,
   getConnectedMetaAccountsList,
   getMetaAccountCredentials,
 } from '../services/metaAccountCredentials';
@@ -211,83 +210,6 @@ router.get('/pixels', async (req, res) => {
     res.json({ pixels: perAccountPixels.flat() });
   } catch (error: any) {
     console.error('[MetaV2] /pixels error:', error);
-    res.status(500).json({ message: error.message });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// GET /api/meta/v2/attribution-default
-// ENG-1141: single status endpoint reused by every UI surface (Meta card,
-// Calendly card) instead of each one reimplementing the ambiguity check —
-// reuses resolveMetaPixelForUser rather than duplicating its logic.
-// ---------------------------------------------------------------------------
-router.get('/attribution-default', async (req, res) => {
-  const userId = (req as any).user.userId;
-  try {
-    const user = await userDb.getUserById(userId);
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    const resolution = await metaService.resolveMetaPixelForUser(user, userId);
-    res.json({ default: user.metaAttributionDefault ?? null, resolution });
-  } catch (error: any) {
-    console.error('[MetaV2] /attribution-default error:', error);
-    res.status(500).json({ message: error.message });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// PUT /api/meta/v2/attribution-default
-// ENG-1141: sets the account-level default resolveMetaPixelForUser's tier 2
-// reads. Never trusts the client to submit a valid pair — both the account
-// and the specific pixel must genuinely belong to the caller's own connected
-// accounts before persisting.
-// ---------------------------------------------------------------------------
-router.put('/attribution-default', async (req, res) => {
-  const userId = (req as any).user.userId;
-  const { pixelId, accountId } = req.body || {};
-  try {
-    if (!pixelId || !accountId) {
-      return res.status(400).json({ message: 'pixelId and accountId are required' });
-    }
-
-    const user = await userDb.getUserById(userId);
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    const cleaned = cleanAccountId(accountId);
-    const accounts = getConnectedMetaAccountsList(user);
-    if (!accounts.some((acc: any) => acc.accountId === cleaned)) {
-      return res.status(400).json({ message: `Meta ad account "${accountId}" is not one of your connected accounts.` });
-    }
-
-    const { accountId: resolvedAccountId, accessToken } = await getMetaAccountCredentials(user, userId, cleaned);
-    const pixels = await metaService.listPixels(resolvedAccountId, accessToken);
-    if (!(pixels || []).some((p: any) => p.id === pixelId)) {
-      return res.status(400).json({ message: `Pixel "${pixelId}" was not found on ad account ${resolvedAccountId}.` });
-    }
-
-    const metaAttributionDefault = { pixelId, accountId: resolvedAccountId };
-    await userDb.updateUser(userId, { metaAttributionDefault });
-    res.json({ default: metaAttributionDefault });
-  } catch (error: any) {
-    console.error('[MetaV2] PUT /attribution-default error:', error);
-    res.status(500).json({ message: error.message });
-  }
-});
-
-// ---------------------------------------------------------------------------
-// DELETE /api/meta/v2/attribution-default
-// ENG-1141: clears the default, reverting to today's auto-resolve (tier 3).
-// ---------------------------------------------------------------------------
-router.delete('/attribution-default', async (req, res) => {
-  const userId = (req as any).user.userId;
-  try {
-    const user = await userDb.getUserById(userId);
-    if (!user) return res.status(404).json({ message: 'User not found' });
-
-    await userDb.updateUser(userId, { metaAttributionDefault: null });
-    res.json({ default: null });
-  } catch (error: any) {
-    console.error('[MetaV2] DELETE /attribution-default error:', error);
     res.status(500).json({ message: error.message });
   }
 });

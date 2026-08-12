@@ -100,3 +100,38 @@ export async function getMetaAccountCredentials(
     accountName: selected.account_name || selected.config?.name || 'Unknown Account',
   };
 }
+
+/**
+ * Validate that a pixelId/accountId pair genuinely belongs to the caller's own connected
+ * Meta accounts before persisting it anywhere a customer submits one explicitly (a Calendly
+ * attribution choice, a landing-page generation override, etc.) — never trust a client-
+ * submitted pair. Throws a user-friendly error if the account isn't connected or the pixel
+ * isn't found on it; returns the cleaned accountId on success. Shared by
+ * `routes/connectedAccounts.ts`'s Calendly attribution route and
+ * `routes/landingPageGeneration.ts`'s generation-time override, so the check can't drift
+ * between the two call sites.
+ *
+ * Imports `./metaService` dynamically, not at module top level, for the same reason
+ * `metaService.ts` imports this module dynamically — `metaService.ts` -> `metaTokenRefresh.ts`
+ * already forms one edge of the cycle; a static import here would close the loop.
+ */
+export async function assertOwnedMetaPixel(
+  user: any,
+  userId: string,
+  pixelId: string,
+  accountId: string,
+): Promise<{ accountId: string }> {
+  const cleaned = cleanAccountId(accountId);
+  const accounts = getConnectedMetaAccountsList(user);
+  if (!accounts.some((acc: any) => acc.accountId === cleaned)) {
+    throw new Error(`Meta ad account "${accountId}" is not one of your connected accounts.`);
+  }
+
+  const { metaService } = await import('./metaService');
+  const { accountId: resolvedAccountId, accessToken } = await getMetaAccountCredentials(user, userId, cleaned);
+  const pixels = await metaService.listPixels(resolvedAccountId, accessToken);
+  if (!(pixels || []).some((p: any) => p.id === pixelId)) {
+    throw new Error(`Pixel "${pixelId}" was not found on ad account ${resolvedAccountId}.`);
+  }
+  return { accountId: resolvedAccountId };
+}
