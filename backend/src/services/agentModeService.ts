@@ -16168,7 +16168,12 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
           .join('; ');
         return {
           ...base,
-          success: false,
+          // The create already committed a live entity. Keep the operation
+          // successful so generic tool retry handling cannot create a
+          // duplicate ad set, while the message remains an explicit loud
+          // failure of the requested settings.
+          success: true,
+          readBackMismatch: true,
           message:
             `Ad set ${adSet.id} was created, but Meta did not apply the settings that were requested ` +
             `(${detail}). It is live with settings nobody chose — review or pause it in Ads Manager.`,

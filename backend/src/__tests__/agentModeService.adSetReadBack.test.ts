@@ -134,7 +134,8 @@ describe('ENG-838 AC4 — the applied ad set settings are read back from Meta, n
       bid_amount: 5
     });
 
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
+    expect(result.readBackMismatch).toBe(true);
     expect(String(result.message)).toMatch(/bid_strategy/);
     expect(String(result.message)).toMatch(/COST_CAP/);
     expect(String(result.message)).toMatch(/LOWEST_COST_WITHOUT_CAP/);
@@ -156,7 +157,8 @@ describe('ENG-838 AC4 — the applied ad set settings are read back from Meta, n
 
     const result = await service.createMetaAdsAdSet('user123', { ...baseAdSetParams });
 
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
+    expect(result.readBackMismatch).toBe(true);
     expect(result.readBackMismatches).toEqual([
       { parameter: 'daily_budget', requested: '1000', applied: '5000' }
     ]);
@@ -178,7 +180,8 @@ describe('ENG-838 AC4 — the applied ad set settings are read back from Meta, n
       end_time: '2026-09-30T00:00:00+0000'
     });
 
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
+    expect(result.readBackMismatch).toBe(true);
     expect(result.readBackMismatches).toEqual([
       { parameter: 'end_time', requested: '2026-09-30T00:00:00+0000', applied: null }
     ]);
