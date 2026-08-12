@@ -53,4 +53,26 @@ console.log = (...args) => {
     originalConsoleLog(...args);
   }
 };
+
+// ENG-1111: block any test from reaching a real non-local host over Node's native `fetch`
+// (which SDKs like `resend` are built on -- see ENG-1112, __mocks__/resend.ts). The
+// separate `node-fetch` package is not covered by wrapping globalThis.fetch here -- see
+// __mocks__/node-fetch.ts for that call site. Both enforce the same policy defined in
+// networkEgressGuard.ts.
+import { assertLocalOrAllowed } from './networkEgressGuard';
+
+const realFetch = globalThis.fetch;
+if (typeof realFetch === 'function') {
+  globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+    const url =
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : input.url;
+    assertLocalOrAllowed(url);
+    return realFetch(input, init);
+  }) as typeof fetch;
+}
+
 export {};

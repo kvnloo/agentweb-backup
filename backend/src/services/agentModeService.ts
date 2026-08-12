@@ -16115,13 +16115,76 @@ Reply "no" for: greetings with no question, one-word reactions, automated notifi
       // The user-facing message is deliberately unchanged: that string is
       // customer-visible copy and is not this issue's to rewrite. The structured
       // fields below are what make the choice detectable.
-      return {
+      //
+      // ENG-838 AC4: `strategy` above is what this process *resolved*, never
+      // what Meta stored. Read the entity back and compare, so a write Meta
+      // reinterpreted (the Open Future Forum shape: specified parameters,
+      // platform defaults applied, run reports success) is visible instead of
+      // silent.
+      const base = {
         success: true,
         message: `Ad set "${adSet.name}" created successfully`,
         adSet: adSet,
         appliedBidStrategy: strategy,
         bidStrategyWasDefaulted: args.bid_strategy === undefined
       };
+
+      let readBack: any;
+      try {
+        readBack = await metaService.getAdSet(accessToken, adSet.id);
+      } catch (readBackError: any) {
+        // The ad set exists; reporting failure would be a different lie. But
+        // the result must not imply the settings were confirmed.
+        return {
+          ...base,
+          readBackVerified: false,
+          readBackError: readBackError?.message || String(readBackError)
+        };
+      }
+
+      const expected: Array<[string, any]> = [
+        ['bid_strategy', strategy],
+        ['bid_amount', normalizedParams.bid_amount],
+        ['daily_budget', normalizedParams.daily_budget],
+        ['lifetime_budget', normalizedParams.lifetime_budget],
+        ['start_time', normalizedParams.start_time],
+        ['end_time', normalizedParams.end_time]
+      ];
+      // Meta returns monetary fields as strings; compare stringified so
+      // 1000 and "1000" are the same value and not a fake mismatch.
+      const asComparable = (v: any) => (v === undefined || v === null ? null : String(v));
+      const readBackMismatches = expected
+        .filter(([, requested]) => requested !== undefined)
+        .map(([parameter, requested]) => ({
+          parameter,
+          requested: asComparable(requested),
+          applied: asComparable(readBack?.[parameter])
+        }))
+        .filter(m => m.requested !== m.applied);
+
+      if (readBackMismatches.length > 0) {
+        const detail = readBackMismatches
+          .map(m => `${m.parameter}: requested ${m.requested}, Meta applied ${m.applied}`)
+          .join('; ');
+        return {
+          ...base,
+          // The create already committed a live entity. Keep the operation
+          // successful so generic tool retry handling cannot create a
+          // duplicate ad set, while the message remains an explicit loud
+          // failure of the requested settings.
+          success: true,
+          readBackMismatch: true,
+          message:
+            `Ad set ${adSet.id} was created, but Meta did not apply the settings that were requested ` +
+            `(${detail}). It is live with settings nobody chose — review or pause it in Ads Manager.`,
+          error: `Ad set read-back mismatch on ${readBackMismatches.map(m => m.parameter).join(', ')}`,
+          readBack,
+          readBackVerified: true,
+          readBackMismatches
+        };
+      }
+
+      return { ...base, readBack, readBackVerified: true, readBackMismatches };
     } catch (error: any) {
       if (error.isMetaAuthError) throw error;
       console.error('AgentMode: Error creating Meta ad set:', error);
