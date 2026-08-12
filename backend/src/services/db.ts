@@ -6818,12 +6818,20 @@ export const crmDb = {
         }
       });
 
-      // Update field names in list
+      // Update field names in list. Best-effort: this is display bookkeeping,
+      // and letting it throw would unwind into the catch below and discard the
+      // per-row ledger for an import whose rows are already written — the
+      // caller would be told the whole import failed and would re-send rows
+      // that are in the list (ENG-1133).
       if (allFieldNames.length > 0) {
-        const list = await this.getLeadListById(listId);
-        const existingFieldNames = (list?.fieldNames as string[]) || [];
-        const combinedFieldNames = [...existingFieldNames, ...allFieldNames];
-        await this.updateFieldNames(listId, combinedFieldNames);
+        try {
+          const list = await this.getLeadListById(listId);
+          const existingFieldNames = (list?.fieldNames as string[]) || [];
+          const combinedFieldNames = [...existingFieldNames, ...allFieldNames];
+          await this.updateFieldNames(listId, combinedFieldNames);
+        } catch (fieldNameError: any) {
+          console.error(`batchCreateLeads: failed to update field names for ${listId}:`, fieldNameError?.message || fieldNameError);
+        }
       }
 
       // Process leads to update (merge existing leads with new data)
@@ -6951,9 +6959,17 @@ export const crmDb = {
         }
       }
 
-      // Update lead count (only for new leads, updates don't change count)
-      if (newLeads.length > 0) {
-        await this.incrementLeadCount(listId, newLeads.length);
+      // Update lead count (only for new leads, updates don't change count).
+      // Counts rows actually WRITTEN, not rows selected for writing: a batch
+      // whose write failed must not inflate the list's count (ENG-1133).
+      // Best-effort for the same reason as the field names above — a
+      // denormalized counter is recoverable, the ledger is not.
+      if (results.created.length > 0) {
+        try {
+          await this.incrementLeadCount(listId, results.created.length);
+        } catch (countError: any) {
+          console.error(`batchCreateLeads: failed to increment lead count for ${listId}:`, countError?.message || countError);
+        }
       }
 
       return results;
