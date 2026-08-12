@@ -1153,7 +1153,7 @@ describe('AgentModeService - CRM Tools', () => {
           company: 'Acme',
           customFields: { dinnerSeat: 'confirmed' },
         },
-      ]);
+      ], expect.objectContaining({ dedupeByNameCompany: true }));
     });
 
     it('allows a listed crm.editor to add leads to another member\'s list (ENG-1049)', async () => {
@@ -1165,7 +1165,7 @@ describe('AgentModeService - CRM Tools', () => {
       const result = await service.addLeadsToList(listId, [newLead], orgMemberId);
 
       expect(result.success).toBe(true);
-      expect(result.newCount).toBe(1);
+      expect(result.reconciliation.created).toBe(1);
       expect(mockCrmDb.batchCreateLeads).toHaveBeenCalledTimes(1);
     });
 
