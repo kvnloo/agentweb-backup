@@ -14594,13 +14594,20 @@ Rules: Do NOT start with "I". Do NOT observe or analyze. Do NOT reference conten
       // for a run whose production publish had already landed and been verified. It
       // is told what succeeded (below) and forbidden from turning an interruption
       // into a claim of lost work.
+      //
+      // ENG-1133: the ledger's numbers are INVOCATION counts, and unlabelled they
+      // read as a quantity of things. Handed {"add_leads_to_list":3} for a run that
+      // wrote 75 leads over three calls, this agent told the customer "I have
+      // successfully added the 3 leads to your CRM list" — the tool ran 3 times.
+      // The unit has to be on the wire, because the agent never sees tool RESULTS.
       const systemPrompt = `You are a diagnostic assistant for an AI marketing platform called Emma. The main AI agent failed while processing a user's request. Based on the context below, write a helpful 1-3 sentence message for the user explaining what happened and what they can do next. Be specific about what was accomplished (if anything) and what failed. Do NOT apologize excessively. Do NOT use technical jargon. Return ONLY the message text.
 
 TRUTHFULNESS RULES (these override tone):
 - The "Succeeded operations" list is what actually happened. Anything on it completed — say so, and name it.
 - An error, timeout, or interruption ENDS the run; it does not undo, roll back, or discard work that already succeeded. Never say or imply that completed work was lost, was not saved, or must be redone.
 - Only tell the user to retry the parts that did NOT succeed. If a publish, deploy, or send succeeded, explicitly tell the user NOT to re-run it.
-- Do not attribute a failure to an operation that appears in the succeeded list.`;
+- Do not attribute a failure to an operation that appears in the succeeded list.
+- The numbers beside each operation are HOW MANY TIMES IT RAN — never how many leads, rows, emails, posts, files, or records it handled. You are not shown those quantities. Never restate a run count as a quantity of things: "add_leads_to_list: 3" means that tool ran 3 times, NOT that 3 leads were added. If you do not know how many items an operation processed, say what ran without inventing a number.`;
 
       const parts: string[] = [
         `Error type: ${context.errorType}`,
@@ -14613,10 +14620,10 @@ TRUTHFULNESS RULES (these override tone):
         parts.push('No work plan.');
       }
       if (context.succeededFunctions && Object.keys(context.succeededFunctions).length > 0) {
-        parts.push(`Succeeded operations (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
+        parts.push(`Succeeded operations, as {operation: number of times it RAN} — NOT a count of records handled (these COMPLETED — do not report them as lost): ${JSON.stringify(context.succeededFunctions)}`);
       }
       if (context.failedFunctions && Object.keys(context.failedFunctions).length > 0) {
-        parts.push(`Failed operations: ${JSON.stringify(context.failedFunctions)}`);
+        parts.push(`Failed operations, as {operation: number of times it FAILED} — NOT a count of records handled: ${JSON.stringify(context.failedFunctions)}`);
       }
 
       const llmPromise = this.callLLM(DIAGNOSIS_MODEL, [
