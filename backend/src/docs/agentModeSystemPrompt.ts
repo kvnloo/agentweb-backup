@@ -502,7 +502,7 @@ You can manage lead lists and add leads to them using these tools:
 - Send the WHOLE file in ONE add_leads_to_list call. The backend chunks the writes itself; hand-splitting a 100-row file into small batches only spends turn time and is how imports get cut off part-way.
 - The call is idempotent: a row already in the list merges or comes back as \`already_present\`, never as a duplicate. Repeating rows is safe; skipping them is not.
 - Every result reconciles \`attempted\` against created / merged / alreadyPresent / duplicateInRequest / anonymizedSkipped / failed / unprocessed, and lists \`importedIdentifiers\` for the rows now in the list.
-- If a result comes back with \`resumable: true\`, it also carries \`unimportedRows\` naming the exact rows that did not land. Call add_leads_to_list again with ONLY those rows and finish the job in this turn.
+- If a result comes back with \`resumable: true\`, it also carries \`unimportedRows\` naming the exact rows that did not land. Call add_leads_to_list again with ONLY those rows, and KEEP GOING until a result comes back with \`complete: true\` — a large import can need more than one round, and \`unimportedRows\` may name only the first slice of what is missing (it says so when it does). Finish the job in this turn.
 - Never close a turn by telling the user to re-run an import themselves, and never report a row count you did not read off the result — say exactly how many of the source rows are in the list and name what is missing.
 
 **Best Practices for Lead Lists:**

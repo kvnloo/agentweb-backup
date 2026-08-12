@@ -6572,16 +6572,27 @@ export class AgentModeService {
           }
         };
       case 'add_leads_to_list':
-        const mockNewCount = Math.floor((args.leads?.length || 0) * 0.7);
-        const mockMergedCount = (args.leads?.length || 0) - mockNewCount;
+        // Mirrors the real result contract (ENG-1133): `attempted` +
+        // `reconciliation`, no legacy scalars beside them. A mock that answers
+        // in a shape the tool no longer returns teaches mockMode callers to read
+        // fields that will be missing in production.
+        const mockAttempted = args.leads?.length || 0;
+        const mockNewCount = Math.floor(mockAttempted * 0.7);
+        const mockMergedCount = mockAttempted - mockNewCount;
         return {
           success: true,
+          complete: true,
           message: `Successfully processed: ${mockNewCount} new lead(s) created, ${mockMergedCount} lead(s) merged.`,
-          successCount: args.leads?.length || 0,
-          newCount: mockNewCount,
-          mergedCount: mockMergedCount,
-          errorCount: 0,
-          errors: []
+          attempted: mockAttempted,
+          reconciliation: {
+            created: mockNewCount,
+            merged: mockMergedCount,
+            alreadyPresent: 0,
+            duplicateInRequest: 0,
+            anonymizedSkipped: 0,
+            failed: 0,
+            unprocessed: 0,
+          },
         };
       case 'create_gtm_plan':
         const mockPhases = args.phases || [
@@ -10519,7 +10530,7 @@ export class AgentModeService {
       // import can be cut off mid-way (the whole-turn cap fires between calls),
       // and "25 new lead(s) created" tells the next turn nothing about WHICH
       // rows landed — so the only offer left was "retry the whole request".
-      const { buildLeadImportRowOutcomes, describeLeadRow, capLeadRowList } = await import('../utils/leadImportLedger');
+      const { buildLeadImportRowOutcomes, describeLeadRow, capLeadRowList, LEAD_IMPORT_ROW_LIST_CAP } = await import('../utils/leadImportLedger');
       const attempted = leads.length;
       const { outcomes, rowAligned } = buildLeadImportRowOutcomes(result, attempted);
       const tally = (outcome: LeadImportRowOutcome) => outcomes.filter(o => o === outcome).length;
@@ -10584,13 +10595,23 @@ export class AgentModeService {
       const summary = messageParts.length > 0
         ? `Successfully processed: ${messageParts.join(', ')}.`
         : 'No leads were processed.';
+      // `unimportedRows` is capped, so on a big partial it names only the first
+      // slice of what is missing. Left unsaid, the agent imports that slice, gets
+      // a clean `complete: true` back and reports the import finished — silently
+      // stranding the rest. A truncated resume list has to say it is truncated
+      // and that finishing it is not the same as finishing the import.
+      const resumeTruncated = unimportedRows.length > LEAD_IMPORT_ROW_LIST_CAP
+        ? `unimportedRows names only the FIRST ${LEAD_IMPORT_ROW_LIST_CAP} of ${unimportedRows.length} missing rows — `
+          + `after those land, call add_leads_to_list again for the remainder. `
+          + `The import is not done until a result comes back with complete: true. `
+        : '';
       const message = attempted === 0
         ? 'No leads were processed.'
         : complete
           ? summary
           : `Partial import: ${landed} of ${attempted} row(s) are in the list. ${summary} `
             + `RESUME by calling add_leads_to_list again with ONLY the ${unimportedRows.length > 0 ? 'rows listed in unimportedRows' : 'rows that did not import'} — `
-            + `do not ask the user to retry the request. `
+            + `do not ask the user to retry the request. ${resumeTruncated}`
             + `Re-sending an already-imported row is safe (it merges instead of duplicating).`;
 
       return {
